@@ -15,6 +15,9 @@ venv.bak/
 # VS Code settings
 .vscode/
 
+# Direnv
+.direnv/
+
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
