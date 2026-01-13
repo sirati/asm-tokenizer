@@ -1,0 +1,15 @@
+######
+# This file is outdated, look at flake.nix for correct dependency list
+# In the future it is planned to use the flake to autogenerate this file
+######
+
+# Core binary analysis and disassembly
+angr
+capstone
+# lief
+pyelftools
+# Data structures and utilities
+intervaltree
+numpy
+pandas
+tqdm
