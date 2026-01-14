@@ -1,0 +1,8 @@
+zlib/x86-gcc-5-O3_minigzipsh
+zlib/x64-gcc-5-O3_minigzipsh
+zlib/x86-gcc-5-O1_minigzipsh
+zlib/x64-gcc-5-O1_minigzipsh
+zlib/x86-clang-5.0-O1_minigzipsh
+zlib/x64-clang-5.0-O1_minigzipsh
+zlib/x86-clang-5.0-O3_minigzipsh
+zlib/x64-clang-5.0-O3_minigzipsh
