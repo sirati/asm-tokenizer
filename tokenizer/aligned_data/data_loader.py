@@ -10,6 +10,11 @@ Key design principles:
 - Efficient random sampling without searching
 """
 
+#todo optimially we would like two more capabilities
+# 1. for a given lengths know how many functions we can load without OOM
+# 2. allow biased sampling to target length, i.e. increase batch variaty by not only taking the target lengths,
+#    but also sampling shorter functions with some bias against them
+
 import csv
 from pathlib import Path
 from typing import Dict, List, Optional, Union
