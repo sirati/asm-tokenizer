@@ -8,6 +8,13 @@ This module provides utilities for:
 - Index management for fast function lookup by length
 """
 
+from .data_loader import (
+    AlignedDataLoader,
+    BinaryDataset,
+    FunctionData,
+    MatchedFunction,
+    load_single_matched_function,
+)
 from .export import (
     collect_binaries,
     compute_avg_function_length,
@@ -58,6 +65,12 @@ from .sections import (
 )
 
 __all__ = [
+    # data_loader
+    "AlignedDataLoader",
+    "BinaryDataset",
+    "FunctionData",
+    "MatchedFunction",
+    "load_single_matched_function",
     # io
     "decode_and_translate_tokens",
     "decode_runlengths",
