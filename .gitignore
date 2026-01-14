@@ -54,3 +54,7 @@ __MACOSX
 src/
 out/
 queue/
+
+
+# files we create during processing
+parsed_constants.txt
