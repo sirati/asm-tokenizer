@@ -1,6 +1,7 @@
+import argparse
 import os
 from pathlib import Path
-import argparse
+
 from tqdm import tqdm
 
 class BinaryFilter:
@@ -16,11 +17,7 @@ class BinaryFilter:
                 filepath = os.path.join(root, file)
                 data = self._parse_filename(file)
                 if data:
-                    binaries.append({
-                        "path": filepath,
-                        "name": file,
-                        **data
-                    })
+                    binaries.append({"path": filepath, "name": file, **data})
         return binaries
 
     def _parse_filename(self, filename):
@@ -37,7 +34,7 @@ class BinaryFilter:
                 "compiler": parts[1],
                 "version": parts[2],
                 "opt": parts[3],
-                "program": program
+                "program": program,
             }
         except ValueError:
             return None
@@ -67,7 +64,8 @@ class BinaryFilter:
                 results.append(binary)
         return results
 
-def sort_files_by_size(paths) -> list[str]:
+
+def sort_files_by_size(paths: list[str]) -> list[str]:
     """
     Takes a list of file paths (as strings), returns a list of (path, size_in_bytes),
     sorted by size descendingly.
@@ -86,7 +84,7 @@ def sort_files_by_size(paths) -> list[str]:
     for path, size in sorted_files:
         size_kb = size / 1024
         size_mb = size / (1024 * 1024)
-        #print(f"{path}:\n"
+        # print(f"{path}:\n"
         #      f"  {size} bytes\n"
         #      f"  {size_kb:.2f} KB\n"
         #      f"  {size_mb:.2f} MB\n")
@@ -121,14 +119,30 @@ def split_paths_interleaved(paths, output_dir, num_lists: int, prefix="queue"):
             for line in bucket:
                 f.write(f"{line}\n")
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--splits", type=int, default=4, help="Number of output queue files to generate.")
-    parser.add_argument("--output-dir", type=str, default="./queue", help="Directory to store queue files.")
+    parser.add_argument(
+        "--splits",
+        type=int,
+        default=4,
+        help="Number of output queue files to generate.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./queue",
+        help="Directory to store queue files.",
+    )
     args = parser.parse_args()
 
     bf = BinaryFilter("./src")
-    matches = bf.filter(arch=["x64"], compiler=["gcc", "clang"], version=["9", "7", "5", "4.8", "3.5", "5.0"], opt=["O0", "O1", "O2", "O3", "Os"])
+    matches = bf.filter(
+        arch=["x64"],
+        compiler=["gcc", "clang"],
+        version=["9", "7", "5", "4.8", "3.5", "5.0"],
+        opt=["O0", "O1", "O2", "O3", "Os"],
+    )
     paths = [match["path"] for match in matches]
     print(f"Found {len(paths)} matching binaries.")
 
@@ -136,6 +150,9 @@ def main():
     with open(file="queue/queue_complete.txt", mode="w", encoding="utf-8") as f:
         for line in tqdm(queue, desc="Writing queue to file", unit="line"):
             f.write(line + "\n")
+
+    split_paths_interleaved(queue, args.output_dir, args.splits)
+
 
     split_paths_interleaved(queue, args.output_dir, args.splits)
 
