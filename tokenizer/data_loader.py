@@ -82,7 +82,7 @@ def load_vocab_manager(csv_path: Path, platform = None) -> VocabularyManager:
             last_local_index = np.where(mask)[0][-1]  # Position in the chunk
             last_global_index = (np.size(search_area) + start) + last_local_index + 1 # Global position in the file
             last_line_chunk = data[last_global_index:]
-            break;
+            break
         #     print(f"  Last linebreak: local index {last_local_index}, global index {last_global_index}")
         # else:
         #     print(f"  No linebreaks found in this chunk.")

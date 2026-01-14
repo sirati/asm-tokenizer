@@ -1,29 +1,32 @@
-import angr
+import argparse
 import pickle
 import time
 from pathlib import Path
-from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
-from tokenizer.compact_base64_utils import ndarray_to_base64
-from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-from tokenizer.csv_files import parse_and_save_data_sections, token_to_functions
-from tokenizer.data_loader import save_vocabulary
-from tokenizer.function_filter import FunctionFilter
-from tokenizer.function_token_list import FunctionTokenList
-from tokenizer.op_imm_mem import tokenize_operand_memory, tokenize_operand_immediate
-from tokenizer.opaque_remapping import apply_opaque_mapping, apply_opaque_mapping_raw_optimized
-from tokenizer.token_lists import BlockTokenList
-from tokenizer.tokens import TokenResolver, Tokens, BlockToken
-from tokenizer.token_manager import VocabularyManager
-from tokenizer.constant_handler import ConstantHandler
-from tokenizer.function_data_manager import FunctionDataManager, FunctionData
-from tokenizer.instruction_sets import InstructionSets
-from tokenizer.utils import filter_queue_file_by_existing_output, pop_first_line
-from tokenizer.architecture import PlatformInstructionTypes
-from typing import Optional, Literal
-from tqdm import tqdm
+from typing import Literal, Optional, cast
+
+import angr
 import numpy as np
 import numpy.typing as npt
-import argparse
+from tqdm import tqdm
+
+from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
+from tokenizer.architecture import PlatformInstructionTypes
+from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
+from tokenizer.constant_handler import ConstantHandler
+from tokenizer.csv_files import parse_and_save_data_sections, token_to_functions
+from tokenizer.data_loader import save_vocabulary
+from tokenizer.function_data_manager import FunctionData, FunctionDataManager
+from tokenizer.function_filter import FunctionFilter
+from tokenizer.function_token_list import FunctionTokenList
+from tokenizer.instruction_sets import InstructionSets
+from tokenizer.op_imm_mem import tokenize_operand_immediate, tokenize_operand_memory
+from tokenizer.opaque_remapping import (
+    apply_opaque_mapping,
+    apply_opaque_mapping_raw_optimized,
+)
+from tokenizer.token_lists import BlockTokenList
+from tokenizer.token_manager import VocabularyManager
+from tokenizer.tokens import BlockToken, TokenResolver, Tokens
 
 VERIFICATION: bool = False
 SCRIPT_FOLDER: Path = Path(__file__).parent.resolve()
@@ -31,27 +34,27 @@ SCRIPT_FOLDER: Path = Path(__file__).parent.resolve()
 
 degenerate_prefixes = {
     0xF2: ["repne", "repnz"],
-    0xF3: ["repe", "repz", "rep"], #ordering important due to string comparisons
+    0xF3: ["repe", "repz", "rep"],  # ordering important due to string comparisons
 }
 
 
 def fill_constant_candidates(
-        func_addr: int,
-        func: angr.knowledge_plugins.functions.function.Function,
-        instr_sets: InstructionSets,
-        constant_dict: dict[str, list[str]],
-        lookup: AddressMetaDataLookup,
-        text_start: int,
-        text_end: int,
-        resolver: TokenResolver,
-        vocab_manager: VocabularyManager,
+    func_addr: int,
+    func: angr.knowledge_plugins.functions.function.Function,
+    instr_sets: InstructionSets,
+    constant_dict: dict[str, list[str]],
+    lookup: AddressMetaDataLookup,
+    text_start: int,
+    text_end: int,
+    resolver: TokenResolver,
+    vocab_manager: VocabularyManager,
 ) -> Optional[
     tuple[
-        list[tuple[str, list[list[Tokens]]]], # temp_bbs
-        list[dict[BlockToken, tuple[str, str]]], # block_list
-        dict[str, BlockToken], # block_dict
+        list[tuple[str, list[list[Tokens]]]],  # temp_bbs
+        list[dict[BlockToken, tuple[str, str]]],  # block_list
+        dict[str, BlockToken],  # block_dict
         ConstantHandler,
-        FunctionTokenList # func_tokens
+        FunctionTokenList,  # func_tokens
     ]
 ]:
     """
@@ -72,28 +75,31 @@ def fill_constant_candidates(
     blocks: set = set()
 
     num_blocks = len(list(func.blocks))
-    block_ranges: np.ndarray = np.empty((num_blocks, 2), dtype=np.uint64)  # uint64 for addresses
+    block_ranges: np.ndarray = np.empty(
+        (num_blocks, 2), dtype=np.uint64
+    )  # uint64 for addresses
 
     for i, block in enumerate(func.blocks):
-        block_ranges[i, 0] = block.addr            # start address
+        block_ranges[i, 0] = block.addr  # start address
         block_ranges[i, 1] = block.addr + block.size  # end address
 
     # Create constant handler for this function
-    constant_handler = ConstantHandler(vocab_manager, resolver, constant_dict, block_ranges)
+    constant_handler = ConstantHandler(
+        vocab_manager, resolver, constant_dict, block_ranges
+    )
     temp_bbs: list[tuple[str, list[list[Tokens]]]] = []
     block_list: list[dict[BlockToken, tuple[int, int]]] = []
     block_dict: dict[str, BlockToken] = {}  # hex value of Block address: block_token
 
     num_blocks = sum(1 for _ in func.blocks)
-    
+
     # Remove all functions that only contain one empty block
     if num_blocks == 1 and not next(func.blocks).capstone.insns:
         return None
-    
+
     func_tokens = FunctionTokenList(num_blocks, vocab_manager=vocab_manager)
     ordered_blocks = sorted(func.blocks, key=lambda b: b.addr)
     for block in ordered_blocks:
-
         func_max_addr = max(block.addr, block.addr + block.size)
 
         # ------------------Register name of current Block---------------------
@@ -110,32 +116,50 @@ def fill_constant_candidates(
         )
         blocks.add(block_addr)
 
-        assert block.capstone.insns is not None, "Block has no instructions, cannot disassemble"
+        assert block.capstone.insns is not None, (
+            "Block has no instructions, cannot disassemble"
+        )
 
         block_dict[block_addr] = block_token
 
         block_def = [vocab_manager.Block_Def(), block_token]
 
-        disassembly_list = BlockTokenList(len(block.capstone.insns)+1, vocab_manager=vocab_manager)
-        disassembly_list.append_as_insn(insn_str=f"block {block_addr}", tokens=block_def)
+        disassembly_list = BlockTokenList(
+            len(block.capstone.insns) + 1, vocab_manager=vocab_manager
+        )
+        disassembly_list.append_as_insn(
+            insn_str=f"block {block_addr}", tokens=block_def
+        )
 
         disassembly_list2 = [block_def]
 
         # Single loop over instructions to get both disassembly and immediates
         for insn in block.capstone.insns:
-            insn_tokens = disassembly_list.view(insn_str = f"{insn.mnemonic} {insn.op_str}")
+            insn_tokens = disassembly_list.view(
+                insn_str=f"{insn.mnemonic} {insn.op_str}"
+            )
 
-
-            (insn_tokens, insn_tokens2) = parse_instruction(instr_sets, constant_handler,
-                              func_max_addr, func_min_addr, insn, lookup, text_end, text_start,
-                              vocab_manager, insn_tokens)
+            (insn_tokens, insn_tokens2) = parse_instruction(
+                instr_sets,
+                constant_handler,
+                func_max_addr,
+                func_min_addr,
+                insn,
+                lookup,
+                text_end,
+                text_start,
+                vocab_manager,
+                insn_tokens,
+            )
             disassembly_list.add_insn(insn_tokens)
             if VERIFICATION:
                 disassembly_list2.append(insn_tokens2)
 
-
         if VERIFICATION:
-            for (x, y) in zip([token   for insn in disassembly_list2  for token in insn], disassembly_list.iter_raw_tokens()):
+            for x, y in zip(
+                [token for insn in disassembly_list2 for token in insn],
+                disassembly_list.iter_raw_tokens(),
+            ):
                 if x != y:
                     print(f"Token mismatch: {x} != {y}")
                     raise ValueError("Token mismatch in disassembly list")
@@ -152,8 +176,18 @@ def fill_constant_candidates(
     )
 
 
-def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr, insn, lookup, text_end, text_start,
-                      vocab_manager, insn_tokens):
+def parse_instruction(
+    instr_sets,
+    constant_handler,
+    func_max_addr,
+    func_min_addr,
+    insn,
+    lookup,
+    text_end,
+    text_start,
+    vocab_manager,
+    insn_tokens,
+):
     insn_tokens2 = [] if VERIFICATION else None
 
     # Register prefix tokens
@@ -161,9 +195,13 @@ def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr
     for byte in insn.prefix:
         if byte in degenerate_prefixes:
             skip = True
-            for prefix_name in degenerate_prefixes[byte]: # Check for ambiguity for repne, repz, repnz, repe, rep
+            for prefix_name in degenerate_prefixes[
+                byte
+            ]:  # Check for ambiguity for repne, repz, repnz, repe, rep
                 if insn.mnemonic.startswith(prefix_name):
-                    token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
+                    token = vocab_manager.PlatformToken(
+                        prefix_name, PlatformInstructionTypes.PREFIXES
+                    )
                     insn_tokens.append(token)
                     if VERIFICATION:
                         assert insn_tokens2 is not None
@@ -176,7 +214,9 @@ def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr
 
         if byte in instr_sets.prefixes:
             prefix_name: str = instr_sets.prefixes[byte]
-            token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
+            token = vocab_manager.PlatformToken(
+                prefix_name, PlatformInstructionTypes.PREFIXES
+            )
             insn_tokens.append(token)
             if VERIFICATION:
                 assert insn_tokens2 is not None
@@ -197,9 +237,11 @@ def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr
         # print("\n")
         # go through all operands
         for op in insn.operands:
-            if op.type == 0 or op.type > 3: # angr wrapper only registers REGISTER (1), IMMEDIATE (2), MEMORY (3)
+            if (
+                op.type == 0 or op.type > 3
+            ):  # angr wrapper only registers REGISTER (1), IMMEDIATE (2), MEMORY (3)
                 raise Exception
-            
+
             if op.type == 1:  # REGISTER
                 token = vocab_manager.get_registry_token(insn, op.reg)
                 insn_tokens.append(token)
@@ -211,17 +253,32 @@ def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr
                 #     symbol_tokens[reg_name] = vocab_manager.PlatformToken(reg_name)
             elif op.type == 2:  # IMMEDIATE
                 immediate_tokens = tokenize_operand_immediate(
-                    instr_sets.addressing_control_flow, instr_sets.arithmetic,
-                    insn, lookup, op, func_max_addr, func_min_addr, constant_handler)
+                    instr_sets.addressing_control_flow,
+                    instr_sets.arithmetic,
+                    insn,
+                    lookup,
+                    op,
+                    func_max_addr,
+                    func_min_addr,
+                    constant_handler,
+                )
                 insn_tokens.extend(immediate_tokens)
                 if VERIFICATION:
                     assert insn_tokens2 is not None
                     insn_tokens2.extend(immediate_tokens)
 
             elif op.type == 3:  # MEMORY
-                memory_tokens = tokenize_operand_memory(insn, lookup, op, text_end,
-                                                        text_start, func_max_addr, func_min_addr,
-                                                        vocab_manager, constant_handler)
+                memory_tokens = tokenize_operand_memory(
+                    insn,
+                    lookup,
+                    op,
+                    text_end,
+                    text_start,
+                    func_max_addr,
+                    func_min_addr,
+                    vocab_manager,
+                    constant_handler,
+                )
                 insn_tokens.extend(memory_tokens)
                 if VERIFICATION:
                     assert insn_tokens2 is not None
@@ -234,10 +291,19 @@ def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr
     return insn_tokens, insn_tokens2
 
 
-def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Literal["x86", "arm64", "arm32", "x64"],
-                          cfg: angr.analyses.cfg.cfg_fast.CFGFast, constant_list: dict[str, list[str]],
-                          csv_path: Path, binary_path: Path,
-                          pickle_mainloop_file_path: Path, with_pickled=False, project=None, **kwargs):
+def disassemble_to_tokens(
+    out_folder: Path,
+    binary_name: str,
+    platform: Literal["x86", "arm64", "arm32", "x64"],
+    cfg: angr.analyses.cfg.cfg_fast.CFGFast,
+    constant_list: dict[str, list[str]],
+    csv_path: Path,
+    binary_path: Path,
+    pickle_mainloop_file_path: Path,
+    with_pickled=False,
+    project=None,
+    **kwargs,
+):
     """
     Wrapper function for the entire disassembly and tokenization.
 
@@ -254,17 +320,19 @@ def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Literal[
         insn_runlength_dict = {}
         opaque_meta_dict = {}
 
-
         opaque_const_meta: dict[str, list[str]] = {}
 
-        func_addr_range: dict[int, list[dict[str, tuple[str, str]]]] = (
-            {}
-        )  # func_addr: [{block_name: (block_min_addr, block_max_addr)}, ... , {block_nr: (block_min_addr, block_max_addr)}]
+        func_addr_range: dict[
+            int, list[dict[str, tuple[str, str]]]
+        ] = {}  # func_addr: [{block_name: (block_min_addr, block_max_addr)}, ... , {block_nr: (block_min_addr, block_max_addr)}]
         func_disas: dict[str, list[dict[str, list[str]]]] = {}
 
-
         # Get .text section size
-        project = angr.Project(binary_path, auto_load_libs=False) if project is None else project
+        project = (
+            angr.Project(binary_path, auto_load_libs=False)
+            if project is None
+            else project
+        )
         obj = project.loader.main_object
         text_start: int = 0
         text_end: int = 0
@@ -282,13 +350,22 @@ def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Literal[
 
         func_name_addr = {}
 
-        kwargs = dict(block_runlength_dict=block_runlength_dict, cfg=cfg, constant_list=constant_list,
-                      func_addr_range=func_addr_range, func_disas=func_disas, func_disas_token=func_disas_token,
-                      func_name_addr=func_name_addr, func_names=func_names, insn_runlength_dict=insn_runlength_dict,
-                      lookup=lookup, opaque_const_meta=opaque_const_meta,
-                      opaque_meta_dict=opaque_meta_dict,
-                      text_end=text_end,
-                      text_start=text_start)
+        kwargs = dict(
+            block_runlength_dict=block_runlength_dict,
+            cfg=cfg,
+            constant_list=constant_list,
+            func_addr_range=func_addr_range,
+            func_disas=func_disas,
+            func_disas_token=func_disas_token,
+            func_name_addr=func_name_addr,
+            func_names=func_names,
+            insn_runlength_dict=insn_runlength_dict,
+            lookup=lookup,
+            opaque_const_meta=opaque_const_meta,
+            opaque_meta_dict=opaque_meta_dict,
+            text_end=text_end,
+            text_start=text_start,
+        )
 
         with open(pickle_mainloop_file_path, "wb") as f:
             pickle.dump(kwargs, f)
@@ -297,7 +374,6 @@ def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Literal[
         kwargs.update(dict(cfg=cfg, constant_list=constant_list))
         func_names = kwargs["func_names"]
 
-    
     # Initialize VocabularyManager
     vocab_manager = VocabularyManager(platform)
 
@@ -314,10 +390,23 @@ def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Literal[
     return (func_names, function_manager, vocab_manager)
 
 
-def main_loop(instr_sets, cfg, constant_list,
-              func_addr_range, func_disas, func_disas_token, func_name_addr, func_names, lookup,
-              resolver, text_end, text_start, vocab_manager, csv_path, **_kwargs) -> FunctionDataManager:
-
+def main_loop(
+    instr_sets,
+    cfg,
+    constant_list,
+    func_addr_range,
+    func_disas,
+    func_disas_token,
+    func_name_addr,
+    func_names,
+    lookup,
+    resolver,
+    text_end,
+    text_start,
+    vocab_manager,
+    csv_path,
+    **_kwargs,
+) -> FunctionDataManager:
     filter = FunctionFilter()
 
     # Initialize FunctionDataManager with pre-allocated arrays
@@ -326,13 +415,21 @@ def main_loop(instr_sets, cfg, constant_list,
         function_manager = FunctionDataManager(total_functions)
 
     exceptions = []
-    
 
-    with open(csv_path, "w", newline='', encoding='utf-8') as csvfile:#
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:  #
         print(f"WRITING OUTPUT")
         writer = csv.writer(csvfile)
         # Write header with occurrence column added
-        writer.writerow(['function_name', 'occurrence', 'tokens_base64', 'block_runlength_base64', 'instruction_runlength_base64', 'opaque_metadata'])
+        writer.writerow(
+            [
+                "function_name",
+                "occurrence",
+                "tokens_base64",
+                "block_runlength_base64",
+                "instruction_runlength_base64",
+                "opaque_metadata",
+            ]
+        )
 
         occurence = 0
         prev_func_name = ""
@@ -341,8 +438,14 @@ def main_loop(instr_sets, cfg, constant_list,
         prev_insn_base64 = ""
 
         try:
-            for i, (func_addr, func) in enumerate(tqdm(iterable=sorted(cfg.functions.items(), key=lambda item: item[1].name),
-                                    desc="Retrieving data from alllll functions. Like a big boy.")):
+            for i, (func_addr, func) in enumerate(
+                tqdm(
+                    iterable=sorted(
+                        cfg.functions.items(), key=lambda item: item[1].name
+                    ),
+                    desc="Retrieving data from alllll functions. Like a big boy.",
+                )
+            ):
                 func_name = cfg.functions[func_addr].name
                 if func_name in ["UnresolvableCallTarget", "UnresolvableJumpTarget"]:
                     continue
@@ -370,28 +473,37 @@ def main_loop(instr_sets, cfg, constant_list,
                 if function_analysis is None:
                     continue
 
-                (temp_bbs,
-                block_list,
-                block_dict,
-                constant_handler,
-                func_tokens) = function_analysis
+                (temp_bbs, block_list, block_dict, constant_handler, func_tokens) = (
+                    function_analysis
+                )
 
                 func_addr_range[func_addr] = sorted(
                     block_list, key=lambda d: list(d.values())[0][0]
                 )
-
 
                 # Create mapping from old opaque tokens to new sorted tokens
                 opaque_mapping = constant_handler.create_opaque_mapping()
 
                 # Apply the mapping to replace opaque tokens in temp_bbs
                 if len(opaque_mapping) > 0:
-                    func_tokens = apply_opaque_mapping_raw_optimized(func_tokens, opaque_mapping, vocab_manager, constant_handler)
+                    func_tokens = apply_opaque_mapping_raw_optimized(
+                        func_tokens, opaque_mapping, vocab_manager, constant_handler
+                    )
                     if VERIFICATION:
-                        temp_bbs = apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler=None) #do not reorder constant_handler twice
+                        temp_bbs = apply_opaque_mapping(
+                            temp_bbs, opaque_mapping, constant_handler=None
+                        )  # do not reorder constant_handler twice
 
                 if VERIFICATION:
-                    for (x, y) in zip([token for (_, block) in temp_bbs for insn in block for token in insn], func_tokens.iter_raw_tokens()):
+                    for x, y in zip(
+                        [
+                            token
+                            for (_, block) in temp_bbs
+                            for insn in block
+                            for token in insn
+                        ],
+                        func_tokens.iter_raw_tokens(),
+                    ):
                         if x != y:
                             print(f"Token mismatch: {x} != {y}")
                             raise ValueError("Token mismatch in disassembly list")
@@ -402,9 +514,6 @@ def main_loop(instr_sets, cfg, constant_list,
 
                 # Create token stream directly from temp_bbs (which already contains TokensRepl objects)
                 # temp_tk = [tokens for (addr, tokens) in temp_bbs]
-
-
-
 
                 tokenized_instructions, block_run_lengths, insn_run_lengths = (
                     build_vocab_tokenize_and_index(func_tokens)
@@ -426,7 +535,11 @@ def main_loop(instr_sets, cfg, constant_list,
                         occurence -= 1
                         continue
 
-                    if prev_block_base64 == block_base64 and prev_insn_base64 == insn_base64 and prev_tokens_base64 == tokens_base64:
+                    if (
+                        prev_block_base64 == block_base64
+                        and prev_insn_base64 == insn_base64
+                        and prev_tokens_base64 == tokens_base64
+                    ):
                         occurence -= 1
                         continue
 
@@ -436,7 +549,7 @@ def main_loop(instr_sets, cfg, constant_list,
                         tokens_base64,
                         block_base64,
                         insn_base64,
-                        str(repr(meta_result))
+                        str(repr(meta_result)),
                     ]
 
                     writer.writerow(row)
@@ -446,23 +559,30 @@ def main_loop(instr_sets, cfg, constant_list,
                     prev_block_base64 = block_base64
                     prev_insn_base64 = insn_base64
 
-                    if i & 16383 == 16383: #2^14-1 so save every 16384 functions
+                    if i & 16383 == 16383:  # 2^14-1 so save every 16384 functions
                         save_vocabulary(vocab_manager, writer)
 
-                    if i & 255 == 255: # flush every 256 functions
+                    if i & 255 == 255:  # flush every 256 functions
                         csvfile.flush()
 
                     if VERIFICATION:
-                        assert np.all(base64_to_ndarray_vec(tokens_base64) == tokenized_instructions), "Base64 conversion failed for tokens"
-                        assert np.all(base64_to_ndarray_vec(block_base64) == block_run_lengths), "Base64 conversion failed for block run lengths"
-                        assert np.all(base64_to_ndarray_vec(insn_base64) == insn_run_lengths), "Base64 conversion failed for instruction run lengths"
+                        assert np.all(
+                            base64_to_ndarray_vec(tokens_base64)
+                            == tokenized_instructions
+                        ), "Base64 conversion failed for tokens"
+                        assert np.all(
+                            base64_to_ndarray_vec(block_base64) == block_run_lengths
+                        ), "Base64 conversion failed for block run lengths"
+                        assert np.all(
+                            base64_to_ndarray_vec(insn_base64) == insn_run_lengths
+                        ), "Base64 conversion failed for instruction run lengths"
                         # Create FunctionData instance
                         function_data = FunctionData(
                             tokens=func_tokens,
                             tokens_base64=tokens_base64,
                             block_runlength_base64=block_base64,
                             instruction_runlength_base64=insn_base64,
-                            opaque_metadata=repr(meta_result)
+                            opaque_metadata=repr(meta_result),
                         )
                         # Add all function data in one operation and get the final function name
                         final_func_name = function_manager.add_function_data(
@@ -476,23 +596,24 @@ def main_loop(instr_sets, cfg, constant_list,
                         func_names.append(final_func_name)
                 except Exception as e:
                     print(
-                        f"Error saving {func_name}: {e}.\nTokenstream: {func_tokens}\nTokens: {tokenized_instructions}\nBlock encoding: {block_run_lengths}\nInstructions: {insn_run_lengths}\nMetaData: {str(meta_result)}")
+                        f"Error saving {func_name}: {e}.\nTokenstream: {func_tokens}\nTokens: {tokenized_instructions}\nBlock encoding: {block_run_lengths}\nInstructions: {insn_run_lengths}\nMetaData: {str(meta_result)}"
+                    )
                     exceptions.append(e)
                     continue
         except Exception as e:
-            print(f"Unrecoverable error in main loop: {e}, writing what we have at least")
+            print(
+                f"Unrecoverable error in main loop: {e}, writing what we have at least"
+            )
             exceptions.append(e)
 
         save_vocabulary(vocab_manager, writer)
         csvfile.flush()
 
-
     if len(exceptions) > 0:
         all_exection_string = "\n".join([str(e) for e in exceptions])
-        raise Exception(f"Errors occurred during disassembly:\n{all_exection_string}") from exceptions[-1]
-
-
-
+        raise Exception(
+            f"Errors occurred during disassembly:\n{all_exection_string}"
+        ) from exceptions[-1]
 
     if VERIFICATION:
         # Compact arrays to save memory
@@ -501,41 +622,91 @@ def main_loop(instr_sets, cfg, constant_list,
         return function_manager
 
 
-def build_vocab_tokenize_and_index(func_tokens: FunctionTokenList) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]:
+def build_vocab_tokenize_and_index(
+    func_tokens: FunctionTokenList,
+) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]:
     """
     Updated function to work with FunctionTokenList for efficient token processing.
     Now expects a FunctionTokenList instance instead of raw block data.
     """
     if func_tokens.last_index == 0:
-        return np.array([], dtype=np.int_), np.array([], dtype=np.int_), np.array([], dtype=np.int_)
+        return (
+            np.array([], dtype=np.int_),
+            np.array([], dtype=np.int_),
+            np.array([], dtype=np.int_),
+        )
 
     # Get the used arrays from FunctionTokenList
-    (token_ids, _, _, _,
-     insn_idx_run_lengths, _,
-     block_insn_run_lengths, _, _) = func_tokens.get_used_arrays()
+    (token_ids, _, _, _, insn_idx_run_lengths, _, block_insn_run_lengths, _, _) = (
+        func_tokens.get_used_arrays()
+    )
 
-    block_insn_split_start_indicies = np.cumsum(np.insert(block_insn_run_lengths[:-1], 0, 0))
-    block_idx_run_lengths = np.add.reduceat(insn_idx_run_lengths, block_insn_split_start_indicies)
+    block_insn_split_start_indicies = np.cumsum(
+        np.insert(block_insn_run_lengths[:-1], 0, 0)
+    )
+    block_idx_run_lengths = np.add.reduceat(
+        insn_idx_run_lengths, block_insn_split_start_indicies
+    )
 
     return token_ids, block_idx_run_lengths, insn_idx_run_lengths
 
 
-def run_tokenizer(binary_path: Path, platform: Literal["x86", "arm64", "arm32", "x64"], skip_existing_csv: bool) -> None:
+def run_tokenizer(
+    binary_path: Path,
+    platform: Literal["x86", "arm64", "arm32", "x64", "file_prefix"],
+    skip_existing_csv: bool,
+    source_dir: Path,
+    output_dir: Path,
+) -> None:
     print(f"STARTING DISASSEMBLY")
 
     file_path: Path = binary_path.absolute()
 
     binary_name = file_path.name
-    assert binary_name.startswith(platform), "Binary name must start with platform name, wrong platform?"
-    out_folder = SCRIPT_FOLDER.parent / "out" / file_path.parent.name #TODO not clean if there are more than one level of parent folder
-    out_folder.mkdir(parents=True, exist_ok = True)
+
+    # Auto-detect platform from file prefix if requested
+    if platform == "file_prefix":
+        possible_platforms: list[Literal["x86", "arm64", "arm32", "x64"]] = [
+            "x86",
+            "arm64",
+            "arm32",
+            "x64",
+        ]
+        detected_platform: Literal["x86", "arm64", "arm32", "x64"] | None = None
+        for p in possible_platforms:
+            if binary_name.startswith(p):
+                detected_platform = p
+                break
+
+        if detected_platform is None:
+            raise ValueError(
+                f"Could not detect platform from binary name '{binary_name}'. "
+                f"Expected one of: {', '.join(possible_platforms)}"
+            )
+        platform = cast(Literal["x86", "arm64", "arm32", "x64"], detected_platform)
+        print(f"[*] Detected platform: {platform}")
+    else:
+        # Validate platform matches file prefix
+        assert binary_name.startswith(platform), (
+            f"Binary name '{binary_name}' must start with platform '{platform}'. Wrong platform's file in queue?"
+        )
+
+    # Calculate relative path from source directory
+    try:
+        relative_path = file_path.relative_to(source_dir.absolute())
+    except ValueError:
+        # If file is not under source_dir, use just the parent folder name
+        relative_path = Path(file_path.parent.name) / file_path.name
+
+    out_folder = output_dir / relative_path.parent
+    out_folder.mkdir(parents=True, exist_ok=True)
 
     pickle_file_path = out_folder / f"{binary_name}.pkl"
     pickle_mainloop_file_path = out_folder / f"{binary_name}.mainloop.pkl"
     csv_path = out_folder / f"{binary_name}_output.csv"
 
     if csv_path.exists() and skip_existing_csv:
-        print(f"File {f"{binary_path.name}_output.csv"} already exists: {csv_path}.")
+        print(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
         return None
 
     with_pickled = False
@@ -556,9 +727,13 @@ def run_tokenizer(binary_path: Path, platform: Literal["x86", "arm64", "arm32", 
 
         print(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
     else:
-        project: angr.Project = angr.Project(file_path, auto_load_libs=False)  # was False
+        project: angr.Project = angr.Project(
+            file_path, auto_load_libs=False
+        )  # was False
         constants: dict[str, list[str]] = parse_and_save_data_sections(project)
-        cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(normalize=True)
+        cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(
+            normalize=True
+        )
 
         kvargs: dict = dict(project=project, cfg=cfg, constant_list=constants)
         print(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
@@ -570,13 +745,21 @@ def run_tokenizer(binary_path: Path, platform: Literal["x86", "arm64", "arm32", 
 
     start_time = time.time()
     print(f"Calling lowlevel_disas")
-    kvargs.update(dict(with_pickled=with_pickled, out_folder=out_folder, binary_name=binary_name, platform=platform,
-                       csv_path=csv_path, binary_path=binary_path, pickle_mainloop_file_path=pickle_mainloop_file_path))
+    kvargs.update(
+        dict(
+            with_pickled=with_pickled,
+            out_folder=out_folder,
+            binary_name=binary_name,
+            platform=platform,
+            csv_path=csv_path,
+            binary_path=binary_path,
+            pickle_mainloop_file_path=pickle_mainloop_file_path,
+        )
+    )
     (func_names, function_manager, vocab_manager) = disassemble_to_tokens(**kvargs)
     disassembly_time = time.time() - start_time
     print(f"Disassembly time: {disassembly_time:.2f} seconds")
 
-    
     # """
     # with open("output.csv", "w", newline='', encoding='utf-8') as csvfile:
     #     writer = csv.writer(csvfile)
@@ -604,24 +787,32 @@ def run_tokenizer(binary_path: Path, platform: Literal["x86", "arm64", "arm32", 
         # datastructures_to_insn(vocab=vocab, block_run_length_dict=block_runlength, insn_runlength_dict=insn_runlength, token_dict=tokens, duplicate_map=duplicate_map)
         # vocab: list[str] = vocab_from_output("output.csv")
         # token_man = VocabularyManager.from_vocab(platform="x86", vocab_list=vocab)
-        for (name, dublicate_idx, tokensRC) in token_to_functions("output.csv"):
+        for name, dublicate_idx, tokensRC in token_to_functions("output.csv"):
             original = function_manager.get_function_data(name, dublicate_idx)
             tokensOG = original.tokens
 
             assert tokensRC.insn_count == original.tokens.insn_count
             assert tokensRC.block_count == original.tokens.block_count
             assert tokensRC.last_index == original.tokens.last_index
-            iterRC = tokensRC.iter_tokens() #here we resolve to check the vocab manager
-            iterOG = tokensOG.iter_raw_tokens() #for og we do not care are resolving does not change equality
+            iterRC = (
+                tokensRC.iter_tokens()
+            )  # here we resolve to check the vocab manager
+            iterOG = (
+                tokensOG.iter_raw_tokens()
+            )  # for og we do not care are resolving does not change equality
 
-            for (x, y) in zip(iterRC, iterOG):
+            for x, y in zip(iterRC, iterOG):
                 if x != y:
                     print(f"Token mismatch: {x} != {y}")
                     raise ValueError("Token mismatch in disassembly list")
 
-            #iterators should both be done, but zip stops at the shortest one
-            assert next(iterRC, None) is None, "Reconstructed function contains more tokens than original"
-            assert next(iterOG, None) is None, "Reconstructed functions missing tokens from original"
+            # iterators should both be done, but zip stops at the shortest one
+            assert next(iterRC, None) is None, (
+                "Reconstructed function contains more tokens than original"
+            )
+            assert next(iterOG, None) is None, (
+                "Reconstructed functions missing tokens from original"
+            )
 
         print("Verification complete.")
 
@@ -629,62 +820,141 @@ def run_tokenizer(binary_path: Path, platform: Literal["x86", "arm64", "arm32", 
 def main():
     parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--batch', type=str, metavar='QUEUE_FILE', help='Process a batch of binaries from a queue file')
-    group.add_argument('--single', type=str, metavar='BINARY_FILE', help='Process a single binary file')
-    group.add_argument('--debugs', action='store_true', help='Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh')
-    group.add_argument('--debugl', action='store_true', help='Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool')
+    group.add_argument(
+        "--batch",
+        type=str,
+        metavar="QUEUE_FILE",
+        help="Process a batch of binaries from a queue file",
+    )
+    group.add_argument(
+        "--single",
+        type=str,
+        metavar="BINARY_FILE",
+        help="Process a single binary file",
+    )
+    group.add_argument(
+        "--debugs",
+        action="store_true",
+        help="Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh",
+    )
+    group.add_argument(
+        "--debugl",
+        action="store_true",
+        help="Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool",
+    )
 
     # Independent arugments
-    parser.add_argument('--platform', type=str, help='Debug only! Specify the platform (e.g., x86, arm64) for the tokenizer. Default is x86.', default='x86', choices=["x86", "arm64", "arm32", "x64"])
-    parser.add_argument('--skip_existing', action='store_true', help='Skip existing csv files.')
+    parser.add_argument(
+        "--platform",
+        type=str,
+        help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'file_prefix' to auto-detect from binary name. Default is file_prefix.",
+        default="file_prefix",
+        choices=["x86", "arm64", "arm32", "x64", "file_prefix"],
+    )
+    parser.add_argument(
+        "--skip_existing", action="store_true", help="Skip existing csv files."
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="./src",
+        help="Source directory containing binaries (default: ./src)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./out",
+        help="Output directory for results (default: ./out)",
+    )
 
     args = parser.parse_args()
 
     platform = args.platform
+
+    # Get current working directory and resolve source/output paths
+    cwd = Path.cwd()
+    source_dir = (cwd / args.source).resolve()
+    output_dir = (cwd / args.output).resolve()
+
+    print(f"[*] Source directory: {source_dir}")
+    print(f"[*] Output directory: {output_dir}")
+
+    # Common parameters for run_tokenizer
+    common_params = dict(
+        platform=platform,
+        skip_existing_csv=args.skip_existing,
+        source_dir=source_dir,
+        output_dir=output_dir,
+    )
+
     if args.batch:
-        queue_file = args.batch
-        print(f"[*] Filtering queue: {queue_file}")
-        filter_queue_file_by_existing_output(queue_file)
+        queue_file_path = (cwd / args.batch).resolve()
+        print(f"[*] Reading queue file: {queue_file_path}")
 
-        with open(queue_file, 'r') as f:
-            print(f"Queue file contents after filtering:\n{''.join(f.readlines())}")
+        # Read all lines from the queue file
+        with open(queue_file_path, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
 
-        print(f"Using queue: {queue_file}")
-        while True:
-            binary_path_str = pop_first_line(queue_file)
+        print(f"[*] Total lines in queue: {len(lines)}")
 
-            if binary_path_str is None:
-                print("Queue is empty. Exiting.")
-                break
-            print(f"Popped binary path: {binary_path_str}")
+        # Convert relative paths to absolute paths based on source directory
+        absolute_lines = []
+        for line in lines:
+            # Remove leading ./ if present
+            if line.startswith("./"):
+                line = line[2:]
+            absolute_lines.append(str(source_dir / line))
+
+        # Filter the queue to skip binaries with existing output
+        from tokenizer.utils import filter_queue
+
+        filtered_lines = filter_queue(
+            absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir)
+        )
+
+        print(f"[*] Filtered queue: {len(filtered_lines)} items to process")
+
+        # Process each binary in the filtered list
+        for idx, binary_path_str in enumerate(filtered_lines, 1):
+            print(
+                f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}"
+            )
             binary_path = Path(binary_path_str).resolve()
-            print(f"\n[*] Processing binary: {binary_path}")
             try:
-                run_tokenizer(binary_path, platform=platform, skip_existing_csv=args.skip_existing)
+                run_tokenizer(binary_path, **common_params)
             except Exception as e:
                 print(f"[!] Error processing {binary_path}: {e}")
                 print("Continuing with next binary in queue...")
                 continue
+
+        print("\n[*] Batch processing complete.")
     elif args.single:
-        binary_path = Path(args.single).resolve()
+        binary_path_input = cwd / args.single
+        binary_path = binary_path_input.resolve()
         print(f"[*] Processing single binary: {binary_path}")
-        run_tokenizer(binary_path, platform=platform, skip_existing_csv=args.skip_existing)
+        run_tokenizer(binary_path, **common_params)
     elif args.debugs:
-        binary_path = SCRIPT_FOLDER / f"../src/clamav/{platform}-gcc-5-O3_minigzipsh"
+        binary_path = source_dir / f"clamav/{platform}-gcc-5-O3_minigzipsh"
         print(f"[*] Debug mode (gcc): {binary_path}")
-        run_tokenizer(binary_path, platform=platform, skip_existing_csv=False)
+        debug_params = common_params.copy()
+        debug_params.update(dict(skip_existing_csv=False))
+        run_tokenizer(binary_path, **debug_params)
     elif args.debugl:
-        binary_path = SCRIPT_FOLDER / f"../src/clamav/{platform}-clang-5.0-O1_sigtool"
+        binary_path = source_dir / f"clamav/{platform}-clang-5.0-O1_sigtool"
         print(f"[*] Debug mode (clang): {binary_path}")
-        run_tokenizer(binary_path, platform=platform, skip_existing_csv=False)
+        debug_params = common_params.copy()
+        debug_params.update(dict(skip_existing_csv=False))
+        run_tokenizer(binary_path, **debug_params)
+
 
 if __name__ == "__main__":
     print("loading")
-    import sys, csv
+    import csv
+    import sys
 
     maxInt = sys.maxsize
-        # decrease the maxInt value by factor 10
-        # as long as the OverflowError occurs.
+    # decrease the maxInt value by factor 10
+    # as long as the OverflowError occurs.
 
     while True:
         try:
