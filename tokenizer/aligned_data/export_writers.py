@@ -78,10 +78,24 @@ def write_unmatched_function_section(
 ):
     """Write a single-line unmatched function section."""
     called_str = format_unique_called(unique_called_list)
-    inlining_data_str = ";".join(
-        f"{idx},{offset:x},{length:x},{is_matched}"
-        for idx, offset, length, is_matched in inlining_data_list
-    )
+
+    from collections import defaultdict
+
+    grouped = defaultdict(list)
+    for called_func_id, comp_set_id, offset, length, is_matched in inlining_data_list:
+        key = (called_func_id, offset, length, is_matched)
+        grouped[key].append(comp_set_id)
+
+    merged_entries = []
+    for (called_func_id, offset, length, is_matched), comp_set_ids in sorted(
+        grouped.items()
+    ):
+        comp_set_str = "_".join(map(str, sorted(comp_set_ids)))
+        merged_entries.append(
+            f"{called_func_id}-{comp_set_str},{offset:x},{length:x},{is_matched}"
+        )
+
+    inlining_data_str = ";".join(merged_entries)
 
     write_unmatched_section_csv(
         writer,
@@ -123,7 +137,8 @@ def build_inlining_data_for_unmatched(
                 func_offset, func_len, is_matched = function_lookup[lookup_key]
                 inlining_data_list.append(
                     [
-                        f"{comp_set_id}-{called_func_id}",
+                        called_func_id,
+                        comp_set_id,
                         func_offset,
                         func_len,
                         is_matched,
