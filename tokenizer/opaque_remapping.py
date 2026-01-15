@@ -1,7 +1,6 @@
 from tokenizer.function_token_list import FunctionTokenList
-from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
-from tokenizer.tokens import Tokens, TokenType, TokenRaw
+from tokenizer.tokens import TokenType
 
 
 def apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler=None):

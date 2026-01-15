@@ -1,5 +1,5 @@
 import csv
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from .csv_format import format_unique_called
 from .export_helpers import (
@@ -11,7 +11,6 @@ from .export_helpers import (
 from .export_writers import (
     build_inlining_data_for_unmatched,
     finalize_index_file,
-    write_matched_function_section,
     write_unmatched_function_section,
 )
 from .io import write_function_section_csv, write_index_entry

@@ -1,7 +1,7 @@
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.patterns import *
-from tokenizer.token_lists import BlockTokenList, InsnTokenList
-from tokenizer.tokens import MemoryOperandSymbol, TokenType
+from tokenizer.token_lists import InsnTokenList
+from tokenizer.tokens import MemoryOperandSymbol
 
 
 def test_jump_only_pattern():

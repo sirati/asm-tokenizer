@@ -1,5 +1,5 @@
 import angr
-from intervaltree import Interval, IntervalTree
+from intervaltree import IntervalTree
 
 
 class AddressMetaDataLookup:

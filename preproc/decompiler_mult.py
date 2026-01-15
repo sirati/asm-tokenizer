@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from multiprocessing import Pool
 from typing import Tuple
-from binary_filter import BinaryFilter
 
 RE_MULTI_WS = re.compile(r"\s+")
 RE_THREE_BEFORE_PIPE = re.compile(r".{3}\|")

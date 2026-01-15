@@ -1,5 +1,4 @@
 import numpy as np
-import numpy.typing as npt
 from typing import Iterator, Optional
 
 from tokenizer.token_manager import VocabularyManager

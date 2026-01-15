@@ -393,7 +393,7 @@ def main_loop(
     exceptions = []
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:  #
-        print(f"WRITING OUTPUT")
+        print("WRITING OUTPUT")
         writer = csv.writer(csvfile)
         # Write header with occurrence column added
         writer.writerow(
@@ -612,7 +612,7 @@ def run_tokenizer(
     source_dir: Path,
     output_dir: Path,
 ) -> None:
-    print(f"STARTING DISASSEMBLY")
+    print("STARTING DISASSEMBLY")
 
     file_path: Path = binary_path.absolute()
 
@@ -694,7 +694,7 @@ def run_tokenizer(
         print(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
 
     start_time = time.time()
-    print(f"Calling lowlevel_disas")
+    print("Calling lowlevel_disas")
     kvargs.update(
         dict(
             with_pickled=with_pickled,

@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any, List, Optional, Type, TypeVar, cast
+from typing import Any, List, Optional, Type, TypeVar
 
 import numpy as np
 import numpy.typing as npt

@@ -1,7 +1,5 @@
-from typing import List, Optional, Any, Union, ForwardRef
+from typing import List, Any, Union, ForwardRef
 
-import tokenizer
-from .matcher import TokenPattern
 
 class PatternParseBase:
     def __add__(self, other) -> Any: ...
