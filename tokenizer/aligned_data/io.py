@@ -19,7 +19,19 @@ def decode_runlengths(row):
     return block_runlength, insn_runlength
 
 
-def write_function_binary_data(file2, tokens, block_runlength, insn_runlength):
+def write_function_binary_data(
+    file2, tokens, block_runlength, insn_runlength, dedup_cache=None
+):
+    cache_key = None
+    if dedup_cache is not None:
+        cache_key = (
+            tokens.tobytes(),
+            block_runlength.tobytes(),
+            insn_runlength.tobytes(),
+        )
+        if cache_key in dedup_cache:
+            return dedup_cache[cache_key]
+
     data_offset = file2.tell()
     insn_bytes = insn_runlength.astype(np.uint8).tobytes()
     block_enc = (
@@ -38,7 +50,12 @@ def write_function_binary_data(file2, tokens, block_runlength, insn_runlength):
     file2.write(block_bytes)
     file2.write(tokens.tobytes())
     data_len = file2.tell() - data_offset
-    return data_offset, data_len
+    result = (data_offset, data_len)
+
+    if dedup_cache is not None:
+        dedup_cache[cache_key] = result
+
+    return result
 
 
 def write_index_entry(file3, start, length, avg_len):
