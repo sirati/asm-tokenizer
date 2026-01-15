@@ -34,16 +34,10 @@ def create_normalized_header(headers: List[List[str]]) -> List[str]:
     return normalized_header
 
 
-def create_column_mapping(
-    header: List[str], normalized_header: List[str]
-) -> Dict[str, Any]:
+def create_column_mapping(header: List[str], normalized_header: List[str]) -> Dict[str, Any]:
     """Create mapping from normalized header field to source row index."""
     header_to_idx = {field: idx for idx, field in enumerate(header)}
-    return {
-        field: header_to_idx.get(field)
-        for field in normalized_header
-        if field in header_to_idx
-    }
+    return {field: header_to_idx.get(field) for field in normalized_header if field in header_to_idx}
 
 
 def normalize_row(row: List[str], column_mapping: Dict[str, int]) -> Dict[str, str]:
@@ -80,9 +74,7 @@ def lockstep_function_match(csv_paths: List[str]):
             current_rows.append(None)
 
     normalized_header = create_normalized_header(headers)
-    column_mappings = [
-        create_column_mapping(header, normalized_header) for header in headers
-    ]
+    column_mappings = [create_column_mapping(header, normalized_header) for header in headers]
 
     while True:
         # Get current function names (None if row is exhausted)
@@ -100,9 +92,7 @@ def lockstep_function_match(csv_paths: List[str]):
 
         # Build result list with normalized row dicts
         result_rows = [
-            normalize_row(current_rows[i], column_mappings[i])
-            if i in matching_indices
-            else None
+            normalize_row(current_rows[i], column_mappings[i]) if i in matching_indices else None
             for i in range(len(csv_paths))
         ]
         yield {"function_name": min_name, "rows": result_rows, "count": count}

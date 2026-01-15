@@ -1,16 +1,26 @@
 def _create(globals):
     from typing import List, Union
 
-    from tokenizer.patterns.engine import (PatternElem, Alternatives, camelcase, Sequence, RepeatType, TokenTypeElem,
-                                           PlatformInstructionTypesElem, MemoryOperandSymbolElem, MaybeElem, MultiElem,
-                                           LookaheadElem)
+    from tokenizer.patterns.engine import (
+        PatternElem,
+        Alternatives,
+        camelcase,
+        Sequence,
+        RepeatType,
+        TokenTypeElem,
+        PlatformInstructionTypesElem,
+        MemoryOperandSymbolElem,
+        MaybeElem,
+        MultiElem,
+        LookaheadElem,
+    )
 
     from tokenizer.architecture import PlatformInstructionTypes
     from tokenizer.tokens import TokenType, MemoryOperandSymbol
 
-    TokenPatternType = Union['Pattern', 'PartialParseResult', List['TokenPatternType']]
+    TokenPatternType = Union["Pattern", "PartialParseResult", List["TokenPatternType"]]
 
-    def parse_list(list_: List[TokenPatternType]) -> Union['PartialParseResult', NotImplemented]:
+    def parse_list(list_: List[TokenPatternType]) -> Union["PartialParseResult", NotImplemented]:
         result = []
         for x in list_:
             if isinstance(x, PartialParseResult):
@@ -29,8 +39,8 @@ def _create(globals):
 
     # --- PartialParseResult class ---
     from abc import ABC, abstractmethod
-    class PatternParseBase(ABC):
 
+    class PatternParseBase(ABC):
         @abstractmethod
         def __add__(self, other):
             """
@@ -44,8 +54,6 @@ def _create(globals):
             Adds another pattern or prefix to this result.
             """
             pass
-
-
 
     class PartialParseResult(PatternParseBase):
         def __init__(self, parsed, end):
@@ -135,9 +143,9 @@ def _create(globals):
             self.building_alternative = True
 
             if isinstance(other, PartialParseResult):
-
-                assert other.building_alternative or len(
-                    other.parsed) <= 1, "PartialParseResult must be empty/one or building alternative."
+                assert other.building_alternative or len(other.parsed) <= 1, (
+                    "PartialParseResult must be empty/one or building alternative."
+                )
 
                 if not other.building_alternative and len(other.parsed) == 1:
                     self.parsed.append(other.parsed[0])
@@ -162,7 +170,9 @@ def _create(globals):
             if not self.end:
                 return str(self)
             symbol = " | " if self.building_alternative else ", "
-            return f"PartialParseResult(parsed={symbol.join([repr(x) for x in self.parsed])}, unparsed={repr(self.end)})"
+            return (
+                f"PartialParseResult(parsed={symbol.join([repr(x) for x in self.parsed])}, unparsed={repr(self.end)})"
+            )
 
     class Prefix(PatternParseBase):
         def __init__(self, value):
@@ -183,14 +193,18 @@ def _create(globals):
             # previous is PartialParseResult
             # A) If Prefix + Prefix, apply rules:
             if isinstance(other, Prefix):
+
                 def combine(self, other):
                     match (self, other):
                         case (RepeatType.MAYBE, RepeatType.MAYBE):
                             return RepeatType.MAYBE
                         case (RepeatType.MULTI, RepeatType.MULTI) | (RepeatType.MULTI, RepeatType.MAYBE):
                             return RepeatType.MULTI
-                        case (RepeatType.LOOKAHEAD, RepeatType.MULTI) | (RepeatType.MULTI, RepeatType.LOOKAHEAD) | ( \
-                            RepeatType.LOOKAHEAD, RepeatType.LOOKAHEAD):
+                        case (
+                            (RepeatType.LOOKAHEAD, RepeatType.MULTI)
+                            | (RepeatType.MULTI, RepeatType.LOOKAHEAD)
+                            | (RepeatType.LOOKAHEAD, RepeatType.LOOKAHEAD)
+                        ):
                             return RepeatType.LOOKAHEAD
                         case (RepeatType.LOOKAHEAD, RepeatType.MAYBE) | (RepeatType.MAYBE, RepeatType.LOOKAHEAD):
                             return []
@@ -273,11 +287,11 @@ def _create(globals):
     for member in RepeatType:
         globals[camelcase(member.name)] = Prefix(member)
 
-    globals['PatternParseBase'] = PatternParseBase
-    globals['PatternSinglet'] = Pattern
-    globals['PatternParseResult'] = PartialParseResult
-    globals['listToPatternParseResult'] = parse_list
-    globals['TokenPatternType'] = TokenPatternType
+    globals["PatternParseBase"] = PatternParseBase
+    globals["PatternSinglet"] = Pattern
+    globals["PatternParseResult"] = PartialParseResult
+    globals["listToPatternParseResult"] = parse_list
+    globals["TokenPatternType"] = TokenPatternType
 
 
 _create(globals())

@@ -52,7 +52,7 @@ class InstructionSets:
         self.prefixes: dict[int, str] = {int(k, 16): v for k, v in data["inv_prefix_tokens"].items()}
 
     @classmethod
-    def from_data_dict(cls, data: dict) -> 'InstructionSets':
+    def from_data_dict(cls, data: dict) -> "InstructionSets":
         """
         Create InstructionSets from pre-loaded data dictionary.
 
@@ -72,16 +72,18 @@ class InstructionSets:
         instance.nop = set(data.get("nop_instructions", []))
         instance.kernel_interaction = set(data.get("kernel_interaction_instructions", []))
         instance.locking_atomic = set(data.get("locking_atomic_instructions", []))
-        instance.prefixes =  {int(k, 16): v for k, v in data["inv_prefix_tokens"].items()}
+        instance.prefixes = {int(k, 16): v for k, v in data["inv_prefix_tokens"].items()}
         return instance
 
     def __repr__(self) -> str:
-        return (f"InstructionSets(arithmetic={len(self.arithmetic)}, "
-                f"addressing_control_flow={len(self.addressing_control_flow)}, "
-                f"string={len(self.string)}, bit_manipulation={len(self.bit_manipulation)}, "
-                f"floating_point={len(self.floating_point)}, system={len(self.system)}, "
-                f"nop={len(self.nop)}, kernel_interaction={len(self.kernel_interaction)}, "
-                f"locking_atomic={len(self.locking_atomic)})")
+        return (
+            f"InstructionSets(arithmetic={len(self.arithmetic)}, "
+            f"addressing_control_flow={len(self.addressing_control_flow)}, "
+            f"string={len(self.string)}, bit_manipulation={len(self.bit_manipulation)}, "
+            f"floating_point={len(self.floating_point)}, system={len(self.system)}, "
+            f"nop={len(self.nop)}, kernel_interaction={len(self.kernel_interaction)}, "
+            f"locking_atomic={len(self.locking_atomic)})"
+        )
 
     def get_instruction_type(self, insn_name: str) -> PlatformInstructionTypes:
         if insn_name in self.arithmetic:

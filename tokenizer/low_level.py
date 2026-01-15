@@ -75,18 +75,14 @@ def fill_constant_candidates(
     blocks: set = set()
 
     num_blocks = len(list(func.blocks))
-    block_ranges: np.ndarray = np.empty(
-        (num_blocks, 2), dtype=np.uint64
-    )  # uint64 for addresses
+    block_ranges: np.ndarray = np.empty((num_blocks, 2), dtype=np.uint64)  # uint64 for addresses
 
     for i, block in enumerate(func.blocks):
         block_ranges[i, 0] = block.addr  # start address
         block_ranges[i, 1] = block.addr + block.size  # end address
 
     # Create constant handler for this function
-    constant_handler = ConstantHandler(
-        vocab_manager, resolver, constant_dict, block_ranges
-    )
+    constant_handler = ConstantHandler(vocab_manager, resolver, constant_dict, block_ranges)
     temp_bbs: list[tuple[str, list[list[Tokens]]]] = []
     block_list: list[dict[BlockToken, tuple[int, int]]] = []
     block_dict: dict[str, BlockToken] = {}  # hex value of Block address: block_token
@@ -116,28 +112,20 @@ def fill_constant_candidates(
         )
         blocks.add(block_addr)
 
-        assert block.capstone.insns is not None, (
-            "Block has no instructions, cannot disassemble"
-        )
+        assert block.capstone.insns is not None, "Block has no instructions, cannot disassemble"
 
         block_dict[block_addr] = block_token
 
         block_def = [vocab_manager.Block_Def(), block_token]
 
-        disassembly_list = BlockTokenList(
-            len(block.capstone.insns) + 1, vocab_manager=vocab_manager
-        )
-        disassembly_list.append_as_insn(
-            insn_str=f"block {block_addr}", tokens=block_def
-        )
+        disassembly_list = BlockTokenList(len(block.capstone.insns) + 1, vocab_manager=vocab_manager)
+        disassembly_list.append_as_insn(insn_str=f"block {block_addr}", tokens=block_def)
 
         disassembly_list2 = [block_def]
 
         # Single loop over instructions to get both disassembly and immediates
         for insn in block.capstone.insns:
-            insn_tokens = disassembly_list.view(
-                insn_str=f"{insn.mnemonic} {insn.op_str}"
-            )
+            insn_tokens = disassembly_list.view(insn_str=f"{insn.mnemonic} {insn.op_str}")
 
             (insn_tokens, insn_tokens2) = parse_instruction(
                 instr_sets,
@@ -195,13 +183,9 @@ def parse_instruction(
     for byte in insn.prefix:
         if byte in degenerate_prefixes:
             skip = True
-            for prefix_name in degenerate_prefixes[
-                byte
-            ]:  # Check for ambiguity for repne, repz, repnz, repe, rep
+            for prefix_name in degenerate_prefixes[byte]:  # Check for ambiguity for repne, repz, repnz, repe, rep
                 if insn.mnemonic.startswith(prefix_name):
-                    token = vocab_manager.PlatformToken(
-                        prefix_name, PlatformInstructionTypes.PREFIXES
-                    )
+                    token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
                     insn_tokens.append(token)
                     if VERIFICATION:
                         assert insn_tokens2 is not None
@@ -214,9 +198,7 @@ def parse_instruction(
 
         if byte in instr_sets.prefixes:
             prefix_name: str = instr_sets.prefixes[byte]
-            token = vocab_manager.PlatformToken(
-                prefix_name, PlatformInstructionTypes.PREFIXES
-            )
+            token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
             insn_tokens.append(token)
             if VERIFICATION:
                 assert insn_tokens2 is not None
@@ -237,9 +219,7 @@ def parse_instruction(
         # print("\n")
         # go through all operands
         for op in insn.operands:
-            if (
-                op.type == 0 or op.type > 3
-            ):  # angr wrapper only registers REGISTER (1), IMMEDIATE (2), MEMORY (3)
+            if op.type == 0 or op.type > 3:  # angr wrapper only registers REGISTER (1), IMMEDIATE (2), MEMORY (3)
                 raise Exception
 
             if op.type == 1:  # REGISTER
@@ -328,11 +308,7 @@ def disassemble_to_tokens(
         func_disas: dict[str, list[dict[str, list[str]]]] = {}
 
         # Get .text section size
-        project = (
-            angr.Project(binary_path, auto_load_libs=False)
-            if project is None
-            else project
-        )
+        project = angr.Project(binary_path, auto_load_libs=False) if project is None else project
         obj = project.loader.main_object
         text_start: int = 0
         text_end: int = 0
@@ -440,9 +416,7 @@ def main_loop(
         try:
             for i, (func_addr, func) in enumerate(
                 tqdm(
-                    iterable=sorted(
-                        cfg.functions.items(), key=lambda item: item[1].name
-                    ),
+                    iterable=sorted(cfg.functions.items(), key=lambda item: item[1].name),
                     desc="Retrieving data from alllll functions. Like a big boy.",
                 )
             ):
@@ -473,13 +447,9 @@ def main_loop(
                 if function_analysis is None:
                     continue
 
-                (temp_bbs, block_list, block_dict, constant_handler, func_tokens) = (
-                    function_analysis
-                )
+                (temp_bbs, block_list, block_dict, constant_handler, func_tokens) = function_analysis
 
-                func_addr_range[func_addr] = sorted(
-                    block_list, key=lambda d: list(d.values())[0][0]
-                )
+                func_addr_range[func_addr] = sorted(block_list, key=lambda d: list(d.values())[0][0])
 
                 # Create mapping from old opaque tokens to new sorted tokens
                 opaque_mapping = constant_handler.create_opaque_mapping()
@@ -496,12 +466,7 @@ def main_loop(
 
                 if VERIFICATION:
                     for x, y in zip(
-                        [
-                            token
-                            for (_, block) in temp_bbs
-                            for insn in block
-                            for token in insn
-                        ],
+                        [token for (_, block) in temp_bbs for insn in block for token in insn],
                         func_tokens.iter_raw_tokens(),
                     ):
                         if x != y:
@@ -515,8 +480,8 @@ def main_loop(
                 # Create token stream directly from temp_bbs (which already contains TokensRepl objects)
                 # temp_tk = [tokens for (addr, tokens) in temp_bbs]
 
-                tokenized_instructions, block_run_lengths, insn_run_lengths = (
-                    build_vocab_tokenize_and_index(func_tokens)
+                tokenized_instructions, block_run_lengths, insn_run_lengths = build_vocab_tokenize_and_index(
+                    func_tokens
                 )
 
                 if len(tokenized_instructions) == 0:
@@ -566,16 +531,15 @@ def main_loop(
                         csvfile.flush()
 
                     if VERIFICATION:
-                        assert np.all(
-                            base64_to_ndarray_vec(tokens_base64)
-                            == tokenized_instructions
-                        ), "Base64 conversion failed for tokens"
-                        assert np.all(
-                            base64_to_ndarray_vec(block_base64) == block_run_lengths
-                        ), "Base64 conversion failed for block run lengths"
-                        assert np.all(
-                            base64_to_ndarray_vec(insn_base64) == insn_run_lengths
-                        ), "Base64 conversion failed for instruction run lengths"
+                        assert np.all(base64_to_ndarray_vec(tokens_base64) == tokenized_instructions), (
+                            "Base64 conversion failed for tokens"
+                        )
+                        assert np.all(base64_to_ndarray_vec(block_base64) == block_run_lengths), (
+                            "Base64 conversion failed for block run lengths"
+                        )
+                        assert np.all(base64_to_ndarray_vec(insn_base64) == insn_run_lengths), (
+                            "Base64 conversion failed for instruction run lengths"
+                        )
                         # Create FunctionData instance
                         function_data = FunctionData(
                             tokens=func_tokens,
@@ -601,9 +565,7 @@ def main_loop(
                     exceptions.append(e)
                     continue
         except Exception as e:
-            print(
-                f"Unrecoverable error in main loop: {e}, writing what we have at least"
-            )
+            print(f"Unrecoverable error in main loop: {e}, writing what we have at least")
             exceptions.append(e)
 
         save_vocabulary(vocab_manager, writer)
@@ -611,9 +573,7 @@ def main_loop(
 
     if len(exceptions) > 0:
         all_exection_string = "\n".join([str(e) for e in exceptions])
-        raise Exception(
-            f"Errors occurred during disassembly:\n{all_exection_string}"
-        ) from exceptions[-1]
+        raise Exception(f"Errors occurred during disassembly:\n{all_exection_string}") from exceptions[-1]
 
     if VERIFICATION:
         # Compact arrays to save memory
@@ -637,16 +597,10 @@ def build_vocab_tokenize_and_index(
         )
 
     # Get the used arrays from FunctionTokenList
-    (token_ids, _, _, _, insn_idx_run_lengths, _, block_insn_run_lengths, _, _) = (
-        func_tokens.get_used_arrays()
-    )
+    (token_ids, _, _, _, insn_idx_run_lengths, _, block_insn_run_lengths, _, _) = func_tokens.get_used_arrays()
 
-    block_insn_split_start_indicies = np.cumsum(
-        np.insert(block_insn_run_lengths[:-1], 0, 0)
-    )
-    block_idx_run_lengths = np.add.reduceat(
-        insn_idx_run_lengths, block_insn_split_start_indicies
-    )
+    block_insn_split_start_indicies = np.cumsum(np.insert(block_insn_run_lengths[:-1], 0, 0))
+    block_idx_run_lengths = np.add.reduceat(insn_idx_run_lengths, block_insn_split_start_indicies)
 
     return token_ids, block_idx_run_lengths, insn_idx_run_lengths
 
@@ -727,13 +681,9 @@ def run_tokenizer(
 
         print(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
     else:
-        project: angr.Project = angr.Project(
-            file_path, auto_load_libs=False
-        )  # was False
+        project: angr.Project = angr.Project(file_path, auto_load_libs=False)  # was False
         constants: dict[str, list[str]] = parse_and_save_data_sections(project)
-        cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(
-            normalize=True
-        )
+        cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(normalize=True)
 
         kvargs: dict = dict(project=project, cfg=cfg, constant_list=constants)
         print(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
@@ -794,12 +744,8 @@ def run_tokenizer(
             assert tokensRC.insn_count == original.tokens.insn_count
             assert tokensRC.block_count == original.tokens.block_count
             assert tokensRC.last_index == original.tokens.last_index
-            iterRC = (
-                tokensRC.iter_tokens()
-            )  # here we resolve to check the vocab manager
-            iterOG = (
-                tokensOG.iter_raw_tokens()
-            )  # for og we do not care are resolving does not change equality
+            iterRC = tokensRC.iter_tokens()  # here we resolve to check the vocab manager
+            iterOG = tokensOG.iter_raw_tokens()  # for og we do not care are resolving does not change equality
 
             for x, y in zip(iterRC, iterOG):
                 if x != y:
@@ -807,12 +753,8 @@ def run_tokenizer(
                     raise ValueError("Token mismatch in disassembly list")
 
             # iterators should both be done, but zip stops at the shortest one
-            assert next(iterRC, None) is None, (
-                "Reconstructed function contains more tokens than original"
-            )
-            assert next(iterOG, None) is None, (
-                "Reconstructed functions missing tokens from original"
-            )
+            assert next(iterRC, None) is None, "Reconstructed function contains more tokens than original"
+            assert next(iterOG, None) is None, "Reconstructed functions missing tokens from original"
 
         print("Verification complete.")
 
@@ -851,9 +793,7 @@ def main():
         default="file_prefix",
         choices=["x86", "arm64", "arm32", "x64", "file_prefix"],
     )
-    parser.add_argument(
-        "--skip_existing", action="store_true", help="Skip existing csv files."
-    )
+    parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
     parser.add_argument(
         "--source",
         type=str,
@@ -876,10 +816,10 @@ def main():
 
     print(f"[*] Source directory: {source_dir}")
     print(f"[*] Output directory: {output_dir}")
-    
+
     if (args.debugs or args.debugl) and args.platform == "file_prefix":
         args.platform = "x86"
-        
+
     # Common parameters for run_tokenizer
     common_params = dict(
         platform=args.platform,
@@ -909,17 +849,13 @@ def main():
         # Filter the queue to skip binaries with existing output
         from tokenizer.utils import filter_queue
 
-        filtered_lines = filter_queue(
-            absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir)
-        )
+        filtered_lines = filter_queue(absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir))
 
         print(f"[*] Filtered queue: {len(filtered_lines)} items to process")
 
         # Process each binary in the filtered list
         for idx, binary_path_str in enumerate(filtered_lines, 1):
-            print(
-                f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}"
-            )
+            print(f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}")
             binary_path = Path(binary_path_str).resolve()
             try:
                 run_tokenizer(binary_path, **common_params)

@@ -47,8 +47,7 @@ def write_matched_function_section(
                 )
 
         inlining_list = [
-            [idx, start, length, is_matched]
-            for idx, (start, length, is_matched) in sorted(inlining_data.items())
+            [idx, start, length, is_matched] for idx, (start, length, is_matched) in sorted(inlining_data.items())
         ]
 
         write_function_section_csv(
@@ -87,13 +86,9 @@ def write_unmatched_function_section(
         grouped[key].append(comp_set_id)
 
     merged_entries = []
-    for (called_func_id, offset, length, is_matched), comp_set_ids in sorted(
-        grouped.items()
-    ):
+    for (called_func_id, offset, length, is_matched), comp_set_ids in sorted(grouped.items()):
         comp_set_str = "_".join(map(str, sorted(comp_set_ids)))
-        merged_entries.append(
-            f"{called_func_id}-{comp_set_str},{offset:x},{length:x},{is_matched}"
-        )
+        merged_entries.append(f"{called_func_id}-{comp_set_str},{offset:x},{length:x},{is_matched}")
 
     inlining_data_str = ";".join(merged_entries)
 
@@ -108,13 +103,9 @@ def write_unmatched_function_section(
     )
 
 
-def finalize_index_file(
-    index_file, index_entries: List[Tuple[int, int, int]], sort_by_avg_len: bool = True
-):
+def finalize_index_file(index_file, index_entries: List[Tuple[int, int, int]], sort_by_avg_len: bool = True):
     """Write sorted index entries to index file."""
-    sorted_entries = (
-        sorted(index_entries, key=lambda x: x[2]) if sort_by_avg_len else index_entries
-    )
+    sorted_entries = sorted(index_entries, key=lambda x: x[2]) if sort_by_avg_len else index_entries
     for start, length, avg_len in sorted_entries:
         write_index_entry(index_file, start, length, avg_len)
 

@@ -7,7 +7,13 @@ import numpy as np
 class ConstantHandler:
     """Handles constant value processing and token creation"""
 
-    def __init__(self, vocab_manager: VocabularyManager, resolver: TokenResolver, constant_dict: Dict[str, List[str]], block_ranges: np.ndarray):
+    def __init__(
+        self,
+        vocab_manager: VocabularyManager,
+        resolver: TokenResolver,
+        constant_dict: Dict[str, List[str]],
+        block_ranges: np.ndarray,
+    ):
         self.vocab_manager = vocab_manager
         self.resolver = resolver
         self.constant_dict = constant_dict
@@ -25,8 +31,9 @@ class ConstantHandler:
         # Track block tokens
         self.block_tokens: Dict[int, Tokens] = {}
 
-    def process_constant(self, value: int, is_arithmetic: bool = False,
-                        meta: Optional[Dict] = None, library_type: str = "unknown") -> List[Tokens]:
+    def process_constant(
+        self, value: int, is_arithmetic: bool = False, meta: Optional[Dict] = None, library_type: str = "unknown"
+    ) -> List[Tokens]:
         """
         Process a constant value and return the appropriate token.
 
@@ -50,23 +57,23 @@ class ConstantHandler:
         # Check if it's a small constant (0x00 to 0xFF)
         if is_arithmetic or 0x00 <= value <= 0xFF or value in self.constant_dict:
             return [self.vocab_manager.Valued_Const(value)]
-        
-        # 
+
+        #
         match_mask = (self.block_ranges[:, 0] < value) & (value < self.block_ranges[:, 1])
         if np.any(match_mask):
             idx = match_mask.nonzero()[0][0]
             if self.block_ranges[idx, 0] == value:
                 return [self.vocab_manager.Block(idx)]
             else:
-                return [self.vocab_manager.Block(idx),
-                        self.vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS),
-                        self.vocab_manager.Valued_Const(value - self.block_ranges[idx, 0])]
+                return [
+                    self.vocab_manager.Block(idx),
+                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS),
+                    self.vocab_manager.Valued_Const(value - self.block_ranges[idx, 0]),
+                ]
         else:
             return [self._create_opaque_const(value, meta, library_type)]
 
-
-    def _create_opaque_const(self, value: int, meta: Optional[Dict] = None,
-                           library_type: str = "unknown") -> Tokens:
+    def _create_opaque_const(self, value: int, meta: Optional[Dict] = None, library_type: str = "unknown") -> Tokens:
         """Create an opaque constant token"""
         if value not in self.opaque_const_tokens:
             # Get or create opaque ID
@@ -82,7 +89,7 @@ class ConstantHandler:
                     hex(meta["end_addr"]),
                     meta["name"],
                     meta["type"],
-                    library_type
+                    library_type,
                 )
         else:
             self.opaque_const_usage[value] += 1
@@ -92,9 +99,9 @@ class ConstantHandler:
     def get_sorted_opaque_constants(self) -> List[Tuple[int, Tokens, int]]:
         """Get opaque constants sorted by usage count (descending)"""
         return sorted(
-            [(val, token, self.opaque_const_usage[val])
-             for val, token in self.opaque_const_tokens.items()],
-            key=lambda x: x[2], reverse=True
+            [(val, token, self.opaque_const_usage[val]) for val, token in self.opaque_const_tokens.items()],
+            key=lambda x: x[2],
+            reverse=True,
         )
 
     def create_opaque_mapping(self) -> Dict[BlockToken, Tokens]:
@@ -116,10 +123,7 @@ class ConstantHandler:
 
     def get_usage_stats(self) -> Dict[str, Dict[str, int]]:
         """Get usage statistics for all constants"""
-        return {
-            "value_constants": self.value_constant_usage.copy(),
-            "opaque_constants": self.opaque_const_usage.copy()
-        }
+        return {"value_constants": self.value_constant_usage.copy(), "opaque_constants": self.opaque_const_usage.copy()}
 
     def get_metadata(self) -> Dict[str, Tuple]:
         """Get metadata for opaque constants"""
@@ -155,4 +159,3 @@ class ConstantHandler:
         # Update the metadata dict
         for hex_val, metadata in new_metadata.items():
             self.opaque_metadata[hex_val] = metadata
-

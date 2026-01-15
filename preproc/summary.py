@@ -4,6 +4,7 @@ import subprocess
 import re
 import pandas as pd
 
+
 def summarize_binaries(folder_path):
     summary = []
 
@@ -14,7 +15,7 @@ def summarize_binaries(folder_path):
 
         try:
             # Detect architecture
-            file_output = subprocess.check_output(['file', filepath], text=True)
+            file_output = subprocess.check_output(["file", filepath], text=True)
 
             arch = "Unknown"
             if "x86-64" in file_output:
@@ -25,7 +26,7 @@ def summarize_binaries(folder_path):
                 arch = "ARM64"
 
             # Detect compiler using strings
-            strings_output = subprocess.check_output(['strings', filepath], text=True)
+            strings_output = subprocess.check_output(["strings", filepath], text=True)
             compiler = "Unknown"
             if "GCC:" in strings_output:
                 compiler = "GCC"
@@ -36,22 +37,20 @@ def summarize_binaries(folder_path):
 
             # Heuristic optimization level
             opt_level = "Unknown"
-            opt_match = re.search(r'-O[0123s]', strings_output)
+            opt_match = re.search(r"-O[0123s]", strings_output)
             if opt_match:
                 opt_level = opt_match.group(0)
 
-            summary.append({
-                "Filename": filename,
-                "Architecture": arch,
-                "Compiler": compiler,
-                "Optimization": opt_level
-            })
+            summary.append(
+                {"Filename": filename, "Architecture": arch, "Compiler": compiler, "Optimization": opt_level}
+            )
 
         except subprocess.CalledProcessError:
             continue
 
     df = pd.DataFrame(summary)
     return df
+
 
 def main():
     if len(sys.argv) != 2:
@@ -68,6 +67,7 @@ def main():
         print("No binaries found or could not extract metadata.")
     else:
         print(df.to_string(index=False))
+
 
 if __name__ == "__main__":
     main()

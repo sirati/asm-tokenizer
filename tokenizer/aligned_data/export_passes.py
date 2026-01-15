@@ -38,9 +38,7 @@ def process_matched_function_pass1(
         if row is not None:
             all_called_by_vkey[vkey] = get_called_functions_from_row(row)
 
-    unique_called = sorted(
-        set(fn for called_list in all_called_by_vkey.values() for fn in called_list)
-    )
+    unique_called = sorted(set(fn for called_list in all_called_by_vkey.values() for fn in called_list))
 
     version_data = []
     for vkey, row in zip(version_keys, rows):
@@ -96,9 +94,7 @@ def process_unmatched_function_pass1(
         mapping = mapping_dict.get(vkey)
 
         try:
-            binary_data = process_function_binary_data(
-                row, mapping, data_file, dedup_cache
-            )
+            binary_data = process_function_binary_data(row, mapping, data_file, dedup_cache)
 
             platform_tuple = (
                 vkey.arch,
@@ -124,9 +120,7 @@ def process_unmatched_function_pass1(
     return unmatched_entries
 
 
-def build_function_lookup_table(
-    matched_data_entries: List[dict], unmatched_data_entries: List[dict]
-) -> dict:
+def build_function_lookup_table(matched_data_entries: List[dict], unmatched_data_entries: List[dict]) -> dict:
     """Build lookup table: {(func_name, vkey): (offset, length, is_matched)}."""
     function_lookup = {}
 
@@ -194,8 +188,7 @@ def write_matched_sections_pass2(
                     )
 
             inlining_list = [
-                [idx, start, length, is_matched]
-                for idx, (start, length, is_matched) in sorted(inlining_data.items())
+                [idx, start, length, is_matched] for idx, (start, length, is_matched) in sorted(inlining_data.items())
             ]
 
             write_function_section_csv(
@@ -211,9 +204,7 @@ def write_matched_sections_pass2(
             total_len += token_len
 
         avg_len = total_len // len(version_data) if version_data else 0
-        index_entries.append(
-            (section_start, sections_file.tell() - section_start, avg_len)
-        )
+        index_entries.append((section_start, sections_file.tell() - section_start, avg_len))
         writer.writerow([])
 
     finalize_index_file(index_file, index_entries, sort_by_avg_len=True)
@@ -244,9 +235,7 @@ def group_unmatched_entries_by_function(
         )
         comp_set_id = len(unmatched_by_func[func_name]["vkeys"])
         unmatched_by_func[func_name]["vkeys"].append(vkey)
-        unmatched_by_func[func_name]["called_by_version"].append(
-            (comp_set_id, entry["called"])
-        )
+        unmatched_by_func[func_name]["called_by_version"].append((comp_set_id, entry["called"]))
 
     return unmatched_by_func
 

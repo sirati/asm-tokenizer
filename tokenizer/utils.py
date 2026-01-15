@@ -40,9 +40,7 @@ def run_length_and_last_type(
     arange = np.arange(len(type_ids), dtype=np.uint32)
     start_idx = arange[start_mask].ravel()
     end_idx = arange[end_mask].ravel()  # probably better contiguous
-    assert len(start_idx) == len(end_idx), (
-        "invalid data: some literals do not open or close"
-    )
+    assert len(start_idx) == len(end_idx), "invalid data: some literals do not open or close"
     if len(start_idx) == 0:
         return np.ones_like(type_ids, dtype=np.uint8), type_ids
 
@@ -62,9 +60,7 @@ def run_length_and_last_type(
 
     # Step 5: Prepare result array to hold run lengths
     result = np.ones(
-        len(type_ids)
-        - long_segment_length.sum(dtype=np.uint32)
-        + len(long_segment_length),
+        len(type_ids) - long_segment_length.sum(dtype=np.uint32) + len(long_segment_length),
         dtype=np.uint8,
     )
 
@@ -74,9 +70,7 @@ def run_length_and_last_type(
     return result, type_ids[anti_segment_mask]
 
 
-def CA_BArle_to_CBrle(
-    c_to_a_rle: npt.NDArray[np.int_], b_to_a_rle: npt.NDArray[np.int_]
-) -> npt.NDArray[np.int_]:
+def CA_BArle_to_CBrle(c_to_a_rle: npt.NDArray[np.int_], b_to_a_rle: npt.NDArray[np.int_]) -> npt.NDArray[np.int_]:
     # we need indecies to be able to us searchsorted - require strictly increasing
     c_to_a_idx = c_to_a_rle.cumsum()
     b_to_a_idx = b_to_a_rle.cumsum()
@@ -88,9 +82,7 @@ def CA_BArle_to_CBrle(
     return x
 
 
-def filter_queue(
-    lines: list[str], out_dir: str = "out", source_dir: str = "src"
-) -> list[str]:
+def filter_queue(lines: list[str], out_dir: str = "out", source_dir: str = "src") -> list[str]:
     """
     Filters a list of binary paths, removing those that already have corresponding output CSVs.
 
@@ -126,9 +118,7 @@ def filter_queue(
     return filtered_lines
 
 
-def filter_queue_file_by_existing_output(
-    queue_file: str, out_dir: str = "out", source_dir: str = "src"
-) -> None:
+def filter_queue_file_by_existing_output(queue_file: str, out_dir: str = "out", source_dir: str = "src") -> None:
     """
     Removes lines from the queue file if a corresponding output CSV already exists in the out/ directory.
     """
@@ -143,9 +133,7 @@ def filter_queue_file_by_existing_output(
         for line in filtered_lines:
             f.write(f"{line}\n")
 
-    print(
-        f"[+] Filtered queue file {queue_file}: {len(filtered_lines)} items remaining."
-    )
+    print(f"[+] Filtered queue file {queue_file}: {len(filtered_lines)} items remaining.")
 
 
 def pop_first_line(queue_file: str) -> str | None:

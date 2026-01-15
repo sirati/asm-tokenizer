@@ -11,7 +11,7 @@ from tokenizer.utils import CA_BArle_to_CBrle, run_length_and_last_type
 class FunctionTokenList:
     """Efficient token list for a function using numpy arrays with three levels of run-length encoding"""
 
-    def __init__(self, num_blocks: int, vocab_manager: Optional['VocabularyManager'] = None, init: bool = True):
+    def __init__(self, num_blocks: int, vocab_manager: Optional["VocabularyManager"] = None, init: bool = True):
         self.vocab_manager = vocab_manager
 
         ## careful this is a bit confusing choice of names
@@ -26,7 +26,6 @@ class FunctionTokenList:
             token_ids_size = num_blocks * 32  # ~32 tokens per block on average
             type_lookup_size = num_blocks * 16 + 2  # ~16 types per block
             insn_size = num_blocks * 4 + 2  # ~4 instructions per block
-
 
             # Token-level arrays (level 0)
             self.token_ids = np.zeros(token_ids_size, dtype=np.int16)
@@ -46,37 +45,33 @@ class FunctionTokenList:
         self.last_index = 0  # Last token index
         self.insn_count = 0  # Total instruction count
         self.block_count = 0  # Total block count
-        self.view_child: Optional['BlockTokenList'] = None
+        self.view_child: Optional["BlockTokenList"] = None
 
-        self.view_parent: Optional['FunctionTokenList'] = None  # Parent FunctionTokenList if this is a view child
-
+        self.view_parent: Optional["FunctionTokenList"] = None  # Parent FunctionTokenList if this is a view child
 
     @staticmethod
-    def reconstruct_func_from_raw_bytes(tokens, block_idx_runlength, insn_idx_runlength, vocab_manager: Optional['VocabularyManager'] = None) -> 'FunctionTokenList':
+    def reconstruct_func_from_raw_bytes(
+        tokens, block_idx_runlength, insn_idx_runlength, vocab_manager: Optional["VocabularyManager"] = None
+    ) -> "FunctionTokenList":
         """Remaps token ids to string representation."""
-        result = FunctionTokenList(
-            num_blocks=-1,
-            vocab_manager=vocab_manager, init=False
-        )
+        result = FunctionTokenList(num_blocks=-1, vocab_manager=vocab_manager, init=False)
         if vocab_manager is None:
             token_types = np.full_like(tokens, fill_value=TokenType.UNRESOLVED, dtype=np.int16)
         else:
             token_types = vocab_manager.id_to_token_type[tokens]
-        
+
         # Token-level arrays (level 0)
         result.token_ids = tokens.astype(np.int16)
         metatoken_idx_run_length, metatoken_first_idx = run_length_and_last_type(
-            tokens,
-            vocab_manager.lit_starts,
-            vocab_manager.lit_ends
+            tokens, vocab_manager.lit_starts, vocab_manager.lit_ends
         )
         result.metatoken_start_lookup = metatoken_idx_run_length.cumsum(dtype=np.int32)
         if vocab_manager is None:
-            result.metatoken_type_ids = np.full_like(metatoken_first_idx, fill_value=TokenType.UNRESOLVED, dtype=np.int16)
+            result.metatoken_type_ids = np.full_like(
+                metatoken_first_idx, fill_value=TokenType.UNRESOLVED, dtype=np.int16
+            )
         else:
             result.metatoken_type_ids = vocab_manager.id_to_token_type[metatoken_first_idx]
-
-
 
         # Instruction-level arrays (level 1)
         result.insn_idx_run_lengths = insn_idx_runlength
@@ -86,7 +81,7 @@ class FunctionTokenList:
         # Block-level arrays (level 2)
         result.block_metatoken_run_lengths = CA_BArle_to_CBrle(block_idx_runlength, metatoken_idx_run_length)
         result.block_insn_run_lengths = CA_BArle_to_CBrle(block_idx_runlength, insn_idx_runlength)
-        result.block_addrs = np.full(len(block_idx_runlength), -0xdeadbeef)
+        result.block_addrs = np.full(len(block_idx_runlength), -0xDEADBEEF)
 
         # Set counters
         result.last_index = len(metatoken_idx_run_length)
@@ -95,14 +90,13 @@ class FunctionTokenList:
 
         return result
 
-
-
     @staticmethod
-    def with_same_size(other: 'FunctionTokenList', vocab_manager: Optional['VocabularyManager'] = None) -> 'FunctionTokenList':
+    def with_same_size(
+        other: "FunctionTokenList", vocab_manager: Optional["VocabularyManager"] = None
+    ) -> "FunctionTokenList":
         """Create a new FunctionTokenList with the same array sizes as another"""
         new_list = FunctionTokenList(
-            num_blocks=len(other.block_insn_run_lengths),
-            vocab_manager=vocab_manager, init=False
+            num_blocks=len(other.block_insn_run_lengths), vocab_manager=vocab_manager, init=False
         )
         # Resize arrays to match other's used sizes
         new_list.token_ids = np.zeros_like(other.token_ids)
@@ -116,11 +110,11 @@ class FunctionTokenList:
         new_list.block_addrs = np.zeros_like(other.block_addrs)
         return new_list
 
-    def set_vocab_manager(self, vocab_manager: 'VocabularyManager'):
+    def set_vocab_manager(self, vocab_manager: "VocabularyManager"):
         """Set the vocabulary manager for token reconstruction"""
         self.vocab_manager = vocab_manager
 
-    def view(self) -> 'BlockTokenList':
+    def view(self) -> "BlockTokenList":
         """Create a view child BlockTokenList that uses the remaining buffer of this FunctionTokenList"""
         if self.view_child is not None:
             raise RuntimeError("FunctionTokenList already has an active view child")
@@ -133,18 +127,17 @@ class FunctionTokenList:
 
         # Create views into the remaining buffer
         view_child.token_ids = self.token_ids[current_token_pos:]
-        view_child.metatoken_type_ids = self.metatoken_type_ids[self.last_index:]
-        view_child.metatoken_start_lookup = self.metatoken_start_lookup[self.last_index:]
-        view_child.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths[self.insn_count:]
-        view_child.insn_idx_run_lengths = self.insn_idx_run_lengths[self.insn_count:]
-        view_child.insn_strs = self.insn_strs[self.insn_count:]
+        view_child.metatoken_type_ids = self.metatoken_type_ids[self.last_index :]
+        view_child.metatoken_start_lookup = self.metatoken_start_lookup[self.last_index :]
+        view_child.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths[self.insn_count :]
+        view_child.insn_idx_run_lengths = self.insn_idx_run_lengths[self.insn_count :]
+        view_child.insn_strs = self.insn_strs[self.insn_count :]
 
         # Set up the view relationship
         view_child.view_parent = self
         self.view_child = view_child
 
         return view_child
-
 
     def add_block(self, block_token_list: BlockTokenList, block_addr: str):
         """Add a block token list to the function"""
@@ -157,11 +150,9 @@ class FunctionTokenList:
         if block_token_list.last_index == 0:
             return
 
-        (new_token_ids,
-         new_token_type_ids,
-         new_token_start_lookup,
-         new_insn_run_lengths,
-         new_insn_strs) = block_token_list.get_used_arrays()
+        (new_token_ids, new_token_type_ids, new_token_start_lookup, new_insn_run_lengths, new_insn_strs) = (
+            block_token_list.get_used_arrays()
+        )
 
         # Check if we need to resize arrays
         new_tokens = len(new_token_ids)
@@ -174,26 +165,28 @@ class FunctionTokenList:
         # Handle token data
         if is_view_child:
             # For view child, data is already in place, just update metadata
-            self.metatoken_start_lookup[self.last_index:self.last_index + new_types] += start_pos
+            self.metatoken_start_lookup[self.last_index : self.last_index + new_types] += start_pos
             self.view_child = None
             block_token_list.readonly = True
         else:
             # For non-view child, copy the data
-            self._ensure_capacity(new_tokens+1, new_types+1, new_insns+1)
+            self._ensure_capacity(new_tokens + 1, new_types + 1, new_insns + 1)
 
             # Copy token IDs
-            self.token_ids[start_pos:start_pos + new_tokens] = new_token_ids
+            self.token_ids[start_pos : start_pos + new_tokens] = new_token_ids
 
             # Copy token types
-            self.metatoken_type_ids[self.last_index:self.last_index + new_types] = new_token_type_ids
-            self.metatoken_start_lookup[self.last_index:self.last_index + new_types] = new_token_start_lookup[:] + start_pos
+            self.metatoken_type_ids[self.last_index : self.last_index + new_types] = new_token_type_ids
+            self.metatoken_start_lookup[self.last_index : self.last_index + new_types] = (
+                new_token_start_lookup[:] + start_pos
+            )
 
             # Copy instruction data
-            self.insn_metatoken_run_lengths[self.insn_count:self.insn_count + new_insns] = new_insn_run_lengths
+            self.insn_metatoken_run_lengths[self.insn_count : self.insn_count + new_insns] = new_insn_run_lengths
             # Calculate insn_idx_run_lengths from block's data
-            block_insn_idx_run_lengths = block_token_list.insn_idx_run_lengths[:block_token_list.insn_count]
-            self.insn_idx_run_lengths[self.insn_count:self.insn_count + new_insns] = block_insn_idx_run_lengths
-            self.insn_strs[self.insn_count:self.insn_count + new_insns] = new_insn_strs
+            block_insn_idx_run_lengths = block_token_list.insn_idx_run_lengths[: block_token_list.insn_count]
+            self.insn_idx_run_lengths[self.insn_count : self.insn_count + new_insns] = block_insn_idx_run_lengths
+            self.insn_strs[self.insn_count : self.insn_count + new_insns] = new_insn_strs
 
         # Store block-level data (same for both paths)
         self.block_addrs[self.block_count] = block_addr
@@ -216,11 +209,11 @@ class FunctionTokenList:
         # Update the view child's arrays to point to the new locations
         current_token_pos = int(self.metatoken_start_lookup[self.last_index - 1]) if self.last_index > 0 else 0
         self.view_child.token_ids = self.token_ids[current_token_pos:]
-        self.view_child.metatoken_type_ids = self.metatoken_type_ids[self.last_index:]
-        self.view_child.metatoken_start_lookup = self.metatoken_start_lookup[self.last_index:]
-        self.view_child.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths[self.insn_count:]
-        self.view_child.insn_idx_run_lengths = self.insn_idx_run_lengths[self.insn_count:]
-        self.view_child.insn_strs = self.insn_strs[self.insn_count:]
+        self.view_child.metatoken_type_ids = self.metatoken_type_ids[self.last_index :]
+        self.view_child.metatoken_start_lookup = self.metatoken_start_lookup[self.last_index :]
+        self.view_child.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths[self.insn_count :]
+        self.view_child.insn_idx_run_lengths = self.insn_idx_run_lengths[self.insn_count :]
+        self.view_child.insn_strs = self.insn_strs[self.insn_count :]
 
     def get_used_token_ids(self) -> np.ndarray:
         """Get the used portion of token_ids array"""
@@ -242,14 +235,14 @@ class FunctionTokenList:
         end_pos = self._get_end_position()
         return (
             self.token_ids[:end_pos],
-            self.metatoken_type_ids[:self.last_index],
-            self.metatoken_start_lookup[:self.last_index],
-            self.insn_metatoken_run_lengths[:self.insn_count],
-            self.insn_idx_run_lengths[:self.insn_count],
-            self.insn_strs[:self.insn_count],
-            self.block_insn_run_lengths[:self.block_count],
-            self.block_metatoken_run_lengths[:self.block_count],
-            self.block_addrs[:self.block_count]
+            self.metatoken_type_ids[: self.last_index],
+            self.metatoken_start_lookup[: self.last_index],
+            self.insn_metatoken_run_lengths[: self.insn_count],
+            self.insn_idx_run_lengths[: self.insn_count],
+            self.insn_strs[: self.insn_count],
+            self.block_insn_run_lengths[: self.block_count],
+            self.block_metatoken_run_lengths[: self.block_count],
+            self.block_addrs[: self.block_count],
         )
 
     def _get_last_token_length(self) -> int:
@@ -271,7 +264,6 @@ class FunctionTokenList:
             token_len = int(self.block_metatoken_run_lengths[block_i])
             insn_len = int(self.block_insn_run_lengths[block_i])
 
-
             if block_token_list is None or not transient:
                 block_token_list = BlockTokenList(0, vocab_manager=self.vocab_manager, init=False)
                 block_token_list.readonly = True
@@ -283,11 +275,15 @@ class FunctionTokenList:
 
             # Set up the block token list
             block_token_list.token_ids = self.token_ids[token_start:token_end]
-            block_token_list.metatoken_type_ids = self.metatoken_type_ids[token_last:token_last + token_len]
-            block_token_list.metatoken_start_lookup = self.metatoken_start_lookup[token_last:token_last + token_len] - token_start
-            block_token_list.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths[insn_last:insn_last + insn_len]
-            block_token_list.insn_idx_run_lengths = self.insn_idx_run_lengths[insn_last:insn_last + insn_len]
-            block_token_list.insn_strs = self.insn_strs[insn_last:insn_last + insn_len]
+            block_token_list.metatoken_type_ids = self.metatoken_type_ids[token_last : token_last + token_len]
+            block_token_list.metatoken_start_lookup = (
+                self.metatoken_start_lookup[token_last : token_last + token_len] - token_start
+            )
+            block_token_list.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths[
+                insn_last : insn_last + insn_len
+            ]
+            block_token_list.insn_idx_run_lengths = self.insn_idx_run_lengths[insn_last : insn_last + insn_len]
+            block_token_list.insn_strs = self.insn_strs[insn_last : insn_last + insn_len]
             block_token_list.last_index = token_len
             block_token_list.insn_count = insn_len
 
@@ -327,11 +323,11 @@ class FunctionTokenList:
 
     def __repr__(self):
         """String representation of the function"""
-        return f"{self.__class__.__name__}(block_count={self.block_count}, blocks={", ".join(repr(b) for b in self.iter_blocks(True))})"
+        return f"{self.__class__.__name__}(block_count={self.block_count}, blocks={', '.join(repr(b) for b in self.iter_blocks(True))})"
 
     def __str__(self):
         """String representation of the function"""
-        return f"FunctionTokenList(block_count={self.block_count}, insn_count={self.insn_count}, tokens={" ".join(str(b) for b in self.iter_blocks(True))})"
+        return f"FunctionTokenList(block_count={self.block_count}, insn_count={self.insn_count}, tokens={' '.join(str(b) for b in self.iter_blocks(True))})"
 
     def _ensure_capacity(self, tokens_needed: int, types_needed: int, insns_needed: int):
         """Ensure arrays have enough capacity"""
@@ -344,7 +340,7 @@ class FunctionTokenList:
                 1
 
             new_token_ids = np.zeros(new_size, dtype=np.int32)
-            new_token_ids[:len(self.token_ids)] = self.token_ids
+            new_token_ids[: len(self.token_ids)] = self.token_ids
             self.token_ids = new_token_ids
 
         # Resize type arrays if needed
@@ -354,8 +350,8 @@ class FunctionTokenList:
             new_token_type_ids = np.zeros(new_size, dtype=np.int32)
             new_token_start_lookup = np.zeros(new_size, dtype=np.int32)
 
-            new_token_type_ids[:len(self.metatoken_type_ids)] = self.metatoken_type_ids
-            new_token_start_lookup[:len(self.metatoken_start_lookup)] = self.metatoken_start_lookup
+            new_token_type_ids[: len(self.metatoken_type_ids)] = self.metatoken_type_ids
+            new_token_start_lookup[: len(self.metatoken_start_lookup)] = self.metatoken_start_lookup
 
             self.metatoken_type_ids = new_token_type_ids
             self.metatoken_start_lookup = new_token_start_lookup
@@ -368,9 +364,9 @@ class FunctionTokenList:
             new_insn_idx_run_lengths = np.zeros(new_size, dtype=np.int32)
             new_insn_strs = np.zeros(new_size, dtype=object)
 
-            new_insn_run_lengths[:len(self.insn_metatoken_run_lengths)] = self.insn_metatoken_run_lengths
-            new_insn_idx_run_lengths[:len(self.insn_idx_run_lengths)] = self.insn_idx_run_lengths
-            new_insn_strs[:len(self.insn_strs)] = self.insn_strs
+            new_insn_run_lengths[: len(self.insn_metatoken_run_lengths)] = self.insn_metatoken_run_lengths
+            new_insn_idx_run_lengths[: len(self.insn_idx_run_lengths)] = self.insn_idx_run_lengths
+            new_insn_strs[: len(self.insn_strs)] = self.insn_strs
 
             self.insn_metatoken_run_lengths = new_insn_run_lengths
             self.insn_idx_run_lengths = new_insn_idx_run_lengths
@@ -384,9 +380,9 @@ class FunctionTokenList:
             new_block_token_run_lengths = np.zeros(new_size, dtype=np.int32)
             new_block_addrs = np.zeros(new_size, dtype=object)
 
-            new_block_insn_run_lengths[:len(self.block_insn_run_lengths)] = self.block_insn_run_lengths
-            new_block_token_run_lengths[:len(self.block_metatoken_run_lengths)] = self.block_metatoken_run_lengths
-            new_block_addrs[:len(self.block_addrs)] = self.block_addrs
+            new_block_insn_run_lengths[: len(self.block_insn_run_lengths)] = self.block_insn_run_lengths
+            new_block_token_run_lengths[: len(self.block_metatoken_run_lengths)] = self.block_metatoken_run_lengths
+            new_block_addrs[: len(self.block_addrs)] = self.block_addrs
 
             self.block_insn_run_lengths = new_block_insn_run_lengths
             self.block_metatoken_run_lengths = new_block_token_run_lengths

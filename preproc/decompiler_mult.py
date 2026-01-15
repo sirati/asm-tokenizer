@@ -13,17 +13,22 @@ from binary_filter import BinaryFilter
 RE_MULTI_WS = re.compile(r"\s+")
 RE_THREE_BEFORE_PIPE = re.compile(r".{3}\|")
 
+
 def sanitize(text):
     return text.replace("\n", " ").replace("\r", "").replace('"', "'")
+
 
 def ensure_single_space(text: str) -> str:
     return RE_MULTI_WS.sub(" ", text)
 
+
 def remove_newline(text):
     return text.replace("\n", " ").replace("\t", " ").replace(" ------ ", " ").replace("IRSB { ", " ").strip()
 
+
 def remove_three_before_pipe(s):
     return RE_THREE_BEFORE_PIPE.sub("|", s)
+
 
 def split_at_first_instruction(text):
     marker = "00 |"
@@ -32,17 +37,20 @@ def split_at_first_instruction(text):
         return text, ""
     return text[:idx].strip(), text[idx:].strip()
 
+
 ail_manager_cache = {}
+
 
 def get_ail_manager(arch):
     if arch not in ail_manager_cache:
         ail_manager_cache[arch] = ailment.Manager(arch=arch)
     return ail_manager_cache[arch]
 
+
 def lowlevel_disas(cfg):
     function_bbs = {}
     for func_addr, func in cfg.functions.items():
-        if func.name.startswith('sub_') or func.name in ['UnresolvableCallTarget', 'UnresolvableJumpTarget']:
+        if func.name.startswith("sub_") or func.name in ["UnresolvableCallTarget", "UnresolvableJumpTarget"]:
             continue
         temp_bbs = {}
         for block in func.blocks:
@@ -53,10 +61,12 @@ def lowlevel_disas(cfg):
         function_bbs[func_addr] = temp_bbs
     return function_bbs
 
+
 def highlevel_disas(func) -> str:
     disasm_lines = [str(block.disassembly) for block in func.blocks]
-    disasm_str = (" ".join(disasm_lines))
+    disasm_str = " ".join(disasm_lines)
     return disasm_str
+
 
 def process_vex_block(addr, block) -> str:
     try:
@@ -66,6 +76,7 @@ def process_vex_block(addr, block) -> str:
         return irsb_str
     except Exception as e:
         return f"[!] VEX error @ {hex(addr)}: {type(e).__name__}: {e}"
+
 
 def process_ail_block(addr, block, man) -> list[str]:
     try:
@@ -83,6 +94,7 @@ def process_ail_block(addr, block, man) -> list[str]:
     except Exception as e:
         return [f"[!] AIL error @ 0x{addr:x}: {type(e).__name__}: {e}"]
 
+
 def vex_repr(func, project) -> str:
     vex_lines = []
     for addr in func.block_addrs:
@@ -91,7 +103,8 @@ def vex_repr(func, project) -> str:
             vex_lines.append(process_vex_block(addr, block))
         except Exception as e:
             vex_lines.append(f"[!] VEX error @ {hex(addr)}: {type(e).__name__}: {e}")
-    return (" ".join(vex_lines))
+    return " ".join(vex_lines)
+
 
 def ail_repr(func, project, man) -> str:
     ail_lines = []
@@ -101,8 +114,9 @@ def ail_repr(func, project, man) -> str:
             ail_lines.extend(process_ail_block(addr, block, man))
         except Exception as e:
             ail_lines.append(f"[!] AIL error @ 0x{addr:x}: {type(e).__name__}: {e}")
-    return (" ".join(ail_lines))
-    #return ensure_single_space(sanitize(" ".join(ail_lines)))
+    return " ".join(ail_lines)
+    # return ensure_single_space(sanitize(" ".join(ail_lines)))
+
 
 def decompilation(func, project, cfg) -> str:
     try:
@@ -115,17 +129,20 @@ def decompilation(func, project, cfg) -> str:
     except Exception as e:
         return f"Decompilation failed: {e}"
 
+
 def get_section_name(project, addr):
     for section in project.loader.main_object.sections:
         if section.contains_addr(addr):
             return section.name
     return "UNKNOWN"
 
+
 def init_worker(binary_path):
     global project, man, cfg
     project = angr.Project(binary_path, auto_load_libs=False)
     man = get_ail_manager(project.arch)
     cfg = project.analyses.CFGFast(normalize=True)
+
 
 def worker_func(func_addr) -> Tuple[dict, dict]:
     func = project.kb.functions[func_addr]
@@ -149,22 +166,20 @@ def worker_func(func_addr) -> Tuple[dict, dict]:
     decomp_str = decompilation(func, project, cfg)
     decomp_time = time.perf_counter() - t6
 
-    times = {
-        "HDISAS": high_dis_time,
-        "VEX": vex_time,
-        "AIL": ail_time,
-        "DECOMP": decomp_time
-    }
+    times = {"HDISAS": high_dis_time, "VEX": vex_time, "AIL": ail_time, "DECOMP": decomp_time}
 
-    return ({
-        "func_addr": func_addr,
-        "func_name": func_name,
-        "section_name": section_name,
-        "highlevel": high_dis_str,
-        "ail": ail_str,
-        "vex": vex_str,
-        "decomp": decomp_str
-    }, times)
+    return (
+        {
+            "func_addr": func_addr,
+            "func_name": func_name,
+            "section_name": section_name,
+            "highlevel": high_dis_str,
+            "ail": ail_str,
+            "vex": vex_str,
+            "decomp": decomp_str,
+        },
+        times,
+    )
 
 
 def extract_function_data_parallel(binary_path, num_workers=14):
@@ -192,13 +207,7 @@ def extract_function_data_parallel(binary_path, num_workers=14):
 
     func_addrs = [fa for fa, _ in project_main.kb.functions.items()]
 
-    total_times = {
-        "LDISAS": l_disas_time,
-        "HDISAS": 0.0,
-        "VEX": 0.0,
-        "AIL": 0.0,
-        "DECOMP": 0.0
-    }
+    total_times = {"LDISAS": l_disas_time, "HDISAS": 0.0, "VEX": 0.0, "AIL": 0.0, "DECOMP": 0.0}
 
     print(f"[*] Starting multiprocessing with {num_workers} workers...")
     with Pool(processes=num_workers, initializer=init_worker, initargs=(binary_path,)) as pool:
@@ -219,18 +228,19 @@ def extract_function_data_parallel(binary_path, num_workers=14):
                 insn_str = "; ".join(f"{m} {o}" for m, o in insns)
                 low_dis_str += f"Block {block_addr}: {insn_str} | "
 
-            writer.writerow([
-                res["func_name"],
-                res["section_name"],
-                f'<HDIS> {res["highlevel"]} </HDIS>',
-                f'<LDIS> {low_dis_str} </LDIS>',
-                f'<AIL> {res["ail"]} </AIL>',
-                f'<VEX> {res["vex"]} </VEX>',
-                f'<DECOMP> {res["decomp"]} </DECOMP>',
-            ])
+            writer.writerow(
+                [
+                    res["func_name"],
+                    res["section_name"],
+                    f"<HDIS> {res['highlevel']} </HDIS>",
+                    f"<LDIS> {low_dis_str} </LDIS>",
+                    f"<AIL> {res['ail']} </AIL>",
+                    f"<VEX> {res['vex']} </VEX>",
+                    f"<DECOMP> {res['decomp']} </DECOMP>",
+                ]
+            )
 
     return total_times, csv_path
-
 
 
 def pop_first_line(queue_file: str) -> str | None:
@@ -247,6 +257,7 @@ def pop_first_line(queue_file: str) -> str | None:
 
     return first_line
 
+
 def filter_queue_file_by_existing_output(queue_file: str, out_dir: str = "out") -> None:
     """
     Removes lines from the queue file if a corresponding output CSV already exists in the out/ directory.
@@ -255,7 +266,7 @@ def filter_queue_file_by_existing_output(queue_file: str, out_dir: str = "out") 
 
     with open(queue_file, "r") as f:
         lines = [line.strip() for line in f if line.strip()]
-    
+
     print(len(lines))
 
     for binary_path in lines:
@@ -280,9 +291,7 @@ def filter_queue_file_by_existing_output(queue_file: str, out_dir: str = "out") 
     print(f"[+] Filtered queue file {queue_file}: {len(filtered_lines)} items remaining.")
 
 
-
 def main():
-
     if len(sys.argv) != 2:
         print(f"Usage: python {sys.argv[0]} <queue_file>")
         sys.exit(1)
@@ -316,8 +325,8 @@ def main():
 
         print(f"\nTotal wall-clock analysis time: {end_time - start_time:.2f} seconds (parallel elapsed time)")
         print(f"[+] Done. Data saved to {csv_path}")
-        
-        
+
+
 if __name__ == "__main__":
     main()
 

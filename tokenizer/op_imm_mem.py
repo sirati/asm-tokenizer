@@ -13,28 +13,30 @@ size_map = {
     2: "word_ptr",
     4: "dword_ptr",
     8: "qword_ptr",
-   10: "xword_ptr",        # x87 extended precision (80-bit)
-   14: "fpu_env_ptr",      # x87 environment (16-bit mode)
-   16: "xmmword_ptr",
-   28: "fpu_env_ptr",      # x87 environment (32-bit mode) - ADD THIS
-   32: "ymmword_ptr",
-   64: "zmmword_ptr",
-   94: "fpu_state_ptr",    # x87 state (16-bit mode)
-   108: "fpu_state_ptr",   # x87 state (32-bit mode)
+    10: "xword_ptr",  # x87 extended precision (80-bit)
+    14: "fpu_env_ptr",  # x87 environment (16-bit mode)
+    16: "xmmword_ptr",
+    28: "fpu_env_ptr",  # x87 environment (32-bit mode) - ADD THIS
+    32: "ymmword_ptr",
+    64: "zmmword_ptr",
+    94: "fpu_state_ptr",  # x87 state (16-bit mode)
+    108: "fpu_state_ptr",  # x87 state (32-bit mode)
 }
 
-segment_prefixes = {
-    0x26: "es:",
-    0x2E: "cs:",
-    0x36: "ss:",
-    0x3E: "ds:",
-    0x64: "fs:",
-    0x65: "gs:"
-}
+segment_prefixes = {0x26: "es:", 0x2E: "cs:", 0x36: "ss:", 0x3E: "ds:", 0x64: "fs:", 0x65: "gs:"}
 
-def tokenize_operand_memory(insn, lookup, op, text_end, text_start,
-                           func_max_addr, func_min_addr, vocab_manager: VocabularyManager,
-                           constant_handler: ConstantHandler) -> List[Tokens]:
+
+def tokenize_operand_memory(
+    insn,
+    lookup,
+    op,
+    text_end,
+    text_start,
+    func_max_addr,
+    func_min_addr,
+    vocab_manager: VocabularyManager,
+    constant_handler: ConstantHandler,
+) -> List[Tokens]:
     """
     Tokenize memory operand and return list of tokens.
 
@@ -59,11 +61,16 @@ def tokenize_operand_memory(insn, lookup, op, text_end, text_start,
         # Find the next bigger size in size_map or take the largest available
         next_size = min((s for s in size_map if s > op.size), default=max(size_map))
         tokens.append(vocab_manager.PlatformToken(size_map[next_size], PlatformInstructionTypes.POINTER_LENGTHS))
-        warnings.warn(f"unexpected memory operand size: {op.size}, using next bigger '{size_map[next_size]}' at {next_size}bytes for instruction {insn}")
-
+        warnings.warn(
+            f"unexpected memory operand size: {op.size}, using next bigger '{size_map[next_size]}' at {next_size}bytes for instruction {insn}"
+        )
 
     if op.mem.segment > 0:
-        tokens.append(vocab_manager.PlatformToken(f"{insn.reg_name(op.mem.segment)}:", PlatformInstructionTypes.MEMORY_ACCESS_MODE))
+        tokens.append(
+            vocab_manager.PlatformToken(
+                f"{insn.reg_name(op.mem.segment)}:", PlatformInstructionTypes.MEMORY_ACCESS_MODE
+            )
+        )
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET))
 
@@ -86,17 +93,17 @@ def tokenize_operand_memory(insn, lookup, op, text_end, text_start,
         else:
             warnings.warn(f"Scale {scale} used without index register in instruction {insn}")
 
-
     if disp < 0:
         tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
     elif has_disp and (has_reg or has_index):
         tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
 
-
     # Process displacement
     if not has_disp:
-        pass # noop ignore
-    elif disp <= 0xFF: # if we are in range 00 to 0xFF we always use constant, same if we are negative as its defo not an addr
+        pass  # noop ignore
+    elif (
+        disp <= 0xFF
+    ):  # if we are in range 00 to 0xFF we always use constant, same if we are negative as its defo not an addr
         tokens.append(vocab_manager.Valued_Const(abs(disp)))
 
     else:
@@ -112,10 +119,7 @@ def tokenize_operand_memory(insn, lookup, op, text_end, text_start,
 
         if force_opaque:
             disp_token = constant_handler.process_constant(
-                disp,
-                is_arithmetic=False,
-                meta=meta,
-                library_type=meta.get("library", "unknown") if meta else "unknown"
+                disp, is_arithmetic=False, meta=meta, library_type=meta.get("library", "unknown") if meta else "unknown"
             )
             tokens.extend(disp_token)
         # For larger displacements, check if pointing to known constant or code or opaque
@@ -124,10 +128,7 @@ def tokenize_operand_memory(insn, lookup, op, text_end, text_start,
             # Check if displacement is in text section or outside function bounds
             if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
                 disp_token = constant_handler.process_constant(
-                    disp,
-                    is_arithmetic=False,
-                    meta=meta,
-                    library_type=meta.get("library", "unknown")
+                    disp, is_arithmetic=False, meta=meta, library_type=meta.get("library", "unknown")
                 )
                 tokens.extend(disp_token)
             else:
@@ -139,15 +140,21 @@ def tokenize_operand_memory(insn, lookup, op, text_end, text_start,
             disp_token = constant_handler.process_constant(disp, is_arithmetic=True)
             tokens.extend(disp_token)
 
-
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
 
     return tokens
 
 
-def tokenize_operand_immediate(addressing_control_flow_instructions, arithmetic_instructions,
-                              insn, lookup, op, func_max_addr, func_min_addr,
-                              constant_handler: ConstantHandler) -> List[Tokens]:
+def tokenize_operand_immediate(
+    addressing_control_flow_instructions,
+    arithmetic_instructions,
+    insn,
+    lookup,
+    op,
+    func_max_addr,
+    func_min_addr,
+    constant_handler: ConstantHandler,
+) -> List[Tokens]:
     """
     Tokenize immediate operand and return list of tokens.
 
@@ -177,18 +184,12 @@ def tokenize_operand_immediate(addressing_control_flow_instructions, arithmetic_
                         tokens.extend(imm_token)
                     else:  # External
                         imm_token = constant_handler.process_constant(
-                            imm_val,
-                            is_arithmetic=False,
-                            meta=meta,
-                            library_type="function"
+                            imm_val, is_arithmetic=False, meta=meta, library_type="function"
                         )
                         tokens.extend(imm_token)
                 else:
                     imm_token = constant_handler.process_constant(
-                        imm_val,
-                        is_arithmetic=False,
-                        meta=meta,
-                        library_type="unknown"
+                        imm_val, is_arithmetic=False, meta=meta, library_type="unknown"
                     )
                     tokens.extend(imm_token)
             else:
@@ -207,10 +208,7 @@ def tokenize_operand_immediate(addressing_control_flow_instructions, arithmetic_
                     "library": "unknown",
                 }
             imm_token = constant_handler.process_constant(
-                imm_val,
-                is_arithmetic=False,
-                meta=meta,
-                library_type="unknown"
+                imm_val, is_arithmetic=False, meta=meta, library_type="unknown"
             )
             tokens.extend(imm_token)
 

@@ -11,7 +11,9 @@ class TokenUtils:
     """Utility functions for token caching with reverse mapping"""
 
     @staticmethod
-    def cache_specific_token(cls, cache_attr: str, token_string: str, vocab_manager: 'VocabularyManager', lit_type: LitTokenType) -> int:
+    def cache_specific_token(
+        cls, cache_attr: str, token_string: str, vocab_manager: "VocabularyManager", lit_type: LitTokenType
+    ) -> int:
         """Get or create a single cached token with reverse mapping"""
         token_id = None
         if hasattr(cls, cache_attr):
@@ -24,7 +26,7 @@ class TokenUtils:
         return token_id
 
     @staticmethod
-    def lookup_specific_token_id(cls, cache_attr: str, token_string: str, vocab_manager: 'VocabularyManager') -> int:
+    def lookup_specific_token_id(cls, cache_attr: str, token_string: str, vocab_manager: "VocabularyManager") -> int:
         """Get or create a single cached token with reverse mapping"""
         token_id = None
         if hasattr(cls, cache_attr):
@@ -39,7 +41,9 @@ class TokenUtils:
         return token_id
 
     @staticmethod
-    def cache_numeric_token(cls, cache_dict_attr: str, key: int, token_id_lambda: typing.Callable[[], int], max_key: int) -> int:
+    def cache_numeric_token(
+        cls, cache_dict_attr: str, key: int, token_id_lambda: typing.Callable[[], int], max_key: int
+    ) -> int:
         """Get or create a token from a dictionary cache with numpy array and reverse mapping"""
 
         # Initialize numpy array if not exists
@@ -66,7 +70,7 @@ class TokenUtils:
         return cache_array[key]
 
     @staticmethod
-    def cache_numeric_reverse(cls, token_id: int, cache_dict_attr: str, vocab_manager: 'VocabularyManager') -> int:
+    def cache_numeric_reverse(cls, token_id: int, cache_dict_attr: str, vocab_manager: "VocabularyManager") -> int:
         """Get key from token ID using reverse cache, creating entry if missing"""
         reverse_cache_attr = f"{cache_dict_attr}_reverse"
         # Initialize reverse cache if not exists
@@ -81,22 +85,32 @@ class TokenUtils:
             if token_str is None or token_str == "":
                 return -1
 
-            underscore_idx = token_str.rfind('_')
+            underscore_idx = token_str.rfind("_")
             if underscore_idx != -1:
-                hex_part = token_str[underscore_idx + 1:]
+                hex_part = token_str[underscore_idx + 1 :]
                 key = int(hex_part, 16)
             else:
                 raise ValueError(f"Cannot parse hex value from token string: {token_str}")
 
-            TokenUtils.cache_numeric_token(cls, cache_dict_attr, key, token_id_lambda=lambda: token_id, max_key=16**len(hex_part))
+            TokenUtils.cache_numeric_token(
+                cls, cache_dict_attr, key, token_id_lambda=lambda: token_id, max_key=16 ** len(hex_part)
+            )
 
         return reverse_cache[token_id]
 
     """Utility methods for encoding and decoding tokens back to numerical values"""
 
     @staticmethod
-    def encode_tokens(basename: str, inner_lit_name: str, hex_values: npt.NDArray[np.int_], vocab_manager: 'VocabularyManager',
-                     token_class, inner_token_class, max_key: int, include_minus: bool = False) -> List[int]:
+    def encode_tokens(
+        basename: str,
+        inner_lit_name: str,
+        hex_values: npt.NDArray[np.int_],
+        vocab_manager: "VocabularyManager",
+        token_class,
+        inner_token_class,
+        max_key: int,
+        include_minus: bool = False,
+    ) -> List[int]:
         """
         Encode a list of hex values into token IDs using cache system.
 
@@ -122,17 +136,17 @@ class TokenUtils:
             hex_str = "0" * (hex_digits - len(hex_str)) + hex_str
 
             token_lambda = lambda: vocab_manager._private_add_token(f"{basename}_{hex_str}", token_class)
-            return [TokenUtils.cache_numeric_token(
-                token_class, f'_{basename}_cache', hex_value, token_lambda, max_key
-            )]
+            return [TokenUtils.cache_numeric_token(token_class, f"_{basename}_cache", hex_value, token_lambda, max_key)]
         else:
             # Complex case: multiple tokens with Lit_Start/Lit_End using cache
             token_ids = []
 
             # Start token - use cache with token_class
-            token_ids.append(TokenUtils.cache_specific_token(
-                token_class, '_start_token_id', f"{basename}_Lit_Start", vocab_manager, LitTokenType.LIT_START
-            ))
+            token_ids.append(
+                TokenUtils.cache_specific_token(
+                    token_class, "_start_token_id", f"{basename}_Lit_Start", vocab_manager, LitTokenType.LIT_START
+                )
+            )
 
             # Minus token if needed - use cache
             if include_minus:
@@ -142,21 +156,33 @@ class TokenUtils:
             for hex_value in hex_values:
                 hex_str = hex(hex_value)[2:].upper()
                 hex_str = "0" * (hex_digits - len(hex_str)) + hex_str
-                token_lambda = lambda: vocab_manager._private_add_token(f"{inner_lit_name}_{hex_str}", inner_token_class)
-                digit_token_id = TokenUtils.cache_numeric_token(inner_token_class, f'_{inner_lit_name}_cache',
-                                                                hex_value, token_lambda, max_key)
+                token_lambda = lambda: vocab_manager._private_add_token(
+                    f"{inner_lit_name}_{hex_str}", inner_token_class
+                )
+                digit_token_id = TokenUtils.cache_numeric_token(
+                    inner_token_class, f"_{inner_lit_name}_cache", hex_value, token_lambda, max_key
+                )
                 token_ids.append(digit_token_id)
                 token_lambda = lambda: vocab_manager._private_add_token(f"{inner_lit_name}_{hex_str}")
-            token_ids.append(TokenUtils.cache_specific_token(
-                token_class, '_end_token_id', f"{basename}_Lit_End", vocab_manager, LitTokenType.LIT_END
-            ))
+            token_ids.append(
+                TokenUtils.cache_specific_token(
+                    token_class, "_end_token_id", f"{basename}_Lit_End", vocab_manager, LitTokenType.LIT_END
+                )
+            )
 
             return token_ids
 
     @staticmethod
-    def decode_tokens_to_value(token_ids: List[int], basename: str, inner_lit_name: str,
-                              vocab_manager: 'VocabularyManager', max_key: int,
-                              support_negative: bool = False, token_class=None, inner_token_class=None) -> int:
+    def decode_tokens_to_value(
+        token_ids: List[int],
+        basename: str,
+        inner_lit_name: str,
+        vocab_manager: "VocabularyManager",
+        max_key: int,
+        support_negative: bool = False,
+        token_class=None,
+        inner_token_class=None,
+    ) -> int:
         """
         Generic function to decode token IDs back to numerical values.
 
@@ -176,9 +202,7 @@ class TokenUtils:
         if len(token_ids) == 1:
             # Simple case: single token
             token_id = token_ids[0]
-            hex_value = TokenUtils.cache_numeric_reverse(
-                token_class, token_id, f'_{basename}_cache', vocab_manager
-            )
+            hex_value = TokenUtils.cache_numeric_reverse(token_class, token_id, f"_{basename}_cache", vocab_manager)
             return hex_value
         else:
             # Complex case: multiple tokens
@@ -189,10 +213,10 @@ class TokenUtils:
 
             # Get start/end token IDs from cache
             start_token_id = TokenUtils.lookup_specific_token_id(
-                token_class, '_start_token_id', f"{basename}_Lit_Start", vocab_manager
+                token_class, "_start_token_id", f"{basename}_Lit_Start", vocab_manager
             )
             end_token_id = TokenUtils.lookup_specific_token_id(
-                token_class, '_end_token_id', f"{basename}_Lit_End", vocab_manager
+                token_class, "_end_token_id", f"{basename}_Lit_End", vocab_manager
             )
             minus_token_id = vocab_manager.MemoryOperand.MINUS.get_token_ids() if support_negative else None
             assert minus_token_id is None or len(minus_token_id) == 1, "Only support single minus token"
@@ -208,7 +232,7 @@ class TokenUtils:
                 elif start_found:
                     # Always use cache function for hex value lookup
                     token_value = TokenUtils.cache_numeric_reverse(
-                        inner_token_class, token_id, f'_{inner_lit_name}_cache', vocab_manager
+                        inner_token_class, token_id, f"_{inner_lit_name}_cache", vocab_manager
                     )
                     decoded_value <<= shift
                     decoded_value |= token_value
@@ -217,4 +241,3 @@ class TokenUtils:
                 decoded_value = -decoded_value
 
             return decoded_value
-

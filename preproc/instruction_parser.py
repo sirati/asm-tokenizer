@@ -80,9 +80,7 @@ def disassemble_and_tokenize(binary_path, symbol_map, string_map):
 
     all_tokens = []
     for insn in tqdm(md.disasm(code, 0x0), desc="Disassembling"):
-        tokens = normalize_instruction(
-            insn.mnemonic + " " + insn.op_str, symbol_map, string_map
-        )
+        tokens = normalize_instruction(insn.mnemonic + " " + insn.op_str, symbol_map, string_map)
         all_tokens.extend(tokens)
 
     return all_tokens
@@ -129,13 +127,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("binary_path", help="Path to ELF binary")
-    parser.add_argument(
-        "-o", "--output", default="vocab.pkl", help="Output vocab pickle"
-    )
+    parser.add_argument("-o", "--output", default="vocab.pkl", help="Output vocab pickle")
     parser.add_argument("binary_path", help="Path to ELF binary")
-    parser.add_argument(
-        "-o", "--output", default="vocab.pkl", help="Output vocab pickle"
-    )
+    parser.add_argument("-o", "--output", default="vocab.pkl", help="Output vocab pickle")
     parser.add_argument("--max_size", type=int, default=10000)
     parser.add_argument("--min_freq", type=int, default=1)
     args = parser.parse_args()

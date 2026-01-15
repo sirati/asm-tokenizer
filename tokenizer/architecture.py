@@ -21,6 +21,7 @@ class PlatformInstructionTypes(IntEnum):
 
     OTHER = 127
 
+
 class X86:
     architecture_str = "x86"
     instruction_types_enum = PlatformInstructionTypes

@@ -113,9 +113,7 @@ def get_function_names_across_versions(versions):
             for row in reader:
                 name = row["function_name"]
                 if not name.startswith(".L"):
-                    block_runlength = base64_to_ndarray_vec(
-                        row["block_runlength_base64"]
-                    )
+                    block_runlength = base64_to_ndarray_vec(row["block_runlength_base64"])
                     if block_runlength.sum() < 4096:
                         names.add(name)
             name_sets.append(names)
@@ -179,9 +177,7 @@ def write_function_sections(
             if row:
                 all_called_by_vkey[vkey] = get_called_functions(row)
 
-        unique_called = collect_unique_called_functions(
-            all_called_by_vkey, version_keys
-        )
+        unique_called = collect_unique_called_functions(all_called_by_vkey, version_keys)
         unique_called_str = format_unique_called(unique_called)
         writer.writerow([func_name, unique_called_str])
 
@@ -198,9 +194,7 @@ def write_function_sections(
             mapping = mapping_dict.get(vkey)
             binary_data = process_function_binary_data(row, mapping, file2, dedup_cache)
 
-            inlining_list = build_inlining_data(
-                called, unique_called, vkey, function_lookup, warn_log, func_name
-            )
+            inlining_list = build_inlining_data(called, unique_called, vkey, function_lookup, warn_log, func_name)
 
             write_function_section_csv(
                 writer,
@@ -242,9 +236,7 @@ def write_unmatched_files(
     )
 
     prefix = f"{binary_name}_unmatched"
-    sections_file = open(
-        f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
-    )
+    sections_file = open(f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii")
     data_file = open(f"{out_path}/{prefix}_data.bin", "wb")
     index_file = open(f"{out_path}/{prefix}_index.bin", "wb")
     sections_writer = csv.writer(sections_file)
@@ -266,16 +258,10 @@ def write_unmatched_files(
             all_called.update(called)
 
             mapping = mapping_dict.get(vkey)
-            binary_data = process_function_binary_data(
-                row, mapping, data_file, dedup_cache
-            )
+            binary_data = process_function_binary_data(row, mapping, data_file, dedup_cache)
 
-            platform_tuples.append(
-                (vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt)
-            )
-            version_data_list.append(
-                (binary_data.data_offset, binary_data.data_len, binary_data.token_len)
-            )
+            platform_tuples.append((vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt))
+            version_data_list.append((binary_data.data_offset, binary_data.data_len, binary_data.token_len))
             called_by_version.append((compiler_set_id, called))
             compiler_set_id += 1
 
@@ -326,9 +312,7 @@ def get_all_function_names(versions):
     return all_names
 
 
-def process_unmatched_too_long(
-    csv_paths, version_keys, mapping_dict, out_path, binary, matched_set
-):
+def process_unmatched_too_long(csv_paths, version_keys, mapping_dict, out_path, binary, matched_set):
     """Process unmatched/too-long functions in a streaming, memory-efficient way."""
     prefix = f"{binary}_unmatched"
     file1 = open(f"{out_path}/{prefix}_data.bin", "wb")
@@ -355,9 +339,7 @@ def process_unmatched_too_long(
             row_dict = {k: v for k, v in zip(headers[i], row)}
             tokens = decode_and_translate_tokens(row_dict, mapping)
             block_runlength_arr, insn_runlength = decode_runlengths(row_dict)
-            data_offset, data_len = write_function_binary_data(
-                file1, tokens, block_runlength_arr, insn_runlength
-            )
+            data_offset, data_len = write_function_binary_data(file1, tokens, block_runlength_arr, insn_runlength)
             write_index_entry(file2, data_offset, data_len, len(tokens))
     for f in files:
         f.close()
@@ -408,9 +390,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             count = match_data["count"]
 
             if count >= 2:
-                entry = process_matched_function_pass1(
-                    func_name, rows, version_keys, mapping_dict, matched_data_file
-                )
+                entry = process_matched_function_pass1(func_name, rows, version_keys, mapping_dict, matched_data_file)
                 if entry is not None:
                     matched_data_entries.append(entry)
                 else:
@@ -428,13 +408,9 @@ def export_matched_and_unmatched_sets(binaries, output_path):
         matched_data_file.close()
         unmatched_data_file.close()
 
-        function_lookup = build_function_lookup_table(
-            matched_data_entries, unmatched_data_entries
-        )
+        function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
 
-        matched_sections_file = open(
-            f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
-        )
+        matched_sections_file = open(f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii")
         matched_index_file = open(f"{out_path}/{prefix}_index.bin", "wb")
         warn_log = open(f"{out_path}/{binary}.warn.log", "w", encoding="ascii")
 

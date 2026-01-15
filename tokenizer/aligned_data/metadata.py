@@ -14,15 +14,11 @@ def parse_inlining_data(inlining_str: str) -> List[List[int]]:
         if entry:
             parts = entry.split(",")
             if len(parts) == 4:
-                result.append(
-                    [int(parts[0]), int(parts[1], 16), int(parts[2], 16), int(parts[3])]
-                )
+                result.append([int(parts[0]), int(parts[1], 16), int(parts[2], 16), int(parts[3])])
     return result
 
 
-def extract_metadata_from_section_row(
-    row: List[str], header: List[str]
-) -> Dict[str, Any]:
+def extract_metadata_from_section_row(row: List[str], header: List[str]) -> Dict[str, Any]:
     """
     Given a row from the section CSV and its header, extract metadata fields as a dict.
     Returns: dict with keys: arch, compiler, compilerversion, opt, inlining_data, data_offset, data_len
@@ -39,7 +35,5 @@ def extract_metadata_from_section_row(
     }
 
 
-def extract_all_metadata_from_section_rows(
-    rows: List[List[str]], header: List[str]
-) -> List[Dict[str, Any]]:
+def extract_all_metadata_from_section_rows(rows: List[List[str]], header: List[str]) -> List[Dict[str, Any]]:
     return [extract_metadata_from_section_row(row, header) for row in rows]

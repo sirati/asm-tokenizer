@@ -37,9 +37,7 @@ class BinaryDataset:
         self.matched_data = self.base_path / f"{binary_name}_data.bin"
         self.matched_index = self.base_path / f"{binary_name}_index.bin"
 
-        self.unmatched_sections = (
-            self.base_path / f"{binary_name}_unmatched_sections.csv"
-        )
+        self.unmatched_sections = self.base_path / f"{binary_name}_unmatched_sections.csv"
         self.unmatched_data = self.base_path / f"{binary_name}_unmatched_data.bin"
         self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
 
@@ -59,9 +57,7 @@ class BinaryDataset:
             raise ValueError(f"Index file size {filesize} is not a multiple of 8")
 
         n_entries = filesize // 8
-        index_memmap = np.memmap(
-            index_path, dtype=np.uint8, mode="r", shape=(n_entries, 8)
-        )
+        index_memmap = np.memmap(index_path, dtype=np.uint8, mode="r", shape=(n_entries, 8))
 
         # Extract all needed data before closing
         starts = np.zeros(n_entries, dtype=np.uint32)
@@ -114,10 +110,7 @@ class BinaryDataset:
         current_idx = 0
         for length in range(max_length + 2):
             # Find first index with actual_lengths[i] >= length
-            while (
-                current_idx < len(actual_lengths)
-                and actual_lengths[current_idx] < length
-            ):
+            while current_idx < len(actual_lengths) and actual_lengths[current_idx] < length:
                 current_idx += 1
             edge_indices[length] = current_idx
 
@@ -144,12 +137,8 @@ class BinaryDataset:
             start = int(starts[i])
             length = int(lengths[i])
             # Read just the header
-            insn_len = int.from_bytes(
-                data_memmap[start : start + 3].tobytes(), "little"
-            )
-            block_len = int.from_bytes(
-                data_memmap[start + 4 : start + 6].tobytes(), "little"
-            )
+            insn_len = int.from_bytes(data_memmap[start : start + 3].tobytes(), "little")
+            block_len = int.from_bytes(data_memmap[start + 4 : start + 6].tobytes(), "little")
             token_bytes = length - 6 - insn_len - block_len
             token_count = token_bytes // 2  # uint16 tokens
             token_counts.append(token_count)
@@ -163,17 +152,13 @@ class BinaryDataset:
         """Load index files and build metadata structures (NO memmap caching)."""
         # Matched functions
         if self.matched_index.exists():
-            self.matched_starts, self.matched_lengths, matched_avg_lengths = (
-                self._load_index_once(self.matched_index)
-            )
+            self.matched_starts, self.matched_lengths, matched_avg_lengths = self._load_index_once(self.matched_index)
 
             if self.matched_starts is not None and matched_avg_lengths is not None:
                 self.matched_count = len(self.matched_starts)
                 if len(matched_avg_lengths) > 0:
-                    self.matched_edge_indices, self.matched_count_per_length = (
-                        self._build_length_lookup_tables(
-                            matched_avg_lengths, scale_factor=16
-                        )
+                    self.matched_edge_indices, self.matched_count_per_length = self._build_length_lookup_tables(
+                        matched_avg_lengths, scale_factor=16
                     )
                 else:
                     self.matched_edge_indices = np.zeros(1, dtype=np.int32)
@@ -181,14 +166,10 @@ class BinaryDataset:
 
                 # Build function name index from sections file
                 self.matched_func_names = []
-                with open(
-                    self.matched_sections, "r", newline="", encoding="ascii"
-                ) as f:
+                with open(self.matched_sections, "r", newline="", encoding="ascii") as f:
                     reader = csv.reader(f)
                     for row in reader:
-                        if (
-                            row and len(row) == 2
-                        ):  # Section header: func_name, called_functions
+                        if row and len(row) == 2:  # Section header: func_name, called_functions
                             self.matched_func_names.append(row[0])
             else:
                 self.matched_count = 0
@@ -207,19 +188,15 @@ class BinaryDataset:
 
         # Unmatched functions
         if self.unmatched_index.exists():
-            self.unmatched_starts, self.unmatched_lengths, _ = self._load_index_once(
-                self.unmatched_index
-            )
+            self.unmatched_starts, self.unmatched_lengths, _ = self._load_index_once(self.unmatched_index)
 
             if self.unmatched_starts is not None:
                 self.unmatched_count = len(self.unmatched_starts)
                 # Load actual token counts (not cached as memmap)
                 unmatched_token_counts = self._load_unmatched_lengths()
                 if len(unmatched_token_counts) > 0:
-                    self.unmatched_edge_indices, self.unmatched_count_per_length = (
-                        self._build_length_lookup_tables(
-                            unmatched_token_counts, scale_factor=1
-                        )
+                    self.unmatched_edge_indices, self.unmatched_count_per_length = self._build_length_lookup_tables(
+                        unmatched_token_counts, scale_factor=1
                     )
                 else:
                     self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
@@ -228,9 +205,7 @@ class BinaryDataset:
                 # Build function names from unmatched sections file
                 self.unmatched_func_names = []
                 if self.unmatched_sections.exists():
-                    with open(
-                        self.unmatched_sections, "r", newline="", encoding="ascii"
-                    ) as f:
+                    with open(self.unmatched_sections, "r", newline="", encoding="ascii") as f:
                         reader = csv.reader(f)
                         for row in reader:
                             if (
@@ -254,9 +229,7 @@ class BinaryDataset:
             self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
             self.unmatched_func_names = []
 
-    def get_matched_indices_by_length(
-        self, target_length: int, min_count: int = 1
-    ) -> np.ndarray:
+    def get_matched_indices_by_length(self, target_length: int, min_count: int = 1) -> np.ndarray:
         """
         Get indices of matched functions at or near target length.
 
@@ -284,9 +257,7 @@ class BinaryDataset:
 
             # Get range using pre-computed edges
             start_idx = (
-                self.matched_edge_indices[min_len]
-                if min_len < len(self.matched_edge_indices)
-                else self.matched_count
+                self.matched_edge_indices[min_len] if min_len < len(self.matched_edge_indices) else self.matched_count
             )
             end_idx = (
                 self.matched_edge_indices[max_len + 1]
@@ -308,9 +279,7 @@ class BinaryDataset:
         # Return all if we couldn't find enough
         return np.arange(self.matched_count, dtype=np.int32)
 
-    def get_unmatched_indices_by_length(
-        self, target_length: int, min_count: int = 1
-    ) -> np.ndarray:
+    def get_unmatched_indices_by_length(self, target_length: int, min_count: int = 1) -> np.ndarray:
         """Get indices of unmatched functions at or near target length."""
         if self.unmatched_count == 0:
             return np.array([], dtype=np.int32)
@@ -386,11 +355,7 @@ class BinaryDataset:
     def load_matched_function(self, idx: int) -> MatchedFunction:
         """Load a matched function by index (opens files fresh, no caching)."""
         # Get section location from stored arrays
-        if (
-            self.matched_starts is None
-            or self.matched_lengths is None
-            or idx >= len(self.matched_starts)
-        ):
+        if self.matched_starts is None or self.matched_lengths is None or idx >= len(self.matched_starts):
             raise IndexError(f"Index {idx} out of bounds for matched functions")
         start = int(self.matched_starts[idx])
         length = int(self.matched_lengths[idx])
@@ -428,32 +393,22 @@ class BinaryDataset:
             # Load binary data (memmap opened and closed inside read_function_data_memmap)
             data_offset = metadata["data_offset"]
             data_len = metadata["data_len"]
-            insn_rl, block_rl, tokens = read_function_data_memmap(
-                str(self.matched_data), data_offset, data_len
-            )
+            insn_rl, block_rl, tokens = read_function_data_memmap(str(self.matched_data), data_offset, data_len)
 
-            versions.append(
-                FunctionData(func_name, metadata, tokens, insn_rl, block_rl)
-            )
+            versions.append(FunctionData(func_name, metadata, tokens, insn_rl, block_rl))
 
         return MatchedFunction(func_name, versions)
 
     def load_unmatched_function(self, idx: int) -> FunctionData:
         """Load an unmatched function by index (opens files fresh, no caching)."""
         # Get data location from stored arrays
-        if (
-            self.unmatched_starts is None
-            or self.unmatched_lengths is None
-            or idx >= len(self.unmatched_starts)
-        ):
+        if self.unmatched_starts is None or self.unmatched_lengths is None or idx >= len(self.unmatched_starts):
             raise IndexError(f"Index {idx} out of bounds for unmatched functions")
         start = int(self.unmatched_starts[idx])
         length = int(self.unmatched_lengths[idx])
 
         # Load binary data (memmap opened and closed inside)
-        insn_rl, block_rl, tokens = read_function_data_memmap(
-            str(self.unmatched_data), start, length
-        )
+        insn_rl, block_rl, tokens = read_function_data_memmap(str(self.unmatched_data), start, length)
 
         # Try to load metadata from sections file if available
         func_name = f"unmatched_{idx}"
@@ -479,11 +434,7 @@ class BinaryDataset:
 
                         # Parse called functions (escaped commas)
                         if called_str:
-                            called = [
-                                name.replace("\\,", ",")
-                                for name in called_str.split(",")
-                                if name
-                            ]
+                            called = [name.replace("\\,", ",") for name in called_str.split(",") if name]
 
                         # Parse inlining data
                         from ..metadata import parse_inlining_data

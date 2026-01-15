@@ -1,26 +1,27 @@
 from abc import ABC, abstractmethod
-from typing import List, Type, TypeVar, ClassVar
-from enum import Enum, IntEnum
 from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import ClassVar, List, Type, TypeVar
+
 import numpy as np
 import numpy.typing as npt
 
 from tokenizer.architecture import PlatformInstructionTypes
 
-T = TypeVar('T', bound='Tokens')
+T = TypeVar("T", bound="Tokens")
 
 class TokenType(IntEnum):
-    ERROR: 'TokenType'
-    PLATFORM: 'TokenType'
-    VALUED_CONST: 'TokenType'
-    BLOCK_DEF: 'TokenType'
-    BLOCK: 'TokenType'
-    OPAQUE_CONST: 'TokenType'
-    MEMORY_OPERAND: 'TokenType'
-    TOKEN_SET: 'TokenType'
-    IDENTIFIER_LITERAL: 'TokenType'
-    LOCAL_FUNCTION: 'TokenType'
-    UNRESOLVED: 'TokenType'
+    ERROR: "TokenType"
+    PLATFORM: "TokenType"
+    VALUED_CONST: "TokenType"
+    BLOCK_DEF: "TokenType"
+    BLOCK: "TokenType"
+    OPAQUE_CONST: "TokenType"
+    MEMORY_OPERAND: "TokenType"
+    TOKEN_SET: "TokenType"
+    IDENTIFIER_LITERAL: "TokenType"
+    LOCAL_FUNCTION: "TokenType"
+    UNRESOLVED: "TokenType"
 
 class MemoryOperandSymbol(Enum):
     OPEN_BRACKET: str
@@ -35,26 +36,18 @@ class Tokens(ABC):
     @classmethod
     @abstractmethod
     def token_type(cls) -> TokenType: ...
-
     @classmethod
     @abstractmethod
-    def _from_token_ids(cls, token_ids: List[int]) -> 'Tokens': ...
-
+    def _from_token_ids(cls, token_ids: List[int]) -> "Tokens": ...
     @abstractmethod
     def get_token_ids(self) -> npt.NDArray[np.int_]: ...
-
     @abstractmethod
     def to_string(self) -> str: ...
-
     @abstractmethod
     def to_asm_like(self) -> str: ...
-
     @property
     def platform_instruction_type(self) -> PlatformInstructionTypes: ...
-
-
-    def register_on_vocab_manager(self, other: 'VocabularyManager') -> Tokens: ...
-
+    def register_on_vocab_manager(self, other: "VocabularyManager") -> Tokens: ...
     def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
     def __hash__(self) -> int: ...
@@ -65,16 +58,12 @@ class PlatformToken(Tokens, ABC):
     @property
     @classmethod
     def token_type(cls) -> TokenType: ...
-
-
     @property
     @abstractmethod
     def platform(self) -> str: ...
-
     @property
     @abstractmethod
-    def platform_instruction_type(self) -> PlatformInstructionTypes:
-
+    def platform_instruction_type(self) -> PlatformInstructionTypes: ...
     @abstractmethod
     def __init__(self, token: str, insn_type: PlatformInstructionTypes) -> None: ...
 
@@ -128,45 +117,38 @@ class MemoryOperandToken(Tokens, ABC):
     # This dataclass is created by the decorator as a class member
     @dataclass
     class EnumTokenCache:
-        OPEN_BRACKET: 'MemoryOperandToken | None' = None
-        CLOSE_BRACKET: 'MemoryOperandToken | None' = None
-        PLUS: 'MemoryOperandToken | None' = None
-        MINUS: 'MemoryOperandToken | None' = None
-        MULTIPLY: 'MemoryOperandToken | None' = None
+        OPEN_BRACKET: "MemoryOperandToken | None" = None
+        CLOSE_BRACKET: "MemoryOperandToken | None" = None
+        PLUS: "MemoryOperandToken | None" = None
+        MINUS: "MemoryOperandToken | None" = None
+        MULTIPLY: "MemoryOperandToken | None" = None
 
     @property
     @classmethod
     def token_type(cls) -> TokenType: ...
-
     @classmethod
     @abstractmethod
     def _get_enum_token_cache(cls) -> EnumTokenCache: ...
-
     @classmethod
     @abstractmethod
-    def _from_enum(cls, symbol: MemoryOperandSymbol) -> 'MemoryOperandToken': ...
+    def _from_enum(cls, symbol: MemoryOperandSymbol) -> "MemoryOperandToken": ...
 
     # Class properties that will be created by the decorator
     @classmethod
     @property
-    def OPEN_BRACKET(cls) -> 'MemoryOperandToken': ...
-
+    def OPEN_BRACKET(cls) -> "MemoryOperandToken": ...
     @classmethod
     @property
-    def CLOSE_BRACKET(cls) -> 'MemoryOperandToken': ...
-
+    def CLOSE_BRACKET(cls) -> "MemoryOperandToken": ...
     @classmethod
     @property
-    def PLUS(cls) -> 'MemoryOperandToken': ...
-
+    def PLUS(cls) -> "MemoryOperandToken": ...
     @classmethod
     @property
-    def MINUS(cls) -> 'MemoryOperandToken': ...
-
+    def MINUS(cls) -> "MemoryOperandToken": ...
     @classmethod
     @property
-    def MULTIPLY(cls) -> 'MemoryOperandToken': ...
-
+    def MULTIPLY(cls) -> "MemoryOperandToken": ...
     @abstractmethod
     def __init__(self, symbol: MemoryOperandSymbol) -> None: ...
 
@@ -190,18 +172,15 @@ class TokenRaw(Tokens):
     token_ids_array: npt.NDArray[np.int_]
     token_type_enum: TokenType
 
-
     @property
     @classmethod
     def token_type(cls) -> TokenType: ...
-
-    def resolve(self, vocab_manager: 'VocabularyManager') -> 'Tokens': ...
-
+    def resolve(self, vocab_manager: "VocabularyManager") -> "Tokens": ...
     @staticmethod
-    def with_type(token_type_enum: TokenType) -> type['TokenRaw']: ...
-
+    def with_type(token_type_enum: TokenType) -> type["TokenRaw"]: ...
 
 class LitTokenType(Enum):
-    REGULAR: 'LitTokenType'
-    LIT_START: 'LitTokenType'
-    LIT_END: 'LitTokenType'
+    REGULAR: "LitTokenType"
+    LIT_START: "LitTokenType"
+    LIT_END: "LitTokenType"
+    LIT_END: "LitTokenType"

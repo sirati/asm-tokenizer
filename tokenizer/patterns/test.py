@@ -4,8 +4,6 @@ from tokenizer.token_lists import BlockTokenList, InsnTokenList
 from tokenizer.tokens import MemoryOperandSymbol, TokenType
 
 
-
-
 def test_jump_only_pattern():
     from tokenizer.token_manager import VocabularyManager
 
@@ -18,15 +16,21 @@ def test_jump_only_pattern():
         vm.PlatformToken("jmp", PlatformInstructionTypes.CONTROL_FLOW),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(0),
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
 
     tokenlist = InsnTokenList.from_insn_token_list(tokens, "", vm)
 
-
-
-
-    pattern = TokenPattern(BlockDef, Block + 0, Maybe + InsnPrefixes, InsnControlFlow, Maybe + InsnPointerLengths, MemOpenBracket, OpaqueConst + 0, MemCloseBracket)
+    pattern = TokenPattern(
+        BlockDef,
+        Block + 0,
+        Maybe + InsnPrefixes,
+        InsnControlFlow,
+        Maybe + InsnPointerLengths,
+        MemOpenBracket,
+        OpaqueConst + 0,
+        MemCloseBracket,
+    )
 
     print(f"Testing jump_only_pattern: {pattern}")
 
@@ -55,10 +59,12 @@ def test_jump_only_pattern():
         vm.PlatformToken("jmp", PlatformInstructionTypes.CONTROL_FLOW),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(0),
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
     if not pattern.match(iter(tokens_prefix), vm, True):
-        raise AssertionError(f"Jump-only pattern with prefix should match: {pattern.get_error()}") from pattern.get_error()
+        raise AssertionError(
+            f"Jump-only pattern with prefix should match: {pattern.get_error()}"
+        ) from pattern.get_error()
 
     # Add a pointer type token (should still match)
     tokens_ptr = [
@@ -68,10 +74,12 @@ def test_jump_only_pattern():
         vm.PlatformToken("dword", PlatformInstructionTypes.POINTER_LENGTHS),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(0),
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
     if not pattern.match(iter(tokens_ptr), vm, True):
-        raise AssertionError(f"Jump-only pattern with pointer type should match: {pattern.get_error()}") from pattern.get_error()
+        raise AssertionError(
+            f"Jump-only pattern with pointer type should match: {pattern.get_error()}"
+        ) from pattern.get_error()
 
     # Wrong: missing CONTROL_FLOW
     tokens_wrong = [
@@ -80,14 +88,17 @@ def test_jump_only_pattern():
         vm.PlatformToken("nop", PlatformInstructionTypes.NOP),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(0),
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
     if pattern.match(iter(tokens_wrong), vm):
         raise AssertionError(f"Pattern missing CONTROL_FLOW should not match: {pattern.get_error()}")
 
     # Wrong: extra token at end
     tokens_extra = tokens + [vm.PlatformToken("nop", PlatformInstructionTypes.NOP)]
-    if pattern.match(iter(tokens_extra), vm,):
+    if pattern.match(
+        iter(tokens_extra),
+        vm,
+    ):
         raise AssertionError(f"Pattern with extra token should not match: {pattern.get_error()}")
 
     # Wrong: missing bracket
@@ -102,7 +113,7 @@ def test_jump_only_pattern():
         vm.PlatformToken("jmp", PlatformInstructionTypes.CONTROL_FLOW),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(0),
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
     if pattern.match(iter(tokens_wrong_block), vm):
         raise AssertionError(f"Pattern with wrong block id should not match: {pattern.get_error()}")
@@ -114,7 +125,7 @@ def test_jump_only_pattern():
         vm.PlatformToken("jmp", PlatformInstructionTypes.CONTROL_FLOW),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(42),  # Should be 0
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
     if pattern.match(iter(tokens_wrong_opaque), vm):
         raise AssertionError(f"Pattern with wrong opaque const should not match: {pattern.get_error()}")
@@ -127,7 +138,7 @@ def test_jump_only_pattern():
         vm.PlatformToken("jmp", PlatformInstructionTypes.CONTROL_FLOW),
         vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
         vm.Opaque_Const(0),
-        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET)
+        vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
     ]
     if pattern.match(iter(tokens_wrong_prefix), vm):
         raise AssertionError(f"Pattern with wrong prefix type should not match: {pattern.get_error()}")

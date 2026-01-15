@@ -4,7 +4,7 @@ from typing import Dict
 
 another_test = "fauxware"
 
-p = angr.Project('fauxware', load_options={"auto_load_libs": False})
+p = angr.Project("fauxware", load_options={"auto_load_libs": False})
 
 # Create static CFG
 cfg = p.analyses.CFGFast()
@@ -22,7 +22,7 @@ for f in p.kb.functions.values():
             operands = ins.op_str
             instr.append((opcode, operands))
         func_dict[block.addr] = instr
-    
+
     functions[key_tuple] = func_dict
 
 
@@ -47,7 +47,6 @@ print(f"Number of functions in fauxware: {number_of_functions}")
 for f in p.kb.functions.values():
     for block in f.blocks:
         print(hex(block.addr))
-
 
 
 """

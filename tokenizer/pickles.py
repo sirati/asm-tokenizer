@@ -25,7 +25,7 @@ def load_all_pickles(*file_paths):
         print(f"Writing to: {new_filename}")
 
         try:
-            with open(new_filename, "w", newline='', encoding='utf-8') as csvfile:
+            with open(new_filename, "w", newline="", encoding="utf-8") as csvfile:
                 writer = csv.writer(csvfile)
                 if isinstance(data, dict):
                     for k, v in data.items():
@@ -49,18 +49,44 @@ def load_all_pickles(*file_paths):
 
 
 def save_pickles(
-        func_names, token_dict, block_runlength_dict, insn_runlength_dict, opaque_meta_dict, vocab,
-        duplicate_func_names, tokenized_instructions, block_run_lengths, insn_run_lengths, meta_result
+    func_names,
+    token_dict,
+    block_runlength_dict,
+    insn_runlength_dict,
+    opaque_meta_dict,
+    vocab,
+    duplicate_func_names,
+    tokenized_instructions,
+    block_run_lengths,
+    insn_run_lengths,
+    meta_result,
 ):
     filenames = [
-        "func_names.pkl", "token_dict.pkl", "block_runlength_dict.pkl", "insn_runlength_dict.pkl",
-        "opaque_meta_dict.pkl", "vocab.pkl", "duplicate_func_names.pkl",
-        "tokenized_instructions.pkl", "block_run_lengths.pkl", "insn_run_lengths.pkl", "meta_result.pkl"
+        "func_names.pkl",
+        "token_dict.pkl",
+        "block_runlength_dict.pkl",
+        "insn_runlength_dict.pkl",
+        "opaque_meta_dict.pkl",
+        "vocab.pkl",
+        "duplicate_func_names.pkl",
+        "tokenized_instructions.pkl",
+        "block_run_lengths.pkl",
+        "insn_run_lengths.pkl",
+        "meta_result.pkl",
     ]
 
     variables = [
-        func_names, token_dict, block_runlength_dict, insn_runlength_dict, opaque_meta_dict, vocab,
-        duplicate_func_names, tokenized_instructions, block_run_lengths, insn_run_lengths, meta_result
+        func_names,
+        token_dict,
+        block_runlength_dict,
+        insn_runlength_dict,
+        opaque_meta_dict,
+        vocab,
+        duplicate_func_names,
+        tokenized_instructions,
+        block_run_lengths,
+        insn_run_lengths,
+        meta_result,
     ]
 
     for filename, variable in zip(filenames, variables):

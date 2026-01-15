@@ -75,12 +75,8 @@ def process_function_binary_data(
     """Decode, translate, and write binary data for a function. Returns offset, length, token count."""
     tokens = decode_and_translate_tokens(row, mapping)
     block_runlength, insn_runlength = decode_runlengths(row)
-    data_offset, data_len = write_function_binary_data(
-        data_file, tokens, block_runlength, insn_runlength, dedup_cache
-    )
-    return FunctionBinaryData(
-        data_offset=data_offset, data_len=data_len, token_len=len(tokens)
-    )
+    data_offset, data_len = write_function_binary_data(data_file, tokens, block_runlength, insn_runlength, dedup_cache)
+    return FunctionBinaryData(data_offset=data_offset, data_len=data_len, token_len=len(tokens))
 
 
 def get_called_functions_from_row(row: dict) -> List[str]:
@@ -102,13 +98,9 @@ def get_called_functions_from_row(row: dict) -> List[str]:
         return []
 
 
-def collect_unique_called_functions(
-    all_called_by_key: Dict, version_keys: List
-) -> List[str]:
+def collect_unique_called_functions(all_called_by_key: Dict, version_keys: List) -> List[str]:
     """Collect and sort unique called function names across all versions."""
-    unique_called = sorted(
-        set(fn for called_list in all_called_by_key.values() for fn in called_list)
-    )
+    unique_called = sorted(set(fn for called_list in all_called_by_key.values() for fn in called_list))
     return unique_called
 
 
@@ -129,9 +121,7 @@ def build_inlining_data(
             func_offset, func_len, is_matched = function_lookup[lookup_key]
             inlining_data[called_idx] = (func_offset, func_len, is_matched)
         else:
-            warn_log.write(
-                f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-            )
+            warn_log.write(f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n")
 
     inlining_list = [
         InliningEntry(idx=idx, offset=start, length=length, is_matched=is_matched)
@@ -142,7 +132,4 @@ def build_inlining_data(
 
 def format_inlining_list(inlining_list: List[InliningEntry]) -> List[List]:
     """Convert InliningEntry list to format expected by CSV writer."""
-    return [
-        [entry.idx, entry.offset, entry.length, entry.is_matched]
-        for entry in inlining_list
-    ]
+    return [[entry.idx, entry.offset, entry.length, entry.is_matched] for entry in inlining_list]

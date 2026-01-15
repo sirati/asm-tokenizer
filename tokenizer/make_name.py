@@ -3,8 +3,10 @@ from tokenizer.token_manager import VocabularyManager
 
 
 def name_opaque_constants(
-        occ: dict, base_name: str, vocab_manager: VocabularyManager, resolver: TokenResolver
-) -> tuple[dict[str, tuple["VocabularyManager.Opaque_Const", int]], dict[str, tuple["VocabularyManager.Opaque_Const", int]]]:
+    occ: dict, base_name: str, vocab_manager: VocabularyManager, resolver: TokenResolver
+) -> tuple[
+    dict[str, tuple["VocabularyManager.Opaque_Const", int]], dict[str, tuple["VocabularyManager.Opaque_Const", int]]
+]:
     """
     Takes a dict of all addresses that do not point to a known constant. Assigns the first 16 to OPAQUE_CONSTANTS, the rest to OPAQUE_CONSTANT_LITERALS
 
@@ -33,7 +35,7 @@ def name_opaque_constants(
 
 
 def name_value_constant_literals(
-        vcl: dict, base_name: str, vocab_manager: VocabularyManager
+    vcl: dict, base_name: str, vocab_manager: VocabularyManager
 ) -> dict[str, tuple["VocabularyManager.Valued_Const", int]]:
     """
     Takes a sorted dict of value constant literals and gives them a descriptive token name: e.g. 0x7c --> x86_VALCONST_124
@@ -53,8 +55,9 @@ def name_value_constant_literals(
     return renamed_dict
 
 
-def name_value_constants(vc: dict, vocab_manager: VocabularyManager) -> dict[
-    str, tuple["VocabularyManager.Valued_Const", int]]:
+def name_value_constants(
+    vc: dict, vocab_manager: VocabularyManager
+) -> dict[str, tuple["VocabularyManager.Valued_Const", int]]:
     """
     Takes a sorted dict of value constants and gives them a descriptive token name: e.g. 0x7c --> x86_VALCONST_124
 
