@@ -34,8 +34,8 @@ def extract_metadata_from_section_row(
         "compilerversion": row[idx["compilerversion"]],
         "opt": row[idx["opt"]],
         "inlining_data": parse_inlining_data(row[idx["inlining_data"]]),
-        "data_offset": int(row[idx["data_offset"]]),
-        "data_len": int(row[idx["data_len"]]),
+        "data_offset": int(row[idx["data_offset"]], 16),
+        "data_len": int(row[idx["data_len"]], 16),
     }
 
 

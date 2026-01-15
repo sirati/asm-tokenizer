@@ -53,7 +53,9 @@ class AlignedDataLoader:
         self.rng = np.random.default_rng(seed)
 
         # Load datasets
-        self.datasets = {name: BinaryDataset(base_path, name) for name in binary_names}
+        self.datasets = {
+            name: BinaryDataset(self.base_path, name) for name in binary_names
+        }
 
         # Build global indices
         self._build_indices()

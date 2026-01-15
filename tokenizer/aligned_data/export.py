@@ -252,7 +252,14 @@ def write_function_sections(
 
 
 def write_unmatched_files(
-    out_path, function_names, version_keys, all_data, mapping_dict, binary_name
+    out_path,
+    function_names,
+    version_keys,
+    all_data,
+    mapping_dict,
+    binary_name,
+    function_lookup,
+    warn_log,
 ):
     prefix = f"{binary_name}_unmatched"
     sections_file = open(
@@ -267,7 +274,9 @@ def write_unmatched_files(
         platform_tuples = []
         all_called = set()
         version_data_list = []
+        called_by_version = []
 
+        compiler_set_id = 0
         for vkey in version_keys:
             row = all_data[vkey].get(func_name)
             if not row:
@@ -287,18 +296,48 @@ def write_unmatched_files(
                 (vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt)
             )
             version_data_list.append((data_offset, data_len, len(tokens)))
+            called_by_version.append((compiler_set_id, called))
+            compiler_set_id += 1
 
         if version_data_list:
-            called_str = format_unique_called(sorted(all_called))
+            unique_called_list = sorted(all_called)
+            called_str = format_unique_called(unique_called_list)
             first_offset, first_len = version_data_list[0][0], version_data_list[0][1]
 
+            inlining_data_list = []
+            for comp_set_id, called_funcs in called_by_version:
+                for called_func in called_funcs:
+                    called_func_id = unique_called_list.index(called_func)
+                    lookup_key = (called_func, version_keys[comp_set_id])
+                    if lookup_key in function_lookup:
+                        func_offset, func_len, is_matched = function_lookup[lookup_key]
+                        inlining_data_list.append(
+                            [
+                                f"{comp_set_id}-{called_func_id}",
+                                func_offset,
+                                func_len,
+                                is_matched,
+                            ]
+                        )
+                    else:
+                        vkey = version_keys[comp_set_id]
+                        warn_log.write(
+                            f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                        )
+
             from .io import write_unmatched_section_csv
+
+            inlining_data_str = ";".join(
+                f"{idx},{offset:x},{length:x},{is_matched}"
+                for idx, offset, length, is_matched in inlining_data_list
+            )
 
             write_unmatched_section_csv(
                 sections_writer,
                 func_name,
                 platform_tuples,
                 called_str,
+                inlining_data_str,
                 first_offset,
                 first_len,
             )
@@ -639,11 +678,14 @@ def export_matched_and_unmatched_sets(binaries, output_path):
         unmatched_by_func = {}
         for entry in unmatched_data_entries:
             func_name = entry["func_name"]
+            vkey = entry["vkey"]
             if func_name not in unmatched_by_func:
                 unmatched_by_func[func_name] = {
                     "platform_tuples": [],
                     "all_called": set(),
                     "version_data_list": [],
+                    "called_by_version": [],
+                    "vkeys": [],
                 }
             unmatched_by_func[func_name]["platform_tuples"].extend(
                 entry.get("platform_tuples", [])
@@ -654,17 +696,53 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             unmatched_by_func[func_name]["version_data_list"].extend(
                 entry.get("version_data_list", [])
             )
+            comp_set_id = len(unmatched_by_func[func_name]["vkeys"])
+            unmatched_by_func[func_name]["vkeys"].append(vkey)
+            unmatched_by_func[func_name]["called_by_version"].append(
+                (comp_set_id, entry.get("called", set()))
+            )
 
         for func_name, data in unmatched_by_func.items():
             platform_tuples = data["platform_tuples"]
             all_called = data["all_called"]
             version_data_list = data["version_data_list"]
+            called_by_version = data["called_by_version"]
+            vkeys = data["vkeys"]
 
             if version_data_list:
-                called_str = format_unique_called(sorted(all_called))
+                unique_called_list = sorted(all_called)
+                called_str = format_unique_called(unique_called_list)
                 first_offset, first_len = (
                     version_data_list[0][0],
                     version_data_list[0][1],
+                )
+
+                inlining_data_list = []
+                for comp_set_id, called_funcs in called_by_version:
+                    for called_func in called_funcs:
+                        called_func_id = unique_called_list.index(called_func)
+                        lookup_key = (called_func, vkeys[comp_set_id])
+                        if lookup_key in function_lookup:
+                            func_offset, func_len, is_matched = function_lookup[
+                                lookup_key
+                            ]
+                            inlining_data_list.append(
+                                [
+                                    f"{comp_set_id}-{called_func_id}",
+                                    func_offset,
+                                    func_len,
+                                    is_matched,
+                                ]
+                            )
+                        else:
+                            vkey = vkeys[comp_set_id]
+                            warn_log.write(
+                                f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                            )
+
+                inlining_data_str = ";".join(
+                    f"{idx},{offset:x},{length:x},{is_matched}"
+                    for idx, offset, length, is_matched in inlining_data_list
                 )
 
                 write_unmatched_section_csv(
@@ -672,6 +750,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                     func_name,
                     platform_tuples,
                     called_str,
+                    inlining_data_str,
                     first_offset,
                     first_len,
                 )
