@@ -1,8 +1,6 @@
-import csv
 from typing import List, Tuple
 
-from .csv_format import format_compiler_sets, format_unique_called
-from .export_helpers import InliningEntry, format_inlining_list
+from .csv_format import format_unique_called
 from .io import (
     write_function_section_csv,
     write_index_entry,

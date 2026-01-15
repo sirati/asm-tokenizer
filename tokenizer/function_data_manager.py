@@ -7,8 +7,6 @@ from typing import Any, Iterator, Tuple, Optional, Dict, List
 from dataclasses import dataclass
 
 from .function_token_list import FunctionTokenList
-from .token_manager import VocabularyManager
-from .tokens import Tokens, TokenType, MemoryOperandSymbol
 
 
 @dataclass

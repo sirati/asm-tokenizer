@@ -308,7 +308,7 @@ def example_analyze_function_structure():
 
         # Inlining information
         if version.metadata["inlining_map"]:
-            print(f"    Detected inlining from other versions:")
+            print("    Detected inlining from other versions:")
             for other_version, inlined_list in version.metadata["inlining_map"].items():
                 print(f"      {other_version}: {len(inlined_list)} occurrences")
 
