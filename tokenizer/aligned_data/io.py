@@ -66,15 +66,15 @@ def write_index_entry(file3, start, length, avg_len):
 
 
 def format_inlining_dict(inlining_list):
-    """Format inlining data as dict with hex values: {idx:(hex,hex,bit)}"""
+    """Format inlining data as semicolon-separated: idx,hex_offset,hex_length,is_matched;..."""
     if not inlining_list:
         return ""
     parts = []
     for idx, start, length, is_matched in inlining_list:
         hex_start = f"{start:08x}"
         hex_length = f"{length:08x}"
-        parts.append(f"{idx}:({hex_start},{hex_length},{is_matched})")
-    return "{" + ",".join(parts) + "}"
+        parts.append(f"{idx},{hex_start},{hex_length},{is_matched}")
+    return ";".join(parts)
 
 
 def format_unique_called(unique_called):
@@ -101,6 +101,30 @@ def write_function_section_csv(
             compilerversion,
             opt,
             inlining_str,
+            data_offset,
+            data_len,
+        ]
+    )
+
+
+def write_unmatched_section_csv(
+    writer,
+    func_name,
+    platform_tuples,
+    called_functions_str,
+    data_offset,
+    data_len,
+):
+    """
+    Write unmatched section row with format:
+    function_name,"(arch,compiler,compilerversion,opt),(arch,compiler,compilerversion,opt)",called_function_string,data_offset,data_len
+    """
+    platform_str = ",".join(f"({p[0]},{p[1]},{p[2]},{p[3]})" for p in platform_tuples)
+    writer.writerow(
+        [
+            func_name,
+            platform_str,
+            called_functions_str,
             data_offset,
             data_len,
         ]
