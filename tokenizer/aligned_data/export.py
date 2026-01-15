@@ -164,6 +164,7 @@ def write_function_sections(
     mapping_dict,
     binary_name,
     function_lookup,
+    warn_log,
     unmatched=False,
 ):
     """Write the function sections and binary data files as specified."""
@@ -216,7 +217,9 @@ def write_function_sections(
                     func_offset, func_len, is_matched = function_lookup[lookup_key]
                     inlining_data[called_idx] = (func_offset, func_len, is_matched)
                 else:
-                    inlining_data[called_idx] = (0xDEADBEEF, 0xDEADBEEF, 0)
+                    warn_log.write(
+                        f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                    )
 
             inlining_list = [
                 [idx, start, length, is_matched]
@@ -557,6 +560,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
         )
         matched_file3 = open(f"{out_path}/{prefix}_index.bin", "wb")
+        warn_log = open(f"{out_path}/{binary}.warn.log", "w", encoding="ascii")
         matched_writer = csv.writer(matched_file1)
         matched_index_entries = []
 
@@ -585,7 +589,9 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                         func_offset, func_len, is_matched = function_lookup[lookup_key]
                         inlining_data[called_idx] = (func_offset, func_len, is_matched)
                     else:
-                        inlining_data[called_idx] = (0xDEADBEEF, 0xDEADBEEF, 0)
+                        warn_log.write(
+                            f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                        )
 
                 inlining_list = [
                     [idx, start, length, is_matched]
@@ -617,6 +623,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
 
         matched_file1.close()
         matched_file3.close()
+        warn_log.close()
 
         # Write unmatched sections and index
         unmatched_sections_file = open(
