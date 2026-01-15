@@ -1,11 +1,8 @@
 import csv
-import json
 import os
 import re
-import struct
+from dataclasses import dataclass
 from pathlib import Path
-
-import numpy as np
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.data_loader import load_vocab_manager
@@ -13,15 +10,27 @@ from tokenizer.data_loader import load_vocab_manager
 from .io import (
     decode_and_translate_tokens,
     decode_runlengths,
+    format_unique_called,
     write_function_binary_data,
     write_function_section_csv,
     write_index_entry,
 )
 from .match import is_vocab_row, lockstep_function_match
 
+
+@dataclass(frozen=True)
+class VersionKey:
+    """Represents a unique version of a binary."""
+
+    arch: str
+    compiler: str
+    compilerversion: str
+    opt: str
+
+
 # Regex for parsing filenames like: x86-gcc-5-O3_minigzipsh_output.csv
 FILENAME_RE = re.compile(
-    r"^(?P<arch>x86|x64|arm32|arm64)-(?P<compiler>gcc|clang)-(?P<compilerversion>[\d\.]+)-(?P<opt>O\d)_(?P<binary>.+?)_output\\.csv$"
+    r"^(?P<arch>x86|x64|arm32|arm64)-(?P<compiler>gcc|clang)-(?P<compilerversion>[\d\.]+)-(?P<opt>O\d)_(?P<binary>.+?)_output\.csv$"
 )
 
 
@@ -71,14 +80,18 @@ def load_function_data(csv_path):
 
 
 # --- Utility functions ---
-def get_vocab_and_mapping(csv_path, mapping_path=None):
+def get_mapping(mapping_path):
     from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
-    vocab = load_vocab_manager(Path(csv_path))
-    mapping = None
     if mapping_path and os.path.exists(mapping_path):
         with open(mapping_path, "r", encoding="ascii") as f:
-            mapping = base64_to_ndarray_vec(f.read())
+            return base64_to_ndarray_vec(f.read())
+    return None
+
+
+def get_vocab_and_mapping(csv_path, mapping_path=None):
+    vocab = load_vocab_manager(Path(csv_path))
+    mapping = get_mapping(mapping_path)
     return vocab, mapping
 
 
@@ -119,48 +132,28 @@ def load_all_function_data(versions, function_names):
 
 
 def get_called_functions(row):
-    """Extract called function names from opaque_metadata field if possible."""
+    """Extract called function names from opaque_metadata field."""
     opaque_metadata = row.get("opaque_metadata", "")
     try:
-        # opaque_metadata is a string representation of a list (see low_level.py)
-        # e.g. str(repr(meta_result)), where meta_result is a list
-        # We expect a list of dicts, each possibly with a 'calls' key
         import ast
 
         meta = ast.literal_eval(opaque_metadata)
         called = set()
         for entry in meta:
-            if isinstance(entry, dict):
-                for key in ("calls", "called", "callees", "call_targets"):
-                    if key in entry and isinstance(entry[key], list):
-                        called.update(str(x) for x in entry[key])
+            if isinstance(entry, tuple) and len(entry) >= 5:
+                name = entry[2]
+                type_field = entry[3]
+                library_type = entry[4]
+                if library_type == "function" or "function" in type_field:
+                    called.add(name)
         return sorted(called)
     except Exception:
         return []
 
 
-def find_inlined_functions(tokens_a, tokens_b):
-    # Naive: find all subsequences of tokens_b in tokens_a (not robust, but placeholder)
-    # Returns list of (start_idx, length) in tokens_a where tokens_b appears
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    if len(tokens_b) == 0 or len(tokens_a) < len(tokens_b):
-        return []
-    windows = sliding_window_view(tokens_a, len(tokens_b))
-    matches = np.where(np.all(windows == tokens_b, axis=1))[0]
-    return [(int(idx), len(tokens_b)) for idx in matches]
-
-
-def compute_avg_function_length(tokens, inlining_map, all_tokens_by_vkey):
-    # Sum own length and all inlined function lengths (non-overlapping)
-    total = len(tokens)
-    for vkey, inlined_list in inlining_map.items():
-        for inlined in inlined_list:
-            # Use the length of the inlined function in the other version
-            other_tokens = all_tokens_by_vkey.get(vkey)
-            if other_tokens is not None:
-                total += len(other_tokens)
-    return total
+def compute_avg_function_length(tokens):
+    """Compute average function length."""
+    return len(tokens)
 
 
 def write_function_sections(
@@ -170,6 +163,7 @@ def write_function_sections(
     all_data,
     mapping_dict,
     binary_name,
+    function_lookup,
     unmatched=False,
 ):
     """Write the function sections and binary data files as specified."""
@@ -180,73 +174,74 @@ def write_function_sections(
 
     writer = csv.writer(file1)
     index_entries = []
-    func_lengths = []
 
     for func_name in function_names:
         section_start = file1.tell()
-        writer.writerow([func_name])
+
+        all_called_by_vkey = {}
+        for vkey in version_keys:
+            row = all_data[vkey].get(func_name)
+            if row:
+                all_called_by_vkey[vkey] = get_called_functions(row)
+
+        unique_called = sorted(
+            set(fn for called_list in all_called_by_vkey.values() for fn in called_list)
+        )
+        unique_called_str = format_unique_called(unique_called)
+        writer.writerow([func_name, unique_called_str])
+
         func_section_len = 0
-        func_avg_len = 0
-        all_tokens_by_vkey = {}
-        inlining_maps_by_vkey = {}
+        total_len = 0
+
         for vkey in version_keys:
             row = all_data[vkey].get(func_name)
             if not row:
                 continue
-            arch, compiler, compilerversion, opt = vkey
-            called = get_called_functions(row)
+
+            called = all_called_by_vkey[vkey]
+
             mapping = mapping_dict.get(vkey)
             tokens = decode_and_translate_tokens(row, mapping)
             block_runlength, insn_runlength = decode_runlengths(row)
             data_offset, data_len = write_function_binary_data(
                 file2, tokens, block_runlength, insn_runlength
             )
-            all_tokens_by_vkey[vkey] = tokens
-            inlining_map = {}
-            for other_vkey in version_keys:
-                if other_vkey == vkey:
-                    continue
-                other_row = all_data[other_vkey].get(func_name)
-                if not other_row:
-                    continue
-                other_tokens = decode_and_translate_tokens(
-                    other_row, mapping_dict.get(other_vkey)
-                )
-                inlined = find_inlined_functions(tokens, other_tokens)
-                if inlined:
-                    inlining_map[str(other_vkey)] = [
-                        {"start": s, "length": l} for (s, l) in inlined
-                    ]
-            inlining_maps_by_vkey[vkey] = inlining_map
+
+            inlining_data = {}
+            for called_func in called:
+                called_idx = unique_called.index(called_func)
+                lookup_key = (called_func, vkey)
+                if lookup_key in function_lookup:
+                    func_offset, func_len, is_matched = function_lookup[lookup_key]
+                    inlining_data[called_idx] = (func_offset, func_len, is_matched)
+                else:
+                    inlining_data[called_idx] = (0xDEADBEEF, 0xDEADBEEF, 0)
+
+            inlining_list = [
+                [idx, start, length, is_matched]
+                for idx, (start, length, is_matched) in sorted(inlining_data.items())
+            ]
+
             write_function_section_csv(
                 writer,
-                func_name,
-                arch,
-                compiler,
-                compilerversion,
-                opt,
-                called,
-                inlining_map,
+                vkey.arch,
+                vkey.compiler,
+                vkey.compilerversion,
+                vkey.opt,
+                inlining_list,
                 data_offset,
                 data_len,
             )
             func_section_len += 1
-        # Compute average length including inlined functions (across all vkeys)
-        avg_len = 0
-        if func_section_len:
-            for vkey in version_keys:
-                tokens = all_tokens_by_vkey.get(vkey)
-                inlining_map = inlining_maps_by_vkey.get(vkey, {})
-                if tokens is not None:
-                    avg_len += compute_avg_function_length(
-                        tokens, inlining_map, all_tokens_by_vkey
-                    )
-            avg_len //= func_section_len
+            total_len += len(tokens)
+
+        avg_len = total_len // func_section_len if func_section_len > 0 else 0
         index_entries.append((section_start, file1.tell() - section_start, avg_len))
-        func_lengths.append(avg_len)
-        writer.writerow([])  # Blank line after each function section
+        writer.writerow([])
+
     for start, length, avg_len in sorted(index_entries, key=lambda x: x[2]):
         write_index_entry(file3, start, length, avg_len)
+
     file1.close()
     file2.close()
     file3.close()
@@ -269,7 +264,7 @@ def write_unmatched_files(
             data_offset, data_len = write_function_binary_data(
                 file1, tokens, block_runlength, insn_runlength
             )
-            write_index_entry(file2, data_offset, data_len, 0, always_zero=True)
+            write_index_entry(file2, data_offset, data_len, len(tokens))
     file1.close()
     file2.close()
 
@@ -322,7 +317,7 @@ def process_unmatched_too_long(
             data_offset, data_len = write_function_binary_data(
                 file1, tokens, block_runlength_arr, insn_runlength
             )
-            write_index_entry(file2, data_offset, data_len, 0, always_zero=True)
+            write_index_entry(file2, data_offset, data_len, len(tokens))
     for f in files:
         f.close()
     file1.close()
@@ -337,106 +332,238 @@ def export_matched_and_unmatched_sets(binaries, output_path):
         version_keys = []
         for v in versions:
             mapping_path = v["file"].replace("_output.csv", ".mapping.b64c")
-            _, mapping = get_vocab_and_mapping(v["file"], mapping_path)
-            vkey = (v["arch"], v["compiler"], v["compilerversion"], v["opt"])
+            mapping = get_mapping(mapping_path)
+            vkey = VersionKey(
+                arch=v["arch"],
+                compiler=v["compiler"],
+                compilerversion=v["compilerversion"],
+                opt=v["opt"],
+            )
             mapping_dict[vkey] = mapping
             csv_paths.append(v["file"])
             version_keys.append(vkey)
         out_path = os.path.dirname(versions[0]["file"])
-        # Matched set: process in streaming lockstep
+
         prefix = binary
-        file1 = open(
+        unmatched_prefix = f"{binary}_unmatched"
+
+        # Pass 1: Write all binary data and build lookup tables
+        matched_data_entries = []
+        unmatched_data_entries = []
+        matched_functions = set()
+
+        matched_data_file = open(f"{out_path}/{prefix}_data.bin", "wb")
+        unmatched_data_file = open(f"{out_path}/{unmatched_prefix}_data.bin", "wb")
+
+        for match_data in lockstep_function_match(csv_paths):
+            func_name = match_data["function_name"]
+            rows = match_data["rows"]
+            count = match_data["count"]
+
+            if count >= 2:
+                if func_name.startswith(".L"):
+                    continue
+                try:
+                    from tokenizer.compact_base64_utils import base64_to_ndarray_vec
+
+                    passes_filter = True
+                    for row in rows:
+                        if row is not None and "block_runlength" in row:
+                            if (
+                                base64_to_ndarray_vec(row["block_runlength"]).sum()
+                                >= 4096
+                            ):
+                                passes_filter = False
+                                break
+
+                    if not passes_filter:
+                        continue
+                except Exception:
+                    pass
+
+                matched_functions.add(func_name)
+
+                all_called_by_vkey = {}
+                for vkey, row in zip(version_keys, rows):
+                    if row is not None:
+                        all_called_by_vkey[vkey] = get_called_functions(row)
+
+                unique_called = sorted(
+                    set(
+                        fn
+                        for called_list in all_called_by_vkey.values()
+                        for fn in called_list
+                    )
+                )
+
+                version_data = []
+                for vkey, row in zip(version_keys, rows):
+                    if row is None:
+                        continue
+
+                    called = all_called_by_vkey[vkey]
+
+                    mapping = mapping_dict.get(vkey)
+                    tokens = decode_and_translate_tokens(row, mapping)
+                    block_runlength, insn_runlength = decode_runlengths(row)
+                    data_offset, data_len = write_function_binary_data(
+                        matched_data_file, tokens, block_runlength, insn_runlength
+                    )
+
+                    version_data.append(
+                        {
+                            "vkey": vkey,
+                            "called": called,
+                            "data_offset": data_offset,
+                            "data_len": data_len,
+                            "token_len": len(tokens),
+                        }
+                    )
+
+                matched_data_entries.append(
+                    {
+                        "func_name": func_name,
+                        "unique_called": unique_called,
+                        "version_data": version_data,
+                    }
+                )
+
+            elif count == 1:
+                if func_name.startswith(".L"):
+                    continue
+                for vkey, row in zip(version_keys, rows):
+                    if row is None:
+                        continue
+                    try:
+                        from tokenizer.compact_base64_utils import base64_to_ndarray_vec
+
+                        if "block_runlength" in row:
+                            if (
+                                base64_to_ndarray_vec(row["block_runlength"]).sum()
+                                < 4096
+                            ):
+                                continue
+
+                        mapping = mapping_dict.get(vkey)
+                        tokens = decode_and_translate_tokens(row, mapping)
+                        block_runlength, insn_runlength = decode_runlengths(row)
+                        data_offset, data_len = write_function_binary_data(
+                            unmatched_data_file, tokens, block_runlength, insn_runlength
+                        )
+
+                        unmatched_data_entries.append(
+                            {
+                                "func_name": func_name,
+                                "vkey": vkey,
+                                "data_offset": data_offset,
+                                "data_len": data_len,
+                                "token_len": len(tokens),
+                            }
+                        )
+                    except Exception:
+                        pass
+
+        matched_data_file.close()
+        unmatched_data_file.close()
+
+        # Build lookup table: {(func_name, vkey): (offset, length, is_matched)}
+        function_lookup = {}
+        for entry in matched_data_entries:
+            func_name = entry["func_name"]
+            version_data = entry["version_data"]
+            for vdata in version_data:
+                vkey = vdata["vkey"]
+                function_lookup[(func_name, vkey)] = (
+                    vdata["data_offset"],
+                    vdata["data_len"],
+                    1,
+                )
+
+        for entry in unmatched_data_entries:
+            func_name = entry["func_name"]
+            vkey = entry["vkey"]
+            function_lookup[(func_name, vkey)] = (
+                entry["data_offset"],
+                entry["data_len"],
+                0,
+            )
+
+        # Pass 2: Write CSV files with actual values
+        matched_file1 = open(
             f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
         )
-        file2 = open(f"{out_path}/{prefix}_data.bin", "wb")
-        file3 = open(f"{out_path}/{prefix}_index.bin", "wb")
-        writer = csv.writer(file1)
-        index_entries = []
-        func_lengths = []
-        for func_name, rows in lockstep_function_match(csv_paths):
-            section_start = file1.tell()
-            writer.writerow([func_name])
-            func_section_len = 0
-            func_avg_len = 0
-            all_tokens_by_vkey = {}
-            inlining_maps_by_vkey = {}
-            for vkey, row, header in zip(
-                version_keys,
-                rows,
-                [
-                    next(csv.reader(open(p, newline="", encoding="ascii")))
-                    for p in csv_paths
-                ],
-            ):
-                row_dict = {k: v for k, v in zip(header, row)}
-                arch, compiler, compilerversion, opt = vkey
-                called = get_called_functions(row_dict)
-                mapping = mapping_dict.get(vkey)
-                tokens = decode_and_translate_tokens(row_dict, mapping)
-                block_runlength, insn_runlength = decode_runlengths(row_dict)
-                data_offset, data_len = write_function_binary_data(
-                    file2, tokens, block_runlength, insn_runlength
-                )
-                all_tokens_by_vkey[vkey] = tokens
-                inlining_map = {}
-                for other_vkey, other_row, other_header in zip(
-                    version_keys,
-                    rows,
-                    [
-                        next(csv.reader(open(p, newline="", encoding="ascii")))
-                        for p in csv_paths
-                    ],
-                ):
-                    if other_vkey == vkey:
-                        continue
-                    other_row_dict = {k: v for k, v in zip(other_header, other_row)}
-                    other_tokens = decode_and_translate_tokens(
-                        other_row_dict, mapping_dict.get(other_vkey)
+        matched_file3 = open(f"{out_path}/{prefix}_index.bin", "wb")
+        matched_writer = csv.writer(matched_file1)
+        matched_index_entries = []
+
+        for entry in matched_data_entries:
+            func_name = entry["func_name"]
+            unique_called = entry["unique_called"]
+            version_data = entry["version_data"]
+
+            section_start = matched_file1.tell()
+            unique_called_str = format_unique_called(unique_called)
+            matched_writer.writerow([func_name, unique_called_str])
+
+            total_len = 0
+            for vdata in version_data:
+                vkey = vdata["vkey"]
+                called = vdata["called"]
+                data_offset = vdata["data_offset"]
+                data_len = vdata["data_len"]
+                token_len = vdata["token_len"]
+
+                inlining_data = {}
+                for called_func in called:
+                    called_idx = unique_called.index(called_func)
+                    lookup_key = (called_func, vkey)
+                    if lookup_key in function_lookup:
+                        func_offset, func_len, is_matched = function_lookup[lookup_key]
+                        inlining_data[called_idx] = (func_offset, func_len, is_matched)
+                    else:
+                        inlining_data[called_idx] = (0xDEADBEEF, 0xDEADBEEF, 0)
+
+                inlining_list = [
+                    [idx, start, length, is_matched]
+                    for idx, (start, length, is_matched) in sorted(
+                        inlining_data.items()
                     )
-                    inlined = find_inlined_functions(tokens, other_tokens)
-                    if inlined:
-                        inlining_map[str(other_vkey)] = [
-                            {"start": s, "length": l} for (s, l) in inlined
-                        ]
-                inlining_maps_by_vkey[vkey] = inlining_map
+                ]
+
                 write_function_section_csv(
-                    writer,
-                    func_name,
-                    arch,
-                    compiler,
-                    compilerversion,
-                    opt,
-                    called,
-                    inlining_map,
+                    matched_writer,
+                    vkey.arch,
+                    vkey.compiler,
+                    vkey.compilerversion,
+                    vkey.opt,
+                    inlining_list,
                     data_offset,
                     data_len,
                 )
-                func_section_len += 1
-            avg_len = 0
-            if func_section_len:
-                for vkey in version_keys:
-                    tokens = all_tokens_by_vkey.get(vkey)
-                    inlining_map = inlining_maps_by_vkey.get(vkey, {})
-                    if tokens is not None:
-                        avg_len += compute_avg_function_length(
-                            tokens, inlining_map, all_tokens_by_vkey
-                        )
-                avg_len //= func_section_len
-            index_entries.append((section_start, file1.tell() - section_start, avg_len))
-            func_lengths.append(avg_len)
-            writer.writerow([])
-        for start, length, avg_len in sorted(index_entries, key=lambda x: x[2]):
-            write_index_entry(file3, start, length, avg_len)
-        file1.close()
-        file2.close()
-        file3.close()
-        # Unmatched/too-long: process all files line by line, skipping matched
-        matched_set = set()
-        for func_name, _ in lockstep_function_match(csv_paths):
-            matched_set.add(func_name)
-        process_unmatched_too_long(
-            csv_paths, version_keys, mapping_dict, out_path, binary, matched_set
-        )
+                total_len += token_len
+
+            avg_len = total_len // len(version_data) if version_data else 0
+            matched_index_entries.append(
+                (section_start, matched_file1.tell() - section_start, avg_len)
+            )
+            matched_writer.writerow([])
+
+        for start, length, avg_len in sorted(matched_index_entries, key=lambda x: x[2]):
+            write_index_entry(matched_file3, start, length, avg_len)
+
+        matched_file1.close()
+        matched_file3.close()
+
+        # Write unmatched index
+        unmatched_file2 = open(f"{out_path}/{unmatched_prefix}_index.bin", "wb")
+        for entry in unmatched_data_entries:
+            write_index_entry(
+                unmatched_file2,
+                entry["data_offset"],
+                entry["data_len"],
+                entry["token_len"],
+            )
+        unmatched_file2.close()
 
 
 def run_alignment_export(output_path):
@@ -449,4 +576,4 @@ def main(output_path):
 
 
 if __name__ == "__main__":
-    main(Path("../tokenizer").resolve())
+    main(Path("./out/zlib/").resolve())
