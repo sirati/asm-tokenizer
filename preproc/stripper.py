@@ -40,7 +40,7 @@ def process_binaries(binary_map):
             continue
 
         try:
-            binary = lief.parse(binary_path)
+            lief.parse(binary_path)
         except Exception as e:
             print(f"[ERROR] Failed to parse {binary_path}: {e}")
             continue

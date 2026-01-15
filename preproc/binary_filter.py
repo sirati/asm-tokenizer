@@ -82,13 +82,13 @@ def sort_files_by_size(paths: list[str]) -> list[str]:
     sorted_files = sorted(file_sizes, key=lambda x: x[1], reverse=False)
 
     # Print with formatting
-    for path, size in sorted_files:
-        size_kb = size / 1024
-        size_mb = size / (1024 * 1024)
-        # print(f"{path}:\n"
-        #      f"  {size} bytes\n"
-        #      f"  {size_kb:.2f} KB\n"
-        #      f"  {size_mb:.2f} MB\n")
+    # for path, size in sorted_files:
+    #     size_kb = size / 1024
+    #     size_mb = size / (1024 * 1024)
+    #     print(f"{path}:\n"
+    #          f"  {size} bytes\n"
+    #          f"  {size_kb:.2f} KB\n"
+    #          f"  {size_mb:.2f} MB\n")
 
     return [path for path, _ in sorted_files]
 

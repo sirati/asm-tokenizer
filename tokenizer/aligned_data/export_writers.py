@@ -20,7 +20,6 @@ def write_matched_function_section(
     Write a complete matched function section (header + version rows).
     Returns (section_start, section_length) for index.
     """
-    section_start_pos = writer.dialect  # Placeholder for file position tracking
     unique_called_str = format_unique_called(unique_called)
     writer.writerow([func_name, unique_called_str])
 
