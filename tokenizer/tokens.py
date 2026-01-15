@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import List, Type, TypeVar, cast, Any, Optional
-from enum import Enum, IntEnum
 from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import Any, List, Optional, Type, TypeVar, cast
+
 import numpy as np
 import numpy.typing as npt
 
@@ -11,6 +12,7 @@ T = TypeVar('T', bound='Tokens')
 
 def EnumTokenCls(enum_class: Type[Enum]) -> Any:
     """Decorator to create lazy class properties for all enum members and required infrastructure"""
+
     def decorator(cls: Type[T]) -> Type[T]:
         # Get the enum name and create dataclass name
         enum_name = enum_class.__name__
@@ -43,6 +45,7 @@ def EnumTokenCls(enum_class: Type[Enum]) -> Any:
         def _from_enum(cls, symbol):
             """Create token from enum member"""
             pass
+
         _from_enum.__doc__ = f"Create token from {enum_name} member"
 
         # Make them abstract methods
@@ -102,6 +105,7 @@ class TokenType(IntEnum):
     MEMORY_OPERAND = 6
     TOKEN_SET = 7
     IDENTIFIER_LITERAL = 8
+    LOCAL_FUNCTION = 9
     UNRESOLVED = -1
 
 class MemoryOperandSymbol(Enum):
@@ -332,6 +336,18 @@ class OpaqueConstToken(IdentifierToken, ABC):
     def __init__(self, opaque_id: int) -> None:
         ...
 
+class LocalFunctionToken(IdentifierToken, ABC):
+    """Protocol for local function identifiers - used by inlining matcher, not by tokenizer"""
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        """Return the type of this token representation"""
+        return TokenType.LOCAL_FUNCTION
+
+    @abstractmethod
+    def __init__(self, local_function_id: int) -> None: ...
+
+
 @EnumTokenCls(MemoryOperandSymbol)
 class MemoryOperandToken(Tokens, ABC):
     """Protocol for memory operand symbol tokens"""
@@ -344,12 +360,11 @@ class MemoryOperandToken(Tokens, ABC):
     symbol: MemoryOperandSymbol
 
     @abstractmethod
-    def __init__(self, symbol: MemoryOperandSymbol) -> None:
-        ...
+    def __init__(self, symbol: MemoryOperandSymbol) -> None: ...
 
-
-    def _register_on(self, cls_other ):
+    def _register_on(self, cls_other):
         return cls_other(self.symbol)
+
 
 class TokenRaw(Tokens, ABC):
     _cache: dict[TokenType, type['TokenRaw']] = {}
@@ -357,9 +372,10 @@ class TokenRaw(Tokens, ABC):
     @abstractmethod
     def resolve(self, vocab_manager: 'VocabularyManager') -> 'Tokens': ...
 
-
-    def _register_on(self, cls_other ):
-        raise NotImplementedError("TokenRaw cannot be registered directly, please resolve first!")
+    def _register_on(self, cls_other):
+        raise NotImplementedError(
+            "TokenRaw cannot be registered directly, please resolve first!"
+        )
 
     @staticmethod
     def with_type(token_type_enum: TokenType) -> type['TokenRaw']:
@@ -431,17 +447,16 @@ class TokenRaw(Tokens, ABC):
             return TokenRawInner
 
 
-
-
-
 class TokenResolver:
     """Manages ID resolution for different token types"""
 
     def __init__(self):
         self.block_counter = 0
         self.opaque_counter = 0
+        self.local_function_counter = 0
         self.block_ids: dict[int, int] = {}  # addr(int) -> id
         self.opaque_ids: dict[int, int] = {}  # addr(int) -> id
+        self.local_function_ids: dict[int, int] = {}  # addr(int) -> id
 
     def get_block_id(self, addr: int) -> int:
         """Get or create a block ID"""
@@ -465,16 +480,30 @@ class TokenResolver:
         self.opaque_counter += 1
         return opaque_id
 
+    def get_local_function_id(self, addr: int) -> int:
+        """Get or create a local function ID"""
+        if addr and addr in self.local_function_ids:
+            return self.local_function_ids[addr]
+
+        local_function_id = self.local_function_counter
+        if addr:
+            self.local_function_ids[addr] = local_function_id
+        self.local_function_counter += 1
+        return local_function_id
+
     def reset(self):
         """Reset the block counter and block IDs for a new function"""
         self.block_counter = 0
         self.opaque_counter = 0
+        self.local_function_counter = 0
         self.block_ids.clear()
         self.opaque_ids.clear()
+        self.local_function_ids.clear()
 
 
 class LitTokenType(Enum):
     """Enum to specify if a token is a regular token, Lit_Start, or Lit_End token"""
+
     REGULAR = "regular"
     LIT_START = "lit_start"
     LIT_END = "lit_end"

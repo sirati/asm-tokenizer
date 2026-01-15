@@ -19,6 +19,7 @@ class TokenType(IntEnum):
     MEMORY_OPERAND: 'TokenType'
     TOKEN_SET: 'TokenType'
     IDENTIFIER_LITERAL: 'TokenType'
+    LOCAL_FUNCTION: 'TokenType'
     UNRESOLVED: 'TokenType'
 
 class MemoryOperandSymbol(Enum):
@@ -114,6 +115,13 @@ class OpaqueConstToken(IdentifierToken, ABC):
     @abstractmethod
     def __init__(self, opaque_id: int) -> None: ...
 
+class LocalFunctionToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, local_function_id: int) -> None: ...
+
 class MemoryOperandToken(Tokens, ABC):
     symbol: MemoryOperandSymbol
 
@@ -165,12 +173,15 @@ class MemoryOperandToken(Tokens, ABC):
 class TokenResolver:
     block_counter: int
     opaque_counter: int
+    local_function_counter: int
     block_ids: dict[int, int]
     opaque_ids: dict[int, int]
+    local_function_ids: dict[int, int]
 
     def __init__(self) -> None: ...
     def get_block_id(self, addr: int) -> int: ...
     def get_opaque_id(self, addr: int) -> int: ...
+    def get_local_function_id(self, addr: int) -> int: ...
     def reset(self) -> None: ...
 
 def EnumTokenCls(enum_class: Type[Enum]) -> Type[T]: ...
