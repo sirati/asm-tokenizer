@@ -61,6 +61,10 @@ def process_matched_function_pass1(
             }
         )
 
+    unique_offsets = set(vdata["data_offset"] for vdata in version_data)
+    if len(unique_offsets) == 1:
+        return None
+
     return {
         "func_name": func_name,
         "unique_called": unique_called,
