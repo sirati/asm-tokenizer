@@ -1,6 +1,7 @@
 import numpy as np
 import os
 
+
 def load_index_memmap(index_path):
     """
     Load the index file (file 3) as a numpy memmap.
@@ -10,7 +11,7 @@ def load_index_memmap(index_path):
     filesize = os.path.getsize(index_path)
     assert filesize % 8 == 0, f"Index file size {filesize} is not a multiple of 8."
     n_entries = filesize // 8
-    return np.memmap(index_path, dtype=np.uint8, mode='r', shape=(n_entries, 8))
+    return np.memmap(index_path, dtype=np.uint8, mode="r", shape=(n_entries, 8))
 
 
 def extract_avg_lengths(index_memmap):
@@ -59,7 +60,7 @@ def read_index_entry(index_memmap, idx):
     Given the memmap and an index, return (start, length, avg_len) for the function.
     """
     entry = index_memmap[idx]
-    start = int.from_bytes(entry[0:4], 'little')
-    length = int.from_bytes(entry[4:7], 'little')
+    start = int.from_bytes(entry[0:4], "little")
+    length = int.from_bytes(entry[4:7], "little")
     avg_len = entry[7]
     return start, length, avg_len

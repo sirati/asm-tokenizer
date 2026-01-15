@@ -38,7 +38,7 @@ def extract_ldis_blocks_from_file(file_path):
 
 
 def parse_and_save_data_sections(
-        proj, sections_to_parse: list[str] = [".rodata"], output_txt="parsed_constants.txt"
+    proj, sections_to_parse: list[str] = [".rodata"], output_txt="parsed_constants.txt"
 ) -> dict[str, list[str]]:
     """
     Parses the .rodata (read-only data) section to retrieve a dict with all constants.
@@ -83,17 +83,13 @@ def parse_and_save_data_sections(
     # Output only exact-address constants
     with open(output_txt, "w") as f:
         for e in all_entries:
-            f.write(f'{e["start"]} - {e["end"]}: {e["section"]}: {e["value"]}\n')
+            f.write(f"{e['start']} - {e['end']}: {e['section']}: {e['value']}\n")
 
-    print(
-        f"Parsed {len(all_entries)} .rodata constants with exact addresses into {output_txt}"
-    )
+    print(f"Parsed {len(all_entries)} .rodata constants with exact addresses into {output_txt}")
     return addr_dict
 
 
-def parse_init_sections(
-        proj, output_txt="parsed_init_sections.txt", sections_to_parse=None
-):
+def parse_init_sections(proj, output_txt="parsed_init_sections.txt", sections_to_parse=None):
     """
     Parse ELF .init/.fini/.init_array/.fini_array sections and write to file.
 
@@ -126,7 +122,7 @@ def parse_init_sections(
             if section.name.endswith("_array"):
                 word_size = proj.arch.bytes
                 for i in range(0, len(data), word_size):
-                    chunk = data[i: i + word_size]
+                    chunk = data[i : i + word_size]
                     if len(chunk) != word_size:
                         continue
                     val = int.from_bytes(chunk, byteorder="little")
@@ -138,9 +134,7 @@ def parse_init_sections(
                         "type": "pointer",
                     }
                     entries.append(entry)
-                    f.write(
-                        f"{entry['section']}, {entry['start']} - {entry['end']}: {entry['value']} (ptr)\n"
-                    )
+                    f.write(f"{entry['section']}, {entry['start']} - {entry['end']}: {entry['value']} (ptr)\n")
             else:
                 hex_preview = data[:32].hex()
                 entry = {
@@ -151,19 +145,14 @@ def parse_init_sections(
                     "type": "code",
                 }
                 entries.append(entry)
-                f.write(
-                    f"{entry['section']}, {entry['start']} - {entry['end']}: {entry['value']} (code)\n"
-                )
+                f.write(f"{entry['section']}, {entry['start']} - {entry['end']}: {entry['value']} (code)\n")
 
     print(f"Parsed {len(entries)} entries from init-related sections into {output_txt}")
     return entries
 
 
 def reverse_tokenization(
-        tokenized_instructions: np.ndarray,
-        block_run_lengths: list[int],
-        insn_run_lengths: list[int],
-        vocab: dict[int, str]
+    tokenized_instructions: np.ndarray, block_run_lengths: list[int], insn_run_lengths: list[int], vocab: dict[int, str]
 ) -> list[dict[str, list[str]]]:
     instructions = []
     token_index = 0
@@ -194,18 +183,14 @@ def reverse_tokenization(
         block_instrs = []
         # print(block_len)
         while i < block_len:
-            block_instrs.append(' '.join(instructions[j]))
+            block_instrs.append(" ".join(instructions[j]))
             i += len(instructions[j])
             # print(f"\t{i}")
             j += 1
         if block_index < 16:
-            block_insns.append({
-                f'Block_{hex(block_index)[2:].upper()}': block_instrs
-            })
+            block_insns.append({f"Block_{hex(block_index)[2:].upper()}": block_instrs})
         else:
-            block_insns.append({
-                f'{register_name_range(block_index, basename="Block")}': block_instrs
-            })
+            block_insns.append({f"{register_name_range(block_index, basename='Block')}": block_instrs})
         block_index += 1
 
     # print(block_insns)
@@ -213,7 +198,7 @@ def reverse_tokenization(
 
 
 def vocab_from_output(output_path: str) -> list[str]:
-    with open(output_path, newline='') as csvfile:
+    with open(output_path, newline="") as csvfile:
         reader = csv.reader(csvfile)
         csv_iter = iter(reader)
         vocab: list[str] = []
@@ -223,7 +208,7 @@ def vocab_from_output(output_path: str) -> list[str]:
 
 
 def token_to_insn(input_path: str, output_path: str, vocab_manager: VocabularyManager):
-    with open(input_path, newline='') as csvfile:
+    with open(input_path, newline="") as csvfile:
         reader = csv.reader(csvfile)
         token_list: list[tuple[str, str]] = []
         vocab: dict[int, str] = {}
@@ -238,19 +223,22 @@ def token_to_insn(input_path: str, output_path: str, vocab_manager: VocabularyMa
             tokens = base64_to_ndarray_vec(row[2])
             block_runlength = base64_to_ndarray_vec(row[3])
             insn_runlength = base64_to_ndarray_vec(row[4])
-            #string_stream = reverse_tokenization(tokens, block_runlength, insn_runlength, vocab)
-            reconst = FunctionTokenList.reconstruct_func_from_raw_bytes(tokens, block_runlength, insn_runlength, vocab_manager)
-            #todo
+            # string_stream = reverse_tokenization(tokens, block_runlength, insn_runlength, vocab)
+            reconst = FunctionTokenList.reconstruct_func_from_raw_bytes(
+                tokens, block_runlength, insn_runlength, vocab_manager
+            )
+            # todo
 
             token_list.append((function_name, string_stream))
 
-    with open(output_path, mode="w", newline='', encoding="utf-8") as csvfile:
+    with open(output_path, mode="w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
         for k, v in token_list:
             writer.writerow([k, v])
 
+
 def token_to_functions(input_path: str):
-    with open(input_path, newline='') as csvfile:
+    with open(input_path, newline="") as csvfile:
         reader = csv.reader(csvfile)
 
         vocab = []
@@ -266,18 +254,20 @@ def token_to_functions(input_path: str):
             tokens = base64_to_ndarray_vec(row[2])
             block_runlength = base64_to_ndarray_vec(row[3])
             insn_runlength = base64_to_ndarray_vec(row[4])
-            #string_stream = reverse_tokenization(tokens, block_runlength, insn_runlength, vocab)
-            reconst = FunctionTokenList.reconstruct_func_from_raw_bytes(tokens, block_runlength, insn_runlength, token_man)
+            # string_stream = reverse_tokenization(tokens, block_runlength, insn_runlength, vocab)
+            reconst = FunctionTokenList.reconstruct_func_from_raw_bytes(
+                tokens, block_runlength, insn_runlength, token_man
+            )
             yield (function_name, function_duplicate, reconst)
 
 
-
-
-def datastructures_to_insn(vocab: dict[int, str],
-                           token_dict: dict[str, str],
-                           block_runlength_dict: dict[str, str],
-                           insn_runlength_dict: dict[str, str],
-                           duplicate_map: dict[str, str]):
+def datastructures_to_insn(
+    vocab: dict[int, str],
+    token_dict: dict[str, str],
+    block_runlength_dict: dict[str, str],
+    insn_runlength_dict: dict[str, str],
+    duplicate_map: dict[str, str],
+):
     reconstructed: dict[str, str] = {}
     vocab = {v: k for k, v in vocab.items()}
 
@@ -297,7 +287,7 @@ def datastructures_to_insn(vocab: dict[int, str],
             print(f"❌ Failed to process index {index}: {e}")
 
     # Write the result to a CSV
-    with open("reconstructed_disassembly_test.csv", mode="w", newline='', encoding="utf-8") as csvfile:
+    with open("reconstructed_disassembly_test.csv", mode="w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
         for k, v in reconstructed.items():
             writer.writerow([k, v])
@@ -307,7 +297,7 @@ def compare_csv_files(file1: str, file2: str):
     # Increase CSV field size limit
     csv.field_size_limit(10_000_000)
 
-    with open(file1, newline='', encoding='utf-8') as f1, open(file2, newline='', encoding='utf-8') as f2:
+    with open(file1, newline="", encoding="utf-8") as f1, open(file2, newline="", encoding="utf-8") as f2:
         reader1 = csv.reader(f1)
         reader2 = csv.reader(f2)
 
@@ -331,7 +321,7 @@ def compare_csv_files(file1: str, file2: str):
 
 def csv_to_dict(filepath):
     result = {}
-    with open(filepath, 'r', encoding='utf-8') as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for row in reader:
             if len(row) != 2:

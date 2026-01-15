@@ -3,7 +3,6 @@ from typing import List, Optional, Any, Union, ForwardRef
 import tokenizer
 from .matcher import TokenPattern
 
-
 class PatternParseBase:
     def __add__(self, other) -> Any: ...
     def __or__(self, other) -> Any: ...
@@ -25,8 +24,7 @@ class PatternSinglet:
     def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
 
-
-TokenPatternType: Union[PatternSinglet, PatternParseResult, List[ForwardRef('TokenPatternType')]]
+TokenPatternType: Union[PatternSinglet, PatternParseResult, List[ForwardRef("TokenPatternType")]]
 
 # class TokenPattern:
 #     def __init__(self, *pattern: TokenPatternType): ...
@@ -70,4 +68,5 @@ Platform: PatternParseBase
 TokenSet: PatternParseBase
 Unresolved: PatternParseBase
 ValuedConst: PatternParseBase
+
 def listToPatternParseResult(list_: List[TokenPatternType]) -> Union[PatternParseResult, NotImplemented]: ...

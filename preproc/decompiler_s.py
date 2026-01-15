@@ -11,17 +11,22 @@ from typing import Tuple
 RE_MULTI_WS = re.compile(r"\s+")
 RE_THREE_BEFORE_PIPE = re.compile(r".{3}\|")
 
+
 def sanitize(text):
     return text.replace("\n", " ").replace("\r", "").replace('"', "'")
+
 
 def ensure_single_space(text: str) -> str:
     return RE_MULTI_WS.sub(" ", text)
 
+
 def remove_newline(text):
     return text.replace("\n", " ").replace("\t", " ").replace(" ------ ", " ").replace("IRSB { ", " ").strip()
 
+
 def remove_three_before_pipe(s):
     return RE_THREE_BEFORE_PIPE.sub("|", s)
+
 
 def split_at_first_instruction(text):
     marker = "00 |"
@@ -30,16 +35,19 @@ def split_at_first_instruction(text):
         return text, ""
     return text[:idx].strip(), text[idx:].strip()
 
+
 ail_manager_cache = {}
+
 
 def get_ail_manager(arch):
     if arch not in ail_manager_cache:
         ail_manager_cache[arch] = ailment.Manager(arch=arch)
     return ail_manager_cache[arch]
 
+
 def lowlevel_disas(cfg, func_addr, func):
     function_bbs = {}
-    if func.name.startswith('sub_') or func.name in ['UnresolvableCallTarget', 'UnresolvableJumpTarget']:
+    if func.name.startswith("sub_") or func.name in ["UnresolvableCallTarget", "UnresolvableJumpTarget"]:
         return function_bbs
     temp_bbs = {}
     for block in func.blocks:
@@ -50,10 +58,12 @@ def lowlevel_disas(cfg, func_addr, func):
     function_bbs[func_addr] = temp_bbs
     return function_bbs
 
+
 def highlevel_disas(func) -> str:
     disasm_lines = [str(block.disassembly) for block in func.blocks]
     disasm_str = sanitize(" ".join(disasm_lines))
     return ensure_single_space(disasm_str)
+
 
 def process_vex_block(addr, block) -> str:
     try:
@@ -67,6 +77,7 @@ def process_vex_block(addr, block) -> str:
         return temp + body2
     except Exception as e:
         return f"[!] VEX error @ {hex(addr)}: {type(e).__name__}: {e}"
+
 
 def process_ail_block(addr, block, man) -> list[str]:
     try:
@@ -84,6 +95,7 @@ def process_ail_block(addr, block, man) -> list[str]:
     except Exception as e:
         return [f"[!] AIL error @ 0x{addr:x}: {type(e).__name__}: {e}"]
 
+
 def vex_repr(func, project) -> str:
     vex_lines = []
     for addr in func.block_addrs:
@@ -93,6 +105,7 @@ def vex_repr(func, project) -> str:
         except Exception as e:
             vex_lines.append(f"[!] VEX error @ {hex(addr)}: {type(e).__name__}: {e}")
     return sanitize(" ".join(vex_lines))
+
 
 def ail_repr(func, project, man) -> str:
     ail_lines = []
@@ -104,6 +117,7 @@ def ail_repr(func, project, man) -> str:
             ail_lines.append(f"[!] AIL error @ 0x{addr:x}: {type(e).__name__}: {e}")
     return ensure_single_space(sanitize(" ".join(ail_lines)))
 
+
 def decompilation(func, project, cfg) -> str:
     try:
         dec = project.analyses.Decompiler(func, cfg=cfg)
@@ -114,17 +128,20 @@ def decompilation(func, project, cfg) -> str:
     except Exception as e:
         return f"Decompilation failed: {e}"
 
+
 def get_section_name(project, addr):
     for section in project.loader.main_object.sections:
         if section.contains_addr(addr):
             return section.name
     return "UNKNOWN"
 
+
 def init_worker(binary_path):
     global project, man, cfg
     project = angr.Project(binary_path, auto_load_libs=False)
     man = get_ail_manager(project.arch)
     cfg = project.analyses.CFGFast(normalize=True)
+
 
 def worker_func(func_addr) -> Tuple[dict, dict]:
     func = project.kb.functions[func_addr]
@@ -148,22 +165,20 @@ def worker_func(func_addr) -> Tuple[dict, dict]:
     decomp_str = decompilation(func, project, cfg)
     decomp_time = time.perf_counter() - t6
 
-    times = {
-        "HDISAS": high_dis_time,
-        "VEX": vex_time,
-        "AIL": ail_time,
-        "DECOMP": decomp_time
-    }
+    times = {"HDISAS": high_dis_time, "VEX": vex_time, "AIL": ail_time, "DECOMP": decomp_time}
 
-    return ({
-        "func_addr": func_addr,
-        "func_name": func_name,
-        "section_name": section_name,
-        "highlevel": high_dis_str,
-        "ail": ail_str,
-        "vex": vex_str,
-        "decomp": decomp_str
-    }, times)
+    return (
+        {
+            "func_addr": func_addr,
+            "func_name": func_name,
+            "section_name": section_name,
+            "highlevel": high_dis_str,
+            "ail": ail_str,
+            "vex": vex_str,
+            "decomp": decomp_str,
+        },
+        times,
+    )
 
 
 def extract_function_data_parallel(binary_path) -> str:
@@ -215,8 +230,6 @@ if __name__ == "__main__":
     start_time = time.perf_counter()
     csv_path = extract_function_data_parallel(sys.argv[1])
     end_time = time.perf_counter()
-
-    
 
     print(f"\nTotal wall-clock analysis time: {end_time - start_time:.2f} seconds (parallel elapsed time)")
 

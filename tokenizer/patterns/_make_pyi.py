@@ -2,12 +2,14 @@ import inspect
 import typing
 from typing import Any
 
+
 def format_type(typ):
-    if hasattr(typ, '__module__') and typ.__module__ == 'typing':
-        return str(typ).replace('typing.', '')
+    if hasattr(typ, "__module__") and typ.__module__ == "typing":
+        return str(typ).replace("typing.", "")
     if isinstance(typ, type):
         return typ.__name__
     return str(typ)
+
 
 def generate_stub(module, output_path):
     type_aliases = []
@@ -26,7 +28,7 @@ def generate_stub(module, output_path):
                     typ = hints.get(attr_name, Any)
                     class_lines.append(f"    {attr_name}: {format_type(typ)}")
             class_lines.append("")
-            classes.append('\n'.join(class_lines))
+            classes.append("\n".join(class_lines))
         elif not name.startswith("_"):
             # Type alias detection: variable is a type
             if isinstance(obj, type) or str(obj).startswith("typing."):

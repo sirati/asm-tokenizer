@@ -14,15 +14,11 @@ from tokenizer.tokens import TokenType
 Platform = Literal["x86", "x64", "arm", "arm64", "unified"]
 
 
-def load_vocab_manager_csv_row_bytes(
-    csv_row: bytes, platform: Platform
-) -> VocabularyManager:
+def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> VocabularyManager:
     csv_data = io.BytesIO(csv_row)
     reader = csv.reader(io.TextIOWrapper(csv_data, encoding="ascii"), quotechar='"')
     row = next(reader)
-    assert len(row) == 10 or (platform == "unified" and len(row) == 13), (
-        f"Expected 10 or 13 columns, got {len(row)}"
-    )
+    assert len(row) == 10 or (platform == "unified" and len(row) == 13), f"Expected 10 or 13 columns, got {len(row)}"
     assert row[0] == "vocabulary"
     assert row[2].startswith("_id_to_token_type")
     assert row[4].startswith("_platform_instruction_type_cache")
@@ -34,24 +30,13 @@ def load_vocab_manager_csv_row_bytes(
     vocabulary = row[1].strip('"').split(",")
     id_to_token_type_offset = int(row[2].partition("norm:")[2])
     platform_instruction_type_cache_offset = int(row[4].partition("norm:")[2])
-    id_to_token_type = (
-        base64_to_ndarray(row[3]).astype(np.int8) + id_to_token_type_offset
-    )
-    platform_instruction_type_cache = (
-        base64_to_ndarray(row[5]).astype(np.int8)
-        + platform_instruction_type_cache_offset
-    )
+    id_to_token_type = base64_to_ndarray(row[3]).astype(np.int8) + id_to_token_type_offset
+    platform_instruction_type_cache = base64_to_ndarray(row[5]).astype(np.int8) + platform_instruction_type_cache_offset
     lit_start_cache = base64_to_ndarray(row[7]).astype(np.int_)
     lit_end_cache = base64_to_ndarray(row[9]).astype(np.int_)
-    platform_offset = (
-        int(row[10].partition("norm:")[2]) if platform == "unified" else None
-    )
+    platform_offset = int(row[10].partition("norm:")[2]) if platform == "unified" else None
     platform_list = row[11].strip('"').split(",") if platform == "unified" else None
-    token_to_platform = (
-        base64_to_ndarray(row[12]).astype(np.int8) + platform_offset
-        if platform == "unified"
-        else None
-    )
+    token_to_platform = base64_to_ndarray(row[12]).astype(np.int8) + platform_offset if platform == "unified" else None
 
     platform = platform if platform != "unified" else None
 
@@ -76,18 +61,14 @@ def load_vocab_manager(csv_path: Path, platform=None) -> VocabularyManager:
                 platform = option
                 break
 
-    assert platform is not None, (
-        f"Could not determine platform from file name: {csv_path.name}"
-    )
+    assert platform is not None, f"Could not determine platform from file name: {csv_path.name}"
 
     # data = np.memmap(r"out\zlib\x86-gcc-9-Os_minigzipsh_output.csv", dtype=np.uint8, mode="r")
     data = np.memmap(csv_path, dtype=np.uint8, mode="r")
     search_area = data[:-64]
     chunk_size = 1 << 14  # 16,384
 
-    num_chunks = (
-        np.size(search_area) + chunk_size - 1
-    ) // chunk_size  # Ceiling division
+    num_chunks = (np.size(search_area) + chunk_size - 1) // chunk_size  # Ceiling division
 
     last_line_chunk = None
     for i in range(num_chunks):
@@ -101,9 +82,7 @@ def load_vocab_manager(csv_path: Path, platform=None) -> VocabularyManager:
 
         if np.any(mask):
             last_local_index = np.where(mask)[0][-1]  # Position in the chunk
-            last_global_index = (
-                (np.size(search_area) + start) + last_local_index + 1
-            )  # Global position in the file
+            last_global_index = (np.size(search_area) + start) + last_local_index + 1  # Global position in the file
             last_line_chunk = data[last_global_index:]
             break
         #     print(f"  Last linebreak: local index {last_local_index}, global index {last_global_index}")
@@ -120,19 +99,14 @@ def save_vocabulary(vocab_manager, csv_writer):
         ",".join(vocab_manager.id_to_token),
         f"_id_to_token_type norm:{0 + TokenType.UNRESOLVED}",
         # need to normalize as ndarray_to_base64 only supports >= 0
-        ndarray_to_base64(
-            vocab_manager._id_to_token_type[:token_count] - TokenType.UNRESOLVED
-        ),
+        ndarray_to_base64(vocab_manager._id_to_token_type[:token_count] - TokenType.UNRESOLVED),
         f"_platform_instruction_type_cache norm:{0 + PlatformInstructionTypes.UNRESOLVED}",
         # need to normalize as ndarray_to_base64 only supports >= 0
         ndarray_to_base64(
-            vocab_manager._platform_instruction_type_cache[:token_count]
-            - PlatformInstructionTypes.UNRESOLVED
+            vocab_manager._platform_instruction_type_cache[:token_count] - PlatformInstructionTypes.UNRESOLVED
         ),
         "_lit_start_cache",
-        ndarray_to_base64(
-            vocab_manager._lit_start_cache[: vocab_manager._lit_start_count]
-        ),
+        ndarray_to_base64(vocab_manager._lit_start_cache[: vocab_manager._lit_start_count]),
         "_lit_end_cache",
         ndarray_to_base64(vocab_manager._lit_end_cache[: vocab_manager._lit_end_count]),
     ]
@@ -142,9 +116,7 @@ def save_vocabulary(vocab_manager, csv_writer):
         extra = [
             f"platforms norm:{platform_norm}",
             ",".join(vocab_manager.platform_list),
-            ndarray_to_base64(
-                vocab_manager.token_to_platform[:token_count] - platform_norm
-            ),
+            ndarray_to_base64(vocab_manager.token_to_platform[:token_count] - platform_norm),
         ]
         row += extra
 
@@ -157,9 +129,7 @@ def unify_vocab(csv_files: list[Path], output_path: Path) -> None:
     for csv_file in csv_files:
         print(f"Loading vocabulary from {csv_file}")
         current_vocab_manager = load_vocab_manager(csv_file)
-        mappings = np.full_like(
-            current_vocab_manager.id_to_token_type, -1, dtype=np.int32
-        )
+        mappings = np.full_like(current_vocab_manager.id_to_token_type, -1, dtype=np.int32)
 
         for tokens in current_vocab_manager.iter_representative_tokens():
             original = tokens.get_token_ids()

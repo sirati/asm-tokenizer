@@ -3,6 +3,7 @@ from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Tokens, TokenType, TokenRaw
 
+
 def apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler=None):
     """
     Apply opaque token mapping to replace old tokens with new sorted tokens.
@@ -17,9 +18,9 @@ def apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler=None):
         Updated temp_bbs with remapped tokens
     """
     updated_bbs = []
-    #todo i am very very sure we also need to reorder metadata
+    # todo i am very very sure we also need to reorder metadata
 
-    for (block_addr, instruction_list) in temp_bbs:
+    for block_addr, instruction_list in temp_bbs:
         updated_instructions = []
 
         for instruction_tokens in instruction_list:
@@ -34,7 +35,6 @@ def apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler=None):
 
             updated_instructions.append(updated_instruction)
 
-
         updated_bbs.append((block_addr, updated_instructions))
 
     # If constant_handler is provided, also reorder metadata
@@ -44,7 +44,9 @@ def apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler=None):
     return updated_bbs
 
 
-def apply_opaque_mapping_raw_optimized(function_token_list: FunctionTokenList, opaque_mapping, vocab_manager: VocabularyManager, constant_handler=None) -> FunctionTokenList:
+def apply_opaque_mapping_raw_optimized(
+    function_token_list: FunctionTokenList, opaque_mapping, vocab_manager: VocabularyManager, constant_handler=None
+) -> FunctionTokenList:
     """
     Apply opaque token mapping using raw tokens for efficiency, only resolving when necessary.
 
@@ -92,12 +94,10 @@ def apply_opaque_mapping_raw_optimized(function_token_list: FunctionTokenList, o
                             updated_tokens.append(raw_token)
                         continue
 
-
-
                     # Only resolve opaque tokens when we need to check the ID
                     resolved_token = raw_token.resolve(vocab_manager)
                     if resolved_token.id in id_mapping:
-                        updated_tokens.append(id_mapping[resolved_token.id ])
+                        updated_tokens.append(id_mapping[resolved_token.id])
                     else:
                         updated_tokens.append(raw_token)
                 else:

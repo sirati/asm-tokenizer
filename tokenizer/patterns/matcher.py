@@ -6,8 +6,8 @@ from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Tokens
 
 
-class TokenPattern():
-    def __init__(self, *pattern: TokenPatternType ):
+class TokenPattern:
+    def __init__(self, *pattern: TokenPatternType):
         super().__init__()
         if len(pattern) == 0:
             raise ValueError("TokenPattern must have at least one pattern element")
@@ -16,13 +16,11 @@ class TokenPattern():
         else:
             pattern = listToPatternParseResult(pattern)
 
-
         if isinstance(pattern, PatternSinglet):
             self.pattern: PatternElem = pattern.to_pattern_elem()
         else:
             self.pattern: PatternElem = pattern.finalize()
         self._last_error = None
-
 
     def match_throw(self, token_iter: Iterator[Tokens], vocab_manager: Optional[VocabularyManager] = None, trace=False):
         buf = TokenBuffer(token_iter)
@@ -37,11 +35,13 @@ class TokenPattern():
                 self._last_error = re
                 raise
         if not buf.finished:
-            raise PatternMatchError(f"Pattern match did not consume all tokens, remaining at position {buf.current_index}",
-                                    trace)
+            raise PatternMatchError(
+                f"Pattern match did not consume all tokens, remaining at position {buf.current_index}", trace
+            )
 
-
-    def match(self, token_iter: Iterator[Tokens], vocab_manager: Optional[VocabularyManager] = None, trace=False) -> bool:
+    def match(
+        self, token_iter: Iterator[Tokens], vocab_manager: Optional[VocabularyManager] = None, trace=False
+    ) -> bool:
         try:
             self.match_throw(token_iter, vocab_manager, trace)
             return True
@@ -75,7 +75,7 @@ class TokenPattern():
         inner = repr(self.pattern)
         # Remove leading 'Sequence' or 'Alternatives' if present
         if isinstance(self.pattern, Sequence) and inner.startswith("Sequence["):
-            inner = inner[len("Sequence["):-1]
+            inner = inner[len("Sequence[") : -1]
         elif isinstance(self.pattern, Alternatives) and inner.startswith("Alternatives("):
-            inner = inner[len("Alternatives["):-1]
+            inner = inner[len("Alternatives[") : -1]
         return f"TokenPattern({inner})"

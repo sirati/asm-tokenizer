@@ -2,6 +2,7 @@ import os
 import sys
 import lief
 
+
 def strip_debug(binary):
     to_remove = [".debug_info", ".debug_line", ".debug_str", ".debug_abbrev", ".debug_frame"]
     for section in to_remove:
@@ -9,6 +10,7 @@ def strip_debug(binary):
         if sec:
             binary.remove_section(sec.name)
     return binary
+
 
 def strip_symbols(binary):
     to_remove = [".symtab", ".strtab"]
@@ -18,6 +20,7 @@ def strip_symbols(binary):
             binary.remove_section(sec.name)
     return binary
 
+
 def strip_metadata(binary):
     to_remove = [".comment", ".note", ".hash", ".gnu.hash"]
     for section in to_remove:
@@ -25,6 +28,7 @@ def strip_metadata(binary):
         if sec:
             binary.remove_section(sec.name)
     return binary
+
 
 def process_binaries(binary_map):
     """Process and strip binaries, returning a dict mapping queue files to newly created binaries."""
@@ -56,7 +60,7 @@ def process_binaries(binary_map):
             "_nodebug_nosym": lambda b: strip_symbols(strip_debug(b)),
             "_nodebug_nometa": lambda b: strip_metadata(strip_debug(b)),
             "_nosym_nometa": lambda b: strip_metadata(strip_symbols(b)),
-            "_nodebug_nosym_nometa": lambda b: strip_metadata(strip_symbols(strip_debug(b)))
+            "_nodebug_nosym_nometa": lambda b: strip_metadata(strip_symbols(strip_debug(b))),
         }
 
         for suffix, transform in variants.items():
@@ -77,6 +81,7 @@ def process_binaries(binary_map):
 
     return queue_updates
 
+
 def update_queue_files(queue_updates):
     """Append new binaries to their respective queue files."""
     for queue_file, new_binaries in queue_updates.items():
@@ -87,6 +92,7 @@ def update_queue_files(queue_updates):
             print(f"[INFO] Updated queue file: {queue_file} with {len(new_binaries)} new binaries.")
         except Exception as e:
             print(f"[ERROR] Could not update {queue_file}: {e}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

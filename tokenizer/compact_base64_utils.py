@@ -1,8 +1,8 @@
-
 import base64
 import math
 import numpy as np
 from typing import List, Tuple, Sequence
+
 
 # --------------------------------------------------------------------------
 # Low-level utilities
@@ -27,7 +27,7 @@ def _pack_bits_vec(
     values = values.astype(np.uint64, copy=False)
     n = values.size
 
-    assert bits<=12, "This one is bugged for larger bits :/"
+    assert bits <= 12, "This one is bugged for larger bits :/"
 
     # compute total bits and allocate a byte array padded to 4-byte boundary
     pfx_bits = sum(nb for _, nb in prefix) if prefix else 0
@@ -38,18 +38,18 @@ def _pack_bits_vec(
 
     # view as little-endian uint32 for MSB-first math,
     # then byteswap back at the end
-    out32_le = out8.view(dtype=np.dtype('<u4'))
+    out32_le = out8.view(dtype=np.dtype("<u4"))
 
     # payload bit positions (after prefix)
-    bitpos   = pfx_bits + np.arange(n, dtype=np.uint64) * bits
+    bitpos = pfx_bits + np.arange(n, dtype=np.uint64) * bits
     word_idx = bitpos >> 5
-    bit_off  = (bitpos & 31).astype(np.uint8)
+    bit_off = (bitpos & 31).astype(np.uint8)
 
     # values fully within one 32-bit word
     fits = bit_off + bits <= 32
     if np.any(fits):
         shift = 32 - bits - bit_off[fits]
-        part  = (values[fits] << shift) & 0xFFFFFFFF
+        part = (values[fits] << shift) & 0xFFFFFFFF
         np.bitwise_or.at(out32_le, word_idx[fits], part.astype(np.uint32))
 
     # values crossing the 32-bit boundary
@@ -65,7 +65,7 @@ def _pack_bits_vec(
 
         # high part in the next word
         hi_part = values[cross] & ((1 << hi_bits) - 1)
-        hi_part <<= (32 - hi_bits)
+        hi_part <<= 32 - hi_bits
         np.bitwise_or.at(out32_le, word_idx[cross] + 1, hi_part.astype(np.uint32))
 
     # byteswap our working LE view back to BE
@@ -87,6 +87,7 @@ def _pack_bits_vec(
 
     return out8[:n_bytes].tobytes()
 
+
 def _pack_bits(
     values: np.ndarray,
     bits_per_val: int,
@@ -98,7 +99,7 @@ def _pack_bits(
     """
     if bits_per_val <= 12:
         return _pack_bits_vec(values, bits_per_val, prefix)
-    
+
     buf = 0
     buf_bits = 0
     out = bytearray()
@@ -124,7 +125,7 @@ def _pack_bits(
     for v in values:
         _write(int(v), bits_per_val)
 
-    if buf_bits:                                   # tail (pad right with zeros)
+    if buf_bits:  # tail (pad right with zeros)
         out.append(buf << (8 - buf_bits) & 0xFF)
 
     return bytes(out)
@@ -132,10 +133,11 @@ def _pack_bits(
 
 class _BitReader:
     """MSB-first bit reader for the decoding side."""
+
     def __init__(self, data: bytes):
         self.stream = int.from_bytes(data, "big")
         self.total = len(data) * 8
-        self.pos = 0                               # bits consumed so far
+        self.pos = 0  # bits consumed so far
 
     def read(self, n: int) -> int:
         if self.pos + n > self.total:
@@ -164,26 +166,26 @@ def ndarray_to_base64(arr: np.ndarray) -> str:
 
     # --- bit-width --------------------------------------------------------
     max_val = int(flat.max())
-    bits = max(2, math.ceil(math.log2(max_val + 1)))   # we never store <2 bits
+    bits = max(2, math.ceil(math.log2(max_val + 1)))  # we never store <2 bits
     if bits > 33:
         raise ValueError("bit-width >33 not supported by 5-bit header")
-    bits_code = bits - 2                                # 0..31 ➟ store in 5 bits
+    bits_code = bits - 2  # 0..31 ➟ store in 5 bits
 
     # --- length field -----------------------------------------------------
     n = flat.size
-    len_needed = max(1, math.ceil(math.log2(n + 1)))    # bits to store n
+    len_needed = max(1, math.ceil(math.log2(n + 1)))  # bits to store n
     length_bits = 4
     while length_bits < len_needed:
         length_bits += 4
     if length_bits > 32:
         raise ValueError("array too long for 32-bit length header")
-    length_prefix = length_bits // 4 - 1                # 0..7 ➟ store in 3 bits
+    length_prefix = length_bits // 4 - 1  # 0..7 ➟ store in 3 bits
 
     # --- header as "prefix bits" -----------------------------------------
     prefix = [
-        (bits_code, 5),             # 5 bits
-        (length_prefix, 3),         # 3 bits
-        (n, length_bits),           # variable bits (4–32)
+        (bits_code, 5),  # 5 bits
+        (length_prefix, 3),  # 3 bits
+        (n, length_bits),  # variable bits (4–32)
     ]
 
     raw = _pack_bits(flat, bits, prefix=prefix)
@@ -199,7 +201,7 @@ def base64_to_ndarray(s: str) -> np.ndarray:
     r = _BitReader(data)
 
     bits_code = r.read(5)
-    bits = bits_code + 2                               # restore real bit-width
+    bits = bits_code + 2  # restore real bit-width
 
     length_prefix = r.read(3)
     length_bits = (length_prefix + 1) * 4
@@ -234,24 +236,24 @@ def base64_to_ndarray_vec(s: str) -> np.ndarray:
     # 1.  Extract header fields (cheap bit-twiddling on the first bytes)
     # --------------------------------------------------------------------
     first = raw[0]
-    bits_code  = first >> 3               # top 5 bits
-    bits       = bits_code + 2            # real bit-width   (2‥33)
+    bits_code = first >> 3  # top 5 bits
+    bits = bits_code + 2  # real bit-width   (2‥33)
     if bits > 33 or bits < 2:
         raise ValueError("invalid bit-width in header")
 
     # print(f"bits: {bits}")
 
-    len_sel    = first & 0b111            # bottom 3 bits
-    len_bits   = (len_sel + 1) * 4        # 4‥32
-    hdr_bits   = 8 + len_bits
-    len_bytes  = (len_bits + 7) // 8
+    len_sel = first & 0b111  # bottom 3 bits
+    len_bits = (len_sel + 1) * 4  # 4‥32
+    hdr_bits = 8 + len_bits
+    len_bytes = (len_bits + 7) // 8
     # print(f"len_bits: {len_bits}")
 
     if len(raw) < 1 + len_bytes:
         raise ValueError("corrupted input – length field incomplete")
 
     # read the length value, which is left-aligned (MSB-aligned) in `len_bits`
-    len_int = int.from_bytes(raw[1:1 + len_bytes], "big")
+    len_int = int.from_bytes(raw[1 : 1 + len_bytes], "big")
     n_shift = 8 * len_bytes - len_bits
     n = (len_int >> n_shift) & ((1 << len_bits) - 1)
     if n == 0:
@@ -265,10 +267,10 @@ def base64_to_ndarray_vec(s: str) -> np.ndarray:
     # pad with four zero bytes so we can safely read past the end
     payload = np.concatenate([payload, np.zeros(4, dtype=np.uint8)])
 
-    start_bit = hdr_bits                        # first payload bit index
-    idx       = start_bit + np.arange(n, dtype=np.uint64) * bits  # bit pos
-    byte_idx  = (idx >> 3).astype(np.int64)     # starting byte for each value
-    bit_off   = (idx & 7).astype(np.uint8)      # bit offset inside that byte
+    start_bit = hdr_bits  # first payload bit index
+    idx = start_bit + np.arange(n, dtype=np.uint64) * bits  # bit pos
+    byte_idx = (idx >> 3).astype(np.int64)  # starting byte for each value
+    bit_off = (idx & 7).astype(np.uint8)  # bit offset inside that byte
 
     # gather the 5 bytes that are guaranteed to contain the whole value
     gather = payload[byte_idx[:, None] + np.arange(5)]
@@ -279,10 +281,11 @@ def base64_to_ndarray_vec(s: str) -> np.ndarray:
     chunks = (gather << shifts).sum(axis=1, dtype=np.uint64)
 
     # right-shift to drop leading padding bits, then mask
-    drop   = 40 - bits - bit_off            # individual shift per element
+    drop = 40 - bits - bit_off  # individual shift per element
     values = (chunks >> drop) & ((1 << bits) - 1)
 
     return values.astype(_dtype_for_bits(bits), copy=False)
+
 
 # -----------------------------------------------------------------------------
 # Tiny demo

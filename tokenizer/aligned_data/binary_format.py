@@ -24,9 +24,7 @@ def parse_binary_header(data_bytes) -> BinaryHeader:
     return BinaryHeader(insn_len=insn_len, block_enc=block_enc, block_len=block_len)
 
 
-def extract_arrays_from_data(
-    data_bytes, header: BinaryHeader
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extract_arrays_from_data(data_bytes, header: BinaryHeader) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract insn_runlength, block_runlength, tokens arrays from data given header."""
     if isinstance(data_bytes, (np.memmap, np.ndarray)):
         data_bytes = data_bytes.tobytes()
@@ -39,9 +37,7 @@ def extract_arrays_from_data(
         dtype=block_dtype,
     )
 
-    tokens = np.frombuffer(
-        data_bytes[6 + header.insn_len + header.block_len :], dtype=np.uint16
-    )
+    tokens = np.frombuffer(data_bytes[6 + header.insn_len + header.block_len :], dtype=np.uint16)
 
     return insn_runlength, block_runlength, tokens
 

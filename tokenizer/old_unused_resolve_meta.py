@@ -1,5 +1,6 @@
-def resolve_metadata(dict1, dict2, metadata_dict, placeholder=('UNKNOWN', -1), key_index=2) -> list[
-    tuple[str, str, str, str, str]]:
+def resolve_metadata(
+    dict1, dict2, metadata_dict, placeholder=("UNKNOWN", -1), key_index=2
+) -> list[tuple[str, str, str, str, str]]:
     """
     Matches addresses from dict1 and dict2 with metadata_dict using exact and range matching.
 

@@ -6,14 +6,26 @@ import numpy.typing as npt
 
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.token_utils import TokenUtils
-from tokenizer.tokens import Tokens, TokenType, PlatformToken, ValuedConstToken, IdentifierToken, BlockDefToken, \
-    BlockToken, OpaqueConstToken, MemoryOperandToken, MemoryOperandSymbol, LitTokenType, LocalFunctionToken
+from tokenizer.tokens import (
+    Tokens,
+    TokenType,
+    PlatformToken,
+    ValuedConstToken,
+    IdentifierToken,
+    BlockDefToken,
+    BlockToken,
+    OpaqueConstToken,
+    MemoryOperandToken,
+    MemoryOperandSymbol,
+    LitTokenType,
+    LocalFunctionToken,
+)
 
 
 class VocabularyManager:
     """Manages vocabulary for token-to-ID mapping"""
 
-    def __init__(self, platform: typing.Optional[str], _init = True):
+    def __init__(self, platform: typing.Optional[str], _init=True):
         self.platform = platform
         if platform is None:
             self.platform_list: list[str] = []
@@ -22,9 +34,8 @@ class VocabularyManager:
 
         self.token_to_id: dict[str, int] = {}  # dict: tokenstr to id
         if _init:
-
             self.id_to_token: list[str] = []  # array: id to tokenstr
-            self.registry_token_cache: list[Tokens] = [] # registry cache
+            self.registry_token_cache: list[Tokens] = []  # registry cache
 
             # Preallocated numpy arrays with different initial capacities
             self._id_to_token_type: npt.NDArray[np.int8] = np.full(256, TokenType.ERROR, dtype=np.int8)
@@ -33,21 +44,27 @@ class VocabularyManager:
             self._lit_start_cache: npt.NDArray[np.int_] = np.empty(4, dtype=np.int_)
             self._lit_end_cache: npt.NDArray[np.int_] = np.empty(4, dtype=np.int_)
             self._lit_start_count = 0  # Track actual entries in lit_start_cache
-            self._lit_end_count = 0    # Track actual entries in lit_end_cache
+            self._lit_end_count = 0  # Track actual entries in lit_end_cache
 
             # New cache for platform instruction types
-            self._platform_instruction_type_cache: npt.NDArray[np.int8] = np.full(256, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8)
+            self._platform_instruction_type_cache: npt.NDArray[np.int8] = np.full(
+                256, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8
+            )
 
         # Create unique inner classes for this instance
         self._create_inner_classes()
 
     @staticmethod
-    def from_vocab(platform: str, vocab_list: list[str], platform_instruction_type_cache: npt.NDArray[np.int8],
-                   id_to_token_type: npt.NDArray[np.int8] = None,
-                   lit_start_cache: npt.NDArray[np.int_] = None,
-                   lit_end_cache: npt.NDArray[np.int_] = None,
-                   platform_list: list[str] = None,
-                   token_to_platform: npt.NDArray[np.int8] = None) -> 'VocabularyManager':
+    def from_vocab(
+        platform: str,
+        vocab_list: list[str],
+        platform_instruction_type_cache: npt.NDArray[np.int8],
+        id_to_token_type: npt.NDArray[np.int8] = None,
+        lit_start_cache: npt.NDArray[np.int_] = None,
+        lit_end_cache: npt.NDArray[np.int_] = None,
+        platform_list: list[str] = None,
+        token_to_platform: npt.NDArray[np.int8] = None,
+    ) -> "VocabularyManager":
         """Creates vocab from tokenizer output."""
         v_man = VocabularyManager(platform)
         v_man.id_to_token = vocab_list
@@ -63,9 +80,9 @@ class VocabularyManager:
             for i, platform_value in enumerate(platform_list):
                 v_man.platform_reverse[platform_value] = i
 
-
-        assert ((id_to_token_type is None) == (lit_start_cache is None)) and \
-               ((lit_start_cache is None) == (lit_end_cache is None)), "All or none of id_to_token_type, lit_start_cache, and lit_end_cache must be provided"
+        assert ((id_to_token_type is None) == (lit_start_cache is None)) and (
+            (lit_start_cache is None) == (lit_end_cache is None)
+        ), "All or none of id_to_token_type, lit_start_cache, and lit_end_cache must be provided"
 
         if id_to_token_type is not None:
             v_man._id_to_token_type = id_to_token_type
@@ -118,16 +135,21 @@ class VocabularyManager:
 
         return v_man
 
-
-
-    def _private_add_token(self, token: str, token_cls: type[Tokens], lit_type: LitTokenType = LitTokenType.REGULAR, insn_type:PlatformInstructionTypes=PlatformInstructionTypes.AGNOSTIC, platform:str=None) -> int:
+    def _private_add_token(
+        self,
+        token: str,
+        token_cls: type[Tokens],
+        lit_type: LitTokenType = LitTokenType.REGULAR,
+        insn_type: PlatformInstructionTypes = PlatformInstructionTypes.AGNOSTIC,
+        platform: str = None,
+    ) -> int:
         """Add a token to the vocabulary and return its ID, optionally setting platform instruction type."""
         if token in self.token_to_id:
             return self.token_to_id[token]
 
-        assert (not (token.startswith("Block") or token.startswith("OPAQUE_CONST"))) or \
-               (token[-2] == '_' or "Lit" in token or token == "Block_Def"), \
-            f"Warning: two digit token thats shouldnt: {token}"
+        assert (not (token.startswith("Block") or token.startswith("OPAQUE_CONST"))) or (
+            token[-2] == "_" or "Lit" in token or token == "Block_Def"
+        ), f"Warning: two digit token thats shouldnt: {token}"
 
         # Add new token
         token_id = self.size
@@ -145,7 +167,9 @@ class VocabularyManager:
 
             # Resize id_to_token_type array
             new_token_type_array = np.empty(new_capacity, dtype=np.int8)
-            new_platform_instruction_type_cache = np.full(new_capacity, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8)
+            new_platform_instruction_type_cache = np.full(
+                new_capacity, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8
+            )
             new_token_type_array[:old_capacity] = self._id_to_token_type[:old_capacity]
             new_platform_instruction_type_cache[:old_capacity] = self._platform_instruction_type_cache[:old_capacity]
             self._id_to_token_type = new_token_type_array
@@ -155,14 +179,12 @@ class VocabularyManager:
                 new_platform_array[:old_capacity] = self.token_to_platform[:old_capacity]
                 self.token_to_platform = new_platform_array
 
-
         # Set token type
         self._id_to_token_type[token_id] = token_type
         self._platform_instruction_type_cache[token_id] = insn_type
 
         # handle platform
-        if platform is not None: #some token are platform-agnostic like Block_Def
-
+        if platform is not None:  # some token are platform-agnostic like Block_Def
             if self.platform is None:
                 platform_id = self.platform_reverse.get(platform, -1)
                 if platform_id == -1:
@@ -173,7 +195,7 @@ class VocabularyManager:
 
                 self.token_to_platform[token_id] = platform_id
             else:
-                assert (self.platform == platform), f"Platform mismatch: {self.platform} != {platform}"
+                assert self.platform == platform, f"Platform mismatch: {self.platform} != {platform}"
 
         # Handle lit cache entries - only add if it's a lit token
         if lit_type == LitTokenType.LIT_START:
@@ -206,21 +228,21 @@ class VocabularyManager:
     @property
     def id_to_token_type(self) -> npt.NDArray[np.int8]:
         """Get readonly view of id_to_token_type array"""
-        result = self._id_to_token_type[:self.size].view()
+        result = self._id_to_token_type[: self.size].view()
         result.flags.writeable = False
         return result
 
     @property
     def lit_starts(self) -> npt.NDArray[np.int_]:
         """Get readonly view of lit_start_cache array"""
-        result = self._lit_start_cache[:self._lit_start_count].view()
+        result = self._lit_start_cache[: self._lit_start_count].view()
         result.flags.writeable = False
         return result
 
     @property
     def lit_ends(self) -> npt.NDArray[np.int_]:
         """Get readonly view of lit_end_cache array"""
-        result = self._lit_end_cache[:self._lit_end_count].view()
+        result = self._lit_end_cache[: self._lit_end_count].view()
         result.flags.writeable = False
         return result
 
@@ -259,7 +281,7 @@ class VocabularyManager:
         """Convert to dictionary format for backward compatibility"""
         return self.token_to_id.copy()
 
-    def create_token_from_insn_list(self, insn_token_list: 'InsnTokenList', index: int) -> 'Tokens':
+    def create_token_from_insn_list(self, insn_token_list: "InsnTokenList", index: int) -> "Tokens":
         """Create a single token from an InsnTokenList at the specified index"""
         if insn_token_list.last_index == 0:
             raise IndexError("Cannot get token from empty instruction token list")
@@ -300,7 +322,7 @@ class VocabularyManager:
         else:
             raise ValueError(f"Unknown token type: {token_type}")
 
-    def _reconstruct_token_from_ids(self, token_type: TokenType, token_ids: List[int]) -> 'Tokens':
+    def _reconstruct_token_from_ids(self, token_type: TokenType, token_ids: List[int]) -> "Tokens":
         """Reconstruct a token from its type and token IDs"""
         token_class = self.get_token_class_for_type(token_type)
         return token_class._from_token_ids(token_ids)
@@ -325,7 +347,7 @@ class VocabularyManager:
 
             yield self._reconstruct_token_from_ids(token_type, [i])
 
-        lit_starts = {self._id_to_token_type[id]: id  for id in lit_starts}
+        lit_starts = {self._id_to_token_type[id]: id for id in lit_starts}
         lits = {self._id_to_token_type[end]: (lit_starts[self._id_to_token_type[end]], end) for end in lit_ends}
 
         if TokenType.VALUED_CONST in lits:
@@ -336,9 +358,12 @@ class VocabularyManager:
         # we must include all identifier tokens even if we do not have opaque or block tokens
         has_opaque = TokenType.OPAQUE_CONST in lits
         has_blocks = TokenType.BLOCK in lits
-        identifier_token_opaque = identifier_token_ids[:3] + (identifier_token_ids[3:len(identifier_token_ids)//2] if has_blocks else identifier_token_ids[3:])
-        identifier_token_blocks = identifier_token_ids[:3] + (identifier_token_ids[len(identifier_token_ids)//2:] if has_opaque else identifier_token_ids[3:])
-
+        identifier_token_opaque = identifier_token_ids[:3] + (
+            identifier_token_ids[3 : len(identifier_token_ids) // 2] if has_blocks else identifier_token_ids[3:]
+        )
+        identifier_token_blocks = identifier_token_ids[:3] + (
+            identifier_token_ids[len(identifier_token_ids) // 2 :] if has_opaque else identifier_token_ids[3:]
+        )
 
         if has_opaque:
             os, oe = lits[TokenType.OPAQUE_CONST]
@@ -347,9 +372,6 @@ class VocabularyManager:
         if has_blocks:
             bs, be = lits[TokenType.BLOCK]
             yield self._reconstruct_token_from_ids(TokenType.BLOCK, [bs] + identifier_token_blocks + [be])
-
-
-
 
     def _create_inner_classes(self):
         """Create inner classes that have access to this VocabularyManager instance"""
@@ -368,39 +390,45 @@ class VocabularyManager:
                 """Convert token to its string representation (for debugging only)"""
                 pass
 
-
         # Ensure TokensInner conforms to Tokens protocol
         assert issubclass(TokensInner, Tokens)
 
         class PlatformTokenInner(TokensInner, PlatformToken):
             """Represents platform-specific tokens like x86 instructions, registers, etc."""
-            __slots__ = ('token', '_token_id')
 
-            def __init__(self, token: str, insn_type: PlatformInstructionTypes, platform:str=None):
-                if ' ' in token:
+            __slots__ = ("token", "_token_id")
+
+            def __init__(self, token: str, insn_type: PlatformInstructionTypes, platform: str = None):
+                if " " in token:
                     raise ValueError(f"Token cannot contain spaces: '{token}'")
                 if platform is None:
                     platform = vocab_manager.platform
 
                 self.token = token
                 # Register the token and cache its ID, passing insn_type
-                self._token_id = vocab_manager._private_add_token(f"{platform}_{token}", self.__class__,
-                                                                  insn_type=insn_type, platform=platform)
-
+                self._token_id = vocab_manager._private_add_token(
+                    f"{platform}_{token}", self.__class__, insn_type=insn_type, platform=platform
+                )
 
             @classmethod
-            def _from_token_ids(cls, token_ids: List[int]) -> 'PlatformTokenInner':
+            def _from_token_ids(cls, token_ids: List[int]) -> "PlatformTokenInner":
                 """Reconstruct a PlatformToken from token IDs"""
                 if len(token_ids) != 1:
                     raise ValueError(f"Platform token must have exactly one ID, got {len(token_ids)}")
 
                 token_str = vocab_manager.get_token_str(token_ids[0])
-                platform = vocab_manager.platform_list[vocab_manager.token_to_platform[token_ids[0]]] if vocab_manager.platform is None else vocab_manager.platform
+                platform = (
+                    vocab_manager.platform_list[vocab_manager.token_to_platform[token_ids[0]]]
+                    if vocab_manager.platform is None
+                    else vocab_manager.platform
+                )
                 if not token_str.startswith(f"{platform}_"):
                     raise ValueError(f"Invalid platform token string: {token_str}")
 
-                platform_token = token_str[len(platform) + 1:]
-                return cls(platform_token, vocab_manager._platform_instruction_type_cache[token_ids[0]], platform=platform)
+                platform_token = token_str[len(platform) + 1 :]
+                return cls(
+                    platform_token, vocab_manager._platform_instruction_type_cache[token_ids[0]], platform=platform
+                )
 
             def get_token_ids(self) -> npt.NDArray[np.int_]:
                 return np.array([self._token_id], dtype=np.int_)
@@ -427,7 +455,8 @@ class VocabularyManager:
 
         class ValuedConstTokenInner(TokensInner, ValuedConstToken):
             """Represents a constant with a specific numeric value"""
-            __slots__ = ('value', '_token_ids')
+
+            __slots__ = ("value", "_token_ids")
 
             def __init__(self, value: int):
                 self.value = value
@@ -442,18 +471,31 @@ class VocabularyManager:
                     hex_str = "0" + hex_str  # Pad to even length
 
                 # Convert hex string chunks to integer values
-                hex_values = [int(hex_str[i:i+2], 16) for i in range(0, len(hex_str), 2)]
+                hex_values = [int(hex_str[i : i + 2], 16) for i in range(0, len(hex_str), 2)]
                 hex_values_array = np.array(hex_values, dtype=np.int_)
-                self._token_ids = TokenUtils.encode_tokens("VALUED_CONST", "VALUED_CONST", hex_values_array, vocab_manager,
-                                                           token_class=self.__class__, inner_token_class=self.__class__,
-                                                           max_key=256, include_minus=is_negative)
+                self._token_ids = TokenUtils.encode_tokens(
+                    "VALUED_CONST",
+                    "VALUED_CONST",
+                    hex_values_array,
+                    vocab_manager,
+                    token_class=self.__class__,
+                    inner_token_class=self.__class__,
+                    max_key=256,
+                    include_minus=is_negative,
+                )
 
             @classmethod
-            def _from_token_ids(cls, token_ids: List[int]) -> 'ValuedConstTokenInner':
+            def _from_token_ids(cls, token_ids: List[int]) -> "ValuedConstTokenInner":
                 """Reconstruct a ValuedConstToken from token IDs using utility method"""
                 value = TokenUtils.decode_tokens_to_value(
-                    token_ids, "VALUED_CONST", "VALUED_CONST", vocab_manager,
-                    max_key=256, support_negative=True, token_class=cls, inner_token_class=cls
+                    token_ids,
+                    "VALUED_CONST",
+                    "VALUED_CONST",
+                    vocab_manager,
+                    max_key=256,
+                    support_negative=True,
+                    token_class=cls,
+                    inner_token_class=cls,
                 )
                 return cls(value)
 
@@ -473,7 +515,7 @@ class VocabularyManager:
                     if len(hex_str) % 2 == 1:
                         hex_str = "0" + hex_str
 
-                    chunks = [hex_str[i:i+2] for i in range(0, len(hex_str), 2)]
+                    chunks = [hex_str[i : i + 2] for i in range(0, len(hex_str), 2)]
 
                     name = "VALUED_CONST_Lit_Start"
                     if is_negative:
@@ -492,8 +534,8 @@ class VocabularyManager:
 
         class IdentifierInner(TokensInner, IdentifierToken, ABC):
             """Abstract base class for identifiers with IDs"""
-            __slots__ = ('id', '_token_ids')
 
+            __slots__ = ("id", "_token_ids")
 
             def __init__(self, identifier_id: int):
                 IdentifierToken.__init__(self, identifier_id)
@@ -506,9 +548,15 @@ class VocabularyManager:
                 # Convert hex string characters to integer values
                 hex_values = [int(c, 16) for c in hex_str]
                 hex_values_array = np.array(hex_values, dtype=np.int_)
-                self._token_ids = TokenUtils.encode_tokens(basename, "Identifier_Lit", hex_values_array,
-                                                           vocab_manager, token_class=self.__class__,
-                                                           inner_token_class=IdentifierInner, max_key=16)
+                self._token_ids = TokenUtils.encode_tokens(
+                    basename,
+                    "Identifier_Lit",
+                    hex_values_array,
+                    vocab_manager,
+                    token_class=self.__class__,
+                    inner_token_class=IdentifierInner,
+                    max_key=16,
+                )
 
             @classmethod
             def singleton_token_index(cls, id: int) -> typing.Optional[int]:
@@ -528,11 +576,17 @@ class VocabularyManager:
                 return None
 
             @classmethod
-            def _from_token_ids(cls, token_ids: List[int]) -> 'IdentifierInner':
+            def _from_token_ids(cls, token_ids: List[int]) -> "IdentifierInner":
                 """Reconstruct an IdentifierToken from token IDs using utility method"""
                 identifier_id = TokenUtils.decode_tokens_to_value(
-                    token_ids, cls._get_basename(), "Identifier_Lit", vocab_manager,
-                    max_key=16, support_negative=False, token_class=cls, inner_token_class=IdentifierInner
+                    token_ids,
+                    cls._get_basename(),
+                    "Identifier_Lit",
+                    vocab_manager,
+                    max_key=16,
+                    support_negative=False,
+                    token_class=cls,
+                    inner_token_class=IdentifierInner,
                 )
 
                 return cls(identifier_id)
@@ -560,14 +614,15 @@ class VocabularyManager:
 
         class BlockDefInner(TokensInner, BlockDefToken):
             """Represents block definition tokens (Block_Def)"""
-            __slots__ = ('_token_id',)
+
+            __slots__ = ("_token_id",)
 
             def __init__(self):
                 # Register the token and cache its ID
                 self._token_id = vocab_manager._private_add_token("Block_Def", self.__class__)
 
             @classmethod
-            def _from_token_ids(cls, token_ids: List[int]) -> 'BlockDefInner':
+            def _from_token_ids(cls, token_ids: List[int]) -> "BlockDefInner":
                 """Reconstruct a BlockDefToken from token IDs"""
                 if len(token_ids) != 1:
                     raise ValueError(f"Block def token must have exactly one ID, got {len(token_ids)}")
@@ -593,6 +648,7 @@ class VocabularyManager:
 
         class BlockInner(IdentifierInner, BlockToken):
             """Represents block identifiers"""
+
             __slots__ = ()
 
             def __init__(self, block_id: int):
@@ -611,6 +667,7 @@ class VocabularyManager:
 
         class OpaqueConstInner(IdentifierInner, OpaqueConstToken):
             """Represents opaque constant identifiers"""
+
             __slots__ = ()
 
             def __init__(self, opaque_id: int):
@@ -646,10 +703,10 @@ class VocabularyManager:
         assert issubclass(LocalFunctionInner, IdentifierToken)
         assert issubclass(LocalFunctionInner, LocalFunctionToken)
 
-
         class MemoryOperandTokenInner(TokensInner, MemoryOperandToken):
             """Represents memory operand symbols like [, ], +, *"""
-            __slots__ = ('symbol', '_token_id')
+
+            __slots__ = ("symbol", "_token_id")
             _token_cache = MemoryOperandToken.EnumTokenCache()
 
             def __init__(self, symbol: MemoryOperandSymbol):
@@ -666,7 +723,7 @@ class VocabularyManager:
                 return cls._token_cache
 
             @classmethod
-            def _from_token_ids(cls, token_ids: List[int]) -> 'MemoryOperandTokenInner':
+            def _from_token_ids(cls, token_ids: List[int]) -> "MemoryOperandTokenInner":
                 """Reconstruct a MemoryOperandToken from token IDs"""
                 if len(token_ids) != 1:
                     raise ValueError(f"Memory operand token must have exactly one ID, got {len(token_ids)}")
@@ -694,7 +751,8 @@ class VocabularyManager:
 
         class TokenSetInner(TokensInner):
             """Represents a collection of tokens"""
-            __slots__ = ('tokens',)
+
+            __slots__ = ("tokens",)
 
             def __init__(self, tokens: List[TokensInner]):
                 self.tokens = tokens
@@ -733,4 +791,3 @@ class VocabularyManager:
         self.Opaque_Const = OpaqueConstInner
         self.MemoryOperand = MemoryOperandTokenInner
         self.TokenSet = TokenSetInner
-

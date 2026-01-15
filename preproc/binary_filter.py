@@ -4,6 +4,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+
 class BinaryFilter:
     def __init__(self, root_dir="src"):
         self.root_dir = root_dir
@@ -153,8 +154,8 @@ def main():
 
     split_paths_interleaved(queue, args.output_dir, args.splits)
 
-
     split_paths_interleaved(queue, args.output_dir, args.splits)
+
 
 if __name__ == "__main__":
     main()

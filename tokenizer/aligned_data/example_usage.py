@@ -151,9 +151,7 @@ def example_load_matched_functions():
     print_separator("LOADING MATCHED FUNCTIONS")
 
     base_path = Path("path/to/your/aligned/data")
-    loader = AlignedDataLoader(
-        base_path=base_path, binary_names=["minigzipsh"], min_length=50, max_length=500
-    )
+    loader = AlignedDataLoader(base_path=base_path, binary_names=["minigzipsh"], min_length=50, max_length=500)
 
     # Load 5 matched functions of similar length
     print("Loading 5 matched functions of similar length...")
@@ -189,10 +187,7 @@ def example_load_specific_length():
 
     for func in functions:
         actual_lengths = [len(v) for v in func.versions]
-        print(
-            f"  {func.func_name}: {min(actual_lengths)}-{max(actual_lengths)} tokens "
-            f"(avg: {len(func)})"
-        )
+        print(f"  {func.func_name}: {min(actual_lengths)}-{max(actual_lengths)} tokens (avg: {len(func)})")
 
 
 def example_load_unmatched_functions():
@@ -200,9 +195,7 @@ def example_load_unmatched_functions():
     print_separator("LOADING UNMATCHED FUNCTIONS")
 
     base_path = Path("path/to/your/aligned/data")
-    loader = AlignedDataLoader(
-        base_path=base_path, binary_names=["minigzipsh"], min_length=20, max_length=200
-    )
+    loader = AlignedDataLoader(base_path=base_path, binary_names=["minigzipsh"], min_length=20, max_length=200)
 
     # Load 10 random unmatched functions
     print("Loading 10 random unmatched functions...")
@@ -211,9 +204,7 @@ def example_load_unmatched_functions():
     for i, func in enumerate(functions, 1):
         print(f"{i}. {func.func_name}: {len(func)} tokens")
         print(f"   First 15 tokens: {func.tokens[:15]}")
-        print(
-            f"   Instructions: {len(func.insn_runlength)}, Blocks: {len(func.block_runlength)}"
-        )
+        print(f"   Instructions: {len(func.insn_runlength)}, Blocks: {len(func.block_runlength)}")
 
 
 def example_load_random_sections():
@@ -221,9 +212,7 @@ def example_load_random_sections():
     print_separator("LOADING RANDOM MIXED SECTIONS")
 
     base_path = Path("path/to/your/aligned/data")
-    loader = AlignedDataLoader(
-        base_path=base_path, binary_names=["minigzipsh"], min_length=30, max_length=300
-    )
+    loader = AlignedDataLoader(base_path=base_path, binary_names=["minigzipsh"], min_length=30, max_length=300)
 
     # Load 20 random sections (mix of matched and unmatched)
     print("Loading 20 random sections (automatically mixed)...")
@@ -259,12 +248,8 @@ def example_multiple_binaries():
     stats = loader.get_statistics()
 
     print(f"Loaded {stats['total_binaries']} binaries")
-    print(
-        f"Total matched functions across all binaries: {stats['total_matched_functions']}"
-    )
-    print(
-        f"Total unmatched functions across all binaries: {stats['total_unmatched_functions']}"
-    )
+    print(f"Total matched functions across all binaries: {stats['total_matched_functions']}")
+    print(f"Total unmatched functions across all binaries: {stats['total_unmatched_functions']}")
 
     # Load functions from all binaries
     functions = loader.load_matched_functions(n=10)
@@ -300,9 +285,7 @@ def example_analyze_function_structure():
     print(f"Versions: {len(func.versions)}")
 
     for version in func.versions:
-        print(
-            f"\n  Version: {version.metadata['arch']}-{version.metadata['compiler']}-{version.metadata['opt']}"
-        )
+        print(f"\n  Version: {version.metadata['arch']}-{version.metadata['compiler']}-{version.metadata['opt']}")
         print(f"    Total tokens: {len(version.tokens)}")
         print(f"    Instructions: {len(version.insn_runlength)}")
         print(f"    Basic blocks: {len(version.block_runlength)}")
@@ -357,9 +340,7 @@ def example_batch_processing():
         matched_in_batch = sum(1 for s in batch if isinstance(s, MatchedFunction))
         unmatched_in_batch = batch_size - matched_in_batch
 
-        print(
-            f"Batch {batch_idx + 1}: {matched_in_batch} matched, {unmatched_in_batch} unmatched"
-        )
+        print(f"Batch {batch_idx + 1}: {matched_in_batch} matched, {unmatched_in_batch} unmatched")
 
         # In a real ML scenario, you would:
         # - Extract tokens from each function
@@ -387,9 +368,7 @@ if __name__ == "__main__":
         example_batch_processing()
     except FileNotFoundError as e:
         print(f"\nError: {e}")
-        print(
-            "\nPlease update the base_path in the examples to point to your actual data directory."
-        )
+        print("\nPlease update the base_path in the examples to point to your actual data directory.")
     except Exception as e:
         print(f"\nError: {e}")
         import traceback

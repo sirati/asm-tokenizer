@@ -8,7 +8,8 @@ import numpy.typing as npt
 
 from tokenizer.architecture import PlatformInstructionTypes
 
-T = TypeVar('T', bound='Tokens')
+T = TypeVar("T", bound="Tokens")
+
 
 def EnumTokenCls(enum_class: Type[Enum]) -> Any:
     """Decorator to create lazy class properties for all enum members and required infrastructure"""
@@ -21,15 +22,19 @@ def EnumTokenCls(enum_class: Type[Enum]) -> Any:
         # Create the dataclass dynamically
         dataclass_fields = {}
         for member in enum_class:
-            dataclass_fields[member.name] = 'MemoryOperandToken | None'
+            dataclass_fields[member.name] = "MemoryOperandToken | None"
 
         # Create the dataclass type
-        dataclass_type = type(dataclass_name, (), {
-            '__annotations__': {name: typ for name, typ in dataclass_fields.items()},
-            '__module__': cls.__module__,
-            '__doc__': f"Dataclass containing all {enum_name.lower()} symbol tokens",
-            **{name: None for name in dataclass_fields.keys()}
-        })
+        dataclass_type = type(
+            dataclass_name,
+            (),
+            {
+                "__annotations__": {name: typ for name, typ in dataclass_fields.items()},
+                "__module__": cls.__module__,
+                "__doc__": f"Dataclass containing all {enum_name.lower()} symbol tokens",
+                **{name: None for name in dataclass_fields.keys()},
+            },
+        )
         # Apply dataclass decorator with type ignore for the warning
         dataclass_type = dataclass(dataclass_type)  # type: ignore
 
@@ -40,6 +45,7 @@ def EnumTokenCls(enum_class: Type[Enum]) -> Any:
         def _get_enum_token_cache(cls):
             """Return a dataclass instance containing all symbol tokens"""
             pass
+
         _get_enum_token_cache.__doc__ = f"Return a dataclass instance containing all {enum_name.lower()} symbol tokens"
 
         def _from_enum(cls, symbol):
@@ -53,8 +59,8 @@ def EnumTokenCls(enum_class: Type[Enum]) -> Any:
         _from_enum = classmethod(abstractmethod(_from_enum))
 
         # Add to class
-        setattr(cls, '_get_enum_token_cache', _get_enum_token_cache)
-        setattr(cls, '_from_enum', _from_enum)
+        setattr(cls, "_get_enum_token_cache", _get_enum_token_cache)
+        setattr(cls, "_from_enum", _from_enum)
 
         # Create properties for each enum member
         for member in enum_class:
@@ -68,10 +74,13 @@ def EnumTokenCls(enum_class: Type[Enum]) -> Any:
                     if getattr(syms, attr_name) is None:
                         setattr(syms, attr_name, cls._from_enum(enum_member))
                     return getattr(syms, attr_name)
+
                 return property_method
 
             property_method = create_property_method(member)
-            property_method.__doc__ = f"Return a {enum_name.lower()} token for {property_name.lower().replace('_', ' ')} symbol"
+            property_method.__doc__ = (
+                f"Return a {enum_name.lower()} token for {property_name.lower().replace('_', ' ')} symbol"
+            )
 
             # Create a class property using a descriptor approach
             class ClassPropertyDescriptor:
@@ -86,16 +95,18 @@ def EnumTokenCls(enum_class: Type[Enum]) -> Any:
             setattr(cls, property_name, ClassPropertyDescriptor(property_method))
 
         return cls
+
     return decorator
+
 
 class classproperty(property):
     def __get__(self, owner_self, owner_cls):
         return self.fget(owner_cls)
 
 
-
 class TokenType(IntEnum):
     """Enum for token types to identify token classes"""
+
     ERROR = 0
     PLATFORM = 1
     VALUED_CONST = 2
@@ -108,8 +119,10 @@ class TokenType(IntEnum):
     LOCAL_FUNCTION = 9
     UNRESOLVED = -1
 
+
 class MemoryOperandSymbol(Enum):
     """Enum for memory operand symbols"""
+
     OPEN_BRACKET = "mem["
     CLOSE_BRACKET = "]mem"
     PLUS = "+"
@@ -131,6 +144,7 @@ class MemoryOperandSymbol(Enum):
         else:
             raise ValueError(f"Unknown memory operand symbol: {self}")
 
+
 class Tokens(ABC):
     """Protocol for token representation objects"""
 
@@ -142,8 +156,7 @@ class Tokens(ABC):
 
     @classmethod
     @abstractmethod
-    def _from_token_ids(cls, token_ids: List[int]) -> 'Tokens': ...
-
+    def _from_token_ids(cls, token_ids: List[int]) -> "Tokens": ...
 
     @abstractmethod
     def get_token_ids(self) -> npt.NDArray[np.int_]:
@@ -155,13 +168,11 @@ class Tokens(ABC):
         """Convert token to its string representation (for debugging only)"""
         ...
 
-    def register_on_vocab_manager(self, other: 'VocabularyManager') -> 'Tokens':
+    def register_on_vocab_manager(self, other: "VocabularyManager") -> "Tokens":
         return self._register_on(other.get_token_class_for_type(self.token_type))
 
-
     @abstractmethod
-    def _register_on(self, other_cls: type['Tokens']) -> 'Tokens': ...
-
+    def _register_on(self, other_cls: type["Tokens"]) -> "Tokens": ...
 
     @abstractmethod
     def to_asm_like(self) -> str:
@@ -177,7 +188,7 @@ class Tokens(ABC):
         return self.to_string()
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__.replace("Inner","Token").replace("TokenToken","Token")}({self.to_string()})"
+        return f"{self.__class__.__name__.replace('Inner', 'Token').replace('TokenToken', 'Token')}({self.to_string()})"
 
     def __hash__(self) -> int:
         """Make tokens hashable based on class and token IDs"""
@@ -190,36 +201,31 @@ class Tokens(ABC):
         myids = self.get_token_ids()
         otherids = other.get_token_ids()
 
-        return (myids.shape == otherids.shape and
-                np.all(myids == otherids))
+        return myids.shape == otherids.shape and np.all(myids == otherids)
+
 
 class PlatformToken(Tokens, ABC):
     """Protocol for platform-specific tokens"""
 
     token: str
-    
+
     @classproperty
     def token_type(cls) -> TokenType:
         """Return the type of this token representation"""
         return TokenType.PLATFORM
 
-
-
     @property
     @abstractmethod
     def platform(self) -> str: ...
-
-
 
     @property
     @abstractmethod
     def platform_instruction_type(self) -> PlatformInstructionTypes: ...
 
     @abstractmethod
-    def __init__(self, token: str, insn_type: PlatformInstructionTypes, platform:str=None) -> None: ...
+    def __init__(self, token: str, insn_type: PlatformInstructionTypes, platform: str = None) -> None: ...
 
-
-    def _register_on(self, cls_other ):
+    def _register_on(self, cls_other):
         return cls_other(self.token, self.platform_instruction_type, self.platform)
 
 
@@ -230,16 +236,13 @@ class ValuedConstToken(Tokens, ABC):
     def token_type(cls) -> TokenType:
         """Return the type of this token representation"""
         return TokenType.VALUED_CONST
-    
-    
+
     value: int
 
     @abstractmethod
-    def __init__(self, value: int) -> None:
-        ...
+    def __init__(self, value: int) -> None: ...
 
-
-    def _register_on(self, cls_other ):
+    def _register_on(self, cls_other):
         return cls_other(self.value)
 
 
@@ -249,8 +252,7 @@ class IdentifierToken(Tokens, ABC):
     id: int
 
     @abstractmethod
-    def __init__(self, identifier_id: int) -> None:
-        ...
+    def __init__(self, identifier_id: int) -> None: ...
 
     @classproperty
     def token_type(cls) -> TokenType:
@@ -288,14 +290,12 @@ class IdentifierToken(Tokens, ABC):
         """Get the base name for this identifier type"""
         ...
 
-
-    def _register_on(self, cls_other ):
+    def _register_on(self, cls_other):
         return cls_other(self.id)
 
 
 class BlockDefToken(Tokens, ABC):
     """Protocol for block definition tokens"""
-
 
     @classproperty
     def token_type(cls) -> TokenType:
@@ -303,10 +303,9 @@ class BlockDefToken(Tokens, ABC):
         return TokenType.BLOCK_DEF
 
     @abstractmethod
-    def __init__(self) -> None:
-        ...
+    def __init__(self) -> None: ...
 
-    def _register_on(self, cls_other ):
+    def _register_on(self, cls_other):
         return cls_other()
 
 
@@ -317,11 +316,9 @@ class BlockToken(IdentifierToken, ABC):
     def token_type(cls) -> TokenType:
         """Return the type of this token representation"""
         return TokenType.BLOCK
-    
-    
+
     @abstractmethod
-    def __init__(self, block_id: int) -> None:
-        ...
+    def __init__(self, block_id: int) -> None: ...
 
 
 class OpaqueConstToken(IdentifierToken, ABC):
@@ -333,8 +330,8 @@ class OpaqueConstToken(IdentifierToken, ABC):
         return TokenType.OPAQUE_CONST
 
     @abstractmethod
-    def __init__(self, opaque_id: int) -> None:
-        ...
+    def __init__(self, opaque_id: int) -> None: ...
+
 
 class LocalFunctionToken(IdentifierToken, ABC):
     """Protocol for local function identifiers - used by inlining matcher, not by tokenizer"""
@@ -367,18 +364,16 @@ class MemoryOperandToken(Tokens, ABC):
 
 
 class TokenRaw(Tokens, ABC):
-    _cache: dict[TokenType, type['TokenRaw']] = {}
+    _cache: dict[TokenType, type["TokenRaw"]] = {}
 
     @abstractmethod
-    def resolve(self, vocab_manager: 'VocabularyManager') -> 'Tokens': ...
+    def resolve(self, vocab_manager: "VocabularyManager") -> "Tokens": ...
 
     def _register_on(self, cls_other):
-        raise NotImplementedError(
-            "TokenRaw cannot be registered directly, please resolve first!"
-        )
+        raise NotImplementedError("TokenRaw cannot be registered directly, please resolve first!")
 
     @staticmethod
-    def with_type(token_type_enum: TokenType) -> type['TokenRaw']:
+    def with_type(token_type_enum: TokenType) -> type["TokenRaw"]:
         """
         Create a new TokenRaw with the specified token type.
 
@@ -392,6 +387,7 @@ class TokenRaw(Tokens, ABC):
         if token_type_enum in TokenRaw._cache:
             return TokenRaw._cache[token_type_enum]
         else:
+
             class TokenRawInner(TokenRaw):
                 """Raw token representation with numpy array of IDs and token type"""
 
@@ -414,7 +410,7 @@ class TokenRaw(Tokens, ABC):
                     return token_type_enum
 
                 @classmethod
-                def _from_token_ids(cls, token_ids: List[int]) -> 'TokenRawInner':
+                def _from_token_ids(cls, token_ids: List[int]) -> "TokenRawInner":
                     """Create TokenRaw from token IDs - type must be determined from context"""
                     return cls(np.array(token_ids, dtype=np.int_))
 
@@ -430,7 +426,7 @@ class TokenRaw(Tokens, ABC):
                     """Convert token to its string representation that resembles assembly syntax"""
                     return f"raw:{token_type_enum.name}:{','.join(map(str, self.token_ids_array))}"
 
-                def resolve(self, vocab_manager: 'VocabularyManager') -> 'Tokens':
+                def resolve(self, vocab_manager: "VocabularyManager") -> "Tokens":
                     """
                     Resolve this TokenRaw into a concrete token using the VocabularyManager
 

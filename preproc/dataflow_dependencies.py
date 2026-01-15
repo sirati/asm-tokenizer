@@ -27,7 +27,7 @@ target_node = cfg.model.get_any_node(target_func.addr)
 # ID to -1 means the very beginning of that CFGNode. A SimProcedure does not
 # have any statement, so you should always specify -1 for it.
 
-bs = b.analyses.BackwardSlice(cfg, cdg=cdg, ddg=ddg, targets=[ (target_node, -1) ])
+bs = b.analyses.BackwardSlice(cfg, cdg=cdg, ddg=ddg, targets=[(target_node, -1)])
 
 # Get the AnnotatedCFG from the backward slice
 acfg = bs.annotated_cfg()
@@ -48,12 +48,11 @@ print("Functions in the backward slice of 'authenticate':")
 for name in sorted(funcs_in_slice):
     print(name)
 
-
     # Get the AnnotatedCFG from the backward slice
 acfg = bs.annotated_cfg()
 
 # Get the 'main' function from the knowledge base
-main_func = cfg.kb.functions.function(name='main')
+main_func = cfg.kb.functions.function(name="main")
 
 # Count how many of main's blocks are in the backward slice
 count = 0

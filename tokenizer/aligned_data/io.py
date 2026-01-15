@@ -27,9 +27,7 @@ def decode_runlengths(row):
     return block_runlength, insn_runlength
 
 
-def write_function_binary_data(
-    file2, tokens, block_runlength, insn_runlength, dedup_cache=None
-):
+def write_function_binary_data(file2, tokens, block_runlength, insn_runlength, dedup_cache=None):
     cache_key = None
     if dedup_cache is not None:
         cache_key = (
@@ -43,9 +41,7 @@ def write_function_binary_data(
     data_offset = file2.tell()
     insn_bytes = insn_runlength.astype(np.uint8).tobytes()
     block_enc = determine_block_encoding(block_runlength)
-    block_bytes = block_runlength.astype(
-        [np.uint8, np.uint16, np.uint32][block_enc]
-    ).tobytes()
+    block_bytes = block_runlength.astype([np.uint8, np.uint16, np.uint32][block_enc]).tobytes()
     insn_len = len(insn_bytes)
 
     header = encode_binary_header(insn_len, block_enc, len(block_bytes))
@@ -171,9 +167,7 @@ def read_function_data_memmap(data_path, offset, length):
     Read the binary data for a function from the data file using numpy.memmap for random access.
     Returns: insn_runlength, block_runlength, tokens
     """
-    data = np.memmap(
-        data_path, dtype=np.uint8, mode="r", offset=offset, shape=(length,)
-    )
+    data = np.memmap(data_path, dtype=np.uint8, mode="r", offset=offset, shape=(length,))
     return parse_function_data_header(data)
 
 

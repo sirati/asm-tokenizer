@@ -9,15 +9,17 @@ from tokenizer.tokens import TokenType, MemoryOperandSymbol, TokenRaw
 
 DEBUG_PATTERN = True  # Set to True to enable debug prints
 
+
 class RepeatType(Enum):
     MAYBE = auto()
     MULTI = auto()
     LOOKAHEAD = auto()
 
+
 class MatchError(RuntimeError):
     def __init__(self, message: str):
         super().__init__(message)
-        
+
 
 class PatternMatchError(MatchError):
     def __init__(self, message: str, trace: Optional[List[str]] = None):
@@ -29,7 +31,7 @@ class PatternMatchError(MatchError):
         if self.trace is None:
             return f"{super().__str__()}\n\tMatch tracing was disable."
         else:
-            return f"{super().__str__()}\nMatching Trace:\n\t{"\n\t".join(self.trace)}\n\n"
+            return f"{super().__str__()}\nMatching Trace:\n\t{'\n\t'.join(self.trace)}\n\n"
             # return f"{super().__str__()}\nMatching Trace: {self.trace}\nTraceback:\n{self._traceback}"
 
 
@@ -75,8 +77,9 @@ class TokenBuffer:
         buf_index = self._buf_index()
         while len(self._buffer) <= buf_index:
             if self.finished:
-                raise MatchError(f"Expected token at position {buf_index + self.forgotten_len}, but iterator is finished")
-
+                raise MatchError(
+                    f"Expected token at position {buf_index + self.forgotten_len}, but iterator is finished"
+                )
 
         if pat is not None and isinstance(pat, CheckSingleBase):
             require_resolved = pat.__class__.require_resolved()
@@ -90,7 +93,6 @@ class TokenBuffer:
             return tok2
         return tok
 
-
     @property
     def finished(self) -> bool:
         if self._finished:
@@ -102,13 +104,10 @@ class TokenBuffer:
             self._finished = True
             return True
 
-
-
     def resolved(self, idx: int) -> bool:
         self.current_rel_index = idx
         buf_index = self._buf_index()
         return buf_index < len(self._buffer) and not isinstance(self._buffer[buf_index], TokenRaw)
-
 
 
 class PatternElem:
@@ -144,8 +143,9 @@ class CheckSingleBase(PatternElem, ABC):
         pass
 
     def get_token(self, buf, vocab_manager):
-        return buf.getCurrent(require_resolved=self.__class__.require_resolved(), pat=self.pat,
-                              vocab_manager=vocab_manager)
+        return buf.getCurrent(
+            require_resolved=self.__class__.require_resolved(), pat=self.pat, vocab_manager=vocab_manager
+        )
 
     @classmethod
     def _format_enum(cls, value):
@@ -159,7 +159,7 @@ class CheckSingleBase(PatternElem, ABC):
         expected = self.pat
         actual = self.__class__.get_check_property(tok, self.pat)
         class_name = self.__class__.__name__.replace("Elem", "")
-        if hasattr(self, 'value'):
+        if hasattr(self, "value"):
             expected = self.value
         expected_str = self._format_enum(expected)
         actual_str = self._format_enum(actual)
@@ -173,15 +173,18 @@ class CheckSingleBase(PatternElem, ABC):
             f"{class_name}: Token at position {buf.current_index} expected {expected_str}, got {actual_str}"
         )
 
+
 class RequireResolved(CheckSingleBase):
     @classmethod
     def require_resolved(cls):
         return True
 
+
 class AllowUnresolved(CheckSingleBase):
     @classmethod
     def require_resolved(cls):
         return False
+
 
 class TokenTypeElem(AllowUnresolved):
     class_field = TokenType
@@ -196,7 +199,7 @@ class TokenTypeElem(AllowUnresolved):
     #         return f"TokenType ({self.pat.name})"
     #     return f"TokenType ({self.pat})"
 
-    def with_value(self, value) -> Optional['WithValueSequence']:
+    def with_value(self, value) -> Optional["WithValueSequence"]:
         result = None
         if self.pat == TokenType.BLOCK:
             result = BlockWithValue(value)
@@ -208,9 +211,9 @@ class TokenTypeElem(AllowUnresolved):
         if result is not None:
             return WithValueSequence(self, result)
 
-
     def __repr__(self):
         return f"{camelcase(self.pat.name)}"
+
 
 class PlatformInstructionTypesElem(RequireResolved):
     class_field = PlatformInstructionTypes
@@ -227,6 +230,7 @@ class PlatformInstructionTypesElem(RequireResolved):
     def __repr__(self):
         return f"Insn{camelcase(self.pat.name)}"
 
+
 class MemoryOperandSymbolElem(RequireResolved):
     class_field = MemoryOperandSymbol
 
@@ -242,6 +246,7 @@ class MemoryOperandSymbolElem(RequireResolved):
     def __repr__(self):
         return f"Mem{camelcase(self.pat.name)}"
 
+
 class WithValueBase(RequireResolved, ABC):
     unresolved_value = None
 
@@ -250,6 +255,7 @@ class WithValueBase(RequireResolved, ABC):
 
     def __str__(self):
         return str(self.pat)
+
 
 class OpaqueWithValue(WithValueBase):
     unresolved_value = TokenType.OPAQUE_CONST
@@ -261,9 +267,9 @@ class OpaqueWithValue(WithValueBase):
     def get_check_property(cls, tok, pat):
         return tok.id
 
-
     def __repr__(self):
         return f"OpaqueWithValue ({self.pat})"
+
 
 class ValuedWithValue(WithValueBase):
     unresolved_value = TokenType.VALUED_CONST
@@ -311,8 +317,10 @@ class MaybeElem(PatternElem):
 
     def __str__(self):
         return f"Maybe + {str(self.pat)}"
+
     def __repr__(self):
         return f"Maybe + {repr(self.pat)}"
+
 
 class MultiElem(PatternElem):
     def __init__(self, pat):
@@ -346,8 +354,10 @@ class MultiElem(PatternElem):
 
     def __str__(self):
         return f"Multi + {str(self.pat)}"
+
     def __repr__(self):
         return f"Multi + {repr(self.pat)}"
+
 
 class Alternatives(PatternElem):
     def __init__(self, alternatives: List[PatternElem]):
@@ -377,10 +387,11 @@ class Alternatives(PatternElem):
 
     def __str__(self):
         return "(" + " | ".join(str(alt) for alt in self.alternatives) + ")"
-    def __repr__(self):
 
+    def __repr__(self):
         return "(" + " | ".join(repr(alt) for alt in self.alternatives) + ")"
         # return f"Alternatives({", ".join(repr(elem) for elem in self.alternatives)})"
+
 
 class LookaheadElem(PatternElem):
     def __init__(self, pat_elem):
@@ -404,11 +415,13 @@ class LookaheadElem(PatternElem):
 
     def __str__(self):
         return f"Lookahead + {str(self.pat_elem)}"
+
     def __repr__(self):
         return f"Lookahead + {repr(self.pat_elem)}"
 
+
 class Sequence(PatternElem):
-    def __init__(self, sequence: List['PatternElem']):
+    def __init__(self, sequence: List["PatternElem"]):
         super().__init__()
         self.sequence = sequence
 
@@ -437,16 +450,18 @@ class Sequence(PatternElem):
         return "[" + ", ".join(repr(elem) for elem in self.sequence) + "]"
         # return f"Sequence[{", ".join(repr(elem) for elem in self.sequence)}]"
 
+
 class WithValueSequence(Sequence):
     def __init__(self, unresolved: AllowUnresolved, value: WithValueBase):
         super().__init__([LookaheadElem(unresolved), value])
 
     def __str__(self):
         return f"{self.sequence[0].pat_elem} + {self.sequence[1]}"
+
     def __repr__(self):
         return f"{repr(self.sequence[0].pat_elem)} + {repr(self.sequence[1])}"
 
 
 def camelcase(name):
-    parts = name.lower().split('_')
-    return parts[0].capitalize() + ''.join(p.capitalize() for p in parts[1:])
+    parts = name.lower().split("_")
+    return parts[0].capitalize() + "".join(p.capitalize() for p in parts[1:])

@@ -37,11 +37,7 @@ def parse_escaped_function_names(called_str: str) -> List[str]:
     current = []
     i = 0
     while i < len(called_str):
-        if (
-            called_str[i] == "\\"
-            and i + 1 < len(called_str)
-            and called_str[i + 1] == ","
-        ):
+        if called_str[i] == "\\" and i + 1 < len(called_str) and called_str[i + 1] == ",":
             current.append(",")
             i += 2
         elif called_str[i] == ",":

@@ -53,9 +53,7 @@ class AlignedDataLoader:
         self.rng = np.random.default_rng(seed)
 
         # Load datasets
-        self.datasets = {
-            name: BinaryDataset(self.base_path, name) for name in binary_names
-        }
+        self.datasets = {name: BinaryDataset(self.base_path, name) for name in binary_names}
 
         # Build global indices
         self._build_indices()
@@ -65,24 +63,18 @@ class AlignedDataLoader:
         # Matched functions: (binary_name, idx)
         self.matched_indices = []
         for binary_name, dataset in self.datasets.items():
-            indices = dataset.get_matched_indices_in_range(
-                self.min_length, self.max_length
-            )
+            indices = dataset.get_matched_indices_in_range(self.min_length, self.max_length)
             for idx in indices:
                 self.matched_indices.append((binary_name, int(idx)))
 
         # Unmatched functions: (binary_name, idx)
         self.unmatched_indices = []
         for binary_name, dataset in self.datasets.items():
-            indices = dataset.get_unmatched_indices_in_range(
-                self.min_length, self.max_length
-            )
+            indices = dataset.get_unmatched_indices_in_range(self.min_length, self.max_length)
             for idx in indices:
                 self.unmatched_indices.append((binary_name, int(idx)))
 
-    def load_matched_functions(
-        self, n: int, target_length: Optional[int] = None
-    ) -> List[MatchedFunction]:
+    def load_matched_functions(self, n: int, target_length: Optional[int] = None) -> List[MatchedFunction]:
         """
         Load N random matched functions of the same or similar length.
 
@@ -164,9 +156,7 @@ class AlignedDataLoader:
         if n == 0:
             return []
 
-        selected_idx = self.rng.choice(
-            len(self.unmatched_indices), size=n, replace=False
-        )
+        selected_idx = self.rng.choice(len(self.unmatched_indices), size=n, replace=False)
 
         functions = []
         for idx in selected_idx:
@@ -176,9 +166,7 @@ class AlignedDataLoader:
 
         return functions
 
-    def load_random_sections(
-        self, n: int
-    ) -> List[Union[FunctionData, MatchedFunction]]:
+    def load_random_sections(self, n: int) -> List[Union[FunctionData, MatchedFunction]]:
         """
         Load N random function sections (mixed matched and unmatched).
 
@@ -209,9 +197,7 @@ class AlignedDataLoader:
 
         # Load both types
         matched = self.load_matched_functions(n_matched) if n_matched > 0 else []
-        unmatched = (
-            self.load_unmatched_functions(n_unmatched) if n_unmatched > 0 else []
-        )
+        unmatched = self.load_unmatched_functions(n_unmatched) if n_unmatched > 0 else []
 
         # Combine and shuffle
         all_functions = matched + unmatched
@@ -231,12 +217,8 @@ class AlignedDataLoader:
         }
 
         for binary_name, dataset in self.datasets.items():
-            matched_in_range = len(
-                dataset.get_matched_indices_in_range(self.min_length, self.max_length)
-            )
-            unmatched_in_range = len(
-                dataset.get_unmatched_indices_in_range(self.min_length, self.max_length)
-            )
+            matched_in_range = len(dataset.get_matched_indices_in_range(self.min_length, self.max_length))
+            unmatched_in_range = len(dataset.get_unmatched_indices_in_range(self.min_length, self.max_length))
 
             stats["binaries"][binary_name] = {
                 "total_matched": dataset.matched_count,
