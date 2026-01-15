@@ -7,7 +7,7 @@ import numpy.typing as npt
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.token_utils import TokenUtils
 from tokenizer.tokens import Tokens, TokenType, PlatformToken, ValuedConstToken, IdentifierToken, BlockDefToken, \
-    BlockToken, OpaqueConstToken, MemoryOperandToken, MemoryOperandSymbol, LitTokenType
+    BlockToken, OpaqueConstToken, MemoryOperandToken, MemoryOperandSymbol, LitTokenType, LocalFunctionToken
 
 
 class VocabularyManager:
@@ -626,6 +626,26 @@ class VocabularyManager:
         # Ensure OpaqueConstInner conforms to both protocols
         assert issubclass(OpaqueConstInner, IdentifierToken)
         assert issubclass(OpaqueConstInner, OpaqueConstToken)
+
+        class LocalFunctionInner(IdentifierInner, LocalFunctionToken):
+            """Represents local function identifiers - used by inlining matcher, not by tokenizer"""
+
+            __slots__ = ()
+
+            def __init__(self, local_function_id: int):
+                super().__init__(local_function_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "LOCAL_FUNCTION"
+
+            def to_asm_like(self) -> str:
+                return f"local_fn:{self.id}"
+
+        # Ensure LocalFunctionInner conforms to both protocols
+        assert issubclass(LocalFunctionInner, IdentifierToken)
+        assert issubclass(LocalFunctionInner, LocalFunctionToken)
+
 
         class MemoryOperandTokenInner(TokensInner, MemoryOperandToken):
             """Represents memory operand symbols like [, ], +, *"""
