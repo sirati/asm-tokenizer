@@ -54,10 +54,13 @@ class FunctionTokenList:
     ) -> "FunctionTokenList":
         """Remaps token ids to string representation."""
         result = FunctionTokenList(num_blocks=-1, vocab_manager=vocab_manager, init=False)
-        if vocab_manager is None:
-            token_types = np.full_like(tokens, fill_value=TokenType.UNRESOLVED, dtype=np.int16)
-        else:
-            token_types = vocab_manager.id_to_token_type[tokens]
+        
+        # todo why are we doing this if we are not using it
+        # todo !!! check if commenting this out changed semantics
+        # if vocab_manager is None:
+        #     token_types = np.full_like(tokens, fill_value=TokenType.UNRESOLVED, dtype=np.int16)
+        # else:
+        #     token_types = vocab_manager.id_to_token_type[tokens]
 
         # Token-level arrays (level 0)
         result.token_ids = tokens.astype(np.int16)
