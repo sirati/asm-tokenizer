@@ -144,7 +144,7 @@ def get_called_functions(row):
                 name = entry[2]
                 type_field = entry[3]
                 library_type = entry[4]
-                if library_type == "function" or "function" in type_field:
+                if type_field == "local_function":
                     called.add(name)
         return sorted(called)
     except Exception:
@@ -176,6 +176,7 @@ def write_function_sections(
     index_entries = []
 
     for func_name in function_names:
+        dedup_cache = {}
         section_start = file1.tell()
 
         all_called_by_vkey = {}
@@ -204,7 +205,7 @@ def write_function_sections(
             tokens = decode_and_translate_tokens(row, mapping)
             block_runlength, insn_runlength = decode_runlengths(row)
             data_offset, data_len = write_function_binary_data(
-                file2, tokens, block_runlength, insn_runlength
+                file2, tokens, block_runlength, insn_runlength, dedup_cache
             )
 
             inlining_data = {}
@@ -254,6 +255,7 @@ def write_unmatched_files(
     file1 = open(f"{out_path}/{prefix}_data.bin", "wb")
     file2 = open(f"{out_path}/{prefix}_index.bin", "wb")
     for func_name in function_names:
+        dedup_cache = {}
         for vkey in version_keys:
             row = all_data[vkey].get(func_name)
             if not row:
@@ -262,7 +264,7 @@ def write_unmatched_files(
             tokens = decode_and_translate_tokens(row, mapping)
             block_runlength, insn_runlength = decode_runlengths(row)
             data_offset, data_len = write_function_binary_data(
-                file1, tokens, block_runlength, insn_runlength
+                file1, tokens, block_runlength, insn_runlength, dedup_cache
             )
             write_index_entry(file2, data_offset, data_len, len(tokens))
     file1.close()
@@ -382,6 +384,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                     pass
 
                 matched_functions.add(func_name)
+                matched_dedup_cache = {}
 
                 all_called_by_vkey = {}
                 for vkey, row in zip(version_keys, rows):
@@ -407,7 +410,11 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                     tokens = decode_and_translate_tokens(row, mapping)
                     block_runlength, insn_runlength = decode_runlengths(row)
                     data_offset, data_len = write_function_binary_data(
-                        matched_data_file, tokens, block_runlength, insn_runlength
+                        matched_data_file,
+                        tokens,
+                        block_runlength,
+                        insn_runlength,
+                        matched_dedup_cache,
                     )
 
                     version_data.append(
@@ -431,6 +438,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             elif count == 1:
                 if func_name.startswith(".L"):
                     continue
+                unmatched_dedup_cache = {}
                 for vkey, row in zip(version_keys, rows):
                     if row is None:
                         continue
@@ -448,7 +456,11 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                         tokens = decode_and_translate_tokens(row, mapping)
                         block_runlength, insn_runlength = decode_runlengths(row)
                         data_offset, data_len = write_function_binary_data(
-                            unmatched_data_file, tokens, block_runlength, insn_runlength
+                            unmatched_data_file,
+                            tokens,
+                            block_runlength,
+                            insn_runlength,
+                            unmatched_dedup_cache,
                         )
 
                         unmatched_data_entries.append(
