@@ -218,7 +218,7 @@ def write_function_sections(
                     inlining_data[called_idx] = (func_offset, func_len, is_matched)
                 else:
                     warn_log.write(
-                        f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                        f"unknown local func called: {func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
                     )
 
             inlining_list = [
