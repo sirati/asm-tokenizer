@@ -413,6 +413,11 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                 )
                 if entry is not None:
                     matched_data_entries.append(entry)
+                else:
+                    entries = process_unmatched_function_pass1(
+                        func_name, rows, version_keys, mapping_dict, unmatched_data_file
+                    )
+                    unmatched_data_entries.extend(entries)
 
             elif count == 1:
                 entries = process_unmatched_function_pass1(
