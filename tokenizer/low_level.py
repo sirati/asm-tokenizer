@@ -869,8 +869,6 @@ def main():
 
     args = parser.parse_args()
 
-    platform = args.platform
-
     # Get current working directory and resolve source/output paths
     cwd = Path.cwd()
     source_dir = (cwd / args.source).resolve()
@@ -878,10 +876,13 @@ def main():
 
     print(f"[*] Source directory: {source_dir}")
     print(f"[*] Output directory: {output_dir}")
-
+    
+    if (args.debugs or args.debugl) and args.platform == "file_prefix":
+        args.platform = "x86"
+        
     # Common parameters for run_tokenizer
     common_params = dict(
-        platform=platform,
+        platform=args.platform,
         skip_existing_csv=args.skip_existing,
         source_dir=source_dir,
         output_dir=output_dir,
@@ -934,13 +935,13 @@ def main():
         print(f"[*] Processing single binary: {binary_path}")
         run_tokenizer(binary_path, **common_params)
     elif args.debugs:
-        binary_path = source_dir / f"clamav/{platform}-gcc-5-O3_minigzipsh"
+        binary_path = source_dir / f"clamav/{args.platform}-gcc-5-O3_minigzipsh"
         print(f"[*] Debug mode (gcc): {binary_path}")
         debug_params = common_params.copy()
         debug_params.update(dict(skip_existing_csv=False))
         run_tokenizer(binary_path, **debug_params)
     elif args.debugl:
-        binary_path = source_dir / f"clamav/{platform}-clang-5.0-O1_sigtool"
+        binary_path = source_dir / f"clamav/{args.platform}-clang-5.0-O1_sigtool"
         print(f"[*] Debug mode (clang): {binary_path}")
         debug_params = common_params.copy()
         debug_params.update(dict(skip_existing_csv=False))
