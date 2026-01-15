@@ -1,0 +1,137 @@
+import csv
+from typing import List, Tuple
+
+from .csv_format import format_compiler_sets, format_unique_called
+from .export_helpers import InliningEntry, format_inlining_list
+from .io import (
+    write_function_section_csv,
+    write_index_entry,
+    write_unmatched_section_csv,
+)
+
+
+def write_matched_function_section(
+    writer,
+    func_name: str,
+    unique_called: List[str],
+    version_data_list: List[dict],
+    function_lookup: dict,
+    warn_log,
+) -> Tuple[int, int]:
+    """
+    Write a complete matched function section (header + version rows).
+    Returns (section_start, section_length) for index.
+    """
+    section_start_pos = writer.dialect  # Placeholder for file position tracking
+    unique_called_str = format_unique_called(unique_called)
+    writer.writerow([func_name, unique_called_str])
+
+    total_len = 0
+    for vdata in version_data_list:
+        vkey = vdata["vkey"]
+        called = vdata["called"]
+        data_offset = vdata["data_offset"]
+        data_len = vdata["data_len"]
+        token_len = vdata["token_len"]
+
+        inlining_data = {}
+        for called_func in called:
+            called_idx = unique_called.index(called_func)
+            lookup_key = (called_func, vkey)
+            if lookup_key in function_lookup:
+                func_offset, func_len, is_matched = function_lookup[lookup_key]
+                inlining_data[called_idx] = (func_offset, func_len, is_matched)
+            else:
+                warn_log.write(
+                    f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                )
+
+        inlining_list = [
+            [idx, start, length, is_matched]
+            for idx, (start, length, is_matched) in sorted(inlining_data.items())
+        ]
+
+        write_function_section_csv(
+            writer,
+            vkey.arch,
+            vkey.compiler,
+            vkey.compilerversion,
+            vkey.opt,
+            inlining_list,
+            data_offset,
+            data_len,
+        )
+        total_len += token_len
+
+    writer.writerow([])
+    return total_len
+
+
+def write_unmatched_function_section(
+    writer,
+    func_name: str,
+    platform_tuples: List[Tuple[str, str, str, str]],
+    unique_called_list: List[str],
+    inlining_data_list: List,
+    first_offset: int,
+    first_len: int,
+):
+    """Write a single-line unmatched function section."""
+    called_str = format_unique_called(unique_called_list)
+    inlining_data_str = ";".join(
+        f"{idx},{offset:x},{length:x},{is_matched}"
+        for idx, offset, length, is_matched in inlining_data_list
+    )
+
+    write_unmatched_section_csv(
+        writer,
+        func_name,
+        platform_tuples,
+        called_str,
+        inlining_data_str,
+        first_offset,
+        first_len,
+    )
+
+
+def finalize_index_file(
+    index_file, index_entries: List[Tuple[int, int, int]], sort_by_avg_len: bool = True
+):
+    """Write sorted index entries to index file."""
+    sorted_entries = (
+        sorted(index_entries, key=lambda x: x[2]) if sort_by_avg_len else index_entries
+    )
+    for start, length, avg_len in sorted_entries:
+        write_index_entry(index_file, start, length, avg_len)
+
+
+def build_inlining_data_for_unmatched(
+    called_by_version: List[Tuple[int, set]],
+    unique_called_list: List[str],
+    vkeys: List,
+    function_lookup: dict,
+    warn_log,
+    func_name: str,
+) -> List:
+    """Build inlining data list for unmatched functions with compiler_set_id-called_func_id format."""
+    inlining_data_list = []
+    for comp_set_id, called_funcs in called_by_version:
+        for called_func in called_funcs:
+            called_func_id = unique_called_list.index(called_func)
+            lookup_key = (called_func, vkeys[comp_set_id])
+            if lookup_key in function_lookup:
+                func_offset, func_len, is_matched = function_lookup[lookup_key]
+                inlining_data_list.append(
+                    [
+                        f"{comp_set_id}-{called_func_id}",
+                        func_offset,
+                        func_len,
+                        is_matched,
+                    ]
+                )
+            else:
+                vkey = vkeys[comp_set_id]
+                warn_log.write(
+                    f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                )
+    return inlining_data_list

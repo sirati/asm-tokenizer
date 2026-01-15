@@ -7,14 +7,21 @@ from pathlib import Path
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.data_loader import load_vocab_manager
 
+from .csv_format import format_unique_called
+from .export_helpers import (
+    build_inlining_data,
+    collect_unique_called_functions,
+    format_inlining_list,
+    get_called_functions_from_row,
+    process_function_binary_data,
+)
+from .export_writers import finalize_index_file
 from .io import (
     decode_and_translate_tokens,
     decode_runlengths,
-    format_unique_called,
     write_function_binary_data,
     write_function_section_csv,
     write_index_entry,
-    write_unmatched_section_csv,
 )
 from .match import is_vocab_row, lockstep_function_match
 
@@ -134,21 +141,7 @@ def load_all_function_data(versions, function_names):
 
 def get_called_functions(row):
     """Extract called function names from opaque_metadata field."""
-    opaque_metadata = row.get("opaque_metadata", "")
-    try:
-        import ast
-
-        meta = ast.literal_eval(opaque_metadata)
-        called = set()
-        for entry in meta:
-            if isinstance(entry, tuple) and len(entry) >= 5:
-                name = entry[2]
-                type_field = entry[3]
-                if type_field == "local_function":
-                    called.add(name)
-        return sorted(called)
-    except Exception:
-        return []
+    return get_called_functions_from_row(row)
 
 
 def compute_avg_function_length(tokens):
@@ -186,8 +179,8 @@ def write_function_sections(
             if row:
                 all_called_by_vkey[vkey] = get_called_functions(row)
 
-        unique_called = sorted(
-            set(fn for called_list in all_called_by_vkey.values() for fn in called_list)
+        unique_called = collect_unique_called_functions(
+            all_called_by_vkey, version_keys
         )
         unique_called_str = format_unique_called(unique_called)
         writer.writerow([func_name, unique_called_str])
@@ -203,28 +196,11 @@ def write_function_sections(
             called = all_called_by_vkey[vkey]
 
             mapping = mapping_dict.get(vkey)
-            tokens = decode_and_translate_tokens(row, mapping)
-            block_runlength, insn_runlength = decode_runlengths(row)
-            data_offset, data_len = write_function_binary_data(
-                file2, tokens, block_runlength, insn_runlength, dedup_cache
+            binary_data = process_function_binary_data(row, mapping, file2, dedup_cache)
+
+            inlining_list = build_inlining_data(
+                called, unique_called, vkey, function_lookup, warn_log, func_name
             )
-
-            inlining_data = {}
-            for called_func in called:
-                called_idx = unique_called.index(called_func)
-                lookup_key = (called_func, vkey)
-                if lookup_key in function_lookup:
-                    func_offset, func_len, is_matched = function_lookup[lookup_key]
-                    inlining_data[called_idx] = (func_offset, func_len, is_matched)
-                else:
-                    warn_log.write(
-                        f"unknown local func called: {func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-                    )
-
-            inlining_list = [
-                [idx, start, length, is_matched]
-                for idx, (start, length, is_matched) in sorted(inlining_data.items())
-            ]
 
             write_function_section_csv(
                 writer,
@@ -232,19 +208,18 @@ def write_function_sections(
                 vkey.compiler,
                 vkey.compilerversion,
                 vkey.opt,
-                inlining_list,
-                data_offset,
-                data_len,
+                format_inlining_list(inlining_list),
+                binary_data.data_offset,
+                binary_data.data_len,
             )
             func_section_len += 1
-            total_len += len(tokens)
+            total_len += binary_data.token_len
 
         avg_len = total_len // func_section_len if func_section_len > 0 else 0
         index_entries.append((section_start, file1.tell() - section_start, avg_len))
         writer.writerow([])
 
-    for start, length, avg_len in sorted(index_entries, key=lambda x: x[2]):
-        write_index_entry(file3, start, length, avg_len)
+    finalize_index_file(file3, index_entries, sort_by_avg_len=True)
 
     file1.close()
     file2.close()
@@ -261,6 +236,11 @@ def write_unmatched_files(
     function_lookup,
     warn_log,
 ):
+    from .export_writers import (
+        build_inlining_data_for_unmatched,
+        write_unmatched_function_section,
+    )
+
     prefix = f"{binary_name}_unmatched"
     sections_file = open(
         f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
@@ -286,58 +266,38 @@ def write_unmatched_files(
             all_called.update(called)
 
             mapping = mapping_dict.get(vkey)
-            tokens = decode_and_translate_tokens(row, mapping)
-            block_runlength, insn_runlength = decode_runlengths(row)
-            data_offset, data_len = write_function_binary_data(
-                data_file, tokens, block_runlength, insn_runlength, dedup_cache
+            binary_data = process_function_binary_data(
+                row, mapping, data_file, dedup_cache
             )
 
             platform_tuples.append(
                 (vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt)
             )
-            version_data_list.append((data_offset, data_len, len(tokens)))
+            version_data_list.append(
+                (binary_data.data_offset, binary_data.data_len, binary_data.token_len)
+            )
             called_by_version.append((compiler_set_id, called))
             compiler_set_id += 1
 
         if version_data_list:
             unique_called_list = sorted(all_called)
-            called_str = format_unique_called(unique_called_list)
             first_offset, first_len = version_data_list[0][0], version_data_list[0][1]
 
-            inlining_data_list = []
-            for comp_set_id, called_funcs in called_by_version:
-                for called_func in called_funcs:
-                    called_func_id = unique_called_list.index(called_func)
-                    lookup_key = (called_func, version_keys[comp_set_id])
-                    if lookup_key in function_lookup:
-                        func_offset, func_len, is_matched = function_lookup[lookup_key]
-                        inlining_data_list.append(
-                            [
-                                f"{comp_set_id}-{called_func_id}",
-                                func_offset,
-                                func_len,
-                                is_matched,
-                            ]
-                        )
-                    else:
-                        vkey = version_keys[comp_set_id]
-                        warn_log.write(
-                            f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-                        )
-
-            from .io import write_unmatched_section_csv
-
-            inlining_data_str = ";".join(
-                f"{idx},{offset:x},{length:x},{is_matched}"
-                for idx, offset, length, is_matched in inlining_data_list
+            inlining_data_list = build_inlining_data_for_unmatched(
+                called_by_version,
+                unique_called_list,
+                version_keys,
+                function_lookup,
+                warn_log,
+                func_name,
             )
 
-            write_unmatched_section_csv(
+            write_unmatched_function_section(
                 sections_writer,
                 func_name,
                 platform_tuples,
-                called_str,
-                inlining_data_str,
+                unique_called_list,
+                inlining_data_list,
                 first_offset,
                 first_len,
             )
@@ -406,6 +366,14 @@ def process_unmatched_too_long(
 
 
 def export_matched_and_unmatched_sets(binaries, output_path):
+    from .export_passes import (
+        build_function_lookup_table,
+        process_matched_function_pass1,
+        process_unmatched_function_pass1,
+        write_matched_sections_pass2,
+        write_unmatched_sections_pass2,
+    )
+
     for binary, versions in binaries.items():
         print(f"Binary: {binary}")
         mapping_dict = {}
@@ -428,10 +396,8 @@ def export_matched_and_unmatched_sets(binaries, output_path):
         prefix = binary
         unmatched_prefix = f"{binary}_unmatched"
 
-        # Pass 1: Write all binary data and build lookup tables
         matched_data_entries = []
         unmatched_data_entries = []
-        matched_functions = set()
 
         matched_data_file = open(f"{out_path}/{prefix}_data.bin", "wb")
         unmatched_data_file = open(f"{out_path}/{unmatched_prefix}_data.bin", "wb")
@@ -442,324 +408,61 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             count = match_data["count"]
 
             if count >= 2:
-                if func_name.startswith(".L"):
-                    continue
-                try:
-                    from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-
-                    passes_filter = True
-                    for row in rows:
-                        if row is not None and "block_runlength" in row:
-                            if (
-                                base64_to_ndarray_vec(row["block_runlength"]).sum()
-                                >= 4096
-                            ):
-                                passes_filter = False
-                                break
-
-                    if not passes_filter:
-                        continue
-                except Exception:
-                    pass
-
-                matched_functions.add(func_name)
-                matched_dedup_cache = {}
-
-                all_called_by_vkey = {}
-                for vkey, row in zip(version_keys, rows):
-                    if row is not None:
-                        all_called_by_vkey[vkey] = get_called_functions(row)
-
-                unique_called = sorted(
-                    set(
-                        fn
-                        for called_list in all_called_by_vkey.values()
-                        for fn in called_list
-                    )
+                entry = process_matched_function_pass1(
+                    func_name, rows, version_keys, mapping_dict, matched_data_file
                 )
-
-                version_data = []
-                for vkey, row in zip(version_keys, rows):
-                    if row is None:
-                        continue
-
-                    called = all_called_by_vkey[vkey]
-
-                    mapping = mapping_dict.get(vkey)
-                    tokens = decode_and_translate_tokens(row, mapping)
-                    block_runlength, insn_runlength = decode_runlengths(row)
-                    data_offset, data_len = write_function_binary_data(
-                        matched_data_file,
-                        tokens,
-                        block_runlength,
-                        insn_runlength,
-                        matched_dedup_cache,
-                    )
-
-                    version_data.append(
-                        {
-                            "vkey": vkey,
-                            "called": called,
-                            "data_offset": data_offset,
-                            "data_len": data_len,
-                            "token_len": len(tokens),
-                        }
-                    )
-
-                matched_data_entries.append(
-                    {
-                        "func_name": func_name,
-                        "unique_called": unique_called,
-                        "version_data": version_data,
-                    }
-                )
+                if entry is not None:
+                    matched_data_entries.append(entry)
 
             elif count == 1:
-                if func_name.startswith(".L"):
-                    continue
-                unmatched_dedup_cache = {}
-                platform_tuples = []
-                all_called = set()
-                version_data_list = []
-
-                for vkey, row in zip(version_keys, rows):
-                    if row is None:
-                        continue
-                    try:
-                        from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-
-                        if "block_runlength" in row:
-                            if (  # todo I do not understand why we have to do this here, i believe we want all functoins including longer ones in the unmatched data
-                                base64_to_ndarray_vec(row["block_runlength"]).sum()
-                                < 4096
-                            ):
-                                continue
-
-                        called = get_called_functions(row)
-                        all_called.update(called)
-
-                        mapping = mapping_dict.get(vkey)
-                        tokens = decode_and_translate_tokens(row, mapping)
-                        block_runlength, insn_runlength = decode_runlengths(row)
-                        data_offset, data_len = write_function_binary_data(
-                            unmatched_data_file,
-                            tokens,
-                            block_runlength,
-                            insn_runlength,
-                            unmatched_dedup_cache,
-                        )
-
-                        platform_tuples.append(
-                            (vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt)
-                        )
-                        version_data_list.append((data_offset, data_len, len(tokens)))
-
-                        unmatched_data_entries.append(
-                            {
-                                "func_name": func_name,
-                                "vkey": vkey,
-                                "data_offset": data_offset,
-                                "data_len": data_len,
-                                "token_len": len(tokens),
-                                "platform_tuples": platform_tuples,
-                                "called": all_called,
-                                "version_data_list": version_data_list,
-                            }
-                        )
-                    except Exception:
-                        pass
+                entries = process_unmatched_function_pass1(
+                    func_name, rows, version_keys, mapping_dict, unmatched_data_file
+                )
+                unmatched_data_entries.extend(entries)
 
         matched_data_file.close()
         unmatched_data_file.close()
 
-        # Build lookup table: {(func_name, vkey): (offset, length, is_matched)}
-        function_lookup = {}
-        for entry in matched_data_entries:
-            func_name = entry["func_name"]
-            version_data = entry["version_data"]
-            for vdata in version_data:
-                vkey = vdata["vkey"]
-                function_lookup[(func_name, vkey)] = (
-                    vdata["data_offset"],
-                    vdata["data_len"],
-                    1,
-                )
+        function_lookup = build_function_lookup_table(
+            matched_data_entries, unmatched_data_entries
+        )
 
-        for entry in unmatched_data_entries:
-            func_name = entry["func_name"]
-            vkey = entry["vkey"]
-            function_lookup[(func_name, vkey)] = (
-                entry["data_offset"],
-                entry["data_len"],
-                0,
-            )
-
-        # Pass 2: Write CSV files with actual values
-        matched_file1 = open(
+        matched_sections_file = open(
             f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
         )
-        matched_file3 = open(f"{out_path}/{prefix}_index.bin", "wb")
+        matched_index_file = open(f"{out_path}/{prefix}_index.bin", "wb")
         warn_log = open(f"{out_path}/{binary}.warn.log", "w", encoding="ascii")
-        matched_writer = csv.writer(matched_file1)
-        matched_index_entries = []
 
-        for entry in matched_data_entries:
-            func_name = entry["func_name"]
-            unique_called = entry["unique_called"]
-            version_data = entry["version_data"]
+        write_matched_sections_pass2(
+            matched_data_entries,
+            function_lookup,
+            matched_sections_file,
+            matched_index_file,
+            warn_log,
+        )
 
-            section_start = matched_file1.tell()
-            unique_called_str = format_unique_called(unique_called)
-            matched_writer.writerow([func_name, unique_called_str])
+        matched_sections_file.close()
+        matched_index_file.close()
 
-            total_len = 0
-            for vdata in version_data:
-                vkey = vdata["vkey"]
-                called = vdata["called"]
-                data_offset = vdata["data_offset"]
-                data_len = vdata["data_len"]
-                token_len = vdata["token_len"]
-
-                inlining_data = {}
-                for called_func in called:
-                    called_idx = unique_called.index(called_func)
-                    lookup_key = (called_func, vkey)
-                    if lookup_key in function_lookup:
-                        func_offset, func_len, is_matched = function_lookup[lookup_key]
-                        inlining_data[called_idx] = (func_offset, func_len, is_matched)
-                    else:
-                        warn_log.write(
-                            f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-                        )
-
-                inlining_list = [
-                    [idx, start, length, is_matched]
-                    for idx, (start, length, is_matched) in sorted(
-                        inlining_data.items()
-                    )
-                ]
-
-                write_function_section_csv(
-                    matched_writer,
-                    vkey.arch,
-                    vkey.compiler,
-                    vkey.compilerversion,
-                    vkey.opt,
-                    inlining_list,
-                    data_offset,
-                    data_len,
-                )
-                total_len += token_len
-
-            avg_len = total_len // len(version_data) if version_data else 0
-            matched_index_entries.append(
-                (section_start, matched_file1.tell() - section_start, avg_len)
-            )
-            matched_writer.writerow([])
-
-        for start, length, avg_len in sorted(matched_index_entries, key=lambda x: x[2]):
-            write_index_entry(matched_file3, start, length, avg_len)
-
-        matched_file1.close()
-        matched_file3.close()
-        warn_log.close()
-
-        # Write unmatched sections and index
         unmatched_sections_file = open(
             f"{out_path}/{unmatched_prefix}_sections.csv",
             "w",
             newline="",
             encoding="ascii",
         )
-        unmatched_file2 = open(f"{out_path}/{unmatched_prefix}_index.bin", "wb")
-        unmatched_writer = csv.writer(unmatched_sections_file)
+        unmatched_index_file = open(f"{out_path}/{unmatched_prefix}_index.bin", "wb")
 
-        # Group unmatched entries by function name
-        unmatched_by_func = {}
-        for entry in unmatched_data_entries:
-            func_name = entry["func_name"]
-            vkey = entry["vkey"]
-            if func_name not in unmatched_by_func:
-                unmatched_by_func[func_name] = {
-                    "platform_tuples": [],
-                    "all_called": set(),
-                    "version_data_list": [],
-                    "called_by_version": [],
-                    "vkeys": [],
-                }
-            unmatched_by_func[func_name]["platform_tuples"].extend(
-                entry.get("platform_tuples", [])
-            )
-            unmatched_by_func[func_name]["all_called"].update(
-                entry.get("called", set())
-            )
-            unmatched_by_func[func_name]["version_data_list"].extend(
-                entry.get("version_data_list", [])
-            )
-            comp_set_id = len(unmatched_by_func[func_name]["vkeys"])
-            unmatched_by_func[func_name]["vkeys"].append(vkey)
-            unmatched_by_func[func_name]["called_by_version"].append(
-                (comp_set_id, entry.get("called", set()))
-            )
-
-        for func_name, data in unmatched_by_func.items():
-            platform_tuples = data["platform_tuples"]
-            all_called = data["all_called"]
-            version_data_list = data["version_data_list"]
-            called_by_version = data["called_by_version"]
-            vkeys = data["vkeys"]
-
-            if version_data_list:
-                unique_called_list = sorted(all_called)
-                called_str = format_unique_called(unique_called_list)
-                first_offset, first_len = (
-                    version_data_list[0][0],
-                    version_data_list[0][1],
-                )
-
-                inlining_data_list = []
-                for comp_set_id, called_funcs in called_by_version:
-                    for called_func in called_funcs:
-                        called_func_id = unique_called_list.index(called_func)
-                        lookup_key = (called_func, vkeys[comp_set_id])
-                        if lookup_key in function_lookup:
-                            func_offset, func_len, is_matched = function_lookup[
-                                lookup_key
-                            ]
-                            inlining_data_list.append(
-                                [
-                                    f"{comp_set_id}-{called_func_id}",
-                                    func_offset,
-                                    func_len,
-                                    is_matched,
-                                ]
-                            )
-                        else:
-                            vkey = vkeys[comp_set_id]
-                            warn_log.write(
-                                f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-                            )
-
-                inlining_data_str = ";".join(
-                    f"{idx},{offset:x},{length:x},{is_matched}"
-                    for idx, offset, length, is_matched in inlining_data_list
-                )
-
-                write_unmatched_section_csv(
-                    unmatched_writer,
-                    func_name,
-                    platform_tuples,
-                    called_str,
-                    inlining_data_str,
-                    first_offset,
-                    first_len,
-                )
-
-                for data_offset, data_len, token_len in version_data_list:
-                    write_index_entry(unmatched_file2, data_offset, data_len, token_len)
+        write_unmatched_sections_pass2(
+            unmatched_data_entries,
+            function_lookup,
+            unmatched_sections_file,
+            unmatched_index_file,
+            warn_log,
+        )
 
         unmatched_sections_file.close()
-        unmatched_file2.close()
+        unmatched_index_file.close()
+        warn_log.close()
 
 
 def run_alignment_export(output_path):
