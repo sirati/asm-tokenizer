@@ -42,6 +42,7 @@ from .io import (
     write_function_binary_data,
     write_function_section_csv,
     write_index_entry,
+    write_unmatched_section_csv,
 )
 from .loader import (
     AlignedDataLoader,
@@ -76,6 +77,7 @@ __all__ = [
     "write_function_binary_data",
     "write_index_entry",
     "write_function_section_csv",
+    "write_unmatched_section_csv",
     "read_index_file",
     "read_sections_file",
     "read_data_file",

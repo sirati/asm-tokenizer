@@ -186,7 +186,9 @@ class BinaryDataset:
                 ) as f:
                     reader = csv.reader(f)
                     for row in reader:
-                        if row and len(row) == 1:  # Section header
+                        if (
+                            row and len(row) == 2
+                        ):  # Section header: func_name, called_functions
                             self.matched_func_names.append(row[0])
             else:
                 self.matched_count = 0
@@ -222,18 +224,33 @@ class BinaryDataset:
                 else:
                     self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
                     self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
+
+                # Build function names from unmatched sections file
+                self.unmatched_func_names = []
+                if self.unmatched_sections.exists():
+                    with open(
+                        self.unmatched_sections, "r", newline="", encoding="ascii"
+                    ) as f:
+                        reader = csv.reader(f)
+                        for row in reader:
+                            if row and len(row) == 5:  # Unmatched format
+                                self.unmatched_func_names.append(row[0])
+                else:
+                    self.unmatched_func_names = []
             else:
                 self.unmatched_count = 0
                 self.unmatched_starts = np.array([], dtype=np.uint32)
                 self.unmatched_lengths = np.array([], dtype=np.uint32)
                 self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
                 self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
+                self.unmatched_func_names = []
         else:
             self.unmatched_count = 0
             self.unmatched_starts = np.array([], dtype=np.uint32)
             self.unmatched_lengths = np.array([], dtype=np.uint32)
             self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
             self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
+            self.unmatched_func_names = []
 
     def get_matched_indices_by_length(
         self, target_length: int, min_count: int = 1
@@ -382,19 +399,20 @@ class BinaryDataset:
             section_data = f.read(length)
 
         lines = section_data.strip().split("\n")
-        func_name = lines[0]
 
-        # Parse versions
+        # Parse first line: func_name, called_functions_str
+        first_line = list(csv.reader([lines[0]]))[0]
+        func_name = first_line[0]
+
+        # Parse versions (remaining lines except empty line at end)
         versions = []
         reader = csv.reader(lines[1:])
         header = [
-            "function_name",
             "arch",
             "compiler",
             "compilerversion",
             "opt",
-            "called",
-            "inlining_map",
+            "inlining_data",
             "data_offset",
             "data_len",
         ]
@@ -435,16 +453,38 @@ class BinaryDataset:
             str(self.unmatched_data), start, length
         )
 
-        # Minimal metadata for unmatched
+        # Try to load metadata from sections file if available
+        func_name = f"unmatched_{idx}"
+        platform_info = "unknown"
+        called = []
+
+        if self.unmatched_sections.exists() and idx < len(self.unmatched_func_names):
+            func_name = self.unmatched_func_names[idx]
+            # Parse sections file for this function
+            with open(self.unmatched_sections, "r", newline="", encoding="ascii") as f:
+                reader = csv.reader(f)
+                for i, row in enumerate(reader):
+                    if i == idx and row and len(row) == 5:
+                        platform_info = row[1]
+                        called_str = row[2]
+                        # Parse called functions (escaped commas)
+                        if called_str:
+                            called = [
+                                name.replace("\\,", ",")
+                                for name in called_str.split(",")
+                                if name
+                            ]
+                        break
+
         metadata = {
             "arch": "unknown",
             "compiler": "unknown",
             "compilerversion": "unknown",
             "opt": "unknown",
-            "called": [],
-            "inlining_map": {},
+            "platform_info": platform_info,
+            "called": called,
             "data_offset": start,
             "data_len": length,
         }
 
-        return FunctionData(f"unmatched_{idx}", metadata, tokens, insn_rl, block_rl)
+        return FunctionData(func_name, metadata, tokens, insn_rl, block_rl)

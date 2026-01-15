@@ -14,6 +14,7 @@ from .io import (
     write_function_binary_data,
     write_function_section_csv,
     write_index_entry,
+    write_unmatched_section_csv,
 )
 from .match import is_vocab_row, lockstep_function_match
 
@@ -143,7 +144,6 @@ def get_called_functions(row):
             if isinstance(entry, tuple) and len(entry) >= 5:
                 name = entry[2]
                 type_field = entry[3]
-                library_type = entry[4]
                 if type_field == "local_function":
                     called.add(name)
         return sorted(called)
@@ -252,23 +252,60 @@ def write_unmatched_files(
     out_path, function_names, version_keys, all_data, mapping_dict, binary_name
 ):
     prefix = f"{binary_name}_unmatched"
-    file1 = open(f"{out_path}/{prefix}_data.bin", "wb")
-    file2 = open(f"{out_path}/{prefix}_index.bin", "wb")
+    sections_file = open(
+        f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii"
+    )
+    data_file = open(f"{out_path}/{prefix}_data.bin", "wb")
+    index_file = open(f"{out_path}/{prefix}_index.bin", "wb")
+    sections_writer = csv.writer(sections_file)
+
     for func_name in function_names:
         dedup_cache = {}
+        platform_tuples = []
+        all_called = set()
+        version_data_list = []
+
         for vkey in version_keys:
             row = all_data[vkey].get(func_name)
             if not row:
                 continue
+
+            called = get_called_functions(row)
+            all_called.update(called)
+
             mapping = mapping_dict.get(vkey)
             tokens = decode_and_translate_tokens(row, mapping)
             block_runlength, insn_runlength = decode_runlengths(row)
             data_offset, data_len = write_function_binary_data(
-                file1, tokens, block_runlength, insn_runlength, dedup_cache
+                data_file, tokens, block_runlength, insn_runlength, dedup_cache
             )
-            write_index_entry(file2, data_offset, data_len, len(tokens))
-    file1.close()
-    file2.close()
+
+            platform_tuples.append(
+                (vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt)
+            )
+            version_data_list.append((data_offset, data_len, len(tokens)))
+
+        if version_data_list:
+            called_str = format_unique_called(sorted(all_called))
+            first_offset, first_len = version_data_list[0][0], version_data_list[0][1]
+
+            from .io import write_unmatched_section_csv
+
+            write_unmatched_section_csv(
+                sections_writer,
+                func_name,
+                platform_tuples,
+                called_str,
+                first_offset,
+                first_len,
+            )
+
+            for data_offset, data_len, token_len in version_data_list:
+                write_index_entry(index_file, data_offset, data_len, token_len)
+
+    sections_file.close()
+    data_file.close()
+    index_file.close()
 
 
 # --- Split out helpers and refactor for clarity ---
@@ -439,6 +476,10 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                 if func_name.startswith(".L"):
                     continue
                 unmatched_dedup_cache = {}
+                platform_tuples = []
+                all_called = set()
+                version_data_list = []
+
                 for vkey, row in zip(version_keys, rows):
                     if row is None:
                         continue
@@ -446,11 +487,14 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                         from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
                         if "block_runlength" in row:
-                            if (
+                            if (  # todo I do not understand why we have to do this here, i believe we want all functoins including longer ones in the unmatched data
                                 base64_to_ndarray_vec(row["block_runlength"]).sum()
                                 < 4096
                             ):
                                 continue
+
+                        called = get_called_functions(row)
+                        all_called.update(called)
 
                         mapping = mapping_dict.get(vkey)
                         tokens = decode_and_translate_tokens(row, mapping)
@@ -463,6 +507,11 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                             unmatched_dedup_cache,
                         )
 
+                        platform_tuples.append(
+                            (vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt)
+                        )
+                        version_data_list.append((data_offset, data_len, len(tokens)))
+
                         unmatched_data_entries.append(
                             {
                                 "func_name": func_name,
@@ -470,6 +519,9 @@ def export_matched_and_unmatched_sets(binaries, output_path):
                                 "data_offset": data_offset,
                                 "data_len": data_len,
                                 "token_len": len(tokens),
+                                "platform_tuples": platform_tuples,
+                                "called": all_called,
+                                "version_data_list": version_data_list,
                             }
                         )
                     except Exception:
@@ -566,15 +618,61 @@ def export_matched_and_unmatched_sets(binaries, output_path):
         matched_file1.close()
         matched_file3.close()
 
-        # Write unmatched index
+        # Write unmatched sections and index
+        unmatched_sections_file = open(
+            f"{out_path}/{unmatched_prefix}_sections.csv",
+            "w",
+            newline="",
+            encoding="ascii",
+        )
         unmatched_file2 = open(f"{out_path}/{unmatched_prefix}_index.bin", "wb")
+        unmatched_writer = csv.writer(unmatched_sections_file)
+
+        # Group unmatched entries by function name
+        unmatched_by_func = {}
         for entry in unmatched_data_entries:
-            write_index_entry(
-                unmatched_file2,
-                entry["data_offset"],
-                entry["data_len"],
-                entry["token_len"],
+            func_name = entry["func_name"]
+            if func_name not in unmatched_by_func:
+                unmatched_by_func[func_name] = {
+                    "platform_tuples": [],
+                    "all_called": set(),
+                    "version_data_list": [],
+                }
+            unmatched_by_func[func_name]["platform_tuples"].extend(
+                entry.get("platform_tuples", [])
             )
+            unmatched_by_func[func_name]["all_called"].update(
+                entry.get("called", set())
+            )
+            unmatched_by_func[func_name]["version_data_list"].extend(
+                entry.get("version_data_list", [])
+            )
+
+        for func_name, data in unmatched_by_func.items():
+            platform_tuples = data["platform_tuples"]
+            all_called = data["all_called"]
+            version_data_list = data["version_data_list"]
+
+            if version_data_list:
+                called_str = format_unique_called(sorted(all_called))
+                first_offset, first_len = (
+                    version_data_list[0][0],
+                    version_data_list[0][1],
+                )
+
+                write_unmatched_section_csv(
+                    unmatched_writer,
+                    func_name,
+                    platform_tuples,
+                    called_str,
+                    first_offset,
+                    first_len,
+                )
+
+                for data_offset, data_len, token_len in version_data_list:
+                    write_index_entry(unmatched_file2, data_offset, data_len, token_len)
+
+        unmatched_sections_file.close()
         unmatched_file2.close()
 
 
