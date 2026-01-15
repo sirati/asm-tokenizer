@@ -144,11 +144,13 @@ class BinaryDataset:
             start = int(starts[i])
             length = int(lengths[i])
             # Read just the header
-            insn_len = data_memmap[start]
-            block_len = int.from_bytes(
-                data_memmap[start + 2 : start + 4].tobytes(), "little"
+            insn_len = int.from_bytes(
+                data_memmap[start : start + 3].tobytes(), "little"
             )
-            token_bytes = length - 4 - insn_len - block_len
+            block_len = int.from_bytes(
+                data_memmap[start + 4 : start + 6].tobytes(), "little"
+            )
+            token_bytes = length - 6 - insn_len - block_len
             token_count = token_bytes // 2  # uint16 tokens
             token_counts.append(token_count)
 

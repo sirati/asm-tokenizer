@@ -1,32 +1,65 @@
 import csv
-from typing import List, Tuple, Dict, Iterator, Any
+from typing import Any, Dict, List
+
 
 def is_vocab_row(row: List[str]) -> bool:
     # Vocab row: field0 == 'vocabulary' and field1 does not start with a digit
-    return row[0] == 'vocabulary' and (not row[1] or not row[1][0].isdigit())
+    return row[0] == "vocabulary" and (not row[1] or not row[1][0].isdigit())
+
 
 def open_csv_skip_vocab(path: str):
-    f = open(path, newline='', encoding='ascii')
+    f = open(path, newline="", encoding="ascii")
     reader = csv.reader(f)
     # Skip header
     header = next(reader)
-    # Advance to first non-vocab row
-    while True:
-        pos = f.tell()
-        try:
-            row = next(reader)
-        except StopIteration:
-            return None, None, None
-        if not is_vocab_row(row):
-            f.seek(pos)
-            break
-    return f, reader, header
 
-def lockstep_function_match(csv_paths: List[str]) -> Iterator[Tuple[str, List[List[str]]]]:
+    # Create an iterator that filters out all vocab rows
+    def row_iterator():
+        for row in reader:
+            if not is_vocab_row(row):
+                yield row
+
+    return f, row_iterator(), header
+
+
+def create_normalized_header(headers: List[List[str]]) -> List[str]:
+    """Create normalized header: union of all headers maintaining order."""
+    normalized_header = []
+    seen_fields = set()
+    for header in headers:
+        for field in header:
+            if field not in seen_fields:
+                normalized_header.append(field)
+                seen_fields.add(field)
+    return normalized_header
+
+
+def create_column_mapping(
+    header: List[str], normalized_header: List[str]
+) -> Dict[str, Any]:
+    """Create mapping from normalized header field to source row index."""
+    header_to_idx = {field: idx for idx, field in enumerate(header)}
+    return {
+        field: header_to_idx.get(field)
+        for field in normalized_header
+        if field in header_to_idx
+    }
+
+
+def normalize_row(row: List[str], column_mapping: Dict[str, int]) -> Dict[str, str]:
+    """Convert a row to a dict using pre-computed column mapping."""
+    if row is None:
+        return None
+    return {field: row[idx] for field, idx in column_mapping.items()}
+
+
+def lockstep_function_match(csv_paths: List[str]):
     """
-    Yields (function_name, [row_per_version]) for all matched functions across all csv_paths.
-    Only yields if all files have the same function_name at the current position, and the function passes the filters.
+    Yields dicts with 'function_name' and 'rows' keys for functions that appear in at least 2 files.
+    Each dict's 'rows' value is a list where each element is either a dict (the CSV row as dict) or None if that version doesn't have the function.
+    Only yields if at least 2 files have the same function_name, and the function passes the filters.
     Assumes function names are sorted in all files.
+    Row dicts are normalized to have all headers from all files (with None for missing fields).
     """
     files = []
     readers = []
@@ -39,51 +72,47 @@ def lockstep_function_match(csv_paths: List[str]) -> Iterator[Tuple[str, List[Li
         files.append(f)
         readers.append(reader)
         headers.append(header)
-        # Read first row
-        while True:
+        # Read first row (vocab rows already skipped by open_csv_skip_vocab)
+        try:
             row = next(reader)
-            if not is_vocab_row(row):
-                break
-        current_rows.append(row)
+            current_rows.append(row)
+        except StopIteration:
+            current_rows.append(None)
+
+    normalized_header = create_normalized_header(headers)
+    column_mappings = [
+        create_column_mapping(header, normalized_header) for header in headers
+    ]
+
     while True:
-        # Get current function names
-        fnames = [row[0] for row in current_rows]
-        # If any file is exhausted, stop
-        if any(f is None for f in current_rows):
+        # Get current function names (None if row is exhausted)
+        fnames = [row[0] if row is not None else None for row in current_rows]
+        # If all files are exhausted, stop
+        if all(f is None for f in fnames):
             break
-        # If all names match and not .L-prefixed and block_runlength < 4096
-        if all(f == fnames[0] for f in fnames) and not fnames[0].startswith('.L'):
-            block_lengths = [row[3] for row in current_rows]
+
+        # Find the minimum function name among non-None entries
+        min_name = min(f for f in fnames if f is not None)
+
+        # Check how many files have this minimum name
+        matching_indices = [i for i, fname in enumerate(fnames) if fname == min_name]
+        count = len(matching_indices)
+
+        # Build result list with normalized row dicts
+        result_rows = [
+            normalize_row(current_rows[i], column_mappings[i])
+            if i in matching_indices
+            else None
+            for i in range(len(csv_paths))
+        ]
+        yield {"function_name": min_name, "rows": result_rows, "count": count}
+
+        # Advance the file(s) with the minimum function name
+        for i in matching_indices:
             try:
-                import numpy as np
-                from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-                if all(base64_to_ndarray_vec(bl).sum() < 4096 for bl in block_lengths):
-                    yield (fnames[0], [row for row in current_rows])
-            except Exception:
-                pass
-            # Advance all
-            for i, reader in enumerate(readers):
-                try:
-                    while True:
-                        row = next(reader)
-                        if not is_vocab_row(row):
-                            current_rows[i] = row
-                            break
-                except StopIteration:
-                    current_rows[i] = None
-        else:
-            # Advance the file(s) with the smallest function name
-            min_name = min(f for f in fnames if f is not None)
-            for i, fname in enumerate(fnames):
-                if fname == min_name:
-                    try:
-                        while True:
-                            row = next(readers[i])
-                            if not is_vocab_row(row):
-                                current_rows[i] = row
-                                break
-                    except StopIteration:
-                        current_rows[i] = None
+                row = next(readers[i])
+                current_rows[i] = row
+            except StopIteration:
+                current_rows[i] = None
     for f in files:
         f.close()
-
