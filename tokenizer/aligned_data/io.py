@@ -71,9 +71,19 @@ def format_inlining_dict(inlining_list):
         return ""
     parts = []
     for idx, start, length, is_matched in inlining_list:
-        hex_start = f"{start:08x}"
-        hex_length = f"{length:08x}"
+        hex_start = f"{start:x}"
+        hex_length = f"{length:x}"
         parts.append(f"{idx},{hex_start},{hex_length},{is_matched}")
+    return ";".join(parts)
+
+
+def format_compiler_sets(compiler_sets):
+    """Format list of compiler set tuples using semicolon separation: arch,compiler,version,opt;..."""
+    if not compiler_sets:
+        return ""
+    parts = []
+    for arch, compiler, compilerversion, opt in compiler_sets:
+        parts.append(f"{arch},{compiler},{compilerversion},{opt}")
     return ";".join(parts)
 
 
@@ -101,8 +111,8 @@ def write_function_section_csv(
             compilerversion,
             opt,
             inlining_str,
-            data_offset,
-            data_len,
+            f"{data_offset:x}",
+            f"{data_len:x}",
         ]
     )
 
@@ -112,21 +122,23 @@ def write_unmatched_section_csv(
     func_name,
     platform_tuples,
     called_functions_str,
+    inlining_data_str,
     data_offset,
     data_len,
 ):
     """
     Write unmatched section row with format:
-    function_name,"(arch,compiler,compilerversion,opt),(arch,compiler,compilerversion,opt)",called_function_string,data_offset,data_len
+    function_name,"compiler_sets","called_functions","inlining_data",data_offset,data_len
     """
-    platform_str = ",".join(f"({p[0]},{p[1]},{p[2]},{p[3]})" for p in platform_tuples)
+    platform_str = format_compiler_sets(platform_tuples)
     writer.writerow(
         [
             func_name,
             platform_str,
             called_functions_str,
-            data_offset,
-            data_len,
+            inlining_data_str,
+            f"{data_offset:x}",
+            f"{data_len:x}",
         ]
     )
 

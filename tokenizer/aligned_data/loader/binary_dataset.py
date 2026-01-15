@@ -233,7 +233,9 @@ class BinaryDataset:
                     ) as f:
                         reader = csv.reader(f)
                         for row in reader:
-                            if row and len(row) == 5:  # Unmatched format
+                            if (
+                                row and len(row) == 6
+                            ):  # Unmatched format: func_name, compiler_sets, called_funcs, inlining_data, offset, len
                                 self.unmatched_func_names.append(row[0])
                 else:
                     self.unmatched_func_names = []
@@ -458,15 +460,23 @@ class BinaryDataset:
         platform_info = "unknown"
         called = []
 
+        inlining_data = []
+        data_offset_from_csv = start
+        data_len_from_csv = length
+
         if self.unmatched_sections.exists() and idx < len(self.unmatched_func_names):
             func_name = self.unmatched_func_names[idx]
             # Parse sections file for this function
             with open(self.unmatched_sections, "r", newline="", encoding="ascii") as f:
                 reader = csv.reader(f)
                 for i, row in enumerate(reader):
-                    if i == idx and row and len(row) == 5:
+                    if i == idx and row and len(row) == 6:
                         platform_info = row[1]
                         called_str = row[2]
+                        inlining_str = row[3]
+                        data_offset_from_csv = int(row[4], 16)
+                        data_len_from_csv = int(row[5], 16)
+
                         # Parse called functions (escaped commas)
                         if called_str:
                             called = [
@@ -474,6 +484,11 @@ class BinaryDataset:
                                 for name in called_str.split(",")
                                 if name
                             ]
+
+                        # Parse inlining data
+                        from ..metadata import parse_inlining_data
+
+                        inlining_data = parse_inlining_data(inlining_str)
                         break
 
         metadata = {
@@ -483,8 +498,9 @@ class BinaryDataset:
             "opt": "unknown",
             "platform_info": platform_info,
             "called": called,
-            "data_offset": start,
-            "data_len": length,
+            "inlining_data": inlining_data,
+            "data_offset": data_offset_from_csv,
+            "data_len": data_len_from_csv,
         }
 
         return FunctionData(func_name, metadata, tokens, insn_rl, block_rl)

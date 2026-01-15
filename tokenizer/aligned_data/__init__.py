@@ -34,6 +34,8 @@ from .index import (
 from .io import (
     decode_and_translate_tokens,
     decode_runlengths,
+    format_compiler_sets,
+    format_inlining_dict,
     parse_function_data_header,
     read_data_file,
     read_function_data_memmap,
@@ -74,6 +76,8 @@ __all__ = [
     # io
     "decode_and_translate_tokens",
     "decode_runlengths",
+    "format_compiler_sets",
+    "format_inlining_dict",
     "write_function_binary_data",
     "write_index_entry",
     "write_function_section_csv",
