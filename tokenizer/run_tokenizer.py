@@ -155,6 +155,8 @@ def run_tokenizer(
 
     if csv_path.exists() and skip_existing_csv:
         logger.info(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
+        if sock:
+            sock.sendall("done:-1:-1\n".encode("utf-8"))
         return (0, 0)
 
     with_pickled = False
