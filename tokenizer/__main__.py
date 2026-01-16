@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 from typing import Literal, cast
 
+from tokenizer.logging_utils import remove_stream_handlers
 from tokenizer.run_tokenizer import run_tokenizer
 
 
@@ -41,6 +42,11 @@ def main():
         type=int,
         metavar="SOCKET_FD",
         help="Worker mode: receive tasks via socket file descriptor",
+    )
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        help="Log file path for worker output (used with --dynamic_queue)",
     )
     group.add_argument(
         "--debugs",
@@ -93,7 +99,19 @@ def main():
         output_dir=output_dir,
     )
 
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file, mode="a")
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
     if args.dynamic_queue:
+        if args.log_file:
+            remove_stream_handlers(logger)
+
         sock = socket.socket(fileno=args.dynamic_queue)
         sock_file = sock.makefile("r")
 

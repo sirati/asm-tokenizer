@@ -1,0 +1,5 @@
+file ram
+0.5MiB 240MiB +- 40MiB
+1MiB 500MiB +- 200MiB
+8MiB 2GiB +- 400MiB
+100MiB 20GiB +- 1GiB
