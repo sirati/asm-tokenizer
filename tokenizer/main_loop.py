@@ -1,7 +1,7 @@
 import csv
+import logging
 import socket
 import time
-from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
@@ -16,7 +16,6 @@ from tokenizer.opaque_remapping import (
     apply_opaque_mapping,
     apply_opaque_mapping_raw_optimized,
 )
-from tokenizer.token_manager import VocabularyManager
 
 VERIFICATION: bool = False
 
@@ -54,19 +53,18 @@ def main_loop(
     text_start,
     vocab_manager,
     csv_path,
+    logger: logging.Logger,
     sock: socket.socket | None = None,
     **_kwargs,
-) -> tuple[FunctionDataManager, int, int]:
-    filter = FunctionFilter()
+) -> tuple[FunctionDataManager, int]:
+    filter = FunctionFilter(logger)
 
     total_functions = len(cfg.functions.items())
     function_manager = FunctionDataManager(total_functions) if VERIFICATION else FunctionDataManager(0)
 
     exceptions = []
-    warning_count = 0
     filtered_count = 0
     last_keepalive_time = time.time()
-
 
     if sock is not None:
         sock.sendall(b"phase:phase3\n")
@@ -121,9 +119,8 @@ def main_loop(
                         vocab_manager=vocab_manager,
                     )
                 except Exception as e:
-                    print(f"Error processing {func_name}: {e}. Skipping function.")
+                    logger.warning(f"Error processing {func_name}: {e}. Skipping function.")
                     exceptions.append(e)
-                    warning_count += 1
                     continue
 
                 if function_analysis is None:
@@ -231,11 +228,15 @@ def main_loop(
                         func_disas_token[final_func_name] = func_tokens
                         func_names.append(final_func_name)
                 except Exception as e:
-                    print(
-                        f"Error saving {func_name}: {e}.\nTokenstream: {func_tokens}\nTokens: {tokenized_instructions}\nBlock encoding: {block_run_lengths}\nInstructions: {insn_run_lengths}\nMetaData: {str(meta_result)}"
+                    logger.warning(
+                        f"Error saving {func_name}: {e}.\n"
+                        f"Tokenstream: {func_tokens}\n"
+                        f"Tokens: {tokenized_instructions}\n"
+                        f"Block encoding: {block_run_lengths}\n"
+                        f"Instructions: {insn_run_lengths}\n"
+                        f"MetaData: {str(meta_result)}"
                     )
                     exceptions.append(e)
-                    warning_count += 1
                     continue
         except Exception as e:
             print(f"Unrecoverable error in main loop: {e}, writing what we have at least")
@@ -254,4 +255,4 @@ def main_loop(
     if VERIFICATION:
         function_manager.compact_arrays()
 
-    return function_manager, warning_count, filtered_count
+    return function_manager, filtered_count

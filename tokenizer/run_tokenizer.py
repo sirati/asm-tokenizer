@@ -1,3 +1,4 @@
+import logging
 import pickle
 import socket
 import time
@@ -9,6 +10,7 @@ import angr
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
 from tokenizer.csv_files import parse_and_save_data_sections
 from tokenizer.instruction_sets import InstructionSets
+from tokenizer.logging_utils import setup_logger
 from tokenizer.main_loop import main_loop
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
@@ -25,6 +27,7 @@ def disassemble_to_tokens(
     csv_path: Path,
     binary_path: Path,
     pickle_mainloop_file_path: Path,
+    logger,
     with_pickled=False,
     project=None,
     sock: socket.socket | None = None,
@@ -88,11 +91,12 @@ def disassemble_to_tokens(
 
     resolver = TokenResolver()
     instr_sets = InstructionSets(SCRIPT_FOLDER / "./data_store.json")
-    kwargs.update(dict(resolver=resolver, instr_sets=instr_sets, csv_path=csv_path))
 
-    function_manager, warnings, filtered = main_loop(vocab_manager=vocab_manager, sock=sock, **kwargs)
+    kwargs.update(dict(resolver=resolver, instr_sets=instr_sets, csv_path=csv_path, logger=logger))
 
-    return (func_names, function_manager, vocab_manager, warnings, filtered)
+    function_manager, filtered = main_loop(vocab_manager=vocab_manager, sock=sock, **kwargs)
+
+    return (func_names, function_manager, vocab_manager, filtered)
 
 
 def run_tokenizer(
@@ -103,7 +107,8 @@ def run_tokenizer(
     output_dir: Path,
     sock: socket.socket | None = None,
 ) -> tuple[int, int]:
-    print("STARTING DISASSEMBLY")
+    logger, warning_handler = setup_logger("tokenizer")
+    logger.info("STARTING DISASSEMBLY")
     if sock is not None:
         sock.sendall(b"phase:phase1\n")
 
@@ -130,7 +135,7 @@ def run_tokenizer(
                 f"Expected one of: {', '.join(possible_platforms)}"
             )
         platform = cast(Literal["x86", "arm64", "arm32", "x64"], detected_platform)
-        print(f"[*] Detected platform: {platform}")
+        logger.info(f"[*] Detected platform: {platform}")
     else:
         assert binary_name.startswith(platform), (
             f"Binary name '{binary_name}' must start with platform '{platform}'. Wrong platform's file in queue?"
@@ -149,15 +154,14 @@ def run_tokenizer(
     csv_path = out_folder / f"{binary_name}_output.csv"
 
     if csv_path.exists() and skip_existing_csv:
-        print(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
+        logger.info(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
         return (0, 0)
 
     with_pickled = False
     start_time = time.time()
 
-
     if pickle_mainloop_file_path.exists():
-        print("loading existing mainloop pickle to speed up")
+        logger.info("loading existing mainloop pickle to speed up")
         if sock is not None:
             sock.sendall(b"phase:phase2\n")
         with open(pickle_mainloop_file_path, "rb") as f:
@@ -165,28 +169,28 @@ def run_tokenizer(
             if "path" not in kvargs:
                 kvargs["path"] = file_path
             with_pickled = True
-        print(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+        logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
     elif pickle_file_path.exists():
-        print("loading existing pickle to speed up")
+        logger.info("loading existing pickle to speed up")
         with open(pickle_file_path, "rb") as f:
             kvargs = pickle.load(f)
 
-        print(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+        logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
     else:
         project: angr.Project = angr.Project(file_path, auto_load_libs=False)
         constants: dict[str, list[str]] = parse_and_save_data_sections(project)
         cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(normalize=True)
 
         kvargs: dict = dict(project=project, cfg=cfg, constant_list=constants)
-        print(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
+        logger.info(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
         start_time = time.time()
         with open(pickle_file_path, "wb") as f:
             pickle.dump(kvargs, f)
 
-        print(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
+        logger.info(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
 
     start_time = time.time()
-    print("Calling lowlevel_disas")
+    logger.info("Calling lowlevel_disas")
     kvargs.update(
         dict(
             with_pickled=with_pickled,
@@ -197,10 +201,19 @@ def run_tokenizer(
             binary_path=binary_path,
             pickle_mainloop_file_path=pickle_mainloop_file_path,
             sock=sock,
+            logger=logger,
         )
     )
-    (func_names, function_manager, vocab_manager, warnings, filtered) = disassemble_to_tokens(**kvargs)
+    (func_names, function_manager, vocab_manager, filtered) = disassemble_to_tokens(**kvargs)
     disassembly_time = time.time() - start_time
-    print(f"Disassembly time: {disassembly_time:.2f} seconds")
+    warning_handler.unregister()
+    logger.info(
+        f"Disassembly time: {disassembly_time:.2f} seconds, \
+        warnings={warning_handler.warning_count}, \
+        errors={warning_handler.error_count}, \
+        filtered={filtered}"
+    )
+    
+    if sock:
+        sock.sendall(f"done:{warning_handler.warning_count}:{filtered}\n".encode("utf-8"))
 
-    return (warnings, filtered)
