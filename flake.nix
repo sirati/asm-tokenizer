@@ -5,39 +5,48 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       # Support multiple systems
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
-      devShells = forAllSystems (system:
+      devShells = forAllSystems (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              (python314.withPackages (python-pkgs: with python-pkgs; [
-                # Core binary analysis and disassembly
-                angr
-                capstone
-                lief
-                pyelftools
+              (python314.withPackages (
+                python-pkgs: with python-pkgs; [
+                  # Core binary analysis and disassembly
+                  angr
+                  capstone
+                  lief
+                  pyelftools
 
-                intervaltree
-                numpy
-                pandas
-                tqdm
-                portalocker
+                  intervaltree
+                  numpy
+                  pandas
+                  tqdm
+                  portalocker
 
-                # Development tools
+                  # Development tools
 
-                pip
-                # language servers
-                ruff
-              ]))
+                  pip
+                  # language servers
+                  ruff
+                ]
+              ))
 
               # normal nix packages
               basedpyright # a language server
@@ -52,9 +61,11 @@
               echo ""
               echo "Python version: $(python --version)"
               echo "Ready to run your scripts!"
-              echo ""
+              export bin_python=$(which python)
+              export bin_python3=$(which python3)
             '';
           };
-        });
+        }
+      );
     };
 }
