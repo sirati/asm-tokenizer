@@ -1,0 +1,7 @@
+before writing code always think about how to achive the cleanest solution. before thinking always read files that provide needed context that you have not read yet.
+
+do not provice a summary. Do not explain changes. Do not provide other comments. Do not create readme or other markdown files unless explicitly asked for. Only minimally adjust code that requires adjustment based on the requested changes. Do not change code unrelated to the request. 
+
+Do however use the provided tools as explained by the tool documentation, if this requires you to chat, do so normally.
+
+Code should be written in a manner that allows future changes without being error prone. Avoid using strings, tuples, positional arguments, instead use dataclasses or records when approriate. Function should not return dicts if they return multiple values, instead the type hint must avoid ambiguity. Code should avoid dublicated sections, always refactor these. Do not leave section unimplemented or to implement later.
