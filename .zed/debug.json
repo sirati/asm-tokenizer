@@ -19,5 +19,20 @@
   "subProcess": true,
   "cwd": "${ZED_WORKTREE_ROOT}",
   "pythonPath": "python3"
-  }
+  },
+  {
+  "label": "List source files",
+  "adapter": "Debugpy",
+  "module": "dynamic_batch",
+  "args": [
+    "--list-files",
+    "--exclude-subfolder", "^z3$"
+  ],
+  "request": "launch",
+  "redirectOutput": true,
+  "stopOnEntry": false,
+  "subProcess": true,
+  "cwd": "${ZED_WORKTREE_ROOT}",
+  "pythonPath": "python3"
+  },
 ]
