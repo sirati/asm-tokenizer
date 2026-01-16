@@ -837,6 +837,8 @@ def main():
     if args.dynamic_queue:
         import socket
         import sys
+        import traceback
+
         # Worker mode: receive tasks via socket
         sock = socket.socket(fileno=args.dynamic_queue)
         sock_file = sock.makefile("r")
@@ -871,11 +873,22 @@ def main():
                     )
                     # Send completion message
                     sock.sendall(b"done\n")
+                except MemoryError as e:
+                    error_msg = f"error:oom:{str(e)}\n"
+                    sock.sendall(error_msg.encode("utf-8"))
+                except (KeyboardInterrupt, SystemExit) as e:
+                    error_msg = f"error:non_recoverable:{type(e).__name__}\n"
+                    sock.sendall(error_msg.encode("utf-8"))
+                    print(f"[!] Non-recoverable error: {e}")
+                    break
                 except Exception as e:
-                    print(f"[!] Error processing {binary_path}: {e}")
-                    # Still send done to avoid blocking manager
-                    sock.sendall(b"done\n")
+                    tb_str = traceback.format_exc().replace("\n", " ")[:200]
+                    error_msg = f"error:recoverable:{type(e).__name__}: {str(e)[:100]} | {tb_str}\n"
+                    sock.sendall(error_msg.encode("utf-8"))
 
+            except (KeyboardInterrupt, SystemExit) as e:
+                print(f"[!] Worker interrupted: {e}")
+                break
             except Exception as e:
                 print(f"[!] Worker error: {e}")
                 break
