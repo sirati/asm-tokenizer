@@ -1,4 +1,6 @@
 import csv
+import socket
+import time
 from pathlib import Path
 
 import numpy as np
@@ -52,15 +54,22 @@ def main_loop(
     text_start,
     vocab_manager,
     csv_path,
+    sock: socket.socket | None = None,
     **_kwargs,
-) -> FunctionDataManager:
+) -> tuple[FunctionDataManager, int, int]:
     filter = FunctionFilter()
 
     total_functions = len(cfg.functions.items())
-    if VERIFICATION:
-        function_manager = FunctionDataManager(total_functions)
+    function_manager = FunctionDataManager(total_functions) if VERIFICATION else FunctionDataManager(0)
 
     exceptions = []
+    warning_count = 0
+    filtered_count = 0
+    last_keepalive_time = time.time()
+
+
+    if sock is not None:
+        sock.sendall(b"phase:phase3\n")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         print("WRITING OUTPUT")
@@ -83,12 +92,16 @@ def main_loop(
         prev_insn_base64 = ""
 
         try:
-            for i, (func_addr, func) in enumerate(
-                tqdm(
-                    iterable=sorted(cfg.functions.items(), key=lambda item: item[1].name),
-                    desc="Retrieving data from alllll functions. Like a big boy.",
-                )
-            ):
+            pbar = tqdm(
+                iterable=sorted(cfg.functions.items(), key=lambda item: item[1].name),
+                desc="Retrieving data from alllll functions. Like a big boy.",
+            )
+            for i, (func_addr, func) in enumerate(pbar):
+                current_time = time.time()
+                if sock is not None and (current_time - last_keepalive_time) >= 0.2:
+                    sock.sendall(b"keepalive\n")
+                    last_keepalive_time = current_time
+
                 func_name = cfg.functions[func_addr].name
                 if func_name in ["UnresolvableCallTarget", "UnresolvableJumpTarget"]:
                     continue
@@ -110,6 +123,7 @@ def main_loop(
                 except Exception as e:
                     print(f"Error processing {func_name}: {e}. Skipping function.")
                     exceptions.append(e)
+                    warning_count += 1
                     continue
 
                 if function_analysis is None:
@@ -158,6 +172,7 @@ def main_loop(
                     writer = csv.writer(csvfile)
                     if filter.filter_fns(func_tokens, func_name, vocab_manager):
                         occurence -= 1
+                        filtered_count += 1
                         continue
 
                     if (
@@ -220,10 +235,14 @@ def main_loop(
                         f"Error saving {func_name}: {e}.\nTokenstream: {func_tokens}\nTokens: {tokenized_instructions}\nBlock encoding: {block_run_lengths}\nInstructions: {insn_run_lengths}\nMetaData: {str(meta_result)}"
                     )
                     exceptions.append(e)
+                    warning_count += 1
                     continue
         except Exception as e:
             print(f"Unrecoverable error in main loop: {e}, writing what we have at least")
             exceptions.append(e)
+
+        if sock is not None:
+            sock.sendall(b"keepalive\n")
 
         save_vocabulary(vocab_manager, writer)
         csvfile.flush()
@@ -235,4 +254,4 @@ def main_loop(
     if VERIFICATION:
         function_manager.compact_arrays()
 
-        return function_manager
+    return function_manager, warning_count, filtered_count

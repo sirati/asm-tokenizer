@@ -1,4 +1,5 @@
 import pickle
+import socket
 import time
 from pathlib import Path
 from typing import Literal, cast
@@ -26,9 +27,12 @@ def disassemble_to_tokens(
     pickle_mainloop_file_path: Path,
     with_pickled=False,
     project=None,
+    sock: socket.socket | None = None,
     **kwargs,
 ):
     if not with_pickled:
+        if sock is not None:
+            sock.sendall(b"phase:phase2\n")
         func_names = []
         block_runlength_dict = {}
         insn_runlength_dict = {}
@@ -86,9 +90,9 @@ def disassemble_to_tokens(
     instr_sets = InstructionSets(SCRIPT_FOLDER / "./data_store.json")
     kwargs.update(dict(resolver=resolver, instr_sets=instr_sets, csv_path=csv_path))
 
-    function_manager = main_loop(vocab_manager=vocab_manager, **kwargs)
+    function_manager, warnings, filtered = main_loop(vocab_manager=vocab_manager, sock=sock, **kwargs)
 
-    return (func_names, function_manager, vocab_manager)
+    return (func_names, function_manager, vocab_manager, warnings, filtered)
 
 
 def run_tokenizer(
@@ -97,8 +101,11 @@ def run_tokenizer(
     skip_existing_csv: bool,
     source_dir: Path,
     output_dir: Path,
-) -> None:
+    sock: socket.socket | None = None,
+) -> tuple[int, int]:
     print("STARTING DISASSEMBLY")
+    if sock is not None:
+        sock.sendall(b"phase:phase1\n")
 
     file_path: Path = binary_path.absolute()
 
@@ -143,13 +150,16 @@ def run_tokenizer(
 
     if csv_path.exists() and skip_existing_csv:
         print(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
-        return None
+        return (0, 0)
 
     with_pickled = False
     start_time = time.time()
 
+
     if pickle_mainloop_file_path.exists():
         print("loading existing mainloop pickle to speed up")
+        if sock is not None:
+            sock.sendall(b"phase:phase2\n")
         with open(pickle_mainloop_file_path, "rb") as f:
             kvargs = pickle.load(f)
             if "path" not in kvargs:
@@ -186,8 +196,11 @@ def run_tokenizer(
             csv_path=csv_path,
             binary_path=binary_path,
             pickle_mainloop_file_path=pickle_mainloop_file_path,
+            sock=sock,
         )
     )
-    (func_names, function_manager, vocab_manager) = disassemble_to_tokens(**kvargs)
+    (func_names, function_manager, vocab_manager, warnings, filtered) = disassemble_to_tokens(**kvargs)
     disassembly_time = time.time() - start_time
     print(f"Disassembly time: {disassembly_time:.2f} seconds")
+
+    return (warnings, filtered)
