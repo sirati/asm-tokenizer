@@ -4,6 +4,7 @@ import logging
 import pickle
 import socket
 import sys
+import os
 import traceback
 from pathlib import Path
 from typing import Literal, cast
@@ -131,7 +132,7 @@ def main():
             sock = socket.socket(fileno=args.dynamic_queue)
             sock_file = sock.makefile("r")
 
-            logger.info("[*] Worker started, waiting for tasks...")
+            logger.info(f"[*] Worker started (PID {os.getpid()}), waiting for tasks...")
 
             while True:
                 try:
