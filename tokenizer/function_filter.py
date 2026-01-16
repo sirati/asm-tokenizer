@@ -1,28 +1,31 @@
+import logging
+
 import numpy as np
 
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.patterns import (
-    MemCloseBracket,
-    OpaqueConst,
-    MemOpenBracket,
-    InsnPointerLengths,
-    Maybe,
-    InsnNop,
-    Multi,
-    InsnPrefixes,
-    InsnControlFlow,
-    BlockDef,
     Block,
-    MemPlus,
-    ValuedConst,
+    BlockDef,
+    InsnControlFlow,
+    InsnNop,
+    InsnPointerLengths,
+    InsnPrefixes,
     InsnRegistry,
+    Maybe,
+    MemCloseBracket,
+    MemOpenBracket,
+    MemPlus,
+    Multi,
+    OpaqueConst,
+    ValuedConst,
 )
 from tokenizer.patterns.matcher import TokenPattern
 from tokenizer.token_manager import VocabularyManager
 
 
 class FunctionFilter:
-    def __init__(self):
+    def __init__(self, logger: logging.Logger | None = None):
+        self.logger = logger or logging.getLogger(__name__)
         # TokenPattern for a jump-only function:
         # Block_Def, Block(0), [RepeatType.MAYBE, PlatformInstructionTypes.PREFIXES], PlatformInstructionTypes.CONTROL_FLOW,
         # [RepeatType.MAYBE, PlatformInstructionTypes.POINTER_LENGTHS], MemoryOperandSymbol.OPEN_BRACKET,
@@ -59,10 +62,12 @@ class FunctionFilter:
             return False
 
         if self.jump_only_pattern.match(fn_tokens.iter_raw_tokens(), vm):
-            print(f"\nREMOVED JUMP_ONLY {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}")
+            self.logger.warning(
+                f"JUMP_ONLY func {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}"
+            )
 
         if self.nop_only_pattern.match(fn_tokens.iter_raw_tokens(), vm):
-            print(f"\nREMOVED NOP_ONLY {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}")
+            self.logger.warning(f"NOP_ONLY func {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}")
 
         # remove nop only and hlt
         if fn_tokens.block_count == 1:
@@ -72,7 +77,9 @@ class FunctionFilter:
             is_padding = np.isin(arr, allowed)
 
             if np.all(is_padding):
-                print(f"\nREMOVED RETURN_ONLY {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}")
+                self.logger.warning(
+                    f"RETURN_ONLY func {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}"
+                )
 
         # insn_mask = np.array([2, 7])
         # if insn_run_lengths.shape == (2,):
