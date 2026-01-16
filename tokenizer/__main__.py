@@ -25,105 +25,106 @@ def main():
                 break
             except OverflowError:
                 maxInt = int(maxInt / 10)
-    parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--batch",
-        type=str,
-        metavar="QUEUE_FILE",
-        help="Process a batch of binaries from a queue file",
-    )
-    group.add_argument(
-        "--single",
-        type=str,
-        metavar="BINARY_FILE",
-        help="Process a single binary file",
-    )
-    group.add_argument(
-        "--dynamic_queue",
-        type=int,
-        metavar="SOCKET_FD",
-        help="Worker mode: receive tasks via socket file descriptor",
-    )
-    parser.add_argument(
-        "--log-file",
-        type=str,
-        help="Log file instead of stdout/err",
-    )
-    group.add_argument(
-        "--debugs",
-        action="store_true",
-        help="Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh",
-    )
-    group.add_argument(
-        "--debugl",
-        action="store_true",
-        help="Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool",
-    )
-
-    parser.add_argument(
-        "--platform",
-        type=str,
-        help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'file_prefix' to auto-detect from binary name. Default is file_prefix.",
-        default="file_prefix",
-        choices=["x86", "arm64", "arm32", "x64", "file_prefix"],
-    )
-    parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="./src",
-        help="Source directory containing binaries (default: ./src)",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="./out",
-        help="Output directory for results (default: ./out)",
-    )
-
-    args = parser.parse_args()
-
-    cwd = Path.cwd()
-    source_dir = (cwd / args.source).resolve()
-    output_dir = (cwd / args.output).resolve()
-
-    if args.log_file:
-        log_file = Path(args.log_file)
-        if not log_file.parent.exists():
-            log_file.parent.mkdir(parents=True)
-
-        log_file.touch()
-
-        file_handler = logging.FileHandler(log_file, mode="a")
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+                
+        parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument(
+            "--batch",
+            type=str,
+            metavar="QUEUE_FILE",
+            help="Process a batch of binaries from a queue file",
         )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-        if args.dynamic_queue:
-            remove_stream_handlers(logger)
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+        group.add_argument(
+            "--single",
+            type=str,
+            metavar="BINARY_FILE",
+            help="Process a single binary file",
         )
-
-    logger.info(f"[*] Source directory: {source_dir}")
-    logger.info(f"[*] Output directory: {output_dir}")
-
-    if (args.debugs or args.debugl) and args.platform == "file_prefix":
-        args.platform = "x86"
-
-    common_params = dict(
-        platform=args.platform,
-        skip_existing_csv=args.skip_existing,
-        source_dir=source_dir,
-        output_dir=output_dir,
-    )
+        group.add_argument(
+            "--dynamic_queue",
+            type=int,
+            metavar="SOCKET_FD",
+            help="Worker mode: receive tasks via socket file descriptor",
+        )
+        parser.add_argument(
+            "--log-file",
+            type=str,
+            help="Log file instead of stdout/err",
+        )
+        group.add_argument(
+            "--debugs",
+            action="store_true",
+            help="Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh",
+        )
+        group.add_argument(
+            "--debugl",
+            action="store_true",
+            help="Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool",
+        )
+    
+        parser.add_argument(
+            "--platform",
+            type=str,
+            help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'file_prefix' to auto-detect from binary name. Default is file_prefix.",
+            default="file_prefix",
+            choices=["x86", "arm64", "arm32", "x64", "file_prefix"],
+        )
+        parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
+        parser.add_argument(
+            "--source",
+            type=str,
+            default="./src",
+            help="Source directory containing binaries (default: ./src)",
+        )
+        parser.add_argument(
+            "--output",
+            type=str,
+            default="./out",
+            help="Output directory for results (default: ./out)",
+        )
+    
+        args = parser.parse_args()
+    
+        cwd = Path.cwd()
+        source_dir = (cwd / args.source).resolve()
+        output_dir = (cwd / args.output).resolve()
+    
+        if args.log_file:
+            log_file = Path(args.log_file)
+            if not log_file.parent.exists():
+                log_file.parent.mkdir(parents=True)
+    
+            log_file.touch()
+    
+            file_handler = logging.FileHandler(log_file, mode="a")
+            file_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter(
+                "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+    
+            if args.dynamic_queue:
+                remove_stream_handlers(logger)
+        else:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+    
+        logger.info(f"[*] Source directory: {source_dir}")
+        logger.info(f"[*] Output directory: {output_dir}")
+    
+        if (args.debugs or args.debugl) and args.platform == "file_prefix":
+            args.platform = "x86"
+    
+        common_params = dict(
+            platform=args.platform,
+            skip_existing_csv=args.skip_existing,
+            source_dir=source_dir,
+            output_dir=output_dir,
+        )
 
         if args.dynamic_queue:
             sock = socket.socket(fileno=args.dynamic_queue)
