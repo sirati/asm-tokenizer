@@ -137,6 +137,7 @@ class TokenUtils:
 
             def token_lambda():
                 return vocab_manager._private_add_token(f"{basename}_{hex_str}", token_class)
+
             return [TokenUtils.cache_numeric_token(token_class, f"_{basename}_cache", hex_value, token_lambda, max_key)]
         else:
             # Complex case: multiple tokens with Lit_Start/Lit_End using cache
@@ -157,16 +158,18 @@ class TokenUtils:
             for hex_value in hex_values:
                 hex_str = hex(hex_value)[2:].upper()
                 hex_str = "0" * (hex_digits - len(hex_str)) + hex_str
+
                 def token_lambda():
-                    return vocab_manager._private_add_token(
-                                    f"{inner_lit_name}_{hex_str}", inner_token_class
-                                )
+                    return vocab_manager._private_add_token(f"{inner_lit_name}_{hex_str}", inner_token_class)
+
                 digit_token_id = TokenUtils.cache_numeric_token(
                     inner_token_class, f"_{inner_lit_name}_cache", hex_value, token_lambda, max_key
                 )
                 token_ids.append(digit_token_id)
+
                 def token_lambda():
                     return vocab_manager._private_add_token(f"{inner_lit_name}_{hex_str}")
+
             token_ids.append(
                 TokenUtils.cache_specific_token(
                     token_class, "_end_token_id", f"{basename}_Lit_End", vocab_manager, LitTokenType.LIT_END
