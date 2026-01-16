@@ -54,7 +54,7 @@ class FunctionTokenList:
     ) -> "FunctionTokenList":
         """Remaps token ids to string representation."""
         result = FunctionTokenList(num_blocks=-1, vocab_manager=vocab_manager, init=False)
-        
+
         # todo why are we doing this if we are not using it
         # todo !!! check if commenting this out changed semantics
         # if vocab_manager is None:

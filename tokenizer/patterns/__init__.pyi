@@ -1,6 +1,5 @@
 from typing import List, Any, Union, ForwardRef
 
-
 class PatternParseBase:
     def __add__(self, other) -> Any: ...
     def __or__(self, other) -> Any: ...

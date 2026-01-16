@@ -1,4 +1,3 @@
-
 import numpy as np
 
 from tokenizer.function_token_list import FunctionTokenList
