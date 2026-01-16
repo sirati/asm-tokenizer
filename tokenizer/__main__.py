@@ -12,7 +12,6 @@ from tokenizer.run_tokenizer import run_tokenizer
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
@@ -44,9 +43,9 @@ def main():
         help="Worker mode: receive tasks via socket file descriptor",
     )
     parser.add_argument(
-        "--log_file",
+        "--log-file",
         type=str,
-        help="Log file path for worker output (used with --dynamic_queue)",
+        help="Log file instead of stdout/err",
     )
     group.add_argument(
         "--debugs",
@@ -86,6 +85,30 @@ def main():
     source_dir = (cwd / args.source).resolve()
     output_dir = (cwd / args.output).resolve()
 
+    if args.log_file:
+        log_file = Path(args.log_file)
+        if not log_file.parent.exists():
+            log_file.parent.mkdir(parents=True)
+        
+        log_file.touch()
+        
+        file_handler = logging.FileHandler(log_file, mode="a")
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        if args.dynamic_queue:
+            remove_stream_handlers(logger)
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
     logger.info(f"[*] Source directory: {source_dir}")
     logger.info(f"[*] Output directory: {output_dir}")
 
@@ -99,19 +122,7 @@ def main():
         output_dir=output_dir,
     )
 
-    if args.log_file:
-        file_handler = logging.FileHandler(args.log_file, mode="a")
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
     if args.dynamic_queue:
-        if args.log_file:
-            remove_stream_handlers(logger)
-
         sock = socket.socket(fileno=args.dynamic_queue)
         sock_file = sock.makefile("r")
 

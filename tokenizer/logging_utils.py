@@ -43,26 +43,11 @@ def remove_stream_handlers(logger: logging.Logger) -> None:
 def setup_logger(
     name: str,
     level: int | None = None,
-    log_file: Optional[str] = None,
-    remove_streams: bool = False,
 ) -> tuple[logging.Logger, WarningCounterHandler]:
+    """Create a logger that inherits from root logger configuration."""
     logger = logging.getLogger(name)
     if level is not None:
         logger.setLevel(level)
-
-    if remove_streams:
-        remove_stream_handlers(logger)
-        root_logger = logging.getLogger()
-        remove_stream_handlers(root_logger)
-
-    if log_file:
-        file_handler = logging.FileHandler(log_file, mode="a")
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
 
     counter_handler = WarningCounterHandler()
     counter_handler.attach_to_logger(logger)

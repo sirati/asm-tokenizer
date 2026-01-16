@@ -213,7 +213,6 @@ def run_tokenizer(
         errors={warning_handler.error_count}, \
         filtered={filtered}"
     )
-    
+
     if sock:
         sock.sendall(f"done:{warning_handler.warning_count}:{filtered}\n".encode("utf-8"))
-
