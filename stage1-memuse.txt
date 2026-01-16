@@ -7,3 +7,6 @@ file ram
 18.78MB, Estimated memory: 6311.31MB, current max 8.5
 36.22MB, Estimated memory: 15205.08MB current max 14
 100MiB 20GiB +- 1GiB
+
+
+x64-clang-7-O0_z3: 36.44MB, Estimated memory: 15331.17MB, current max 19
