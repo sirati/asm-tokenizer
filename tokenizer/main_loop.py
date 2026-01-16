@@ -57,6 +57,8 @@ def main_loop(
     sock: socket.socket | None = None,
     **_kwargs,
 ) -> tuple[FunctionDataManager, int]:
+    logger.info("Preparing main loop")
+
     filter = FunctionFilter(logger)
 
     total_functions = len(cfg.functions.items())
@@ -65,9 +67,6 @@ def main_loop(
     exceptions = []
     filtered_count = 0
     last_keepalive_time = time.time()
-
-    if sock is not None:
-        sock.sendall(b"phase:phase3\n")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         print("WRITING OUTPUT")
@@ -88,6 +87,10 @@ def main_loop(
         prev_tokens_base64 = ""
         prev_block_base64 = ""
         prev_insn_base64 = ""
+
+        logger.info("Starting main loop")
+        if sock is not None:
+            sock.sendall(b"phase:phase3\n")
 
         try:
             pbar = tqdm(
