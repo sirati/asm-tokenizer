@@ -1,0 +1,198 @@
+import argparse
+import csv
+import socket
+import sys
+import traceback
+from pathlib import Path
+from typing import Literal, cast
+
+from tokenizer.run_tokenizer import run_tokenizer
+
+
+def main():
+    maxInt = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(maxInt)
+            break
+        except OverflowError:
+            maxInt = int(maxInt / 10)
+    parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--batch",
+        type=str,
+        metavar="QUEUE_FILE",
+        help="Process a batch of binaries from a queue file",
+    )
+    group.add_argument(
+        "--single",
+        type=str,
+        metavar="BINARY_FILE",
+        help="Process a single binary file",
+    )
+    group.add_argument(
+        "--dynamic_queue",
+        type=int,
+        metavar="SOCKET_FD",
+        help="Worker mode: receive tasks via socket file descriptor",
+    )
+    group.add_argument(
+        "--debugs",
+        action="store_true",
+        help="Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh",
+    )
+    group.add_argument(
+        "--debugl",
+        action="store_true",
+        help="Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool",
+    )
+
+    parser.add_argument(
+        "--platform",
+        type=str,
+        help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'file_prefix' to auto-detect from binary name. Default is file_prefix.",
+        default="file_prefix",
+        choices=["x86", "arm64", "arm32", "x64", "file_prefix"],
+    )
+    parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="./src",
+        help="Source directory containing binaries (default: ./src)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./out",
+        help="Output directory for results (default: ./out)",
+    )
+
+    args = parser.parse_args()
+
+    cwd = Path.cwd()
+    source_dir = (cwd / args.source).resolve()
+    output_dir = (cwd / args.output).resolve()
+
+    print(f"[*] Source directory: {source_dir}")
+    print(f"[*] Output directory: {output_dir}")
+
+    if (args.debugs or args.debugl) and args.platform == "file_prefix":
+        args.platform = "x86"
+
+    common_params = dict(
+        platform=args.platform,
+        skip_existing_csv=args.skip_existing,
+        source_dir=source_dir,
+        output_dir=output_dir,
+    )
+
+    if args.dynamic_queue:
+        sock = socket.socket(fileno=args.dynamic_queue)
+        sock_file = sock.makefile("r")
+
+        print("[*] Worker started, waiting for tasks...")
+
+        while True:
+            try:
+                line = sock_file.readline()
+                if not line:
+                    break
+
+                command = line.strip()
+
+                if command == "stop":
+                    print("[*] Received stop command, shutting down")
+                    break
+
+                binary_path = source_dir / command
+                print(f"[*] Processing: {binary_path}")
+
+                try:
+                    run_tokenizer(
+                        binary_path,
+                        platform=cast(
+                            Literal["x86", "arm64", "arm32", "x64", "file_prefix"], common_params["platform"]
+                        ),
+                        skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
+                        source_dir=cast(Path, common_params["source_dir"]),
+                        output_dir=cast(Path, common_params["output_dir"]),
+                    )
+                    sock.sendall(b"done\n")
+                except MemoryError as e:
+                    error_msg = f"error:oom:{str(e)}\n"
+                    sock.sendall(error_msg.encode("utf-8"))
+                except (KeyboardInterrupt, SystemExit) as e:
+                    error_msg = f"error:non_recoverable:{type(e).__name__}\n"
+                    sock.sendall(error_msg.encode("utf-8"))
+                    print(f"[!] Non-recoverable error: {e}")
+                    break
+                except Exception as e:
+                    tb_str = traceback.format_exc().replace("\n", " ")[:200]
+                    error_msg = f"error:recoverable:{type(e).__name__}: {str(e)[:100]} | {tb_str}\n"
+                    sock.sendall(error_msg.encode("utf-8"))
+
+            except (KeyboardInterrupt, SystemExit) as e:
+                print(f"[!] Worker interrupted: {e}")
+                break
+            except Exception as e:
+                print(f"[!] Worker error: {e}")
+                break
+
+        sock.close()
+        print("[*] Worker shutdown complete")
+
+    elif args.batch:
+        queue_file_path = (cwd / args.batch).resolve()
+        print(f"[*] Reading queue file: {queue_file_path}")
+
+        with open(queue_file_path, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        print(f"[*] Total lines in queue: {len(lines)}")
+
+        absolute_lines = []
+        for line in lines:
+            if line.startswith("./"):
+                line = line[2:]
+            absolute_lines.append(str(source_dir / line))
+
+        from tokenizer.utils import filter_queue
+
+        filtered_lines = filter_queue(absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir))
+
+        print(f"[*] Filtered queue: {len(filtered_lines)} items to process")
+
+        for idx, binary_path_str in enumerate(filtered_lines, 1):
+            print(f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}")
+            binary_path = Path(binary_path_str).resolve()
+            try:
+                run_tokenizer(binary_path, **common_params)
+            except Exception as e:
+                print(f"[!] Error processing {binary_path}: {e}")
+                print("Continuing with next binary in queue...")
+                continue
+
+        print("\n[*] Batch processing complete.")
+    elif args.single:
+        binary_path_input = cwd / args.single
+        binary_path = binary_path_input.resolve()
+        print(f"[*] Processing single binary: {binary_path}")
+        run_tokenizer(binary_path, **common_params)
+    elif args.debugs:
+        binary_path = source_dir / f"clamav/{args.platform}-gcc-5-O3_minigzipsh"
+        print(f"[*] Debug mode (gcc): {binary_path}")
+        debug_params = common_params.copy()
+        debug_params.update(dict(skip_existing_csv=False))
+        run_tokenizer(binary_path, **debug_params)
+    elif args.debugl:
+        binary_path = source_dir / f"clamav/{args.platform}-clang-5.0-O1_sigtool"
+        print(f"[*] Debug mode (clang): {binary_path}")
+        debug_params = common_params.copy()
+        debug_params.update(dict(skip_existing_csv=False))
+        run_tokenizer(binary_path, **debug_params)
+
+
+if __name__ == "__main__":
+    main()
