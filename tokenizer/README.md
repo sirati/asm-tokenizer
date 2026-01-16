@@ -1,11 +1,11 @@
 # Tokenizer notes
 
 
-python3 -m tokenizer.low_level 
+python3 -m tokenizer 
 
 low_level has a help function that documents how it exactly works.
 ```bash
-python3 -m tokenizer.low_level --help
+python3 -m tokenizer --help
 ```
 
 ## old readme below
