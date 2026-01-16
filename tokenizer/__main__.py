@@ -110,7 +110,7 @@ def main():
                 print(f"[*] Processing: {binary_path}")
 
                 try:
-                    run_tokenizer(
+                    warnings, filtered = run_tokenizer(
                         binary_path,
                         platform=cast(
                             Literal["x86", "arm64", "arm32", "x64", "file_prefix"], common_params["platform"]
@@ -118,8 +118,9 @@ def main():
                         skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
                         source_dir=cast(Path, common_params["source_dir"]),
                         output_dir=cast(Path, common_params["output_dir"]),
+                        sock=sock,
                     )
-                    sock.sendall(b"done\n")
+                    sock.sendall(f"done:{warnings}:{filtered}\n".encode("utf-8"))
                 except MemoryError as e:
                     error_msg = f"error:oom:{str(e)}\n"
                     sock.sendall(error_msg.encode("utf-8"))
