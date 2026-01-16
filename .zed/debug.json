@@ -1,0 +1,23 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  // {
+  //   "name": "Launch tokenizer giantic binary",
+  {
+  "label": "Tokenizer giantic binary",
+  "adapter": "Debugpy",
+  "module": "tokenizer",
+  "args": [
+    "--single",
+    "z3/x64-clang-9-O0_z3"
+  ],
+  "request": "launch",
+  "redirectOutput": true,
+  "stopOnEntry": false,
+  "subProcess": true,
+  "cwd": "${ZED_WORKTREE_ROOT}",
+  "pythonPath": "python3"
+  }
+]
