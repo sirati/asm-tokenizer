@@ -775,6 +775,12 @@ def main():
         help="Process a single binary file",
     )
     group.add_argument(
+        "--dynamic_queue",
+        type=int,
+        metavar="SOCKET_FD",
+        help="Worker mode: receive tasks via socket file descriptor",
+    )
+    group.add_argument(
         "--debugs",
         action="store_true",
         help="Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh",
@@ -828,7 +834,56 @@ def main():
         output_dir=output_dir,
     )
 
-    if args.batch:
+    if args.dynamic_queue:
+        import socket
+        import sys
+        # Worker mode: receive tasks via socket
+        sock = socket.socket(fileno=args.dynamic_queue)
+        sock_file = sock.makefile("r")
+
+        print("[*] Worker started, waiting for tasks...")
+
+        while True:
+            try:
+                line = sock_file.readline()
+                if not line:
+                    break
+
+                command = line.strip()
+
+                if command == "stop":
+                    print("[*] Received stop command, shutting down")
+                    break
+
+                # Command is a relative path to a binary
+                binary_path = source_dir / command
+                print(f"[*] Processing: {binary_path}")
+
+                try:
+                    run_tokenizer(
+                        binary_path,
+                        platform=cast(
+                            Literal["x86", "arm64", "arm32", "x64", "file_prefix"], common_params["platform"]
+                        ),
+                        skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
+                        source_dir=cast(Path, common_params["source_dir"]),
+                        output_dir=cast(Path, common_params["output_dir"]),
+                    )
+                    # Send completion message
+                    sock.sendall(b"done\n")
+                except Exception as e:
+                    print(f"[!] Error processing {binary_path}: {e}")
+                    # Still send done to avoid blocking manager
+                    sock.sendall(b"done\n")
+
+            except Exception as e:
+                print(f"[!] Worker error: {e}")
+                break
+
+        sock.close()
+        print("[*] Worker shutdown complete")
+
+    elif args.batch:
         queue_file_path = (cwd / args.batch).resolve()
         print(f"[*] Reading queue file: {queue_file_path}")
 
