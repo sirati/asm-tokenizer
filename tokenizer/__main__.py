@@ -14,7 +14,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
+
     maxInt = sys.maxsize
     while True:
         try:
@@ -182,8 +182,44 @@ def main():
 
         logger.info("\n[*] Batch processing complete.")
     elif args.single:
-        binary_path_input = cwd / args.single
-        binary_path = binary_path_input.resolve()
+        binary_path_input = Path(args.single)
+
+        # If the path is absolute, use it directly
+        if binary_path_input.is_absolute():
+            binary_path = binary_path_input.resolve()
+        else:
+            # Check if --source was explicitly provided by the user
+            source_was_explicit = "--source" in sys.argv
+
+            if source_was_explicit:
+                # If source was explicitly set, always use file relative to source_dir
+                binary_path = (source_dir / binary_path_input).resolve()
+            else:
+                # Check if path exists relative to cwd
+                cwd_path = cwd / binary_path_input
+                exists_in_cwd = cwd_path.exists()
+
+                # Check if path exists relative to source_dir
+                source_path = source_dir / binary_path_input
+                exists_in_source = source_path.exists()
+
+                if exists_in_cwd and exists_in_source:
+                    logger.error(
+                        f"[!] Ambiguous path: '{args.single}' exists in both current directory and source directory."
+                    )
+                    logger.error(f"    Found at: {cwd_path}")
+                    logger.error(f"    Found at: {source_path}")
+                    logger.error(
+                        "    Suggestion: Use --source ./ or --source ./src/ to explicitly set the directory, or provide an absolute path."
+                    )
+                    sys.exit(1)
+                elif exists_in_cwd:
+                    binary_path = cwd_path.resolve()
+                elif exists_in_source:
+                    binary_path = source_path.resolve()
+                else:
+                    # Neither exists, just resolve relative to cwd (will fail later with clear error)
+                    binary_path = cwd_path.resolve()
         logger.info(f"[*] Processing single binary: {binary_path}")
         run_tokenizer(binary_path, **common_params)
     elif args.debugs:
