@@ -25,7 +25,7 @@ def main():
                 break
             except OverflowError:
                 maxInt = int(maxInt / 10)
-                
+
         parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument(
@@ -61,7 +61,7 @@ def main():
             action="store_true",
             help="Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool",
         )
-    
+
         parser.add_argument(
             "--platform",
             type=str,
@@ -82,20 +82,23 @@ def main():
             default="./out",
             help="Output directory for results (default: ./out)",
         )
-    
+
         args = parser.parse_args()
-    
+
         cwd = Path.cwd()
         source_dir = (cwd / args.source).resolve()
         output_dir = (cwd / args.output).resolve()
-    
+
         if args.log_file:
+            if args.dynamic_queue:
+                remove_stream_handlers(logger)
+
             log_file = Path(args.log_file)
             if not log_file.parent.exists():
                 log_file.parent.mkdir(parents=True)
-    
+
             log_file.touch()
-    
+
             file_handler = logging.FileHandler(log_file, mode="a")
             file_handler.setLevel(logging.INFO)
             formatter = logging.Formatter(
@@ -103,22 +106,20 @@ def main():
             )
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
-    
-            if args.dynamic_queue:
-                remove_stream_handlers(logger)
+
         else:
             logging.basicConfig(
                 level=logging.INFO,
                 format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
-    
+
         logger.info(f"[*] Source directory: {source_dir}")
         logger.info(f"[*] Output directory: {output_dir}")
-    
+
         if (args.debugs or args.debugl) and args.platform == "file_prefix":
             args.platform = "x86"
-    
+
         common_params = dict(
             platform=args.platform,
             skip_existing_csv=args.skip_existing,
