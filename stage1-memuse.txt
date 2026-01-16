@@ -1,5 +1,9 @@
 file ram
 0.5MiB 240MiB +- 40MiB
 1MiB 500MiB +- 200MiB
+4.29MB, Estimated memory: 1013.56MB, Available after: 2200
 8MiB 2GiB +- 400MiB
+18.89MiB, 11GiB
+18.78MB, Estimated memory: 6311.31MB, current max 8.5
+36.22MB, Estimated memory: 15205.08MB current max 14
 100MiB 20GiB +- 1GiB
