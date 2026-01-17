@@ -1,5 +1,23 @@
 import csv
-from typing import Any, Dict, List
+import os
+from typing import Any, Callable, Dict, List, Optional
+
+
+class PositionTrackingWrapper:
+    """Wrapper that tracks bytes read without interfering with csv.reader buffering."""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.fd = os.open(file_path, os.O_RDONLY)
+        self.file = open(self.fd, newline="", encoding="ascii")
+        self.bytes_read = 0
+
+    def get_position(self) -> int:
+        """Get current file position using lseek."""
+        return os.lseek(self.fd, 0, os.SEEK_CUR)
+
+    def close(self):
+        self.file.close()
 
 
 def is_vocab_row(row: List[str]) -> bool:
@@ -8,8 +26,8 @@ def is_vocab_row(row: List[str]) -> bool:
 
 
 def open_csv_skip_vocab(path: str):
-    f = open(path, newline="", encoding="ascii")
-    reader = csv.reader(f)
+    wrapper = PositionTrackingWrapper(path)
+    reader = csv.reader(wrapper.file)
     # Skip header
     header = next(reader)
 
@@ -19,7 +37,7 @@ def open_csv_skip_vocab(path: str):
             if not is_vocab_row(row):
                 yield row
 
-    return f, row_iterator(), header
+    return wrapper, row_iterator(), header
 
 
 def create_normalized_header(headers: List[List[str]]) -> List[str]:
@@ -47,23 +65,28 @@ def normalize_row(row: List[str], column_mapping: Dict[str, int]) -> Dict[str, s
     return {field: row[idx] for field, idx in column_mapping.items()}
 
 
-def lockstep_function_match(csv_paths: List[str]):
+def lockstep_function_match(csv_paths: List[str], progress_callback: Optional[Callable[[int], None]] = None):
     """
     Yields dicts with 'function_name' and 'rows' keys for functions that appear in at least 2 files.
-    Each dict's 'rows' value is a list where each element is either a dict (the CSV row as dict) or None if that version doesn't have the function.
+    Each dict's 'rows' value is a list where each element is either a dict (the CSV row as dict)
+    or None if that version doesn't have the function.
     Only yields if at least 2 files have the same function_name, and the function passes the filters.
     Assumes function names are sorted in all files.
     Row dicts are normalized to have all headers from all files (with None for missing fields).
+
+    Args:
+        csv_paths: List of paths to CSV files to process
+        progress_callback: Optional callback function that receives total bytes processed
     """
-    files = []
+    wrappers = []
     readers = []
     headers = []
     current_rows = []
     for path in csv_paths:
-        f, reader, header = open_csv_skip_vocab(path)
-        if f is None:
+        wrapper, reader, header = open_csv_skip_vocab(path)
+        if wrapper is None:
             raise RuntimeError(f"Could not open or find data in {path}")
-        files.append(f)
+        wrappers.append(wrapper)
         readers.append(reader)
         headers.append(header)
         # Read first row (vocab rows already skipped by open_csv_skip_vocab)
@@ -76,7 +99,9 @@ def lockstep_function_match(csv_paths: List[str]):
     normalized_header = create_normalized_header(headers)
     column_mappings = [create_column_mapping(header, normalized_header) for header in headers]
 
+    iteration_count = 0
     while True:
+        iteration_count += 1
         # Get current function names (None if row is exhausted)
         fnames = [row[0] if row is not None else None for row in current_rows]
         # If all files are exhausted, stop
@@ -104,5 +129,14 @@ def lockstep_function_match(csv_paths: List[str]):
                 current_rows[i] = row
             except StopIteration:
                 current_rows[i] = None
-    for f in files:
-        f.close()
+
+        if progress_callback is not None and iteration_count % 100 == 0:
+            total_bytes = sum(wrapper.get_position() for wrapper in wrappers)
+            progress_callback(total_bytes)
+
+    if progress_callback is not None:
+        total_bytes = sum(wrapper.get_position() for wrapper in wrappers)
+        progress_callback(total_bytes)
+
+    for wrapper in wrappers:
+        wrapper.close()
