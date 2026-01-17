@@ -35,7 +35,12 @@ class ConstantHandler:
         self.block_tokens: Dict[int, Tokens] = {}
 
     def process_constant(
-        self, value: int, is_arithmetic: bool = False, meta: Optional[Dict] = None, library_type: str = "unknown"
+        self,
+        value: int,
+        is_arithmetic: bool = False,
+        meta: Optional[Dict] = None,
+        library_type: str = "unknown",
+        insn_mnemonic: Optional[str] = None,
     ) -> List[Tokens]:
         """
         Process a constant value and return the appropriate token.
@@ -62,7 +67,7 @@ class ConstantHandler:
             return [self.vocab_manager.Valued_Const(value)]
 
         #
-        match_mask = (self.block_ranges[:, 0] < value) & (value < self.block_ranges[:, 1])
+        match_mask = (self.block_ranges[:, 0] <= value) & (value < self.block_ranges[:, 1])
         if np.any(match_mask):
             idx = match_mask.nonzero()[0][0]
             if self.block_ranges[idx, 0] == value:
@@ -74,32 +79,74 @@ class ConstantHandler:
                     self.vocab_manager.Valued_Const(value - self.block_ranges[idx, 0]),
                 ]
         else:
-            return self._create_opaque_const_with_offset(value, meta, library_type)
+            return self._create_opaque_const_with_offset(value, meta, library_type, insn_mnemonic)
 
     def _create_opaque_const_with_offset(
-        self, value: int, meta: Optional[Dict] = None, library_type: str = "unknown"
+        self,
+        value: int,
+        meta: Optional[Dict] = None,
+        library_type: str = "unknown",
+        insn_mnemonic: Optional[str] = None,
     ) -> List[Tokens]:
         """Create an opaque constant token, decomposing into base+offset if pointing into a range"""
         if meta is not None and "start_addr" in meta and "end_addr" in meta and value > meta["start_addr"]:
             start_addr = meta["start_addr"]
             end_addr = meta["end_addr"]
-            logger = logging.getLogger(__name__)
-            # we found a range, decompose it
-            logger.info(
-                f"Found range {start_addr:x}-{end_addr:x} for memory target {value:x}, decomposing it into base+offset with single metadata"
-            )
+            range_length = end_addr - start_addr
+            offset = value - start_addr
 
-            # If value points into the range (not at the start), decompose it
-            if start_addr < value < end_addr:
-                offset = value - start_addr
+            # Apply heuristics to decide if we should decompose
+            should_decompose = True
+            reason = ""
+
+            # Heuristic 5: Don't decompose local_function or library_function ranges (they should be exact)
+            if meta.get("type") in ["local_function", "library_function", "unknown_function"]:
+                should_decompose = False
+                reason = f"function range (type={meta.get('type')})"
+
+            # Heuristic 3: Call instructions should not be decomposed (must point to function header)
+            elif insn_mnemonic and insn_mnemonic.startswith("call"):
+                should_decompose = False
+                reason = "call instruction must point to function header"
+
+            # Heuristic 1: Range cannot start at 0 (not in binary)
+            elif start_addr == 0:
+                should_decompose = False
+                reason = "range starts at 0"
+
+            # Heuristic 2: Range cannot be longer than 2^16
+            elif range_length > (1 << 16):
+                should_decompose = False
+                reason = f"range too large (length={range_length:#x} > 0x10000)"
+
+            # Heuristic 6: Prefer decomposing data/rodata/bss sections
+            elif meta.get("type") not in ["data", "rodata", "bss", "code"]:
+                should_decompose = False
+                reason = f"unexpected metadata type: {meta.get('type')}"
+
+            logger = logging.getLogger(__name__)
+
+            # If value points into the range (not at the start), consider decomposition
+            if start_addr < value < end_addr and should_decompose:
+                insn_info = f" in {insn_mnemonic}" if insn_mnemonic else ""
+                # logger.info(
+                #     f"Decomposing: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
+                #     f"for target {value:#x}, offset={offset:#x}{insn_info}"
+                # )
                 base_token = self._create_opaque_const(start_addr, meta, library_type)
                 return [
-                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
+                    self.vocab_manager.MemoryOperand.OPEN_BRACKET,
                     base_token,
-                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS),
+                    self.vocab_manager.MemoryOperand.PLUS,
                     self.vocab_manager.Valued_Const(offset),
-                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
+                    self.vocab_manager.MemoryOperand.CLOSE_BRACKET,
                 ]
+            elif start_addr < value < end_addr and not should_decompose:
+                insn_info = f" in {insn_mnemonic}" if insn_mnemonic else ""
+                logger.info(
+                    f"Skipping decomposition: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
+                    f"for target {value:#x}, offset={offset:#x}{insn_info}, reason: {reason}"
+                )
 
         # Otherwise just create a simple opaque constant
         return [self._create_opaque_const(value, meta, library_type)]

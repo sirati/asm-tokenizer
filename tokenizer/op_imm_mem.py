@@ -1,11 +1,10 @@
 import warnings
+from typing import List
 
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
-from typing import List
-
-from tokenizer.tokens import Tokens, MemoryOperandSymbol
 from tokenizer.token_manager import VocabularyManager
+from tokenizer.tokens import MemoryOperandSymbol, Tokens
 from tokenizer.utils import num_hex_digits
 
 size_map = {
@@ -119,7 +118,11 @@ def tokenize_operand_memory(
 
         if force_opaque:
             disp_token = constant_handler.process_constant(
-                disp, is_arithmetic=False, meta=meta, library_type=meta.get("library", "unknown") if meta else "unknown"
+                disp,
+                is_arithmetic=False,
+                meta=meta,
+                library_type=meta.get("library", "unknown") if meta else "unknown",
+                insn_mnemonic=insn.mnemonic,
             )
             tokens.extend(disp_token)
         # For larger displacements, check if pointing to known constant or code or opaque
@@ -128,16 +131,20 @@ def tokenize_operand_memory(
             # Check if displacement is in text section or outside function bounds
             if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
                 disp_token = constant_handler.process_constant(
-                    disp, is_arithmetic=False, meta=meta, library_type=meta.get("library", "unknown")
+                    disp,
+                    is_arithmetic=False,
+                    meta=meta,
+                    library_type=meta.get("library", "unknown"),
+                    insn_mnemonic=insn.mnemonic,
                 )
                 tokens.extend(disp_token)
             else:
                 # Local constant - treat as valued constant literal
-                disp_token = constant_handler.process_constant(disp, is_arithmetic=True)
+                disp_token = constant_handler.process_constant(disp, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
                 tokens.extend(disp_token)
         else:
             # No metadata found - treat as valued constant literal
-            disp_token = constant_handler.process_constant(disp, is_arithmetic=True)
+            disp_token = constant_handler.process_constant(disp, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
             tokens.extend(disp_token)
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
@@ -167,34 +174,41 @@ def tokenize_operand_immediate(
     imm_val_hex_len = num_hex_digits(imm_val)
 
     if imm_val_hex_len <= 2:  # Small immediate (0x00 to 0xFF)
-        imm_token = constant_handler.process_constant(imm_val)
+        imm_token = constant_handler.process_constant(imm_val, insn_mnemonic=insn.mnemonic)
         tokens.extend(imm_token)
     elif imm_val_hex_len <= (128 / 4):  # Larger immediate (up to 128-bit)
         if insn.mnemonic in arithmetic_instructions:
             # Arithmetic instruction - treat as valued constant literal
-            imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True)
+            imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
             tokens.extend(imm_token)
         elif insn.mnemonic in addressing_control_flow_instructions:
             # Addressing/control flow instruction - check for metadata
             meta, kind = lookup.lookup(imm_val)
+            # todo we have a major issue here: a lot of targets are NOI in this table, e.g. I got .plt but angr can resolve it cfg.kb.functions.get(call_target_addr)
             if meta is not None:
                 if kind == "range":
                     if func_min_addr <= imm_val < func_max_addr:  # Local
-                        imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True)
+                        imm_token = constant_handler.process_constant(
+                            imm_val, is_arithmetic=True, insn_mnemonic=insn.mnemonic
+                        )
                         tokens.extend(imm_token)
                     else:  # External
                         imm_token = constant_handler.process_constant(
-                            imm_val, is_arithmetic=False, meta=meta, library_type="function"
+                            imm_val,
+                            is_arithmetic=False,
+                            meta=meta,
+                            library_type="function",
+                            insn_mnemonic=insn.mnemonic,
                         )
                         tokens.extend(imm_token)
                 else:
                     imm_token = constant_handler.process_constant(
-                        imm_val, is_arithmetic=False, meta=meta, library_type="unknown"
+                        imm_val, is_arithmetic=False, meta=meta, library_type="unknown", insn_mnemonic=insn.mnemonic
                     )
                     tokens.extend(imm_token)
             else:
                 # No metadata - treat as valued constant literal
-                imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True)
+                imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
                 tokens.extend(imm_token)
         else:  # Fallback - create opaque constant
             meta, kind = lookup.lookup(imm_val)
@@ -208,7 +222,7 @@ def tokenize_operand_immediate(
                     "library": "unknown",
                 }
             imm_token = constant_handler.process_constant(
-                imm_val, is_arithmetic=False, meta=meta, library_type="unknown"
+                imm_val, is_arithmetic=False, meta=meta, library_type="unknown", insn_mnemonic=insn.mnemonic
             )
             tokens.extend(imm_token)
 

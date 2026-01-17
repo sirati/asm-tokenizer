@@ -49,7 +49,7 @@ def main():
         group.add_argument(
             "--debugs",
             action="store_true",
-            help="Debug mode: process ../src/clamav/x86-gcc-5-O3_minigzipsh",
+            help="Debug mode: process ../src/zlib/x86-gcc-5-O3_minigzipsh",
         )
         group.add_argument(
             "--debugl",
@@ -253,7 +253,7 @@ def main():
             logger.info(f"[*] Processing single binary: {binary_path}")
             run_tokenizer(binary_path, **common_params)
         elif args.debugs:
-            binary_path = source_dir / f"clamav/{args.platform}-gcc-5-O3_minigzipsh"
+            binary_path = source_dir / f"zlib/{args.platform}-gcc-5-O3_minigzipsh"
             logger.info(f"[*] Debug mode (gcc): {binary_path}")
             debug_params = common_params.copy()
             debug_params.update(dict(skip_existing_csv=False))
