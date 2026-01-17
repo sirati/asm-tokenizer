@@ -148,6 +148,8 @@ def fill_constant_candidates(
         block_ranges[i, 0] = block.addr
         block_ranges[i, 1] = block.addr + block.size
 
+
+    func_max_addr = int(block_ranges.max())
     constant_handler = ConstantHandler(vocab_manager, resolver, constant_dict, block_ranges)
     temp_bbs: list[tuple[str, list[list[Tokens]]]] = []
     block_list: list[dict[BlockToken, tuple[int, int]]] = []

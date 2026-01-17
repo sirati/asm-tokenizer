@@ -1,3 +1,5 @@
+import logging
+
 import angr
 from intervaltree import IntervalTree
 
@@ -124,8 +126,17 @@ class AddressMetaDataLookup:
                 ):
                     func_name = f"sub_{func.addr:x}"
 
-                meta = {"name": func_name, "type": func_type, "size": size, "source": source, "library": library}
+                meta = dict(
+                    name=func_name,
+                    type=func_type,
+                    size=size,
+                    start_addr=func.addr,
+                    end_addr=func.addr + size,
+                    source=source,
+                    library=library,
+                )
 
+                self.exact_lookup[func.addr] = meta
                 self.range_lookup[func.addr : func.addr + size] = meta
         except Exception as e:
             print(f"EXCEPTION during function indexing: {e}")
@@ -148,15 +159,42 @@ class AddressMetaDataLookup:
         Returns a tuple: (metadata_dict, source-type)
         source_type is one of 'exact', 'range', 'synthetic'
         """
-        if addr in self.exact_lookup:
-            return self.exact_lookup[addr], "exact"
+        logger = logging.getLogger(__name__)
 
-        matches = self.range_lookup[addr]
-        if matches:
-            interval = list(matches)[0]
-            meta = interval.data.copy()
-            meta["start_addr"] = interval.begin
-            meta["end_addr"] = interval.end
+        # fn_result = self.cfg.kb.functions.get(addr)
+        # if fn_result is not None and addr not in self.exact_lookup:
+        #     logger.warning(f"Function {fn_result.name} at {addr:x} is not in exact lookup")
+
+        #     meta = {
+        #         "start_addr": addr,
+        #         "end_addr": addr + fn_result.size,
+        #         "name": fn_result.name,
+        #         "type": "function",
+        #         "size": fn_result.size,
+        #         "source": "function",
+        #         "library": self._find_library_for_addr(addr),
+        #     }
+        #     return meta, "exact"
+
+        match = self.range_lookup[addr]
+        # Find the most constrained (smallest) match
+        if match:
+            matches_list = list(match)
+            # Find the interval with the smallest size
+            match = min(matches_list, key=lambda iv: iv.end - iv.begin)
+
+        if addr in self.exact_lookup:
+            exact = self.exact_lookup[addr]
+
+            if match is not None and match.data != exact:
+                logger.fatal(f"Exact lookup mismatch for {addr:x}")
+
+            return exact, "exact"
+
+        if match:
+            meta = match.data.copy()
+            meta["start_addr"] = match.begin
+            meta["end_addr"] = match.end
             return meta, "range"
 
         # Fallback to synthetic metadata to guarantee no empty result

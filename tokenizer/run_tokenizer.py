@@ -16,6 +16,7 @@ from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
 
 SCRIPT_FOLDER: Path = Path(__file__).parent.resolve()
+DO_PICKLES: bool = False
 
 
 def disassemble_to_tokens(
@@ -80,8 +81,9 @@ def disassemble_to_tokens(
             text_start=text_start,
         )
 
-        with open(pickle_mainloop_file_path, "wb") as f:
-            pickle.dump(kwargs, f)
+        if DO_PICKLES:
+            with open(pickle_mainloop_file_path, "wb") as f:
+                pickle.dump(kwargs, f)
 
     else:
         kwargs.update(dict(cfg=cfg, constant_list=constant_list))
@@ -163,31 +165,32 @@ def run_tokenizer(
     kvargs: dict | None = None
     start_time = time.time()
 
-    if pickle_mainloop_file_path.exists():
-        logger.info("loading existing mainloop pickle to speed up")
-        if sock is not None:
-            sock.sendall(b"phase:phase2\n")
-        try:
-            with open(pickle_mainloop_file_path, "rb") as f:
-                kvargs = pickle.load(f)
-                if kvargs is not None and "path" not in kvargs:
-                    kvargs["path"] = file_path
-                with_pickled = True
-            logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
-        except Exception as e:
-            logger.warning(f"Failed to load pickle from {pickle_mainloop_file_path}: {e}")
-            logger.info(f"Deleting corrupted pickle file: {pickle_mainloop_file_path}")
-            pickle_mainloop_file_path.unlink()
-    elif pickle_file_path.exists():
-        logger.info("loading existing pickle to speed up")
-        try:
-            with open(pickle_file_path, "rb") as f:
-                kvargs = pickle.load(f)
-            logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
-        except Exception as e:
-            logger.warning(f"Failed to load pickle from {pickle_file_path}: {e}")
-            logger.info(f"Deleting corrupted pickle file: {pickle_file_path}")
-            pickle_file_path.unlink()
+    if DO_PICKLES:
+        if pickle_mainloop_file_path.exists():
+            logger.info("loading existing mainloop pickle to speed up")
+            if sock is not None:
+                sock.sendall(b"phase:phase2\n")
+            try:
+                with open(pickle_mainloop_file_path, "rb") as f:
+                    kvargs = pickle.load(f)
+                    if kvargs is not None and "path" not in kvargs:
+                        kvargs["path"] = file_path
+                    with_pickled = True
+                logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+            except Exception as e:
+                logger.warning(f"Failed to load pickle from {pickle_mainloop_file_path}: {e}")
+                logger.info(f"Deleting corrupted pickle file: {pickle_mainloop_file_path}")
+                pickle_mainloop_file_path.unlink()
+        elif pickle_file_path.exists():
+            logger.info("loading existing pickle to speed up")
+            try:
+                with open(pickle_file_path, "rb") as f:
+                    kvargs = pickle.load(f)
+                logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+            except Exception as e:
+                logger.warning(f"Failed to load pickle from {pickle_file_path}: {e}")
+                logger.info(f"Deleting corrupted pickle file: {pickle_file_path}")
+                pickle_file_path.unlink()
 
     if kvargs is None:
         project: angr.Project = angr.Project(file_path, auto_load_libs=False)
@@ -197,10 +200,11 @@ def run_tokenizer(
         kvargs = dict(project=project, cfg=cfg, constant_list=constants)
         logger.info(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
         start_time = time.time()
-        with open(pickle_file_path, "wb") as f:
-            pickle.dump(kvargs, f)
+        if DO_PICKLES:
+            with open(pickle_file_path, "wb") as f:
+                pickle.dump(kvargs, f)
 
-        logger.info(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
+            logger.info(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
 
     start_time = time.time()
     logger.info("Calling lowlevel_disas")
