@@ -4,7 +4,9 @@ from typing import Any, Dict, List
 def parse_inlining_data(inlining_str: str) -> List[List[int]]:
     """
     Parse inlining data string format: "idx,hex_offset,hex_length,is_matched;idx,hex_offset,hex_length,is_matched;..."
+    For unmatched format: "idx-comp_set,hex_offset,hex_length,is_matched;..."
     Returns list of [idx, offset, length, is_matched]
+    Note: comp_set information is discarded for unmatched functions
     """
     if not inlining_str:
         return []
@@ -13,7 +15,8 @@ def parse_inlining_data(inlining_str: str) -> List[List[int]]:
         if entry:
             parts = entry.split(",")
             if len(parts) == 4:
-                result.append([int(parts[0]), int(parts[1], 16), int(parts[2], 16), int(parts[3])])
+                idx_part = parts[0].split("-")[0]
+                result.append([int(idx_part), int(parts[1], 16), int(parts[2], 16), int(parts[3])])
     return result
 
 

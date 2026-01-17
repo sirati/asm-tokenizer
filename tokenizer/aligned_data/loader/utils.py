@@ -27,9 +27,11 @@ def load_single_matched_function(
     """
     dataset = BinaryDataset(base_path, binary_name)
 
-    # Find function in the sections file
-    try:
-        idx = dataset.matched_func_names.index(func_name)
-        return dataset.load_matched_function(idx)
-    except (ValueError, IndexError):
-        return None
+    # Index file is sorted by length, not by name order in sections file
+    # Must scan through all functions to find the one with matching name
+    for idx in range(dataset.matched_count):
+        matched_func = dataset.load_matched_function(idx)
+        if matched_func.func_name == func_name:
+            return matched_func
+
+    return None

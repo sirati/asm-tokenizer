@@ -110,3 +110,28 @@ def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> Voca
         return None
 
     return load_vocab_manager_csv_row_bytes(last_line, platform)
+
+
+def load_unified_vocab_manager(csv_path: Path) -> VocabularyManager | None:
+    """Load vocabulary manager from unified_vocab.csv file.
+
+    Args:
+        csv_path: Path to unified_vocab.csv file
+
+    Returns:
+        VocabularyManager instance or None if loading fails
+    """
+    try:
+        # Read the second line (skip header) from the CSV file
+        with open(csv_path, "rb") as f:
+            # Skip first line (header)
+            f.readline()
+            # Read second line (actual vocab data)
+            vocab_line = f.readline()
+
+        return load_vocab_manager_csv_row_bytes(vocab_line, "unified")
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error reading vocab from file: {csv_path}")
+        logger.error(f"Error message: {e}")
+        return None
