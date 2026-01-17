@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-from tokenizer.data_loader import load_vocab_manager
+from tokenizer.vocab_unifier import load_vocab_manager
 
 from .csv_format import format_unique_called
 from .export_helpers import (
