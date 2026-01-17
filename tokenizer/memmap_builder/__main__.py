@@ -35,14 +35,8 @@ def match_csv_to_mapping(csv_binaries, mapping_binaries):
     for csv_bin in csv_binaries:
         found = False
         for map_bin in mapping_binaries:
-            if (
-                csv_bin.platform == map_bin.platform
-                and csv_bin.compiler == map_bin.compiler
-                and csv_bin.version == map_bin.version
-                and csv_bin.opt_level == map_bin.opt_level
-                and csv_bin.binary_name == map_bin.binary_name
-            ):
-                matched[csv_bin] = map_bin
+            if csv_bin.identifier == map_bin.identifier:
+                matched[csv_bin.identifier] = map_bin
                 found = True
                 break
         if not found:
@@ -132,6 +126,8 @@ def main() -> None:
 
     matched_pairs, unmatched_csv = match_csv_to_mapping(csv_binaries, mapping_binaries)
 
+    csv_by_identifier = {csv_bin.identifier: csv_bin for csv_bin in csv_binaries}
+
     if unmatched_csv:
         logger.warning(f"{len(unmatched_csv)} CSV file(s) have no matching mapping file:")
         for csv_bin in unmatched_csv:
@@ -139,7 +135,8 @@ def main() -> None:
 
     if config.list_files:
         logger.info(f"Found {len(matched_pairs)} matched CSV/mapping file pairs:")
-        for csv_bin, map_bin in matched_pairs.items():
+        for identifier, map_bin in matched_pairs.items():
+            csv_bin = csv_by_identifier[identifier]
             csv_info = format_binary_info(csv_bin, config.source_dir)
             map_info = format_binary_info(map_bin, vocab_source_dir)
             logger.info(f"  CSV: {csv_info}")
@@ -148,7 +145,8 @@ def main() -> None:
 
     logger.info(f"Found {len(matched_pairs)} matched CSV/mapping file pairs to process")
 
-    binaries_by_name = group_binaries_by_name(list(matched_pairs.keys()))
+    csv_binaries_matched = [csv_by_identifier[identifier] for identifier in matched_pairs.keys()]
+    binaries_by_name = group_binaries_by_name(csv_binaries_matched)
 
     for binary_name, binaries in binaries_by_name.items():
         logger.info(f"\nProcessing binary: {binary_name}")
@@ -157,7 +155,7 @@ def main() -> None:
         versions = [
             BinaryVersionInfo(
                 path=binary.path,
-                mapping_path=matched_pairs[binary].path,
+                mapping_path=matched_pairs[binary.identifier].path,
                 arch=binary.platform,
                 compiler=binary.compiler,
                 compilerversion=binary.version,
