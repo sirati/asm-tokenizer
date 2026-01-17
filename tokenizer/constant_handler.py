@@ -1,3 +1,4 @@
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -73,7 +74,35 @@ class ConstantHandler:
                     self.vocab_manager.Valued_Const(value - self.block_ranges[idx, 0]),
                 ]
         else:
-            return [self._create_opaque_const(value, meta, library_type)]
+            return self._create_opaque_const_with_offset(value, meta, library_type)
+
+    def _create_opaque_const_with_offset(
+        self, value: int, meta: Optional[Dict] = None, library_type: str = "unknown"
+    ) -> List[Tokens]:
+        """Create an opaque constant token, decomposing into base+offset if pointing into a range"""
+        if meta is not None and "start_addr" in meta and "end_addr" in meta and value > meta["start_addr"]:
+            start_addr = meta["start_addr"]
+            end_addr = meta["end_addr"]
+            logger = logging.getLogger(__name__)
+            # we found a range, decompose it
+            logger.info(
+                f"Found range {start_addr:x}-{end_addr:x} for memory target {value:x}, decomposing it into base+offset with single metadata"
+            )
+
+            # If value points into the range (not at the start), decompose it
+            if start_addr < value < end_addr:
+                offset = value - start_addr
+                base_token = self._create_opaque_const(start_addr, meta, library_type)
+                return [
+                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
+                    base_token,
+                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS),
+                    self.vocab_manager.Valued_Const(offset),
+                    self.vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
+                ]
+
+        # Otherwise just create a simple opaque constant
+        return [self._create_opaque_const(value, meta, library_type)]
 
     def _create_opaque_const(self, value: int, meta: Optional[Dict] = None, library_type: str = "unknown") -> Tokens:
         """Create an opaque constant token"""
