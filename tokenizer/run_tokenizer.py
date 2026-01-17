@@ -160,30 +160,41 @@ def run_tokenizer(
         return (0, 0)
 
     with_pickled = False
+    kvargs: dict | None = None
     start_time = time.time()
 
     if pickle_mainloop_file_path.exists():
         logger.info("loading existing mainloop pickle to speed up")
         if sock is not None:
             sock.sendall(b"phase:phase2\n")
-        with open(pickle_mainloop_file_path, "rb") as f:
-            kvargs = pickle.load(f)
-            if "path" not in kvargs:
-                kvargs["path"] = file_path
-            with_pickled = True
-        logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+        try:
+            with open(pickle_mainloop_file_path, "rb") as f:
+                kvargs = pickle.load(f)
+                if kvargs is not None and "path" not in kvargs:
+                    kvargs["path"] = file_path
+                with_pickled = True
+            logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+        except Exception as e:
+            logger.warning(f"Failed to load pickle from {pickle_mainloop_file_path}: {e}")
+            logger.info(f"Deleting corrupted pickle file: {pickle_mainloop_file_path}")
+            pickle_mainloop_file_path.unlink()
     elif pickle_file_path.exists():
         logger.info("loading existing pickle to speed up")
-        with open(pickle_file_path, "rb") as f:
-            kvargs = pickle.load(f)
+        try:
+            with open(pickle_file_path, "rb") as f:
+                kvargs = pickle.load(f)
+            logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
+        except Exception as e:
+            logger.warning(f"Failed to load pickle from {pickle_file_path}: {e}")
+            logger.info(f"Deleting corrupted pickle file: {pickle_file_path}")
+            pickle_file_path.unlink()
 
-        logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
-    else:
+    if kvargs is None:
         project: angr.Project = angr.Project(file_path, auto_load_libs=False)
         constants: dict[str, list[str]] = parse_and_save_data_sections(project)
         cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(normalize=True)
 
-        kvargs: dict = dict(project=project, cfg=cfg, constant_list=constants)
+        kvargs = dict(project=project, cfg=cfg, constant_list=constants)
         logger.info(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
         start_time = time.time()
         with open(pickle_file_path, "wb") as f:
@@ -193,19 +204,22 @@ def run_tokenizer(
 
     start_time = time.time()
     logger.info("Calling lowlevel_disas")
-    kvargs.update(
-        dict(
-            with_pickled=with_pickled,
-            out_folder=out_folder,
-            binary_name=binary_name,
-            platform=platform,
-            csv_path=csv_path,
-            binary_path=binary_path,
-            pickle_mainloop_file_path=pickle_mainloop_file_path,
-            sock=sock,
-            logger=logger,
+    if kvargs is not None:
+        kvargs.update(
+            dict(
+                with_pickled=with_pickled,
+                out_folder=out_folder,
+                binary_name=binary_name,
+                platform=platform,
+                csv_path=csv_path,
+                binary_path=binary_path,
+                pickle_mainloop_file_path=pickle_mainloop_file_path,
+                sock=sock,
+                logger=logger,
+            )
         )
-    )
+    else:
+        raise RuntimeError("Failed to initialize kvargs")
     (func_names, function_manager, vocab_manager, filtered) = disassemble_to_tokens(**kvargs)
     disassembly_time = time.time() - start_time
     warning_handler.unregister()

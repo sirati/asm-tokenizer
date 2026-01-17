@@ -164,8 +164,9 @@ def main():
                         logger.info(f"[!] Non-recoverable error: {e}")
                         break
                     except Exception as e:
-                        tb_str = traceback.format_exc().replace("\n", " ")[:200]
-                        error_msg = f"error:recoverable:{type(e).__name__}: {str(e)[:100]} | {tb_str}\n"
+                        tb_str = traceback.format_exc()
+                        logger.error(f"[!] Error processing {binary_path}:\n{tb_str}")
+                        error_msg = f"error:recoverable:{type(e).__name__}: {str(e)}\n"
                         sock.sendall(error_msg.encode("utf-8"))
 
                 except (KeyboardInterrupt, SystemExit) as e:
