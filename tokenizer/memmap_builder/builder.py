@@ -1,4 +1,5 @@
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -83,7 +84,27 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     matched_data_file = open(matched_data_path, "wb")
     unmatched_data_file = open(unmatched_data_path, "wb")
 
-    for match_data in lockstep_function_match(csv_paths):
+    progress_callback = None
+    pbar = None
+    if sys.stdout.isatty():
+        try:
+            from tqdm import tqdm
+
+            total_size = sum(Path(csv_path).stat().st_size for csv_path in csv_paths)
+            pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Processing {binary_name}", leave=False)
+            progress_callback = pbar.update
+            last_bytes = [0]
+
+            def progress_wrapper(current_bytes):
+                delta = current_bytes - last_bytes[0]
+                last_bytes[0] = current_bytes
+                pbar.update(delta)
+
+            progress_callback = progress_wrapper
+        except ImportError:
+            pass
+
+    for match_data in lockstep_function_match(csv_paths, progress_callback):
         func_name = match_data["function_name"]
         rows = match_data["rows"]
         count = match_data["count"]
@@ -101,6 +122,9 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
         elif count == 1:
             entries = process_unmatched_function_pass1(func_name, rows, version_keys, mapping_dict, unmatched_data_file)
             unmatched_data_entries.extend(entries)
+
+    if pbar is not None:
+        pbar.close()
 
     matched_data_file.close()
     logger.info(f"  Closed: {matched_data_path}")
