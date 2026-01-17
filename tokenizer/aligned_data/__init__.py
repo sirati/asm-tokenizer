@@ -9,6 +9,7 @@ This module provides utilities for:
 """
 
 from .export import (
+    VersionKey,
     collect_binaries,
     compute_avg_function_length,
     export_matched_and_unmatched_sets,
@@ -102,6 +103,7 @@ __all__ = [
     "process_unmatched_too_long",
     "export_matched_and_unmatched_sets",
     "run_alignment_export",
+    "VersionKey",
     # match
     "is_vocab_row",
     "open_csv_skip_vocab",

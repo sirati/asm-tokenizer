@@ -5,7 +5,7 @@ import numpy as np
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
-from .io import (
+from ..aligned_data.io import (
     decode_and_translate_tokens,
     decode_runlengths,
     write_function_binary_data,

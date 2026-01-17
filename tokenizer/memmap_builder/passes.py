@@ -1,19 +1,19 @@
 import csv
 from typing import Dict, List
 
-from .csv_format import format_unique_called
-from .export_helpers import (
+from ..aligned_data.csv_format import format_unique_called
+from ..aligned_data.io import write_function_section_csv, write_index_entry
+from .helpers import (
     get_called_functions_from_row,
     process_function_binary_data,
     should_skip_function_for_matched,
     should_skip_function_for_unmatched,
 )
-from .export_writers import (
+from .writers import (
     build_inlining_data_for_unmatched,
     finalize_index_file,
     write_unmatched_function_section,
 )
-from .io import write_function_section_csv, write_index_entry
 
 
 def process_matched_function_pass1(

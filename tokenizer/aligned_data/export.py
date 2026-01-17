@@ -6,19 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-from tokenizer.vocab_unifier import load_vocab_manager
-
-logger = logging.getLogger(__name__)
-
-from .csv_format import format_unique_called
-from .export_helpers import (
+from tokenizer.memmap_builder.helpers import (
     build_inlining_data,
     collect_unique_called_functions,
     format_inlining_list,
     get_called_functions_from_row,
     process_function_binary_data,
 )
-from .export_writers import finalize_index_file
+from tokenizer.memmap_builder.writers import finalize_index_file
+from tokenizer.vocab_unifier import load_vocab_manager
+
+from .csv_format import format_unique_called
 from .io import (
     decode_and_translate_tokens,
     decode_runlengths,
@@ -27,6 +25,8 @@ from .io import (
     write_index_entry,
 )
 from .match import is_vocab_row, lockstep_function_match
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -103,8 +103,8 @@ def get_mapping(mapping_path):
 def get_vocab_and_mapping(csv_path, mapping_path=None):
     vocab = load_vocab_manager(Path(csv_path))
     if vocab is None:
-        logger.error(f"Failed to load vocabulary from {csv_path}: {e}")
-        raise e
+        logger.error(f"Failed to load vocabulary from {csv_path}")
+        raise RuntimeError(f"Failed to load vocabulary from {csv_path}")
     mapping = get_mapping(mapping_path)
     return vocab, mapping
 
@@ -236,7 +236,7 @@ def write_unmatched_files(
     function_lookup,
     warn_log,
 ):
-    from .export_writers import (
+    from tokenizer.memmap_builder.writers import (
         build_inlining_data_for_unmatched,
         write_unmatched_function_section,
     )
@@ -354,7 +354,7 @@ def process_unmatched_too_long(csv_paths, version_keys, mapping_dict, out_path, 
 
 
 def export_matched_and_unmatched_sets(binaries, output_path):
-    from .export_passes import (
+    from tokenizer.memmap_builder.passes import (
         build_function_lookup_table,
         process_matched_function_pass1,
         process_unmatched_function_pass1,

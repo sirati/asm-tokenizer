@@ -1,7 +1,7 @@
 from typing import List, Tuple
 
-from .csv_format import format_unique_called
-from .io import (
+from ..aligned_data.csv_format import format_unique_called
+from ..aligned_data.io import (
     write_function_section_csv,
     write_index_entry,
     write_unmatched_section_csv,
