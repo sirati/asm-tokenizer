@@ -15,8 +15,6 @@ from shared import (
 
 from .builder import BinaryVersionInfo, build_memmap_files
 
-logger = logging.getLogger(__name__)
-
 
 def group_binaries_by_name(binaries):
     """Group binaries by their binary name."""
@@ -54,6 +52,15 @@ def match_csv_to_mapping(csv_binaries, mapping_binaries):
 
 
 def main() -> None:
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     parser = argparse.ArgumentParser(description="Build memory-mapped binary files from aligned CSV data.")
 
     add_selection_arguments(parser)
@@ -72,14 +79,15 @@ def main() -> None:
     config = process_selection_arguments(args)
 
     vocab_source_dir = Path(args.vocab_source).resolve() if args.vocab_source else config.source_dir
+    logger.info(f"Vocab source directory: {vocab_source_dir}")
 
     if not vocab_source_dir.exists():
-        print(f"Error: Vocab source directory does not exist: {vocab_source_dir}")
+        logger.error(f"Vocab source directory does not exist: {vocab_source_dir}")
         sys.exit(1)
 
     unified_vocab_path = vocab_source_dir / "unified_vocab.csv"
     if not unified_vocab_path.exists():
-        print(f"Error: unified_vocab.csv not found in vocab source directory: {vocab_source_dir}")
+        logger.error(f"unified_vocab.csv not found in vocab source directory: {vocab_source_dir}")
         sys.exit(1)
 
     display_opt_levels = None
@@ -89,11 +97,10 @@ def main() -> None:
 
     print_selection_summary(config, display_opt_levels)
     if args.vocab_source:
-        print(f"Vocab source directory: {vocab_source_dir}")
-        print()
+        logger.info(f"Vocab source directory: {vocab_source_dir}")
 
     csv_output_format = config.file_format + "_out\\put.\\csv"
-    mapping_format = config.file_format + ".ma\\pping.b64\\c"
+    mapping_format = config.file_format + "_out\\put.ma\\p\\ping.b64\\c"
 
     csv_binaries = find_matching_binaries(
         source_dir=config.source_dir,
@@ -121,31 +128,31 @@ def main() -> None:
         exclude_subfolders=config.exclude_subfolders,
     )
 
+    logger.info(f"Found {len(csv_binaries)} output.csv and {len(mapping_binaries)} mapping.bin files")
+
     matched_pairs, unmatched_csv = match_csv_to_mapping(csv_binaries, mapping_binaries)
 
     if unmatched_csv:
-        print(f"Warning: {len(unmatched_csv)} CSV file(s) have no matching mapping file:")
+        logger.warning(f"{len(unmatched_csv)} CSV file(s) have no matching mapping file:")
         for csv_bin in unmatched_csv:
-            print(f"  {format_binary_info(csv_bin, config.source_dir)}")
-        print()
+            logger.warning(f"  {format_binary_info(csv_bin, config.source_dir)}")
 
     if config.list_files:
-        print(f"Found {len(matched_pairs)} matched CSV/mapping file pairs:")
+        logger.info(f"Found {len(matched_pairs)} matched CSV/mapping file pairs:")
         for csv_bin, map_bin in matched_pairs.items():
             csv_info = format_binary_info(csv_bin, config.source_dir)
             map_info = format_binary_info(map_bin, vocab_source_dir)
-            print(f"  CSV: {csv_info}")
-            print(f"  MAP: {map_info}")
-            print()
+            logger.info(f"  CSV: {csv_info}")
+            logger.info(f"  MAP: {map_info}")
         return
 
-    print(f"Found {len(matched_pairs)} matched CSV/mapping file pairs to process")
+    logger.info(f"Found {len(matched_pairs)} matched CSV/mapping file pairs to process")
 
     binaries_by_name = group_binaries_by_name(list(matched_pairs.keys()))
 
     for binary_name, binaries in binaries_by_name.items():
-        print(f"\nProcessing binary: {binary_name}")
-        print(f"  Versions: {len(binaries)}")
+        logger.info(f"\nProcessing binary: {binary_name}")
+        logger.info(f"  Versions: {len(binaries)}")
 
         versions = [
             BinaryVersionInfo(
@@ -161,9 +168,9 @@ def main() -> None:
 
         build_memmap_files(versions, config.output_dir, binary_name)
 
-        print(f"  Completed: {binary_name}")
+        logger.info(f"  Completed: {binary_name}")
 
-    print("\nDone!")
+    logger.info("\nDone!")
 
 
 if __name__ == "__main__":

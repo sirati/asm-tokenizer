@@ -1,4 +1,5 @@
 import argparse
+import logging
 
 from shared import (
     add_selection_arguments,
@@ -13,6 +14,14 @@ from .unifier import unify_vocab
 
 
 def main() -> None:
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     parser = argparse.ArgumentParser(
         description="Unify vocabularies from multiple CSV files into a single unified vocabulary."
     )
@@ -55,19 +64,19 @@ def main() -> None:
     )
 
     if config.list_files:
-        print(f"Found {len(file_names_parsed)} CSV files:")
+        logger.info(f"Found {len(file_names_parsed)} CSV files:")
         for csv_file in file_names_parsed:
-            print(format_binary_info(csv_file, config.source_dir))
+            logger.info(format_binary_info(csv_file, config.source_dir))
         return
 
-    print(f"Found {len(file_names_parsed)} CSV files to unify")
+    logger.info(f"Found {len(file_names_parsed)} CSV files to unify")
 
     unified_vocab_file = config.output_dir / args.out_unified_vocab
 
     csv_paths = [binary.path for binary in file_names_parsed]
     unify_vocab(csv_paths, unified_vocab_file)
 
-    print("Done!")
+    logger.info("Done!")
 
 
 if __name__ == "__main__":

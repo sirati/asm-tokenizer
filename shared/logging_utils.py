@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Optional
 
 
@@ -53,3 +54,46 @@ def setup_logger(
     counter_handler.attach_to_logger(logger)
 
     return logger, counter_handler
+
+
+def setup_file_logger(
+    name: str,
+    log_file_path: Path,
+    level: int = logging.INFO,
+    console: bool = True,
+    console_format: str | None = None,
+) -> logging.Logger:
+    """Create a logger with file handler and optional console handler.
+
+    Args:
+        name: Logger name
+        log_file_path: Path to log file
+        level: Logging level (default: INFO)
+        console: Whether to add console handler (default: True)
+        console_format: Custom format for console handler. If None, uses standard format.
+
+    Returns:
+        Configured logger
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    file_handler = logging.FileHandler(log_file_path, mode="a")
+    file_handler.setLevel(level)
+    file_formatter = logging.Formatter(
+        "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    if console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        if console_format is None:
+            console_format = "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s"
+        console_formatter = logging.Formatter(console_format, datefmt="%Y-%m-%d %H:%M:%S")
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+
+    return logger
