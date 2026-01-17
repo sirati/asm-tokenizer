@@ -1,5 +1,6 @@
 import argparse
 import logging
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -25,17 +26,61 @@ def group_binaries_by_name(binaries):
     return grouped
 
 
+def match_csv_to_mapping(csv_binaries, mapping_binaries):
+    """Match each CSV binary to its corresponding mapping file.
+
+    Returns dict mapping csv BinaryInfo to mapping BinaryInfo.
+    """
+    matched = {}
+    unmatched_csv = []
+
+    for csv_bin in csv_binaries:
+        found = False
+        for map_bin in mapping_binaries:
+            if (
+                csv_bin.platform == map_bin.platform
+                and csv_bin.compiler == map_bin.compiler
+                and csv_bin.version == map_bin.version
+                and csv_bin.opt_level == map_bin.opt_level
+                and csv_bin.binary_name == map_bin.binary_name
+            ):
+                matched[csv_bin] = map_bin
+                found = True
+                break
+        if not found:
+            unmatched_csv.append(csv_bin)
+
+    return matched, unmatched_csv
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build memory-mapped binary files from aligned CSV data.")
 
     add_selection_arguments(parser)
 
-    parser.set_defaults(file_format="platform-compiler-version-optimisationlevel_binaryname_output.csv")
+    parser.add_argument(
+        "--vocab-source",
+        type=str,
+        default=None,
+        help="Source directory for vocabulary and mapping files. If not specified, uses the same as --source.",
+    )
+
     parser.set_defaults(source="./out/")
 
     args = parser.parse_args()
 
     config = process_selection_arguments(args)
+
+    vocab_source_dir = Path(args.vocab_source).resolve() if args.vocab_source else config.source_dir
+
+    if not vocab_source_dir.exists():
+        print(f"Error: Vocab source directory does not exist: {vocab_source_dir}")
+        sys.exit(1)
+
+    unified_vocab_path = vocab_source_dir / "unified_vocab.csv"
+    if not unified_vocab_path.exists():
+        print(f"Error: unified_vocab.csv not found in vocab source directory: {vocab_source_dir}")
+        sys.exit(1)
 
     display_opt_levels = None
     if config.opt_levels:
@@ -43,29 +88,60 @@ def main() -> None:
         display_opt_levels = normalized.display_values
 
     print_selection_summary(config, display_opt_levels)
+    if args.vocab_source:
+        print(f"Vocab source directory: {vocab_source_dir}")
+        print()
 
-    file_names_parsed = find_matching_binaries(
+    csv_output_format = config.file_format + "_out\\put.\\csv"
+    mapping_format = config.file_format + ".ma\\pping.b64\\c"
+
+    csv_binaries = find_matching_binaries(
         source_dir=config.source_dir,
         platforms=config.platforms,
         compiler=config.compiler,
         compiler_versions=config.compiler_versions,
         opt_levels=config.opt_levels,
-        format_string=config.file_format,
+        format_string=csv_output_format,
         version_regex=config.version_regex,
         opt_regex=config.opt_regex,
         name_regex=config.name_regex,
         exclude_subfolders=config.exclude_subfolders,
     )
 
+    mapping_binaries = find_matching_binaries(
+        source_dir=vocab_source_dir,
+        platforms=config.platforms,
+        compiler=config.compiler,
+        compiler_versions=config.compiler_versions,
+        opt_levels=config.opt_levels,
+        format_string=mapping_format,
+        version_regex=config.version_regex,
+        opt_regex=config.opt_regex,
+        name_regex=config.name_regex,
+        exclude_subfolders=config.exclude_subfolders,
+    )
+
+    matched_pairs, unmatched_csv = match_csv_to_mapping(csv_binaries, mapping_binaries)
+
+    if unmatched_csv:
+        print(f"Warning: {len(unmatched_csv)} CSV file(s) have no matching mapping file:")
+        for csv_bin in unmatched_csv:
+            print(f"  {format_binary_info(csv_bin, config.source_dir)}")
+        print()
+
     if config.list_files:
-        print(f"Found {len(file_names_parsed)} CSV files:")
-        for csv_file in file_names_parsed:
-            print(format_binary_info(csv_file, config.source_dir))
+        print(f"Found {len(matched_pairs)} matched CSV/mapping file pairs:")
+        for csv_bin, map_bin in matched_pairs.items():
+            csv_info = format_binary_info(csv_bin, config.source_dir)
+            map_info = format_binary_info(map_bin, vocab_source_dir)
+            print(f"  CSV: {csv_info}")
+            print(f"  MAP: {map_info}")
+            print()
         return
 
-    print(f"Found {len(file_names_parsed)} CSV files to process")
+    print(f"Found {len(matched_pairs)} matched CSV/mapping file pairs to process")
 
-    binaries_by_name = group_binaries_by_name(file_names_parsed)
+    binaries_by_name = group_binaries_by_name(list(matched_pairs.keys()))
 
     for binary_name, binaries in binaries_by_name.items():
         print(f"\nProcessing binary: {binary_name}")
@@ -74,6 +150,7 @@ def main() -> None:
         versions = [
             BinaryVersionInfo(
                 path=binary.path,
+                mapping_path=matched_pairs[binary].path,
                 arch=binary.platform,
                 compiler=binary.compiler,
                 compilerversion=binary.version,
