@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -12,10 +13,7 @@ from tokenizer.tokens import TokenType
 from .types import Platform
 
 
-def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> VocabularyManager:
-    csv_data = io.BytesIO(csv_row)
-    reader = csv.reader(io.TextIOWrapper(csv_data, encoding="ascii"), quotechar='"')
-    row = next(reader)
+def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
     assert len(row) == 10 or (platform == "unified" and len(row) == 13), f"Expected 10 or 13 columns, got {len(row)}"
     assert row[0] == "vocabulary"
     assert row[2].startswith("_id_to_token_type")
@@ -24,6 +22,48 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
     assert row[8] == "_lit_end_cache"
     if platform == "unified":
         assert row[9].startswith("platforms")
+
+
+def is_vocab_def(csv_row: bytes, platform: Platform) -> tuple[bool, list[str]]:
+    try:
+        csv_data = io.BytesIO(csv_row)
+        reader = csv.reader(io.TextIOWrapper(csv_data, encoding="ascii"), quotechar='"')
+        row = next(reader)
+        assert_valid_vocab_def(row, platform)
+        return True, row
+    except Exception:
+        return False, None
+
+
+def read_last_line_of_file(csv_path: Path) -> bytes:
+    data = np.memmap(csv_path, dtype=np.uint8, mode="r")
+    search_area = data[:-64]
+    chunk_size = 1 << 14
+
+    num_chunks = (np.size(search_area) + chunk_size - 1) // chunk_size
+
+    last_line_chunk = None
+    for i in range(num_chunks):
+        start = max(-(i + 1) << 14, -np.size(search_area))
+        end = -(i << 14) if (i << 14) != 0 else None
+        chunk = search_area[start:end]
+
+        mask = (chunk == 10) | (chunk == 13)
+
+        if np.any(mask):
+            last_local_index = np.where(mask)[0][-1]
+            last_global_index = (np.size(search_area) + start) + last_local_index + 1
+            last_line_chunk = data[last_global_index:]
+            break
+
+    assert last_line_chunk is not None, f"Could not find last line in {csv_path}"
+    return last_line_chunk.tobytes()
+
+
+def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> VocabularyManager | None:
+    valid, row = is_vocab_def(csv_row, platform)
+    if not valid:
+        return None
 
     vocabulary = row[1].strip('"').split(",")
     id_to_token_type_offset = int(row[2].partition("norm:")[2])
@@ -50,7 +90,7 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
     )
 
 
-def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> VocabularyManager:
+def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> VocabularyManager | None:
     if platform is None:
         platform_options = Platform.__args__
         file_name = csv_path.name
@@ -61,24 +101,12 @@ def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> Voca
 
     assert platform is not None, f"Could not determine platform from file name: {csv_path.name}"
 
-    data = np.memmap(csv_path, dtype=np.uint8, mode="r")
-    search_area = data[:-64]
-    chunk_size = 1 << 14
+    try:
+        last_line = read_last_line_of_file(csv_path)
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error reading last line of file: {csv_path}")
+        logger.error(f"Error message: {e}")
+        return None
 
-    num_chunks = (np.size(search_area) + chunk_size - 1) // chunk_size
-
-    last_line_chunk = None
-    for i in range(num_chunks):
-        start = max(-(i + 1) << 14, -np.size(search_area))
-        end = -(i << 14) if (i << 14) != 0 else None
-        chunk = search_area[start:end]
-
-        mask = (chunk == 10) | (chunk == 13)
-
-        if np.any(mask):
-            last_local_index = np.where(mask)[0][-1]
-            last_global_index = (np.size(search_area) + start) + last_local_index + 1
-            last_line_chunk = data[last_global_index:]
-            break
-
-    return load_vocab_manager_csv_row_bytes(last_line_chunk.tobytes(), platform)
+    return load_vocab_manager_csv_row_bytes(last_line, platform)

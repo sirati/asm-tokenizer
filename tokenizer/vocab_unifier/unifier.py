@@ -1,4 +1,5 @@
 import csv
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,8 @@ from tokenizer.token_manager import VocabularyManager
 from .loader import load_vocab_manager
 from .saver import save_vocabulary
 
+logger = logging.getLogger(__name__)
+
 
 def unify_vocab(csv_files: list[Path], unified_vocab_file: Path) -> None:
     unified_vm = VocabularyManager(platform=None)
@@ -16,6 +19,10 @@ def unify_vocab(csv_files: list[Path], unified_vocab_file: Path) -> None:
     for csv_file in csv_files:
         print(f"Loading vocabulary from {csv_file}")
         current_vocab_manager = load_vocab_manager(csv_file)
+        if current_vocab_manager is None:
+            logger.error(f"Failed to load vocabulary from {csv_file}. Probably incomplete from crashed stage-1")
+            continue
+
         mappings = np.full_like(current_vocab_manager.id_to_token_type, -1, dtype=np.int32)
 
         for tokens in current_vocab_manager.iter_representative_tokens():
@@ -25,7 +32,9 @@ def unify_vocab(csv_files: list[Path], unified_vocab_file: Path) -> None:
             for original_id, mapped_id in zip(original, mapped):
                 mappings[original_id] = mapped_id
 
-        assert np.all(mappings >= 0)
+        if not np.all(mappings >= 0):
+            logger.error(f"Invalid mappings found in {csv_file}, skipping file")
+            continue
 
         mapping_file_path = csv_file.with_suffix(".mapping.b64c")
         with open(mapping_file_path, "w", newline="", encoding="ascii") as mapping_file:
