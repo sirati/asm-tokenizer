@@ -26,8 +26,6 @@ def main() -> None:
         help="Name of the output unified vocabulary file (default: unified_vocab.csv)",
     )
 
-    #'^((?:x86|x64))\\-([^-_]+)\\-([^-_]+)\\-([oO]?([0123s]))_(.+)_out\\1ut\\.\\2sv$'
-    parser.set_defaults(file_format="platform-compiler-version-optimisationlevel_binaryname_out\\put.\\csv")
     parser.set_defaults(source="./out/")
 
     args = parser.parse_args()
@@ -41,13 +39,15 @@ def main() -> None:
 
     print_selection_summary(config, display_opt_levels)
 
+    csv_output_format = config.file_format + "_out\\put.\\csv"
+
     file_names_parsed = find_matching_binaries(
         source_dir=config.source_dir,
         platforms=config.platforms,
         compiler=config.compiler,
         compiler_versions=config.compiler_versions,
         opt_levels=config.opt_levels,
-        format_string=config.file_format,
+        format_string=csv_output_format,
         version_regex=config.version_regex,
         opt_regex=config.opt_regex,
         name_regex=config.name_regex,

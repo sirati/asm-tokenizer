@@ -1,14 +1,11 @@
-import csv
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 from ..aligned_data.match import lockstep_function_match
-from .helpers import get_called_functions_from_row, process_function_binary_data
 from .passes import (
     build_function_lookup_table,
     process_matched_function_pass1,
@@ -35,6 +32,7 @@ class BinaryVersionInfo:
     """Information about a specific binary version."""
 
     path: Path
+    mapping_path: Path
     arch: str
     compiler: str
     compilerversion: str
@@ -57,8 +55,7 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     version_keys = []
 
     for version in versions:
-        mapping_path = version.path.with_suffix("").with_suffix(".mapping.b64c")
-        mapping = get_mapping(mapping_path)
+        mapping = get_mapping(version.mapping_path)
 
         vkey = VersionKey(
             arch=version.arch,
