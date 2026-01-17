@@ -151,8 +151,7 @@ def main_loop(
                             print(f"Token mismatch: {x} != {y}")
                             raise ValueError("Token mismatch in disassembly list")
 
-                opaque_metadata = constant_handler.get_metadata()
-                meta_result = list(opaque_metadata.values())
+                meta_result = constant_handler.get_metadata_list_by_opaque_id()
 
                 tokenized_instructions, block_run_lengths, insn_run_lengths = build_vocab_tokenize_and_index(
                     func_tokens

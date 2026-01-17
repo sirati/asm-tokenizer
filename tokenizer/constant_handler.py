@@ -1,7 +1,9 @@
-from typing import Dict, List, Tuple, Optional
-from tokenizer.tokens import TokenResolver, Tokens, OpaqueConstToken, BlockToken, MemoryOperandSymbol
-from tokenizer.token_manager import VocabularyManager
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+
+from tokenizer.token_manager import VocabularyManager
+from tokenizer.tokens import BlockToken, MemoryOperandSymbol, OpaqueConstToken, TokenResolver, Tokens
 
 
 class ConstantHandler:
@@ -128,6 +130,27 @@ class ConstantHandler:
     def get_metadata(self) -> Dict[str, Tuple]:
         """Get metadata for opaque constants"""
         return self.opaque_metadata.copy()
+
+    def get_metadata_list_by_opaque_id(self) -> List[Tuple]:
+        """
+        Get metadata as a list indexed by opaque ID (after remapping).
+        Returns a list where index corresponds to the opaque token ID.
+
+        Returns:
+            List of metadata tuples indexed by opaque ID
+        """
+        sorted_opaques = self.get_sorted_opaque_constants()
+
+        # Create list indexed by new opaque ID
+        metadata_list = []
+        for new_id, (value, old_token, usage_count) in enumerate(sorted_opaques):
+            if value in self.opaque_metadata:
+                metadata_list.append(self.opaque_metadata[value])
+            else:
+                # No metadata for this opaque constant (shouldn't happen normally)
+                metadata_list.append(None)
+
+        return metadata_list
 
     def reorder_metadata_for_mapping(self, opaque_mapping: Dict[Tokens, Tokens]) -> None:
         """
