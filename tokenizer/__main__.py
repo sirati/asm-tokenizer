@@ -1,15 +1,15 @@
 import argparse
 import csv
 import logging
+import os
 import pickle
 import socket
 import sys
-import os
 import traceback
 from pathlib import Path
 from typing import Literal, cast
 
-from tokenizer.logging_utils import remove_stream_handlers
+from shared import remove_stream_handlers
 from tokenizer.run_tokenizer import run_tokenizer
 
 
