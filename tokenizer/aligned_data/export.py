@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -6,6 +7,8 @@ from pathlib import Path
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier import load_vocab_manager
+
+logger = logging.getLogger(__name__)
 
 from .csv_format import format_unique_called
 from .export_helpers import (
@@ -99,6 +102,9 @@ def get_mapping(mapping_path):
 
 def get_vocab_and_mapping(csv_path, mapping_path=None):
     vocab = load_vocab_manager(Path(csv_path))
+    if vocab is None:
+        logger.error(f"Failed to load vocabulary from {csv_path}: {e}")
+        raise e
     mapping = get_mapping(mapping_path)
     return vocab, mapping
 
