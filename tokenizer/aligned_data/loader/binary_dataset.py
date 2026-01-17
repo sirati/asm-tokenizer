@@ -164,12 +164,14 @@ class BinaryDataset:
                     self.matched_edge_indices = np.zeros(1, dtype=np.int32)
                     self.matched_count_per_length = np.zeros(1, dtype=np.int32)
 
-                # Build function name index from sections file
+                # Build function name index from sections file, following index file order
                 self.matched_func_names = []
                 with open(self.matched_sections, "r", newline="", encoding="ascii") as f:
-                    reader = csv.reader(f)
-                    for row in reader:
-                        if row and len(row) == 2:  # Section header: func_name, called_functions
+                    for i in range(len(self.matched_starts)):
+                        f.seek(self.matched_starts[i])
+                        first_line = f.readline()
+                        row = list(csv.reader([first_line]))[0]
+                        if row and len(row) >= 1:
                             self.matched_func_names.append(row[0])
             else:
                 self.matched_count = 0
