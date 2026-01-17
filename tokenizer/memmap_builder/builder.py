@@ -50,6 +50,8 @@ def get_mapping(mapping_path: Path):
 def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, binary_name: str) -> None:
     """Build memory-mapped binary files from aligned CSV data."""
 
+    logger.info(f"  Output directory: {output_dir}")
+
     mapping_dict = {}
     csv_paths = []
     version_keys = []
@@ -74,8 +76,12 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     matched_data_entries = []
     unmatched_data_entries = []
 
-    matched_data_file = open(output_dir / f"{prefix}_data.bin", "wb")
-    unmatched_data_file = open(output_dir / f"{unmatched_prefix}_data.bin", "wb")
+    matched_data_path = output_dir / f"{prefix}_data.bin"
+    unmatched_data_path = output_dir / f"{unmatched_prefix}_data.bin"
+    logger.info(f"  Creating: {matched_data_path}")
+    logger.info(f"  Creating: {unmatched_data_path}")
+    matched_data_file = open(matched_data_path, "wb")
+    unmatched_data_file = open(unmatched_data_path, "wb")
 
     for match_data in lockstep_function_match(csv_paths):
         func_name = match_data["function_name"]
@@ -97,13 +103,21 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
             unmatched_data_entries.extend(entries)
 
     matched_data_file.close()
+    logger.info(f"  Closed: {matched_data_path}")
     unmatched_data_file.close()
+    logger.info(f"  Closed: {unmatched_data_path}")
 
     function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
 
-    matched_sections_file = open(output_dir / f"{prefix}_sections.csv", "w", newline="", encoding="ascii")
-    matched_index_file = open(output_dir / f"{prefix}_index.bin", "wb")
-    warn_log = open(output_dir / f"{binary_name}.warn.log", "w", encoding="ascii")
+    matched_sections_path = output_dir / f"{prefix}_sections.csv"
+    matched_index_path = output_dir / f"{prefix}_index.bin"
+    warn_log_path = output_dir / f"{binary_name}.warn.log"
+    logger.info(f"  Creating: {matched_sections_path}")
+    logger.info(f"  Creating: {matched_index_path}")
+    logger.info(f"  Creating: {warn_log_path}")
+    matched_sections_file = open(matched_sections_path, "w", newline="", encoding="ascii")
+    matched_index_file = open(matched_index_path, "wb")
+    warn_log = open(warn_log_path, "w", encoding="ascii")
 
     write_matched_sections_pass2(
         matched_data_entries,
@@ -114,15 +128,21 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     )
 
     matched_sections_file.close()
+    logger.info(f"  Closed: {matched_sections_path}")
     matched_index_file.close()
+    logger.info(f"  Closed: {matched_index_path}")
 
+    unmatched_sections_path = output_dir / f"{unmatched_prefix}_sections.csv"
+    unmatched_index_path = output_dir / f"{unmatched_prefix}_index.bin"
+    logger.info(f"  Creating: {unmatched_sections_path}")
+    logger.info(f"  Creating: {unmatched_index_path}")
     unmatched_sections_file = open(
-        output_dir / f"{unmatched_prefix}_sections.csv",
+        unmatched_sections_path,
         "w",
         newline="",
         encoding="ascii",
     )
-    unmatched_index_file = open(output_dir / f"{unmatched_prefix}_index.bin", "wb")
+    unmatched_index_file = open(unmatched_index_path, "wb")
 
     write_unmatched_sections_pass2(
         unmatched_data_entries,
@@ -133,5 +153,8 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     )
 
     unmatched_sections_file.close()
+    logger.info(f"  Closed: {unmatched_sections_path}")
     unmatched_index_file.close()
+    logger.info(f"  Closed: {unmatched_index_path}")
     warn_log.close()
+    logger.info(f"  Closed: {warn_log_path}")

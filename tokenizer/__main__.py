@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 from typing import Literal, cast
 
-from shared import remove_stream_handlers
+from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.run_tokenizer import run_tokenizer
 
 
@@ -19,13 +19,7 @@ def main():
         logger = logging.getLogger()
         logger.setLevel(logging.INFO)
 
-        maxInt = sys.maxsize
-        while True:
-            try:
-                csv.field_size_limit(maxInt)
-                break
-            except OverflowError:
-                maxInt = int(maxInt / 10)
+        increase_csv_field_size_limit()
 
         parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
         group = parser.add_mutually_exclusive_group(required=True)

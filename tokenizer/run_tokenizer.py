@@ -7,10 +7,10 @@ from typing import Literal, cast
 
 import angr
 
+from shared import setup_logger
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
 from tokenizer.csv_files import parse_and_save_data_sections
 from tokenizer.instruction_sets import InstructionSets
-from tokenizer.logging_utils import setup_logger
 from tokenizer.main_loop import main_loop
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver

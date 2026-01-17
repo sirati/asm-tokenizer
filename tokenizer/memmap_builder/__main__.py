@@ -8,6 +8,7 @@ from shared import (
     add_selection_arguments,
     find_matching_binaries,
     format_binary_info,
+    increase_csv_field_size_limit,
     normalize_opt_levels,
     print_selection_summary,
     process_selection_arguments,
@@ -54,6 +55,8 @@ def main() -> None:
         format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    increase_csv_field_size_limit()
 
     parser = argparse.ArgumentParser(description="Build memory-mapped binary files from aligned CSV data.")
 
