@@ -7,7 +7,6 @@ import numpy as np
 from tqdm import tqdm
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
-from tokenizer.data_loader import save_vocabulary
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
 from tokenizer.function_filter import FunctionFilter
@@ -16,6 +15,7 @@ from tokenizer.opaque_remapping import (
     apply_opaque_mapping,
     apply_opaque_mapping_raw_optimized,
 )
+from tokenizer.vocab_unifier import save_vocabulary
 
 VERIFICATION: bool = False
 
