@@ -1,11 +1,12 @@
 import logging
-import socket
 import time
 from pathlib import Path
 from typing import Literal, cast
 
 import angr
 
+from dynamic_batch.comm import CommunicationInterface, DoneResponse, KeepaliveResponse, PhaseUpdateResponse
+from dynamic_batch.task.tokenizer import TokenizerPhase
 from shared import setup_logger
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
 from tokenizer.csv_files import parse_and_save_data_sections
@@ -35,12 +36,11 @@ def disassemble_to_tokens(
     logger: logging.Logger,
     with_pickled=False,
     project=None,
-    sock: socket.socket | None = None,
+    comm: CommunicationInterface,
     **kwargs,
 ):
     if not with_pickled:
-        if sock is not None:
-            sock.sendall(b"phase:phase2\n")
+        comm.send_response(PhaseUpdateResponse(phase_name=TokenizerPhase.ANGR_2.value))
         func_names = []
         block_runlength_dict = {}
         insn_runlength_dict = {}
@@ -110,12 +110,11 @@ def run_tokenizer(
     skip_existing_csv: bool,
     source_dir: Path,
     output_dir: Path,
-    sock: socket.socket | None = None,
+    comm: CommunicationInterface,
 ):
     logger, warning_handler = setup_logger("tokenizer")
     logger.info("STARTING DISASSEMBLY")
-    if sock is not None:
-        sock.sendall(b"phase:phase1\n")
+    comm.send_response(PhaseUpdateResponse(phase_name=TokenizerPhase.ANGR_1.value))
 
     file_path: Path = binary_path.absolute()
 
@@ -160,8 +159,7 @@ def run_tokenizer(
 
     if csv_path.exists() and skip_existing_csv:
         logger.info(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
-        if sock:
-            sock.sendall("done:-1:-1\n".encode("utf-8"))
+        comm.send_response(DoneResponse(warnings=-1, filtered=-1))
         return
 
     with_pickled = False
@@ -171,8 +169,7 @@ def run_tokenizer(
     if DO_PICKLES:
         if has_valid_pickle(pickle_mainloop_file_path):
             logger.info("loading existing mainloop pickle to speed up")
-            if sock is not None:
-                sock.sendall(b"phase:phase2\n")
+            comm.send_response(PhaseUpdateResponse(phase_name=TokenizerPhase.ANGR_2.value))
             kvargs = try_load_pickle(pickle_mainloop_file_path, logger)
             if kvargs is not None:
                 if "path" not in kvargs:
@@ -225,5 +222,4 @@ def run_tokenizer(
         filtered={filtered}"
     )
 
-    if sock:
-        sock.sendall(f"done:{warning_handler.warning_count}:{filtered}\n".encode("utf-8"))
+    comm.send_response(DoneResponse(warnings=warning_handler.warning_count, filtered=filtered))
