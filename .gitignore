@@ -57,3 +57,7 @@ queue/
 
 # tokenizer hash cache
 tokenizer/.tokenizer_hash_cache.json
+
+# output articacts from nix build
+result
+pyvex_ffi_parser_cache*
