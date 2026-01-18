@@ -14,6 +14,7 @@ from dynamic_batch.comm import (
     ErrorType,
     NoopInterface,
     PickledErrorResponse,
+    ReadyResponse,
     StopCommand,
     UnixSocketInterface,
     parse_command,
@@ -113,7 +114,13 @@ def main():
             "--dynamic_queue",
             type=int,
             metavar="SOCKET_FD",
-            help="Worker mode: receive tasks via socket file descriptor",
+            help="Worker mode: receive tasks via socket file descriptor (anonymous socket)",
+        )
+        group.add_argument(
+            "--socket-path",
+            type=str,
+            metavar="SOCKET_PATH",
+            help="Worker mode: receive tasks via named Unix socket at this path",
         )
         parser.add_argument(
             "--log-file",
@@ -205,11 +212,20 @@ def main():
             output_dir=output_dir,
         )
 
-        if args.dynamic_queue:
-            sock = socket.socket(fileno=args.dynamic_queue)
-            comm = UnixSocketInterface(sock)
+        if args.dynamic_queue or args.socket_path:
+            if args.socket_path:
+                from dynamic_batch.comm import NamedSocketInterface
 
-            logger.info(f"[*] Worker started (PID {os.getpid()}), waiting for tasks...")
+                logger.info(f"[*] Worker connecting to named socket: {args.socket_path}")
+                comm = NamedSocketInterface(args.socket_path, is_server=False)
+                logger.info(f"[*] Worker started (PID {os.getpid()}), sending ready signal...")
+            else:
+                sock = socket.socket(fileno=args.dynamic_queue)
+                comm = UnixSocketInterface(sock)
+                logger.info(f"[*] Worker started (PID {os.getpid()}), sending ready signal...")
+
+            comm.send_response(ReadyResponse())
+            logger.info(f"[*] Ready signal sent, waiting for tasks...")
 
             while True:
                 try:

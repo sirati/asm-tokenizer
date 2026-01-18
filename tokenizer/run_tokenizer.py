@@ -34,9 +34,9 @@ def disassemble_to_tokens(
     binary_path: Path,
     pickle_mainloop_file_path: Path,
     logger: logging.Logger,
+    comm: CommunicationInterface,
     with_pickled=False,
     project=None,
-    comm: CommunicationInterface,
     **kwargs,
 ):
     if not with_pickled:
@@ -99,7 +99,7 @@ def disassemble_to_tokens(
 
     kwargs.update(dict(resolver=resolver, instr_sets=instr_sets, csv_path=csv_path, logger=logger))
 
-    function_manager, filtered = main_loop(vocab_manager=vocab_manager, sock=sock, **kwargs)
+    function_manager, filtered = main_loop(vocab_manager=vocab_manager, comm=comm, **kwargs)
 
     return (func_names, function_manager, vocab_manager, filtered)
 
@@ -206,7 +206,7 @@ def run_tokenizer(
                 csv_path=csv_path,
                 binary_path=binary_path,
                 pickle_mainloop_file_path=pickle_mainloop_file_path,
-                sock=sock,
+                comm=comm,
                 logger=logger,
             )
         )
