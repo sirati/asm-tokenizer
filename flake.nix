@@ -52,6 +52,8 @@
               basedpyright # a language server
               nil
               nixd
+              vscode-json-languageserver
+              bash-language-server
             ];
 
             shellHook = ''
