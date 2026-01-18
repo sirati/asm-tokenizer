@@ -54,6 +54,7 @@
               nixd
               vscode-json-languageserver
               bash-language-server
+              package-version-server
             ];
 
             shellHook = ''
