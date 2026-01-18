@@ -1,11 +1,12 @@
 import csv
 import logging
-import socket
 import time
 
 import numpy as np
 from tqdm import tqdm
 
+from dynamic_batch.comm import CommunicationInterface, KeepaliveResponse, PhaseUpdateResponse
+from dynamic_batch.task.tokenizer import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
@@ -54,7 +55,7 @@ def main_loop(
     vocab_manager,
     csv_path,
     logger: logging.Logger,
-    sock: socket.socket | None = None,
+    comm: CommunicationInterface,
     **_kwargs,
 ) -> tuple[FunctionDataManager, int]:
     logger.info("Preparing main loop")
@@ -89,8 +90,7 @@ def main_loop(
         prev_insn_base64 = ""
 
         logger.info("Starting main loop")
-        if sock is not None:
-            sock.sendall(b"phase:phase3\n")
+        comm.send_response(PhaseUpdateResponse(phase_name=TokenizerPhase.TOKENIZATION.value))
 
         try:
             pbar = tqdm(
@@ -99,8 +99,8 @@ def main_loop(
             )
             for i, (func_addr, func) in enumerate(pbar):
                 current_time = time.time()
-                if sock is not None and (current_time - last_keepalive_time) >= 0.2:
-                    sock.sendall(b"keepalive\n")
+                if (current_time - last_keepalive_time) >= 0.2:
+                    comm.send_response(KeepaliveResponse())
                     last_keepalive_time = current_time
 
                 func_name = cfg.functions[func_addr].name
@@ -244,8 +244,7 @@ def main_loop(
             print(f"Unrecoverable error in main loop: {e}, writing what we have at least")
             exceptions.append(e)
 
-        if sock is not None:
-            sock.sendall(b"keepalive\n")
+        comm.send_response(KeepaliveResponse())
 
         save_vocabulary(vocab_manager, writer)
         csvfile.flush()

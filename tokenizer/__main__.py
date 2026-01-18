@@ -2,7 +2,6 @@ import argparse
 import csv
 import logging
 import os
-import pickle
 import socket
 import sys
 import traceback
@@ -10,6 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from dynamic_batch.comm import (
+    ErrorResponse,
+    ErrorType,
+    NoopInterface,
+    PickledErrorResponse,
+    StopCommand,
+    UnixSocketInterface,
+    parse_command,
+)
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.run_tokenizer import run_tokenizer
 
@@ -199,23 +207,21 @@ def main():
 
         if args.dynamic_queue:
             sock = socket.socket(fileno=args.dynamic_queue)
-            sock_file = sock.makefile("r")
+            comm = UnixSocketInterface(sock)
 
             logger.info(f"[*] Worker started (PID {os.getpid()}), waiting for tasks...")
 
             while True:
                 try:
-                    line = sock_file.readline()
-                    if not line:
+                    command = comm.receive_command(blocking=True)
+                    if not command:
                         break
 
-                    command = line.strip()
-
-                    if command == "stop":
+                    if isinstance(command, StopCommand):
                         logger.info("[*] Received stop command, shutting down")
                         break
 
-                    binary_path = source_dir / command
+                    binary_path = source_dir / command.relative_path
                     logger.info(f"[*] Processing: {binary_path}")
 
                     try:
@@ -225,31 +231,46 @@ def main():
                             skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
                             source_dir=cast(Path, common_params["source_dir"]),
                             output_dir=cast(Path, common_params["output_dir"]),
-                            sock=sock,
+                            comm=comm,
                         )
                     except MemoryError as e:
-                        error_msg = f"error:oom:{str(e)}\n"
-                        sock.sendall(error_msg.encode("utf-8"))
+                        response = ErrorResponse(error_type=ErrorType.OUT_OF_MEMORY, error_message=str(e))
+                        comm.send_response(response)
                         break
                     except (KeyboardInterrupt, SystemExit) as e:
-                        error_msg = f"error:non_recoverable:{type(e).__name__}\n"
-                        sock.sendall(error_msg.encode("utf-8"))
+                        response = ErrorResponse(error_type=ErrorType.NON_RECOVERABLE, error_message=type(e).__name__)
+                        comm.send_response(response)
                         logger.info(f"[!] Non-recoverable error: {e}")
                         break
                     except Exception as e:
                         tb_str = traceback.format_exc()
                         logger.error(f"[!] Error processing {binary_path}:\n{tb_str}")
-                        error_msg = f"error:recoverable:{type(e).__name__}: {str(e)}\n"
-                        sock.sendall(error_msg.encode("utf-8"))
+                        response = ErrorResponse(
+                            error_type=ErrorType.RECOVERABLE, error_message=f"{type(e).__name__}: {str(e)}"
+                        )
+                        comm.send_response(response)
 
                 except (KeyboardInterrupt, SystemExit) as e:
                     logger.info(f"[!] Worker interrupted: {e}")
                     break
                 except Exception as e:
                     logger.info(f"[!] Worker error: {e}")
+                    try:
+                        response = PickledErrorResponse(
+                            exception_type=type(e).__name__,
+                            exception_message=str(e),
+                            traceback_str=traceback.format_exc(),
+                        )
+                        comm.send_response(response)
+                    except Exception:
+                        fallback = ErrorResponse(
+                            error_type=ErrorType.NON_RECOVERABLE,
+                            error_message=f"Failed to send error: {type(e).__name__}: {str(e)[:100]}",
+                        )
+                        comm.send_response(fallback)
                     break
 
-            sock.close()
+            comm.close()
             logger.info("[*] Worker shutdown complete")
 
         elif args.batch:
@@ -273,11 +294,12 @@ def main():
 
             logger.info(f"[*] Filtered queue: {len(filtered_lines)} items to process")
 
+            comm = NoopInterface()
             for idx, binary_path_str in enumerate(filtered_lines, 1):
                 logger.info(f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}")
                 binary_path = Path(binary_path_str).resolve()
                 try:
-                    run_tokenizer(binary_path, **common_params)
+                    run_tokenizer(binary_path, comm=comm, **common_params)
                 except Exception as e:
                     logger.info(f"[!] Error processing {binary_path}: {e}")
                     logger.info("Continuing with next binary in queue...")
@@ -324,7 +346,8 @@ def main():
                         # Neither exists, just resolve relative to cwd (will fail later with clear error)
                         binary_path = cwd_path.resolve()
             logger.info(f"[*] Processing single binary: {binary_path}")
-            run_tokenizer(binary_path, **common_params)
+            comm = NoopInterface()
+            run_tokenizer(binary_path, comm=comm, **common_params)
 
     except Exception as e:
         if sock is not None:
