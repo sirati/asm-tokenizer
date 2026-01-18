@@ -6,11 +6,74 @@ import pickle
 import socket
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.run_tokenizer import run_tokenizer
+
+
+@dataclass(frozen=True)
+class DebugDefaults:
+    arg_abbr: str  # e.g. "s"
+    arg_name: str  # e.g. "small"
+    binary: str
+    folder: str
+    compiler: str
+    version: str
+    optimisation: str
+
+    @property
+    def choices(self) -> tuple[str, str]:
+        return self.arg_abbr, self.arg_name
+
+    def path(self) -> str:
+        return f"{{source}}/{self.folder}/x86-{self.compiler}-{self.version}-{self.optimisation}_{self.binary}"
+
+    def help_line(self) -> str:
+        return f"default for {self.arg_name}: {self.binary} -> {self.path()}"
+
+
+debug_defaults = [
+    DebugDefaults(
+        arg_abbr="s",
+        arg_name="small",
+        binary="minigzipsh",
+        folder="zlib",
+        compiler="gcc",
+        version="5",
+        optimisation="O3",
+    ),
+    DebugDefaults(
+        arg_abbr="m",
+        arg_name="medium",
+        binary="sigtool",
+        folder="clamav",
+        compiler="clang",
+        version="5.0",
+        optimisation="O1",
+    ),
+    DebugDefaults(
+        arg_abbr="l",
+        arg_name="large",
+        binary="sigtool",
+        folder="nmap",
+        compiler="clang",
+        version="5.0",
+        optimisation="Os",
+    ),
+    DebugDefaults(
+        arg_abbr="g",
+        arg_name="giantic",
+        binary="z3",
+        folder="z3",
+        compiler="gcc",
+        version="5",
+        optimisation="O0",
+    ),
+]
+debug_defaults_loopup = {d.arg_abbr: d for d in debug_defaults} | {d.arg_name: d for d in debug_defaults}
 
 
 def main():
@@ -21,7 +84,10 @@ def main():
 
         increase_csv_field_size_limit()
 
-        parser = argparse.ArgumentParser(description="Tokenize binaries for BinAI.")
+        parser = argparse.ArgumentParser(
+            description="Tokenize binaries for BinAI.",
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument(
             "--batch",
@@ -47,22 +113,20 @@ def main():
             help="Log file instead of stdout/err",
         )
         group.add_argument(
-            "--debugs",
-            action="store_true",
-            help="Debug mode: process ../src/zlib/x86-gcc-5-O3_minigzipsh",
-        )
-        group.add_argument(
-            "--debugl",
-            action="store_true",
-            help="Debug mode: process ../src/clamav/x86-clang-5.0-O1_sigtool",
+            "--debug",
+            choices=([d.arg_abbr for d in debug_defaults] + [d.arg_name for d in debug_defaults]),
+            help=(
+                "Debug mode: process a debug file. Possible to override platform, "
+                "compiler, version, and optimisation-level.\n" + "\n".join(d.help_line() for d in debug_defaults)
+            ),
         )
 
         parser.add_argument(
             "--platform",
             type=str,
-            help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'file_prefix' to auto-detect from binary name. Default is file_prefix.",
-            default="file_prefix",
-            choices=["x86", "arm64", "arm32", "x64", "file_prefix"],
+            help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'auto' to auto-detect from binary name. Default is auto.",
+            default="auto",
+            choices=["x86", "arm64", "arm32", "x64", "auto"],
         )
         parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
         parser.add_argument(
@@ -112,8 +176,19 @@ def main():
         logger.info(f"[*] Source directory: {source_dir}")
         logger.info(f"[*] Output directory: {output_dir}")
 
-        if (args.debugs or args.debugl) and args.platform == "file_prefix":
-            args.platform = "x86"
+        if args.debug is not None:
+            args.platform = args.platform if args.platform != "auto" else "x86"
+            debug_default = debug_defaults_loopup[args.debug]
+            if debug_default is None:
+                raise NotImplementedError(f"Debug option '{args.debug}' not found")
+
+            if args.skip_existing:
+                logger.warning("Skipping existing file in debug mode!! - probably not what you want")
+
+            args.single = (
+                f"{debug_default.folder}/x86-"
+                f"{debug_default.compiler}-{debug_default.version}-{debug_default.optimisation}_{debug_default.binary}"
+            )
 
         common_params = dict(
             platform=args.platform,
@@ -147,7 +222,7 @@ def main():
                         run_tokenizer(
                             binary_path,
                             platform=cast(
-                                Literal["x86", "arm64", "arm32", "x64", "file_prefix"], common_params["platform"]
+                                Literal["x86", "arm64", "arm32", "x64", "auto"], common_params["platform"]
                             ),
                             skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
                             source_dir=cast(Path, common_params["source_dir"]),
@@ -252,18 +327,7 @@ def main():
                         binary_path = cwd_path.resolve()
             logger.info(f"[*] Processing single binary: {binary_path}")
             run_tokenizer(binary_path, **common_params)
-        elif args.debugs:
-            binary_path = source_dir / f"zlib/{args.platform}-gcc-5-O3_minigzipsh"
-            logger.info(f"[*] Debug mode (gcc): {binary_path}")
-            debug_params = common_params.copy()
-            debug_params.update(dict(skip_existing_csv=False))
-            run_tokenizer(binary_path, **debug_params)
-        elif args.debugl:
-            binary_path = source_dir / f"clamav/{args.platform}-clang-5.0-O1_sigtool"
-            logger.info(f"[*] Debug mode (clang): {binary_path}")
-            debug_params = common_params.copy()
-            debug_params.update(dict(skip_existing_csv=False))
-            run_tokenizer(binary_path, **debug_params)
+
     except Exception as e:
         if sock is not None:
             try:

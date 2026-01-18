@@ -103,12 +103,12 @@ def disassemble_to_tokens(
 
 def run_tokenizer(
     binary_path: Path,
-    platform: Literal["x86", "arm64", "arm32", "x64", "file_prefix"],
+    platform: Literal["x86", "arm64", "arm32", "x64", "auto"],
     skip_existing_csv: bool,
     source_dir: Path,
     output_dir: Path,
     sock: socket.socket | None = None,
-) -> tuple[int, int]:
+):
     logger, warning_handler = setup_logger("tokenizer")
     logger.info("STARTING DISASSEMBLY")
     if sock is not None:
@@ -118,7 +118,7 @@ def run_tokenizer(
 
     binary_name = file_path.name
 
-    if platform == "file_prefix":
+    if platform == "auto":
         possible_platforms: list[Literal["x86", "arm64", "arm32", "x64"]] = [
             "x86",
             "arm64",
@@ -159,7 +159,7 @@ def run_tokenizer(
         logger.info(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_path}.")
         if sock:
             sock.sendall("done:-1:-1\n".encode("utf-8"))
-        return (0, 0)
+        return
 
     with_pickled = False
     kvargs: dict | None = None
