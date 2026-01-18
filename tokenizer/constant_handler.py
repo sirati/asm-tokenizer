@@ -62,6 +62,11 @@ class ConstantHandler:
             value = int(clean_hex, 16)
         except ValueError:
             raise ValueError(f"Invalid hex value: {hex_value}")"""
+
+        # Metadata ranges starting at 0 represent abstract constant domains, not real memory segments
+        if meta is not None and meta.get("start_addr") == 0:
+            is_arithmetic = True
+
         # Check if it's a small constant (0x00 to 0xFF)
         if is_arithmetic or 0x00 <= value <= 0xFF or value in self.constant_dict:
             return [self.vocab_manager.Valued_Const(value)]
@@ -129,10 +134,10 @@ class ConstantHandler:
             # If value points into the range (not at the start), consider decomposition
             if start_addr < value < end_addr and should_decompose:
                 insn_info = f" in {insn_mnemonic}" if insn_mnemonic else ""
-                # logger.info(
-                #     f"Decomposing: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
-                #     f"for target {value:#x}, offset={offset:#x}{insn_info}"
-                # )
+                logger.debug(
+                    f"Decomposing: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
+                    f"for target {value:#x}, offset={offset:#x}{insn_info}"
+                )
                 base_token = self._create_opaque_const(start_addr, meta, library_type)
                 return [
                     self.vocab_manager.MemoryOperand.OPEN_BRACKET,
@@ -143,7 +148,7 @@ class ConstantHandler:
                 ]
             elif start_addr < value < end_addr and not should_decompose:
                 insn_info = f" in {insn_mnemonic}" if insn_mnemonic else ""
-                logger.info(
+                logger.debug(
                     f"Skipping decomposition: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
                     f"for target {value:#x}, offset={offset:#x}{insn_info}, reason: {reason}"
                 )
