@@ -2,6 +2,7 @@ import argparse
 import csv
 import logging
 import os
+import random
 import socket
 import sys
 import traceback
@@ -157,6 +158,13 @@ def main():
             help="Output directory for results (default: ./out)",
         )
 
+        parser.add_argument(
+            "--simulate-crash",
+            type=float,
+            metavar="PERCENTAGE",
+            help="Simulate random worker crashes with given percentage chance (0-100)",
+        )
+
         args = parser.parse_args()
 
         cwd = Path.cwd()
@@ -227,6 +235,11 @@ def main():
             comm.send_response(ReadyResponse())
             logger.info(f"[*] Ready signal sent, waiting for tasks...")
 
+            # Check if crash simulation is enabled
+            simulate_crash_chance = args.simulate_crash if args.simulate_crash is not None else 0.0
+            if simulate_crash_chance > 0:
+                logger.info(f"[*] Crash simulation enabled: {simulate_crash_chance}% chance per task")
+
             while True:
                 try:
                     command = comm.receive_command(blocking=True)
@@ -239,6 +252,17 @@ def main():
 
                     binary_path = source_dir / command.relative_path
                     logger.info(f"[*] Processing: {binary_path}")
+
+                    # Simulate crash if enabled
+                    if simulate_crash_chance > 0:
+                        if random.random() * 100 < simulate_crash_chance:
+                            logger.warning(f"[!] SIMULATED CRASH for {binary_path.name}")
+                            response = ErrorResponse(
+                                error_type=ErrorType.NON_RECOVERABLE,
+                                error_message=f"Simulated crash ({simulate_crash_chance}% chance)",
+                            )
+                            comm.send_response(response)
+                            break
 
                     try:
                         run_tokenizer(
