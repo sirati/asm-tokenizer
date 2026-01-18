@@ -3,10 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    gitignore = {
+      url = "github:hercules-ci/gitignore.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      gitignore,
+    }:
     let
       # Support multiple systems
       systems = [
@@ -16,6 +24,48 @@
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+
+      # Package definitions
+      deploymentPythonPackages =
+        python-pkgs: with python-pkgs; [
+          # Core binary analysis and disassembly
+          angr
+          capstone
+          lief
+          pyelftools
+
+          intervaltree
+          numpy
+          pandas
+          tqdm
+          portalocker
+        ];
+
+      devPythonPackages =
+        python-pkgs: with python-pkgs; [
+          pip
+          ruff
+        ];
+
+      deploymentPackages =
+        pkgs: with pkgs; [
+        ];
+
+      dockerOnlyPackages =
+        pkgs: with pkgs; [
+          bash
+          coreutils
+        ];
+
+      devPackages =
+        pkgs: with pkgs; [
+          basedpyright
+          nil
+          nixd
+          vscode-json-languageserver
+          bash-language-server
+          package-version-server
+        ];
     in
     {
       devShells = forAllSystems (
@@ -25,37 +75,15 @@
         in
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              (python314.withPackages (
-                python-pkgs: with python-pkgs; [
-                  # Core binary analysis and disassembly
-                  angr
-                  capstone
-                  lief
-                  pyelftools
-
-                  intervaltree
-                  numpy
-                  pandas
-                  tqdm
-                  portalocker
-
-                  # Development tools
-
-                  pip
-                  # language servers
-                  ruff
-                ]
-              ))
-
-              # normal nix packages
-              basedpyright # a language server
-              nil
-              nixd
-              vscode-json-languageserver
-              bash-language-server
-              package-version-server
-            ];
+            packages =
+              with pkgs;
+              [
+                (python314.withPackages (
+                  python-pkgs: (deploymentPythonPackages python-pkgs) ++ (devPythonPackages python-pkgs)
+                ))
+              ]
+              ++ (deploymentPackages pkgs)
+              ++ (devPackages pkgs);
 
             shellHook = ''
               echo "╔════════════════════════════════════════════════════════════╗"
@@ -68,6 +96,64 @@
               export bin_python3=$(which python3)
             '';
           };
+        }
+      );
+
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          python = pkgs.python314.withPackages deploymentPythonPackages;
+          inherit (gitignore.lib) gitignoreSource;
+
+          # Filter source files using gitignore, plus exclude dot files, flake files, and result
+          projectSource = pkgs.lib.cleanSourceWith {
+            src = gitignoreSource ./.;
+            filter =
+              path: type:
+              let
+                baseName = baseNameOf path;
+              in
+              # Exclude dot files and directories
+              !(pkgs.lib.hasPrefix "." baseName)
+              &&
+                # Exclude flake files
+                baseName != "flake.nix"
+              && baseName != "flake.lock"
+              &&
+                # Exclude nix build results
+                baseName != "result";
+          };
+
+          # Create a derivation that contains the project files
+          projectFiles = pkgs.runCommand "asm-tokenizer-source" { } ''
+            mkdir -p $out/app
+            cp -r ${projectSource}/. $out/app/
+            chmod -R +w $out/app
+          '';
+        in
+        {
+          dockerImage = pkgs.dockerTools.buildLayeredImage {
+            name = "asm-tokenizer";
+            tag = "latest";
+
+            contents = [
+              python
+              projectFiles
+            ]
+            ++ (deploymentPackages pkgs)
+            ++ (dockerOnlyPackages pkgs);
+
+            config = {
+              Entrypoint = [
+                "${python}/bin/python"
+                "-m"
+              ];
+              WorkingDir = "/app";
+            };
+          };
+
+          default = self.packages.${system}.dockerImage;
         }
       );
     };
