@@ -5,3 +5,5 @@ do not provice a summary. Do not explain changes. Do not provide other comments.
 Do however use the provided tools as explained by the tool documentation, if this requires you to chat, do so normally.
 
 Code should be written in a manner that allows future changes without being error prone. Avoid using strings, tuples, positional arguments, instead use dataclasses or records when approriate. Function should not return dicts if they return multiple values, instead the type hint must avoid ambiguity. Code should avoid dublicated sections, always refactor these. Do not leave section unimplemented or to implement later.
+
+When checking your code, never write code that simply prints that everything is working or correct. This does not qualify as a test or validation.
