@@ -187,7 +187,7 @@ def run_tokenizer(
 
     if kvargs is None:
         project: angr.Project = angr.Project(file_path, auto_load_libs=False)
-        constants: dict[str, list[str]] = parse_and_save_data_sections(project)
+        constants: dict[str, list[str]] = parse_and_save_data_sections(project, output_csv_path=str(csv_path))
         cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(normalize=True)
 
         kvargs = dict(project=project, cfg=cfg, constant_list=constants)

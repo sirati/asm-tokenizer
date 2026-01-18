@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 
 from tokenizer.compact_base64_utils import base64_to_ndarray, base64_to_ndarray_vec
-from tokenizer.utils import register_name_range
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.token_manager import VocabularyManager
+from tokenizer.utils import register_name_range
 
 
 def extract_ldis_blocks_from_file(file_path):
@@ -38,7 +38,7 @@ def extract_ldis_blocks_from_file(file_path):
 
 
 def parse_and_save_data_sections(
-    proj, sections_to_parse: list[str] = [".rodata"], output_txt="parsed_constants.txt"
+    proj, sections_to_parse: list[str] = [".rodata"], output_csv_path: str | None = None
 ) -> dict[str, list[str]]:
     """
     Parses the .rodata (read-only data) section to retrieve a dict with all constants.
@@ -46,7 +46,7 @@ def parse_and_save_data_sections(
     Args:
         proj: angr Project
         sections_to_parse (list[str]): Contains per default only '.rodata'
-        output_txt (str): Name of the file for persistence
+        output_csv_path (str | None): Path to the output CSV file, used to derive constants filename
 
     Returns:
         dict with all constants of structure: start_addr: [end_addr, section_name, value]
@@ -81,11 +81,19 @@ def parse_and_save_data_sections(
                 addr_dict[e["start"]] = [e["end"], e["section"], e["value"]]
 
     # Output only exact-address constants
-    with open(output_txt, "w") as f:
+    if output_csv_path:
+        from pathlib import Path
+
+        csv_path = Path(output_csv_path)
+        consts_path = csv_path.parent / f"{csv_path.stem.replace('_output', '')}_consts.txt"
+    else:
+        consts_path = Path("parsed_constants.txt")
+
+    with open(consts_path, "w") as f:
         for e in all_entries:
             f.write(f"{e['start']} - {e['end']}: {e['section']}: {e['value']}\n")
 
-    print(f"Parsed {len(all_entries)} .rodata constants with exact addresses into {output_txt}")
+    print(f"Parsed {len(all_entries)} .rodata constants with exact addresses into {consts_path}")
     return addr_dict
 
 
