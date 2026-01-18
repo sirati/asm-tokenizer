@@ -31,7 +31,7 @@ def run_length_and_last_type(
     type_ids: npt.NDArray[np.int_],
     start_set: npt.NDArray[np.int_],
     end_set: npt.NDArray[np.int_],
-) -> (npt.NDArray[np.int_], npt.NDArray[np.int_]):
+) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.int_]]:
     # Step 1: Create masks for start and end values
     start_mask = np.isin(type_ids, start_set)
     end_mask = np.isin(type_ids, end_set)

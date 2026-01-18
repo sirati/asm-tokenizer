@@ -58,3 +58,6 @@ queue/
 
 # files we create during processing
 parsed_constants.txt
+
+# tokenizer hash cache
+tokenizer/.tokenizer_hash_cache.json
