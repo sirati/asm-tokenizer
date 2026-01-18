@@ -1,5 +1,4 @@
 import logging
-import pickle
 import socket
 import time
 from pathlib import Path
@@ -10,13 +9,18 @@ import angr
 from shared import setup_logger
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
 from tokenizer.csv_files import parse_and_save_data_sections
+from tokenizer.hash_checked_pickles import (
+    has_valid_pickle,
+    save_pickle,
+    try_load_pickle,
+)
 from tokenizer.instruction_sets import InstructionSets
 from tokenizer.main_loop import main_loop
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
 
 SCRIPT_FOLDER: Path = Path(__file__).parent.resolve()
-DO_PICKLES: bool = False
+DO_PICKLES: bool = True
 
 
 def disassemble_to_tokens(
@@ -28,7 +32,7 @@ def disassemble_to_tokens(
     csv_path: Path,
     binary_path: Path,
     pickle_mainloop_file_path: Path,
-    logger,
+    logger: logging.Logger,
     with_pickled=False,
     project=None,
     sock: socket.socket | None = None,
@@ -82,8 +86,7 @@ def disassemble_to_tokens(
         )
 
         if DO_PICKLES:
-            with open(pickle_mainloop_file_path, "wb") as f:
-                pickle.dump(kwargs, f)
+            save_pickle(pickle_mainloop_file_path, kwargs)
 
     else:
         kwargs.update(dict(cfg=cfg, constant_list=constant_list))
@@ -166,31 +169,21 @@ def run_tokenizer(
     start_time = time.time()
 
     if DO_PICKLES:
-        if pickle_mainloop_file_path.exists():
+        if has_valid_pickle(pickle_mainloop_file_path):
             logger.info("loading existing mainloop pickle to speed up")
             if sock is not None:
                 sock.sendall(b"phase:phase2\n")
-            try:
-                with open(pickle_mainloop_file_path, "rb") as f:
-                    kvargs = pickle.load(f)
-                    if kvargs is not None and "path" not in kvargs:
-                        kvargs["path"] = file_path
-                    with_pickled = True
+            kvargs = try_load_pickle(pickle_mainloop_file_path, logger)
+            if kvargs is not None:
+                if "path" not in kvargs:
+                    kvargs["path"] = file_path
+                with_pickled = True
                 logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
-            except Exception as e:
-                logger.warning(f"Failed to load pickle from {pickle_mainloop_file_path}: {e}")
-                logger.info(f"Deleting corrupted pickle file: {pickle_mainloop_file_path}")
-                pickle_mainloop_file_path.unlink()
-        elif pickle_file_path.exists():
+        elif has_valid_pickle(pickle_file_path):
             logger.info("loading existing pickle to speed up")
-            try:
-                with open(pickle_file_path, "rb") as f:
-                    kvargs = pickle.load(f)
+            kvargs = try_load_pickle(pickle_file_path, logger)
+            if kvargs is not None:
                 logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
-            except Exception as e:
-                logger.warning(f"Failed to load pickle from {pickle_file_path}: {e}")
-                logger.info(f"Deleting corrupted pickle file: {pickle_file_path}")
-                pickle_file_path.unlink()
 
     if kvargs is None:
         project: angr.Project = angr.Project(file_path, auto_load_libs=False)
@@ -201,9 +194,7 @@ def run_tokenizer(
         logger.info(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
         start_time = time.time()
         if DO_PICKLES:
-            with open(pickle_file_path, "wb") as f:
-                pickle.dump(kvargs, f)
-
+            save_pickle(pickle_file_path, kvargs)
             logger.info(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
 
     start_time = time.time()

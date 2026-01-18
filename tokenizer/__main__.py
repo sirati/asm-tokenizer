@@ -221,9 +221,7 @@ def main():
                     try:
                         run_tokenizer(
                             binary_path,
-                            platform=cast(
-                                Literal["x86", "arm64", "arm32", "x64", "auto"], common_params["platform"]
-                            ),
+                            platform=cast(Literal["x86", "arm64", "arm32", "x64", "auto"], common_params["platform"]),
                             skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
                             source_dir=cast(Path, common_params["source_dir"]),
                             output_dir=cast(Path, common_params["output_dir"]),
