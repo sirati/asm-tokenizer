@@ -60,5 +60,6 @@ run/
 tokenizer/.tokenizer_hash_cache.json
 
 # output articacts from nix build
-result
+result*
+docker*
 pyvex_ffi_parser_cache*
