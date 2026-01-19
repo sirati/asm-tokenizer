@@ -39,6 +39,7 @@
           pandas
           tqdm
           portalocker
+          aioquic
         ];
 
       devPythonPackages =
@@ -49,6 +50,7 @@
 
       deploymentPackages =
         pkgs: with pkgs; [
+          openssl
         ];
 
       dockerOnlyPackages =
