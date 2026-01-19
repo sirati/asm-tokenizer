@@ -14,14 +14,6 @@ from .unifier import unify_vocab
 
 
 def main() -> None:
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
     parser = argparse.ArgumentParser(
         description="Unify vocabularies from multiple CSV files into a single unified vocabulary."
     )
@@ -35,9 +27,35 @@ def main() -> None:
         help="Name of the output unified vocabulary file (default: unified_vocab.csv)",
     )
 
+    parser.add_argument(
+        "--raw-logs",
+        type=str,
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PREFIX",
+        help="Disable log formatting (no level, timestamp, etc - only raw messages). Optionally specify a prefix",
+    )
+
     parser.set_defaults(source="./out/")
 
     args = parser.parse_args()
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    if args.raw_logs is not None:
+        log_format = f"{args.raw_logs}%(message)s" if args.raw_logs else "%(message)s"
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
     config = process_selection_arguments(args)
 
