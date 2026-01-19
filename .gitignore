@@ -54,6 +54,7 @@ __MACOSX
 src/
 out/
 queue/
+run/
 
 # tokenizer hash cache
 tokenizer/.tokenizer_hash_cache.json
