@@ -40,6 +40,7 @@
           tqdm
           portalocker
           aioquic
+          websockets
         ];
 
       devPythonPackages =
