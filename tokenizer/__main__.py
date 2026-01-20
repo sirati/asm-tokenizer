@@ -159,7 +159,7 @@ def main():
         )
 
         parser.add_argument(
-            "--simulate-crash",
+            "--simulate-errors",
             type=float,
             metavar="PERCENTAGE",
             help="Simulate random worker crashes with given percentage chance (0-100)",
@@ -236,9 +236,9 @@ def main():
             logger.info(f"[*] Ready signal sent, waiting for tasks...")
 
             # Check if crash simulation is enabled
-            simulate_crash_chance = args.simulate_crash if args.simulate_crash is not None else 0.0
-            if simulate_crash_chance > 0:
-                logger.info(f"[*] Crash simulation enabled: {simulate_crash_chance}% chance per task")
+            simulate_errors_chance = args.simulate_errors if args.simulate_errors is not None else 0.0
+            if simulate_errors_chance > 0:
+                logger.info(f"[*] Error simulation enabled: {simulate_errors_chance}% chance per task")
 
             while True:
                 try:
@@ -254,12 +254,12 @@ def main():
                     logger.info(f"[*] Processing: {binary_path}")
 
                     # Simulate crash if enabled
-                    if simulate_crash_chance > 0:
-                        if random.random() * 100 < simulate_crash_chance:
-                            logger.warning(f"[!] SIMULATED CRASH for {binary_path.name}")
+                    if simulate_errors_chance > 0:
+                        if random.random() * 100 < simulate_errors_chance:
+                            logger.warning(f"[!] SIMULATED Error for task {binary_path.name}")
                             response = ErrorResponse(
                                 error_type=ErrorType.NON_RECOVERABLE,
-                                error_message=f"Simulated crash ({simulate_crash_chance}% chance)",
+                                error_message=f"Simulated error ({simulate_errors_chance}% chance)",
                             )
                             comm.send_response(response)
                             break
