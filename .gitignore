@@ -51,10 +51,10 @@ pip-wheel-metadata/
 __MACOSX
 
 # src and out and queue
-src/
-out/
-queue/
-run/
+/src/
+/out/
+/queue/
+/run/
 
 # tokenizer hash cache
 tokenizer/.tokenizer_hash_cache.json

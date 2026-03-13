@@ -60,6 +60,17 @@
           coreutils
         ];
 
+      rustPackages =
+        pkgs: with pkgs; [
+          rustc
+          cargo
+          rust-analyzer
+          clippy
+          rustfmt
+          maturin
+          pkg-config
+        ];
+
       devPackages =
         pkgs: with pkgs; [
           basedpyright
@@ -86,6 +97,7 @@
                 ))
               ]
               ++ (deploymentPackages pkgs)
+              ++ (rustPackages pkgs)
               ++ (devPackages pkgs);
 
             shellHook = ''
