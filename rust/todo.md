@@ -36,3 +36,19 @@ please add to your plan as a last step: continuously work on this. never end the
 DONE: the specific code that runs e.g. binary identifier is user dependent and the code here must be generic over it.
 (BinaryIdentifier replaced with generic `I: Identifier` trait parameter throughout all crates.
  Concrete `TokenizerIdentifier` moved to `db_python_provider`.)
+
+
+If you are using channels instead of the comms API in any messager then you are doing it completely wrong. remember the goal is not identical behaviour to python. the python code has major flaws, bugs and inconsistencies. the Rust impl has to be strictly split correcrtly by the crate bondaries, because it makes it harder to cheat, and impl stuff incorrectly just to pass tests.
+
+yes indeed this is another issue the python package ONLY exposes all functionality to python. it does NOT impl anything itself! very important
+
+
+just saying if you dependecy graph has cycles there is high likelihood that you either copied python code that just tried to cheat the tests, or your design is cheating the test!
+
+i see in your plan make Quic impl primary and secondary transport. NO!
+the have the comms bases API that provides the APIs that allow message passing. Quic MUST only impl comms bases API. the [@todo.md (7:8)](file:///home/sirati/devel/python/asm-tokenizer/rust/todo.md#L7:8) are another two APIs the impl the actual protocol spec and the communication API at a rust function level, for statemachine correct usage. they do however NOT directly allow handling communication!
+
+
+
+The Rust secondary coordinator is functional but missing some of the Python version's advanced features (peer-to-peer QUIC, file transfer/ZIP extraction, reconnection).
+if they have not been added yet, they must
