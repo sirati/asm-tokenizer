@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "dynamic-batch-rs": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": "rust-overlay"
+      },
+      "locked": {
+        "path": "./rust/dynamic_batch",
+        "type": "path"
+      },
+      "original": {
+        "path": "./rust/dynamic_batch",
+        "type": "path"
+      },
+      "parent": []
+    },
     "gitignore": {
       "inputs": {
         "nixpkgs": [
@@ -38,8 +55,30 @@
     },
     "root": {
       "inputs": {
+        "dynamic-batch-rs": "dynamic-batch-rs",
         "gitignore": "gitignore",
         "nixpkgs": "nixpkgs"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "dynamic-batch-rs",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1773457417,
+        "narHash": "sha256-waABTSxPdbxml4BhcabHhyQF02Qnj27qRU4ard0mTQo=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "055977c30249484010750e03074c744dcdaa0d23",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
       }
     }
   },

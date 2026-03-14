@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    dynamic-batch-rs = {
+      url = "path:./rust/dynamic_batch";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     gitignore = {
       url = "github:hercules-ci/gitignore.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -13,6 +17,7 @@
     {
       self,
       nixpkgs,
+      dynamic-batch-rs,
       gitignore,
     }:
     let
@@ -60,17 +65,6 @@
           coreutils
         ];
 
-      rustPackages =
-        pkgs: with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          clippy
-          rustfmt
-          maturin
-          pkg-config
-        ];
-
       devPackages =
         pkgs: with pkgs; [
           basedpyright
@@ -86,6 +80,7 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          dbrs = dynamic-batch-rs.packages.${system};
         in
         {
           default = pkgs.mkShell {
@@ -93,11 +88,17 @@
               with pkgs;
               [
                 (python314.withPackages (
-                  python-pkgs: (deploymentPythonPackages python-pkgs) ++ (devPythonPackages python-pkgs)
+                  python-pkgs:
+                  (deploymentPythonPackages python-pkgs)
+                  ++ (devPythonPackages python-pkgs)
+                  ++ [ dbrs.python-package ]
                 ))
+                dbrs.rust-toolchain
+                maturin
+                rustfmt
+                pkg-config
               ]
               ++ (deploymentPackages pkgs)
-              ++ (rustPackages pkgs)
               ++ (devPackages pkgs);
 
             shellHook = ''
