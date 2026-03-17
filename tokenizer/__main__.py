@@ -8,7 +8,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 from dynamic_batch.comm import (
     ErrorResponse,
@@ -21,6 +21,7 @@ from dynamic_batch.comm import (
     parse_command,
 )
 from shared import increase_csv_field_size_limit, remove_stream_handlers
+from tokenizer.arch import Platform
 from tokenizer.run_tokenizer import run_tokenizer
 
 
@@ -142,7 +143,7 @@ def main():
             type=str,
             help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'auto' to auto-detect from binary name. Default is auto.",
             default="auto",
-            choices=["x86", "arm64", "arm32", "x64", "auto"],
+            choices=["x86", "x64", "arm32", "arm64", "mips", "mips64", "ppc", "ppc64", "riscv32", "riscv64", "auto"],
         )
         parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
         parser.add_argument(
@@ -267,7 +268,7 @@ def main():
                     try:
                         run_tokenizer(
                             binary_path,
-                            platform=cast(Literal["x86", "arm64", "arm32", "x64", "auto"], common_params["platform"]),
+                            platform=cast(Platform | str, common_params["platform"]),
                             skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
                             source_dir=cast(Path, common_params["source_dir"]),
                             output_dir=cast(Path, common_params["output_dir"]),

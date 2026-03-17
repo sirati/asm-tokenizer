@@ -1,7 +1,7 @@
 import logging
 import time
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 import angr
 
@@ -9,7 +9,7 @@ from dynamic_batch.comm import CommunicationInterface, DoneResponse, KeepaliveRe
 from dynamic_batch.task.tokenizer import TokenizerPhase
 from shared import setup_logger
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
-from tokenizer.arch import get_provider
+from tokenizer.arch import Platform, get_provider
 from tokenizer.csv_files import parse_and_save_data_sections
 from tokenizer.hash_checked_pickles import (
     has_valid_pickle,
@@ -26,7 +26,7 @@ DO_PICKLES: bool = True
 def disassemble_to_tokens(
     out_folder: Path,
     binary_name: str,
-    platform: Literal["x86", "arm64", "arm32", "x64"],
+    platform: Platform,
     cfg: angr.analyses.cfg.cfg_fast.CFGFast,
     constant_list: dict[str, list[str]],
     csv_path: Path,
@@ -108,7 +108,7 @@ def disassemble_to_tokens(
 
 def run_tokenizer(
     binary_path: Path,
-    platform: Literal["x86", "arm64", "arm32", "x64", "auto"],
+    platform: Platform | str,
     skip_existing_csv: bool,
     source_dir: Path,
     output_dir: Path,
@@ -123,14 +123,20 @@ def run_tokenizer(
     binary_name = file_path.name
 
     if platform == "auto":
-        possible_platforms: list[Literal["x86", "arm64", "arm32", "x64"]] = [
+        _ALL_PLATFORMS: list[Platform] = [
             "x86",
+            "x64",
             "arm64",
             "arm32",
-            "x64",
+            "mips64",
+            "mips",
+            "ppc64",
+            "ppc",
+            "riscv64",
+            "riscv32",
         ]
-        detected_platform: Literal["x86", "arm64", "arm32", "x64"] | None = None
-        for p in possible_platforms:
+        detected_platform: Platform | None = None
+        for p in _ALL_PLATFORMS:
             if binary_name.startswith(p):
                 detected_platform = p
                 break
@@ -138,9 +144,9 @@ def run_tokenizer(
         if detected_platform is None:
             raise ValueError(
                 f"Could not detect platform from binary name '{binary_name}'. "
-                f"Expected one of: {', '.join(possible_platforms)}"
+                f"Expected one of: {', '.join(_ALL_PLATFORMS)}"
             )
-        platform = cast(Literal["x86", "arm64", "arm32", "x64"], detected_platform)
+        platform = cast(Platform, detected_platform)
         logger.info(f"[*] Detected platform: {platform}")
     else:
         assert binary_name.startswith(platform), (

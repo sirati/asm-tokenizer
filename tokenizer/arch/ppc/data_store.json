@@ -1,0 +1,123 @@
+{
+  "arithmetic_instructions": [
+    "add", "add.", "addo", "addo.",
+    "addc", "addc.", "addco", "addco.",
+    "adde", "adde.", "addeo", "addeo.",
+    "addi", "addic", "addic.", "addis",
+    "addme", "addme.", "addmeo", "addmeo.",
+    "addze", "addze.", "addzeo", "addzeo.",
+    "subf", "subf.", "subfo", "subfo.",
+    "subfc", "subfc.", "subfco", "subfco.",
+    "subfe", "subfe.", "subfeo", "subfeo.",
+    "subfic",
+    "subfme", "subfme.", "subfmeo", "subfmeo.",
+    "subfze", "subfze.", "subfzeo", "subfzeo.",
+    "mullw", "mullw.", "mullwo", "mullwo.",
+    "mulhw", "mulhw.", "mulhwu", "mulhwu.",
+    "divw", "divw.", "divwo", "divwo.",
+    "divwu", "divwu.", "divwuo", "divwuo.",
+    "mulld", "mulld.", "mulldo", "mulldo.",
+    "mulhd", "mulhd.", "mulhdu", "mulhdu.",
+    "divd", "divd.", "divdo", "divdo.",
+    "divdu", "divdu.", "divduo", "divduo.",
+    "and", "and.", "andc", "andc.", "andi.", "andis.",
+    "or", "or.", "orc", "orc.", "ori", "oris",
+    "xor", "xor.", "xori", "xoris",
+    "nand", "nand.", "nor", "nor.",
+    "eqv", "eqv.",
+    "neg", "neg.", "nego", "nego.",
+    "extsb", "extsb.", "extsh", "extsh.", "extsw", "extsw.",
+    "cntlzw", "cntlzw.", "cntlzd", "cntlzd.",
+    "slw", "slw.", "srw", "srw.", "sraw", "sraw.", "srawi", "srawi.",
+    "sld", "sld.", "srd", "srd.", "srad", "srad.", "sradi", "sradi.",
+    "rlwinm", "rlwinm.", "rlwnm", "rlwnm.",
+    "rlwimi", "rlwimi.",
+    "rldcl", "rldcl.", "rldcr", "rldcr.",
+    "rldic", "rldic.", "rldicl", "rldicl.", "rldicr", "rldicr.",
+    "rldimi", "rldimi.",
+    "cmp", "cmpi", "cmpl", "cmpli",
+    "cmpw", "cmpwi", "cmplw", "cmplwi",
+    "cmpd", "cmpdi", "cmpld", "cmpldi",
+    "li", "lis",
+    "mr", "mr.",
+    "not", "not.",
+    "nop"
+  ],
+
+  "addressing_control_flow_instructions": [
+    "b", "ba", "bl", "bla",
+    "bc", "bca", "bcl", "bcla",
+    "bclr", "bclrl", "bcctr", "bcctrl",
+    "blr", "bctr", "bctrl",
+    "beq", "bne", "blt", "bgt", "ble", "bge",
+    "beqa", "bnea", "blta", "bgta", "blea", "bgea",
+    "beql", "bnel", "bltl", "bgtl", "blel", "bgel",
+    "beqla", "bnela", "bltla", "bgtla", "blela", "bgela",
+    "beqlr", "bnelr", "bltlr", "bgtlr", "blelr", "bgelr",
+    "beqctr", "bnectr", "bltctr", "bgtctr", "blectr", "bgectr",
+    "bdnz", "bdnza", "bdnzl", "bdnzla",
+    "bdz", "bdza", "bdzl", "bdzla",
+    "bns", "bso", "bun", "bnu",
+    "lwz", "lwzu", "lbz", "lbzu", "lhz", "lhzu", "lha", "lhau",
+    "stw", "stwu", "stb", "stbu", "sth", "sthu",
+    "lwzx", "lwzux", "lbzx", "lbzux", "lhzx", "lhzux", "lhax", "lhaux",
+    "stwx", "stwux", "stbx", "stbux", "sthx", "sthux",
+    "ld", "ldu", "lwa",
+    "std", "stdu",
+    "ldx", "ldux", "lwax", "lwaux",
+    "stdx", "stdux",
+    "lmw", "stmw",
+    "sc"
+  ],
+
+  "string_instructions": [
+    "lswi", "lswx", "stswi", "stswx"
+  ],
+
+  "bit_manipulation_instructions": [],
+
+  "floating_point_instructions": [
+    "fadd", "fadds", "fsub", "fsubs",
+    "fmul", "fmuls", "fdiv", "fdivs",
+    "fabs", "fnabs", "fneg", "fsqrt", "fsqrts",
+    "fmadd", "fmadds", "fmsub", "fmsubs",
+    "fnmadd", "fnmadds", "fnmsub", "fnmsubs",
+    "fmr",
+    "fcmpu", "fcmpo",
+    "frsp", "fctid", "fctidz", "fctiw", "fctiwz", "fcfid",
+    "fsel",
+    "lfs", "lfsu", "lfd", "lfdu",
+    "stfs", "stfsu", "stfd", "stfdu",
+    "lfsx", "lfsux", "lfdx", "lfdux",
+    "stfsx", "stfsux", "stfdx", "stfdux",
+    "mffs", "mtfsf", "mtfsfi", "mtfsb0", "mtfsb1"
+  ],
+
+  "system_instructions": [
+    "mfspr", "mtspr", "mfmsr", "mtmsr", "mtmsrd",
+    "mfcr", "mtcrf", "mcrf",
+    "mftb",
+    "rfi", "rfid",
+    "tlbie", "tlbiel", "tlbia", "tlbsync",
+    "eciwx", "ecowx",
+    "dcbf", "dcbi", "dcbst", "dcbt", "dcbtst", "dcbz",
+    "icbi",
+    "tw", "twi", "td", "tdi",
+    "trap"
+  ],
+
+  "nop_instructions": [
+    "nop"
+  ],
+
+  "kernel_interaction_instructions": [
+    "sc"
+  ],
+
+  "locking_atomic_instructions": [
+    "lwarx", "stwcx.", "ldarx", "stdcx.",
+    "sync", "lwsync", "ptesync", "isync", "eieio"
+  ],
+
+  "inv_prefix_tokens": {}
+}
