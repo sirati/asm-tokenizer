@@ -19,11 +19,3 @@ class PlatformInstructionTypes(IntEnum):
     LOCKING_ATOMIC = 12
 
     OTHER = 127
-
-
-class X86:
-    architecture_str = "x86"
-    instruction_types_enum = PlatformInstructionTypes
-
-    def __init__(self, instruction_types_class):
-        self.instruction_types_class = instruction_types_class

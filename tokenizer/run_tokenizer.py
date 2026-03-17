@@ -9,18 +9,17 @@ from dynamic_batch.comm import CommunicationInterface, DoneResponse, KeepaliveRe
 from dynamic_batch.task.tokenizer import TokenizerPhase
 from shared import setup_logger
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
+from tokenizer.arch import get_provider
 from tokenizer.csv_files import parse_and_save_data_sections
 from tokenizer.hash_checked_pickles import (
     has_valid_pickle,
     save_pickle,
     try_load_pickle,
 )
-from tokenizer.instruction_sets import InstructionSets
 from tokenizer.main_loop import main_loop
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
 
-SCRIPT_FOLDER: Path = Path(__file__).parent.resolve()
 DO_PICKLES: bool = True
 
 
@@ -95,9 +94,12 @@ def disassemble_to_tokens(
     vocab_manager = VocabularyManager(platform)
 
     resolver = TokenResolver()
-    instr_sets = InstructionSets(SCRIPT_FOLDER / "./data_store.json")
+    arch_provider = get_provider(platform)
+    instr_sets = arch_provider.load_instruction_sets()
 
-    kwargs.update(dict(resolver=resolver, instr_sets=instr_sets, csv_path=csv_path, logger=logger))
+    kwargs.update(
+        dict(resolver=resolver, instr_sets=instr_sets, arch_provider=arch_provider, csv_path=csv_path, logger=logger)
+    )
 
     function_manager, filtered = main_loop(vocab_manager=vocab_manager, comm=comm, **kwargs)
 
