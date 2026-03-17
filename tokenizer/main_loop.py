@@ -54,6 +54,7 @@ def main_loop(
     text_start,
     vocab_manager,
     csv_path,
+    arch_provider,
     logger: logging.Logger,
     comm: CommunicationInterface,
     **_kwargs,
@@ -120,6 +121,7 @@ def main_loop(
                         text_end=text_end,
                         resolver=resolver,
                         vocab_manager=vocab_manager,
+                        arch_provider=arch_provider,
                     )
                 except Exception as e:
                     logger.warning(f"Error processing {func_name}: {e}. Skipping function.")

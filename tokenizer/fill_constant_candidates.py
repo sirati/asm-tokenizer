@@ -4,119 +4,15 @@ import angr
 import numpy as np
 
 from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
-from tokenizer.architecture import PlatformInstructionTypes
+from tokenizer.arch.provider import ArchitectureProvider
 from tokenizer.constant_handler import ConstantHandler
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.instruction_sets import InstructionSets
-from tokenizer.op_imm_mem import tokenize_operand_immediate, tokenize_operand_memory
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import BlockToken, TokenResolver, Tokens
 
 VERIFICATION: bool = False
-
-degenerate_prefixes = {
-    0xF2: ["repne", "repnz"],
-    0xF3: ["repe", "repz", "rep"],
-}
-
-
-def parse_instruction(
-    instr_sets,
-    constant_handler,
-    func_max_addr,
-    func_min_addr,
-    insn,
-    lookup,
-    text_end,
-    text_start,
-    vocab_manager,
-    insn_tokens,
-):
-    insn_tokens2 = [] if VERIFICATION else None
-
-    for byte in insn.prefix:
-        if byte in degenerate_prefixes:
-            skip = True
-            for prefix_name in degenerate_prefixes[byte]:
-                if insn.mnemonic.startswith(prefix_name):
-                    token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
-                    insn_tokens.append(token)
-                    if VERIFICATION:
-                        assert insn_tokens2 is not None
-                        insn_tokens2.append(token)
-                    break
-            else:
-                skip = False
-            if skip:
-                continue
-
-        if byte in instr_sets.prefixes:
-            prefix_name: str = instr_sets.prefixes[byte]
-            token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
-            insn_tokens.append(token)
-            if VERIFICATION:
-                assert insn_tokens2 is not None
-                insn_tokens2.append(token)
-
-    insn_name = insn.insn.insn_name()
-    insn_type = instr_sets.get_instruction_type(insn_name)
-
-    token = vocab_manager.PlatformToken(insn_name, insn_type)
-    insn_tokens.append(token)
-    if VERIFICATION:
-        assert insn_tokens2 is not None
-        insn_tokens2.append(token)
-
-    if hasattr(insn, "operands"):
-        for op in insn.operands:
-            if op.type == 0 or op.type > 3:
-                raise Exception
-
-            if op.type == 1:
-                token = vocab_manager.get_registry_token(insn, op.reg)
-                insn_tokens.append(token)
-                if VERIFICATION:
-                    assert insn_tokens2 is not None
-                    insn_tokens2.append(token)
-            elif op.type == 2:
-                immediate_tokens = tokenize_operand_immediate(
-                    instr_sets.addressing_control_flow,
-                    instr_sets.arithmetic,
-                    insn,
-                    lookup,
-                    op,
-                    func_max_addr,
-                    func_min_addr,
-                    constant_handler,
-                )
-                insn_tokens.extend(immediate_tokens)
-                if VERIFICATION:
-                    assert insn_tokens2 is not None
-                    insn_tokens2.extend(immediate_tokens)
-
-            elif op.type == 3:
-                memory_tokens = tokenize_operand_memory(
-                    insn,
-                    lookup,
-                    op,
-                    text_end,
-                    text_start,
-                    func_max_addr,
-                    func_min_addr,
-                    vocab_manager,
-                    constant_handler,
-                )
-                insn_tokens.extend(memory_tokens)
-                if VERIFICATION:
-                    assert insn_tokens2 is not None
-                    insn_tokens2.extend(memory_tokens)
-
-    else:
-        print(f"INSTRUCTION WITHOUT OPERANDS: {insn}")
-        raise TypeError
-
-    return insn_tokens, insn_tokens2
 
 
 def fill_constant_candidates(
@@ -129,6 +25,7 @@ def fill_constant_candidates(
     text_end: int,
     resolver: TokenResolver,
     vocab_manager: VocabularyManager,
+    arch_provider: ArchitectureProvider,
 ) -> Optional[
     tuple[
         list[tuple[str, list[list[Tokens]]]],
@@ -147,7 +44,6 @@ def fill_constant_candidates(
     for i, block in enumerate(func.blocks):
         block_ranges[i, 0] = block.addr
         block_ranges[i, 1] = block.addr + block.size
-
 
     func_max_addr = int(block_ranges.max())
     constant_handler = ConstantHandler(vocab_manager, resolver, constant_dict, block_ranges)
@@ -192,7 +88,7 @@ def fill_constant_candidates(
         for insn in block.capstone.insns:
             insn_tokens = disassembly_list.view(insn_str=f"{insn.mnemonic} {insn.op_str}")
 
-            (insn_tokens, insn_tokens2) = parse_instruction(
+            insn_tokens = arch_provider.parse_instruction(
                 instr_sets,
                 constant_handler,
                 func_max_addr,
@@ -206,7 +102,7 @@ def fill_constant_candidates(
             )
             disassembly_list.add_insn(insn_tokens)
             if VERIFICATION:
-                disassembly_list2.append(insn_tokens2)
+                disassembly_list2.append(list(insn_tokens))
 
         if VERIFICATION:
             for x, y in zip(

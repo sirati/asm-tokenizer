@@ -7,7 +7,7 @@ from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, Tokens
 from tokenizer.utils import num_hex_digits
 
-size_map = {
+SIZE_MAP: dict[int, str] = {
     1: "byte_ptr",
     2: "word_ptr",
     4: "dword_ptr",
@@ -22,8 +22,6 @@ size_map = {
     108: "fpu_state_ptr",  # x87 state (32-bit mode)
 }
 
-segment_prefixes = {0x26: "es:", 0x2E: "cs:", 0x36: "ss:", 0x3E: "ds:", 0x64: "fs:", 0x65: "gs:"}
-
 
 def tokenize_operand_memory(
     insn,
@@ -37,7 +35,7 @@ def tokenize_operand_memory(
     constant_handler: ConstantHandler,
 ) -> List[Tokens]:
     """
-    Tokenize memory operand and return list of tokens.
+    Tokenize x86/x64 memory operand and return list of tokens.
 
     Returns:
         List of TokensRepl objects for this memory operand
@@ -54,14 +52,14 @@ def tokenize_operand_memory(
     has_index = op.mem.index != 0
     has_disp = op.mem.disp != 0
 
-    if op.size in size_map:
-        tokens.append(vocab_manager.PlatformToken(size_map[op.size], PlatformInstructionTypes.POINTER_LENGTHS))
+    if op.size in SIZE_MAP:
+        tokens.append(vocab_manager.PlatformToken(SIZE_MAP[op.size], PlatformInstructionTypes.POINTER_LENGTHS))
     else:
-        # Find the next bigger size in size_map or take the largest available
-        next_size = min((s for s in size_map if s > op.size), default=max(size_map))
-        tokens.append(vocab_manager.PlatformToken(size_map[next_size], PlatformInstructionTypes.POINTER_LENGTHS))
+        # Find the next bigger size in SIZE_MAP or take the largest available
+        next_size = min((s for s in SIZE_MAP if s > op.size), default=max(SIZE_MAP))
+        tokens.append(vocab_manager.PlatformToken(SIZE_MAP[next_size], PlatformInstructionTypes.POINTER_LENGTHS))
         warnings.warn(
-            f"unexpected memory operand size: {op.size}, using next bigger '{size_map[next_size]}' at {next_size}bytes for instruction {insn}"
+            f"unexpected memory operand size: {op.size}, using next bigger '{SIZE_MAP[next_size]}' at {next_size}bytes for instruction {insn}"
         )
 
     if op.mem.segment > 0:
@@ -163,7 +161,7 @@ def tokenize_operand_immediate(
     constant_handler: ConstantHandler,
 ) -> List[Tokens]:
     """
-    Tokenize immediate operand and return list of tokens.
+    Tokenize x86/x64 immediate operand and return list of tokens.
 
     Returns:
         List of TokensRepl objects for this immediate operand
