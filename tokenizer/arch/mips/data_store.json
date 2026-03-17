@@ -1,0 +1,110 @@
+{
+  "arithmetic_instructions": [
+    "add", "addi", "addiu", "addu",
+    "sub", "subu",
+    "mul", "mult", "multu", "madd", "maddu", "msub", "msubu",
+    "div", "divu",
+    "and", "andi",
+    "or", "ori",
+    "xor", "xori",
+    "nor",
+    "sll", "sllv", "srl", "srlv", "sra", "srav",
+    "rotr", "rotrv",
+    "slt", "slti", "sltiu", "sltu",
+    "clo", "clz",
+    "ext", "ins",
+    "wsbh", "seh", "seb",
+    "lui",
+    "mfhi", "mflo", "mthi", "mtlo",
+    "movn", "movz",
+    "dadd", "daddi", "daddiu", "daddu",
+    "dsub", "dsubu",
+    "dmult", "dmultu", "ddiv", "ddivu",
+    "dsll", "dsll32", "dsrl", "dsrl32", "dsra", "dsra32",
+    "dsllv", "dsrlv", "dsrav",
+    "dext", "dins", "dinsm", "dinsu", "dextu", "dextm",
+    "dclo", "dclz",
+    "drotr", "drotr32", "drotrv",
+    "dsbh", "dshd",
+    "dmfc0", "dmtc0"
+  ],
+
+  "addressing_control_flow_instructions": [
+    "j", "jal", "jr", "jalr",
+    "b", "bal",
+    "beq", "bne",
+    "bgtz", "blez", "bltz", "bgez",
+    "bgtzl", "blezl", "bltzl", "bgezl",
+    "beql", "bnel",
+    "bltzal", "bgezal", "bltzall", "bgezall",
+    "lw", "lh", "lhu", "lb", "lbu", "lwl", "lwr",
+    "sw", "sh", "sb", "swl", "swr",
+    "ll", "sc",
+    "ld", "sd", "ldl", "ldr", "sdl", "sdr",
+    "lwu", "lld", "scd",
+    "move",
+    "syscall"
+  ],
+
+  "string_instructions": [],
+
+  "bit_manipulation_instructions": [],
+
+  "floating_point_instructions": [
+    "add.s", "add.d",
+    "sub.s", "sub.d",
+    "mul.s", "mul.d",
+    "div.s", "div.d",
+    "abs.s", "abs.d",
+    "neg.s", "neg.d",
+    "sqrt.s", "sqrt.d",
+    "mov.s", "mov.d",
+    "cvt.s.d", "cvt.s.w", "cvt.s.l",
+    "cvt.d.s", "cvt.d.w", "cvt.d.l",
+    "cvt.w.s", "cvt.w.d",
+    "cvt.l.s", "cvt.l.d",
+    "c.eq.s", "c.eq.d",
+    "c.lt.s", "c.lt.d",
+    "c.le.s", "c.le.d",
+    "c.un.s", "c.un.d",
+    "bc1t", "bc1f", "bc1tl", "bc1fl",
+    "lwc1", "swc1", "ldc1", "sdc1",
+    "mfc1", "mtc1", "mfhc1", "mthc1",
+    "dmfc1", "dmtc1",
+    "movf", "movt", "movf.s", "movf.d", "movt.s", "movt.d",
+    "movn.s", "movn.d", "movz.s", "movz.d",
+    "trunc.w.s", "trunc.w.d", "trunc.l.s", "trunc.l.d",
+    "round.w.s", "round.w.d", "round.l.s", "round.l.d",
+    "ceil.w.s", "ceil.w.d", "ceil.l.s", "ceil.l.d",
+    "floor.w.s", "floor.w.d", "floor.l.s", "floor.l.d",
+    "madd.s", "madd.d", "msub.s", "msub.d",
+    "nmadd.s", "nmadd.d", "nmsub.s", "nmsub.d"
+  ],
+
+  "system_instructions": [
+    "mfc0", "mtc0",
+    "eret",
+    "tlbr", "tlbwi", "tlbwr", "tlbp",
+    "cache", "pref",
+    "di", "ei",
+    "wait",
+    "break", "sdbbp",
+    "rdhwr",
+    "cop2"
+  ],
+
+  "nop_instructions": [
+    "nop"
+  ],
+
+  "kernel_interaction_instructions": [
+    "syscall"
+  ],
+
+  "locking_atomic_instructions": [
+    "sync",
+    "synci"
+  ],
+
+  "inv_prefix_tokens": {}
+}

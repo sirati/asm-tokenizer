@@ -41,11 +41,14 @@ _ARM_CC_NAMES: dict[int, str] = {
 
 
 class ARM32Provider(ArchitectureProvider):
-    """Architecture provider for ARM32 (AArch32 / Thumb) platform."""
+    """Architecture provider for ARM32 (AArch32 / Thumb) and ARM64 (AArch64) platforms."""
+
+    def __init__(self, platform: str = "arm32"):
+        self._platform = platform
 
     @property
     def platform_str(self) -> str:
-        return "arm32"
+        return self._platform
 
     def load_instruction_sets(self) -> InstructionSets:
         return InstructionSets(_DATA_STORE_PATH)
