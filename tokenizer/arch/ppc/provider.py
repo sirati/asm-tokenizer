@@ -75,7 +75,7 @@ class PPCProvider(ArchitectureProvider):
             for op in insn.operands:
                 if op.type == _OP_REG:
                     if op.reg != 0:
-                        insn_tokens.append(vocab_manager.get_registry_token(insn, op.reg))
+                        insn_tokens.append(vocab_manager.get_registry_token(insn.reg_name(op.reg), op.reg))
                 elif op.type == _OP_IMM:
                     insn_tokens.extend(
                         tokenize_operand_immediate_generic(
@@ -106,7 +106,7 @@ class PPCProvider(ArchitectureProvider):
                 elif op.type == _OP_CRX:
                     # Condition register field — emit the CR register
                     if hasattr(op, "crx") and hasattr(op.crx, "reg") and op.crx.reg != 0:
-                        insn_tokens.append(vocab_manager.get_registry_token(insn, op.crx.reg))
+                        insn_tokens.append(vocab_manager.get_registry_token(insn.reg_name(op.crx.reg), op.crx.reg))
                 elif op.type == 0:
                     pass
                 else:

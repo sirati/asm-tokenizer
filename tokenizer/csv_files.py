@@ -37,66 +37,6 @@ def extract_ldis_blocks_from_file(file_path):
     return result
 
 
-def parse_and_save_data_sections(
-    proj, sections_to_parse: list[str] = [".rodata"], output_csv_path: str | None = None
-) -> dict[str, list[str]]:
-    """
-    Parses the .rodata (read-only data) section to retrieve a dict with all constants.
-
-    Args:
-        proj: angr Project
-        sections_to_parse (list[str]): Contains per default only '.rodata'
-        output_csv_path (str | None): Path to the output CSV file, used to derive constants filename
-
-    Returns:
-        dict with all constants of structure: start_addr: [end_addr, section_name, value]
-    """
-    all_entries = []
-    addr_dict: dict[str, list[str]] = {}
-
-    def parse_rodata(data, base_addr):
-        entries = []
-        for match in re.finditer(b"[\x20-\x7e]{4,}\x00", data):
-            s = match.group().rstrip(b"\x00").decode("utf-8", errors="ignore")
-            start = base_addr + match.start()
-            entries.append(
-                {
-                    "section": ".rodata",
-                    "start": hex(start),
-                    "end": hex(start + len(s) + 1),
-                    "value": f'"{s}"',
-                }
-            )
-        return entries
-
-    # Only process .rodata or other truly constant sections
-    for sec in proj.loader.main_object.sections:
-        if sec.name not in sections_to_parse:
-            continue
-        if sec.name == ".rodata" and sec.is_readable and sec.memsize > 0:
-            data = proj.loader.memory.load(sec.vaddr, sec.memsize)
-            entries = parse_rodata(data, sec.vaddr)
-            all_entries.extend(entries)
-            for e in entries:
-                addr_dict[e["start"]] = [e["end"], e["section"], e["value"]]
-
-    # Output only exact-address constants
-    if output_csv_path:
-        from pathlib import Path
-
-        csv_path = Path(output_csv_path)
-        consts_path = csv_path.parent / f"{csv_path.stem.replace('_output', '')}_consts.txt"
-    else:
-        consts_path = Path("parsed_constants.txt")
-
-    with open(consts_path, "w") as f:
-        for e in all_entries:
-            f.write(f"{e['start']} - {e['end']}: {e['section']}: {e['value']}\n")
-
-    print(f"Parsed {len(all_entries)} .rodata constants with exact addresses into {consts_path}")
-    return addr_dict
-
-
 def parse_init_sections(proj, output_txt="parsed_init_sections.txt", sections_to_parse=None):
     """
     Parse ELF .init/.fini/.init_array/.fini_array sections and write to file.

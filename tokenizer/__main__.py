@@ -160,6 +160,13 @@ def main():
         )
 
         parser.add_argument(
+            "--backend",
+            type=str,
+            default="angr",
+            choices=["angr", "ghidra"],
+            help="Disassembly backend to use (default: angr)",
+        )
+        parser.add_argument(
             "--simulate-errors",
             type=float,
             metavar="PERCENTAGE",
@@ -219,6 +226,7 @@ def main():
             skip_existing_csv=args.skip_existing,
             source_dir=source_dir,
             output_dir=output_dir,
+            backend=args.backend,
         )
 
         if args.dynamic_queue or args.socket_path:
@@ -273,6 +281,7 @@ def main():
                             source_dir=cast(Path, common_params["source_dir"]),
                             output_dir=cast(Path, common_params["output_dir"]),
                             comm=comm,
+                            backend=cast(str, common_params["backend"]),
                         )
                     except MemoryError as e:
                         response = ErrorResponse(error_type=ErrorType.OUT_OF_MEMORY, error_message=str(e))

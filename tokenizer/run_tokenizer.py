@@ -3,14 +3,11 @@ import time
 from pathlib import Path
 from typing import cast
 
-import angr
-
 from dynamic_batch.comm import CommunicationInterface, DoneResponse, KeepaliveResponse, PhaseUpdateResponse
 from dynamic_batch.task.tokenizer import TokenizerPhase
 from shared import setup_logger
-from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
 from tokenizer.arch import Platform, get_provider
-from tokenizer.csv_files import parse_and_save_data_sections
+from tokenizer.disasm import DisassemblyProvider, get_disassembly_provider
 from tokenizer.hash_checked_pickles import (
     has_valid_pickle,
     save_pickle,
@@ -27,7 +24,7 @@ def disassemble_to_tokens(
     out_folder: Path,
     binary_name: str,
     platform: Platform,
-    cfg: angr.analyses.cfg.cfg_fast.CFGFast,
+    provider: DisassemblyProvider,
     constant_list: dict[str, list[str]],
     csv_path: Path,
     binary_path: Path,
@@ -35,7 +32,7 @@ def disassemble_to_tokens(
     logger: logging.Logger,
     comm: CommunicationInterface,
     with_pickled=False,
-    project=None,
+    do_pickles=True,
     **kwargs,
 ):
     if not with_pickled:
@@ -50,18 +47,8 @@ def disassemble_to_tokens(
         func_addr_range: dict[int, list[dict[str, tuple[str, str]]]] = {}
         func_disas: dict[str, list[dict[str, list[str]]]] = {}
 
-        project = angr.Project(binary_path, auto_load_libs=False) if project is None else project
-        obj = project.loader.main_object
-        text_start: int = 0
-        text_end: int = 0
-
-        for section in obj.sections:
-            if section.name == ".text":
-                text_start = section.vaddr
-                text_size = section.memsize
-                text_end = text_start + text_size
-
-        lookup = AddressMetaDataLookup(binary_path)
+        text_start, text_end = provider.get_text_section_bounds()
+        lookup = provider.create_metadata_lookup()
 
         func_disas_token: dict[str, list[dict[str, list[str]]]] = {}
 
@@ -69,7 +56,7 @@ def disassemble_to_tokens(
 
         kwargs = dict(
             block_runlength_dict=block_runlength_dict,
-            cfg=cfg,
+            provider=provider,
             constant_list=constant_list,
             func_addr_range=func_addr_range,
             func_disas=func_disas,
@@ -84,11 +71,11 @@ def disassemble_to_tokens(
             text_start=text_start,
         )
 
-        if DO_PICKLES:
+        if do_pickles:
             save_pickle(pickle_mainloop_file_path, kwargs)
 
     else:
-        kwargs.update(dict(cfg=cfg, constant_list=constant_list))
+        kwargs.update(dict(provider=provider, constant_list=constant_list))
         func_names = kwargs["func_names"]
 
     vocab_manager = VocabularyManager(platform)
@@ -113,6 +100,7 @@ def run_tokenizer(
     source_dir: Path,
     output_dir: Path,
     comm: CommunicationInterface,
+    backend: str = "angr",
 ):
     logger, warning_handler = setup_logger("tokenizer")
     logger.info("STARTING DISASSEMBLY")
@@ -173,8 +161,9 @@ def run_tokenizer(
     with_pickled = False
     kvargs: dict | None = None
     start_time = time.time()
+    do_pickles = DO_PICKLES and backend == "angr"
 
-    if DO_PICKLES:
+    if do_pickles:
         if has_valid_pickle(pickle_mainloop_file_path):
             logger.info("loading existing mainloop pickle to speed up")
             comm.send_response(PhaseUpdateResponse(phase_name=TokenizerPhase.ANGR_2.value))
@@ -191,14 +180,14 @@ def run_tokenizer(
                 logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
 
     if kvargs is None:
-        project: angr.Project = angr.Project(file_path, auto_load_libs=False)
-        constants: dict[str, list[str]] = parse_and_save_data_sections(project, output_csv_path=str(csv_path))
-        cfg: angr.analyses.cfg.cfg_fast.CFGFast = project.analyses.CFGFast(normalize=True)
+        provider = get_disassembly_provider(backend, file_path)
+        constants: dict[str, list[str]] = provider.parse_data_sections(output_csv_path=str(csv_path))
+        provider.build_cfg()
 
-        kvargs = dict(project=project, cfg=cfg, constant_list=constants)
+        kvargs = dict(provider=provider, constant_list=constants)
         logger.info(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
         start_time = time.time()
-        if DO_PICKLES:
+        if do_pickles:
             save_pickle(pickle_file_path, kvargs)
             logger.info(f"Pickle (prep only) saving time: {time.time() - start_time:.2f} seconds")
 
@@ -208,6 +197,7 @@ def run_tokenizer(
         kvargs.update(
             dict(
                 with_pickled=with_pickled,
+                do_pickles=do_pickles,
                 out_folder=out_folder,
                 binary_name=binary_name,
                 platform=platform,

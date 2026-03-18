@@ -1,11 +1,10 @@
-from typing import Optional
+from typing import Any, Optional
 
-import angr
 import numpy as np
 
-from tokenizer.address_meta_data_lookup import AddressMetaDataLookup
 from tokenizer.arch.provider import ArchitectureProvider
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm import MetadataLookup
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.instruction_sets import InstructionSets
 from tokenizer.token_lists import BlockTokenList
@@ -17,10 +16,10 @@ VERIFICATION: bool = False
 
 def fill_constant_candidates(
     func_addr: int,
-    func: angr.knowledge_plugins.functions.function.Function,
+    func: Any,
     instr_sets: InstructionSets,
     constant_dict: dict[str, list[str]],
-    lookup: AddressMetaDataLookup,
+    lookup: MetadataLookup,
     text_start: int,
     text_end: int,
     resolver: TokenResolver,
