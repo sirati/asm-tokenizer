@@ -41,7 +41,7 @@ def build_vocab_tokenize_and_index(
 
 def main_loop(
     instr_sets,
-    cfg,
+    provider,
     constant_list,
     func_addr_range,
     func_disas,
@@ -63,7 +63,7 @@ def main_loop(
 
     filter = FunctionFilter(logger)
 
-    total_functions = len(cfg.functions.items())
+    total_functions = provider.function_count()
     function_manager = FunctionDataManager(total_functions) if VERIFICATION else FunctionDataManager(0)
 
     exceptions = []
@@ -95,18 +95,15 @@ def main_loop(
 
         try:
             pbar = tqdm(
-                iterable=sorted(cfg.functions.items(), key=lambda item: item[1].name),
+                iterable=provider.iter_functions(),
+                total=total_functions,
                 desc="Retrieving data from alllll functions. Like a big boy.",
             )
-            for i, (func_addr, func) in enumerate(pbar):
+            for i, (func_addr, func_name, func) in enumerate(pbar):
                 current_time = time.time()
                 if (current_time - last_keepalive_time) >= 0.2:
                     comm.send_response(KeepaliveResponse())
                     last_keepalive_time = current_time
-
-                func_name = cfg.functions[func_addr].name
-                if func_name in ["UnresolvableCallTarget", "UnresolvableJumpTarget"]:
-                    continue
 
                 resolver.reset()
 

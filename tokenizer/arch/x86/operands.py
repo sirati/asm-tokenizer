@@ -73,13 +73,13 @@ def tokenize_operand_memory(
 
     # Register the base and index registers
     if has_reg:
-        tokens.append(vocab_manager.get_registry_token(insn, base))
+        tokens.append(vocab_manager.get_registry_token(insn.reg_name(base), base))
 
     if has_index:
         if has_reg:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
 
-        tokens.append(vocab_manager.get_registry_token(insn, index))
+        tokens.append(vocab_manager.get_registry_token(insn.reg_name(index), index))
 
     # Process scale as a constant if in expected range
     if scale != 1:

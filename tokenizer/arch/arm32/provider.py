@@ -93,7 +93,7 @@ class ARM32Provider(ArchitectureProvider):
         if hasattr(insn, "operands"):
             for op in insn.operands:
                 if op.type == _ARM_OP_REG:
-                    token = vocab_manager.get_registry_token(insn, op.reg)
+                    token = vocab_manager.get_registry_token(insn.reg_name(op.reg), op.reg)
                     insn_tokens.append(token)
                     # Shifted register operand
                     shift_tokens = tokenize_operand_shift(insn, op, vocab_manager)
