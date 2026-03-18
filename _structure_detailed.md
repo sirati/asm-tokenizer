@@ -8,36 +8,1391 @@ The tree is placed inside a fenced code block for ease of copying.
 ```
 asm-tokenizer/
     dynamic_batch/
+        comm/
+            interface/
+                __init__.py
+                    (no top-level functions or classes)
+                base_interface.py
+                    # class
+                    class CommunicationInterface(ABC)
+                        # methods
+                        def send_command(self, command: Command) -> tuple[bool, str | None] [abstractmethod]
+                        def send_response(self, response: Response) -> tuple[bool, str | None] [abstractmethod]
+                        def receive_command(self, blocking: bool = True) -> Command | None [abstractmethod]
+                        def receive_responses(self) -> list[Response] [abstractmethod]
+                        def close(self) -> None [abstractmethod]
+                        def set_blocking(self, blocking: bool) -> None [abstractmethod]
+                named_socket.py
+                    # class
+                    class NamedSocketInterface(CommunicationInterface)
+                        # instance attributes (inferred from __init__)
+                        socket_path = Path(socket_path)
+                        is_server = is_server
+                        socket: socket.socket | None = None
+                        connection: socket.socket | None = None
+                        socket_file = None
+                        # methods
+                        def __init__(self, socket_path: str | Path, is_server: bool = True)
+                        def _setup_server(self) -> None
+                        def _setup_client(self) -> None
+                        def accept_connection(self) -> bool
+                        def send_command(self, command: Command) -> tuple[bool, str | None]
+                        def send_response(self, response: Response) -> tuple[bool, str | None]
+                        def receive_command(self, blocking: bool = True) -> Command | None
+                        def receive_responses(self) -> list[Response]
+                        def close(self) -> None
+                        def set_blocking(self, blocking: bool) -> None
+                noop.py
+                    # class
+                    class NoopInterface(CommunicationInterface)
+                        # methods
+                        def send_command(self, command: Command) -> tuple[bool, str | None]
+                        def send_response(self, response: Response) -> tuple[bool, str | None]
+                        def receive_command(self, blocking: bool = True) -> Command | None
+                        def receive_responses(self) -> list[Response]
+                        def close(self) -> None
+                        def set_blocking(self, blocking: bool) -> None
+                unix_socket.py
+                    # class
+                    class UnixSocketInterface(CommunicationInterface)
+                        # instance attributes (inferred from __init__)
+                        socket = sock
+                        socket_file = None
+                        # methods
+                        def __init__(self, sock: socket.socket)
+                        def send_command(self, command: Command) -> tuple[bool, str | None]
+                        def send_response(self, response: Response) -> tuple[bool, str | None]
+                        def receive_command(self, blocking: bool = True) -> Command | None
+                        def receive_responses(self) -> list[Response]
+                        def close(self) -> None
+                        def set_blocking(self, blocking: bool) -> None
+            proto/
+                __init__.py
+                    (no top-level functions or classes)
+                messages.py
+                    # functions
+                    def parse_command(data: str) -> Command | None
+                    def parse_response(data: str) -> Response | None
+                    # class
+                    class ErrorType(Enum)
+                        # class attributes
+                        OUT_OF_MEMORY = 'oom'
+                        NON_RECOVERABLE = 'non_recoverable'
+                        RECOVERABLE = 'recoverable'
+                    # class
+                    class Command [dataclass]
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class StopCommand(Command) [dataclass]
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class ProcessBinaryCommand(Command) [dataclass]
+                        # class attributes
+                        relative_path: str
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class Response [dataclass]
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class DoneResponse(Response) [dataclass]
+                        # class attributes
+                        warnings: int = 0
+                        filtered: int = 0
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class ErrorResponse(Response) [dataclass]
+                        # class attributes
+                        error_type: ErrorType
+                        error_message: str
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class PickledErrorResponse(Response) [dataclass]
+                        # class attributes
+                        exception_type: str
+                        exception_message: str
+                        traceback_str: str
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class PhaseUpdateResponse(Response) [dataclass]
+                        # class attributes
+                        phase_name: str
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class KeepaliveResponse(Response) [dataclass]
+                        # methods
+                        def serialize(self) -> bytes
+                    # class
+                    class ReadyResponse(Response) [dataclass]
+                        # methods
+                        def serialize(self) -> bytes
+            __init__.py
+                (no top-level functions or classes)
+        gateway/
+            __init__.py
+                # functions
+                def parse_gateway_url(url: str) -> GatewayConfig
+                def create_gateway(config: GatewayConfig) -> Gateway
+                # class
+                class GatewayConfig [dataclass]
+                    # class attributes
+                    mode: str
+                    ssh_host: str | None = None
+                    ssh_port: int | None = None
+                    ssh_user: str | None = None
+                # class
+                class Gateway(Protocol)
+                    # methods
+                    def connect(self) -> None
+                    def disconnect(self) -> None
+                    def execute_command(self, command: str, cwd: Path | None = None) -> tuple[int, str, str]
+                    def transfer_file(self, local_path: Path, remote_path: Path) -> None
+                    def upload_file(self, local_path: str | Path, remote_path: str | Path) -> None
+                    def download_file(self, remote_path: str | Path, local_path: str | Path) -> None
+                    def create_directory(self, remote_path: Path | str) -> None
+                    def file_exists(self, remote_path: Path) -> bool
+                    def sync_project(self, local_project_root: Path, remote_project_root: Path) -> None
+                    def setup_port_forwarding(self, local_port: int, remote_port: int) -> None
+            local_gateway.py
+                # class
+                class LocalGateway
+                    # instance attributes (inferred from __init__)
+                    connected = False
+                    remote_home = Path.home()
+                    # methods
+                    def __init__(self)
+                    def connect(self) -> None
+                    def disconnect(self) -> None
+                    def execute_command(self, command: str, cwd: Path | None = None) -> tuple[int, str, str]
+                    def transfer_file(self, local_path: Path, remote_path: Path) -> None
+                    def upload_file(self, local_path: str | Path, remote_path: str | Path) -> None
+                    def download_file(self, remote_path: str | Path, local_path: str | Path) -> None
+                    def create_directory(self, remote_path: Path | str) -> None
+                    def file_exists(self, remote_path: Path) -> bool
+                    def sync_project(self, local_project_root: Path, remote_project_root: Path) -> None
+                    def setup_port_forwarding(self, local_port: int, remote_port: int) -> None
+            ssh_gateway.py
+                # class
+                class SSHGateway
+                    # instance attributes (inferred from __init__)
+                    host = host
+                    port = port
+                    user = user
+                    connected = False
+                    remote_home = None
+                    control_path = None
+                    control_dir = None
+                    forwarded_ports: list[tuple[int, int]] = []
+                    gateway_ports_enabled = None
+                    # methods
+                    def __init__(self, host: str, port: int, user: str | None)
+                    def connect(self) -> None
+                    def disconnect(self) -> None
+                    def _check_gateway_ports(self) -> None
+                    def _build_ssh_base_command(self) -> list[str]
+                    def _build_ssh_command(self, remote_command: str) -> list[str]
+                    def _execute_ssh_command(self, command: str, cwd: str | None = None) -> tuple[int, str, str]
+                    def execute_command(self, command: str, cwd: str | None = None) -> tuple[int, str, str]
+                    def transfer_file(self, local_path: Path, remote_path: Path | str) -> None
+                    def upload_file(self, local_path: str | Path, remote_path: str | Path) -> None
+                    def download_file(self, remote_path: str | Path, local_path: str | Path) -> None
+                    def create_directory(self, remote_path: Path | str) -> None
+                    def file_exists(self, remote_path: Path | str) -> bool
+                    def sync_project(self, local_project_root: Path, remote_project_root: Path | str) -> None
+                    def setup_port_forwarding(self, local_port: int, remote_port: int) -> None
+        multi_computer/
+            primary/
+                __init__.py
+                    (no top-level functions or classes)
+                coordinator.py
+                    # class
+                    class BaseCoordinator
+                        # instance attributes (inferred from __init__)
+                        binaries = binaries
+                        task_definition = task_definition
+                        task_args = task_args
+                        run_id = run_id
+                        source_dir = source_dir
+                        cert_dir = Path.cwd() / 'run' / run_id / 'certificates'
+                        secondaries: dict[str, dict[str, Any]] = {}
+                        worker_managers: dict[str, ActualAuthoritativeWorkerManager] = {}
+                        remote_workers: dict[str, list[RemoteWorker]] = {}
+                        task_assignments: dict[str, str] = {}
+                        completed_tasks: set[str] = set()
+                        failed_tasks: set[str] = set()
+                        discovered_binaries: dict[str, dict[str, Any]] = {}
+                        peer_connections_ready: set[str] = set()
+                        primary_entropy = secrets.token_bytes(32)
+                        peer_info: list[dict[str, Any]] = []
+                        running = True
+                        transfer_complete = False
+                        slurm_primary_id: str | None = None
+                        message_router = MessageRouter('primary', 'primary')
+                        quic_transport: QuicTransport | None = None
+                        primary_quic_port = 0
+                        active_connections: dict[str, Any] = {}
+                        # methods
+                        def __init__(self, binaries: list[BinaryInfo], task_definition: TaskDefinition, task_args: Any, run_id: str = 'default', source_dir: Path | None = None)
+                        def run(self, num_secondaries: int, quic_port: int = 5000) -> None
+                        async def _run_async(self, num_secondaries: int, quic_port: int) -> None
+                        async def _setup_quic_transport(self) -> None
+                        async def prepare(self, num_secondaries: int, quic_port: int) -> PreparationResult
+                        async def connect(self, prep_result: PreparationResult) -> ConnectionResult
+                        async def transfer_files(self, conn_result: ConnectionResult) -> None
+                        def get_file_transfer_mode(self) -> FileTransferMode
+                        async def _wait_for_secondaries(self, num_secondaries: int) -> None
+                        async def _handle_secondary_welcome(self, message: dict[str, Any], connection: Any) -> None
+                        async def _handle_cert_exchange(self, message: dict[str, Any], connection: Any) -> None
+                        async def _handle_secondary_error(self, message: dict[str, Any], connection: Any) -> None
+                        async def _handle_secondary_log(self, message: dict[str, Any], connection: Any) -> None
+                        async def _exchange_certificates(self) -> None
+                        async def _wait_for_peer_connections(self) -> None
+                        async def _handle_peer_connections_ready(self, message: dict[str, Any], connection: Any) -> None
+                        async def _initial_assignment_phase(self, conn_result: ConnectionResult) -> None
+                        async def _wait_for_workers(self) -> None
+                        async def _handle_worker_ready(self, message: dict[str, Any], connection: Any) -> None
+                        async def _preliminary_assignment(self) -> None
+                        async def _source_discovery(self) -> None
+                        async def _handle_source_discovered(self, message: dict[str, Any], connection: Any) -> None
+                        async def _notify_transfer_complete(self) -> None
+                        async def _promote_primary(self) -> None
+                        async def _send_full_task_list(self) -> None
+                        async def _monitor_mode(self) -> None
+                        async def _cleanup(self) -> None
+                        async def _send_to_secondary(self, secondary_id: str, message: dict[str, Any]) -> None
+                        def _compute_task_hash(self, binary: BinaryInfo) -> str
+                        async def _handle_task_complete(self, message: dict[str, Any], connection: Any) -> None
+                        async def _handle_task_failed(self, message: dict[str, Any], connection: Any) -> None
+                        async def _handle_task_request(self, message: dict[str, Any], connection: Any) -> None
+                file_utils.py
+                    # functions
+                    def compute_file_hash(file_path: Path) -> str
+                    def compute_task_hash(binary: BinaryInfo) -> str
+                    async def send_initial_assignment_file_ready(secondary_id: str, file_ready_list: list[dict[str, Any]], worker_assignments: list[dict[str, Any]], secondary_info: dict[str, Any], message_router: Any, quic_transport: Any) -> None
+                    async def send_initial_assignment_zip(secondary_id: str, zip_files_info: list[dict[str, Any]], worker_assignments: list[dict[str, Any]], secondary_info: dict[str, Any], message_router: Any, quic_transport: Any) -> None
+            secondary/
+                __init__.py
+                    (no top-level functions or classes)
+                connection.py
+                    # class
+                    class ConnectionManager
+                        # instance attributes (inferred from __init__)
+                        coordinator = coordinator
+                        peer_list_received = asyncio.Event()
+                        # methods
+                        def __init__(self, coordinator: 'SecondaryCoordinator')
+                        async def connect_to_primary(self) -> None
+                        async def send_welcome(self) -> None
+                        async def send_error_to_primary(self, error: Exception) -> None
+                        async def _monitor_primary_connection_wss(self, websocket) -> None
+                        async def send_cert_exchange(self) -> None
+                        async def handle_peer_list(self, message: dict[str, Any], sender_id: str | None) -> None
+                        async def connect_to_peers(self) -> None
+                        async def _send_peer_connections_ready(self) -> None
+                coordinator.py
+                    # class
+                    class SecondaryCoordinator
+                        # instance attributes (inferred from __init__)
+                        primary_url = primary_url
+                        secondary_id = secondary_id
+                        num_workers = num_workers
+                        ram_bytes = ram_bytes
+                        src_tmp = src_tmp
+                        out_tmp = out_tmp
+                        log_tmp = log_tmp
+                        src_network = src_network
+                        out_network = out_network
+                        log_network = log_network
+                        socket_dir = socket_dir
+                        task_definition = task_definition
+                        task_args = task_args
+                        skip_existing = skip_existing
+                        worker_manager: ActualSubmissiveWorkerManager | None = None
+                        authoritative_manager: ActualAuthoritativeWorkerManager | None = None
+                        extracted_binaries: dict[str, Path] = {}
+                        completed_tasks: set[str] = set()
+                        failed_tasks: set[str] = set()
+                        all_tasks: list[Any] = []
+                        pending_worker_assignments: list[dict[str, Any]] = []
+                        is_slurm_primary = False
+                        slurm_primary_id: str | None = None
+                        transfer_complete = False
+                        last_keepalives: dict[str, float] = {}
+                        running = True
+                        setup_complete = False
+                        connection_closing = False
+                        message_router = MessageRouter(secondary_id, 'secondary')
+                        quic_transport = QuicTransport(secondary_id, listen_port=quic_port)
+                        primary_websocket = None
+                        connection_manager = ConnectionManager(self)
+                        worker_mgr = WorkerManager(self)
+                        task_handler = TaskHandler(self)
+                        # methods
+                        def __init__(self, primary_url: str, secondary_id: str, num_workers: int, ram_bytes: int, src_tmp: Path, out_tmp: Path, log_tmp: Path, src_network: Path, out_network: Path, log_network: Path, socket_dir: Path, task_definition: Any, task_args: Any, skip_existing: bool = False, quic_port: int = 0)
+                        def run(self) -> None
+                        async def _run_async(self) -> None
+                        async def _main_loop(self) -> None
+                        async def send_to_primary_ws(self, message: dict[str, Any]) -> None
+                        async def _cleanup(self) -> None
+                logging_handler.py
+                    # class
+                    class PrimaryLogHandler(logging.Handler)
+                        # instance attributes (inferred from __init__)
+                        secondary_coordinator = secondary_coordinator
+                        _in_emit = False
+                        # methods
+                        def __init__(self, secondary_coordinator: 'SecondaryCoordinator')
+                        def emit(self, record: logging.LogRecord) -> None
+                task_handling.py
+                    # class
+                    class TaskHandler
+                        # instance attributes (inferred from __init__)
+                        coordinator = coordinator
+                        # methods
+                        def __init__(self, coordinator: 'SecondaryCoordinator')
+                        def compute_file_hash(self, path: Path) -> str
+                        def extract_binary_from_zip(self, zip_name: str, local_path: str, file_hash: str) -> Path | None
+                        def get_file_by_hash(self, file_hash: str, file_path: str | None = None) -> Path | None
+                        async def handle_initial_assignment(self, message: dict[str, Any], sender_id: str | None) -> None
+                        async def handle_task_assignment(self, message: dict[str, Any], sender_id: str | None) -> None
+                        async def notify_task_complete(self, worker_id: int, task_hash: str) -> None
+                        async def handle_discover_sources(self, message: dict[str, Any], sender_id: str | None) -> None
+                        async def handle_transfer_complete(self, message: dict[str, Any], sender_id: str | None) -> None
+                        async def process_initial_worker_assignments(self) -> None
+                        async def handle_promote_primary(self, message: dict[str, Any], sender_id: str | None) -> None
+                        async def handle_full_task_list(self, message: dict[str, Any], sender_id: str | None) -> None
+                        def _create_authoritative_manager(self) -> None
+                        def _populate_authoritative_manager_tasks(self, all_tasks: list[dict[str, Any]], completed_tasks: set[str]) -> None
+                        def handle_task_request(self, worker_id: int) -> None
+                worker_management.py
+                    # class
+                    class WorkerManager
+                        # instance attributes (inferred from __init__)
+                        coordinator = coordinator
+                        # methods
+                        def __init__(self, coordinator: 'SecondaryCoordinator')
+                        async def start_workers(self) -> None
+                        def _request_task_callback(self, worker_id: int) -> None
+                        async def _send_worker_ready(self, worker_id: int, memory_budget: int) -> None
+                        async def _request_new_task(self, worker_id: int) -> None
+                        def process_worker_updates(self) -> None
+                        async def send_keepalive(self) -> None
+                        def check_peer_timeouts(self) -> None
+                        def _handle_timeout(self, peer_id: str) -> None
+            test_network/
+                primary/
+                    __init__.py
+                        (no top-level functions or classes)
+                    coordinator.py
+                        # class
+                        class LocalTestPrimaryCoordinator(BaseCoordinator)
+                            # instance attributes (inferred from __init__)
+                            num_workers_per_secondary = num_workers_per_secondary
+                            secondary_processes: list[subprocess.Popen] = []
+                            raw_logs = raw_logs
+                            # methods
+                            def __init__(self, binaries: list[BinaryInfo], task_definition: TaskDefinition, task_args: Any, run_id: str = 'default', source_dir: Path | None = None, num_workers_per_secondary: int = 2, raw_logs: bool = False)
+                            async def prepare(self, num_secondaries: int, quic_port: int) -> PreparationResult
+                            async def transfer_files(self, conn_result: ConnectionResult) -> None
+                            def get_file_transfer_mode(self) -> FileTransferMode
+                            async def _cleanup(self) -> None
+                __init__.py
+                    (no top-level functions or classes)
+            test_single_process/
+                primary/
+                    __init__.py
+                        (no top-level functions or classes)
+                    coordinator.py
+                        # class
+                        class SingleProcessPrimaryCoordinator(BaseCoordinator)
+                            # instance attributes (inferred from __init__)
+                            output_dir = output_dir or Path.cwd() / 'out'
+                            num_workers_per_secondary = num_workers_per_secondary
+                            secondary_tasks: list[asyncio.Task] = []
+                            to_secondary_queues: dict[str, asyncio.Queue] = {}
+                            from_secondary_queues: dict[str, asyncio.Queue] = {}
+                            submissive_managers: list[ActualSubmissiveWorkerManager] = []
+                            authoritative_manager: ActualAuthoritativeWorkerManager | None = None
+                            promoted_secondary_id: str | None = None
+                            # methods
+                            def __init__(self, binaries: list[BinaryInfo], task_definition: TaskDefinition, task_args: Any, run_id: str = 'default', source_dir: Path | None = None, output_dir: Path | None = None, num_workers_per_secondary: int = 2)
+                            async def prepare(self, num_secondaries: int, quic_port: int) -> PreparationResult
+                            async def connect(self, prep_result: PreparationResult) -> ConnectionResult
+                            async def transfer_files(self, conn_result: ConnectionResult) -> None
+                            def get_file_transfer_mode(self) -> FileTransferMode
+                            async def _preliminary_assignment(self) -> None
+                            async def _wait_for_workers(self) -> None
+                            async def _monitor_mode(self) -> None
+                            async def _cleanup(self) -> None
+                            def _get_submissive_for_secondary(self, secondary_id: str) -> ActualSubmissiveWorkerManager | None
+                            def _get_base_worker_id_for_secondary(self, secondary_id: str) -> int
+                            def _get_global_worker_id(self, secondary_id: str, local_worker_id: int) -> int
+                __init__.py
+                    (no top-level functions or classes)
+            __init__.py
+                # class
+                class ExecutionMode(Enum)
+                    # class attributes
+                    SLURM = 'slurm'
+                    LOCAL = 'local'
+                # class
+                class CoordinationPhase(Enum)
+                    # class attributes
+                    PREPARATION = auto()
+                    CONNECTION = auto()
+                    INITIAL_ASSIGNMENT = auto()
+                    FILE_TRANSFER = auto()
+                    EXECUTION = auto()
+                    MONITORING = auto()
+                    CLEANUP = auto()
+                # class
+                class PreparationResult
+                    # instance attributes (inferred from __init__)
+                    num_secondaries = num_secondaries
+                    run_id = run_id
+                    cert_dir = cert_dir
+                    primary_entropy = primary_entropy
+                    mode_specific_data = mode_specific_data or {}
+                    # methods
+                    def __init__(self, num_secondaries: int, run_id: str, cert_dir: Path, primary_entropy: bytes, mode_specific_data: dict[str, Any] | None = None)
+                # class
+                class ConnectionResult
+                    # instance attributes (inferred from __init__)
+                    secondaries = secondaries
+                    peer_connections_ready = peer_connections_ready
+                    # methods
+                    def __init__(self, secondaries: dict[str, dict[str, Any]], peer_connections_ready: set[str])
+                # class
+                class FileTransferMode(Enum)
+                    # class attributes
+                    FULL_TRANSFER = auto()
+                    SKIP_TRANSFER = auto()
+            file_distribution.py
+                # class
+                class FileDistributor
+                    # instance attributes (inferred from __init__)
+                    srcbins_dir = Path(srcbins_dir)
+                    discovered_hashes: dict[str, tuple[str, str]] = {}
+                    sent_hashes: set[str] = set()
+                    # methods
+                    def __init__(self, srcbins_dir: Path)
+                    def register_discovered_binary(self, hash_str: str, zip_name: str, local_path: str) -> None
+                    def compute_binary_hash(self, binary_path: Path) -> str
+                    def is_already_sent(self, binary_path: Path) -> tuple[bool, str | None]
+                    def create_distribution_zip(self, binaries: list[BinaryInfo], secondary_id: str, base_dir: Path) -> tuple[Path, dict[str, tuple[str, bool]]]
+                    def create_batched_zips(self, binaries: list[BinaryInfo], secondary_id: str, base_dir: Path, min_batch_size_mb: float = 20.0) -> list[tuple[Path, list[BinaryInfo]]]
+                    def _create_zip_from_batch(self, batch: list[tuple[BinaryInfo, Path]], secondary_id: str, batch_num: int) -> Path
+                    def extract_binaries_from_zip(self, zip_path: Path, extract_dir: Path, file_list: list[str] | None = None) -> list[Path]
+                    def scan_srcbins_for_hashes(self, srcbins_dir: Path) -> dict[str, tuple[str, str, str]]
+            message_router.py
+                # class
+                class MessageRouter
+                    # instance attributes (inferred from __init__)
+                    node_id = node_id
+                    node_type = node_type
+                    handlers: dict[str, Callable] = {}
+                    pending_responses: dict[str, asyncio.Future] = {}
+                    primary_connection = None
+                    secondary_connections: dict[str, Any] = {}
+                    running = False
+                    # methods
+                    def __init__(self, node_id: str, node_type: str)
+                    def register_handler(self, message_type: str, handler: Callable) -> None
+                    async def handle_message(self, message_dict: dict[str, Any], sender_id: str | None = None) -> dict[str, Any] | None
+                    async def send_to_primary(self, message: dict[str, Any]) -> None
+                    async def send_to_secondary(self, secondary_id: str, message: dict[str, Any]) -> None
+                    async def broadcast_to_secondaries(self, message: dict[str, Any], exclude: set[str] | None = None) -> None
+                    async def request_from_primary(self, message: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]
+                    async def request_from_secondary(self, secondary_id: str, message: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]
+                    async def _send_message(self, connection: Any, message: dict[str, Any]) -> None
+                    async def receive_loop(self, reader: Any, sender_id: str | None = None) -> None
+                    def stop(self) -> None
+                    def set_primary_connection(self, connection: Any) -> None
+                    def add_secondary_connection(self, secondary_id: str, connection: Any) -> None
+                    def remove_secondary_connection(self, secondary_id: str) -> None
+            protocol.py
+                # class
+                class MessageType(Enum)
+                    # class attributes
+                    SECONDARY_WELCOME = 'secondary_welcome'
+                    ENTROPY = 'entropy'
+                    CERT_EXCHANGE = 'cert_exchange'
+                    PEER_INFO = 'peer_info'
+                    INITIAL_ASSIGNMENT = 'initial_assignment'
+                    TASK_REQUEST = 'task_request'
+                    TASK_ASSIGNMENT = 'task_assignment'
+                    TRANSFER_COMPLETE = 'transfer_complete'
+                    PROMOTE_PRIMARY = 'promote_primary'
+                    FULL_TASK_LIST = 'full_task_list'
+                    TASK_COMPLETE = 'task_complete'
+                    TASK_FAILED = 'task_failed'
+                    KEEPALIVE = 'keepalive'
+                    TIMEOUT_DETECTED = 'timeout_detected'
+                    TIMEOUT_QUERY = 'timeout_query'
+                    TIMEOUT_RESPONSE = 'timeout_response'
+                    PROMOTION_VOTE = 'promotion_vote'
+                    PROMOTION_CONFIRM = 'promotion_confirm'
+                    EXECUTE_COMMAND = 'execute_command'
+                    COMMAND_RESULT = 'command_result'
+                # class
+                class Message [dataclass]
+                    # class attributes
+                    msg_type: MessageType
+                    sender_id: str
+                    timestamp: float
+                    # methods
+                    def to_json(self) -> str
+                    def from_json(cls, data: str) -> 'Message' [classmethod]
+                # class
+                class SecondaryWelcomeMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    ram_bytes: int
+                    worker_count: int
+                    hostname: str
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    ram_bytes = ram_bytes
+                    worker_count = worker_count
+                    hostname = hostname
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, ram_bytes: int, worker_count: int, hostname: str)
+                # class
+                class EntropyMessage(Message) [dataclass]
+                    # class attributes
+                    entropy_hex: str
+                    # instance attributes (inferred from __init__)
+                    entropy_hex = entropy_hex
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, entropy_hex: str)
+                # class
+                class CertExchangeMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    public_cert_pem: str
+                    ipv4_address: str | None
+                    ipv6_address: str | None
+                    quic_port: int
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    public_cert_pem = public_cert_pem
+                    ipv4_address = ipv4_address
+                    ipv6_address = ipv6_address
+                    quic_port = quic_port
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, public_cert_pem: str, ipv4_address: str | None, ipv6_address: str | None, quic_port: int)
+                # class
+                class PeerInfoMessage(Message) [dataclass]
+                    # class attributes
+                    peers: list[dict[str, Any]]
+                    # instance attributes (inferred from __init__)
+                    peers = peers
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, peers: list[dict[str, Any]])
+                # class
+                class WorkerReadyInfo [dataclass]
+                    # class attributes
+                    worker_id: int
+                    memory_budget: int
+                # class
+                class InitialAssignmentMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    zip_files: list[dict[str, Any]]
+                    workers_ready: list[WorkerReadyInfo]
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    zip_files = zip_files
+                    workers_ready = [WorkerReadyInfo(**w) for w in workers_ready]
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, zip_files: list[dict[str, Any]], workers_ready: list[dict[str, Any]])
+                # class
+                class TaskRequestMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    worker_id: int
+                    available_memory: int
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    worker_id = worker_id
+                    available_memory = available_memory
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, worker_id: int, available_memory: int)
+                # class
+                class TaskAssignmentMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    worker_id: int
+                    zip_file: str | None
+                    binary_info: dict[str, Any]
+                    local_path: str
+                    file_hash: str
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    worker_id = worker_id
+                    zip_file = zip_file
+                    binary_info = binary_info
+                    local_path = local_path
+                    file_hash = file_hash
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, worker_id: int, zip_file: str | None, binary_info: dict[str, Any], local_path: str, file_hash: str)
+                # class
+                class TransferCompleteMessage(Message) [dataclass]
+                    # class attributes
+                    total_files: int
+                    total_bytes: int
+                    # instance attributes (inferred from __init__)
+                    total_files = total_files
+                    total_bytes = total_bytes
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, total_files: int, total_bytes: int)
+                # class
+                class PromotePrimaryMessage(Message) [dataclass]
+                    # class attributes
+                    new_primary_id: str
+                    # instance attributes (inferred from __init__)
+                    new_primary_id = new_primary_id
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, new_primary_id: str)
+                # class
+                class FullTaskListMessage(Message) [dataclass]
+                    # class attributes
+                    all_tasks: list[dict[str, Any]]
+                    completed_tasks: list[str]
+                    # instance attributes (inferred from __init__)
+                    all_tasks = all_tasks
+                    completed_tasks = completed_tasks
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, all_tasks: list[dict[str, Any]], completed_tasks: list[str])
+                # class
+                class TaskCompleteMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    worker_id: int
+                    task_hash: str
+                    warnings: int
+                    filtered: int
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    worker_id = worker_id
+                    task_hash = task_hash
+                    warnings = warnings
+                    filtered = filtered
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, worker_id: int, task_hash: str, warnings: int, filtered: int)
+                # class
+                class TaskFailedMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    worker_id: int
+                    task_hash: str
+                    error_type: str
+                    error_message: str
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    worker_id = worker_id
+                    task_hash = task_hash
+                    error_type = error_type
+                    error_message = error_message
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, worker_id: int, task_hash: str, error_type: str, error_message: str)
+                # class
+                class KeepaliveMessage(Message) [dataclass]
+                    # class attributes
+                    secondary_id: str
+                    active_workers: int
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    active_workers = active_workers
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, secondary_id: str, active_workers: int)
+                # class
+                class TimeoutDetectedMessage(Message) [dataclass]
+                    # class attributes
+                    timed_out_secondary_id: str
+                    last_seen: float
+                    # instance attributes (inferred from __init__)
+                    timed_out_secondary_id = timed_out_secondary_id
+                    last_seen = last_seen
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, timed_out_secondary_id: str, last_seen: float)
+                # class
+                class TimeoutQueryMessage(Message) [dataclass]
+                    # class attributes
+                    query_secondary_id: str
+                    # instance attributes (inferred from __init__)
+                    query_secondary_id = query_secondary_id
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, query_secondary_id: str)
+                # class
+                class TimeoutResponseMessage(Message) [dataclass]
+                    # class attributes
+                    query_secondary_id: str
+                    last_keepalive: float | None
+                    # instance attributes (inferred from __init__)
+                    query_secondary_id = query_secondary_id
+                    last_keepalive = last_keepalive
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, query_secondary_id: str, last_keepalive: float | None)
+                # class
+                class PromotionVoteMessage(Message) [dataclass]
+                    # class attributes
+                    candidate_id: str
+                    vote_round: int
+                    # instance attributes (inferred from __init__)
+                    candidate_id = candidate_id
+                    vote_round = vote_round
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, candidate_id: str, vote_round: int)
+                # class
+                class PromotionConfirmMessage(Message) [dataclass]
+                    # class attributes
+                    new_primary_id: str
+                    vote_round: int
+                    # instance attributes (inferred from __init__)
+                    new_primary_id = new_primary_id
+                    vote_round = vote_round
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, new_primary_id: str, vote_round: int)
+                # class
+                class ExecuteCommandMessage(Message) [dataclass]
+                    # class attributes
+                    command: str
+                    command_id: str
+                    # instance attributes (inferred from __init__)
+                    command = command
+                    command_id = command_id
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, command: str, command_id: str)
+                # class
+                class CommandResultMessage(Message) [dataclass]
+                    # class attributes
+                    command_id: str
+                    return_code: int
+                    stdout: str
+                    stderr: str
+                    # instance attributes (inferred from __init__)
+                    command_id = command_id
+                    return_code = return_code
+                    stdout = stdout
+                    stderr = stderr
+                    # methods
+                    def __init__(self, sender_id: str, timestamp: float, command_id: str, return_code: int, stdout: str, stderr: str)
+            quic_transport.py
+                # class
+                class QuicPeerInfo [dataclass]
+                    # class attributes
+                    peer_id: str
+                    ipv4: str | None
+                    ipv6: str | None
+                    port: int
+                    cert_pem: str
+                    cert_fingerprint: str = ''
+                    use_wss_fallback: bool = False
+                # class
+                class QuicProtocol(QuicConnectionProtocol)
+                    # instance attributes (inferred from __init__)
+                    peer_id = peer_id
+                    transport = transport
+                    stream_id = None
+                    buffer = bytearray()
+                    # methods
+                    def __init__(self, *args, peer_id: str, transport: 'QuicTransport', **kwargs)
+                    def quic_event_received(self, event: QuicEvent) -> None
+                # class
+                class QuicTransport
+                    # instance attributes (inferred from __init__)
+                    peer_id = peer_id
+                    listen_port = listen_port
+                    bind_address = bind_address
+                    cert_path: Path | None = None
+                    key_path: Path | None = None
+                    cert_fingerprint: str | None = None
+                    peers: dict[str, QuicPeerInfo] = {}
+                    connections: dict[str, QuicProtocol] = {}
+                    clients: dict[str, Any] = {}
+                    client_cms: dict[str, Any] = {}
+                    peer_certs: dict[str, Path] = {}
+                    wss_connections: dict[str, websockets.WebSocketServerProtocol | websockets.WebSocketClientProtocol] = {}
+                    wss_server = None
+                    message_handlers: dict[str, Callable] = {}
+                    server = None
+                    running = False
+                    _original_exception_handler = None
+                    _exception_handler_installed = False
+                    # methods
+                    def __init__(self, peer_id: str, listen_port: int, bind_address: str = '0.0.0.0')
+                    async def generate_certificates(self) -> tuple[str, str]
+                    def _compute_cert_fingerprint(self, cert_path: Path) -> str
+                    def get_public_cert(self) -> bytes
+                    def add_peer(self, peer_info: QuicPeerInfo) -> None
+                    async def connect_to_peers(self) -> None
+                    async def _connect_to_peer(self, peer_id: str, peer_info: QuicPeerInfo) -> None
+                    async def _connect_quic(self, peer_id: str, host: str, peer_info: QuicPeerInfo) -> None
+                    async def _connect_wss(self, peer_id: str, host: str, peer_info: QuicPeerInfo) -> None
+                    async def _monitor_quic_connection(self, peer_id: str, client: Any) -> None
+                    async def _receive_wss_messages(self, peer_id: str, websocket) -> None
+                    async def start_server(self) -> None
+                    def _install_exception_handler(self) -> None
+                    async def _start_wss_server(self) -> None
+                    async def _handle_peer_message(self, message: dict[str, Any], protocol: Any) -> None
+                    def register_handler(self, message_type: str, handler: Callable) -> None
+                    async def send_to_peer(self, peer_id: str, message: dict[str, Any]) -> None
+                    async def broadcast_to_peers(self, message: dict[str, Any], exclude: set[str] | None = None) -> None
+                    async def stop(self) -> None
+                    def get_local_addresses(self) -> tuple[str | None, str | None]
+        runtime_env/
+            docker/
+                __init__.py
+                    # functions
+                    def create_packaging_method(config: PackagingConfig) -> PackagingMethod
+                    # class
+                    class PackagingConfig [dataclass]
+                        # class attributes
+                        method: str
+                        build_on_gateway: bool = True
+                    # class
+                    class PackagingMethod
+                        # methods
+                        def build_image(self, gateway, project_root: Path, output_path: Path) -> Path
+                        def get_load_command(self, image_path: Path) -> str
+                        def get_run_command(self, image_name: str, image_tag: str, mounts: dict[str, str], ports: dict[int, int], entrypoint_args: list[str]) -> str
+                docker_packaging.py
+                    # class
+                    class DockerPackaging
+                        # instance attributes (inferred from __init__)
+                        image_name = 'asm-tokenizer'
+                        image_tag = 'latest'
+                        # methods
+                        def __init__(self)
+                        def build_image(self, gateway, local_project_root: Path, output_path: Path) -> Path
+                        def get_load_command(self, image_path: Path, storage_root: str = None, run_root: str = None) -> str
+                        def get_run_command(self, image_name: str, image_tag: str, mounts: dict[str, str], ports: dict[int, int], entrypoint_args: list[str], storage_root: str = None, run_root: str = None) -> str
+                        def get_image_name(self) -> str
+                        def get_image_tag(self) -> str
+            podman/
+                __init__.py
+                    (no top-level functions or classes)
+                podman_packaging.py
+                    # class
+                    class PodmanPackaging
+                        # instance attributes (inferred from __init__)
+                        image_name = 'asm-tokenizer'
+                        image_tag = 'latest'
+                        # methods
+                        def __init__(self)
+                        def build_image(self, gateway, local_project_root: Path, output_path: Path) -> Path
+                        def get_load_command(self, image_path: str, storage_root: str, run_root: str) -> str
+                        def get_run_command(self, image_name: str, image_tag: str, mounts: dict[str, str], ports: dict[int, int], entrypoint_args: list[str], storage_root: str, run_root: str) -> str
+                        def get_images_command(self, storage_root: str, run_root: str) -> str
+                        def get_version_command(self) -> str
+                        def get_image_name(self) -> str
+                        def get_image_tag(self) -> str
+                        def requires_storage_paths(self) -> bool
+            __init__.py
+                # functions
+                def create_packaging_method(config: PackagingConfig)
+                # class
+                class PackagingConfig [dataclass]
+                    # class attributes
+                    method: str
+        slurm/
+            primary/
+                __init__.py
+                    (no top-level functions or classes)
+                coordinator.py
+                    # class
+                    class SlurmPrimaryCoordinator(BaseCoordinator)
+                        # instance attributes (inferred from __init__)
+                        skip_image_build = skip_image_build
+                        gateway = create_gateway(gateway_config)
+                        gateway_config = gateway_config
+                        use_reverse_connection = False
+                        slurm_config = SlurmConfig(root_folder=root_folder, image_subfolder=slurm_config_kwargs.get('image_subfolder', 'image_bin'), output_subfolder=slurm_config_kwargs.get('output_subfolder', 'out'), log_subfolder=slurm_config_kwargs.get('log_subfolder', 'log'), notify_email=slurm_config_kwargs.get('notify_email'))
+                        job_manager = SlurmJobManager(self.gateway, self.slurm_config, packaging)
+                        slurm_preparation = SlurmPreparation(slurm_config=self.slurm_config, job_manager=self.job_manager, gateway=self.gateway, use_reverse_connection=self.use_reverse_connection, run_id=run_id)
+                        slurm_file_transfer = SlurmFileTransfer(slurm_config=self.slurm_config, gateway=self.gateway, source_dir=source_dir)
+                        # methods
+                        def __init__(self, binaries: list[BinaryInfo], gateway_url: str, slurm_root_folder: str, packaging_method: str, task_definition: TaskDefinition, task_args: Any, run_id: str = 'default', source_dir: Path | None = None, skip_image_build: bool = False, slurm_config_kwargs: dict[str, Any] | None = None)
+                        async def prepare(self, num_secondaries: int, quic_port: int) -> PreparationResult
+                        async def _setup_port_forwarding_after_quic(self) -> None
+                        async def _connect_via_ssh_tunnels(self, prep_result: PreparationResult) -> None
+                        async def transfer_files(self, conn_result: ConnectionResult) -> None
+                        def get_file_transfer_mode(self) -> FileTransferMode
+                        async def _cleanup(self) -> None
+                file_transfer.py
+                    # class
+                    class SlurmFileTransfer
+                        # instance attributes (inferred from __init__)
+                        slurm_config = slurm_config
+                        gateway = gateway
+                        source_dir = source_dir
+                        file_distributor = FileDistributor(Path(srcbins_dir))
+                        # methods
+                        def __init__(self, slurm_config: Any, gateway: Any, source_dir: Path)
+                        async def transfer_files(self, binaries: list[BinaryInfo], secondaries: dict[str, dict[str, Any]], task_assignments: dict[str, str], discovered_binaries: dict[str, dict[str, Any]], quic_transport: Any, message_router: Any) -> None
+                        def _create_zip_batches(self, binaries: list[BinaryInfo], min_batch_size_mb: float = 20.0) -> list[tuple[list[BinaryInfo], int]]
+                        async def _create_and_upload_zip(self, zip_path: str, binaries: list[BinaryInfo]) -> dict[str, Any] | None
+                preparation.py
+                    # class
+                    class SlurmPreparation
+                        # instance attributes (inferred from __init__)
+                        slurm_config = slurm_config
+                        job_manager = job_manager
+                        gateway = gateway
+                        use_reverse_connection = use_reverse_connection
+                        run_id = run_id
+                        run_log_dir = f'{base_log_dir}/{run_id}'
+                        secondary_port_map: dict[str, int] = {}
+                        ssh_tunnels: list[subprocess.Popen] = []
+                        # methods
+                        def __init__(self, slurm_config: Any, job_manager: Any, gateway: Any, use_reverse_connection: bool = False, run_id: str = 'default')
+                        async def prepare(self, num_secondaries: int, quic_port: int, primary_quic_port: int, cert_dir: Path, skip_image_build: bool = False) -> PreparationResult
+                        async def _prepare_docker_image(self, skip_image_build: bool) -> str
+                        def _submit_slurm_jobs(self, num_secondaries: int, primary_quic_port: int, image_path: str) -> None
+                        def _determine_gateway_host(self) -> str
+                        async def _setup_ssh_tunnels(self, num_secondaries: int) -> None
+                        def _create_ssh_tunnel(self, secondary_id: str, remote_host: str, remote_port: int, local_port: int) -> None
+                        async def _async_sleep(self, seconds: float) -> None
+                        def cleanup(self) -> None
+            __init__.py
+                # functions
+                def validate_slurm_config(config: SlurmConfig, gateway = None) -> None
+                # class
+                class SlurmConfig [dataclass]
+                    # class attributes
+                    root_folder: str | Path
+                    image_subfolder: str = 'image_bin'
+                    output_subfolder: str = 'out'
+                    log_subfolder: str = 'log'
+                    notify_email: str | None = None
+                    partition: str = 'All'
+                    nodes: int = 1
+                    cpus_per_task: int = 14
+                    memory_per_node: str = '64G'
+                    time_limit: str = '48:00:00'
+                    # methods
+                    def get_image_dir(self) -> str
+                    def get_output_dir(self) -> str
+                    def get_log_dir(self) -> str
+                    def get_srcbins_dir(self) -> str
+            coordinator.py
+                [parse-error] SyntaxError: unterminated string literal (detected at line 302) (coordinator.py, line 302)
+            job_manager.py
+                # class
+                class SlurmJobManager
+                    # instance attributes (inferred from __init__)
+                    gateway = gateway
+                    slurm_config = slurm_config
+                    packaging = packaging_method
+                    job_ids: list[str] = []
+                    # methods
+                    def __init__(self, gateway: Any, slurm_config: Any, packaging_method: Any)
+                    def _expand_path(self, path: str | Path) -> str
+                    def prepare_directories(self) -> None
+                    def build_and_transfer_image(self, local_project_root: Path) -> Path
+                    def generate_wrapper_script(self, image_path: Path, secondary_id: str, gateway_host: str | None, gateway_port: int | None, reverse_connection: bool = False, run_log_dir: str | None = None) -> str
+                    def generate_test_wrapper_script(self, image_path: Path) -> str
+                    def submit_job(self, wrapper_script: str, job_name: str, nodes: int = 1, run_log_dir: str | None = None) -> str
+                    def cancel_job(self, job_id: str) -> None
+                    def cancel_all_jobs(self) -> None
+                    def get_job_status(self, job_id: str) -> dict[str, str]
+            secondary_mode.py
+                # class
+                class PrimaryLogHandler(logging.Handler)
+                    # instance attributes (inferred from __init__)
+                    secondary_mode = secondary_mode
+                    _in_emit = False
+                    # methods
+                    def __init__(self, secondary_mode: 'SecondaryMode')
+                    def emit(self, record: logging.LogRecord) -> None
+                # class
+                class SecondaryMode
+                    # instance attributes (inferred from __init__)
+                    primary_url = primary_url
+                    secondary_id = secondary_id
+                    num_workers = num_workers
+                    ram_bytes = ram_bytes
+                    src_tmp = src_tmp
+                    out_tmp = out_tmp
+                    log_tmp = log_tmp
+                    src_network = src_network
+                    out_network = out_network
+                    log_network = log_network
+                    socket_dir = socket_dir
+                    task_definition = task_definition
+                    task_args = task_args
+                    skip_existing = skip_existing
+                    peers: dict[str, Any] = {}
+                    primary_connection: Any = None
+                    peer_connections: dict[str, Any] = {}
+                    worker_manager: ActualSubmissiveWorkerManager | None = None
+                    extracted_binaries: dict[str, Path] = {}
+                    completed_tasks: set[str] = set()
+                    failed_tasks: set[str] = set()
+                    all_tasks: list[Any] = []
+                    is_slurm_primary = False
+                    slurm_primary_id: str | None = None
+                    transfer_complete = False
+                    last_keepalives: dict[str, float] = {}
+                    pending_worker_assignments: list[dict[str, Any]] = []
+                    running = True
+                    setup_complete = False
+                    peer_list_received = asyncio.Event()
+                    connection_closing = False
+                    message_router = MessageRouter(secondary_id, 'secondary')
+                    quic_transport = QuicTransport(secondary_id, listen_port=quic_port)
+                    primary_host = parsed.hostname or 'localhost'
+                    primary_port = parsed.port or 6000
+                    # methods
+                    def __init__(self, primary_url: str, secondary_id: str, num_workers: int, ram_bytes: int, src_tmp: Path, out_tmp: Path, log_tmp: Path, src_network: Path, out_network: Path, log_network: Path, socket_dir: Path, task_definition: Any, task_args: Any, skip_existing: bool = False, quic_port: int = 0)
+                    def run(self) -> None
+                    async def _run_async(self) -> None
+                    async def _connect_to_primary(self) -> None
+                    async def _send_welcome(self) -> None
+                    async def _send_error_to_primary(self, error: Exception) -> None
+                    async def _monitor_primary_connection(self, reader: asyncio.StreamReader) -> None
+                    async def _setup_certificates(self) -> None
+                    async def _handle_peer_list(self, message: dict[str, Any], sender_id: str | None) -> None
+                    async def _connect_to_peers(self) -> None
+                    async def _send_peer_connections_ready(self) -> None
+                    async def _start_workers(self) -> None
+                    def _request_task_callback(self, worker_id: int) -> None
+                    async def _send_worker_ready(self, worker_id: int, memory_budget: int) -> None
+                    async def _main_loop(self) -> None
+                    async def _send_keepalive(self) -> None
+                    def _check_peer_timeouts(self) -> None
+                    def _handle_timeout(self, peer_id: str) -> None
+                    def _process_worker_updates(self) -> None
+                    def _process_messages(self) -> None
+                    async def _cleanup(self) -> None
+                    async def _execute_host_command(self, command: str, timeout: float = 30.0) -> tuple[int, str, str]
+                    def _write_to_socket(self, socket_path: Path, data: str) -> None
+                    def _read_from_socket(self, socket_path: Path) -> str
+                    def _read_output_socket(self, socket_path: Path) -> str
+                    def _read_exit_code(self, socket_path: Path) -> int
+                    def _send_signal(self, socket_path: Path, signal_num: int) -> None
+                    def _move_completed_files(self, worker_id: int, task_hash: str) -> None
+                    def _rotate_worker_log(self, worker_id: int, force: bool = False) -> None
+                    def _extract_binary_from_zip(self, zip_name: str, local_path: str, file_hash: str) -> Path | None
+                    def _compute_file_hash(self, path: Path) -> str
+                    async def _handle_initial_assignment(self, message: dict[str, Any], sender_id: str | None) -> None
+                    async def _handle_task_assignment(self, message: dict[str, Any], sender_id: str | None) -> None
+                    async def _notify_task_complete(self, worker_id: int, task_hash: str) -> None
+                    async def _request_new_task(self, worker_id: int) -> None
+                    async def _handle_discover_sources(self, message: dict[str, Any], sender_id: str | None) -> None
+                    async def _handle_transfer_complete(self, message: dict[str, Any], sender_id: str | None) -> None
+                    async def _process_initial_worker_assignments(self) -> None
+                    async def _handle_promote_primary(self, message: dict[str, Any], sender_id: str | None) -> None
+                    async def _handle_full_task_list(self, message: dict[str, Any], sender_id: str | None) -> None
+        task/
+            base/
+                __init__.py
+                    (no top-level functions or classes)
+                task_definition.py
+                    # class
+                    class Phase(Enum)
+                    # class
+                    class StageDefinition [dataclass]
+                        # class attributes
+                        phase: Phase
+                        timeout_seconds: float | None = None
+                    # class
+                    class TaskDefinition(ABC)
+                        # methods
+                        def get_stages(self) -> list[StageDefinition] [abstractmethod]
+                        def organize_and_sort_items(self, items: list[BinaryInfo]) -> list[BinaryInfo] [abstractmethod]
+                        def estimate_memory(self, binary_size: int) -> int [abstractmethod]
+                        def get_worker_module(self) -> str [abstractmethod]
+                        def add_task_arguments(self, parser: ArgumentParser) -> None [abstractmethod]
+                        def build_worker_command_args(self, args: Namespace, source_dir: Path, output_dir: Path, skip_existing: bool) -> list[str] [abstractmethod]
+                        def get_output_filename_pattern(self, input_filename: str) -> str [abstractmethod]
+                        def get_reserved_memory_per_worker(self) -> int
+            tokenizer/
+                __init__.py
+                    (no top-level functions or classes)
+                tokenizer_task.py
+                    # class
+                    class TokenizerPhase(Phase)
+                        # class attributes
+                        ANGR_1 = 'angr-1'
+                        ANGR_2 = 'angr-2'
+                        TOKENIZATION = 'tokenization'
+                    # class
+                    class TokenizerTask(TaskDefinition)
+                        # methods
+                        def get_stages(self) -> list[StageDefinition]
+                        def organize_and_sort_items(self, items: list[BinaryInfo]) -> list[BinaryInfo]
+                        def estimate_memory(self, binary_size: int) -> int
+                        def get_worker_module(self) -> str
+                        def add_task_arguments(self, parser: ArgumentParser) -> None
+                        def build_worker_command_args(self, args: Namespace, source_dir: Path, output_dir: Path, skip_existing: bool) -> list[str]
+                        def get_output_filename_pattern(self, input_filename: str) -> str
+            __init__.py
+                (no top-level functions or classes)
+        worker/
+            __init__.py
+                (no top-level functions or classes)
+            base_worker.py
+                # class
+                class BaseWorker(ABC)
+                    # instance attributes (inferred from __init__)
+                    worker_id = worker_id
+                    memory_budget = memory_budget
+                    current_binary: BinaryInfo | None = None
+                    estimated_memory: int = 0
+                    idle: bool = False
+                    opportunistic: bool = False
+                    reserved_budget: int = memory_budget
+                    has_received_initial_assignment: bool = False
+                    ready: bool = False
+                    phase: str | None = None
+                    phase_start_time: float | None = None
+                    last_keepalive: float | None = None
+                    last_printed_minute: int | None = None
+                    # methods
+                    def __init__(self, worker_id: int, memory_budget: int)
+                    def start(self) -> bool [abstractmethod]
+                    def assign_task(self, binary: BinaryInfo, estimated_memory: int) -> tuple[bool, str | None] [abstractmethod]
+                    def check_status(self) -> tuple[bool, TaskResult | None] [abstractmethod]
+                    def terminate(self) -> None [abstractmethod]
+                    def restart(self) -> bool [abstractmethod]
+                    def is_alive(self) -> bool [abstractmethod]
+                    def get_actual_memory_usage(self) -> int [abstractmethod]
+                    def mark_idle(self) -> None
+                    def mark_busy(self, binary: BinaryInfo, estimated_memory: int, opportunistic: bool = False) -> None
+                    def clear_task(self) -> None
+            local_worker.py
+                # class
+                class LocalWorker(BaseWorker)
+                    # instance attributes (inferred from __init__)
+                    source_dir = source_dir
+                    output_dir = output_dir
+                    log_path = log_path
+                    task_definition = task_definition
+                    task_args = task_args
+                    skip_existing = skip_existing
+                    manual_start = manual_start
+                    connection_mode = connection_mode
+                    socket_path = socket_path
+                    worker_state: WorkerState | None = None
+                    # methods
+                    def __init__(self, worker_id: int, memory_budget: int, source_dir: Path, output_dir: Path, log_path: Path, task_definition: TaskDefinition, task_args: Any, skip_existing: bool = False, manual_start: bool = False, connection_mode: str = 'socketpair', socket_path: Path | None = None)
+                    def start(self) -> bool
+                    def assign_task(self, binary: BinaryInfo, estimated_memory: int) -> tuple[bool, str | None]
+                    def check_status(self) -> tuple[bool, TaskResult | None]
+                    def terminate(self) -> None
+                    def restart(self) -> bool
+                    def is_alive(self) -> bool
+                    def get_actual_memory_usage(self) -> int
+                    def check_timeout(self) -> bool
+            remote_worker.py
+                # class
+                class RemoteWorker(BaseWorker)
+                    # instance attributes (inferred from __init__)
+                    secondary_id = secondary_id
+                    message_router = message_router
+                    task_hash: str | None = None
+                    task_started_time: float | None = None
+                    _started = False
+                    # methods
+                    def __init__(self, worker_id: int, memory_budget: int, secondary_id: str, message_router: Any)
+                    def start(self) -> bool
+                    def assign_task(self, binary: BinaryInfo, estimated_memory: int) -> tuple[bool, str | None]
+                    def send_task_assignment(self, binary: BinaryInfo, zip_file: str | None, local_path: str, file_hash: str) -> None
+                    def check_status(self) -> tuple[bool, TaskResult | None]
+                    def handle_task_complete(self, warnings: int, filtered: int) -> TaskResult
+                    def handle_task_failed(self, error_type_str: str, error_message: str) -> TaskResult
+                    def terminate(self) -> None
+                    def restart(self) -> bool
+                    def is_alive(self) -> bool
+                    def get_actual_memory_usage(self) -> int
+                    def get_elapsed_time(self) -> float | None
+        worker_manager/
+            __init__.py
+                (no top-level functions or classes)
+            actual_authoritative.py
+                # class
+                class ActualAuthoritativeWorkerManager(DecisionWorkerManMixin, AuthoritativeBase)
+                    # instance attributes (inferred from __init__)
+                    submissive_managers = submissive_managers or []
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, log_dir: Path, task_definition: TaskDefinition, workers: list[BaseWorker] | None = None, submissive_managers: list['ActualSubmissiveWorkerManager'] | None = None, enable_logging: bool = True)
+                    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None
+            actual_submissive.py
+                # class
+                class ActualSubmissiveWorkerManager(ExecutionWorkerManBaseImpl, SubmissiveBase)
+                    # instance attributes (inferred from __init__)
+                    request_task_callback = request_task_callback
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, source_dir: Path, output_dir: Path, task_definition: TaskDefinition, task_args: Any, skip_existing: bool, request_task_callback: Callable[[int], None], manual_start_worker: bool = False, connection_mode: str = 'socketpair', socket_dir: Path | None = None, enable_logging: bool = True)
+                    def _request_task_from_authoritative(self, worker_id: int) -> None
+            authoritative_base.py
+                # class
+                class AuthoritativeBase(WorkerManagerBase, ABC)
+                    # instance attributes (inferred from __init__)
+                    _external_workers = workers or []
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, log_dir: Path, task_definition: TaskDefinition, workers: list[BaseWorker] | None = None, always_restart_worker: bool = False, enable_logging: bool = True, **kwargs)
+                    def _create_workers(self) -> list[BaseWorker]
+                    def _check_memory_pressure_and_kill(self) -> None
+                    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None [abstractmethod]
+                    def _assign_binary_to_worker_initial_phase(self, worker: BaseWorker) -> bool
+                    def _assign_binary_to_worker_normal(self, worker: BaseWorker, retry_attempt: bool = False) -> bool
+                    def get_worker_assignments(self) -> dict[int, tuple[BinaryInfo, int] | None]
+                    def assign_task_to_worker(self, worker_id: int, binary: BinaryInfo, estimated_memory: int) -> bool
+                    def set_pending_binaries(self, binaries: list[BinaryInfo]) -> None
+                    def handle_task_request(self, worker_id: int) -> tuple[BinaryInfo, int] | None
+            base.py
+                # class
+                class WorkerManagerBase(ABC)
+                    # instance attributes (inferred from __init__)
+                    num_workers = num_workers
+                    max_memory = max_memory
+                    task_definition = task_definition
+                    reserved_memory_per_worker = task_definition.get_reserved_memory_per_worker()
+                    always_restart_worker = always_restart_worker
+                    enable_logging = enable_logging
+                    session_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                    workers: list[BaseWorker] = []
+                    available_memory = max_memory
+                    total_assigned_memory = 0
+                    lock = threading.Lock()
+                    pending_binaries: list[BinaryInfo] = []
+                    failed_tasks: list[FailedTask] = []
+                    oom_tasks: list[FailedTask] = []
+                    unassigned_tasks: list[BinaryInfo] = []
+                    pending_worker_assignments: set[int] = set()
+                    stats = {'completed': 0, 'total': 0, 'skipped': 0, 'errored': 0}
+                    idle_workers_logged: set[int] = set()
+                    in_oom_phase: bool = False
+                    worker_assignment_failures: dict[int, int] = {}
+                    log_dir = log_dir / start_time
+                    manager_logger = self._setup_logger()
+                    memuse_log_path = log_dir.parent / 'memuse.log'
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, log_dir: Path, task_definition: TaskDefinition, always_restart_worker: bool = False, enable_logging: bool = True, **kwargs)
+                    def _calculate_initial_budget(self, worker_index: int) -> int
+                    def _setup_logger(self) -> logging.Logger
+                    def _log_memory_usage(self, worker: BaseWorker, errored: bool = False) -> None
+                    def _create_workers(self) -> list[BaseWorker] [abstractmethod]
+                    def _assign_binary_to_worker_initial_phase(self, worker: BaseWorker) -> bool [abstractmethod]
+                    def _assign_binary_to_worker_normal(self, worker: BaseWorker, retry_attempt: bool = False) -> bool [abstractmethod]
+                    def _worker_completed(self, worker: BaseWorker, result: TaskResult) -> None
+                    def _get_worker_actual_memory_usage(self) -> int
+                    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None
+                    def _check_memory_pressure_and_kill(self) -> None
+                    def handle_assignment_failure(self, worker: BaseWorker, error_msg: str) -> bool
+                    def _handle_worker_without_task(self, worker: BaseWorker, worker_id: int, active_workers: set[int], allow_stop: bool, is_initial_phase: bool = False) -> bool
+                    def _handle_monitor_result(self, worker: BaseWorker, result: TaskResult | None, task_completed: bool, should_restart: bool, worker_id: int, active_workers: set[int], allow_stop: bool, on_failure_increment_failed: bool, is_initial_phase: bool = False) -> None
+                    def _wait_for_workers_ready(self) -> None
+                    def _process_worker_loop(self, active_workers: set[int], allow_stop: bool = True, on_failure_increment_failed: bool = False, is_initial_phase: bool = False) -> None
+                    def _initialize_workers(self) -> None
+                    def initialize_workers_only(self) -> None
+                    def _run_initial_assignments(self) -> None
+                    def _run_main_phase(self) -> None
+                    def _run_retry_phase(self) -> None
+                    def _run_oom_phase(self) -> None
+                    def _run_unassigned_phase(self) -> None
+                    def process_binaries(self, binaries: list[BinaryInfo]) -> None
+            decision_impl.py
+                # class
+                class DecisionWorkerManMixin
+                    # methods
+                    def _assign_binary_to_worker_initial_phase(self, worker: BaseWorker) -> bool
+                    def _assign_binary_to_worker_normal(self, worker: BaseWorker, retry_attempt: bool = False) -> bool
+                    def _handle_worker_without_task(self, worker: BaseWorker, worker_id: int, active_workers: set[int], allow_stop: bool, is_initial_phase: bool = False) -> bool
+                    def _run_initial_assignments(self) -> None
+                    def _run_main_phase(self) -> None
+            execution_impl.py
+                # class
+                class ExecutionWorkerManBaseImpl(WorkerManagerBase)
+                    # instance attributes (inferred from __init__)
+                    source_dir = source_dir
+                    output_dir = output_dir
+                    task_args = task_args
+                    skip_existing = skip_existing
+                    manual_start_worker = manual_start_worker
+                    connection_mode = connection_mode
+                    socket_dir = socket_dir
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, log_dir: Path, task_definition: TaskDefinition, source_dir: Path, output_dir: Path, task_args: Any, skip_existing: bool, always_restart_worker: bool = False, manual_start_worker: bool = False, connection_mode: str = 'socketpair', socket_dir: Path | None = None, enable_logging: bool = True, **kwargs)
+                    def _get_socket_path(self, worker_id: int) -> Path | None
+                    def _create_workers(self) -> list[BaseWorker]
+                    def _check_memory_pressure_and_kill(self) -> None
+            local.py
+                # class
+                class LocalWorkerManager(DecisionWorkerManMixin, ExecutionWorkerManBaseImpl)
+                    # instance attributes (inferred from __init__)
+                    print_pid = print_pid
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, source_dir: Path, output_dir: Path, task_definition: TaskDefinition, task_args: Any, skip_existing: bool, print_pid: bool, always_restart_worker: bool = False, manual_start_worker: bool = False, connection_mode: str = 'socketpair', socket_dir: Path | None = None, enable_logging: bool = True)
+                    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None
+            submissive_base.py
+                # class
+                class SubmissiveBase(WorkerManagerBase, ABC)
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, log_dir: Path, task_definition: TaskDefinition, always_restart_worker: bool = False, enable_logging: bool = True, **kwargs)
+                    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None
+                    def _assign_binary_to_worker_initial_phase(self, worker: BaseWorker) -> bool
+                    def _assign_binary_to_worker_normal(self, worker: BaseWorker, retry_attempt: bool = False) -> bool
+                    def _request_task_from_authoritative(self, worker_id: int) -> None [abstractmethod]
+                    def _handle_worker_without_task(self, worker: BaseWorker, worker_id: int, active_workers: set[int], allow_stop: bool, is_initial_phase: bool = False) -> bool
+                    def assign_task_from_authoritative(self, worker_id: int, binary: BinaryInfo, estimated_memory: int) -> bool
+            test_network_sim.py
+                # functions
+                def run_baseline_test(binaries: list[BinaryInfo], task_definition: TaskDefinition, task_args: Any, source_dir: Path, output_dir: Path, num_cores: int, max_memory: int) -> dict[str, Any]
+                def run_network_sim_test(binaries: list[BinaryInfo], task_definition: TaskDefinition, task_args: Any, source_dir: Path, output_dir: Path, num_cores: int, max_memory: int) -> dict[str, Any]
+                def compare_results(baseline: dict[str, Any], netsim: dict[str, Any]) -> bool
+                # class
+                class NetworkSimulator
+                    # instance attributes (inferred from __init__)
+                    submissive_to_authoritative: Queue = Queue()
+                    authoritative_to_submissive: Queue = Queue()
+                    messages_sent = 0
+                    task_requests = 0
+                    task_assignments = 0
+                    # methods
+                    def __init__(self)
+                    def send_task_request(self, worker_id: int) -> None
+                    def send_task_assignment(self, worker_id: int, binary: BinaryInfo, estimated_memory: int) -> None
+                    def get_task_request(self) -> TaskRequestMessage | None
+                    def get_task_assignment(self) -> TaskAssignmentMessage | None
+                    def print_stats(self) -> None
+                # class
+                class NetworkSimulatedSubmissiveManager(ActualSubmissiveWorkerManager)
+                    # instance attributes (inferred from __init__)
+                    network_sim = network_sim
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, source_dir: Path, output_dir: Path, task_definition: TaskDefinition, task_args: Any, skip_existing: bool, network_sim: NetworkSimulator, manual_start_worker: bool = False, connection_mode: str = 'socketpair', socket_dir: Path | None = None)
+                    def process_network_messages(self) -> None
+                # class
+                class NetworkSimulatedAuthoritativeManager(ActualAuthoritativeWorkerManager)
+                    # instance attributes (inferred from __init__)
+                    network_sim = network_sim
+                    network_submissive_manager: NetworkSimulatedSubmissiveManager | None = None
+                    # methods
+                    def __init__(self, num_workers: int, max_memory: int, log_dir: Path, task_definition: TaskDefinition, network_sim: NetworkSimulator, submissive_managers: list[ActualSubmissiveWorkerManager])
+                    def process_network_messages(self) -> None
         __init__.py
             (no top-level functions or classes)
         __main__.py
             # functions
             def main()
-        binary_discovery.py
-            # functions
-            def find_matching_binaries(source_dir: Path, platforms: list[str], compiler: str | None, compiler_versions: list[str] | None, opt_levels: list[str] | None, format_string: str = 'platform-compiler-version-optimisationlevel_binaryname', version_regex: str | None = None, opt_regex: str | None = None, name_regex: str | None = None, exclude_subfolders: list[str] | None = None) -> list[BinaryInfo]
-            def organize_and_sort_binaries(binaries: list[BinaryInfo]) -> list[BinaryInfo]
-            def filter_existing_outputs(binaries: list[BinaryInfo], source_dir: Path, output_dir: Path) -> tuple[list[BinaryInfo], int]
         binary_info.py
             (no top-level functions or classes)
         memory.py
             # functions
-            def estimate_memory(binary_size: int) -> int
             def get_actual_memory_usage() -> int
             def get_free_system_memory() -> int
         models.py
-            # class
-            class ErrorType(Enum)
-                # class attributes
-                OUT_OF_MEMORY = 'oom'
-                NON_RECOVERABLE = 'non_recoverable'
-                RECOVERABLE = 'recoverable'
-            # class
-            class ProcessingPhase(Enum)
-                # class attributes
-                PHASE_1 = 'phase1'
-                PHASE_2 = 'phase2'
-                PHASE_3 = 'phase3'
             # class
             class TaskResult [dataclass]
                 # class attributes
@@ -49,19 +1404,24 @@ asm-tokenizer/
             # class
             class WorkerState [dataclass]
                 # class attributes
-                process: subprocess.Popen
-                socket: socket.socket
+                process: Any
+                comm: CommunicationInterface
                 current_binary: BinaryInfo | None
                 estimated_memory: int
                 worker_id: int
-                phase: ProcessingPhase | None = None
+                child_fd: int | None = None
+                socket_path: Any = None
+                phase: str | None = None
                 phase_start_time: float | None = None
                 last_keepalive: float | None = None
                 last_printed_minute: int | None = None
-                last_memory_check: float | None = None
-                max_memory_current_task: int = 0
                 idle: bool = False
                 opportunistic: bool = False
+                reserved_budget: int = 0
+                has_received_initial_assignment: bool = False
+                connection_established: bool = True
+                ready: bool = False
+                connection_established_time: float | None = None
             # class
             class FailedTask [dataclass]
                 # class attributes
@@ -73,10 +1433,10 @@ asm-tokenizer/
             # functions
             def process_retry_phase(failed_tasks: list[FailedTask], pending_binaries: list[BinaryInfo], num_workers: int, process_worker_loop_callback, logger: logging.Logger) -> None
             def process_oom_phase(oom_tasks: list[FailedTask], pending_binaries: list[BinaryInfo], workers: list[WorkerState], log_dir: Path, process_worker_loop_callback, logger: logging.Logger) -> None
-            def process_unassigned_phase(unassigned_tasks: list[BinaryInfo], workers: list[WorkerState], source_dir: Path, log_dir: Path, lock: threading.Lock, stats: dict, restart_worker_callback, worker_completed_callback, logger: logging.Logger) -> None
-            def _process_single_unassigned_binary(binary: BinaryInfo, worker: WorkerState, source_dir: Path, log_dir: Path, lock: threading.Lock, stats: dict, restart_worker_callback, worker_completed_callback, logger: logging.Logger) -> bool
+            def process_unassigned_phase(unassigned_tasks: list[BinaryInfo], workers: list[WorkerState], source_dir: Path, log_dir: Path, lock: threading.Lock, stats: dict, task_definition: TaskDefinition, restart_worker_callback, worker_completed_callback, logger: logging.Logger) -> None
+            def _process_single_unassigned_binary(binary: BinaryInfo, worker: WorkerState, source_dir: Path, log_dir: Path, lock: threading.Lock, stats: dict, task_definition: TaskDefinition, restart_worker_callback, worker_completed_callback, logger: logging.Logger) -> bool
             def _assign_binary_directly(binary: BinaryInfo, worker: WorkerState, source_dir: Path, logger: logging.Logger) -> bool
-            def _monitor_unassigned_binary(binary: BinaryInfo, worker: WorkerState, lock: threading.Lock, stats: dict, restart_worker_callback, worker_completed_callback, logger: logging.Logger) -> bool
+            def _monitor_unassigned_binary(binary: BinaryInfo, worker: WorkerState, lock: threading.Lock, stats: dict, task_definition: TaskDefinition, restart_worker_callback, worker_completed_callback, logger: logging.Logger) -> bool
         system_resources.py
             # functions
             def get_cpu_count() -> int
@@ -85,27 +1445,17 @@ asm-tokenizer/
             def parse_memory(memory_str: str) -> int
         task_handler.py
             # functions
-            def assign_binary_to_worker(worker: WorkerState, pending_binaries: list[BinaryInfo], available_memory: int, reserved_memory: int, source_dir: Path, lock: threading.Lock, unassigned_tasks: list[BinaryInfo] | None = None, logger = None) -> AssignmentResult
             def worker_completed(worker: WorkerState, result: TaskResult, oom_tasks: list[FailedTask], failed_tasks: list[FailedTask], stats: dict[str, int], lock: threading.Lock, logger = None) -> int
-            def parse_response(response: str) -> TaskResult | ProcessingPhase | None
-            # class
-            class AssignmentResult [dataclass]
-                # class attributes
-                assigned: bool
-                new_available_memory: int
-                socket_error: bool = False
-                memory_insufficient: bool = False
         worker_communication.py
             # functions
-            def send_worker_command(worker: WorkerState, command: str) -> tuple[bool, str | None]
-            def handle_pickled_error(response: str) -> dict | None
+            def send_worker_command(worker: WorkerState, binary_relative_path: str) -> tuple[bool, str | None]
             def receive_worker_messages(worker: WorkerState) -> WorkerMessage
             def log_pickled_error(worker_id: int, error_info: dict, logger: logging.Logger) -> str
             # class
             class WorkerCommunicationError(Enum)
                 # class attributes
-                SOCKET_ERROR = 'socket_error'
-                SOCKET_CLOSED = 'socket_closed'
+                COMMUNICATION_ERROR = 'communication_error'
+                CONNECTION_CLOSED = 'connection_closed'
                 NO_ERROR = 'no_error'
             # class
             class WorkerMessage [dataclass]
@@ -113,64 +1463,19 @@ asm-tokenizer/
                 success: bool
                 error_type: WorkerCommunicationError
                 error_message: str | None = None
-                parsed_responses: list[ProcessingPhase | TaskResult] | None = None
+                parsed_responses: list[str | TaskResult] | None = None
                 pickled_error_info: dict | None = None
         worker_lifecycle.py
             # functions
-            def start_worker(worker_id: int, source_dir: Path, output_dir: Path, platform_arg: str, skip_existing: bool, worker_log_path: Path) -> WorkerState
-            def restart_worker(worker: WorkerState, source_dir: Path, output_dir: Path, platform_arg: str, skip_existing: bool, worker_log_path: Path) -> WorkerState
-            def check_worker_timeout(worker: WorkerState) -> bool
-            def print_phase_status(worker: WorkerState, logger) -> None
-        worker_manager.py
-            # class
-            class WorkerManager
-                # instance attributes (inferred from __init__)
-                num_workers = num_workers
-                max_memory = max_memory
-                reserved_memory_per_worker = 650 * 1024 * 1024
-                source_dir = source_dir
-                output_dir = output_dir
-                platform_arg = platform_arg
-                skip_existing = skip_existing
-                print_pid = print_pid
-                always_restart_worker = always_restart_worker
-                workers: list[WorkerState] = []
-                available_memory = max_memory
-                lock = threading.Lock()
-                pending_binaries: list[BinaryInfo] = []
-                failed_tasks: list = []
-                oom_tasks: list = []
-                unassigned_tasks: list[BinaryInfo] = []
-                stats = {'completed': 0, 'failed': 0, 'total': 0, 'skipped': 0}
-                log_dir = output_dir / 'logs' / start_time
-                manager_logger = self._setup_logger()
-                memuse_log_path = output_dir / 'memuse.log'
-                # methods
-                def __init__(self, num_workers: int, max_memory: int, source_dir: Path, output_dir: Path, platform_arg: str, skip_existing: bool, print_pid: bool, always_restart_worker: bool = False)
-                def _setup_logger(self) -> logging.Logger
-                def _log_memory_usage(self, worker: WorkerState, errored: bool) -> None
-                def _start_worker(self, worker_id: int) -> WorkerState
-                def _restart_worker(self, worker_id: int) -> WorkerState
-                def _assign_binary_to_worker(self, worker: WorkerState, track_unassigned: bool = False) -> bool
-                def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None
-                def _get_worker_actual_memory_usage(self) -> int
-                def _try_assign_to_idle_workers(self) -> None
-                def _try_opportunistic_assignment(self) -> None
-                def _check_memory_pressure_and_kill_opportunistic(self) -> None
-                def _handle_worker_without_task(self, worker: WorkerState, worker_id: int, active_workers: set[int], allow_stop: bool) -> bool
-                def _handle_monitor_result(self, monitor_result, worker: WorkerState, worker_id: int, active_workers: set[int], allow_stop: bool, on_failure_increment_failed: bool) -> None
-                def _process_worker_loop(self, active_workers: set[int], allow_stop: bool = True, on_failure_increment_failed: bool = False) -> None
-                def _initialize_workers(self) -> None
-                def _run_initial_phase(self) -> None
-                def _run_retry_phase(self) -> None
-                def _run_oom_phase(self) -> None
-                def _run_unassigned_phase(self) -> None
-                def process_binaries(self, binaries: list[BinaryInfo]) -> None
+            def start_worker(worker_id: int, source_dir: Path, output_dir: Path, worker_log_path: Path, task_definition: TaskDefinition, task_args, skip_existing: bool, manual_start: bool = False, connection_mode: str = 'socketpair', socket_path: Path | None = None) -> WorkerState
+            def restart_worker(worker: WorkerState, source_dir: Path, output_dir: Path, worker_log_path: Path, task_definition: TaskDefinition, task_args, skip_existing: bool, manual_start: bool = False, connection_mode: str = 'socketpair', socket_path: Path | None = None) -> WorkerState
+            def check_worker_timeout(worker: WorkerState, task_definition: TaskDefinition) -> bool
+            def print_phase_status(worker: WorkerState, logger, task_definition: TaskDefinition) -> None
+            def check_manual_worker_connection(worker: WorkerState, socket_path: Path) -> tuple[Any, bool]
         worker_monitoring.py
             # functions
             def _get_process_memory(pid: int) -> int
-            def _check_and_update_memory(worker: WorkerState) -> None
-            def monitor_worker_once(worker: WorkerState, worker_id: int, logger, on_failure_increment_failed: bool = False, increment_failed_callback = None) -> WorkerMonitorResult
+            def monitor_worker_once(worker: WorkerState, worker_id: int, logger, task_definition: TaskDefinition, on_failure_increment_failed: bool = False, increment_failed_callback = None) -> WorkerMonitorResult
             # class
             class WorkerMonitorResult [dataclass]
                 # class attributes
@@ -267,9 +1572,22 @@ asm-tokenizer/
             # functions
             def summarize_binaries(folder_path)
             def main()
+    rust/
+        dynamic_batch/
+            crates/
+                db_local_manager/
+                    tests/
+                        test_worker_mod/
+                            __main__.py
+                                # functions
+                                def run_protocol(conn)
+                                def main()
     shared/
         __init__.py
             (no top-level functions or classes)
+        binary_filter.py
+            # functions
+            def filter_existing_outputs(binaries: list[BinaryInfo], source_dir: Path, output_dir: Path, output_filename_fn: Callable[[str], str]) -> tuple[list[BinaryInfo], int]
         binary_info.py
             # functions
             def build_field_regexes(platforms: list[str] | None = None, compilers: list[str] | None = None, versions: list[str] | None = None, opt_levels: list[str] | None = None, version_regex: str | None = None, opt_regex: str | None = None, name_regex: str | None = None) -> FieldRegexes
@@ -299,6 +1617,7 @@ asm-tokenizer/
                 def compiler(self) -> str [property]
                 def version(self) -> str [property]
                 def opt_level(self) -> str [property]
+                def to_dict(self) -> dict
             # class
             class FieldRegexes [dataclass]
                 # class attributes
@@ -319,6 +1638,9 @@ asm-tokenizer/
         binary_selector.py
             # functions
             def find_matching_binaries(source_dir: Path, platforms: list[str], compiler: str | None, compiler_versions: list[str] | None, opt_levels: list[str] | None, format_string: str = 'platform-compiler-version-optimisationlevel_binaryname', version_regex: str | None = None, opt_regex: str | None = None, name_regex: str | None = None, exclude_subfolders: list[str] | None = None) -> list[BinaryInfo]
+        csv_helper.py
+            # functions
+            def increase_csv_field_size_limit() -> None
         logging_utils.py
             # functions
             def remove_stream_handlers(logger: logging.Logger) -> None
@@ -540,7 +1862,18 @@ asm-tokenizer/
                 def create_normalized_header(headers: List[List[str]]) -> List[str]
                 def create_column_mapping(header: List[str], normalized_header: List[str]) -> Dict[str, Any]
                 def normalize_row(row: List[str], column_mapping: Dict[str, int]) -> Dict[str, str]
-                def lockstep_function_match(csv_paths: List[str])
+                def lockstep_function_match(csv_paths: List[str], progress_callback: Optional[Callable[[int], None]] = None)
+                # class
+                class PositionTrackingWrapper
+                    # instance attributes (inferred from __init__)
+                    file_path = file_path
+                    fd = os.open(file_path, os.O_RDONLY)
+                    file = open(self.fd, newline='', encoding='ascii')
+                    bytes_read = 0
+                    # methods
+                    def __init__(self, file_path: str)
+                    def get_position(self) -> int
+                    def close(self)
             metadata.py
                 # functions
                 def parse_inlining_data(inlining_str: str) -> List[List[int]]
@@ -549,6 +1882,231 @@ asm-tokenizer/
             sections.py
                 # functions
                 def read_function_section(file1_path, start, length)
+        arch/
+            arm32/
+                __init__.py
+                    (no top-level functions or classes)
+                operands.py
+                    # functions
+                    def tokenize_operand_memory(insn, lookup, op, text_end: int, text_start: int, func_max_addr: int, func_min_addr: int, vocab_manager: VocabularyManager, constant_handler: ConstantHandler) -> List[Tokens]
+                    def tokenize_operand_shift(insn, op, vocab_manager: VocabularyManager) -> List[Tokens]
+                provider.py
+                    # class
+                    class ARM32Provider(ArchitectureProvider)
+                        # instance attributes (inferred from __init__)
+                        _platform = platform
+                        # methods
+                        def __init__(self, platform: str = 'arm32')
+                        def platform_str(self) -> str [property]
+                        def load_instruction_sets(self) -> InstructionSets
+                        def parse_instruction(self, instr_sets: InstructionSets, constant_handler: ConstantHandler, func_max_addr: int, func_min_addr: int, insn, lookup, text_end: int, text_start: int, vocab_manager: VocabularyManager, insn_tokens: List[Tokens]) -> List[Tokens]
+            mips/
+                __init__.py
+                    (no top-level functions or classes)
+                provider.py
+                    # class
+                    class MIPSProvider(ArchitectureProvider)
+                        # instance attributes (inferred from __init__)
+                        _platform = platform
+                        # methods
+                        def __init__(self, platform: str = 'mips')
+                        def platform_str(self) -> str [property]
+                        def load_instruction_sets(self) -> InstructionSets
+                        def parse_instruction(self, instr_sets: InstructionSets, constant_handler: ConstantHandler, func_max_addr: int, func_min_addr: int, insn, lookup, text_end: int, text_start: int, vocab_manager: VocabularyManager, insn_tokens: List[Tokens]) -> List[Tokens]
+            ppc/
+                __init__.py
+                    (no top-level functions or classes)
+                provider.py
+                    # class
+                    class PPCProvider(ArchitectureProvider)
+                        # instance attributes (inferred from __init__)
+                        _platform = platform
+                        # methods
+                        def __init__(self, platform: str = 'ppc')
+                        def platform_str(self) -> str [property]
+                        def load_instruction_sets(self) -> InstructionSets
+                        def parse_instruction(self, instr_sets: InstructionSets, constant_handler: ConstantHandler, func_max_addr: int, func_min_addr: int, insn, lookup, text_end: int, text_start: int, vocab_manager: VocabularyManager, insn_tokens: List[Tokens]) -> List[Tokens]
+            riscv/
+                __init__.py
+                    (no top-level functions or classes)
+                provider.py
+                    # class
+                    class RISCVProvider(ArchitectureProvider)
+                        # instance attributes (inferred from __init__)
+                        _platform = platform
+                        # methods
+                        def __init__(self, platform: str = 'riscv')
+                        def platform_str(self) -> str [property]
+                        def load_instruction_sets(self) -> InstructionSets
+                        def parse_instruction(self, instr_sets: InstructionSets, constant_handler: ConstantHandler, func_max_addr: int, func_min_addr: int, insn, lookup, text_end: int, text_start: int, vocab_manager: VocabularyManager, insn_tokens: List[Tokens]) -> List[Tokens]
+            x86/
+                __init__.py
+                    (no top-level functions or classes)
+                operands.py
+                    # functions
+                    def tokenize_operand_memory(insn, lookup, op, text_end, text_start, func_max_addr, func_min_addr, vocab_manager: VocabularyManager, constant_handler: ConstantHandler) -> List[Tokens]
+                    def tokenize_operand_immediate(addressing_control_flow_instructions, arithmetic_instructions, insn, lookup, op, func_max_addr, func_min_addr, constant_handler: ConstantHandler) -> List[Tokens]
+                provider.py
+                    # class
+                    class X86Provider(ArchitectureProvider)
+                        # instance attributes (inferred from __init__)
+                        _platform = platform
+                        # methods
+                        def __init__(self, platform: Literal['x86', 'x64'])
+                        def platform_str(self) -> str [property]
+                        def load_instruction_sets(self) -> InstructionSets
+                        def parse_instruction(self, instr_sets: InstructionSets, constant_handler: ConstantHandler, func_max_addr: int, func_min_addr: int, insn, lookup, text_end: int, text_start: int, vocab_manager: VocabularyManager, insn_tokens: List[Tokens]) -> List[Tokens]
+            __init__.py
+                # functions
+                def get_provider(platform: Platform) -> ArchitectureProvider
+            operands_base.py
+                # functions
+                def tokenize_operand_memory_base_disp(insn, lookup, op, text_end: int, text_start: int, func_max_addr: int, func_min_addr: int, vocab_manager: VocabularyManager, constant_handler: ConstantHandler) -> List[Tokens]
+                def tokenize_operand_immediate_generic(addressing_control_flow_instructions: set[str], arithmetic_instructions: set[str], insn, lookup, op, func_max_addr: int, func_min_addr: int, constant_handler: ConstantHandler) -> List[Tokens]
+            provider.py
+                # class
+                class ArchitectureProvider(ABC)
+                    # methods
+                    def platform_str(self) -> str [property abstractmethod]
+                    def load_instruction_sets(self) -> InstructionSets [abstractmethod]
+                    def parse_instruction(self, instr_sets: InstructionSets, constant_handler: ConstantHandler, func_max_addr: int, func_min_addr: int, insn, lookup, text_end: int, text_start: int, vocab_manager: VocabularyManager, insn_tokens: List[Tokens]) -> List[Tokens] [abstractmethod]
+        disasm/
+            __init__.py
+                # functions
+                def get_disassembly_provider(backend: str, binary_path: Path) -> DisassemblyProvider
+                # class
+                class MetadataLookup(Protocol)
+                    # methods
+                    def lookup(self, addr: int) -> tuple[dict, str]
+                # class
+                class DisassemblyProvider(ABC)
+                    # methods
+                    def __init__(self, binary_path: Path) -> None [abstractmethod]
+                    def build_cfg(self) -> None [abstractmethod]
+                    def get_text_section_bounds(self) -> tuple[int, int] [abstractmethod]
+                    def parse_data_sections(self, sections: list[str] | None = None, output_csv_path: str | None = None) -> dict[str, list[str]] [abstractmethod]
+                    def create_metadata_lookup(self) -> MetadataLookup [abstractmethod]
+                    def function_count(self) -> int [abstractmethod]
+                    def iter_functions(self) -> Iterable[tuple[int, str, Any]] [abstractmethod]
+            angr_provider.py
+                # class
+                class AngrDisassemblyProvider(DisassemblyProvider)
+                    # instance attributes (inferred from __init__)
+                    binary_path = binary_path
+                    project: angr.Project = angr.Project(binary_path, auto_load_libs=False)
+                    cfg: angr.analyses.cfg.cfg_fast.CFGFast | None = None
+                    # methods
+                    def __init__(self, binary_path: Path) -> None
+                    def build_cfg(self) -> None
+                    def get_text_section_bounds(self) -> tuple[int, int]
+                    def parse_data_sections(self, sections: list[str] | None = None, output_csv_path: str | None = None) -> dict[str, list[str]]
+                    def create_metadata_lookup(self) -> MetadataLookup
+                    def function_count(self) -> int
+                    def iter_functions(self) -> Iterable[tuple[int, str, Any]]
+            ghidra_provider.py
+                # functions
+                def _build_register_map(program: Any) -> dict[int, str]
+                def _ghidra_insn_to_cap(ghidra_insn: Any, reg_map: dict[int, str], program: Any) -> _CapInstruction
+                # class
+                class _CapMemOperand [dataclass]
+                    # class attributes
+                    base: int = 0
+                    index: int = 0
+                    scale: int = 1
+                    disp: int = 0
+                    segment: int = 0
+                # class
+                class _CapShift [dataclass]
+                    # class attributes
+                    type: int = 0
+                    value: int = 0
+                # class
+                class _CapOperand [dataclass]
+                    # class attributes
+                    type: int = 0
+                    reg: int = 0
+                    imm: int = 0
+                    mem: _CapMemOperand = field(default_factory=_CapMemOperand)
+                    size: int = 0
+                    shift: _CapShift = field(default_factory=_CapShift)
+                    crx: _CRX = field(default_factory=_CRX)
+                    # nested class
+                    class _CRX [dataclass]
+                        # class attributes
+                        reg: int = 0
+                # class
+                class _CapInsnInner [dataclass]
+                    # class attributes
+                    _insn_name: str = ''
+                    cc: int = 0
+                    update_flags: bool = False
+                    writeback: bool = False
+                    bc: int = 0
+                    update_cr0: bool = False
+                    # methods
+                    def insn_name(self) -> str
+                # class
+                class _CapInstruction
+                    # class attributes
+                    __slots__ = ('mnemonic', 'op_str', 'operands', 'prefix', 'insn', '_reg_map')
+                    # instance attributes (inferred from __init__)
+                    mnemonic = mnemonic
+                    op_str = op_str
+                    operands = operands
+                    prefix = prefix
+                    insn = insn_inner
+                    _reg_map = reg_map
+                    # methods
+                    def __init__(self, mnemonic: str, op_str: str, operands: list[_CapOperand], prefix: bytes, insn_inner: _CapInsnInner, reg_map: dict[int, str])
+                    def reg_name(self, reg_id: int) -> str
+                # class
+                class _CapBlock [dataclass]
+                    # class attributes
+                    addr: int
+                    size: int
+                    capstone: Any = None
+                    # methods
+                    def set_insns(self, insns: list[_CapInstruction]) -> None
+                    # nested class
+                    class _CapstoneHolder [dataclass]
+                        # class attributes
+                        insns: list[_CapInstruction]
+                # class
+                class _CapFunction [dataclass]
+                    # class attributes
+                    _blocks: list[_CapBlock]
+                    # methods
+                    def blocks(self) -> list[_CapBlock] [property]
+                # class
+                class GhidraMetadataLookup
+                    # instance attributes (inferred from __init__)
+                    _program = program
+                    _fm = function_manager
+                    _memory = program.getMemory()
+                    _symbol_table = program.getSymbolTable()
+                    _listing = program.getListing()
+                    # methods
+                    def __init__(self, program: Any, function_manager: Any) -> None
+                    def lookup(self, addr: int) -> tuple[dict, str]
+                # class
+                class GhidraDisassemblyProvider(DisassemblyProvider)
+                    # instance attributes (inferred from __init__)
+                    binary_path = binary_path
+                    _project = pyghidra.open_project(str(binary_path.parent), binary_path.stem, create=True)
+                    _load_results = loader.load()
+                    _fm = self._program.getFunctionManager()
+                    _listing = self._program.getListing()
+                    _memory = self._program.getMemory()
+                    _reg_map = _build_register_map(self._program)
+                    _analyzed = False
+                    # methods
+                    def __init__(self, binary_path: Path) -> None
+                    def build_cfg(self) -> None
+                    def get_text_section_bounds(self) -> tuple[int, int]
+                    def parse_data_sections(self, sections: list[str] | None = None, output_csv_path: str | None = None) -> dict[str, list[str]]
+                    def create_metadata_lookup(self) -> MetadataLookup
+                    def function_count(self) -> int
+                    def iter_functions(self) -> Iterable[tuple[int, str, _CapFunction]]
         memmap_builder/
             __init__.py
                 (no top-level functions or classes)
@@ -614,6 +2172,48 @@ asm-tokenizer/
                 def write_unmatched_function_section(writer, func_name: str, platform_tuples: List[Tuple[str, str, str, str]], unique_called_list: List[str], inlining_data_list: List, first_offset: int, first_len: int)
                 def finalize_index_file(index_file, index_entries: List[Tuple[int, int, int]], sort_by_avg_len: bool = True)
                 def build_inlining_data_for_unmatched(called_by_version: List[Tuple[int, set]], unique_called_list: List[str], vkeys: List, function_lookup: dict, warn_log, func_name: str) -> List
+        memmap_validation/
+            __init__.py
+                (no top-level functions or classes)
+            __main__.py
+                # functions
+                def group_binaries_by_name(binaries)
+                def match_csv_to_mapping(csv_binaries, mapping_binaries)
+                def main() -> None
+            validator.py
+                # functions
+                def load_mapping(mapping_path: Path) -> Optional[np.ndarray]
+                def decode_csv_row_data(row: dict, mapping: Optional[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]
+                def should_skip_matched_function(rows: List[Optional[dict]]) -> bool
+                def should_skip_unmatched_function(row: dict) -> bool
+                def has_unique_offsets(version_data_list: List[dict]) -> bool
+                def format_token_mismatch(memmap_tokens: np.ndarray, csv_tokens: np.ndarray, vocab_manager: Optional[VocabularyManager] = None) -> str
+                def validate_memmap_output(config: ValidatorConfig) -> ValidationStats
+                # class
+                class VersionInfo [dataclass]
+                    # class attributes
+                    csv_path: Path
+                    mapping_path: Path
+                    arch: str
+                    compiler: str
+                    compilerversion: str
+                    opt: str
+                # class
+                class ValidatorConfig [dataclass]
+                    # class attributes
+                    versions: List[VersionInfo]
+                    output_dir: Path
+                    binary_name: str
+                # class
+                class ValidationStats [dataclass]
+                    # class attributes
+                    matched_validated: int
+                    matched_skipped: int
+                    unmatched_validated: int
+                    unmatched_skipped: int
+                    csv_only_matched: int
+                    csv_only_unmatched: int
+                    errors: List[str]
         patterns/
             __init__.py
                 (no top-level functions or classes)
@@ -824,6 +2424,7 @@ asm-tokenizer/
                 def read_last_line_of_file(csv_path: Path) -> bytes
                 def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> VocabularyManager | None
                 def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> VocabularyManager | None
+                def load_unified_vocab_manager(csv_path: Path) -> VocabularyManager | None
             saver.py
                 # functions
                 def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) -> None
@@ -837,9 +2438,23 @@ asm-tokenizer/
         __main__.py
             # functions
             def main()
+            # class
+            class DebugDefaults [dataclass(frozen=True)]
+                # class attributes
+                arg_abbr: str
+                arg_name: str
+                binary: str
+                folder: str
+                compiler: str
+                version: str
+                optimisation: str
+                # methods
+                def choices(self) -> tuple[str, str] [property]
+                def path(self) -> str
+                def help_line(self) -> str
         address_meta_data_lookup.py
             # class
-            class AddressMetaDataLookup
+            class AngrMetadataLookup
                 # instance attributes (inferred from __init__)
                 project = angr.Project(path, auto_load_libs=True)
                 _code_regions = []
@@ -874,15 +2489,6 @@ asm-tokenizer/
                 REGISTRY = 11
                 LOCKING_ATOMIC = 12
                 OTHER = 127
-            # class
-            class X86
-                # class attributes
-                architecture_str = 'x86'
-                instruction_types_enum = PlatformInstructionTypes
-                # instance attributes (inferred from __init__)
-                instruction_types_class = instruction_types_class
-                # methods
-                def __init__(self, instruction_types_class)
         binary_parser.py
             # functions
             def main(binary_path, address)
@@ -932,17 +2538,18 @@ asm-tokenizer/
                 block_tokens: Dict[int, Tokens] = {}
                 # methods
                 def __init__(self, vocab_manager: VocabularyManager, resolver: TokenResolver, constant_dict: Dict[str, List[str]], block_ranges: np.ndarray)
-                def process_constant(self, value: int, is_arithmetic: bool = False, meta: Optional[Dict] = None, library_type: str = 'unknown') -> List[Tokens]
+                def process_constant(self, value: int, is_arithmetic: bool = False, meta: Optional[Dict] = None, library_type: str = 'unknown', insn_mnemonic: Optional[str] = None) -> List[Tokens]
+                def _create_opaque_const_with_offset(self, value: int, meta: Optional[Dict] = None, library_type: str = 'unknown', insn_mnemonic: Optional[str] = None) -> List[Tokens]
                 def _create_opaque_const(self, value: int, meta: Optional[Dict] = None, library_type: str = 'unknown') -> Tokens
                 def get_sorted_opaque_constants(self) -> List[Tuple[int, Tokens, int]]
                 def create_opaque_mapping(self) -> Dict[BlockToken, Tokens]
                 def get_usage_stats(self) -> Dict[str, Dict[str, int]]
                 def get_metadata(self) -> Dict[str, Tuple]
+                def get_metadata_list_by_opaque_id(self) -> List[Tuple]
                 def reorder_metadata_for_mapping(self, opaque_mapping: Dict[Tokens, Tokens]) -> None
         csv_files.py
             # functions
             def extract_ldis_blocks_from_file(file_path)
-            def parse_and_save_data_sections(proj, sections_to_parse: list[str] = ['.rodata'], output_txt = 'parsed_constants.txt') -> dict[str, list[str]]
             def parse_init_sections(proj, output_txt = 'parsed_init_sections.txt', sections_to_parse = None)
             def reverse_tokenization(tokenized_instructions: np.ndarray, block_run_lengths: list[int], insn_run_lengths: list[int], vocab: dict[int, str]) -> list[dict[str, list[str]]]
             def vocab_from_output(output_path: str) -> list[str]
@@ -953,8 +2560,7 @@ asm-tokenizer/
             def csv_to_dict(filepath)
         fill_constant_candidates.py
             # functions
-            def parse_instruction(instr_sets, constant_handler, func_max_addr, func_min_addr, insn, lookup, text_end, text_start, vocab_manager, insn_tokens)
-            def fill_constant_candidates(func_addr: int, func: angr.knowledge_plugins.functions.function.Function, instr_sets: InstructionSets, constant_dict: dict[str, list[str]], lookup: AddressMetaDataLookup, text_start: int, text_end: int, resolver: TokenResolver, vocab_manager: VocabularyManager) -> Optional[tuple[list[tuple[str, list[list[Tokens]]]], list[dict[BlockToken, tuple[str, str]]], dict[str, BlockToken], ConstantHandler, FunctionTokenList]]
+            def fill_constant_candidates(func_addr: int, func: Any, instr_sets: InstructionSets, constant_dict: dict[str, list[str]], lookup: MetadataLookup, text_start: int, text_end: int, resolver: TokenResolver, vocab_manager: VocabularyManager, arch_provider: ArchitectureProvider) -> Optional[tuple[list[tuple[str, list[list[Tokens]]]], list[dict[BlockToken, tuple[str, str]]], dict[str, BlockToken], ConstantHandler, FunctionTokenList]]
         function_data_manager.py
             # class
             class FunctionData [dataclass]
@@ -1031,6 +2637,31 @@ asm-tokenizer/
                 def __str__(self)
                 def _ensure_capacity(self, tokens_needed: int, types_needed: int, insns_needed: int)
                 def iter_raw_tokens(self) -> Iterator[TokenRaw]
+        hash_checked_pickles.py
+            # functions
+            def _compute_file_hash(file_path: Path) -> str
+            def _load_hash_cache(cache_path: Path) -> DirectoryHash | None
+            def _save_hash_cache(cache_path: Path, dir_hash: DirectoryHash) -> None
+            def compute_directory_hash(directory: Path, cache_path: Path) -> str
+            def save_pickle_with_hash(file_path: Path, data: Any, expected_hash: str) -> None
+            def load_pickle_with_hash(file_path: Path, expected_hash: str) -> Any
+            def get_pickle_hash(file_path: Path) -> str | None
+            def get_current_hash() -> str
+            def has_valid_pickle(file_path: Path) -> bool
+            def try_load_pickle(file_path: Path, logger: logging.Logger | None = None) -> Any | None
+            def save_pickle(file_path: Path, data: Any) -> None
+            # class
+            class FileInfo [dataclass]
+                # class attributes
+                relative_path: str
+                size: int
+                mtime: float
+                file_hash: str
+            # class
+            class DirectoryHash [dataclass]
+                # class attributes
+                overall_hash: str
+                files: dict[str, FileInfo]
         instruction_sets.py
             # class
             class InstructionSets
@@ -1050,12 +2681,10 @@ asm-tokenizer/
                 def from_data_dict(cls, data: dict) -> 'InstructionSets' [classmethod]
                 def __repr__(self) -> str
                 def get_instruction_type(self, insn_name: str) -> PlatformInstructionTypes
-        low_level.py
-            (no top-level functions or classes)
         main_loop.py
             # functions
             def build_vocab_tokenize_and_index(func_tokens: FunctionTokenList) -> tuple[np.ndarray, np.ndarray, np.ndarray]
-            def main_loop(instr_sets, cfg, constant_list, func_addr_range, func_disas, func_disas_token, func_name_addr, func_names, lookup, resolver, text_end, text_start, vocab_manager, csv_path, logger: logging.Logger, sock: socket.socket | None = None, **_kwargs) -> tuple[FunctionDataManager, int]
+            def main_loop(instr_sets, provider, constant_list, func_addr_range, func_disas, func_disas_token, func_name_addr, func_names, lookup, resolver, text_end, text_start, vocab_manager, csv_path, arch_provider, logger: logging.Logger, comm: CommunicationInterface, **_kwargs) -> tuple[FunctionDataManager, int]
         make_name.py
             # functions
             def name_opaque_constants(occ: dict, base_name: str, vocab_manager: VocabularyManager, resolver: TokenResolver) -> tuple[dict[str, tuple['VocabularyManager.Opaque_Const', int]], dict[str, tuple['VocabularyManager.Opaque_Const', int]]]
@@ -1064,10 +2693,6 @@ asm-tokenizer/
         old_unused_resolve_meta.py
             # functions
             def resolve_metadata(dict1, dict2, metadata_dict, placeholder = ('UNKNOWN', -1), key_index = 2) -> list[tuple[str, str, str, str, str]]
-        op_imm_mem.py
-            # functions
-            def tokenize_operand_memory(insn, lookup, op, text_end, text_start, func_max_addr, func_min_addr, vocab_manager: VocabularyManager, constant_handler: ConstantHandler) -> List[Tokens]
-            def tokenize_operand_immediate(addressing_control_flow_instructions, arithmetic_instructions, insn, lookup, op, func_max_addr, func_min_addr, constant_handler: ConstantHandler) -> List[Tokens]
         opaque_remapping.py
             # functions
             def apply_opaque_mapping(temp_bbs, opaque_mapping, constant_handler = None)
@@ -1078,8 +2703,8 @@ asm-tokenizer/
             def save_pickles(func_names, token_dict, block_runlength_dict, insn_runlength_dict, opaque_meta_dict, vocab, duplicate_func_names, tokenized_instructions, block_run_lengths, insn_run_lengths, meta_result)
         run_tokenizer.py
             # functions
-            def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Literal['x86', 'arm64', 'arm32', 'x64'], cfg: angr.analyses.cfg.cfg_fast.CFGFast, constant_list: dict[str, list[str]], csv_path: Path, binary_path: Path, pickle_mainloop_file_path: Path, logger, with_pickled = False, project = None, sock: socket.socket | None = None, **kwargs)
-            def run_tokenizer(binary_path: Path, platform: Literal['x86', 'arm64', 'arm32', 'x64', 'file_prefix'], skip_existing_csv: bool, source_dir: Path, output_dir: Path, sock: socket.socket | None = None) -> tuple[int, int]
+            def disassemble_to_tokens(out_folder: Path, binary_name: str, platform: Platform, provider: DisassemblyProvider, constant_list: dict[str, list[str]], csv_path: Path, binary_path: Path, pickle_mainloop_file_path: Path, logger: logging.Logger, comm: CommunicationInterface, with_pickled = False, **kwargs)
+            def run_tokenizer(binary_path: Path, platform: Platform | str, skip_existing_csv: bool, source_dir: Path, output_dir: Path, comm: CommunicationInterface, backend: str = 'angr')
         token_lists.py
             # class
             class InsnTokenIterator
@@ -1158,7 +2783,7 @@ asm-tokenizer/
                 def id_to_token_type(self) -> npt.NDArray[np.int8] [property]
                 def lit_starts(self) -> npt.NDArray[np.int_] [property]
                 def lit_ends(self) -> npt.NDArray[np.int_] [property]
-                def get_registry_token(self, insn, reg_id) -> Tokens
+                def get_registry_token(self, reg_name: str, reg_id: int) -> Tokens
                 def get_token_id(self, token: str) -> int
                 def get_token_str(self, token_id: int) -> str
                 def size(self) -> int [property]
@@ -1314,7 +2939,7 @@ asm-tokenizer/
         utils.py
             # functions
             def register_name_range(id: int, basename: str) -> str
-            def run_length_and_last_type(type_ids: npt.NDArray[np.int_], start_set: npt.NDArray[np.int_], end_set: npt.NDArray[np.int_]) -> (npt.NDArray[np.int_], npt.NDArray[np.int_])
+            def run_length_and_last_type(type_ids: npt.NDArray[np.int_], start_set: npt.NDArray[np.int_], end_set: npt.NDArray[np.int_]) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.int_]]
             def CA_BArle_to_CBrle(c_to_a_rle: npt.NDArray[np.int_], b_to_a_rle: npt.NDArray[np.int_]) -> npt.NDArray[np.int_]
             def filter_queue(lines: list[str], out_dir: str = 'out', source_dir: str = 'src') -> list[str]
             def filter_queue_file_by_existing_output(queue_file: str, out_dir: str = 'out', source_dir: str = 'src') -> None
@@ -1393,4 +3018,15 @@ asm-tokenizer/
             functions: List[FunctionInfo] = field(default_factory=list)
             classes: List[ClassInfo] = field(default_factory=list)
             parse_error: Optional[str] = None
+    test_connection.py
+        # functions
+        async def test_primary()
+        async def test_secondary(gateway_host: str, gateway_port: int)
+    test_integration.py
+        # functions
+        async def run_mock_secondary(gateway_host: str, gateway_port: int, secondary_id: str)
+        async def run_mock_primary(num_secondaries: int = 1)
+        async def test_local()
+        async def test_ssh()
+        async def test_secondary_only(gateway_host: str, gateway_port: int, secondary_id: str)
 ```

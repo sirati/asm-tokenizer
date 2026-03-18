@@ -4,7 +4,7 @@ import angr
 from intervaltree import IntervalTree
 
 
-class AddressMetaDataLookup:
+class AngrMetadataLookup:
     def __init__(self, path):
         self.project = angr.Project(path, auto_load_libs=True)
         # Define code-related sections to include in CFG
@@ -208,3 +208,7 @@ class AddressMetaDataLookup:
             "library": self._find_library_for_addr(addr),
         }
         return fallback_meta, "synthetic"
+
+
+# Backward-compat alias
+AddressMetaDataLookup = AngrMetadataLookup

@@ -48,7 +48,7 @@ class RISCVProvider(ArchitectureProvider):
         if hasattr(insn, "operands"):
             for op in insn.operands:
                 if op.type == _OP_REG:
-                    insn_tokens.append(vocab_manager.get_registry_token(insn, op.reg))
+                    insn_tokens.append(vocab_manager.get_registry_token(insn.reg_name(op.reg), op.reg))
                 elif op.type == _OP_IMM:
                     insn_tokens.extend(
                         tokenize_operand_immediate_generic(

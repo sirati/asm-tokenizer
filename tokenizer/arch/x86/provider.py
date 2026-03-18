@@ -75,7 +75,7 @@ class X86Provider(ArchitectureProvider):
                     raise Exception(f"Unsupported x86 operand type: {op.type}")
 
                 if op.type == 1:  # register
-                    token = vocab_manager.get_registry_token(insn, op.reg)
+                    token = vocab_manager.get_registry_token(insn.reg_name(op.reg), op.reg)
                     insn_tokens.append(token)
                 elif op.type == 2:  # immediate
                     immediate_tokens = tokenize_operand_immediate(

@@ -1,24 +1,25 @@
 import typing
 from abc import ABC, abstractmethod
 from typing import List
+
 import numpy as np
 import numpy.typing as npt
 
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.token_utils import TokenUtils
 from tokenizer.tokens import (
-    Tokens,
-    TokenType,
-    PlatformToken,
-    ValuedConstToken,
-    IdentifierToken,
     BlockDefToken,
     BlockToken,
-    OpaqueConstToken,
-    MemoryOperandToken,
-    MemoryOperandSymbol,
+    IdentifierToken,
     LitTokenType,
     LocalFunctionToken,
+    MemoryOperandSymbol,
+    MemoryOperandToken,
+    OpaqueConstToken,
+    PlatformToken,
+    Tokens,
+    TokenType,
+    ValuedConstToken,
 )
 
 
@@ -246,19 +247,17 @@ class VocabularyManager:
         result.flags.writeable = False
         return result
 
-    def get_registry_token(self, insn, reg_id) -> Tokens:
+    def get_registry_token(self, reg_name: str, reg_id: int) -> Tokens:
         if len(self.registry_token_cache) <= reg_id:
             # Ensure the list is large enough
             self.registry_token_cache.extend([None] * (reg_id - len(self.registry_token_cache) + 1))
 
-        register_str = insn.reg_name(reg_id)
-        token = None
         if self.registry_token_cache[reg_id] is None:
-            token = self.PlatformToken(register_str, insn_type=PlatformInstructionTypes.REGISTRY)
+            token = self.PlatformToken(reg_name, insn_type=PlatformInstructionTypes.REGISTRY)
             self.registry_token_cache[reg_id] = token
         else:
             token = self.registry_token_cache[reg_id]
-            assert str(token) == f"{self.platform}_{register_str}", "Token mismatch for register ID"
+            assert str(token) == f"{self.platform}_{reg_name}", "Token mismatch for register ID"
 
         return token
 

@@ -48,12 +48,12 @@ def tokenize_operand_memory(
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET))
 
     if has_base:
-        tokens.append(vocab_manager.get_registry_token(insn, base))
+        tokens.append(vocab_manager.get_registry_token(insn.reg_name(base), base))
 
     if has_index:
         if has_base:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
-        tokens.append(vocab_manager.get_registry_token(insn, index))
+        tokens.append(vocab_manager.get_registry_token(insn.reg_name(index), index))
 
     if has_disp:
         if disp < 0:
