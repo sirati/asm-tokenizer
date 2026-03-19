@@ -5,11 +5,15 @@ from tokenizer.arch.provider import ArchitectureProvider
 Platform = Literal["x86", "x64", "arm32", "arm64", "mips", "mips64", "ppc", "ppc64", "riscv32", "riscv64"]
 
 
-def get_provider(platform: Platform) -> ArchitectureProvider:
+def get_provider(platform: Platform, backend: str = "angr") -> ArchitectureProvider:
     if platform in ("x86", "x64"):
-        from tokenizer.arch.x86.provider import X86Provider
+        if backend == "ghidra":
+            from tokenizer.arch.x86.ghidra.provider import X86GhidraProvider
 
-        return X86Provider(platform)
+            return X86GhidraProvider(platform)
+        from tokenizer.arch.x86.angr.provider import X86AngrProvider
+
+        return X86AngrProvider(platform)
     elif platform in ("arm32", "arm64"):
         from tokenizer.arch.arm32.provider import ARM32Provider
 
