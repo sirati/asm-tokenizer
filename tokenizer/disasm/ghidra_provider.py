@@ -46,6 +46,19 @@ class _CapMemOperand:
 
 
 @dataclass
+class _GhidraMemRawData:
+    """Raw Ghidra data for native memory operand tokenization.
+
+    Carried on _CapOperand so the Ghidra arch provider can tokenize
+    MEM operands directly from Ghidra API objects without string parsing.
+    """
+
+    ghidra_insn: Any  # Ghidra Instruction object (for size inference)
+    op_objects: list[Any]  # getOpObjects() result
+    reg_map: Any  # _RegisterMap instance (for name -> id conversion)
+
+
+@dataclass
 class _CapShift:
     """Capstone-compatible shift descriptor (ARM32)."""
 
@@ -70,6 +83,7 @@ class _CapOperand:
     mem: _CapMemOperand = field(default_factory=_CapMemOperand)
     size: int = 0  # x86 operand size in bytes
     shift: _CapShift = field(default_factory=_CapShift)
+    ghidra_raw_data: _GhidraMemRawData | None = None
 
     @dataclass
     class _CRX:
@@ -248,96 +262,223 @@ class GhidraMetadataLookup:
 # ---------------------------------------------------------------------------
 
 
-def _build_register_map(program: Any) -> dict[int, str]:
-    """Build a mapping from Ghidra register hash -> lowercase register name.
+class _RegisterMap:
+    """Bidirectional register name <-> small integer ID map.
 
-    Ghidra doesn't use integer register IDs like Capstone.  We assign a
-    stable int id to each register (hash of the Register object) and keep
-    a reverse map so ``_CapInstruction.reg_name()`` works.
+    Ghidra doesn't use integer register IDs like Capstone.  We assign
+    sequential small ints so they work as cache indices in VocabularyManager.
     """
-    reg_map: dict[int, str] = {}
-    language = program.getLanguage()
-    for reg in language.getRegisters():
-        reg_map[hash(reg)] = str(reg.getName()).lower()
-    return reg_map
+
+    def __init__(self, program: Any) -> None:
+        self._name_to_id: dict[str, int] = {}
+        self._id_to_name: dict[int, str] = {}
+        language = program.getLanguage()
+        for reg in language.getRegisters():
+            name = str(reg.getName()).lower()
+            if name not in self._name_to_id:
+                rid = len(self._name_to_id)
+                self._name_to_id[name] = rid
+                self._id_to_name[rid] = name
+
+    def get_id(self, reg_name: str) -> int:
+        """Get (or create) a small integer ID for a register name."""
+        name = reg_name.lower()
+        if name not in self._name_to_id:
+            rid = len(self._name_to_id)
+            self._name_to_id[name] = rid
+            self._id_to_name[rid] = name
+        return self._name_to_id[name]
+
+    def get_name(self, reg_id: int) -> str:
+        return self._id_to_name.get(reg_id, f"reg{reg_id}")
+
+    def as_dict(self) -> dict[int, str]:
+        """Return id->name dict for _CapInstruction.reg_name()."""
+        return dict(self._id_to_name)
+
+
+# ---------------------------------------------------------------------------
+# x86/x64 instruction translation constants
+# ---------------------------------------------------------------------------
+
+_SEGMENT_REGISTERS = frozenset({"fs", "gs", "cs", "ds", "es", "ss"})
+
+_X86_PREFIX_BYTES = frozenset(
+    {
+        0xF0,  # LOCK
+        0xF2,  # REPNE/REPNZ
+        0xF3,  # REP/REPE/REPZ
+        0x26,  # ES segment override
+        0x2E,  # CS segment override
+        0x36,  # SS segment override
+        0x3E,  # DS segment override
+        0x64,  # FS segment override
+        0x65,  # GS segment override
+        0x66,  # Operand size override
+        0x67,  # Address size override
+    }
+)
+
+_GHIDRA_SUFFIX_TO_PREFIX: dict[str, tuple[int, str]] = {
+    "repe": (0xF3, "repe"),
+    "repz": (0xF3, "repz"),
+    "rep": (0xF3, "rep"),
+    "repne": (0xF2, "repne"),
+    "repnz": (0xF2, "repnz"),
+    "lock": (0xF0, "lock"),
+}
+
+_GHIDRA_MNEMONIC_ALIASES: dict[str, str] = {
+    # Conditional jumps — Ghidra form -> Capstone canonical
+    "jz": "je",
+    "jnz": "jne",
+    "jnbe": "ja",
+    "jnae": "jb",
+    "jna": "jbe",
+    "jnb": "jae",
+    "jnge": "jl",
+    "jnle": "jg",
+    "jnl": "jge",
+    "jng": "jle",
+    "jpe": "jp",
+    "jpo": "jnp",
+    # Conditional moves
+    "cmovz": "cmove",
+    "cmovnz": "cmovne",
+    "cmovnbe": "cmova",
+    "cmovnae": "cmovb",
+    "cmovna": "cmovbe",
+    "cmovnb": "cmovae",
+    "cmovnge": "cmovl",
+    "cmovnle": "cmovg",
+    "cmovnl": "cmovge",
+    "cmovng": "cmovle",
+    # Conditional sets
+    "setz": "sete",
+    "setnz": "setne",
+    "setna": "setbe",
+    "setnae": "setb",
+    "setnb": "setae",
+    "setnbe": "seta",
+    "setng": "setle",
+    "setnge": "setl",
+    "setnl": "setge",
+    "setnle": "setg",
+    # Misc
+    "retn": "ret",
+}
+
+
+def _split_ghidra_mnemonic(raw_mnemonic: str) -> tuple[str, str | None, int | None]:
+    """Split Ghidra's suffix-encoded prefix from a mnemonic.
+
+    Ghidra encodes rep/lock as a dot-suffix: ``CMPSB.REPE``, ``ADD.LOCK``.
+    Returns ``(base_mnemonic, prefix_name, prefix_byte)`` or
+    ``(mnemonic, None, None)`` when there is no suffix.
+    """
+    lower = raw_mnemonic.lower()
+    if "." in lower:
+        base, suffix = lower.rsplit(".", 1)
+        if suffix in _GHIDRA_SUFFIX_TO_PREFIX:
+            prefix_byte, prefix_name = _GHIDRA_SUFFIX_TO_PREFIX[suffix]
+            return base, prefix_name, prefix_byte
+    return lower, None, None
+
+
+def _extract_x86_prefixes(ghidra_insn: Any) -> set[int]:
+    """Extract x86 legacy prefix bytes from the raw instruction encoding."""
+    raw = ghidra_insn.getBytes()
+    prefixes: set[int] = set()
+    for b in raw:
+        unsigned = int(b) & 0xFF
+        if unsigned in _X86_PREFIX_BYTES:
+            prefixes.add(unsigned)
+        else:
+            break  # first non-prefix byte = opcode start
+    return prefixes
 
 
 def _ghidra_insn_to_cap(
     ghidra_insn: Any,
-    reg_map: dict[int, str],
+    reg_map: _RegisterMap,
     program: Any,
 ) -> _CapInstruction:
     """Translate a single Ghidra Instruction into a _CapInstruction."""
     from ghidra.program.model.address import Address
-    from ghidra.program.model.lang import Register
+    from ghidra.program.model.lang import OperandType, Register
     from ghidra.program.model.scalar import Scalar
 
-    mnemonic = str(ghidra_insn.getMnemonicString()).lower()
-    num_ops = ghidra_insn.getNumOperands()
+    # -- Mnemonic / prefix handling -------------------------------------------
+    raw_mnemonic = str(ghidra_insn.getMnemonicString())
+    base_mnemonic, suffix_prefix_name, suffix_prefix_byte = _split_ghidra_mnemonic(raw_mnemonic)
+    base_mnemonic = _GHIDRA_MNEMONIC_ALIASES.get(base_mnemonic, base_mnemonic)
 
-    op_strs = []
+    prefix_set = _extract_x86_prefixes(ghidra_insn)
+    if suffix_prefix_byte is not None:
+        prefix_set.add(suffix_prefix_byte)
+    prefix_bytes = bytes(sorted(prefix_set))
+
+    # Capstone-compatible mnemonic: X86Provider checks mnemonic.startswith("repe") etc.
+    if suffix_prefix_name is not None:
+        mnemonic = f"{suffix_prefix_name} {base_mnemonic}"
+    else:
+        mnemonic = base_mnemonic
+
+    # -- Operand handling -----------------------------------------------------
+    num_ops = ghidra_insn.getNumOperands()
+    op_strs: list[str] = []
     operands: list[_CapOperand] = []
 
     for i in range(num_ops):
-        op_str_i = str(ghidra_insn.getDefaultOperandRepresentation(i))
-        op_strs.append(op_str_i)
+        op_repr = str(ghidra_insn.getDefaultOperandRepresentation(i))
+        op_strs.append(op_repr)
         objects = ghidra_insn.getOpObjects(i)
 
         if not objects:
             continue
 
-        first = objects[0]
+        # Detect memory operands via OperandType bitmask (no string parsing).
+        # DYNAMIC: register-based memory (e.g. [RSP + 0x10], FS:[0x28])
+        # INDIRECT: indirect memory reference (e.g. jmp [0x301f28])
+        # SCALAR|ADDRESS w/o REGISTER|CODE: absolute memory in LEA (e.g. [0x10168c])
+        op_type = ghidra_insn.getOperandType(i)
+        is_memory = (
+            bool(op_type & OperandType.DYNAMIC)
+            or bool(op_type & OperandType.INDIRECT)
+            or (
+                bool(op_type & OperandType.ADDRESS)
+                and bool(op_type & OperandType.SCALAR)
+                and not (op_type & (OperandType.REGISTER | OperandType.CODE))
+            )
+        )
 
-        if isinstance(first, Register):
-            reg_id = hash(first)
-            if str(first.getName()).lower() not in reg_map.values():
-                reg_map[reg_id] = str(first.getName()).lower()
-            operands.append(_CapOperand(type=_OP_REG, reg=reg_id))
-
-        elif isinstance(first, Scalar):
-            operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue())))
-
-        elif isinstance(first, Address):
-            # Ghidra represents memory references as Address objects.
-            # We model this as an immediate (address target) — the
-            # architecture providers will route it through the constant
-            # handler just like Capstone immediates.
-            operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset())))
-
+        if is_memory:
+            # Attach raw Ghidra objects for native tokenization in X86GhidraProvider
+            raw_data = _GhidraMemRawData(
+                ghidra_insn=ghidra_insn,
+                op_objects=list(objects),
+                reg_map=reg_map,
+            )
+            operands.append(_CapOperand(type=_OP_MEM, ghidra_raw_data=raw_data))
         else:
-            # Multiple objects in one operand slot -> likely memory operand
-            # e.g. [base + disp]
-            mem = _CapMemOperand()
-            for obj in objects:
-                if isinstance(obj, Register):
-                    rid = hash(obj)
-                    if str(obj.getName()).lower() not in reg_map.values():
-                        reg_map[rid] = str(obj.getName()).lower()
-                    if mem.base == 0:
-                        mem.base = rid
-                    else:
-                        mem.index = rid
-                elif isinstance(obj, Scalar):
-                    mem.disp = int(obj.getValue())
-                elif isinstance(obj, Address):
-                    mem.disp = int(obj.getOffset())
-            operands.append(_CapOperand(type=_OP_MEM, mem=mem))
+            first = objects[0]
+            if isinstance(first, Register):
+                reg_id = reg_map.get_id(str(first.getName()))
+                operands.append(_CapOperand(type=_OP_REG, reg=reg_id))
+            elif isinstance(first, Scalar):
+                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue())))
+            elif isinstance(first, Address):
+                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset())))
 
-    # If we got a single operand slot with multiple objects that we didn't
-    # already handle as MEM above, re-check:
-    # (The loop above handles it, but let's also handle the case where a
-    # single slot has both Register+Scalar → memory operand)
-    # This is already covered above.
-
-    insn_inner = _CapInsnInner(_insn_name=mnemonic)
+    insn_inner = _CapInsnInner(_insn_name=base_mnemonic)
 
     return _CapInstruction(
         mnemonic=mnemonic,
         op_str=", ".join(op_strs),
         operands=operands,
-        prefix=b"",
+        prefix=prefix_bytes,
         insn_inner=insn_inner,
-        reg_map=reg_map,
+        reg_map=reg_map.as_dict(),
     )
 
 
@@ -358,7 +499,11 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
     """
 
     def __init__(self, binary_path: Path) -> None:
+        import jpype.config
         import pyghidra
+
+        # Prevent JVM from hanging on Python exit (known JPype issue)
+        jpype.config.destroy_jvm = False
 
         if not pyghidra.started():
             pyghidra.start()
@@ -373,7 +518,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         self._fm = self._program.getFunctionManager()
         self._listing = self._program.getListing()
         self._memory = self._program.getMemory()
-        self._reg_map = _build_register_map(self._program)
+        self._reg_map = _RegisterMap(self._program)
         self._analyzed = False
 
     def build_cfg(self) -> None:

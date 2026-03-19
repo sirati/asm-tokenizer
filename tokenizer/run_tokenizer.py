@@ -31,6 +31,7 @@ def disassemble_to_tokens(
     pickle_mainloop_file_path: Path,
     logger: logging.Logger,
     comm: CommunicationInterface,
+    backend: str = "angr",
     with_pickled=False,
     do_pickles=True,
     **kwargs,
@@ -81,7 +82,7 @@ def disassemble_to_tokens(
     vocab_manager = VocabularyManager(platform)
 
     resolver = TokenResolver()
-    arch_provider = get_provider(platform)
+    arch_provider = get_provider(platform, backend)
     instr_sets = arch_provider.load_instruction_sets()
 
     kwargs.update(
@@ -206,6 +207,7 @@ def run_tokenizer(
                 pickle_mainloop_file_path=pickle_mainloop_file_path,
                 comm=comm,
                 logger=logger,
+                backend=backend,
             )
         )
     else:

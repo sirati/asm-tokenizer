@@ -2,14 +2,15 @@ from pathlib import Path
 from typing import List, Literal
 
 from tokenizer.arch.provider import ArchitectureProvider
-from tokenizer.arch.x86.operands import tokenize_operand_immediate, tokenize_operand_memory
+from tokenizer.arch.x86.ghidra.operands import tokenize_operand_memory_ghidra
+from tokenizer.arch.x86.operands import tokenize_operand_immediate
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
 from tokenizer.instruction_sets import InstructionSets
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Tokens
 
-_DATA_STORE_PATH = Path(__file__).parent / "data_store.json"
+_DATA_STORE_PATH = Path(__file__).parent.parent / "data_store.json"
 
 _DEGENERATE_PREFIXES: dict[int, list[str]] = {
     0xF2: ["repne", "repnz"],
@@ -17,8 +18,13 @@ _DEGENERATE_PREFIXES: dict[int, list[str]] = {
 }
 
 
-class X86Provider(ArchitectureProvider):
-    """Architecture provider for x86 and x64 platforms."""
+class X86GhidraProvider(ArchitectureProvider):
+    """Architecture provider for x86/x64 with Ghidra backend.
+
+    Prefix, mnemonic, REG, and IMM handling is shared with the angr provider.
+    MEM operands are tokenized natively from Ghidra API objects via
+    tokenize_operand_memory_ghidra().
+    """
 
     def __init__(self, platform: Literal["x86", "x64"]):
         self._platform = platform
@@ -43,7 +49,7 @@ class X86Provider(ArchitectureProvider):
         vocab_manager: VocabularyManager,
         insn_tokens: List[Tokens],
     ) -> List[Tokens]:
-        # Prefix handling
+        # Prefix handling (same as angr)
         for byte in insn.prefix:
             if byte in _DEGENERATE_PREFIXES:
                 skip = True
@@ -62,7 +68,7 @@ class X86Provider(ArchitectureProvider):
                 token = vocab_manager.PlatformToken(prefix_name, PlatformInstructionTypes.PREFIXES)
                 insn_tokens.append(token)
 
-        # Mnemonic
+        # Mnemonic (same as angr)
         insn_name = insn.insn.insn_name()
         insn_type = instr_sets.get_instruction_type(insn_name)
         token = vocab_manager.PlatformToken(insn_name, insn_type)
@@ -89,11 +95,11 @@ class X86Provider(ArchitectureProvider):
                         constant_handler,
                     )
                     insn_tokens.extend(immediate_tokens)
-                elif op.type == 3:  # memory
-                    memory_tokens = tokenize_operand_memory(
+                elif op.type == 3:  # memory — Ghidra-native path
+                    memory_tokens = tokenize_operand_memory_ghidra(
+                        op.ghidra_raw_data,
                         insn,
                         lookup,
-                        op,
                         text_end,
                         text_start,
                         func_max_addr,

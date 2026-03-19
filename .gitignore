@@ -52,7 +52,7 @@ __MACOSX
 
 # src and out and queue
 /src/
-/out/
+/out*/
 /queue/
 /run/
 

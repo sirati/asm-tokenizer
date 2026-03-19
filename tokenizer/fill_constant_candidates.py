@@ -37,10 +37,11 @@ def fill_constant_candidates(
     func_min_addr: int = int(func_addr)
     blocks: set = set()
 
-    num_blocks = len(list(func.blocks))
+    block_objs = list(func.blocks)
+    num_blocks = len(block_objs)
     block_ranges: np.ndarray = np.empty((num_blocks, 2), dtype=np.uint64)
 
-    for i, block in enumerate(func.blocks):
+    for i, block in enumerate(block_objs):
         block_ranges[i, 0] = block.addr
         block_ranges[i, 1] = block.addr + block.size
 
@@ -50,13 +51,11 @@ def fill_constant_candidates(
     block_list: list[dict[BlockToken, tuple[int, int]]] = []
     block_dict: dict[str, BlockToken] = {}
 
-    num_blocks = sum(1 for _ in func.blocks)
-
-    if num_blocks == 1 and not next(func.blocks).capstone.insns:
+    if num_blocks == 1 and not block_objs[0].capstone.insns:
         return None
 
     func_tokens = FunctionTokenList(num_blocks, vocab_manager=vocab_manager)
-    ordered_blocks = sorted(func.blocks, key=lambda b: b.addr)
+    ordered_blocks = sorted(block_objs, key=lambda b: b.addr)
     for block in ordered_blocks:
         func_max_addr = max(block.addr, block.addr + block.size)
 
