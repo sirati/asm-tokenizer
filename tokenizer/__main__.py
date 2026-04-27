@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from dynamic_batch.comm import (
+from dynamic_batch_rs.comm import (
     ErrorResponse,
     ErrorType,
     NoopInterface,
@@ -231,7 +231,7 @@ def main():
 
         if args.dynamic_queue or args.socket_path:
             if args.socket_path:
-                from dynamic_batch.comm import NamedSocketInterface
+                from dynamic_batch_rs.comm import NamedSocketInterface
 
                 logger.info(f"[*] Worker connecting to named socket: {args.socket_path}")
                 comm = NamedSocketInterface(args.socket_path, is_server=False)

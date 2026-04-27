@@ -5,7 +5,7 @@ import time
 import numpy as np
 from tqdm import tqdm
 
-from dynamic_batch.comm import CommunicationInterface, KeepaliveResponse, PhaseUpdateResponse
+from dynamic_batch_rs.comm import CommunicationInterface, KeepaliveResponse, PhaseUpdateResponse
 from dynamic_batch_tokenizer import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
