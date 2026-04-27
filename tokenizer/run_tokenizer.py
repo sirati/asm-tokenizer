@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from typing import cast
 
-from dynamic_batch.comm import CommunicationInterface, DoneResponse, KeepaliveResponse, PhaseUpdateResponse
+from dynamic_batch_rs.comm import CommunicationInterface, DoneResponse, KeepaliveResponse, PhaseUpdateResponse
 from dynamic_batch_tokenizer import TokenizerPhase
 from shared import setup_logger
 from tokenizer.arch import Platform, get_provider
