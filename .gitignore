@@ -59,7 +59,9 @@ __MACOSX
 # tokenizer hash cache
 tokenizer/.tokenizer_hash_cache.json
 
-# output articacts from nix build
-result*
-docker*
+# output artifacts from nix build (only the root-level "result"
+# symlinks; not actual Python source files named result.py)
+/result
+/result-*
+/docker*
 pyvex_ffi_parser_cache*
