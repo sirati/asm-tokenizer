@@ -5,7 +5,7 @@ from pathlib import Path
 
 from shared import BinaryInfo
 
-from dynamic_batch.task.base import Phase, StageDefinition, TaskDefinition
+from dynamic_batch.task_protocol import Phase, StageDefinition, TaskDefinition
 
 
 class TokenizerPhase(Phase):
