@@ -91,6 +91,7 @@
         python-pkgs: with python-pkgs; [
           pip
           ruff
+          pytest
         ];
 
       deploymentPackages =
@@ -159,26 +160,36 @@
         system:
         let
           pkgs = pkgsFor system;
-          python = pkgs.python314.withPackages deploymentPythonPackages;
+          dbrs = dynamic-batch-rs.packages.${system};
+          python = pkgs.python314.withPackages (
+            python-pkgs: (deploymentPythonPackages python-pkgs) ++ [ dbrs.python-package ]
+          );
           inherit (gitignore.lib) gitignoreSource;
 
-          # Filter source files using gitignore, plus exclude dot files, flake files, and result
+          # Restrict app payload to selected source directories and root Python files only
           projectSource = pkgs.lib.cleanSourceWith {
             src = gitignoreSource ./.;
             filter =
               path: type:
               let
-                baseName = baseNameOf path;
+                relPath = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+                pathParts = pkgs.lib.splitString "/" relPath;
+                topLevel = if pathParts == [ ] then "" else builtins.head pathParts;
+                isRootPyFile = builtins.match "[^/]+\\.py" relPath != null;
+                allowedTopLevelDirs = [
+                  "dynamic_batch"
+                  "dynamic_batch_tokenizer"
+                  "preproc"
+                  "shared"
+                  "tokenizer"
+                ];
               in
-              # Exclude dot files and directories
-              !(pkgs.lib.hasPrefix "." baseName)
-              &&
-                # Exclude flake files
-                baseName != "flake.nix"
-              && baseName != "flake.lock"
-              &&
-                # Exclude nix build results
-                baseName != "result";
+              if relPath == "" then
+                true
+              else if type == "directory" then
+                builtins.elem topLevel allowedTopLevelDirs
+              else
+                (builtins.elem topLevel allowedTopLevelDirs) || isRootPyFile;
           };
 
           # Create a derivation that contains the project files
@@ -189,16 +200,12 @@
           '';
         in
         {
-          dockerImage = pkgs.dockerTools.buildLayeredImage {
-            name = "asm-tokenizer";
+          dockerImageBase = pkgs.dockerTools.buildLayeredImage {
+            name = "asm-tokenizer-base";
             tag = "latest";
+            maxLayers = 3;
 
-            contents = [
-              python
-              projectFiles
-            ]
-            ++ (deploymentPackages pkgs)
-            ++ (dockerOnlyPackages pkgs);
+            contents = [ python ] ++ (deploymentPackages pkgs) ++ (dockerOnlyPackages pkgs);
 
             config = {
               Entrypoint = [
@@ -209,7 +216,26 @@
             };
           };
 
-          default = self.packages.${system}.dockerImage;
+          dockerImageApp = pkgs.dockerTools.buildLayeredImage {
+            name = "asm-tokenizer";
+            tag = "latest";
+            maxLayers = 6;
+
+            fromImage = self.packages.${system}.dockerImageBase;
+
+            contents = [ projectFiles ];
+
+            config = {
+              Entrypoint = [
+                "${python}/bin/python"
+                "-m"
+              ];
+              WorkingDir = "/app";
+            };
+          };
+
+          dockerImage = self.packages.${system}.dockerImageApp;
+          default = self.packages.${system}.dockerImageApp;
         }
       );
     };
