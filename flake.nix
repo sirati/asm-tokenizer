@@ -216,52 +216,82 @@
 
           # ── Semantic layer plan ───────────────────────────────────
           #
-          # Define each user-facing concern as a "unit" — an ordered
-          # list (most-specific first → foundational last). The
-          # generic `semantic-layering.nix` helper turns this into
-          # a chain of split_paths peels for buildLayeredImage's
-          # layeringPipeline arg.
+          # Each unit becomes ONE or TWO layers (per
+          # `semantic-layering.nix`'s subcomponent_out approach):
+          #   isolate=false → 1 layer (unit's full closure)
+          #   isolate=true  → 2 layers (roots alone + deps)
+          # The "rest" after all unit peels becomes one basics
+          # layer (or, with --impure + NIX_DOCKER_LAYER_CACHE, a
+          # chain that preserves the previous build's basics-tier
+          # layer grouping).
           #
-          # Layer-by-layer outcome (bottom-up in the docker manifest):
+          # Order matters: peel FOUNDATIONAL units first (they end
+          # up at the bottom of the docker manifest, and earlier
+          # peels claim shared closure paths so later units don't
+          # redundantly include e.g. python3+libc).
           #
-          #   project_code               (projectFiles only)
-          #   rust_wheel                 (dbrs.python-package only)
-          #   rust_wheel_exclusive_deps  (popularity-contested)
-          #   ghidra + openjdk21         (each in own layer)
-          #   tokenizer_python_pkgs      (each in own layer)
-          #   basics                     (popularity-contested:
-          #                              python interpreter, glibc,
-          #                              gcc-lib, openssl, bash,
-          #                              coreutils, gtk libs, ...)
+          # Layer-by-layer outcome (bottom-up in docker manifest):
           #
-          # Partial rebuild: any unit's content is deterministic in
-          # its inputs, so unchanged categories produce identical
-          # layer.tar bytes → identical sha256 → upload-side blob
-          # cache hits in dynamic_batch/packaging/layered_transfer.py.
-          # Across input-changing rebuilds, set
-          # NIX_DOCKER_LAYER_CACHE=<path-to-prev-assignment.json>
-          # and pass `--impure` to stabilise basics-tier popularity
-          # ordering — see nix/semantic-layering.nix docstring.
+          #   base-python (1 layer)        - python3 interpreter +
+          #                                  its closure: glibc,
+          #                                  openssl, libc++, etc.
+          #   ghidra (1 layer)             - ghidra + jdk21 + their
+          #                                  exclusive transitive
+          #                                  closure (gtk/glib/etc.
+          #                                  if not already in base)
+          #   tokenizer-python (1 layer)   - numpy, pandas, sympy,
+          #                                  capstone, lief, etc.
+          #                                  AND their exclusive
+          #                                  closure under the
+          #                                  reduced graph
+          #   angr (1 layer)               - angr + angr-only deps
+          #                                  (z3, pyvex, etc.)
+          #   rust-wheel (2 layers)        - the wheel alone, then
+          #                                  its rust-only closure
+          #                                  (usually just the wheel
+          #                                  since python3 is
+          #                                  claimed by base-python)
+          #   project-code (1-2 layers)    - projectFiles alone, no
+          #                                  closure → 1 layer
+          #   basics (1 layer)             - whatever's left:
+          #                                  bash, coreutils, etc.
+          #                                  (or per-prev-layer
+          #                                  groups via --impure)
+          #
+          # Total: ~7 explicit layers + customisation = 8 layers.
+          # Well under docker's ~127 ceiling, well under any
+          # podman limit. Each layer's content is deterministic in
+          # its unit's nix-store inputs, so partial rebuilds via
+          # content-addressed blob cache (see
+          # dynamic_batch/packaging/layered_transfer.py) flow
+          # naturally.
 
-          tokenizerPyPkgRoots = deploymentPythonPackages pkgs.python314.pkgs;
+          py = pkgs.python314.pkgs;
 
-          # Optional impure read of a previous build's layer
-          # assignment, captured via
-          # `nix/extract-layer-assignment.py`. When unset we use
-          # the standard popularity_contest for the basics tier.
+          # angr is split out from the rest of the python pkgs
+          # because it's the largest single python package
+          # (~85 MB) and updates independently of the others.
+          tokenizerPyOtherRoots = with py; [
+            capstone
+            lief
+            pyelftools
+            pyghidra
+            intervaltree
+            numpy
+            pandas
+            tqdm
+            portalocker
+            aioquic
+            websockets
+          ];
+
           previousAssignment = semanticLayering.readAssignmentFromEnv "NIX_DOCKER_LAYER_CACHE";
 
           dockerLayeringPipeline = semanticLayering.buildPipeline {
             units = [
               {
-                name = "project-code";
-                roots = [ projectFiles ];
-                isolate = true;
-              }
-              {
-                name = "rust-wheel";
-                roots = [ dbrs.python-package ];
-                isolate = true;
+                name = "base-python";
+                roots = [ pkgs.python314 ];
               }
               {
                 name = "ghidra";
@@ -272,12 +302,23 @@
               }
               {
                 name = "tokenizer-python";
-                roots = tokenizerPyPkgRoots;
+                roots = tokenizerPyOtherRoots;
+              }
+              {
+                name = "angr";
+                roots = [ py.angr ];
+              }
+              {
+                name = "rust-wheel";
+                roots = [ dbrs.python-package ];
+                isolate = true;
+              }
+              {
+                name = "project-code";
+                roots = [ projectFiles ];
+                isolate = true;
               }
             ];
-            # Cap at 120 to stay under docker's ~127 manifest
-            # ceiling. Our closure has ~80 paths; popularity_contest
-            # gives one path per layer below the cap.
             maxLayers = 120;
             inherit previousAssignment;
           };

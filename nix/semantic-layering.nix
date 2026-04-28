@@ -101,66 +101,110 @@ let
   toRoots = roots: map (p: "${p}") roots;
 
   /*
-    Op applied to a unit's "main" subgraph (the unit's
-    exclusive content after split_paths peel).
-
-    `isolate=true` → subcomponent_in puts JUST the explicit roots
-    into one layer; remaining exclusive deps get
-    popularity-contested into individual layers.
-
-    `isolate=false` → popularity_contest splits the entire main
-    subgraph (roots + exclusive deps) into one layer per path.
+    No-op pipeline step (identity). `pipe([])` curried with data
+    returns data unchanged.
   */
-  unitMainOp = unit:
-    if unit.isolate or false then
-      [
-        "pipe"
-        [
-          [
-            "subcomponent_in"
-            (toRoots unit.roots)
-          ]
-          [
-            "over"
-            "rest"
-            [ "popularity_contest" ]
-          ]
-        ]
-      ]
-    else
-      [ "popularity_contest" ];
+  noop = [
+    "pipe"
+    [ ]
+  ];
 
   /*
-    Recursively chain the basics tier into a sequence of explicit
-    `split_paths` operations, one per previously-existing layer.
-    This keeps each old layer's exact content together (modulo
-    paths that no longer exist in the current closure), so the
-    upload-side blob cache hits across rebuilds.
+    Each unit becomes ONE layer (non-isolate) or TWO layers
+    (isolate). We use `subcomponent_out` to claim the unit's full
+    closure (no `common` output to deal with — unlike split_paths,
+    subcomponent_out gives just `{main, rest}`). Order matters:
+    a unit's `subcomponent_out` claims paths from its closure that
+    earlier units didn't already peel. So peel foundational units
+    FIRST (they appear earlier in the units list).
 
-    Termination: the chain ends with the LAST layer's split_paths
-    alone — no `over rest` after it. Whatever ends up in that
-    final `rest` (i.e., paths added to the closure since the
-    previous build) becomes ONE merged layer when `flatten` walks
-    the result. We can't append `over rest [popularity_contest]`
-    at the bottom: split_paths might consume all remaining graph,
-    omitting `rest` from the result dict, which would crash the
-    next stage with KeyError. So we accept a coarser layer for
-    newly-added closure paths — usually rare and small if you're
-    rebuilding the same project.
+    Layout:
+      isolate=false → one layer for the unit's full closure
+      isolate=true  → one layer for the explicit roots, one layer
+                      for everything else in their closure
 
-    To get fresh popularity_contest layering for new paths, just
-    run one build without NIX_DOCKER_LAYER_CACHE set, then save
-    the resulting assignment for subsequent rebuilds.
+    Compared to the previous popularity-contest design, we
+    typically end up with one tenth as many layers — easier on
+    docker's manifest ceiling, fewer cache misses to track in
+    layered_transfer.py, simpler to reason about for partial
+    rebuilds. The trade-off: a single change to any path inside a
+    layer invalidates the whole layer's bytes, so a 200 MB
+    "tokenizer-python-other" layer with one new wheel costs 200 MB
+    on the wire. Pick units accordingly: if a sub-package is
+    likely to update independently, give it its own unit (see
+    `angr` in our flake.nix).
+  */
+
+  /*
+    Build the per-unit ops emitted into the pipeline:
+      - subcomponent_out roots → {main: closure, rest: bulk}
+      - if isolate, also: over main [subcomponent_in roots]
+        → main becomes {main: just_roots, rest: deps}
+  */
+  peelOps =
+    unit:
+    [
+      [
+        "subcomponent_out"
+        (toRoots unit.roots)
+      ]
+    ]
+    ++ lib.optional (unit.isolate or false) [
+      "over"
+      "main"
+      [
+        "subcomponent_in"
+        (toRoots unit.roots)
+      ]
+    ];
+
+  /*
+    Recursively chain the units. Each unit's peel emits one or
+    two layers, then `over rest` recurses on the remaining graph.
+    Last unit terminates the chain: applies its peel + (optional)
+    isolate transform, then `over rest [basicsOp]` if basicsOp is
+    non-trivial, else just stops.
+
+    "Stops" means: whatever's in `rest` of the last peel becomes
+    one layer when `flatten` walks the result dict. That's the
+    basics tier when basicsOp is noop.
+  */
+  chainUnits =
+    basicsOp: remainingUnits:
+    if remainingUnits == [ ] then
+      basicsOp
+    else
+      let
+        unit = builtins.head remainingUnits;
+        rest = builtins.tail remainingUnits;
+        recurseStep = [
+          "over"
+          "rest"
+          (chainUnits basicsOp rest)
+        ];
+      in
+      [
+        "pipe"
+        ((peelOps unit) ++ [ recurseStep ])
+      ];
+
+  /*
+    Optional partial-build helper. Replaces the basics tier's
+    "everything in one layer" default with a chain of split_paths
+    that preserves each previously-existing layer's content
+    grouping. Useful when the basics tier is itself heterogeneous
+    enough that you want layer-by-layer cache stability across
+    input changes.
+
+    Reads the previous assignment from a JSON file via
+    `readAssignmentFromEnv`. Requires `--impure`.
   */
   preserveLayers =
     layers:
     let
       nonEmpty = builtins.filter (paths: paths != [ ]) layers;
     in
-    if nonEmpty == [ ] then
-      [ "popularity_contest" ]
-    else
-      preserveLayersChain nonEmpty;
+    if nonEmpty == [ ] then noop else preserveLayersChain nonEmpty;
 
   preserveLayersChain =
     layers:
@@ -185,40 +229,6 @@ let
             "over"
             "rest"
             (preserveLayersChain rest)
-          ]
-        ]
-      ];
-
-  /*
-    Recursively peel remaining units from the "rest" subgraph of
-    the previously-peeled split. Base case applies the basics-tier
-    op (popularity_contest, or a previousAssignment-preserving
-    chain).
-  */
-  chainUnits = basicsOp: remainingUnits:
-    if remainingUnits == [ ] then
-      basicsOp
-    else
-      let
-        unit = builtins.head remainingUnits;
-        rest = builtins.tail remainingUnits;
-      in
-      [
-        "pipe"
-        [
-          [
-            "split_paths"
-            (toRoots unit.roots)
-          ]
-          [
-            "over"
-            "main"
-            (unitMainOp unit)
-          ]
-          [
-            "over"
-            "rest"
-            (chainUnits basicsOp rest)
           ]
         ]
       ];
@@ -249,11 +259,7 @@ in
       previousAssignment ? null,
     }:
     let
-      basicsOp =
-        if previousAssignment != null then
-          preserveLayers previousAssignment
-        else
-          [ "popularity_contest" ];
+      basicsOp = if previousAssignment != null then preserveLayers previousAssignment else noop;
     in
     if units == [ ] then
       [
@@ -268,28 +274,20 @@ in
       let
         firstUnit = builtins.head units;
         restUnits = builtins.tail units;
-      in
-      [
-        [
-          "split_paths"
-          (toRoots firstUnit.roots)
-        ]
-        [
-          "over"
-          "main"
-          (unitMainOp firstUnit)
-        ]
-        [
+        recurseStep = [
           "over"
           "rest"
           (chainUnits basicsOp restUnits)
-        ]
+        ];
+      in
+      ((peelOps firstUnit) ++ [
+        recurseStep
         [ "flatten" ]
         [
           "limit_layers"
           maxLayers
         ]
-      ];
+      ]);
 
   /*
     Convenience: read a previous layer assignment from a JSON file
