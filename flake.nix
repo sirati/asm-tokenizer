@@ -162,6 +162,7 @@
           pkgs = pkgsFor system;
           dbrs = dynamic-batch-rs.packages.${system};
           inherit (gitignore.lib) gitignoreSource;
+          semanticLayering = import ./nix/semantic-layering.nix { inherit (pkgs) lib; };
 
           # Python WITHOUT the rust wheel — that goes into its own
           # explicit layer (see `dockerImage` below). The bulk python
@@ -213,154 +214,73 @@
             ln -s ${dbrs.python-package}/lib $out/opt/runner-wheel/lib
           '';
 
-          # Concrete root paths for each semantic category. By
-          # listing these as roots for `split_paths`, each peel-off
-          # yields a dict `{main, common, rest}` where:
-          #   - `main` = closure(roots) - paths reachable from rest
-          #             (the category's exclusive content)
-          #   - `common` = closure(roots) ∩ closure(rest)
-          #                (deps shared with what's not yet peeled)
-          #   - `rest`   = paths not reachable from roots
+          # ── Semantic layer plan ───────────────────────────────────
           #
-          # Iterating peels in specific-first order gives us
-          # non-overlapping layers, lowest peel = topmost layer.
-          # See nixpkgs/pkgs/by-name/fl/flatten-references-graph/
-          # for the algorithm.
-
-          ghidraRoots = [
-            "${pkgs.ghidra}"
-            "${pkgs.openjdk21}"
-          ];
-
-          # The python packages used by the tokenizer worker (and
-          # only those — the wheel and project source live in their
-          # own layers above). split_paths on these collects the
-          # python-pkgs.<*> derivations + each one's exclusive
-          # closure into a "main" subgraph.
-          tokenizerPyPkgRoots = map (p: "${p}") (
-            deploymentPythonPackages pkgs.python314.pkgs
-          );
-
-          # ── Explicit semantic layering ────────────────────────────
+          # Define each user-facing concern as a "unit" — an ordered
+          # list (most-specific first → foundational last). The
+          # generic `semantic-layering.nix` helper turns this into
+          # a chain of split_paths peels for buildLayeredImage's
+          # layeringPipeline arg.
           #
-          # Pipeline is read top-down as "peel off the most-specific
-          # categories first; whatever doesn't fit becomes basics".
-          # The order in the pipeline output (after `flatten`) ends
-          # up bottom-up in the docker manifest, so the topmost
-          # (most-volatile) layer in the image is `project code`.
-          #
-          # Layer-by-layer breakdown after `flatten` (bottom-up
-          # in the image, left-to-right in the pipeline output):
+          # Layer-by-layer outcome (bottom-up in the docker manifest):
           #
           #   project_code               (projectFiles only)
           #   rust_wheel                 (dbrs.python-package only)
-          #   rust_wheel_exclusive_deps  (popularity-contested if non-empty)
-          #   rust_wheel_shared          (deps shared with rest of bulk)
-          #   ghidra+jdk_main            (popularity-contested)
-          #   ghidra_shared              (deps shared with rest of bulk)
-          #   tokenizer_python_pkgs      (popularity-contested)
-          #   tokenizer_python_shared    (deps shared with basics)
+          #   rust_wheel_exclusive_deps  (popularity-contested)
+          #   ghidra + openjdk21         (each in own layer)
+          #   tokenizer_python_pkgs      (each in own layer)
           #   basics                     (popularity-contested:
           #                              python interpreter, glibc,
           #                              gcc-lib, openssl, bash,
-          #                              coreutils, ...)
+          #                              coreutils, gtk libs, ...)
           #
-          # Each "split_paths" peel emits {main, common, rest} in
-          # dict-insertion order, which is what flatten walks. The
-          # `over <key> <pipe>` pattern keeps recursing into "rest"
-          # to layer-up the next category.
-          #
-          # Partial rebuild: when one of these categories changes
-          # (e.g. you edit rust source and rebuild the wheel), only
-          # the layers whose `main` content changed get a new
-          # sha256 of layer.tar. layered_transfer.py keys its
-          # gateway-side blob cache by exactly that sha, so the
-          # untouched categories upload zero bytes. Determinism
-          # comes from nix; the partial-rebuild win comes from the
-          # cache.
+          # Partial rebuild: any unit's content is deterministic in
+          # its inputs, so unchanged categories produce identical
+          # layer.tar bytes → identical sha256 → upload-side blob
+          # cache hits in dynamic_batch/packaging/layered_transfer.py.
+          # Across input-changing rebuilds, set
+          # NIX_DOCKER_LAYER_CACHE=<path-to-prev-assignment.json>
+          # and pass `--impure` to stabilise basics-tier popularity
+          # ordering — see nix/semantic-layering.nix docstring.
 
-          dockerLayeringPipeline = [
-            # 1. Peel: project code
-            [ "split_paths" [ "${projectFiles}" ] ]
-            [
-              "over"
-              "rest"
-              [
-                "pipe"
-                [
-                  # 2. Peel: rust wheel
-                  [ "split_paths" [ "${dbrs.python-package}" ] ]
-                  [
-                    "over"
-                    "main"
-                    [
-                      "pipe"
-                      [
-                        # Separate the wheel from its exclusive deps
-                        # — wheel alone in `main`, deps in `rest`.
-                        [ "subcomponent_in" [ "${dbrs.python-package}" ] ]
-                        [
-                          "over"
-                          "rest"
-                          [ "popularity_contest" ]
-                        ]
-                      ]
-                    ]
-                  ]
-                  [
-                    "over"
-                    "rest"
-                    [
-                      "pipe"
-                      [
-                        # 3. Peel: ghidra + openjdk
-                        [ "split_paths" ghidraRoots ]
-                        [
-                          "over"
-                          "main"
-                          [ "popularity_contest" ]
-                        ]
-                        [
-                          "over"
-                          "rest"
-                          [
-                            "pipe"
-                            [
-                              # 4. Peel: tokenizer python packages
-                              [ "split_paths" tokenizerPyPkgRoots ]
-                              [
-                                "over"
-                                "main"
-                                [ "popularity_contest" ]
-                              ]
-                              # 5. Whatever's left = basics
-                              # (python interpreter, glibc, openssl,
-                              # bash, coreutils, gcc-lib, ...).
-                              [
-                                "over"
-                                "rest"
-                                [ "popularity_contest" ]
-                              ]
-                            ]
-                          ]
-                        ]
-                      ]
-                    ]
-                  ]
-                ]
-              ]
-            ]
-            [ "flatten" ]
-            # Cap at 120 to stay below docker's manifest layer
-            # ceiling (~127). The semantic peels above produce ~10
-            # named layers; the rest is popularity_contest output
-            # (one path per layer). 120 leaves headroom for
-            # ~110 popularity-only basics layers — plenty.
-            [
-              "limit_layers"
-              120
-            ]
-          ];
+          tokenizerPyPkgRoots = deploymentPythonPackages pkgs.python314.pkgs;
+
+          # Optional impure read of a previous build's layer
+          # assignment, captured via
+          # `nix/extract-layer-assignment.py`. When unset we use
+          # the standard popularity_contest for the basics tier.
+          previousAssignment = semanticLayering.readAssignmentFromEnv "NIX_DOCKER_LAYER_CACHE";
+
+          dockerLayeringPipeline = semanticLayering.buildPipeline {
+            units = [
+              {
+                name = "project-code";
+                roots = [ projectFiles ];
+                isolate = true;
+              }
+              {
+                name = "rust-wheel";
+                roots = [ dbrs.python-package ];
+                isolate = true;
+              }
+              {
+                name = "ghidra";
+                roots = [
+                  pkgs.ghidra
+                  pkgs.openjdk21
+                ];
+              }
+              {
+                name = "tokenizer-python";
+                roots = tokenizerPyPkgRoots;
+              }
+            ];
+            # Cap at 120 to stay under docker's ~127 manifest
+            # ceiling. Our closure has ~80 paths; popularity_contest
+            # gives one path per layer below the cap.
+            maxLayers = 120;
+            inherit previousAssignment;
+          };
 
         in
         {
