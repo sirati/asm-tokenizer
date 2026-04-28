@@ -65,3 +65,9 @@ tokenizer/.tokenizer_hash_cache.json
 /result-*
 /docker*
 pyvex_ffi_parser_cache*
+
+# Per-developer cache for incremental nix-docker layer assignment
+# (consumed via NIX_DOCKER_LAYER_CACHE in flake.nix; refreshed
+# automatically by PodmanPackaging after each successful build).
+/.docker-layer-cache.json
+/.docker-layer-cache.json.partial
