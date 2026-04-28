@@ -66,6 +66,13 @@ tokenizer/.tokenizer_hash_cache.json
 /docker*
 pyvex_ffi_parser_cache*
 
+# nix build symlinks anywhere in the tree
+**/result
+**/result-*
+
+# Zed editor agent rules (auto-generated)
+.rules-zed-provided
+
 # Per-developer cache for incremental nix-docker layer assignment
 # (consumed via NIX_DOCKER_LAYER_CACHE in flake.nix; refreshed
 # automatically by PodmanPackaging after each successful build).
