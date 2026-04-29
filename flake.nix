@@ -192,7 +192,7 @@
                 topLevel = if pathParts == [ ] then "" else builtins.head pathParts;
                 isRootPyFile = builtins.match "[^/]+\\.py" relPath != null;
                 allowedTopLevelDirs = [
-                  "dynamic_runner_tokenizer"
+                  "dynrunner"
                   "preproc"
                   "shared"
                   "tokenizer"
