@@ -1,49 +1,72 @@
-"""Stub TaskDefinition for a hypothetical disassembler task.
+"""TaskDefinition stub for a hypothetical disassembler task.
 
 The point isn't to actually disassemble — it's to demonstrate that the
 runner accepts a task with a different identifier shape, different
-phase set, different memory model, and a different worker module
-without any change to the `dynamic_runner` package.
+memory model, and a different worker module without any change to the
+`dynamic_runner` package.
 """
 
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
+from collections.abc import Iterable
 from pathlib import Path
 
 from shared import BinaryInfo
 
-from dynamic_runner.task_protocol import Phase, StageDefinition
+from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 
-class DisasmPhase(Phase):
-    DISASSEMBLE = "disassemble"
-    SYMBOL_EXTRACT = "symbol-extract"
+_PHASE_ID = "disassemble"
+_TYPE_ID = "disasm"
 
 
 class DisasmTask:
-    """Implements the dynamic_runner.task_protocol.TaskDefinition shape
-    structurally — no inheritance required.
-    """
+    """Implements `dynamic_runner.task_protocol.TaskDefinition` structurally
+    — no inheritance required."""
 
-    def get_stages(self) -> list[StageDefinition]:
-        return [
-            StageDefinition(phase=DisasmPhase.DISASSEMBLE, timeout_seconds=None),
-            StageDefinition(phase=DisasmPhase.SYMBOL_EXTRACT, timeout_seconds=30.0),
-        ]
+    # ── Topology ───────────────────────────────────────────────────────
 
-    def organize_and_sort_items(self, items: list[BinaryInfo]) -> list[BinaryInfo]:
-        # Smallest first — opposite of the tokenizer, just to demonstrate
-        # tasks pick their own ordering.
-        return sorted(items, key=lambda b: b.size)
+    def get_phases(self) -> tuple[PhaseSpec, ...]:
+        return (
+            PhaseSpec(
+                phase_id=_PHASE_ID,
+                types=(
+                    TaskTypeSpec(
+                        type_id=_TYPE_ID,
+                        worker_module="disasm_worker",
+                        # The old code had a 30s timeout on the
+                        # SYMBOL_EXTRACT stage. With one consolidated
+                        # type the worker reports its internal
+                        # progress via keepalive; choose the tighter
+                        # of the two old timeouts.
+                        timeout_seconds=30.0,
+                        reserved_memory_per_worker=128 * 1024 * 1024,
+                    ),
+                ),
+            ),
+        )
 
-    def estimate_memory(self, binary_size: int) -> int:
-        # Constant 256 MiB per binary, regardless of size. Different
-        # model than the tokenizer's power-law estimator.
+    # ── Item discovery ─────────────────────────────────────────────────
+
+    def discover_items(
+        self, source_dir: Path, args: Namespace
+    ) -> Iterable[BinaryInfo]:
+        """Scan `source_dir` for binaries; tag each with this task's
+        single phase + type. The actual file scan is whatever the
+        existing disasm-task pipeline produced before — for the
+        stub task this is a noop placeholder."""
+        # Stub task: this is a hypothetical disassembler that doesn't
+        # actually scan anything. Real consumers replace this with their
+        # own scan (e.g. via `dynamic_runner._shared.find_matching_binaries`).
+        return ()
+
+    # ── Per-type plumbing ──────────────────────────────────────────────
+
+    def estimate_memory(self, item: BinaryInfo) -> int:
+        # Constant 256 MiB per binary. Receives the full item now
+        # (was: just `binary_size: int`).
         return 256 * 1024 * 1024
-
-    def get_worker_module(self) -> str:
-        return "disasm_worker"
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
@@ -55,6 +78,7 @@ class DisasmTask:
 
     def build_worker_command_args(
         self,
+        type_id: TypeId,
         args: Namespace,
         source_dir: Path,
         output_dir: Path,
@@ -62,8 +86,24 @@ class DisasmTask:
     ) -> list[str]:
         return ["--symbol-format", args.symbol_format]
 
-    def get_output_filename_pattern(self, input_filename: str) -> str:
-        return f"{input_filename}.disasm"
+    def get_output_filename_pattern(
+        self, type_id: TypeId, item: BinaryInfo
+    ) -> str:
+        # `item.path.name` is the binary filename.
+        return f"{item.path.name}.disasm"
 
-    def get_reserved_memory_per_worker(self) -> int:
-        return 128 * 1024 * 1024
+    # ── Lifecycle hooks ────────────────────────────────────────────────
+
+    def on_run_start(
+        self, source_dir: Path, output_dir: Path, args: Namespace
+    ) -> None:
+        pass
+
+    def on_run_end(self, success: bool) -> None:
+        pass
+
+    def on_phase_start(self, phase_id: str) -> None:
+        pass
+
+    def on_phase_end(self, phase_id: str, completed: int, failed: int) -> None:
+        pass
