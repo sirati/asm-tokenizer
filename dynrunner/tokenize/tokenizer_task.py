@@ -13,15 +13,33 @@ import math
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from collections.abc import Iterable
+from enum import Enum
 from pathlib import Path
 
-from shared import BinaryInfo
-
+from dynamic_runner._shared import (
+    TaskInfo,
+    find_matching_binaries,
+    process_selection_arguments,
+)
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 
 _PHASE_ID = "tokenize"
 _TYPE_ID = "tokenizer"
+
+
+class TokenizerPhase(str, Enum):
+    """Worker-internal progress labels.
+
+    The framework no longer cares about these — the new task protocol
+    has only one phase per type. The worker still emits these strings
+    via `PhaseUpdateResponse` so the runner's logs/progress bar can show
+    which sub-stage of tokenization is running.
+    """
+
+    ANGR_1 = "angr-1"
+    ANGR_2 = "angr-2"
+    TOKENIZATION = "tokenization"
 
 
 class TokenizerTask:
@@ -51,32 +69,40 @@ class TokenizerTask:
 
     def discover_items(
         self, source_dir: Path, args: Namespace
-    ) -> Iterable[BinaryInfo]:
-        """Yield binaries discovered under `source_dir`, grouped by
-        binary name with intra-group size-DESC ordering preserved.
+    ) -> Iterable[TaskInfo]:
+        """Yield binaries under `source_dir`, grouped by binary name with
+        intra-group size-DESC ordering, and tagged with this task's
+        phase + type.
 
-        The old `organize_and_sort_items` did this re-ordering after
-        the framework's file scan; the new design folds the scan and
-        the ordering into one method.
+        The old `organize_and_sort_items` did the re-ordering after the
+        framework's file scan; the new design folds the scan and the
+        ordering into one method.
         """
-        # The scan helper lives in the framework; importing lazily so
-        # the file still parses without dynamic_runner installed.
-        from dynamic_runner._shared.binary_info import format_size  # noqa: F401  (proves import works)
-        # Real scan: delegate to the framework's matching helper. We
-        # don't have the full filter args here in the stub; in
-        # production this method receives `args` populated with
-        # whatever `add_task_arguments` declared and the framework's
-        # standard `--platforms / --compilers / ...` filters.
-        items: list[BinaryInfo] = list(_collect_unsorted(source_dir, args))
+        return self._sort_and_tag(_scan(source_dir, args))
 
-        # Group by binary_name; sort within group by size DESC; order
-        # groups by group-average size DESC. Same shape as the old
-        # `organize_and_sort_items`; now lives inside discovery.
-        groups: dict[str, list[BinaryInfo]] = defaultdict(list)
+    def organize_and_sort_items(
+        self, items: Iterable[TaskInfo]
+    ) -> list[TaskInfo]:
+        """Compat shim for the legacy `dynamic_runner.run()` path.
+
+        The runner's `run.py` still calls `find_matching_binaries` +
+        `task.organize_and_sort_items()` instead of `discover_items()`.
+        This method preserves the historical sort+tag behaviour so the
+        legacy entry point keeps working until the runner is updated to
+        call `discover_items`. Both methods share `_sort_and_tag`.
+        """
+        return list(self._sort_and_tag(items))
+
+    @staticmethod
+    def _sort_and_tag(items: Iterable[TaskInfo]) -> Iterable[TaskInfo]:
+        """Group by binary_name; sort within group by size DESC; order
+        groups by group-average size DESC; tag each item with this
+        task's phase + type."""
+        groups: dict[str, list[TaskInfo]] = defaultdict(list)
         for binary in items:
             groups[binary.binary_name].append(binary)
 
-        group_averages: list[tuple[str, float, list[BinaryInfo]]] = []
+        group_averages: list[tuple[str, float, list[TaskInfo]]] = []
         for binary_name, group in groups.items():
             avg_size = sum(b.size for b in group) / len(group)
             group.sort(key=lambda b: b.size, reverse=True)
@@ -95,7 +121,7 @@ class TokenizerTask:
 
     # ── Per-type plumbing ──────────────────────────────────────────────
 
-    def estimate_memory(self, item: BinaryInfo) -> int:
+    def estimate_memory(self, item: TaskInfo) -> int:
         """Power-law estimator: RAM_MiB = 430.870 * size_MiB^1.051 + 260.15.
 
         R² = 0.9866, RMSE = 203.66 MiB. Adds the RMSE so we
@@ -128,7 +154,7 @@ class TokenizerTask:
         return cmd_args
 
     def get_output_filename_pattern(
-        self, type_id: TypeId, item: BinaryInfo
+        self, type_id: TypeId, item: TaskInfo
     ) -> str:
         return f"{item.path.name}_output.csv"
 
@@ -149,14 +175,28 @@ class TokenizerTask:
         pass
 
 
-def _collect_unsorted(
-    source_dir: Path, args: Namespace
-) -> Iterable[BinaryInfo]:
-    """Stub file scanner.
+def _scan(source_dir: Path, args: Namespace) -> list[TaskInfo]:
+    """Scan `source_dir` for binaries matching the framework's standard
+    selection arguments (`--platform`, `--compiler`, `--compiler-versions`,
+    `--opt`, `--file-format`, `--version-regex`, `--opt-regex`,
+    `--name-regex`, `--exclude-subfolder`).
 
-    Production code would call into `dynamic_runner._shared`'s
-    `find_matching_binaries` helper to apply standard filters; the
-    stub returns nothing because this task is a fixture, not an
-    actual production tokenizer.
+    Mirrors the pattern used by `tokenizer/vocab_unifier/__main__.py`:
+    build a `SelectionConfig` from the parsed `args` Namespace and pass
+    its fields into `find_matching_binaries`. `source_dir` is passed by
+    the framework but `config.source_dir` is the canonical, resolved
+    value (Path-resolved, validated to exist).
     """
-    return ()
+    config = process_selection_arguments(args)
+    return find_matching_binaries(
+        source_dir=config.source_dir,
+        platforms=config.platforms,
+        compiler=config.compiler,
+        compiler_versions=config.compiler_versions,
+        opt_levels=config.opt_levels,
+        format_string=config.file_format,
+        version_regex=config.version_regex,
+        opt_regex=config.opt_regex,
+        name_regex=config.name_regex,
+        exclude_subfolders=config.exclude_subfolders,
+    )
