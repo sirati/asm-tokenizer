@@ -7,6 +7,9 @@
       url = "path:./rust/dynamic_batch";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # New extracted flakes — wired into outputs in T3.1-D, not yet used here.
+    dynamic-runner.url = "github:sirati/dynamic-runner/v0.1.0";
+    nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
     gitignore = {
       url = "github:hercules-ci/gitignore.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -18,6 +21,8 @@
       self,
       nixpkgs,
       dynamic-batch-rs,
+      dynamic-runner,
+      nix-docker-layered-image,
       gitignore,
     }:
     let
