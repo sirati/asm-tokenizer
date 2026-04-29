@@ -2,7 +2,7 @@
 
 Demonstrates the "task-agnostic" property of the runner: a sibling
 package can compose its own identifier shape (here: file_hash + arch)
-without changing anything in `rust/` or `dynamic_batch/`. The runner
+without changing anything in the `dynamic_runner` package. The runner
 ingests the canonical key string and treats it opaquely.
 """
 
