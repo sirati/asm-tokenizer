@@ -3,12 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/e4bae1bd10c9c57b2cf517953ab70060a828ee6f";
-    dynamic-batch-rs = {
-      url = "path:./rust/dynamic_batch";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    # New extracted flakes — wired into outputs in T3.1-D, not yet used here.
+    # External runner: provides `python3Packages.dynamic-runner` via its
+    # overlay (replaces the previous in-tree `dynamic-batch-rs` path-flake).
     dynamic-runner.url = "github:sirati/dynamic-runner/v0.1.0";
+    # Generic semantic-layering helpers + extract-layer-assignment tool
+    # (replaces the in-tree `nix/semantic-layering.nix` import).
     nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
     gitignore = {
       url = "github:hercules-ci/gitignore.nix";
@@ -20,7 +19,6 @@
     {
       self,
       nixpkgs,
-      dynamic-batch-rs,
       dynamic-runner,
       nix-docker-layered-image,
       gitignore,
@@ -70,7 +68,12 @@
         system:
         import nixpkgs {
           inherit system;
-          overlays = [ pyghidraOverlay ];
+          overlays = [
+            pyghidraOverlay
+            # Injects `dynamic-runner` into every Python package set,
+            # so `pkgs.python314.pkgs.dynamic-runner` is in scope.
+            dynamic-runner.overlays.default
+          ];
         };
 
       # Package definitions
@@ -127,7 +130,6 @@
         system:
         let
           pkgs = pkgsFor system;
-          dbrs = dynamic-batch-rs.packages.${system};
         in
         {
           default = pkgs.mkShell {
@@ -136,11 +138,10 @@
               [
                 (python314.withPackages (
                   python-pkgs:
-                  (deploymentPythonPackages python-pkgs) ++ (devPythonPackages python-pkgs) ++ [ dbrs.python-package ]
+                  (deploymentPythonPackages python-pkgs)
+                  ++ (devPythonPackages python-pkgs)
+                  ++ [ python-pkgs.dynamic-runner ]
                 ))
-                dbrs.rust-toolchain
-                maturin
-                rustfmt
                 pkg-config
               ]
               ++ (deploymentPackages pkgs)
@@ -165,9 +166,11 @@
         system:
         let
           pkgs = pkgsFor system;
-          dbrs = dynamic-batch-rs.packages.${system};
+          # Pre-built rust+python wheel from the external dynamic-runner
+          # flake (consumed via its overlay; see `pkgsFor`).
+          runnerWheel = pkgs.python314.pkgs.dynamic-runner;
           inherit (gitignore.lib) gitignoreSource;
-          semanticLayering = import ./nix/semantic-layering.nix { inherit (pkgs) lib; };
+          semanticLayering = nix-docker-layered-image.lib.${system}.semanticLayering;
 
           # Python WITHOUT the rust wheel — that goes into its own
           # explicit layer (see `dockerImage` below). The bulk python
@@ -216,13 +219,13 @@
           # it without adding it to bulkPython's wrapper.
           rustWheelTree = pkgs.runCommand "rust-wheel-tree" { } ''
             mkdir -p $out/opt/runner-wheel
-            ln -s ${dbrs.python-package}/lib $out/opt/runner-wheel/lib
+            ln -s ${runnerWheel}/lib $out/opt/runner-wheel/lib
           '';
 
           # ── Semantic layer plan ───────────────────────────────────
           #
-          # Each unit becomes ONE or TWO layers (per
-          # `semantic-layering.nix`'s subcomponent_out approach):
+          # Each unit becomes ONE or TWO layers (per the external
+          # `nix-docker-layered-image` flake's subcomponent_out approach):
           #   isolate=false → 1 layer (unit's full closure)
           #   isolate=true  → 2 layers (roots alone + deps)
           # The "rest" after all unit peels becomes one basics
@@ -315,7 +318,7 @@
               }
               {
                 name = "rust-wheel";
-                roots = [ dbrs.python-package ];
+                roots = [ runnerWheel ];
                 isolate = true;
               }
               {
