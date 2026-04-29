@@ -193,7 +193,6 @@
                 isRootPyFile = builtins.match "[^/]+\\.py" relPath != null;
                 allowedTopLevelDirs = [
                   "dynamic_runner_tokenizer"
-                  "dynamic_runner_disasm"
                   "preproc"
                   "shared"
                   "tokenizer"
