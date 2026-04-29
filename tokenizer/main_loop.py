@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 
 from dynamic_runner.comm import CommunicationInterface, KeepaliveResponse, PhaseUpdateResponse
-from dynamic_batch_tokenizer import TokenizerPhase
+from dynrunner.tokenize import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
