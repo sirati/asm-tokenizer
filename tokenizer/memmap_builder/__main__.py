@@ -14,6 +14,7 @@ from shared import (
     process_selection_arguments,
 )
 
+from ._pairing import match_csv_to_mapping
 from .builder import BinaryVersionInfo, build_memmap_files
 
 
@@ -23,27 +24,6 @@ def group_binaries_by_name(binaries):
     for binary in binaries:
         grouped[binary.binary_name].append(binary)
     return grouped
-
-
-def match_csv_to_mapping(csv_binaries, mapping_binaries):
-    """Match each CSV binary to its corresponding mapping file.
-
-    Returns dict mapping csv BinaryInfo to mapping BinaryInfo.
-    """
-    matched = {}
-    unmatched_csv = []
-
-    for csv_bin in csv_binaries:
-        found = False
-        for map_bin in mapping_binaries:
-            if csv_bin.identifier == map_bin.identifier:
-                matched[csv_bin.identifier] = map_bin
-                found = True
-                break
-        if not found:
-            unmatched_csv.append(csv_bin)
-
-    return matched, unmatched_csv
 
 
 def main() -> None:
