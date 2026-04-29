@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/e4bae1bd10c9c57b2cf517953ab70060a828ee6f";
     # External runner: provides `python3Packages.dynamic-runner` via its
     # overlay (replaces the previous in-tree `dynamic-batch-rs` path-flake).
-    dynamic-runner.url = "github:sirati/dynamic-runner/b1b97431d0679ed5c8ba7df9c801471e697d61b5";
+    dynamic-runner.url = "github:sirati/dynamic-runner/02a7196e852420e7c61387ebccd5028b869c420c";
     # Generic semantic-layering helpers + extract-layer-assignment tool
     # (replaces the in-tree `nix/semantic-layering.nix` import).
     nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
