@@ -11,13 +11,13 @@
         "narHash": "sha256-P9DJNamricEWMvo3ryUHx9coctWTmyvigqo76GXsrZk=",
         "owner": "sirati",
         "repo": "dynamic-runner",
-        "rev": "02a7196e852420e7c61387ebccd5028b869c420c",
+        "rev": "55fc5d432f4b48db63d1a8382df1c9e8af6b6e8b",
         "type": "github"
       },
       "original": {
         "owner": "sirati",
+        "ref": "v0.2.0",
         "repo": "dynamic-runner",
-        "rev": "02a7196e852420e7c61387ebccd5028b869c420c",
         "type": "github"
       }
     },
