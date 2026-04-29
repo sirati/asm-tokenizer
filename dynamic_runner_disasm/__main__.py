@@ -1,5 +1,5 @@
 """Acceptance-test entry: prove the runner is task-agnostic by using
-the same `dynamic_batch.run` facade and `make_subprocess_spawn_factory`
+the same `dynamic_runner.run` facade and `make_subprocess_spawn_factory`
 helper that the tokenizer package uses, with a totally different task.
 """
 

@@ -3,7 +3,7 @@
 The point isn't to actually disassemble — it's to demonstrate that the
 runner accepts a task with a different identifier shape, different
 phase set, different memory model, and a different worker module
-without any change to `rust/` or `dynamic_batch/`.
+without any change to the `dynamic_runner` package.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from pathlib import Path
 
 from shared import BinaryInfo
 
-from dynamic_batch.task_protocol import Phase, StageDefinition
+from dynamic_runner.task_protocol import Phase, StageDefinition
 
 
 class DisasmPhase(Phase):
@@ -22,7 +22,7 @@ class DisasmPhase(Phase):
 
 
 class DisasmTask:
-    """Implements the dynamic_batch.task_protocol.TaskDefinition shape
+    """Implements the dynamic_runner.task_protocol.TaskDefinition shape
     structurally — no inheritance required.
     """
 

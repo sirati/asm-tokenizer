@@ -192,8 +192,8 @@
                 topLevel = if pathParts == [ ] then "" else builtins.head pathParts;
                 isRootPyFile = builtins.match "[^/]+\\.py" relPath != null;
                 allowedTopLevelDirs = [
-                  "dynamic_batch"
-                  "dynamic_batch_tokenizer"
+                  "dynamic_runner_tokenizer"
+                  "dynamic_runner_disasm"
                   "preproc"
                   "shared"
                   "tokenizer"
@@ -271,7 +271,7 @@
           # podman limit. Each layer's content is deterministic in
           # its unit's nix-store inputs, so partial rebuilds via
           # content-addressed blob cache (see
-          # dynamic_batch/packaging/layered_transfer.py) flow
+          # dynamic_runner.packaging.layered_transfer) flow
           # naturally.
 
           py = pkgs.python314.pkgs;
@@ -334,7 +334,7 @@
         in
         {
           # Single image. The base/app split is retired; layered
-          # transfer (dynamic_batch/packaging/layered_transfer.py)
+          # transfer (dynamic_runner.packaging.layered_transfer)
           # provides per-blob upload deduplication on the gateway,
           # so the historical reason for the split (avoid
           # re-uploading a 2.7 GB static base) is now redundant.
