@@ -17,9 +17,9 @@ if [[ ! "$TIMEOUT" =~ ^[0-9]+s$ ]]; then
 fi
 
 # timeout --foreground -k "$TIMEOUT" "$TIMEOUT" \
-#   python -m dynamic_batch --raw-logs --debugs --debug --simulate-errors 40 --platform x86 --compiler clang "$@" 2>&1 | tail -n "$TAIL_LINES"
+#   python -m dynamic_runner_tokenizer --raw-logs --debugs --debug --simulate-errors 40 --platform x86 --compiler clang "$@" 2>&1 | tail -n "$TAIL_LINES"
 
 # TAIL is disabled for now - its better that way - do not add a tail yourself
 
 timeout --foreground -k "$TIMEOUT" "$TIMEOUT" \
-  python -m dynamic_batch --raw-logs --debugs --debug --simulate-errors 40 --platform x86 --compiler clang "$@" 2>&1
+  python -m dynamic_runner_tokenizer --raw-logs --debugs --debug --simulate-errors 40 --platform x86 --compiler clang "$@" 2>&1
