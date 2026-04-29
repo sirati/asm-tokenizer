@@ -65,7 +65,30 @@ dispatch site — only the wire format needs the slot. Python workers
 gain a `command.payload: dict` field they can read instead of
 re-deriving state.
 
-## 3. `nix/wheel.nix` `cargoDeps.hash` is stale post-v0.1.1
+## 3. Resource discovery is not cgroup-aware
+
+**Where:** `python/dynamic_runner/system_resources.py` (and the
+secondary's RAM probe at
+`crates/dynrunner-manager-distributed/src/secondary/setup.rs`).
+
+**Current behaviour:** `psutil.virtual_memory().total` and
+`psutil.cpu_count()` read system-wide values from `/proc/meminfo` and
+the kernel cpuset, not from the cgroup the process is in. When
+asm-tokenizer runs inside a `systemd-run --scope -p MemoryMax=24G -p
+CPUQuota=1600%` (or any container/cgroup-limited environment), each
+secondary reports `ram_gb=91.87` and the manager's scheduler budgets
+against that, while the kernel still enforces the cgroup at 24 GiB.
+Result: the runner over-commits and, on a non-toy workload, the
+cgroup OOM-killer fires.
+
+**Suggested fix:** read `/sys/fs/cgroup/memory.max` (cgroup v2) or the
+v1 equivalent first, fall back to `/proc/meminfo` only when the
+cgroup isn't memory-constrained. Same idea for cpus: prefer
+`/sys/fs/cgroup/cpu.max` (the `quota period` pair maps to fractional
+cores) then fall back to `psutil.cpu_count()`. The Rust
+`secondary/setup.rs` has the same issue and needs the same fix.
+
+## 4. `nix/wheel.nix` `cargoDeps.hash` is stale post-v0.1.1
 
 **Where:** `nix/wheel.nix:27`.
 
