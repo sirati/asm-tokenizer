@@ -6,7 +6,7 @@ from .tokenizer_task import TokenizerTask
 def main():
     run(
         task=TokenizerTask(),
-        spawn_secondary_factory=make_subprocess_spawn_factory("dynamic_runner_tokenizer"),
+        spawn_secondary_factory=make_subprocess_spawn_factory("dynrunner.tokenize"),
         description="Dynamic batch processing for binary tokenization with memory-aware parallel execution",
     )
 
