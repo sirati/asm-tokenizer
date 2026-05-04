@@ -1,4 +1,4 @@
-from dynamic_runner import make_subprocess_spawn_factory, run
+from dynamic_runner import TaskDeploymentSpec, run
 
 from .tokenizer_task import TokenizerTask
 
@@ -6,7 +6,10 @@ from .tokenizer_task import TokenizerTask
 def main():
     run(
         task=TokenizerTask(),
-        spawn_secondary_factory=make_subprocess_spawn_factory("dynrunner.tokenize"),
+        deployment=TaskDeploymentSpec(
+            secondary_module="dynrunner.tokenize",
+            image_name="asm-tokenizer",
+        ),
         description="Dynamic batch processing for binary tokenization with memory-aware parallel execution",
     )
 

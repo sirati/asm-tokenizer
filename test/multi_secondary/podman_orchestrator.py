@@ -63,6 +63,8 @@ def make_podman_spawn(
     output_root: Path,
     raw_logs: bool,
     cgroup_parent: str | None,
+    container_cpus: float,
+    container_memory: str,
     extra_runner_flags: list[str],
 ):
     """Return a `spawn_secondary(primary_url, secondary_id, quic_port)` callback
@@ -85,6 +87,13 @@ def make_podman_spawn(
             # accept a `.scope` parent — its default systemd manager
             # only accepts `.slice` parents.
             "--cgroup-manager=cgroupfs",
+            f"--cpus={container_cpus}",
+            # No `--memory` here: under cgroupfs+systemd-scope-parent the
+            # outer scope hasn't enabled the memory controller in
+            # `cgroup.subtree_control`, so crun fails to write
+            # `memory.max` for the container's nested cgroup. The outer
+            # scope's MemoryMax is what enforces total RAM anyway, so
+            # the per-container slice is informational at best.
         ]
         if cgroup_parent:
             cmd.extend(["--cgroup-parent", cgroup_parent])
@@ -146,6 +155,17 @@ def main() -> int:
     parser.add_argument("--compiler", default="gcc")
     parser.add_argument("--raw-logs", action="store_true")
     parser.add_argument("--keep-output", action="store_true")
+    # Per-container budget. Defaults pin each secondary to exactly one
+    # worker so the workload spreads across containers (otherwise the
+    # SLURM-primary's local manager drains the small set before peer
+    # secondaries see any cross-secondary assignments).
+    parser.add_argument("--container-cpus", type=float, default=1.0)
+    parser.add_argument("--container-memory", default="4G")
+    parser.add_argument("--secondary-cores", type=int, default=1,
+                        help="Per-secondary --cores forwarded to dynrunner; "
+                             "1 means the manager spawns a single worker.")
+    parser.add_argument("--secondary-max-memory", default="4G",
+                        help="Per-secondary --max-memory forwarded to dynrunner.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -192,16 +212,21 @@ def main() -> int:
         logging.error("no binaries matched; check --input-dir and filters")
         return 1
 
-    # Per-binary command args the secondary forwards to the workers.
-    # `args.simulate_errors` is checked by `build_worker_command_args` —
-    # we don't simulate failures in this test.
-    extra_runner_flags: list[str] = []
+    # Forward a per-secondary resource budget so the worker manager
+    # plans against the same numbers podman is enforcing at the cgroup.
+    # With --secondary-cores 1 the manager spawns exactly one worker.
+    extra_runner_flags: list[str] = [
+        "--cores", str(args.secondary_cores),
+        "--max-memory", args.secondary_max_memory,
+    ]
 
     spawn_secondary = make_podman_spawn(
         input_host=args.input_dir,
         output_root=args.output_root,
         raw_logs=args.raw_logs,
         cgroup_parent=cgroup,
+        container_cpus=args.container_cpus,
+        container_memory=args.container_memory,
         extra_runner_flags=extra_runner_flags,
     )
 

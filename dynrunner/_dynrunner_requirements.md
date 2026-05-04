@@ -88,18 +88,31 @@ cgroup isn't memory-constrained. Same idea for cpus: prefer
 cores) then fall back to `psutil.cpu_count()`. The Rust
 `secondary/setup.rs` has the same issue and needs the same fix.
 
-## 4. `nix/wheel.nix` `cargoDeps.hash` is stale post-v0.1.1
+### 3a. Secondary path silently drops `--cores` and `--max-memory`
 
-**Where:** `nix/wheel.nix:27`.
+**Where:** `python/dynamic_runner/run.py:221-227` (`_dispatch_secondary`).
 
-**Current behaviour:** the hash was pinned at v0.1.1 build time. The
-phases/types/affinity work added new Rust dependencies (`serde_json`,
-`thiserror 2.0.18`, etc.); the recorded hash no longer matches the
-vendored Cargo deps. `nix develop` / `nix build .#dockerImage` from
-asm-tokenizer fails with `hash mismatch in fixed-output derivation`.
+**Current behaviour:** the secondary's `argparse` accepts `--cores` /
+`--max-memory` (the same flags the primary takes), but
+`_dispatch_secondary` builds `SecondaryConfig` from
+`psutil.virtual_memory().total` and
+`psutil.cpu_count(logical=False) or 4` instead of `args.cores` /
+`args.max_memory`. The user-supplied override is parsed and discarded.
 
-**Suggested fix:** rebuild against the current `Cargo.lock` and pin
-the new hash. `lib.fakeHash` placeholder + one failing build to read
-back the correct value is the canonical recipe. asm-tokenizer's
-flake already does this for its own pin — the same flow applies
-upstream.
+**Impact on asm-tokenizer:** the multi-secondary podman test at
+`test/multi_secondary/podman_orchestrator.py` cannot get a single
+worker per container even with `--cores 1` forwarded into the
+container — every secondary spawns 16 workers (one per host physical
+core) and the SLURM-promoted secondary drains the entire workload
+before peer secondaries see any cross-secondary assignment. Effect:
+multi-secondary dispatch can't be observed on small workloads.
+
+**Suggested fix:** in `_dispatch_secondary` honor `args.cores` /
+`args.max_memory` when present (same `parse_cores` / `parse_memory`
+helpers the primary uses), fall back to the cgroup-aware probe, fall
+back to psutil last. This is also the only API the test harness has
+to constrain a containerized secondary to fewer workers than the
+host's physical-core count — `--cpus` and `--cpuset-cpus` on the
+container don't reach `psutil.cpu_count(logical=False)`, which reads
+`/proc/cpuinfo` and ignores the cgroup.
+

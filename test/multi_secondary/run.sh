@@ -161,9 +161,15 @@ main() {
   log "   output : $pmulti_root"
   log "   log    : $pmulti_log"
   cd "$REPO_ROOT"
+  # 5 secondaries / 1 cpu each / 1 worker per manager so the 5-binary
+  # workload actually spreads across containers. Each container gets a
+  # 4G slice (well under the 24G outer cgroup) so the kernel doesn't
+  # over-commit if every secondary peaks at once.
   PATH="$PODMAN_BIN:$PATH" \
     nix develop --command python "$REPO_ROOT/test/multi_secondary/podman_orchestrator.py" \
-      --raw-logs --num-secondaries 3 \
+      --raw-logs --num-secondaries 5 \
+      --container-cpus 1 --container-memory 4G \
+      --secondary-cores 1 --secondary-max-memory 4G \
       --input-dir "$INPUT_DIR" \
       --output-root "$pmulti_root" \
       >>"$pmulti_log" 2>&1
