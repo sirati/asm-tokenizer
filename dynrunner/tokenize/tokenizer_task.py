@@ -9,6 +9,7 @@ framework now (the new design has no `get_stages`).
 
 from __future__ import annotations
 
+import logging
 import math
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
@@ -31,6 +32,8 @@ from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 _PHASE_ID = "tokenize"
 _TYPE_ID = "tokenizer"
+
+_logger = logging.getLogger(__name__)
 
 
 class TokenizerPhase(str, Enum):
@@ -93,7 +96,33 @@ class TokenizerTask:
                 root = str(config.source_dir)
                 gateway_url = None
             items = _native.find_items(self, root, gateway_url=gateway_url)
-            return self._sort_and_tag(root, items)
+            sorted_items = list(self._sort_and_tag(root, items))
+
+            if getattr(args, "skip_existing", False):
+                output_root = _existing_outputs_root(args, config)
+                if output_root is not None:
+                    completed = _collect_existing_output_filenames(
+                        output_root, gateway_url
+                    )
+                    before = len(sorted_items)
+                    sorted_items = [
+                        it
+                        for it in sorted_items
+                        if self.get_output_filename_pattern(_TYPE_ID, it)
+                        not in completed
+                    ]
+                    skipped = before - len(sorted_items)
+                    _logger.info(
+                        "skip-existing: %d candidates → %d remaining "
+                        "(%d skipped via %d existing outputs at %s)",
+                        before,
+                        len(sorted_items),
+                        skipped,
+                        len(completed),
+                        output_root,
+                    )
+
+            return sorted_items
         finally:
             self._filters = None
 
@@ -229,3 +258,76 @@ class TokenizerTask:
 
     def on_phase_end(self, phase_id: str, completed: int, failed: int) -> None:
         pass
+
+
+class _OutputFilenameCollector:
+    """Single-purpose visitor for `_native.find_items`: walks an output
+    tree and records every basename in `self.filenames`.
+
+    Used by `TokenizerTask.discover_items` when `--skip-existing` is set
+    so the task can drop already-completed binaries from the source
+    candidate list. Stays at the task level (not the framework) so the
+    "what counts as already done" decision lives next to
+    `get_output_filename_pattern`, the matching key.
+
+    Doesn't call `f.mark(...)` — we don't need `find_items` to return
+    `TaskInfo` records, just the side-effect set of basenames.
+    """
+
+    def __init__(self) -> None:
+        self.filenames: set[str] = set()
+
+    def visit(
+        self,
+        parent_payload: object,
+        subfolders: list,
+        files: list,
+    ) -> None:
+        for folder in subfolders:
+            folder.enter(True)
+        for f in files:
+            self.filenames.add(f.name)
+
+
+def _existing_outputs_root(args: Namespace, config) -> str | None:
+    """Where to look for already-completed outputs.
+
+    Pre-staged SLURM mode: gateway-side `<slurm-root>/<output-subfolder>`,
+    mirroring `slurm_config.get_output_dir()`'s computation but rebuilt
+    here from args because `discover_items` isn't given the SlurmConfig.
+    Returns `None` when the SLURM flags aren't set.
+
+    Local modes: the resolved local `--output` dir.
+
+    Caller must pass an absolute path to `--slurm-root-folder` (no
+    tilde-expansion is applied here; the framework's gateway-aware
+    expansion in `_make_slurm_config` doesn't run on this path).
+    """
+    if getattr(args, "source_already_staged", None):
+        slurm_root = getattr(args, "slurm_root_folder", None)
+        if not slurm_root:
+            return None
+        output_subfolder = getattr(args, "slurm_output_subfolder", None) or "out"
+        return f"{slurm_root}/{output_subfolder}"
+    return str(config.output_dir)
+
+
+def _collect_existing_output_filenames(
+    output_root: str, gateway_url: str | None
+) -> set[str]:
+    """Walk `output_root` via `_native.find_items` and return the set of
+    file basenames present.
+
+    A non-existent `output_root` (first run; framework hasn't created the
+    directory yet) yields an empty set rather than an error — the
+    skip-existing filter degrades to no-op on a fresh deployment instead
+    of failing the whole dispatch.
+    """
+    collector = _OutputFilenameCollector()
+    try:
+        _native.find_items(collector, output_root, gateway_url=gateway_url)
+    except OSError:
+        # Path doesn't exist or unreadable — first-run case; treat as
+        # "no completions yet".
+        return set()
+    return collector.filenames
