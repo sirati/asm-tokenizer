@@ -48,8 +48,9 @@ nix develop --command bash -c '
 | `--platform x86 x64 arm32 arm64 mips32 mips64` | Allowlist of architectures matched against the format-string's `platform` field. Omit a platform to drop those binaries. |
 | `--jobs N` | Number of SLURM secondaries to spawn. Start at 1 for first validation; bump to 2+ for multi-node fan-out. |
 | `--slurm-time-limit 30` | sbatch `--time` in minutes. Short enough that a runaway job auto-terminates. |
+| `--slurm-partition <name>` | (Optional) sbatch `--partition`. Defaults to `All` (all 131 rock-named nodes). For LMU CIP, useful values: `AMD` (66 nodes, "Gesteine B"), `NvidiaAll` (25, GPU nodes), `Krater` (40), `Abaki` (4). |
 | `--raw-logs` | Bypass log file rewrites. Recommended for ad-hoc dispatches; the wrapper script still tees the secondary's stdout/stderr into `<slurm-root>/log/run_<ts>/slurm_<jobid>.{out,err}`. |
-| `--skip-existing` | (Optional) Idempotent re-runs: skip binaries with existing CSV output. Useful for re-dispatch without manually clearing the gateway out dir. |
+| `--skip-existing` | (Optional) Idempotent re-runs: filtered task-side in `discover_items` against `args.resolved_output_root` (gateway-side `<slurm-root>/<output-subfolder>` in pre-staged mode, local `--output` otherwise). Walks the output dir via the same `_native.find_items` SSH backend the source walk uses, drops any binary whose `get_output_filename_pattern` filename is already present. |
 
 ### What you do NOT need
 
