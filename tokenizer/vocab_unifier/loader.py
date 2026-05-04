@@ -92,7 +92,16 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
 
 def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> VocabularyManager | None:
     if platform is None:
-        platform_options = Platform.__args__
+        # Use the canonical tokenizer Platform list (not the local
+        # `Platform | Literal["unified"]` alias — `"unified"` is a
+        # marker for already-unified vocab files, not a filename prefix).
+        # Sort by length DESC so longer prefixes match first (e.g.
+        # "mips64" wins over "mips" for `mips64-...` filenames; without
+        # this, `mips64-...`.startswith("mips") would silently
+        # mis-detect). Mirrors the tokenizer's auto-detect order in
+        # `tokenizer/run_tokenizer.py:_ALL_PLATFORMS`.
+        from tokenizer.arch import Platform as _CanonicalPlatform
+        platform_options = sorted(_CanonicalPlatform.__args__, key=len, reverse=True)
         file_name = csv_path.name
         for option in platform_options:
             if file_name.startswith(option):
