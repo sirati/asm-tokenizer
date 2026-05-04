@@ -1,18 +1,19 @@
 """Worker subprocess for `dynrunner.build_memmap`.
 
-Receives one ``ProcessBinaryCommand`` per group; the ``relative_path``
-points at a manifest JSON file written by the starting instance's
-``MemmapBuilderTask.discover_items``. The worker:
+Receives one ``ProcessBinaryCommand`` per group. The wire's
+``relative_path`` is the binary_name (an opaque identifier; not a
+filesystem path) and ``payload`` is a JSON string containing the
+per-version pairing data the starting instance prepared. The worker:
 
-1. Resolves the manifest path (absolute paths pass through unchanged;
-   relative paths are joined onto ``--source-dir``).
-2. Reads the manifest, reconstructs ``BinaryVersionInfo`` instances.
+1. Parses ``command.payload`` into a ``versions`` list of
+   ``{csv_path, mapping_path, arch, compiler, compilerversion, opt}``.
+2. Reconstructs ``BinaryVersionInfo`` instances.
 3. Calls ``tokenizer.memmap_builder.builder.build_memmap_files`` once
    for the group and replies ``done``.
 
-The worker scans nothing, calls ``find_matching_binaries`` nowhere,
-and does no pairing or grouping — those concerns live entirely in the
-starting instance.
+The worker scans nothing, reads no manifest from disk, and does no
+pairing or grouping — those concerns live entirely in
+``MemmapBuilderTask.discover_items`` on the starting instance.
 """
 
 from __future__ import annotations
@@ -38,9 +39,11 @@ from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
 
 
-def _process_manifest(manifest_path: Path, output_dir: Path) -> None:
-    """Read a manifest, reconstruct BinaryVersionInfo, build memmap."""
-    data = json.loads(manifest_path.read_text())
+def _process_payload(
+    binary_name: str, payload_json: str, output_dir: Path
+) -> None:
+    """Parse the inline payload, reconstruct BinaryVersionInfo, build memmap."""
+    data = json.loads(payload_json)
     versions_raw = data["versions"]
     versions = [
         BinaryVersionInfo(
@@ -53,7 +56,6 @@ def _process_manifest(manifest_path: Path, output_dir: Path) -> None:
         )
         for entry in versions_raw
     ]
-    binary_name = manifest_path.stem  # `<binary_name>.json` -> `<binary_name>`
     build_memmap_files(versions, output_dir, binary_name)
 
 
@@ -87,7 +89,11 @@ def main() -> None:
             "--source",
             type=str,
             required=True,
-            help="Source directory (manifest paths are resolved against this)",
+            help=(
+                "Source directory. Informational only at this layer — "
+                "the per-version csv/mapping paths come absolute inside "
+                "the wire's task payload."
+            ),
         )
         parser.add_argument(
             "--output",
@@ -99,7 +105,10 @@ def main() -> None:
             "--vocab-source",
             type=str,
             default=None,
-            help="Vocab source directory (informational; manifests carry absolute mapping paths)",
+            help=(
+                "Vocab source directory (informational; the wire payload "
+                "carries absolute mapping paths)."
+            ),
         )
         parser.add_argument(
             "--log-file",
@@ -109,7 +118,11 @@ def main() -> None:
         parser.add_argument(
             "--skip_existing",
             action="store_true",
-            help="Accepted for framework compatibility; per-group skip is governed by the manifest list.",
+            help=(
+                "Accepted for framework compatibility; per-group skip "
+                "is governed by the starting instance's discover_items "
+                "filter, not the worker."
+            ),
         )
 
         args = parser.parse_args()
@@ -167,15 +180,26 @@ def main() -> None:
                     logger.info("[*] Received stop command, shutting down")
                     break
 
-                # `relative_path` may be absolute (manifest lives under
-                # output_dir, not source_dir). Path-join handles both:
-                # joining an absolute child onto any base just returns
-                # the absolute child.
-                manifest_path = source_dir / command.relative_path
-                logger.info(f"[*] Processing manifest: {manifest_path}")
+                # `relative_path` is the binary_name; `payload` is the
+                # per-version pairing JSON. Both come from the wire's
+                # `task:` form (see ProcessBinaryCommand).
+                binary_name = command.relative_path
+                if not command.payload:
+                    response = ErrorResponse(
+                        error_type=ErrorType.NON_RECOVERABLE,
+                        error_message=(
+                            f"build_memmap worker received task without "
+                            f"payload for binary_name={binary_name!r}; "
+                            f"discover_items must emit non-empty "
+                            f"TaskInfo.payload for this task type."
+                        ),
+                    )
+                    comm.send_response(response)
+                    continue
+                logger.info(f"[*] Processing group: {binary_name}")
 
                 try:
-                    _process_manifest(manifest_path, output_dir)
+                    _process_payload(binary_name, command.payload, output_dir)
                     from dynamic_runner.comm import DoneResponse
 
                     comm.send_response(DoneResponse())
@@ -195,7 +219,7 @@ def main() -> None:
                     break
                 except Exception as e:
                     tb_str = traceback.format_exc()
-                    logger.error(f"[!] Error processing {manifest_path}:\n{tb_str}")
+                    logger.error(f"[!] Error processing {binary_name}:\n{tb_str}")
                     response = ErrorResponse(
                         error_type=ErrorType.RECOVERABLE,
                         error_message=f"{type(e).__name__}: {str(e)}",
