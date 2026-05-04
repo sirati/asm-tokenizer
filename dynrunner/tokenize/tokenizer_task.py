@@ -10,25 +10,21 @@ framework now (the new design has no `get_stages`).
 from __future__ import annotations
 
 import math
-import re
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from re import Pattern
 
 from dynamic_runner import _native
 from dynamic_runner._shared import (
     BinaryIdentifier,
+    SelectionFilters,
     TaskInfo,
+    compile_selection_filters,
+    is_excluded_subfolder,
+    match_filename,
     process_selection_arguments,
-)
-from dynamic_runner._shared.binary_info import (
-    build_binary_filename_format,
-    build_field_regexes,
-    parse_binary_filename,
 )
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
@@ -88,7 +84,7 @@ class TokenizerTask:
         without re-deriving from args per directory.
         """
         config = process_selection_arguments(args)
-        self._filters = _build_filters(config)
+        self._filters: SelectionFilters | None = compile_selection_filters(config)
         try:
             if getattr(args, "source_already_staged", None):
                 root = args.source_already_staged
@@ -111,10 +107,10 @@ class TokenizerTask:
 
         `parent_payload` carries the relative path of the current
         directory (set by the parent's `enter()`; `None` at root).
-        Mirrors today's `find_matching_binaries`: prune subfolders
-        matching `--exclude-subfolder`, mark files matching the format
-        regex + field allowlists with the parsed `BinaryIdentifier` as
-        the per-file payload.
+        Per-file matching + per-subfolder exclude both delegate to the
+        framework's `match_filename` / `is_excluded_subfolder` helpers
+        so this stays in lockstep with the standard
+        `platform-compiler-version-opt-binary` filename format.
         """
         filters = self._filters
         if filters is None:
@@ -126,45 +122,15 @@ class TokenizerTask:
             child_rel = (
                 f"{current_rel}/{folder.name}" if current_rel else folder.name
             )
-            if (
-                filters.exclude_pattern is not None
-                and filters.exclude_pattern.search(child_rel)
-            ):
+            if is_excluded_subfolder(child_rel, filters):
                 folder.enter(False)
             else:
                 folder.enter(True, payload=child_rel)
 
         for f in files:
-            if f.name.startswith("."):
-                continue
-            parsed = parse_binary_filename(f.name, filters.binary_format)
-            if not parsed:
-                continue
-            platform, comp, version, opt, binary_name = parsed
-            if platform not in filters.platforms:
-                continue
-            if filters.compiler and comp != filters.compiler:
-                continue
-            if (
-                filters.compiler_versions
-                and version not in filters.compiler_versions
-            ):
-                continue
-            if (
-                filters.normalized_opt_levels
-                and opt not in filters.normalized_opt_levels
-            ):
-                continue
-            f.mark(
-                True,
-                payload=BinaryIdentifier(
-                    binary_name=binary_name,
-                    platform=platform,
-                    compiler=comp,
-                    version=version,
-                    opt_level=opt,
-                ),
-            )
+            identifier = match_filename(f.name, filters)
+            if identifier is not None:
+                f.mark(True, payload=identifier)
 
     @staticmethod
     def _sort_and_tag(root: str, items: Iterable) -> Iterable[TaskInfo]:
@@ -263,75 +229,3 @@ class TokenizerTask:
 
     def on_phase_end(self, phase_id: str, completed: int, failed: int) -> None:
         pass
-
-
-@dataclass
-class _ScanFilters:
-    """Pre-compiled per-walk filter state read by `TokenizerTask.visit`.
-
-    Replaces the field-by-field args munging that today's
-    `find_matching_binaries` does inline. Compiled once per
-    `discover_items` call; the visitor reads it for every directory
-    without re-deriving regexes.
-    """
-
-    binary_format: object
-    platforms: list[str]
-    compiler: str | None
-    compiler_versions: list[str] | None
-    normalized_opt_levels: list[str] | None
-    exclude_pattern: Pattern[str] | None
-
-
-def _build_filters(config) -> _ScanFilters:
-    """Compile per-walk filter state from a `SelectionConfig`.
-
-    Mirrors the field-regex / opt-level normalisation / exclude-pattern
-    logic in `dynamic_runner._shared.binary_selector.find_matching_binaries`.
-    Refactor candidate: hoist this into a framework helper so any task
-    using the standard `platform-compiler-version-opt-binary` filename
-    format can share the compilation step instead of re-implementing.
-    """
-    field_regexes = build_field_regexes(
-        platforms=config.platforms,
-        compilers=[config.compiler] if config.compiler else None,
-        versions=config.compiler_versions,
-        opt_levels=config.opt_levels,
-        version_regex=config.version_regex,
-        opt_regex=config.opt_regex,
-        name_regex=config.name_regex,
-    )
-    binary_format = build_binary_filename_format(
-        config.file_format, field_regexes
-    )
-
-    normalized_opt_levels: list[str] | None = None
-    if config.opt_levels:
-        opt_pattern = config.opt_regex if config.opt_regex else r"[oO]([0123s])"
-        opt_re = re.compile(opt_pattern)
-        has_subgroup = "(" in opt_pattern and ")" in opt_pattern
-        normalized_opt_levels = []
-        for opt in config.opt_levels:
-            match = opt_re.fullmatch(opt)
-            if match:
-                if has_subgroup and len(match.groups()) > 0:
-                    normalized_opt_levels.append("O" + match.group(1))
-                else:
-                    normalized_opt_levels.append(match.group(0))
-            else:
-                normalized_opt_levels.append(opt)
-
-    exclude_pattern: Pattern[str] | None = None
-    if config.exclude_subfolders:
-        exclude_pattern = re.compile(
-            "(" + "|".join(config.exclude_subfolders) + ")"
-        )
-
-    return _ScanFilters(
-        binary_format=binary_format,
-        platforms=config.platforms,
-        compiler=config.compiler,
-        compiler_versions=config.compiler_versions,
-        normalized_opt_levels=normalized_opt_levels,
-        exclude_pattern=exclude_pattern,
-    )
