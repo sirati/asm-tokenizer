@@ -10,16 +10,25 @@ framework now (the new design has no `get_stages`).
 from __future__ import annotations
 
 import math
+import re
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from re import Pattern
 
+from dynamic_runner import _native
 from dynamic_runner._shared import (
+    BinaryIdentifier,
     TaskInfo,
-    find_matching_binaries,
     process_selection_arguments,
+)
+from dynamic_runner._shared.binary_info import (
+    build_binary_filename_format,
+    build_field_regexes,
+    parse_binary_filename,
 )
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
@@ -70,39 +79,114 @@ class TokenizerTask:
     def discover_items(
         self, source_dir: Path, args: Namespace
     ) -> Iterable[TaskInfo]:
-        """Yield binaries under `source_dir`, grouped by binary name with
-        intra-group size-DESC ordering, and tagged with this task's
-        phase + type.
+        """Drive the Rust walker via `_native.find_items`, then sort+tag.
 
-        The old `organize_and_sort_items` did the re-ordering after the
-        framework's file scan; the new design folds the scan and the
-        ordering into one method.
+        When `args.source_already_staged` is set (SLURM mode), discovery
+        walks the gateway-side filesystem via SSH at that path; otherwise
+        it walks the local `source_dir`. Filter state is stashed on
+        `self` for the duration of the walk so `visit()` can read it
+        without re-deriving from args per directory.
         """
-        return self._sort_and_tag(_scan(source_dir, args))
+        config = process_selection_arguments(args)
+        self._filters = _build_filters(config)
+        try:
+            if getattr(args, "source_already_staged", None):
+                root = args.source_already_staged
+                gateway_url = getattr(args, "gateway", None)
+            else:
+                root = str(config.source_dir)
+                gateway_url = None
+            items = _native.find_items(self, root, gateway_url=gateway_url)
+            return self._sort_and_tag(root, items)
+        finally:
+            self._filters = None
 
-    def organize_and_sort_items(
-        self, items: Iterable[TaskInfo]
-    ) -> list[TaskInfo]:
-        """Compat shim for the legacy `dynamic_runner.run()` path.
+    def visit(
+        self,
+        parent_payload: str | None,
+        subfolders: list,
+        files: list,
+    ) -> None:
+        """Per-directory policy callback driven by `_native.find_items`.
 
-        The runner's `run.py` still calls `find_matching_binaries` +
-        `task.organize_and_sort_items()` instead of `discover_items()`.
-        This method preserves the historical sort+tag behaviour so the
-        legacy entry point keeps working until the runner is updated to
-        call `discover_items`. Both methods share `_sort_and_tag`.
+        `parent_payload` carries the relative path of the current
+        directory (set by the parent's `enter()`; `None` at root).
+        Mirrors today's `find_matching_binaries`: prune subfolders
+        matching `--exclude-subfolder`, mark files matching the format
+        regex + field allowlists with the parsed `BinaryIdentifier` as
+        the per-file payload.
         """
-        return list(self._sort_and_tag(items))
+        filters = self._filters
+        if filters is None:
+            return
+
+        current_rel = parent_payload or ""
+
+        for folder in subfolders:
+            child_rel = (
+                f"{current_rel}/{folder.name}" if current_rel else folder.name
+            )
+            if (
+                filters.exclude_pattern is not None
+                and filters.exclude_pattern.search(child_rel)
+            ):
+                folder.enter(False)
+            else:
+                folder.enter(True, payload=child_rel)
+
+        for f in files:
+            if f.name.startswith("."):
+                continue
+            parsed = parse_binary_filename(f.name, filters.binary_format)
+            if not parsed:
+                continue
+            platform, comp, version, opt, binary_name = parsed
+            if platform not in filters.platforms:
+                continue
+            if filters.compiler and comp != filters.compiler:
+                continue
+            if (
+                filters.compiler_versions
+                and version not in filters.compiler_versions
+            ):
+                continue
+            if (
+                filters.normalized_opt_levels
+                and opt not in filters.normalized_opt_levels
+            ):
+                continue
+            f.mark(
+                True,
+                payload=BinaryIdentifier(
+                    binary_name=binary_name,
+                    platform=platform,
+                    compiler=comp,
+                    version=version,
+                    opt_level=opt,
+                ),
+            )
 
     @staticmethod
-    def _sort_and_tag(items: Iterable[TaskInfo]) -> Iterable[TaskInfo]:
+    def _sort_and_tag(root: str, items: Iterable) -> Iterable[TaskInfo]:
         """Group by binary_name; sort within group by size DESC; order
-        groups by group-average size DESC; tag each item with this
-        task's phase + type."""
-        groups: dict[str, list[TaskInfo]] = defaultdict(list)
-        for binary in items:
-            groups[binary.binary_name].append(binary)
+        groups by group-average size DESC; emit fresh Python `TaskInfo`
+        instances tagged with this task's phase + type.
 
-        group_averages: list[tuple[str, float, list[TaskInfo]]] = []
+        `items` are `_native.PyTaskInfo` objects from `find_items`
+        (read-only) carrying *relative* paths; we re-construct mutable
+        Python `TaskInfo`s with paths joined back to `root` so the
+        framework's downstream `compute_file_hash`/`strip_prefix` pass
+        (in `queue_initial_staging`) sees the same absolute-path
+        contract today's `find_matching_binaries` provided.
+        affinity_id stays `None` — the tokenizer has no cache-locality
+        classes worth exploiting.
+        """
+        root_path = Path(root)
+        groups: dict[str, list] = defaultdict(list)
+        for item in items:
+            groups[item.identifier.binary_name].append(item)
+
+        group_averages: list[tuple[str, float, list]] = []
         for binary_name, group in groups.items():
             avg_size = sum(b.size for b in group) / len(group)
             group.sort(key=lambda b: b.size, reverse=True)
@@ -111,13 +195,19 @@ class TokenizerTask:
 
         for _, _, group in group_averages:
             for b in group:
-                # Tag each item with phase + type so the framework
-                # routes it correctly. affinity_id stays None — the
-                # tokenizer has no cache-locality classes worth
-                # exploiting.
-                b.phase_id = _PHASE_ID
-                b.type_id = _TYPE_ID
-                yield b
+                yield TaskInfo(
+                    path=root_path / str(b.path),
+                    size=b.size,
+                    identifier=BinaryIdentifier(
+                        binary_name=b.identifier.binary_name,
+                        platform=b.identifier.platform,
+                        compiler=b.identifier.compiler,
+                        version=b.identifier.version,
+                        opt_level=b.identifier.opt_level,
+                    ),
+                    phase_id=_PHASE_ID,
+                    type_id=_TYPE_ID,
+                )
 
     # ── Per-type plumbing ──────────────────────────────────────────────
 
@@ -175,28 +265,73 @@ class TokenizerTask:
         pass
 
 
-def _scan(source_dir: Path, args: Namespace) -> list[TaskInfo]:
-    """Scan `source_dir` for binaries matching the framework's standard
-    selection arguments (`--platform`, `--compiler`, `--compiler-versions`,
-    `--opt`, `--file-format`, `--version-regex`, `--opt-regex`,
-    `--name-regex`, `--exclude-subfolder`).
+@dataclass
+class _ScanFilters:
+    """Pre-compiled per-walk filter state read by `TokenizerTask.visit`.
 
-    Mirrors the pattern used by `tokenizer/vocab_unifier/__main__.py`:
-    build a `SelectionConfig` from the parsed `args` Namespace and pass
-    its fields into `find_matching_binaries`. `source_dir` is passed by
-    the framework but `config.source_dir` is the canonical, resolved
-    value (Path-resolved, validated to exist).
+    Replaces the field-by-field args munging that today's
+    `find_matching_binaries` does inline. Compiled once per
+    `discover_items` call; the visitor reads it for every directory
+    without re-deriving regexes.
     """
-    config = process_selection_arguments(args)
-    return find_matching_binaries(
-        source_dir=config.source_dir,
+
+    binary_format: object
+    platforms: list[str]
+    compiler: str | None
+    compiler_versions: list[str] | None
+    normalized_opt_levels: list[str] | None
+    exclude_pattern: Pattern[str] | None
+
+
+def _build_filters(config) -> _ScanFilters:
+    """Compile per-walk filter state from a `SelectionConfig`.
+
+    Mirrors the field-regex / opt-level normalisation / exclude-pattern
+    logic in `dynamic_runner._shared.binary_selector.find_matching_binaries`.
+    Refactor candidate: hoist this into a framework helper so any task
+    using the standard `platform-compiler-version-opt-binary` filename
+    format can share the compilation step instead of re-implementing.
+    """
+    field_regexes = build_field_regexes(
         platforms=config.platforms,
-        compiler=config.compiler,
-        compiler_versions=config.compiler_versions,
+        compilers=[config.compiler] if config.compiler else None,
+        versions=config.compiler_versions,
         opt_levels=config.opt_levels,
-        format_string=config.file_format,
         version_regex=config.version_regex,
         opt_regex=config.opt_regex,
         name_regex=config.name_regex,
-        exclude_subfolders=config.exclude_subfolders,
+    )
+    binary_format = build_binary_filename_format(
+        config.file_format, field_regexes
+    )
+
+    normalized_opt_levels: list[str] | None = None
+    if config.opt_levels:
+        opt_pattern = config.opt_regex if config.opt_regex else r"[oO]([0123s])"
+        opt_re = re.compile(opt_pattern)
+        has_subgroup = "(" in opt_pattern and ")" in opt_pattern
+        normalized_opt_levels = []
+        for opt in config.opt_levels:
+            match = opt_re.fullmatch(opt)
+            if match:
+                if has_subgroup and len(match.groups()) > 0:
+                    normalized_opt_levels.append("O" + match.group(1))
+                else:
+                    normalized_opt_levels.append(match.group(0))
+            else:
+                normalized_opt_levels.append(opt)
+
+    exclude_pattern: Pattern[str] | None = None
+    if config.exclude_subfolders:
+        exclude_pattern = re.compile(
+            "(" + "|".join(config.exclude_subfolders) + ")"
+        )
+
+    return _ScanFilters(
+        binary_format=binary_format,
+        platforms=config.platforms,
+        compiler=config.compiler,
+        compiler_versions=config.compiler_versions,
+        normalized_opt_levels=normalized_opt_levels,
+        exclude_pattern=exclude_pattern,
     )

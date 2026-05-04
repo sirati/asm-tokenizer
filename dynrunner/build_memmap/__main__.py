@@ -1,4 +1,4 @@
-from dynamic_runner import make_subprocess_spawn_factory, run
+from dynamic_runner import TaskDeploymentSpec, run
 
 from .memmap_builder_task import MemmapBuilderTask
 
@@ -6,7 +6,10 @@ from .memmap_builder_task import MemmapBuilderTask
 def main() -> None:
     run(
         task=MemmapBuilderTask(),
-        spawn_secondary_factory=make_subprocess_spawn_factory("dynrunner.build_memmap"),
+        deployment=TaskDeploymentSpec(
+            secondary_module="dynrunner.build_memmap",
+            image_name="asm-tokenizer",
+        ),
         description="Memory-mapped binary file builder (per-binary-group parallel).",
     )
 
