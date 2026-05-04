@@ -112,15 +112,18 @@ def run_tokenizer(
     binary_name = file_path.name
 
     if platform == "auto":
+        # Order: longer prefixes first so `mips64-...` matches "mips64"
+        # before "mips32" (and similarly for ppc, riscv). Within each
+        # family, the 64-bit variant comes first.
         _ALL_PLATFORMS: list[Platform] = [
             "x86",
             "x64",
             "arm64",
             "arm32",
             "mips64",
-            "mips",
+            "mips32",
             "ppc64",
-            "ppc",
+            "ppc32",
             "riscv64",
             "riscv32",
         ]

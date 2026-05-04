@@ -285,14 +285,19 @@ class MemmapBuilderTask:
                 total_size += csv_item.size
                 entries.append(
                     {
-                        # find_items returns relative paths; reconstruct
-                        # absolute by joining onto the walk root. For
-                        # SLURM pre-staged the absolute path is
-                        # gateway-side, which the secondary's container
-                        # resolves through the bind-mount at
-                        # /app/src-network.
-                        "csv_path": f"{source_root}/{csv_item.path}",
-                        "mapping_path": f"{vocab_root}/{map_item.path}",
+                        # Per-version paths are kept *relative* to the
+                        # walk roots so the worker resolves them against
+                        # its own `source_dir` / `vocab_dir` at run
+                        # time. In SLURM pre-staged mode the worker
+                        # sees the bind-mounted in-container root
+                        # (`/app/src-network`) and joins these relatives
+                        # against it; locally the worker sees the
+                        # primary's filesystem root. Emitting absolutes
+                        # here would inline the primary's gateway path
+                        # into the payload, which the container can't
+                        # resolve through its bind-mount.
+                        "csv_path": str(csv_item.path),
+                        "mapping_path": str(map_item.path),
                         "arch": csv_item.identifier.platform,
                         "compiler": csv_item.identifier.compiler,
                         "compilerversion": csv_item.identifier.version,
@@ -388,11 +393,19 @@ class MemmapBuilderTask:
         output_dir: Path,
         skip_existing: bool,
     ) -> list[str]:
-        # The worker reads its per-task `payload` for the per-version
-        # csv/mapping paths, so --vocab-source is purely informational
-        # at the worker level (logging parity with the standalone CLI).
+        # Worker resolves payload `csv_path` against `--source` and
+        # `mapping_path` against `--vocab-source` (which the worker
+        # defaults to `--source` when unset). For SLURM
+        # `--source-already-staged` mode the user-supplied
+        # `args.vocab_source` is a local primary-side path that is
+        # *not* meaningful inside the container, so we don't forward
+        # it; the worker's vocab_dir falls back to source_dir which IS
+        # the bind-mount root. Only forward `--vocab-source` for plain
+        # local dispatch where the path is meaningful at worker time.
         cmd: list[str] = []
-        if getattr(args, "vocab_source", None):
+        if getattr(args, "vocab_source", None) and not getattr(
+            args, "source_already_staged", None
+        ):
             cmd.extend(["--vocab-source", str(args.vocab_source)])
         return cmd
 

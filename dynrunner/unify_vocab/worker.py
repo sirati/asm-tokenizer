@@ -1,19 +1,19 @@
-"""Worker subprocess for `dynrunner.build_memmap`.
+"""Worker subprocess for `dynrunner.unify_vocab`.
 
-Receives one ``ProcessBinaryCommand`` per group. The wire's
-``relative_path`` is the binary_name (an opaque identifier; not a
-filesystem path) and ``payload`` is a JSON string containing the
-per-version pairing data the starting instance prepared. The worker:
+Receives one ``ProcessBinaryCommand`` per run. The wire's
+``relative_path`` is the literal "unify_vocab" sentinel and
+``payload`` is a JSON string carrying the list of discovered
+per-binary CSV relative paths. The worker:
 
-1. Parses ``command.payload`` into a ``versions`` list of
-   ``{csv_path, mapping_path, arch, compiler, compilerversion, opt}``.
-2. Reconstructs ``BinaryVersionInfo`` instances.
-3. Calls ``tokenizer.memmap_builder.builder.build_memmap_files`` once
-   for the group and replies ``done``.
+1. Parses ``command.payload`` into a ``csv_paths`` list.
+2. Joins each entry against ``--source`` (the bind-mount root inside
+   the container, or the local source dir for non-SLURM dispatch).
+3. Calls ``tokenizer.vocab_unifier.unifier.unify_vocab(csv_files,
+   unified_vocab_path)`` and replies ``done``.
 
-The worker scans nothing, reads no manifest from disk, and does no
-pairing or grouping — those concerns live entirely in
-``MemmapBuilderTask.discover_items`` on the starting instance.
+The standalone CLI at ``tokenizer.vocab_unifier.__main__`` does its
+own discovery; this worker doesn't. Discovery is the starting
+instance's concern under the dynrunner Protocol.
 """
 
 from __future__ import annotations
@@ -35,40 +35,22 @@ from dynamic_runner.comm import (
     StopCommand,
     UnixSocketInterface,
 )
-from shared import increase_csv_field_size_limit, remove_stream_handlers
-from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
+from shared import remove_stream_handlers
+from tokenizer.vocab_unifier.unifier import unify_vocab
 
 
 def _process_payload(
-    binary_name: str,
     payload_json: str,
     source_dir: Path,
-    vocab_dir: Path,
     output_dir: Path,
+    unified_vocab_filename: str,
 ) -> None:
-    """Parse the inline payload, reconstruct BinaryVersionInfo, build memmap.
-
-    `csv_path` and `mapping_path` in each payload entry are relative
-    paths produced by the starting instance's `find_items` walks; we
-    resolve them against `source_dir` / `vocab_dir` here so the same
-    payload shape works under SLURM (where source_dir is the
-    bind-mounted in-container path) and under local dispatch (where
-    source_dir is the primary's filesystem root).
-    """
     data = json.loads(payload_json)
-    versions_raw = data["versions"]
-    versions = [
-        BinaryVersionInfo(
-            path=source_dir / entry["csv_path"],
-            mapping_path=vocab_dir / entry["mapping_path"],
-            arch=entry["arch"],
-            compiler=entry["compiler"],
-            compilerversion=entry["compilerversion"],
-            opt=entry["opt"],
-        )
-        for entry in versions_raw
-    ]
-    build_memmap_files(versions, output_dir, binary_name)
+    csv_paths_raw = data["csv_paths"]
+    csv_files = [source_dir / rel for rel in csv_paths_raw]
+    unified_vocab_path = output_dir / unified_vocab_filename
+    output_dir.mkdir(parents=True, exist_ok=True)
+    unify_vocab(csv_files, unified_vocab_path)
 
 
 def main() -> None:
@@ -77,10 +59,8 @@ def main() -> None:
         logger = logging.getLogger()
         logger.setLevel(logging.INFO)
 
-        increase_csv_field_size_limit()
-
         parser = argparse.ArgumentParser(
-            description="Memmap-builder worker (per-binary-group).",
+            description="Vocab-unifier worker (single-process aggregation).",
         )
 
         group = parser.add_mutually_exclusive_group(required=True)
@@ -102,25 +82,22 @@ def main() -> None:
             type=str,
             required=True,
             help=(
-                "Source directory. Informational only at this layer — "
-                "the per-version csv/mapping paths come absolute inside "
-                "the wire's task payload."
+                "Source directory. Per-CSV relative paths in the worker's "
+                "task payload resolve against this; in SLURM bind-mount "
+                "deployments this is `/app/src-network`."
             ),
         )
         parser.add_argument(
             "--output",
             type=str,
             required=True,
-            help="Output directory for memmap files",
+            help="Output directory for the unified vocab CSV.",
         )
         parser.add_argument(
-            "--vocab-source",
+            "--out-unified-vocab",
             type=str,
-            default=None,
-            help=(
-                "Vocab source directory (informational; the wire payload "
-                "carries absolute mapping paths)."
-            ),
+            default="unified_vocab.csv",
+            help="Filename for the unified vocab CSV (default: unified_vocab.csv).",
         )
         parser.add_argument(
             "--log-file",
@@ -131,19 +108,17 @@ def main() -> None:
             "--skip_existing",
             action="store_true",
             help=(
-                "Accepted for framework compatibility; per-group skip "
-                "is governed by the starting instance's discover_items "
-                "filter, not the worker."
+                "Accepted for framework compatibility; the discover_items "
+                "filter on the starting instance owns the skip-existing "
+                "check, not the worker."
             ),
         )
 
         args = parser.parse_args()
 
         source_dir = Path(args.source).resolve()
-        vocab_dir = (
-            Path(args.vocab_source).resolve() if args.vocab_source else source_dir
-        )
         output_dir = Path(args.output).resolve()
+        unified_vocab_filename = args.out_unified_vocab
 
         if args.log_file:
             if args.dynamic_queue:
@@ -195,31 +170,25 @@ def main() -> None:
                     logger.info("[*] Received stop command, shutting down")
                     break
 
-                # `relative_path` is the binary_name; `payload` is the
-                # per-version pairing JSON. Both come from the wire's
-                # `task:` form (see ProcessBinaryCommand).
-                binary_name = command.relative_path
                 if not command.payload:
                     response = ErrorResponse(
                         error_type=ErrorType.NON_RECOVERABLE,
                         error_message=(
-                            f"build_memmap worker received task without "
-                            f"payload for binary_name={binary_name!r}; "
-                            f"discover_items must emit non-empty "
-                            f"TaskInfo.payload for this task type."
+                            "vocab_unifier worker received task without "
+                            "payload; discover_items must emit non-empty "
+                            "TaskInfo.payload for this task type."
                         ),
                     )
                     comm.send_response(response)
                     continue
-                logger.info(f"[*] Processing group: {binary_name}")
+                logger.info("[*] Processing unify_vocab task")
 
                 try:
                     _process_payload(
-                        binary_name,
                         command.payload,
                         source_dir,
-                        vocab_dir,
                         output_dir,
+                        unified_vocab_filename,
                     )
                     from dynamic_runner.comm import DoneResponse
 
@@ -239,13 +208,17 @@ def main() -> None:
                     logger.info(f"[!] Non-recoverable error: {e}")
                     break
                 except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
-                    # File-system shape errors (missing path, wrong
-                    # type) are permanent — re-running the same payload
-                    # against the same filesystem state yields the same
-                    # result. Mark NonRecoverable so the framework
+                    # Filesystem-shape errors are permanent for this
+                    # input set — re-running won't make a missing CSV
+                    # appear. Mark NonRecoverable so the framework
                     # surfaces the misconfiguration instead of looping.
                     tb_str = traceback.format_exc()
-                    logger.error(f"[!] Non-recoverable filesystem error processing {binary_name}:\n{tb_str}")
+                    logger.error(f"[!] Non-recoverable filesystem error:\n{tb_str}")
+                    print(
+                        f"[!] Non-recoverable filesystem error:\n{tb_str}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     response = ErrorResponse(
                         error_type=ErrorType.NON_RECOVERABLE,
                         error_message=f"{type(e).__name__}: {str(e)}",
@@ -253,12 +226,12 @@ def main() -> None:
                     comm.send_response(response)
                 except Exception as e:
                     tb_str = traceback.format_exc()
-                    logger.error(f"[!] Error processing {binary_name}:\n{tb_str}")
+                    logger.error(f"[!] Error processing unify_vocab:\n{tb_str}")
                     # Also dump to stderr so the traceback survives
-                    # ephemeral worker logs and reaches the gateway-
-                    # persistent SLURM stderr capture (slurm_<jobid>.err).
+                    # ephemeral worker logs and reaches the SLURM stderr
+                    # capture (slurm_<jobid>.err).
                     print(
-                        f"[!] Error processing {binary_name}:\n{tb_str}",
+                        f"[!] Error processing unify_vocab:\n{tb_str}",
                         file=sys.stderr,
                         flush=True,
                     )

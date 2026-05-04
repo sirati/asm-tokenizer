@@ -393,7 +393,19 @@ class VocabularyManager:
         assert issubclass(TokensInner, Tokens)
 
         class PlatformTokenInner(TokensInner, PlatformToken):
-            """Represents platform-specific tokens like x86 instructions, registers, etc."""
+            """Represents platform-specific tokens like x86 instructions, registers, etc.
+
+            In a per-binary VocabularyManager (`vocab_manager.platform`
+            is set to a single ISA), tokens are stored under
+            `<platform>_<token>` — the per-ISA namespace. In a unified
+            VocabularyManager (`vocab_manager.platform is None`), tokens
+            are stored under `<family>_<token>` so cross-bitness siblings
+            (e.g. mips32 + mips64 both producing `addu`) collapse to a
+            single ID. The original ISA each occurrence came from is
+            still tracked via `token_to_platform[token_id]`, so
+            consumers that need per-bitness provenance haven't lost
+            information.
+            """
 
             __slots__ = ("token", "_token_id")
 
@@ -403,10 +415,26 @@ class VocabularyManager:
                 if platform is None:
                     platform = vocab_manager.platform
 
+                # Family-merge prefix when registering on a unified VM;
+                # per-ISA prefix when on a per-binary VM. The lookup
+                # prefers PLATFORM_FAMILY but falls back to the
+                # platform name itself if the platform isn't in the
+                # family map (test fixtures, custom ISAs).
+                from tokenizer.arch import PLATFORM_FAMILY
+                if vocab_manager.platform is None:
+                    name_prefix = PLATFORM_FAMILY.get(platform, platform)
+                else:
+                    name_prefix = platform
+
                 self.token = token
-                # Register the token and cache its ID, passing insn_type
+                # `platform=` retains the original per-ISA name so
+                # `_private_add_token`'s platform_list / token_to_platform
+                # tracking records which specific ISA contributed this
+                # token. The token NAME uses the family prefix when
+                # registering on a unified VM.
                 self._token_id = vocab_manager._private_add_token(
-                    f"{platform}_{token}", self.__class__, insn_type=insn_type, platform=platform
+                    f"{name_prefix}_{token}", self.__class__,
+                    insn_type=insn_type, platform=platform,
                 )
 
             @classmethod
@@ -421,10 +449,19 @@ class VocabularyManager:
                     if vocab_manager.platform is None
                     else vocab_manager.platform
                 )
-                if not token_str.startswith(f"{platform}_"):
+                # On a unified VM the token's stored prefix is the
+                # FAMILY (e.g. `mips`), not the per-ISA platform
+                # (`mips32` / `mips64`). Resolve the expected prefix
+                # accordingly.
+                from tokenizer.arch import PLATFORM_FAMILY
+                if vocab_manager.platform is None:
+                    expected_prefix = PLATFORM_FAMILY.get(platform, platform)
+                else:
+                    expected_prefix = platform
+                if not token_str.startswith(f"{expected_prefix}_"):
                     raise ValueError(f"Invalid platform token string: {token_str}")
 
-                platform_token = token_str[len(platform) + 1 :]
+                platform_token = token_str[len(expected_prefix) + 1 :]
                 return cls(
                     platform_token, vocab_manager._platform_instruction_type_cache[token_ids[0]], platform=platform
                 )

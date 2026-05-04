@@ -1,19 +1,31 @@
 """Dynrunner entry point for vocabulary unification.
 
-This is a single-process aggregation (`unify_vocab` merges all CSVs into
-one VocabularyManager sequentially); we skip the runner subprocess
-machinery entirely and delegate to the standalone CLI.
+Vocab unification has no parallelism to exploit (each binary's vocab
+registers onto a shared `VocabularyManager`), but it's now a runner
+task so the full 3-phase pipeline (tokenize → unify-vocab →
+build-memmap) can run autonomously on SLURM. The dispatch produces
+exactly one TaskInfo, dispatched to one worker on one secondary;
+phase 1 and phase 3 retain their multi-worker parallelism.
 """
-import logging
 
-from tokenizer.vocab_unifier.__main__ import main as _standalone_main
+from dynamic_runner import TaskDeploymentSpec, run
+
+from .vocab_unifier_task import VocabUnifierTask
 
 
 def main() -> None:
-    logging.getLogger().info(
-        "vocab unification runs in single-process mode (no runner parallelism)"
+    run(
+        task=VocabUnifierTask(),
+        deployment=TaskDeploymentSpec(
+            secondary_module="dynrunner.unify_vocab",
+            image_name="asm-tokenizer",
+        ),
+        description=(
+            "Vocabulary unification: build a single shared vocab + "
+            "per-binary mapping files from the per-binary CSVs the "
+            "tokenize phase produced."
+        ),
     )
-    _standalone_main()
 
 
 if __name__ == "__main__":
