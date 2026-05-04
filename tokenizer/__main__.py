@@ -143,7 +143,7 @@ def main():
             type=str,
             help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'auto' to auto-detect from binary name. Default is auto.",
             default="auto",
-            choices=["x86", "x64", "arm32", "arm64", "mips", "mips64", "ppc", "ppc64", "riscv32", "riscv64", "auto"],
+            choices=["x86", "x64", "arm32", "arm64", "mips32", "mips64", "ppc32", "ppc64", "riscv32", "riscv64", "auto"],
         )
         parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
         parser.add_argument(

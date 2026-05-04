@@ -18,7 +18,7 @@ _OP_MEM = 3
 class MIPSProvider(ArchitectureProvider):
     """Architecture provider for MIPS32 and MIPS64 platforms."""
 
-    def __init__(self, platform: str = "mips"):
+    def __init__(self, platform: str = "mips32"):
         self._platform = platform
 
     @property

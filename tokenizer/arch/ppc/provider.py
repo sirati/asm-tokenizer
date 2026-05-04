@@ -34,7 +34,7 @@ _PPC_BC_NAMES: dict[int, str] = {
 class PPCProvider(ArchitectureProvider):
     """Architecture provider for PowerPC (32-bit and 64-bit) platforms."""
 
-    def __init__(self, platform: str = "ppc"):
+    def __init__(self, platform: str = "ppc32"):
         self._platform = platform
 
     @property
