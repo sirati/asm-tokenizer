@@ -2,57 +2,57 @@
 
 The library function `tokenizer.memmap_builder.builder.build_memmap_files`
 consumes a list of `BinaryVersionInfo` (one per (compiler, version, opt)
-triple) for a single `binary_name` group. The dynrunner wire protocol,
-however, only carries `relative_path` per item, so we cannot pass the
-version list directly to the worker.
+triple) for a single `binary_name` group. The wire protocol's `task:`
+form (FR-3, dynamic_runner) carries a per-task `payload` JSON value,
+so the starting instance does ALL discovery + pairing + grouping inside
+`discover_items` and emits one TaskInfo per group with the per-version
+pairing data inline in `TaskInfo.payload`. The worker reads
+`command.payload`, reconstructs `BinaryVersionInfo`, and calls
+`build_memmap_files`. No manifest file on disk; works identically
+under local dispatch and under SLURM `--source-already-staged`.
 
-Resolution: **manifest-on-disk**. The starting instance does ALL discovery
-+ pairing + grouping inside `discover_items` (and the compat shim
-`organize_and_sort_items`). For each binary_name group it writes a JSON
-manifest to ``<output_dir>/.dynrunner-memmap/<binary_name>.json`` and
-yields a single TaskInfo whose `path` is the manifest file. The worker
-reads its assigned manifest, reconstructs `BinaryVersionInfo` instances,
-and calls `build_memmap_files`. The worker scans nothing.
-
-Compat shim: `dynamic_runner.run.run()` (`run.py:82-128`) still uses the
-legacy path — `_shared.find_matching_binaries(...)` followed by
-`task.organize_and_sort_items(binaries)`. New-API tasks must implement
-*both* methods until the runtime migrates. To keep the file-format
-defaults useful in this hybrid era, `add_task_arguments` rewrites
-``--file-format``'s default so the framework's pre-shim scan discovers
-CSV outputs (otherwise it returns ``[]`` and the run aborts before our
-shim runs).
+`uses_file_based_items = False` tells the framework that
+`TaskInfo.path` isn't a real filesystem path — it's just an opaque
+identifier (the `binary_name`). Primary-side staging
+(content-hashing, StageFile, src_network resolution) is therefore
+skipped for these items; the wire's `local_path` carries the
+binary_name verbatim and the worker uses the inline payload.
 """
 
 from __future__ import annotations
 
-import json
+import dataclasses
 import logging
-import shutil
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
-from shared import (
-    BinaryInfo,
-    find_matching_binaries,
-    format_binary_info,
+from dynamic_runner import _native
+from dynamic_runner._shared import (
+    BinaryIdentifier,
+    SelectionFilters,
+    TaskInfo,
+    compile_selection_filters,
+    is_excluded_subfolder,
+    match_filename,
     process_selection_arguments,
 )
-
-from dynamic_runner._shared.binary_info import BinaryIdentifier, TaskInfo
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
-from tokenizer.memmap_builder._pairing import match_csv_to_mapping
 
 
-logger = logging.getLogger(__name__)
-
+_logger = logging.getLogger(__name__)
 
 _PHASE_ID = "memmap"
 _TYPE_ID = "memmap"
-_STAGING_SUBDIR = ".dynrunner-memmap"
 
+# Filename suffixes that the tokenize phase + vocab unifier emit.
+# Appended to the user-supplied --file-format. The framework's
+# format-string DSL maps 1-char field shorthands `p` (platform), `c`
+# (compiler), `name` etc.; the backslashes are the DSL's escape so
+# literal `p`/`c` aren't gobbled as field placeholders. See
+# `dynamic_runner._shared.binary_info.process_escaping`.
+# Pairing is by `BinaryIdentifier` equality after parsing.
 _CSV_SUFFIX = "_out\\put.\\csv"
 _MAPPING_SUFFIX = "_out\\put.ma\\p\\ping.b64\\c"
 
@@ -65,46 +65,106 @@ def _mapping_format(base_format: str) -> str:
     return base_format + _MAPPING_SUFFIX
 
 
-def _write_manifest(
-    manifest_path: Path,
-    csv_binaries: list[BinaryInfo],
-    matched_pairs: dict,
-) -> int:
-    """Write a per-group manifest. Returns total CSV size (rough work estimate)."""
-    entries = []
-    total_size = 0
-    for csv_bin in csv_binaries:
-        map_bin = matched_pairs[csv_bin.identifier]
-        size = csv_bin.size
-        total_size += size
-        entries.append(
-            {
-                "csv_path": str(csv_bin.path),
-                "mapping_path": str(map_bin.path),
-                "arch": csv_bin.platform,
-                "compiler": csv_bin.compiler,
-                "compilerversion": csv_bin.version,
-                "opt": csv_bin.opt_level,
-            }
-        )
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps({"versions": entries}, indent=2))
-    return total_size
+class _FormatVisitor:
+    """Visitor for `_native.find_items`: marks every file matching the
+    pre-compiled `SelectionFilters` with its parsed `BinaryIdentifier`
+    as the per-file payload. One instance is used per pass (CSV pass,
+    mapping pass); each pass has its own filters compiled from a
+    different file_format.
+    """
+
+    def __init__(self, filters: SelectionFilters) -> None:
+        self._filters = filters
+
+    def visit(
+        self,
+        parent_payload: str | None,
+        subfolders: list,
+        files: list,
+    ) -> None:
+        current_rel = parent_payload or ""
+        for folder in subfolders:
+            child_rel = (
+                f"{current_rel}/{folder.name}" if current_rel else folder.name
+            )
+            if is_excluded_subfolder(child_rel, self._filters):
+                folder.enter(False)
+            else:
+                folder.enter(True, payload=child_rel)
+        for f in files:
+            identifier = match_filename(f.name, self._filters)
+            if identifier is not None:
+                f.mark(True, payload=identifier)
+
+
+class _OutputFilenameCollector:
+    """Visitor that records every file's basename. Used by the
+    task-side `--skip-existing` filter to enumerate already-completed
+    outputs at `args.resolved_output_root` (gateway-side in SLURM
+    pre-staged mode, local otherwise)."""
+
+    def __init__(self) -> None:
+        self.filenames: set[str] = set()
+
+    def visit(
+        self,
+        parent_payload: object,
+        subfolders: list,
+        files: list,
+    ) -> None:
+        for folder in subfolders:
+            folder.enter(True)
+        for f in files:
+            self.filenames.add(f.name)
+
+
+def _walk_with_filters(
+    root: str, gateway_url: str | None, filters: SelectionFilters
+) -> list:
+    """Run `_native.find_items` against `root` with a `_FormatVisitor`
+    parameterised by `filters`. Returns the list of marked PyTaskInfo
+    objects (relative_path under `root`, parsed `BinaryIdentifier` as
+    `.identifier`).
+    """
+    visitor = _FormatVisitor(filters)
+    return _native.find_items(visitor, root, gateway_url=gateway_url)
+
+
+def _collect_existing_output_filenames(
+    output_root: str, gateway_url: str | None
+) -> set[str]:
+    """Walk `output_root` via `_native.find_items` and return the set of
+    file basenames present. A non-existent or unreadable `output_root`
+    yields an empty set rather than failing the dispatch — first-run
+    deployments don't have the directory yet.
+    """
+    collector = _OutputFilenameCollector()
+    try:
+        _native.find_items(collector, output_root, gateway_url=gateway_url)
+    except OSError:
+        return set()
+    return collector.filenames
+
+
+def _config_with_format(config, file_format: str):
+    """Return a copy of the parsed `SelectionConfig` with `file_format`
+    overridden — needed because the CSV pass and the mapping pass share
+    every other field but differ on the filename format string.
+    """
+    return dataclasses.replace(config, file_format=file_format)
 
 
 class MemmapBuilderTask:
     """Memmap-builder task: one phase, one type, one item per binary_name group."""
 
-    def __init__(self) -> None:
-        # Captured by the parse_args-wrapping shim in `add_task_arguments`
-        # so `organize_and_sort_items` can recover source/output dirs and
-        # the optional `--vocab-source`. Populated by the time any item
-        # is dispatched, which is after `parser.parse_args()` returns.
-        self._captured_args: Namespace | None = None
-        # User's BASE file_format (before we append the CSV suffix to
-        # satisfy the legacy ``_collect_binaries`` scan). Used by the
-        # shim to derive both CSV and mapping format strings.
-        self._base_file_format: str | None = None
+    # Items represent binary_name groups (the worker iterates a list of
+    # `BinaryVersionInfo` per group); `TaskInfo.path` is an opaque
+    # identifier (the binary_name itself), not a real filesystem path.
+    # Setting `uses_file_based_items = False` tells the framework to
+    # skip its file-based staging machinery (content-hashing, StageFile
+    # transfer, src_network resolve) for these items — see FR-2 in the
+    # dynamic_runner protocol.
+    uses_file_based_items: bool = False
 
     # ── Topology ───────────────────────────────────────────────────────
 
@@ -132,103 +192,170 @@ class MemmapBuilderTask:
     def discover_items(
         self, source_dir: Path, args: Namespace
     ) -> Iterable[TaskInfo]:
-        """Discover CSV outputs, pair each with its mapping file, group by
-        binary_name, write a manifest per group, and yield one TaskInfo
-        per manifest. All decisional work happens here, on the starting
-        instance.
+        """Discover CSV outputs + mapping files via two `find_items`
+        passes, pair by `BinaryIdentifier`, group by `binary_name`,
+        emit one TaskInfo per group with the per-version pairing data
+        inline in `TaskInfo.payload`.
+
+        SLURM pre-staged mode (`args.source_already_staged` set):
+        both walks happen against the gateway via SSH, paths in the
+        emitted payload are gateway-absolute (the secondary's
+        bind-mount makes them resolve inside the container).
+
+        Local mode: walks resolve locally; payload paths are absolute
+        primary-side filesystem paths.
         """
         config = process_selection_arguments(args)
-        vocab_source_dir = (
-            Path(args.vocab_source).resolve() if args.vocab_source else config.source_dir
-        )
-        output_dir = config.output_dir
-        staging_dir = output_dir / _STAGING_SUBDIR
 
-        # Use the BASE format (before the CSV suffix the wrapping shim
-        # appended). When invoked outside the wrapping shim — e.g.
-        # directly by the new-API runtime — fall back to ``config.file_format``.
-        base_format = self._base_file_format or config.file_format
-
-        csv_binaries = find_matching_binaries(
-            source_dir=config.source_dir,
-            platforms=config.platforms,
-            compiler=config.compiler,
-            compiler_versions=config.compiler_versions,
-            opt_levels=config.opt_levels,
-            format_string=_csv_format(base_format),
-            version_regex=config.version_regex,
-            opt_regex=config.opt_regex,
-            name_regex=config.name_regex,
-            exclude_subfolders=config.exclude_subfolders,
-        )
-        mapping_binaries = find_matching_binaries(
-            source_dir=vocab_source_dir,
-            platforms=config.platforms,
-            compiler=config.compiler,
-            compiler_versions=config.compiler_versions,
-            opt_levels=config.opt_levels,
-            format_string=_mapping_format(base_format),
-            version_regex=config.version_regex,
-            opt_regex=config.opt_regex,
-            name_regex=config.name_regex,
-            exclude_subfolders=config.exclude_subfolders,
-        )
-
-        matched_pairs, unmatched_csv = match_csv_to_mapping(csv_binaries, mapping_binaries)
-        if unmatched_csv:
-            logger.warning(
-                f"{len(unmatched_csv)} CSV file(s) have no matching mapping file:"
+        # Decide source / vocab roots and the gateway URL once. The
+        # `--vocab-source` flag (if set) overrides the mapping-pass
+        # root; otherwise it tracks the source root in both deployment
+        # modes.
+        if getattr(args, "source_already_staged", None):
+            source_root = args.source_already_staged
+            vocab_root = (
+                args.vocab_source
+                if args.vocab_source
+                else args.source_already_staged
             )
-            for csv_bin in unmatched_csv:
-                logger.warning(f"  {format_binary_info(csv_bin, config.source_dir)}")
+            gateway_url = getattr(args, "gateway", None)
+        else:
+            source_root = str(config.source_dir)
+            vocab_root = (
+                str(Path(args.vocab_source).resolve())
+                if args.vocab_source
+                else str(config.source_dir)
+            )
+            gateway_url = None
 
-        csv_by_identifier = {csv_bin.identifier: csv_bin for csv_bin in csv_binaries}
-        matched_csv_binaries = [
-            csv_by_identifier[identifier] for identifier in matched_pairs.keys()
-        ]
+        csv_filters = compile_selection_filters(
+            _config_with_format(config, _csv_format(config.file_format))
+        )
+        mapping_filters = compile_selection_filters(
+            _config_with_format(config, _mapping_format(config.file_format))
+        )
 
-        groups: dict[str, list[BinaryInfo]] = defaultdict(list)
-        for csv_bin in matched_csv_binaries:
-            groups[csv_bin.binary_name].append(csv_bin)
+        csv_items = _walk_with_filters(source_root, gateway_url, csv_filters)
+        mapping_items = _walk_with_filters(vocab_root, gateway_url, mapping_filters)
 
+        # Pair CSV ↔ mapping by explicit tuple key.
+        # `_native.find_items` returns `PyTaskInfo` objects whose
+        # `.identifier` is a Rust pyclass (`PyBinaryIdentifier`). The
+        # Rust pyclass doesn't implement `__eq__`/`__hash__` semantically,
+        # so a dict keyed on the identifier object compares by Python
+        # default (pointer identity) — pairing fails. Tuple keys force
+        # value equality on the relevant 5 fields.
+        def _key(item) -> tuple[str, str, str, str, str]:
+            ident = item.identifier
+            return (
+                ident.binary_name,
+                ident.platform,
+                ident.compiler,
+                ident.version,
+                ident.opt_level,
+            )
+
+        mapping_by_key = {_key(m): m for m in mapping_items}
+        matched_csv_items = []
+        unmatched_csv = []
+        for csv_item in csv_items:
+            if _key(csv_item) in mapping_by_key:
+                matched_csv_items.append(csv_item)
+            else:
+                unmatched_csv.append(csv_item)
+        if unmatched_csv:
+            _logger.warning(
+                "%d CSV file(s) have no matching mapping file:", len(unmatched_csv)
+            )
+            for csv_item in unmatched_csv:
+                _logger.warning("  %s", _key(csv_item))
+
+        # Group by binary_name. Each group becomes one TaskInfo with the
+        # per-version pairing inline in payload.
+        groups: dict[str, list] = defaultdict(list)
+        for csv_item in matched_csv_items:
+            groups[csv_item.identifier.binary_name].append(csv_item)
+
+        group_items: list[TaskInfo] = []
         for binary_name, group in groups.items():
-            manifest_path = staging_dir / f"{binary_name}.json"
-            total_size = _write_manifest(manifest_path, group, matched_pairs)
+            entries = []
+            total_size = 0
+            for csv_item in group:
+                map_item = mapping_by_key[_key(csv_item)]
+                total_size += csv_item.size
+                entries.append(
+                    {
+                        # find_items returns relative paths; reconstruct
+                        # absolute by joining onto the walk root. For
+                        # SLURM pre-staged the absolute path is
+                        # gateway-side, which the secondary's container
+                        # resolves through the bind-mount at
+                        # /app/src-network.
+                        "csv_path": f"{source_root}/{csv_item.path}",
+                        "mapping_path": f"{vocab_root}/{map_item.path}",
+                        "arch": csv_item.identifier.platform,
+                        "compiler": csv_item.identifier.compiler,
+                        "compilerversion": csv_item.identifier.version,
+                        "opt": csv_item.identifier.opt_level,
+                    }
+                )
 
             representative = group[0]
-            yield TaskInfo(
-                path=manifest_path,
-                size=total_size,
-                identifier=BinaryIdentifier(
-                    binary_name=binary_name,
-                    platform=representative.platform,
-                    compiler=representative.compiler,
-                    version=representative.version,
-                    opt_level=representative.opt_level,
-                ),
-                phase_id=_PHASE_ID,
-                type_id=_TYPE_ID,
-                affinity_id=None,
-                payload={},
+            group_items.append(
+                TaskInfo(
+                    # `path` is the binary_name — not a file. The
+                    # framework treats it opaquely because of
+                    # uses_file_based_items=False; on the wire it
+                    # becomes the worker's `command.relative_path`.
+                    path=Path(binary_name),
+                    size=total_size,
+                    identifier=BinaryIdentifier(
+                        binary_name=binary_name,
+                        platform=representative.identifier.platform,
+                        compiler=representative.identifier.compiler,
+                        version=representative.identifier.version,
+                        opt_level=representative.identifier.opt_level,
+                    ),
+                    phase_id=_PHASE_ID,
+                    type_id=_TYPE_ID,
+                    affinity_id=None,
+                    payload={
+                        "binary_name": binary_name,
+                        "versions": entries,
+                    },
+                )
             )
 
-    # ── Compat shim for the legacy run.py path ─────────────────────────
+        # Largest groups first (rough wallclock heuristic — total CSV
+        # size is the dominant work driver).
+        group_items.sort(key=lambda ti: ti.size, reverse=True)
 
-    def organize_and_sort_items(self, items: list) -> list[TaskInfo]:
-        """Compat shim: ignore the framework's pre-discovered items
-        (scanned with the wrong format string for CSV/mapping pairing)
-        and run our own discovery via `discover_items`.
+        # Task-side --skip-existing: walk args.resolved_output_root for
+        # already-produced index files; drop matching groups.
+        if getattr(args, "skip_existing", False):
+            output_root = getattr(args, "resolved_output_root", None)
+            if output_root:
+                completed = _collect_existing_output_filenames(
+                    output_root, gateway_url
+                )
+                before = len(group_items)
+                group_items = [
+                    ti
+                    for ti in group_items
+                    if self.get_output_filename_pattern(_TYPE_ID, ti)
+                    not in completed
+                ]
+                _logger.info(
+                    "skip-existing: %d candidates → %d remaining "
+                    "(%d skipped via %d existing outputs at %s)",
+                    before,
+                    len(group_items),
+                    before - len(group_items),
+                    len(completed),
+                    output_root,
+                )
 
-        `dynamic_runner.run.run()` calls this BEFORE `on_run_start`, so
-        we cannot rely on a lifecycle hook to hand us source/output dirs
-        — we recover them from `self._captured_args` instead.
-        """
-        if self._captured_args is None:
-            # If parse_args never ran (unusual; e.g. unit-test path)
-            # fall back to keeping whatever the framework gave us.
-            return list(items)
-        config = process_selection_arguments(self._captured_args)
-        return list(self.discover_items(config.source_dir, self._captured_args))
+        return group_items
 
     # ── Per-type plumbing ──────────────────────────────────────────────
 
@@ -236,46 +363,22 @@ class MemmapBuilderTask:
         """Estimate per-group RAM. ``item.size`` is the sum of CSV sizes
         in this group; the builder's working set is dominated by
         ``lockstep_function_match`` buffering + numpy mapping arrays.
-        We have no fitted model yet, so use 4x size + 512 MiB floor.
+        We have no fitted model yet, so use 4× size + 512 MiB floor +
+        256 MiB constant overhead.
         """
         return max(4 * item.size, 512 * 1024 * 1024) + 256 * 1024 * 1024
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
-        """Add ``--vocab-source``.
-
-        We also wrap ``parser.parse_args`` to:
-        1. Append ``_CSV_SUFFIX`` to ``args.file_format`` so the runtime's
-           legacy ``_collect_binaries`` (which scans with that format
-           string) finds CSV outputs — otherwise the run aborts before
-           our compat shim can re-discover with proper formats.
-           ``self._base_file_format`` retains the user's BASE format for
-           use in pairing.
-        2. Capture the parsed Namespace into ``self._captured_args``;
-           the runtime calls ``organize_and_sort_items`` without args,
-           so this wrapping is the only way to recover them.
-        """
         parser.add_argument(
             "--vocab-source",
             type=str,
             default=None,
             help=(
                 "Source directory for vocabulary and mapping files. "
-                "If not specified, uses the same as --source."
+                "If not specified, uses the same as --source / "
+                "--source-already-staged."
             ),
         )
-
-        original_parse_args = parser.parse_args
-
-        def _capturing_parse_args(*pa_args, **pa_kwargs):
-            namespace = original_parse_args(*pa_args, **pa_kwargs)
-            # Stash the user's BASE format BEFORE rewriting it for the
-            # runtime's CSV-discovery scan.
-            self._base_file_format = namespace.file_format
-            namespace.file_format = _csv_format(namespace.file_format)
-            self._captured_args = namespace
-            return namespace
-
-        parser.parse_args = _capturing_parse_args  # type: ignore[method-assign]
 
     def build_worker_command_args(
         self,
@@ -285,10 +388,9 @@ class MemmapBuilderTask:
         output_dir: Path,
         skip_existing: bool,
     ) -> list[str]:
-        # Worker reads its manifest and writes outputs under output_dir;
-        # vocab-source is informational here (the manifest already
-        # contains absolute mapping_paths), but pass it through for
-        # logging parity.
+        # The worker reads its per-task `payload` for the per-version
+        # csv/mapping paths, so --vocab-source is purely informational
+        # at the worker level (logging parity with the standalone CLI).
         cmd: list[str] = []
         if getattr(args, "vocab_source", None):
             cmd.extend(["--vocab-source", str(args.vocab_source)])
@@ -297,9 +399,9 @@ class MemmapBuilderTask:
     def get_output_filename_pattern(
         self, type_id: TypeId, item: TaskInfo
     ) -> str:
-        # `build_memmap_files` writes ``<binary_name>_data.bin`` (and a
-        # few siblings) — pick the index file as the canonical
-        # done-marker for skip-existing checks.
+        # `build_memmap_files` writes <binary_name>_index.bin (and a
+        # few siblings — _data.bin, _meta.json, etc.). Pick the index
+        # file as the canonical done-marker for skip-existing checks.
         return f"{item.binary_name}_index.bin"
 
     # ── Lifecycle hooks ────────────────────────────────────────────────
@@ -310,17 +412,7 @@ class MemmapBuilderTask:
         pass
 
     def on_run_end(self, success: bool) -> None:
-        # Best-effort cleanup of the staging dir. We only remove it on
-        # success — failed runs may want the manifest list for triage.
-        if not success or self._captured_args is None:
-            return
-        try:
-            config = process_selection_arguments(self._captured_args)
-            staging_dir = config.output_dir / _STAGING_SUBDIR
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir)
-        except Exception as exc:  # pragma: no cover - cleanup is best-effort
-            logger.warning(f"Failed to clean staging dir: {exc}")
+        pass
 
     def on_phase_start(self, phase_id: str) -> None:
         pass
