@@ -99,8 +99,8 @@ class TokenizerTask:
             sorted_items = list(self._sort_and_tag(root, items))
 
             if getattr(args, "skip_existing", False):
-                output_root = _existing_outputs_root(args, config)
-                if output_root is not None:
+                output_root = getattr(args, "resolved_output_root", None)
+                if output_root:
                     completed = _collect_existing_output_filenames(
                         output_root, gateway_url
                     )
@@ -287,29 +287,6 @@ class _OutputFilenameCollector:
             folder.enter(True)
         for f in files:
             self.filenames.add(f.name)
-
-
-def _existing_outputs_root(args: Namespace, config) -> str | None:
-    """Where to look for already-completed outputs.
-
-    Pre-staged SLURM mode: gateway-side `<slurm-root>/<output-subfolder>`,
-    mirroring `slurm_config.get_output_dir()`'s computation but rebuilt
-    here from args because `discover_items` isn't given the SlurmConfig.
-    Returns `None` when the SLURM flags aren't set.
-
-    Local modes: the resolved local `--output` dir.
-
-    Caller must pass an absolute path to `--slurm-root-folder` (no
-    tilde-expansion is applied here; the framework's gateway-aware
-    expansion in `_make_slurm_config` doesn't run on this path).
-    """
-    if getattr(args, "source_already_staged", None):
-        slurm_root = getattr(args, "slurm_root_folder", None)
-        if not slurm_root:
-            return None
-        output_subfolder = getattr(args, "slurm_output_subfolder", None) or "out"
-        return f"{slurm_root}/{output_subfolder}"
-    return str(config.output_dir)
 
 
 def _collect_existing_output_filenames(
