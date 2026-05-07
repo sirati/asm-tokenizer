@@ -1,28 +1,25 @@
 import argparse
-import csv
 import logging
 import os
 import random
-import socket
 import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from dynamic_runner.comm import (
-    ErrorResponse,
-    ErrorType,
-    NoopInterface,
-    PickledErrorResponse,
-    ReadyResponse,
-    StopCommand,
-    UnixSocketInterface,
-    parse_command,
+from dynamic_runner.worker import (
+    NonRecoverableError,
+    RecoverableError,
+    Task,
+    WorkerOutput,
+    run,
+    task_function,
 )
+
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.arch import Platform
-from tokenizer.run_tokenizer import run_tokenizer
+from tokenizer.run_tokenizer import NonRecoverableTokenizerError, run_tokenizer
 
 
 @dataclass(frozen=True)
@@ -87,337 +84,325 @@ debug_defaults = [
 debug_defaults_loopup = {d.arg_abbr: d for d in debug_defaults} | {d.arg_name: d for d in debug_defaults}
 
 
-def main():
-    sock = None
-    try:
-        logger = logging.getLogger()
-        logger.setLevel(logging.INFO)
+# Module-level config populated by `_on_args` before the run-loop
+# starts; the @task_function handler reads it for each task. The
+# runtime's contract: on_args owns CLI-arg → config translation,
+# the handler reads from there (the Task object carries only
+# per-task data — relative_path + payload).
+_PLATFORM: str
+_SKIP_EXISTING: bool
+_SOURCE_DIR: Path
+_OUTPUT_DIR: Path
+_BACKEND: str
+_SIMULATE_ERRORS: float
 
-        increase_csv_field_size_limit()
 
-        parser = argparse.ArgumentParser(
-            description="Tokenize binaries for BinAI.",
-            formatter_class=argparse.RawTextHelpFormatter,
-        )
-        group = parser.add_mutually_exclusive_group(required=True)
-        group.add_argument(
-            "--batch",
-            type=str,
-            metavar="QUEUE_FILE",
-            help="Process a batch of binaries from a queue file",
-        )
-        group.add_argument(
-            "--single",
-            type=str,
-            metavar="BINARY_FILE",
-            help="Process a single binary file",
-        )
-        group.add_argument(
-            "--dynamic_queue",
-            type=int,
-            metavar="SOCKET_FD",
-            help="Worker mode: receive tasks via socket file descriptor (anonymous socket)",
-        )
-        group.add_argument(
-            "--socket-path",
-            type=str,
-            metavar="SOCKET_PATH",
-            help="Worker mode: receive tasks via named Unix socket at this path",
-        )
-        parser.add_argument(
-            "--log-file",
-            type=str,
-            help="Log file instead of stdout/err",
-        )
-        group.add_argument(
-            "--debug",
-            choices=([d.arg_abbr for d in debug_defaults] + [d.arg_name for d in debug_defaults]),
-            help=(
-                "Debug mode: process a debug file. Possible to override platform, "
-                "compiler, version, and optimisation-level.\n" + "\n".join(d.help_line() for d in debug_defaults)
-            ),
-        )
+def _build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Tokenize binaries for BinAI.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--batch",
+        type=str,
+        metavar="QUEUE_FILE",
+        help="Process a batch of binaries from a queue file",
+    )
+    group.add_argument(
+        "--single",
+        type=str,
+        metavar="BINARY_FILE",
+        help="Process a single binary file",
+    )
+    group.add_argument(
+        "--dynamic_queue",
+        type=int,
+        metavar="SOCKET_FD",
+        help="Worker mode: receive tasks via socket file descriptor (anonymous socket)",
+    )
+    group.add_argument(
+        "--socket-path",
+        type=str,
+        metavar="SOCKET_PATH",
+        help="Worker mode: receive tasks via named Unix socket at this path",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        help="Log file instead of stdout/err",
+    )
+    group.add_argument(
+        "--debug",
+        choices=([d.arg_abbr for d in debug_defaults] + [d.arg_name for d in debug_defaults]),
+        help=(
+            "Debug mode: process a debug file. Possible to override platform, "
+            "compiler, version, and optimisation-level.\n" + "\n".join(d.help_line() for d in debug_defaults)
+        ),
+    )
 
-        parser.add_argument(
-            "--platform",
-            type=str,
-            help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'auto' to auto-detect from binary name. Default is auto.",
-            default="auto",
-            choices=["x86", "x64", "arm32", "arm64", "mips32", "mips64", "ppc32", "ppc64", "riscv32", "riscv64", "auto"],
-        )
-        parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
-        parser.add_argument(
-            "--source",
-            type=str,
-            default="./src",
-            help="Source directory containing binaries (default: ./src)",
-        )
-        parser.add_argument(
-            "--output",
-            type=str,
-            default="./out",
-            help="Output directory for results (default: ./out)",
-        )
+    parser.add_argument(
+        "--platform",
+        type=str,
+        help="Specify the platform (e.g., x86, arm64) for the tokenizer. Use 'auto' to auto-detect from binary name. Default is auto.",
+        default="auto",
+        choices=["x86", "x64", "arm32", "arm64", "mips32", "mips64", "ppc32", "ppc64", "riscv32", "riscv64", "auto"],
+    )
+    parser.add_argument("--skip_existing", action="store_true", help="Skip existing csv files.")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="./src",
+        help="Source directory containing binaries (default: ./src)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./out",
+        help="Output directory for results (default: ./out)",
+    )
 
-        parser.add_argument(
-            "--backend",
-            type=str,
-            default="angr",
-            choices=["angr", "ghidra"],
-            help="Disassembly backend to use (default: angr)",
-        )
-        parser.add_argument(
-            "--simulate-errors",
-            type=float,
-            metavar="PERCENTAGE",
-            help="Simulate random worker crashes with given percentage chance (0-100)",
-        )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="angr",
+        choices=["angr", "ghidra"],
+        help="Disassembly backend to use (default: angr)",
+    )
+    parser.add_argument(
+        "--simulate-errors",
+        type=float,
+        metavar="PERCENTAGE",
+        help="Simulate random worker crashes with given percentage chance (0-100)",
+    )
+    return parser
 
-        args = parser.parse_args()
 
-        cwd = Path.cwd()
-        source_dir = (cwd / args.source).resolve()
-        output_dir = (cwd / args.output).resolve()
+def _setup_logging(args: argparse.Namespace) -> None:
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
 
-        if args.log_file:
-            if args.dynamic_queue:
-                remove_stream_handlers(logger)
-
-            log_file = Path(args.log_file)
-            if not log_file.parent.exists():
-                log_file.parent.mkdir(parents=True)
-
-            log_file.touch()
-
-            file_handler = logging.FileHandler(log_file, mode="a")
-            file_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter(
-                "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-            )
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-
-        else:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+    if args.log_file:
+        if args.dynamic_queue:
+            remove_stream_handlers(logger)
+        log_file = Path(args.log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.touch()
+        file_handler = logging.FileHandler(log_file, mode="a")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
-
-        logger.info(f"[*] Source directory: {source_dir}")
-        logger.info(f"[*] Output directory: {output_dir}")
-
-        if args.debug is not None:
-            args.platform = args.platform if args.platform != "auto" else "x86"
-            debug_default = debug_defaults_loopup[args.debug]
-            if debug_default is None:
-                raise NotImplementedError(f"Debug option '{args.debug}' not found")
-
-            if args.skip_existing:
-                logger.warning("Skipping existing file in debug mode!! - probably not what you want")
-
-            args.single = (
-                f"{debug_default.folder}/x86-"
-                f"{debug_default.compiler}-{debug_default.version}-{debug_default.optimisation}_{debug_default.binary}"
-            )
-
-        common_params = dict(
-            platform=args.platform,
-            skip_existing_csv=args.skip_existing,
-            source_dir=source_dir,
-            output_dir=output_dir,
-            backend=args.backend,
+        )
+        logger.addHandler(file_handler)
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-        if args.dynamic_queue or args.socket_path:
-            if args.socket_path:
-                from dynamic_runner.comm import NamedSocketInterface
 
-                logger.info(f"[*] Worker connecting to named socket: {args.socket_path}")
-                comm = NamedSocketInterface(args.socket_path, is_server=False)
-                logger.info(f"[*] Worker started (PID {os.getpid()}), sending ready signal...")
-            else:
-                sock = socket.socket(fileno=args.dynamic_queue)
-                comm = UnixSocketInterface(sock)
-                logger.info(f"[*] Worker started (PID {os.getpid()}), sending ready signal...")
+def _resolve_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
+    cwd = Path.cwd()
+    return (cwd / args.source).resolve(), (cwd / args.output).resolve()
 
-            comm.send_response(ReadyResponse())
-            logger.info(f"[*] Ready signal sent, waiting for tasks...")
 
-            # Check if crash simulation is enabled
-            simulate_errors_chance = args.simulate_errors if args.simulate_errors is not None else 0.0
-            if simulate_errors_chance > 0:
-                logger.info(f"[*] Error simulation enabled: {simulate_errors_chance}% chance per task")
+def _on_args(args: argparse.Namespace) -> None:
+    """Hook invoked by `run()` before the loop starts. Sets up
+    logging, CSV field-size limits, and the module-level config
+    the handler closes over.
+    """
+    global _PLATFORM, _SKIP_EXISTING, _SOURCE_DIR, _OUTPUT_DIR, _BACKEND, _SIMULATE_ERRORS
 
-            while True:
-                try:
-                    command = comm.receive_command(blocking=True)
-                    if not command:
-                        break
+    increase_csv_field_size_limit()
+    _setup_logging(args)
+    _SOURCE_DIR, _OUTPUT_DIR = _resolve_dirs(args)
+    _PLATFORM = args.platform
+    _SKIP_EXISTING = bool(args.skip_existing)
+    _BACKEND = args.backend
+    _SIMULATE_ERRORS = float(args.simulate_errors) if args.simulate_errors is not None else 0.0
 
-                    if isinstance(command, StopCommand):
-                        logger.info("[*] Received stop command, shutting down")
-                        break
+    logger = logging.getLogger()
+    logger.info(f"[*] Source directory: {_SOURCE_DIR}")
+    logger.info(f"[*] Output directory: {_OUTPUT_DIR}")
+    if _SIMULATE_ERRORS > 0:
+        logger.info(f"[*] Error simulation enabled: {_SIMULATE_ERRORS}% chance per task")
 
-                    binary_path = source_dir / command.relative_path
-                    logger.info(f"[*] Processing: {binary_path}")
 
-                    # Simulate crash if enabled
-                    if simulate_errors_chance > 0:
-                        if random.random() * 100 < simulate_errors_chance:
-                            logger.warning(f"[!] SIMULATED Error for task {binary_path.name}")
-                            response = ErrorResponse(
-                                error_type=ErrorType.NON_RECOVERABLE,
-                                error_message=f"Simulated error ({simulate_errors_chance}% chance)",
-                            )
-                            comm.send_response(response)
-                            break
+@task_function
+def handle(task: Task) -> WorkerOutput | None:
+    """Per-task body — runtime owns the read/run/respond cycle.
 
-                    try:
-                        run_tokenizer(
-                            binary_path,
-                            platform=cast(Platform | str, common_params["platform"]),
-                            skip_existing_csv=cast(bool, common_params["skip_existing_csv"]),
-                            source_dir=cast(Path, common_params["source_dir"]),
-                            output_dir=cast(Path, common_params["output_dir"]),
-                            comm=comm,
-                            backend=cast(str, common_params["backend"]),
-                        )
-                    except MemoryError as e:
-                        response = ErrorResponse(error_type=ErrorType.OUT_OF_MEMORY, error_message=str(e))
-                        comm.send_response(response)
-                        break
-                    except (KeyboardInterrupt, SystemExit) as e:
-                        response = ErrorResponse(error_type=ErrorType.NON_RECOVERABLE, error_message=type(e).__name__)
-                        comm.send_response(response)
-                        logger.info(f"[!] Non-recoverable error: {e}")
-                        break
-                    except Exception as e:
-                        tb_str = traceback.format_exc()
-                        logger.error(f"[!] Error processing {binary_path}:\n{tb_str}")
-                        response = ErrorResponse(
-                            error_type=ErrorType.RECOVERABLE, error_message=f"{type(e).__name__}: {str(e)}"
-                        )
-                        comm.send_response(response)
+    The runtime's exception → wire mapping turns:
+      * MemoryError                       → OUT_OF_MEMORY (exit)
+      * RecoverableError                  → RECOVERABLE
+      * NonRecoverableError               → NON_RECOVERABLE
+      * NonRecoverableTokenizerError      → routed to NonRecoverableError
+        below because angr CFG-resolver bugs (arm_elf_fast.py:89
+        IndexError, missing-VEX NotImplementedError) are
+        binary-deterministic — retry won't help.
+      * subprocess.CalledProcessError     → RECOVERABLE (default)
+      * everything else                   → WorkerExceptionResponse
+                                            (default: RECOVERABLE).
+    """
+    logger = logging.getLogger()
+    binary_path = _SOURCE_DIR / task.relative_path
+    logger.info(f"[*] Processing: {binary_path}")
 
-                except (KeyboardInterrupt, SystemExit) as e:
-                    logger.info(f"[!] Worker interrupted: {e}")
-                    break
-                except Exception as e:
-                    logger.info(f"[!] Worker error: {e}")
-                    try:
-                        response = PickledErrorResponse(
-                            exception_type=type(e).__name__,
-                            exception_message=str(e),
-                            traceback_str=traceback.format_exc(),
-                        )
-                        comm.send_response(response)
-                    except Exception:
-                        fallback = ErrorResponse(
-                            error_type=ErrorType.NON_RECOVERABLE,
-                            error_message=f"Failed to send error: {type(e).__name__}: {str(e)[:100]}",
-                        )
-                        comm.send_response(fallback)
-                    break
+    if _SIMULATE_ERRORS > 0 and random.random() * 100 < _SIMULATE_ERRORS:
+        logger.warning(f"[!] SIMULATED Error for task {binary_path.name}")
+        raise NonRecoverableError(f"Simulated error ({_SIMULATE_ERRORS}% chance)")
 
-            comm.close()
-            logger.info("[*] Worker shutdown complete")
-
-        elif args.batch:
-            queue_file_path = (cwd / args.batch).resolve()
-            logger.info(f"[*] Reading queue file: {queue_file_path}")
-
-            with open(queue_file_path, "r") as f:
-                lines = [line.strip() for line in f if line.strip()]
-
-            logger.info(f"[*] Total lines in queue: {len(lines)}")
-
-            absolute_lines = []
-            for line in lines:
-                if line.startswith("./"):
-                    line = line[2:]
-                absolute_lines.append(str(source_dir / line))
-
-            from tokenizer.utils import filter_queue
-
-            filtered_lines = filter_queue(absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir))
-
-            logger.info(f"[*] Filtered queue: {len(filtered_lines)} items to process")
-
-            comm = NoopInterface()
-            for idx, binary_path_str in enumerate(filtered_lines, 1):
-                logger.info(f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}")
-                binary_path = Path(binary_path_str).resolve()
-                try:
-                    run_tokenizer(binary_path, comm=comm, **common_params)
-                except Exception as e:
-                    logger.info(f"[!] Error processing {binary_path}: {e}")
-                    logger.info("Continuing with next binary in queue...")
-                    continue
-
-            logger.info("\n[*] Batch processing complete.")
-        elif args.single:
-            binary_path_input = Path(args.single)
-
-            # If the path is absolute, use it directly
-            if binary_path_input.is_absolute():
-                binary_path = binary_path_input.resolve()
-            else:
-                # Check if --source was explicitly provided by the user
-                source_was_explicit = "--source" in sys.argv
-
-                if source_was_explicit:
-                    # If source was explicitly set, always use file relative to source_dir
-                    binary_path = (source_dir / binary_path_input).resolve()
-                else:
-                    # Check if path exists relative to cwd
-                    cwd_path = cwd / binary_path_input
-                    exists_in_cwd = cwd_path.exists()
-
-                    # Check if path exists relative to source_dir
-                    source_path = source_dir / binary_path_input
-                    exists_in_source = source_path.exists()
-
-                    if exists_in_cwd and exists_in_source:
-                        logger.error(
-                            f"[!] Ambiguous path: '{args.single}' exists in both current directory and source directory."
-                        )
-                        logger.error(f"    Found at: {cwd_path}")
-                        logger.error(f"    Found at: {source_path}")
-                        logger.error(
-                            "    Suggestion: Use --source ./ or --source ./src/ to explicitly set the directory, or provide an absolute path."
-                        )
-                        sys.exit(1)
-                    elif exists_in_cwd:
-                        binary_path = cwd_path.resolve()
-                    elif exists_in_source:
-                        binary_path = source_path.resolve()
-                    else:
-                        # Neither exists, just resolve relative to cwd (will fail later with clear error)
-                        binary_path = cwd_path.resolve()
-            logger.info(f"[*] Processing single binary: {binary_path}")
-            comm = NoopInterface()
-            run_tokenizer(binary_path, comm=comm, **common_params)
-
-    except Exception as e:
-        if sock is not None:
-            try:
-                tb_str = traceback.format_exc()
-                error_info = {
-                    "type": type(e).__name__,
-                    "message": str(e),
-                    "traceback": tb_str,
-                }
-                pickled_error = pickle.dumps(error_info)
-                error_msg = f"error:pickle:{pickled_error.decode('latin-1')}\n"
-                sock.sendall(error_msg.encode("utf-8"))
-            except Exception as pickle_error:
-                try:
-                    fallback_msg = f"error:non_recoverable:Failed to pickle error: {type(e).__name__}: {str(e)[:100]}\n"
-                    sock.sendall(fallback_msg.encode("utf-8"))
-                except Exception:
-                    pass
+    try:
+        warnings, filtered = run_tokenizer(
+            binary_path,
+            platform=cast(Platform | str, _PLATFORM),
+            skip_existing_csv=_SKIP_EXISTING,
+            source_dir=_SOURCE_DIR,
+            output_dir=_OUTPUT_DIR,
+            task=task,
+            backend=_BACKEND,
+        )
+    except NonRecoverableTokenizerError as e:
+        # Binary-deterministic tokenizer failures (e.g.
+        # angr arm_elf_fast.py:89 IndexError on certain
+        # ARM ELF indirect jumps). Retry won't help.
+        tb_str = traceback.format_exc()
+        logger.error(f"[!] Non-recoverable tokenizer error processing {binary_path}:\n{tb_str}")
+        raise NonRecoverableError(str(e)) from e
+    except (RecoverableError, NonRecoverableError, MemoryError):
         raise
+    except Exception:
+        # All other exceptions surface as WorkerExceptionResponse
+        # (RECOVERABLE per c455835's default — the retry-pass
+        # exhaustion logic catches truly-permanent cases). The
+        # traceback ships with the response.
+        tb_str = traceback.format_exc()
+        logger.error(f"[!] Error processing {binary_path}:\n{tb_str}")
+        raise
+
+    return WorkerOutput(warnings=warnings, filtered=filtered)
+
+
+def _run_standalone(args: argparse.Namespace) -> None:
+    """Standalone (non-framework) entry points: --single, --batch,
+    --debug. These don't go through the runtime's read/run/respond
+    loop; they iterate locally and pass a default ``Task()`` to
+    ``run_tokenizer`` (its keepalive/set_phase methods are no-ops
+    when ``_emit`` is None).
+    """
+    increase_csv_field_size_limit()
+    _setup_logging(args)
+    source_dir, output_dir = _resolve_dirs(args)
+    logger = logging.getLogger()
+    logger.info(f"[*] Source directory: {source_dir}")
+    logger.info(f"[*] Output directory: {output_dir}")
+
+    if args.debug is not None:
+        args.platform = args.platform if args.platform != "auto" else "x86"
+        debug_default = debug_defaults_loopup[args.debug]
+        if debug_default is None:
+            raise NotImplementedError(f"Debug option '{args.debug}' not found")
+        if args.skip_existing:
+            logger.warning("Skipping existing file in debug mode!! - probably not what you want")
+        args.single = (
+            f"{debug_default.folder}/x86-"
+            f"{debug_default.compiler}-{debug_default.version}-{debug_default.optimisation}_{debug_default.binary}"
+        )
+
+    common_params = dict(
+        platform=args.platform,
+        skip_existing_csv=args.skip_existing,
+        source_dir=source_dir,
+        output_dir=output_dir,
+        backend=args.backend,
+    )
+
+    if args.batch:
+        cwd = Path.cwd()
+        queue_file_path = (cwd / args.batch).resolve()
+        logger.info(f"[*] Reading queue file: {queue_file_path}")
+
+        with open(queue_file_path, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        logger.info(f"[*] Total lines in queue: {len(lines)}")
+
+        absolute_lines = []
+        for line in lines:
+            if line.startswith("./"):
+                line = line[2:]
+            absolute_lines.append(str(source_dir / line))
+
+        from tokenizer.utils import filter_queue
+
+        filtered_lines = filter_queue(absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir))
+        logger.info(f"[*] Filtered queue: {len(filtered_lines)} items to process")
+
+        for idx, binary_path_str in enumerate(filtered_lines, 1):
+            logger.info(f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}")
+            binary_path = Path(binary_path_str).resolve()
+            try:
+                run_tokenizer(binary_path, task=Task(relative_path=str(binary_path)), **common_params)
+            except Exception as e:
+                logger.info(f"[!] Error processing {binary_path}: {e}")
+                logger.info("Continuing with next binary in queue...")
+                continue
+        logger.info("\n[*] Batch processing complete.")
+        return
+
+    # --single (also reached after --debug's expansion above).
+    binary_path_input = Path(args.single)
+    cwd = Path.cwd()
+
+    if binary_path_input.is_absolute():
+        binary_path = binary_path_input.resolve()
+    else:
+        source_was_explicit = "--source" in sys.argv
+        if source_was_explicit:
+            binary_path = (source_dir / binary_path_input).resolve()
+        else:
+            cwd_path = cwd / binary_path_input
+            exists_in_cwd = cwd_path.exists()
+            source_path = source_dir / binary_path_input
+            exists_in_source = source_path.exists()
+
+            if exists_in_cwd and exists_in_source:
+                logger.error(
+                    f"[!] Ambiguous path: '{args.single}' exists in both current directory and source directory."
+                )
+                logger.error(f"    Found at: {cwd_path}")
+                logger.error(f"    Found at: {source_path}")
+                logger.error(
+                    "    Suggestion: Use --source ./ or --source ./src/ to explicitly set the directory, or provide an absolute path."
+                )
+                sys.exit(1)
+            elif exists_in_cwd:
+                binary_path = cwd_path.resolve()
+            elif exists_in_source:
+                binary_path = source_path.resolve()
+            else:
+                binary_path = cwd_path.resolve()
+
+    logger.info(f"[*] Processing single binary: {binary_path}")
+    run_tokenizer(binary_path, task=Task(relative_path=str(binary_path)), **common_params)
+
+
+def main() -> None:
+    parser = _build_argparser()
+    args = parser.parse_args()
+
+    if args.dynamic_queue or args.socket_path:
+        # Worker mode: hand control to the framework's runtime,
+        # which owns the read/run/respond loop and exception →
+        # wire mapping. Our `_on_args` populates module-level
+        # config that the @task_function handler reads.
+        run(args=args, on_args=_on_args)
+        return
+
+    _run_standalone(args)
 
 
 if __name__ == "__main__":

@@ -159,14 +159,22 @@ def ndarray_to_base64(arr: np.ndarray) -> str:
         • k*4 bits: length itself (4 .. 32 bits)
         • payload : values, each `bit-width` bits
     The whole stream is byte-aligned and Base-64 encoded.
+
+    Empty arrays encode to a header-only stream (n=0, minimum bit-width).
+    `base64_to_ndarray_vec` already handles n=0 in the decode path, so the
+    round-trip is symmetric. This matters for tokenizing very small
+    binaries where a function may produce zero usable tokens — the encoder
+    used to raise on empty input, which surfaced as a NonRecoverable
+    `ValueError: empty array` for tiny .so files (e.g. openssl plugins).
     """
     flat = np.asarray(arr, dtype=np.uint64).ravel()
-    if flat.size == 0:
-        raise ValueError("empty array")
 
     # --- bit-width --------------------------------------------------------
-    max_val = int(flat.max())
-    bits = max(2, math.ceil(math.log2(max_val + 1)))  # we never store <2 bits
+    if flat.size == 0:
+        bits = 2  # minimum the format encodes; payload is empty either way
+    else:
+        max_val = int(flat.max())
+        bits = max(2, math.ceil(math.log2(max_val + 1)))  # we never store <2 bits
     if bits > 33:
         raise ValueError("bit-width >33 not supported by 5-bit header")
     bits_code = bits - 2  # 0..31 ➟ store in 5 bits

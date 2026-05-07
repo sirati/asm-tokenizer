@@ -18,16 +18,18 @@ from enum import Enum
 from pathlib import Path
 
 from dynamic_runner import _native
-from dynamic_runner._shared import (
+from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
+
+from dynrunner.binary_selection import (
     BinaryIdentifier,
     SelectionFilters,
     TaskInfo,
+    add_asm_selection_arguments,
     compile_selection_filters,
     is_excluded_subfolder,
     match_filename,
     process_selection_arguments,
 )
-from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 
 _PHASE_ID = "tokenize"
@@ -221,9 +223,15 @@ class TokenizerTask:
         return math.ceil(ram_mb * 1024 * 1024)
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
-        # No tokenizer-specific arguments beyond the framework's
-        # standard file-discovery parameters.
-        pass
+        # Asm-binary corpus-shape filter flags (--platform, --compiler,
+        # --compiler-versions, --opt, --file-format, --debugs,
+        # --exclude-subfolder, --name-regex, --version-regex, --opt-regex)
+        # used to live in `dynamic_runner._shared.selection_args`. After
+        # framework commit 6c65bb7 they're consumer-owned; we vendor them
+        # under `dynrunner/binary_selection/` and register them per-task
+        # here so the `discover_items` body can consume them via
+        # `process_selection_arguments(args)`.
+        add_asm_selection_arguments(parser)
 
     def build_worker_command_args(
         self,
