@@ -32,6 +32,7 @@ from dynrunner.binary_selection import (
     process_selection_arguments,
 )
 from tokenizer.binary_discovery import BinaryHandle, walk_dataset
+from tokenizer.output_filename import format_output_csv_filename
 from tokenizer.variant_info import VariantInfo
 
 
@@ -344,21 +345,34 @@ class TokenizerTask:
     ) -> str:
         """Output filename for ``item``.
 
-        Variant-id-suffixed when ``variant_id != 0`` so same-canonical-4
-        sidecar variants don't collide; legacy paths stay byte-identical
-        (``<item.path.name>_output.csv``) since ``variant_id`` defaults to 0.
-        ``variant_id`` lives on the payload because ``BinaryIdentifier``
-        has 5 locked fields and can't carry it.
+        Composes the canonical-format
+        ``<arch>-<compiler>-<compiler_version>-<opt>_<pkg>`` from the
+        VariantInfo carried in ``item.payload`` (sidecar mode) or
+        recovered from the legacy filename (legacy mode), then appends
+        ``_output.csv`` — with a ``__<variant_id:08x>`` suffix on the
+        binary-name slot when ``variant_id != 0`` to disambiguate
+        same-canonical-4 sidecar variants. Delegates the format string
+        to ``tokenizer.output_filename`` so the worker's CSV writeout
+        and the build_memmap phase's pairing walk use the same single
+        source of truth.
 
-        ``item.path.name`` is used (not ``.stem``) because legacy
-        binaries can have multi-segment versioned suffixes such as
-        ``libz.so.1.2.11`` where ``.stem`` would strip ``.11`` and break
-        the legacy byte-identical contract. For sidecar tasks
-        ``item.path`` is the JSON sidecar so the ``.json`` infix is
-        carried into the output name; the worker (S3-tok) mirrors this
-        in its CSV writeout so skip-existing matching agrees.
+        Using ``item.path.name`` here would mis-name sidecar tasks (the
+        JSON sidecar's filename, e.g.
+        ``clang10_armv7l-hf_Oz_15f3f338.json``, does NOT match the
+        canonical regex consumed by build_memmap and can't carry the
+        ``pkg`` slot the pairing walk relies on); reconstructing from
+        the canonical fields keeps both formats on a single naming
+        scheme.
         """
-        return _format_output_filename(item.path.name, _payload_variant_id(item))
+        variant = _payload_variant(item)
+        return format_output_csv_filename(
+            variant.arch,
+            variant.compiler,
+            variant.compiler_version,
+            variant.opt,
+            variant.pkg,
+            variant.variant_id,
+        )
 
     # ── Lifecycle hooks ────────────────────────────────────────────────
 
@@ -417,31 +431,30 @@ def _build_payload(variant: VariantInfo, tarball: Path | None) -> dict[str, Any]
     }
 
 
-def _payload_variant_id(item: TaskInfo) -> int:
-    """Pull ``variant_id`` out of ``item.payload``.
+def _payload_variant(item: TaskInfo) -> VariantInfo:
+    """Reconstruct the ``VariantInfo`` carried on ``item.payload``.
 
-    Defaults to 0 if the payload is missing or shaped legacy-style —
-    keeps ``get_output_filename_pattern`` working for any TaskInfo a
-    framework consumer constructs without going through
-    ``_sort_and_tag_pairs`` (e.g. unit tests, future hand-built
-    items).
+    Mirrors the encode-side ``_variant_to_payload_dict`` field order
+    verbatim. Falls back to ``VariantInfo.from_legacy_filename`` when
+    the payload is missing or unshaped — keeps
+    ``get_output_filename_pattern`` working for any TaskInfo a framework
+    consumer constructs without going through ``_sort_and_tag_pairs``
+    (e.g. the gateway-SSH path which still has the legacy filename on
+    ``item.path``).
     """
     payload = item.payload or {}
-    variant_dict = payload.get(_PAYLOAD_VARIANT_KEY) or {}
-    return int(variant_dict.get("variant_id", 0))
-
-
-def _format_output_filename(stem: str, variant_id: int) -> str:
-    """Compose the per-variant output filename.
-
-    ``variant_id == 0`` → ``<stem>_output.csv`` (byte-identical to the
-    pre-variant-id rule). ``variant_id != 0`` → ``<stem>__<8hex>_output.csv``
-    so same-canonical-4 sidecar variants (which all share the legacy
-    filename projection) get unique output filenames.
-    """
-    if variant_id == 0:
-        return f"{stem}_output.csv"
-    return f"{stem}__{variant_id:08x}_output.csv"
+    variant_dict = payload.get(_PAYLOAD_VARIANT_KEY)
+    if variant_dict is None:
+        return VariantInfo.from_legacy_filename(item.path)
+    return VariantInfo(
+        arch=variant_dict["arch"],
+        compiler=variant_dict["compiler"],
+        compiler_version=variant_dict["compiler_version"],
+        opt=variant_dict["opt"],
+        pkg=variant_dict["pkg"],
+        variant_id=int(variant_dict.get("variant_id", 0)),
+        extra_metadata=variant_dict.get("extra_metadata", {}) or {},
+    )
 
 
 def _variant_passes_filters(
