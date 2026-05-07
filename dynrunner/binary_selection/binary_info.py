@@ -79,7 +79,19 @@ def build_field_regexes(
     if platforms:
         platform_regex = "(?:" + "|".join(re.escape(p) for p in platforms) + ")"
     else:
-        platform_regex = r"[^-_]+"
+        # Allow dashes inside platform names so dash-segmented archs from
+        # the sidecar corpus (e.g. ``armv7l-hf``, ``aarch64-be``) parse
+        # under the default ``platform-compiler-version-opt_binary``
+        # format. The compiler / version / opt slots stay dash-free
+        # (``[^-_]+`` and the ``O…`` opt anchor below), so the regex
+        # backtracking still finds the unique split: greedy platform
+        # absorbs leading dashed chunks, then the last three dashed
+        # chunks before ``_`` consume compiler/version/opt. Pre-2026
+        # default ``[^-_]+`` silently dropped multi-segment archs (e.g.
+        # ``armv7l-hf``) from output-CSV pairing in build_memmap and
+        # vocab_unifier; relaxing here keeps the legacy single-segment
+        # corpus parse identical (only sidecar-derived names benefit).
+        platform_regex = r"[^_]+"
 
     if compilers:
         compiler_regex = "(?:" + "|".join(re.escape(c) for c in compilers) + ")"
@@ -99,7 +111,13 @@ def build_field_regexes(
         if "(" in opt_regex and ")" in opt_regex:
             opt_level_transform = "transform"
     else:
-        opt_level_pattern = r"O([0123s])"
+        # Accept ``Oz`` and ``Ofast`` in addition to the historical
+        # ``O[0-3s]`` levels. Clang emits these on the sidecar corpus;
+        # pre-2026 default ``O([0123s])`` silently dropped them. The
+        # capture group still reduces to the bare opt-letter token so
+        # ``opt_level_transform = "O"`` re-prepends the ``O`` to recover
+        # the canonical ``Oz`` / ``Ofast`` string downstream.
+        opt_level_pattern = r"O([0123s]|fast|z)"
         opt_level_transform = "O"
 
     binary_name_pattern = name_regex if name_regex else r".+"
