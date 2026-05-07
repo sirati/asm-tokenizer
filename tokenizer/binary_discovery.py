@@ -91,8 +91,9 @@ def _tarball_uncompressed_size(tarball_path: Path) -> int:
     Opens the archive in ``r:zst`` mode and walks ``getmembers()``;
     member sizes come from the tar header so the data payload is never
     decompressed. The "regular file" filter mirrors the convention the
-    extractor uses (``tarball_extractor._pick_member``): directory and
-    symlink entries don't contribute to the binary content.
+    extractor uses (``tarball_extractor.extract_all_binaries`` skips
+    every non-``isfile()`` member): directory and symlink entries
+    don't contribute to the binary content.
     """
     with tarfile.open(tarball_path, "r:zst") as tf:
         return sum(m.size for m in tf.getmembers() if m.isfile())
