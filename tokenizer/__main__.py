@@ -22,6 +22,7 @@ from dynamic_runner.worker import (
 
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.arch import Platform
+from tokenizer.arch_translation import arch_to_platform
 from tokenizer.run_tokenizer import NonRecoverableTokenizerError, run_tokenizer
 from tokenizer.tarball_extractor import extract_binary
 from tokenizer.variant_info import VariantInfo
@@ -348,11 +349,23 @@ def handle(task: Task) -> WorkerOutput | None:
     # explicitly to keep outputs mirroring the source tree's layout.
     source_relative_path = Path(task.relative_path)
 
+    # Sidecar tasks (``variant_id != 0``) carry a distro-style ``arch``
+    # string (``x86_64``, ``aarch64``, ``armv7l-hf``, ...) that the
+    # tokenizer's filename auto-detect can't read off the extracted
+    # binary's bare name (``hello`` / ``busybox``). The translator owns
+    # the mapping and raises on unknown arches; legacy tasks
+    # (``variant_id == 0``) keep the auto-detect-from-filename pathway
+    # because their on-disk filename still encodes the platform.
+    if variant.variant_id != 0:
+        platform: Platform | str = arch_to_platform(variant.arch)
+    else:
+        platform = cast(Platform | str, _PLATFORM)
+
     try:
         with _resolve_binary_for_task(source_path, variant, tarball_path) as binary_path:
             warnings, filtered = run_tokenizer(
                 binary_path,
-                platform=cast(Platform | str, _PLATFORM),
+                platform=platform,
                 skip_existing_csv=_SKIP_EXISTING,
                 source_dir=_SOURCE_DIR,
                 output_dir=_OUTPUT_DIR,
