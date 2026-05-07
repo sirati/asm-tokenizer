@@ -29,16 +29,18 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from dynamic_runner import _native
-from dynamic_runner._shared import (
+from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
+
+from dynrunner.binary_selection import (
     BinaryIdentifier,
     SelectionFilters,
     TaskInfo,
+    add_asm_selection_arguments,
     compile_selection_filters,
     is_excluded_subfolder,
     match_filename,
     process_selection_arguments,
 )
-from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 
 _logger = logging.getLogger(__name__)
@@ -374,6 +376,9 @@ class MemmapBuilderTask:
         return max(4 * item.size, 512 * 1024 * 1024) + 256 * 1024 * 1024
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
+        # Vendored asm-binary corpus selection flags (--platform etc.) —
+        # see TokenizerTask.add_task_arguments for rationale.
+        add_asm_selection_arguments(parser)
         parser.add_argument(
             "--vocab-source",
             type=str,

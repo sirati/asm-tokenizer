@@ -172,13 +172,19 @@
           inherit (gitignore.lib) gitignoreSource;
           semanticLayering = nix-docker-layered-image.lib.${system}.semanticLayering;
 
-          # Python WITHOUT the rust wheel — that goes into its own
-          # explicit layer (see `dockerImage` below). The bulk python
-          # wrapper carries everything else (angr, ghidra/pyghidra,
-          # numpy/pandas/sympy, etc.) so updating the rust wheel
-          # invalidates only the wheel layer, not this 1+ GB closure.
+          # Python wrapper carries everything the container needs:
+          # angr, ghidra/pyghidra, numpy/pandas/sympy, AND
+          # dynamic-runner. Including dynamic-runner in withPackages
+          # means the wrapper resolves it via its own site-packages
+          # (no PYTHONPATH injection at the OCI layer). The
+          # layering pipeline below isolates `runnerWheel` into its
+          # own layer, so wheel updates only re-upload the wheel
+          # blob plus the (tiny) wrapper script — not the 1+ GB
+          # numpy/pandas/angr closure.
           bulkPython = pkgs.python314.withPackages (
-            python-pkgs: deploymentPythonPackages python-pkgs
+            python-pkgs:
+            (deploymentPythonPackages python-pkgs)
+            ++ [ python-pkgs.dynamic-runner ]
           );
 
           # Restrict app payload to selected source directories and root Python files only
@@ -212,13 +218,6 @@
             mkdir -p $out/app
             cp -r ${projectSource}/. $out/app/
             chmod -R +w $out/app
-          '';
-
-          # Wheel placed under a fixed path so PYTHONPATH can find
-          # it without adding it to bulkPython's wrapper.
-          rustWheelTree = pkgs.runCommand "rust-wheel-tree" { } ''
-            mkdir -p $out/opt/runner-wheel
-            ln -s ${runnerWheel}/lib $out/opt/runner-wheel/lib
           '';
 
           # ── Semantic layer plan ───────────────────────────────────
@@ -294,6 +293,87 @@
 
           previousAssignment = semanticLayering.readAssignmentFromEnv "NIX_DOCKER_LAYER_CACHE";
 
+          # `mkShell` derivation that captures the runtime env we want
+          # the container to launch into. We pass its drvAttrs through
+          # `unstructuredDerivationInputEnv` to extract the env vars
+          # nix-shell would set, then bake them into the image's OCI
+          # Env. At container start, the entrypoint sources
+          # `$stdenv/setup` which processes each input package's
+          # setupHook (so e.g. `openjdk21`'s setupHook sets
+          # `JAVA_HOME=$out/lib/openjdk` automatically — without us
+          # hardcoding the `/lib/openjdk` subpath), then runs our
+          # shellHook for GHIDRA_INSTALL_DIR. This is the
+          # dockerTools.buildNixShellImage approach minus its custom
+          # base image, so we keep the layered-transfer optimization.
+          containerShell = pkgs.mkShell {
+            packages = (deploymentPackages pkgs) ++ (dockerOnlyPackages pkgs);
+            shellHook = ''
+              export GHIDRA_INSTALL_DIR="${pkgs.ghidra}/lib/ghidra"
+            '';
+          };
+          containerShellEnv =
+            pkgs.devShellTools.unstructuredDerivationInputEnv {
+              inherit (containerShell) drvAttrs;
+            }
+            // pkgs.devShellTools.derivationOutputEnv {
+              outputList = containerShell.outputs;
+              outputMap = containerShell;
+            };
+          # Activation rcfile: replicates the slice of `$stdenv/setup`
+          # that processes setupHooks for our nativeBuildInputs, without
+          # pulling stdenv's gcc/binutils/glibc closure (~400 MB) into
+          # the runtime image. The OCI Env (extracted from
+          # `containerShell.drvAttrs` via
+          # `devShellTools.unstructuredDerivationInputEnv`) supplies
+          # `nativeBuildInputs`, `buildInputs`, `shellHook`, etc.
+          #
+          # For each input package we walk `nix-support/`'s propagated
+          # transitive closure, source `setup-hook` if present, and
+          # prepend `bin`/`sbin` to PATH. Setup-hooks that register
+          # callbacks via stdenv's `addEnvHooks` (e.g.
+          # `set-java-classpath-hook`) become inert — those callbacks
+          # only fire during nix builds. Setup-hooks that directly
+          # export env vars (e.g. openjdk21's JAVA_HOME export) work
+          # unchanged. Then we eval the user `shellHook` (which sets
+          # GHIDRA_INSTALL_DIR) and exec the python entrypoint.
+          containerEntrypointRc = pkgs.writeText "asm-tokenizer-rc.sh" ''
+            unset PATH
+            addEnvHooks() { :; }
+            addToSearchPath() {
+              local var="$1" path="$2"
+              [ -d "$path" ] && export "$var=$path''${!var:+:''${!var}}"
+            }
+            __processed=" "
+            __processPkg() {
+              local pkg="$1"
+              case "$__processed" in *" $pkg "*) return;; esac
+              __processed="$__processed$pkg "
+              local prop_file
+              for prop_file in propagated-native-build-inputs propagated-build-inputs; do
+                if [ -e "$pkg/nix-support/$prop_file" ]; then
+                  local prop __contents
+                  __contents=$(< "$pkg/nix-support/$prop_file")
+                  for prop in $__contents; do
+                    __processPkg "$prop"
+                  done
+                fi
+              done
+              if [ -e "$pkg/nix-support/setup-hook" ]; then
+                source "$pkg/nix-support/setup-hook"
+              fi
+              local sub
+              for sub in bin sbin; do
+                [ -d "$pkg/$sub" ] && PATH="$pkg/$sub''${PATH:+:}$PATH"
+              done
+            }
+            for pkg in $nativeBuildInputs $buildInputs; do
+              __processPkg "$pkg"
+            done
+            export PATH
+            eval "$shellHook"
+            exec ${bulkPython}/bin/python -m "$@"
+          '';
+
           dockerLayeringPipeline = semanticLayering.buildPipeline {
             units = [
               {
@@ -343,26 +423,32 @@
             layeringPipeline = pkgs.writeText "asm-tokenizer-pipeline.json" (
               builtins.toJSON dockerLayeringPipeline
             );
+            # fakeNss provides /etc/passwd + /etc/group with a `root`
+            # entry, so getpwuid(0) succeeds inside the container.
+            # Without it Java's `System.getProperty("user.home")`
+            # returns "?" and LaunchSupport exits 1 (`User home
+            # directory does not exist: ?`). `extraCommands` creates
+            # `/root` (HOME) since fakeNss only ships passwd entries.
             contents =
               [
                 bulkPython
-                rustWheelTree
                 projectFiles
+                pkgs.dockerTools.fakeNss
               ]
               ++ (deploymentPackages pkgs)
               ++ (dockerOnlyPackages pkgs);
+            extraCommands = ''
+              mkdir -p root tmp
+              chmod 1777 tmp
+            '';
             config = {
               Entrypoint = [
-                "${bulkPython}/bin/python"
-                "-m"
+                "${pkgs.bash}/bin/bash"
+                "${containerEntrypointRc}"
               ];
-              # The rust wheel lives at /opt/runner-wheel (not in
-              # bulkPython's site-packages, on purpose — that's what
-              # gives it its own layer). PYTHONPATH adds it to
-              # python's import path at startup.
-              Env = [
-                "PYTHONPATH=/opt/runner-wheel/lib/python3.14/site-packages"
-              ];
+              Env =
+                (pkgs.lib.mapAttrsToList (n: v: "${n}=${toString v}") containerShellEnv)
+                ++ [ "HOME=/root" ];
               WorkingDir = "/app";
             };
           };
