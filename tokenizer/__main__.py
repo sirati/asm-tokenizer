@@ -23,8 +23,9 @@ from dynamic_runner.worker import (
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.arch import Platform
 from tokenizer.arch_translation import arch_to_platform
+from tokenizer.output_filename import format_output_basename
 from tokenizer.run_tokenizer import NonRecoverableTokenizerError, run_tokenizer
-from tokenizer.tarball_extractor import extract_binary
+from tokenizer.tarball_extractor import extract_all_binaries
 from tokenizer.variant_info import VariantInfo
 
 # Payload-key constants mirror the task-side encoder
@@ -65,26 +66,104 @@ def _decode_variant(variant_dict: dict) -> VariantInfo:
     )
 
 
+@dataclass(frozen=True)
+class _TokenizeJob:
+    """One binary to tokenize: its on-disk path and the canonical
+    output basename it should emit under.
+
+    ``output_basename`` is precomputed at job-resolution time (legacy:
+    derived from the variant's pkg slot; sidecar: per-archive-member
+    basename in the binary slot) so the worker handler doesn't need
+    to know which pathway produced the job — both flows converge on
+    the same shape and ``run_tokenizer`` sees an explicit basename
+    for each emit.
+    """
+
+    binary_path: Path
+    output_basename: str
+
+
+def _legacy_job(source_path: Path, variant: VariantInfo) -> _TokenizeJob:
+    """Build the single ``_TokenizeJob`` for a legacy (non-sidecar)
+    task.
+
+    The basename is composed from the variant's canonical-4 + pkg +
+    variant_id — for legacy tasks ``variant_id == 0`` and
+    ``variant.pkg`` equals the binary basename, so this round-trips
+    the source filename byte-for-byte (preserving legacy output
+    paths).
+    """
+    return _TokenizeJob(
+        binary_path=source_path,
+        output_basename=format_output_basename(
+            variant.arch,
+            variant.compiler,
+            variant.compiler_version,
+            variant.opt,
+            variant.pkg,
+            variant.variant_id,
+        ),
+    )
+
+
+def _sidecar_jobs(
+    tarball: Path, scratch_dir: Path, variant: VariantInfo
+) -> list[_TokenizeJob]:
+    """Extract every regular-file member of ``tarball`` into
+    ``scratch_dir``; return one ``_TokenizeJob`` per member.
+
+    Each job's output basename is composed by replacing the binary-
+    name slot (``pkg`` parameter on
+    ``tokenizer.output_filename.format_output_basename``) with the
+    archive member's basename. ``Path(member_name).name`` strips any
+    archive-internal subdir layout (e.g. ``./hello`` → ``hello``,
+    ``usr/bin/cat`` → ``cat``) so the emitted filename is the bare
+    binary name regardless of how the archive structures its members.
+
+    All N jobs share the same ``VariantInfo`` (per-package metadata
+    applies identically to every binary in the package); only the
+    output basename differs per binary.
+    """
+    return [
+        _TokenizeJob(
+            binary_path=binary_path,
+            output_basename=format_output_basename(
+                variant.arch,
+                variant.compiler,
+                variant.compiler_version,
+                variant.opt,
+                Path(member_name).name,
+                variant.variant_id,
+            ),
+        )
+        for binary_path, member_name in extract_all_binaries(tarball, scratch_dir)
+    ]
+
+
 @contextlib.contextmanager
-def _resolve_binary_for_task(
+def _resolve_jobs_for_task(
     source_path: Path,
     variant: VariantInfo,
     tarball: Path | None,
 ):
-    """Yield the on-disk binary path the tokenizer reads.
+    """Yield the list of ``_TokenizeJob`` instances the handler runs
+    for this task.
 
     Two pathways converge:
 
     * Legacy (``tarball is None``): ``source_path`` is the binary file
-      itself; yielded unchanged. No scratch dir.
+      itself; yields a one-element list with the canonical-format
+      basename derived from ``variant``. No scratch dir.
     * Sidecar (``tarball`` is set): the archive is extracted into a
       per-task scratch dir under ``/tmp/tokenizer-extract/`` (scoped
-      by variant pkg + id so concurrent tasks don't collide); the
-      yielded path is the extracted binary inside that scratch.
-      Cleanup runs unconditionally on context exit.
+      by variant pkg + id so concurrent tasks don't collide); yields
+      one job per regular-file member of the archive, each with its
+      own per-binary basename. Scratch cleanup runs unconditionally
+      on context exit so all jobs must finish before the with-block
+      exits (the handler's loop is fully inside this scope).
     """
     if tarball is None:
-        yield source_path
+        yield [_legacy_job(source_path, variant)]
         return
 
     _EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -93,8 +172,7 @@ def _resolve_binary_for_task(
         dir=_EXTRACT_ROOT,
     ) as scratch_str:
         scratch_dir = Path(scratch_str)
-        binary_path = extract_binary(tarball, scratch_dir, variant.pkg)
-        yield binary_path
+        yield _sidecar_jobs(tarball, scratch_dir, variant)
 
 
 @dataclass(frozen=True)
@@ -362,18 +440,40 @@ def handle(task: Task) -> WorkerOutput | None:
         platform = cast(Platform | str, _PLATFORM)
 
     try:
-        with _resolve_binary_for_task(source_path, variant, tarball_path) as binary_path:
-            warnings, filtered = run_tokenizer(
-                binary_path,
-                platform=platform,
-                skip_existing_csv=_SKIP_EXISTING,
-                source_dir=_SOURCE_DIR,
-                output_dir=_OUTPUT_DIR,
-                task=task,
-                backend=_BACKEND,
-                variant_info=variant,
-                source_relative_path=source_relative_path,
-            )
+        # ``_resolve_jobs_for_task`` yields one job per binary the
+        # handler must tokenize: legacy → exactly one (the source
+        # file); sidecar → one per regular-file member of the
+        # tarball. Each job carries its own ``output_basename`` so
+        # multi-binary tarballs land at distinct filenames while
+        # sharing one VariantInfo's per-package metadata. Aggregated
+        # warnings + filtered counts surface to the framework as a
+        # single ``WorkerOutput``; the framework's protocol has no
+        # per-emit reporting so summing is the right model
+        # (skip-existing emits return ``(-1, -1)``; clamping to 0
+        # below preserves the existing semantic that
+        # ``warnings_total == 0 and filtered_total == 0`` after a
+        # full skip is indistinguishable from a successful zero-
+        # warning run, matching the legacy single-binary contract).
+        warnings_total = 0
+        filtered_total = 0
+        with _resolve_jobs_for_task(source_path, variant, tarball_path) as jobs:
+            for job in jobs:
+                warnings, filtered = run_tokenizer(
+                    job.binary_path,
+                    platform=platform,
+                    skip_existing_csv=_SKIP_EXISTING,
+                    source_dir=_SOURCE_DIR,
+                    output_dir=_OUTPUT_DIR,
+                    task=task,
+                    backend=_BACKEND,
+                    variant_info=variant,
+                    source_relative_path=source_relative_path,
+                    output_basename=job.output_basename,
+                )
+                if warnings >= 0:
+                    warnings_total += warnings
+                if filtered >= 0:
+                    filtered_total += filtered
     except NonRecoverableTokenizerError as e:
         # Binary-deterministic tokenizer failures (e.g.
         # angr arm_elf_fast.py:89 IndexError on certain
@@ -392,7 +492,7 @@ def handle(task: Task) -> WorkerOutput | None:
         logger.error(f"[!] Error processing {source_path}:\n{tb_str}")
         raise
 
-    return WorkerOutput(warnings=warnings, filtered=filtered)
+    return WorkerOutput(warnings=warnings_total, filtered=filtered_total)
 
 
 def _run_standalone(args: argparse.Namespace) -> None:
