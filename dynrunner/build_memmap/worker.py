@@ -41,6 +41,27 @@ _VOCAB_DIR: Path
 _OUTPUT_DIR: Path
 
 
+def _load_meta_sidecar(
+    meta_path: Path,
+) -> tuple[str | None, dict]:
+    """Read a `_meta.json` sidecar emitted by the tokenize worker and
+    extract the `(pkg, extra_metadata)` pair carried inside.
+
+    The sidecar is a serialized `VariantInfo` (canonical-4 + pkg +
+    variant_id + extra_metadata). The worker uses only `pkg` and
+    `extra_metadata` from it; the canonical-4 + `variant_id` are
+    authoritative from the wire payload (the planner emits both
+    together). Forward-compat: missing keys collapse to defaults
+    rather than raising — the per-variant metadata is opaque
+    pass-through and an undecodable sidecar must not fail the whole
+    binary group.
+    """
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    pkg = raw.get("pkg")
+    extra_metadata = raw.get("extra_metadata") or {}
+    return pkg, extra_metadata
+
+
 def _process_payload(
     task: Task,
     binary_name: str,
@@ -59,10 +80,20 @@ def _process_payload(
     source_dir is the primary's filesystem root).
 
     Per-version resilience: the planner emits one entry per
-    (compiler, version, opt) the binary was built with — but phase 1
-    or phase 2 may have failed individually for some of those. Skip
-    entries whose csv or mapping is missing on disk; only fail the
-    whole group if NO entries survive (no usable input at all).
+    (compiler, version, opt, variant_id) the binary was built with —
+    but phase 1 or phase 2 may have failed individually for some of
+    those. Skip entries whose csv or mapping is missing on disk; only
+    fail the whole group if NO entries survive (no usable input at
+    all).
+
+    `variant_id` and `meta_path` plumb the per-variant metadata
+    through to `build_memmap_files`. The canonical-4 axes plus
+    `variant_id` come from the payload (authoritative); the
+    `_meta.json` sidecar (when present) supplements with `pkg` and
+    the opaque `extra_metadata` dict. Legacy entries without a
+    sidecar default `pkg` to the group's `binary_name` and
+    `extra_metadata` to an empty dict — the same shape produced by
+    `VariantInfo.from_legacy_filename`.
     """
     data = json.loads(payload_json)
     versions_raw = data["versions"]
@@ -77,6 +108,27 @@ def _process_payload(
         if not mapping_path.exists():
             skipped.append(f"{entry['arch']}-{entry['compiler']}-{entry['compilerversion']}-{entry['opt']} (mapping missing: {mapping_path})")
             continue
+
+        # Default the per-variant metadata to the legacy shape; if a
+        # sidecar is present and readable, override.
+        pkg: str = binary_name
+        extra_metadata: dict = {}
+        meta_path_rel = entry.get("meta_path")
+        if meta_path_rel is not None:
+            meta_path = source_dir / meta_path_rel
+            if meta_path.exists():
+                meta_pkg, meta_extra = _load_meta_sidecar(meta_path)
+                if meta_pkg is not None:
+                    pkg = meta_pkg
+                extra_metadata = meta_extra
+            else:
+                logger.warning(
+                    "[!] %s: meta sidecar declared but missing on disk: %s "
+                    "— falling back to empty metadata.",
+                    binary_name,
+                    meta_path,
+                )
+
         versions.append(
             BinaryVersionInfo(
                 path=csv_path,
@@ -85,6 +137,9 @@ def _process_payload(
                 compiler=entry["compiler"],
                 compilerversion=entry["compilerversion"],
                 opt=entry["opt"],
+                pkg=pkg,
+                variant_id=int(entry.get("variant_id", 0)),
+                extra_metadata=extra_metadata,
             )
         )
 
