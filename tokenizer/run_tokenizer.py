@@ -149,6 +149,7 @@ def run_tokenizer(
     backend: str = "angr",
     variant_info: VariantInfo | None = None,
     source_relative_path: Path | None = None,
+    output_basename: str | None = None,
 ) -> tuple[int, int]:
     """Tokenize one binary; return ``(warnings, filtered)``.
 
@@ -156,13 +157,14 @@ def run_tokenizer(
     can map that to the framework's "already done" Done envelope (a
     convention the local manager treats as a no-warning skip).
 
-    Per-variant metadata flows through two optional parameters that
+    Per-variant metadata flows through three optional parameters that
     the standalone CLI doesn't need to wire:
 
-    * ``variant_info``: drives both the per-variant metadata
-      ``<base>_meta.json`` sidecar AND the canonical-format output
-      filename composed by ``tokenizer.output_filename`` (the single
-      source of truth shared with
+    * ``variant_info``: drives the per-variant metadata
+      ``<base>_meta.json`` sidecar AND (when ``output_basename`` is
+      ``None``) the canonical-format output filename composed by
+      ``tokenizer.output_filename`` (the single source of truth shared
+      with
       ``dynrunner.tokenize.tokenizer_task.get_output_filename_pattern``).
       ``None`` → recovered from ``binary_path.name`` via
       ``VariantInfo.from_legacy_filename``, preserving byte-identical
@@ -176,6 +178,18 @@ def run_tokenizer(
       lands next to where the binary "logically" lives in the source
       tree, not under the per-task scratch dir where the tarball got
       extracted.
+    * ``output_basename``: explicit ``<base>`` (without
+      ``_output.csv``/``_meta.json`` suffix) for the emitted files.
+      Multi-binary sidecar tarballs need this because all N binaries
+      in one tarball share a single ``VariantInfo`` (per-package
+      metadata), but each emits its own pair of files distinguished
+      by the binary's archive-member basename in the filename slot.
+      ``None`` → composed from ``variant_info`` via
+      ``format_output_basename`` (the legacy 1:1 pkg-equals-binary
+      case). The meta sidecar's serialised payload is unchanged either
+      way — it's always ``dataclasses.asdict(variant_info)`` so all N
+      meta sidecars in a multi-binary tarball carry identical
+      per-package metadata.
     """
     logger, warning_handler = setup_logger("tokenizer")
     logger.info("STARTING DISASSEMBLY")
@@ -275,24 +289,30 @@ def run_tokenizer(
     pickle_file_path = pickle_folder / f"{binary_name}.pkl"
     pickle_mainloop_file_path = pickle_folder / f"{binary_name}.mainloop.pkl"
 
-    # Resolve the VariantInfo that drives both the meta sidecar and
-    # the canonical-format output filename. Standalone CLI callers
-    # pass nothing → recover from the binary's legacy 4-axis filename;
-    # worker handler passes the decoded payload. The output basename
-    # is composed from the variant's canonical-4 + pkg + variant_id
-    # via ``tokenizer.output_filename`` so the task-side
+    # Resolve the VariantInfo that drives the meta sidecar (and, when
+    # the caller doesn't supply an explicit ``output_basename``, also
+    # drives the canonical-format output filename). Standalone CLI
+    # callers pass nothing → recover from the binary's legacy 4-axis
+    # filename; worker handler passes the decoded payload. The default
+    # output basename is composed from the variant's canonical-4 + pkg
+    # + variant_id via ``tokenizer.output_filename`` so the task-side
     # ``get_output_filename_pattern`` and this writeout agree on the
-    # filename byte-for-byte.
+    # filename byte-for-byte. Multi-binary sidecar callers override
+    # ``output_basename`` per archive member so each binary in the
+    # same tarball lands at its own filename (their VariantInfo —
+    # including ``pkg`` — stays unchanged because per-package metadata
+    # applies identically to every binary in the package).
     if variant_info is None:
         variant_info = VariantInfo.from_legacy_filename(binary_path)
-    output_basename = format_output_basename(
-        variant_info.arch,
-        variant_info.compiler,
-        variant_info.compiler_version,
-        variant_info.opt,
-        variant_info.pkg,
-        variant_info.variant_id,
-    )
+    if output_basename is None:
+        output_basename = format_output_basename(
+            variant_info.arch,
+            variant_info.compiler,
+            variant_info.compiler_version,
+            variant_info.opt,
+            variant_info.pkg,
+            variant_info.variant_id,
+        )
     csv_filename = f"{output_basename}{_OUTPUT_CSV_SUFFIX}"
     csv_final_path = out_folder / csv_filename
 
