@@ -7,10 +7,13 @@ edge indices.
 """
 
 import csv
+import json
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
+
+from tokenizer.variant_info import VariantInfo
 
 from ..io import read_function_data_memmap
 from ..metadata import extract_metadata_from_section_row
@@ -41,8 +44,54 @@ class BinaryDataset:
         self.unmatched_data = self.base_path / f"{binary_name}_unmatched_data.bin"
         self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
 
+        self.versions_sidecar = self.base_path / f"{binary_name}_versions.json"
+
+        # Load per-version variant metadata sidecar (legacy fallback: empty list).
+        self._versions: List[VariantInfo] = self._load_versions_sidecar()
+
         # Load metadata (NO memmap caching)
         self._load_metadata()
+
+    def _load_versions_sidecar(self) -> List[VariantInfo]:
+        """Read ``<binary>_versions.json`` and rebuild a positional list
+        of ``VariantInfo`` (list index == ``version_idx``).
+
+        Missing sidecar yields an empty list — legacy datasets without
+        the sidecar simply have no per-variant metadata available, and
+        ``get_variant_metadata`` returns ``None`` for every index.
+        """
+        if not self.versions_sidecar.exists():
+            return []
+
+        with open(self.versions_sidecar, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        # Sidecar entries are written in version_idx order; positional
+        # reconstruction matches the writer's contract.
+        return [
+            VariantInfo(
+                arch=entry["arch"],
+                compiler=entry["compiler"],
+                compiler_version=entry["compiler_version"],
+                opt=entry["opt"],
+                pkg=entry["pkg"],
+                variant_id=entry["variant_id"],
+                extra_metadata=entry["extra_metadata"],
+            )
+            for entry in payload
+        ]
+
+    def get_variant_metadata(self, version_idx: int) -> Optional[VariantInfo]:
+        """Return the ``VariantInfo`` for a given ``version_idx``.
+
+        Returns ``None`` when the sidecar is absent (legacy datasets) or
+        when ``version_idx`` is out of range. Negative indices are
+        rejected so callers cannot accidentally wrap around to a valid
+        end-of-list entry.
+        """
+        if version_idx < 0 or version_idx >= len(self._versions):
+            return None
+        return self._versions[version_idx]
 
     def _load_index_once(
         self, index_path: Path
