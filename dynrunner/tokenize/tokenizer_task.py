@@ -16,6 +16,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from dynamic_runner import _native
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
@@ -30,6 +31,8 @@ from dynrunner.binary_selection import (
     match_filename,
     process_selection_arguments,
 )
+from tokenizer.binary_discovery import BinaryHandle, walk_dataset
+from tokenizer.variant_info import VariantInfo
 
 
 _PHASE_ID = "tokenize"
@@ -80,53 +83,134 @@ class TokenizerTask:
     def discover_items(
         self, source_dir: Path, args: Namespace
     ) -> Iterable[TaskInfo]:
-        """Drive the Rust walker via `_native.find_items`, then sort+tag.
+        """Walk the source corpus, build TaskInfos with VariantInfo payload, sort.
 
-        When `args.source_already_staged` is set (SLURM mode), discovery
-        walks the gateway-side filesystem via SSH at that path; otherwise
-        it walks the local `source_dir`. Filter state is stashed on
-        `self` for the duration of the walk so `visit()` can read it
-        without re-deriving from args per directory.
+        Two transport pathways converge on the same
+        ``(BinaryHandle, VariantInfo)`` pair stream:
+
+        * Local (default): ``walk_dataset`` from
+          ``tokenizer.binary_discovery`` handles both legacy 4-axis
+          filenames and the new sidecar-JSON format with per-directory
+          dispatch, returning ``(handle, variant)`` pairs with
+          ``handle.tarball`` set in sidecar mode.
+        * Gateway / SSH (``args.source_already_staged`` set, SLURM
+          mode): the Rust ``_native.find_items`` walker still drives
+          remote discovery via the existing ``--gateway`` connection;
+          its ``BinaryIdentifier`` outputs are adapted to
+          ``VariantInfo`` via ``VariantInfo.from_legacy_filename`` for
+          symmetry with the local pathway. Sidecar over SSH is not yet
+          supported (TODO: extend ``walk_dataset`` to take a path-walk
+          backend so the gateway transport can carry both formats).
+
+        Selection filters (``--platform``, ``--compiler``,
+        ``--compiler-versions``, ``--opt``, ``--exclude-subfolder``) are
+        applied uniformly on the converged pair stream so both formats
+        respect the same allowlists.
         """
         config = process_selection_arguments(args)
-        self._filters: SelectionFilters | None = compile_selection_filters(config)
+        filters: SelectionFilters = compile_selection_filters(config)
+
+        gateway_url = (
+            getattr(args, "gateway", None)
+            if getattr(args, "source_already_staged", None)
+            else None
+        )
+
+        pairs = self._iter_filtered_pairs(args, config, filters)
+        sorted_items = list(self._sort_and_tag_pairs(pairs))
+
+        if getattr(args, "skip_existing", False):
+            output_root = getattr(args, "resolved_output_root", None)
+            if output_root:
+                completed = _collect_existing_output_filenames(
+                    output_root, gateway_url
+                )
+                before = len(sorted_items)
+                sorted_items = [
+                    it
+                    for it in sorted_items
+                    if self.get_output_filename_pattern(_TYPE_ID, it)
+                    not in completed
+                ]
+                skipped = before - len(sorted_items)
+                _logger.info(
+                    "skip-existing: %d candidates → %d remaining "
+                    "(%d skipped via %d existing outputs at %s)",
+                    before,
+                    len(sorted_items),
+                    skipped,
+                    len(completed),
+                    output_root,
+                )
+
+        return sorted_items
+
+    def _iter_filtered_pairs(
+        self,
+        args: Namespace,
+        config,
+        filters: SelectionFilters,
+    ) -> Iterable[tuple[BinaryHandle, VariantInfo, int]]:
+        """Yield ``(handle, variant, size)`` triples respecting selection filters.
+
+        Dispatches between the local ``walk_dataset`` pathway and the
+        gateway ``_native.find_items`` pathway based on whether
+        ``--source-already-staged`` is set; both converge on the same
+        triple shape so downstream sort + emit logic stays uniform.
+        """
+        if getattr(args, "source_already_staged", None):
+            yield from self._iter_gateway_pairs(args, filters)
+        else:
+            yield from self._iter_local_pairs(config.source_dir, filters)
+
+    def _iter_local_pairs(
+        self,
+        source_dir: Path,
+        filters: SelectionFilters,
+    ) -> Iterable[tuple[BinaryHandle, VariantInfo, int]]:
+        """Walk ``source_dir`` locally via ``walk_dataset`` and apply filters."""
+        for handle, variant in walk_dataset(source_dir):
+            if not _variant_passes_filters(variant, filters):
+                continue
+            if not _path_passes_subfolder_filter(handle.path, source_dir, filters):
+                continue
+            try:
+                # TODO(S5): sidecar size from tarball header — today this
+                # is the JSON sidecar size (~500 B) for sidecar tasks,
+                # which feeds estimate_memory wrong; S5 fixes the seam.
+                size = handle.path.stat().st_size
+            except OSError:
+                continue
+            yield handle, variant, size
+
+    def _iter_gateway_pairs(
+        self,
+        args: Namespace,
+        filters: SelectionFilters,
+    ) -> Iterable[tuple[BinaryHandle, VariantInfo, int]]:
+        """Walk a gateway-side path via ``_native.find_items`` over SSH.
+
+        Only legacy 4-axis filenames are handled here — the Rust walker
+        + ``visit()`` only mark files matching that format. Sidecar-over-
+        SSH is a known gap (see ``discover_items`` docstring).
+        """
+        root = args.source_already_staged
+        gateway_url = getattr(args, "gateway", None)
+        self._filters: SelectionFilters | None = filters
         try:
-            if getattr(args, "source_already_staged", None):
-                root = args.source_already_staged
-                gateway_url = getattr(args, "gateway", None)
-            else:
-                root = str(config.source_dir)
-                gateway_url = None
             items = _native.find_items(self, root, gateway_url=gateway_url)
-            sorted_items = list(self._sort_and_tag(root, items))
-
-            if getattr(args, "skip_existing", False):
-                output_root = getattr(args, "resolved_output_root", None)
-                if output_root:
-                    completed = _collect_existing_output_filenames(
-                        output_root, gateway_url
-                    )
-                    before = len(sorted_items)
-                    sorted_items = [
-                        it
-                        for it in sorted_items
-                        if self.get_output_filename_pattern(_TYPE_ID, it)
-                        not in completed
-                    ]
-                    skipped = before - len(sorted_items)
-                    _logger.info(
-                        "skip-existing: %d candidates → %d remaining "
-                        "(%d skipped via %d existing outputs at %s)",
-                        before,
-                        len(sorted_items),
-                        skipped,
-                        len(completed),
-                        output_root,
-                    )
-
-            return sorted_items
         finally:
             self._filters = None
+
+        root_path = Path(root)
+        for item in items:
+            absolute_path = root_path / str(item.path)
+            try:
+                variant = VariantInfo.from_legacy_filename(absolute_path)
+            except ValueError:
+                continue
+            handle = BinaryHandle(path=absolute_path, tarball=None)
+            yield handle, variant, item.size
 
     def visit(
         self,
@@ -136,12 +220,12 @@ class TokenizerTask:
     ) -> None:
         """Per-directory policy callback driven by `_native.find_items`.
 
-        `parent_payload` carries the relative path of the current
-        directory (set by the parent's `enter()`; `None` at root).
-        Per-file matching + per-subfolder exclude both delegate to the
-        framework's `match_filename` / `is_excluded_subfolder` helpers
-        so this stays in lockstep with the standard
-        `platform-compiler-version-opt-binary` filename format.
+        Used only on the gateway-SSH pathway (``_iter_gateway_pairs``);
+        the local pathway uses ``walk_dataset`` directly. Per-file
+        matching + per-subfolder exclude both delegate to the framework's
+        ``match_filename`` / ``is_excluded_subfolder`` helpers so this
+        stays in lockstep with the standard
+        ``platform-compiler-version-opt-binary`` filename format.
         """
         filters = self._filters
         if filters is None:
@@ -164,46 +248,55 @@ class TokenizerTask:
                 f.mark(True, payload=identifier)
 
     @staticmethod
-    def _sort_and_tag(root: str, items: Iterable) -> Iterable[TaskInfo]:
-        """Group by binary_name; sort within group by size DESC; order
-        groups by group-average size DESC; emit fresh Python `TaskInfo`
-        instances tagged with this task's phase + type.
+    def _sort_and_tag_pairs(
+        pairs: Iterable[tuple[BinaryHandle, VariantInfo, int]],
+    ) -> Iterable[TaskInfo]:
+        """Group by ``variant.pkg``; sort within group by size DESC; order
+        groups by group-average size DESC; emit ``TaskInfo`` instances
+        tagged with this task's phase + type.
 
-        `items` are `_native.PyTaskInfo` objects from `find_items`
-        (read-only) carrying *relative* paths; we re-construct mutable
-        Python `TaskInfo`s with paths joined back to `root` so the
-        framework's downstream `compute_file_hash`/`strip_prefix` pass
-        (in `queue_initial_staging`) sees the same absolute-path
-        contract today's `find_matching_binaries` provided.
-        affinity_id stays `None` — the tokenizer has no cache-locality
+        Carries the ``VariantInfo`` (full identity incl. ``variant_id``
+        and ``extra_metadata``) plus the optional sidecar tarball path on
+        ``TaskInfo.payload`` so the worker (S3-tok) can reconstruct
+        ``VariantInfo`` and locate the archive without re-parsing the
+        filename / sidecar JSON. ``TaskInfo.identifier`` keeps the locked
+        5-field ``BinaryIdentifier`` shape for framework FFI compatibility
+        (per the master plan's "VariantInfo wraps BinaryIdentifier"
+        decision).
+
+        affinity_id stays ``None`` — the tokenizer has no cache-locality
         classes worth exploiting.
         """
-        root_path = Path(root)
-        groups: dict[str, list] = defaultdict(list)
-        for item in items:
-            groups[item.identifier.binary_name].append(item)
+        materialised = list(pairs)
+        groups: dict[str, list[tuple[BinaryHandle, VariantInfo, int]]] = defaultdict(list)
+        for triple in materialised:
+            _, variant, _ = triple
+            groups[variant.pkg].append(triple)
 
-        group_averages: list[tuple[str, float, list]] = []
-        for binary_name, group in groups.items():
-            avg_size = sum(b.size for b in group) / len(group)
-            group.sort(key=lambda b: b.size, reverse=True)
-            group_averages.append((binary_name, avg_size, group))
+        group_averages: list[
+            tuple[str, float, list[tuple[BinaryHandle, VariantInfo, int]]]
+        ] = []
+        for pkg, group in groups.items():
+            avg_size = sum(size for _, _, size in group) / len(group)
+            group.sort(key=lambda t: t[2], reverse=True)
+            group_averages.append((pkg, avg_size, group))
         group_averages.sort(key=lambda x: x[1], reverse=True)
 
         for _, _, group in group_averages:
-            for b in group:
+            for handle, variant, size in group:
                 yield TaskInfo(
-                    path=root_path / str(b.path),
-                    size=b.size,
+                    path=handle.path,
+                    size=size,
                     identifier=BinaryIdentifier(
-                        binary_name=b.identifier.binary_name,
-                        platform=b.identifier.platform,
-                        compiler=b.identifier.compiler,
-                        version=b.identifier.version,
-                        opt_level=b.identifier.opt_level,
+                        binary_name=variant.pkg,
+                        platform=variant.arch,
+                        compiler=variant.compiler,
+                        version=variant.compiler_version,
+                        opt_level=variant.opt,
                     ),
                     phase_id=_PHASE_ID,
                     type_id=_TYPE_ID,
+                    payload=_build_payload(variant, handle.tarball),
                 )
 
     # ── Per-type plumbing ──────────────────────────────────────────────
@@ -249,7 +342,23 @@ class TokenizerTask:
     def get_output_filename_pattern(
         self, type_id: TypeId, item: TaskInfo
     ) -> str:
-        return f"{item.path.name}_output.csv"
+        """Output filename for ``item``.
+
+        Variant-id-suffixed when ``variant_id != 0`` so same-canonical-4
+        sidecar variants don't collide; legacy paths stay byte-identical
+        (``<item.path.name>_output.csv``) since ``variant_id`` defaults to 0.
+        ``variant_id`` lives on the payload because ``BinaryIdentifier``
+        has 5 locked fields and can't carry it.
+
+        ``item.path.name`` is used (not ``.stem``) because legacy
+        binaries can have multi-segment versioned suffixes such as
+        ``libz.so.1.2.11`` where ``.stem`` would strip ``.11`` and break
+        the legacy byte-identical contract. For sidecar tasks
+        ``item.path`` is the JSON sidecar so the ``.json`` infix is
+        carried into the output name; the worker (S3-tok) mirrors this
+        in its CSV writeout so skip-existing matching agrees.
+        """
+        return _format_output_filename(item.path.name, _payload_variant_id(item))
 
     # ── Lifecycle hooks ────────────────────────────────────────────────
 
@@ -266,6 +375,125 @@ class TokenizerTask:
 
     def on_phase_end(self, phase_id: str, completed: int, failed: int) -> None:
         pass
+
+
+_PAYLOAD_VARIANT_KEY = "variant"
+_PAYLOAD_TARBALL_KEY = "tarball"
+
+
+def _variant_to_payload_dict(variant: VariantInfo) -> dict[str, Any]:
+    """Serialise a ``VariantInfo`` to the JSON-safe dict the worker
+    receives via ``TaskInfo.payload``.
+
+    Mirrors the dataclass fields verbatim — including
+    ``extra_metadata`` so the opaque pass-through carries through to
+    the worker without enumeration. ``__hash__``/``__eq__`` excluded
+    fields aren't excluded here: identity is one concern, transport is
+    another.
+    """
+    return {
+        "arch": variant.arch,
+        "compiler": variant.compiler,
+        "compiler_version": variant.compiler_version,
+        "opt": variant.opt,
+        "pkg": variant.pkg,
+        "variant_id": variant.variant_id,
+        "extra_metadata": variant.extra_metadata,
+    }
+
+
+def _build_payload(variant: VariantInfo, tarball: Path | None) -> dict[str, Any]:
+    """Build the ``TaskInfo.payload`` dict for one ``(variant, tarball)``.
+
+    The framework FFI serialises the dict to JSON on the wire (see
+    ``_native.TaskInfo.payload_json``); the worker decodes back to a
+    dict and reconstructs ``VariantInfo`` from
+    ``payload[_PAYLOAD_VARIANT_KEY]``. ``payload[_PAYLOAD_TARBALL_KEY]``
+    is the absolute tarball path (sidecar mode) or ``None`` (legacy).
+    """
+    return {
+        _PAYLOAD_VARIANT_KEY: _variant_to_payload_dict(variant),
+        _PAYLOAD_TARBALL_KEY: str(tarball) if tarball is not None else None,
+    }
+
+
+def _payload_variant_id(item: TaskInfo) -> int:
+    """Pull ``variant_id`` out of ``item.payload``.
+
+    Defaults to 0 if the payload is missing or shaped legacy-style —
+    keeps ``get_output_filename_pattern`` working for any TaskInfo a
+    framework consumer constructs without going through
+    ``_sort_and_tag_pairs`` (e.g. unit tests, future hand-built
+    items).
+    """
+    payload = item.payload or {}
+    variant_dict = payload.get(_PAYLOAD_VARIANT_KEY) or {}
+    return int(variant_dict.get("variant_id", 0))
+
+
+def _format_output_filename(stem: str, variant_id: int) -> str:
+    """Compose the per-variant output filename.
+
+    ``variant_id == 0`` → ``<stem>_output.csv`` (byte-identical to the
+    pre-variant-id rule). ``variant_id != 0`` → ``<stem>__<8hex>_output.csv``
+    so same-canonical-4 sidecar variants (which all share the legacy
+    filename projection) get unique output filenames.
+    """
+    if variant_id == 0:
+        return f"{stem}_output.csv"
+    return f"{stem}__{variant_id:08x}_output.csv"
+
+
+def _variant_passes_filters(
+    variant: VariantInfo, filters: SelectionFilters
+) -> bool:
+    """Apply the corpus-shape allowlists (platforms, compiler,
+    compiler_versions, normalized_opt_levels) to a parsed VariantInfo.
+
+    Mirrors the gating semantics ``match_filename`` applies on the
+    legacy ``(parsed-tuple, filters)`` boundary, but operates on the
+    already-parsed VariantInfo so both legacy and sidecar pathways
+    share the same gate without re-parsing the source filename.
+    """
+    if filters.platforms is not None and variant.arch not in filters.platforms:
+        return False
+    if filters.compiler and variant.compiler != filters.compiler:
+        return False
+    if (
+        filters.compiler_versions
+        and variant.compiler_version not in filters.compiler_versions
+    ):
+        return False
+    if (
+        filters.normalized_opt_levels
+        and variant.opt not in filters.normalized_opt_levels
+    ):
+        return False
+    return True
+
+
+def _path_passes_subfolder_filter(
+    path: Path, source_dir: Path, filters: SelectionFilters
+) -> bool:
+    """Apply the ``--exclude-subfolder`` substring filter to a file's
+    parent-relative path.
+
+    ``walk_dataset`` does not prune subdirs (it has no knowledge of
+    consumer-side selection state), so any exclude rule must filter
+    the emitted pairs after the walk. Files at the root itself
+    (rel_path == '.') are always retained, matching the existing
+    ``is_excluded_subfolder`` contract.
+    """
+    try:
+        rel_dir = path.parent.relative_to(source_dir)
+    except ValueError:
+        # Path lives outside source_dir — defensive; walk_dataset only
+        # yields paths under the source root, but this keeps the
+        # contract robust if the caller passes a non-canonicalised
+        # source_dir.
+        return True
+    rel_dir_str = str(rel_dir)
+    return not is_excluded_subfolder(rel_dir_str, filters)
 
 
 class _OutputFilenameCollector:
