@@ -17,6 +17,7 @@ from tokenizer.hash_checked_pickles import (
     try_load_pickle,
 )
 from tokenizer.main_loop import main_loop
+from tokenizer.output_filename import format_output_basename
 from tokenizer.output_staging import staged_publish
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
@@ -25,30 +26,13 @@ from tokenizer.vocab_unifier.loader import load_vocab_manager
 
 DO_PICKLES: bool = True
 
-# Output-filename naming rule (mirrors
-# ``dynrunner.tokenize.tokenizer_task._format_output_filename``):
-# ``variant_id == 0`` → bare stem; ``variant_id != 0`` → ``<stem>__<8hex>``.
-# The CSV adds ``_output.csv``, the meta sidecar adds ``_meta.json`` to
-# the same base, so ``build_memmap`` (which looks for
-# ``<base>_meta.json`` next to ``<base>_output.csv``) pairs them by
-# stripping the suffix. Mirror — not import — because the task side
-# constructs filenames pre-dispatch from ``TaskInfo.path.name`` whereas
-# the worker constructs them post-dispatch from a caller-supplied
-# ``output_stem``; both shapes converge on the same string by passing
-# the same ``(stem, variant_id)`` pair.
+# Output-filename suffixes appended to the canonical-format
+# ``<base>`` (computed in ``tokenizer.output_filename``). The CSV
+# carries the token stream, the meta sidecar carries the variant's
+# canonical-4 + extra_metadata; ``build_memmap``'s pairing walk
+# matches them by their shared ``<base>`` prefix.
 _OUTPUT_CSV_SUFFIX = "_output.csv"
 _META_SIDECAR_SUFFIX = "_meta.json"
-
-
-def _format_output_basename(stem: str, variant_id: int) -> str:
-    """Return ``<base>``: the prefix shared by ``<base>_output.csv`` and
-    ``<base>_meta.json``. Bare ``stem`` for legacy variants
-    (``variant_id == 0``); ``<stem>__<8hex>`` for sidecar variants so
-    same-canonical-4 builds disambiguate.
-    """
-    if variant_id == 0:
-        return stem
-    return f"{stem}__{variant_id:08x}"
 
 
 def _write_meta_sidecar(
@@ -59,7 +43,8 @@ def _write_meta_sidecar(
     The file is written into the staging dir so ``staged_publish``'s
     rglob picks it up alongside the CSV + ``_consts.txt`` and atomic-
     publishes all three under one transaction. ``output_basename`` is
-    the shared prefix (see ``_format_output_basename``); the meta
+    the canonical-format shared prefix produced by
+    ``tokenizer.output_filename.format_output_basename``; the meta
     filename is ``<base>_meta.json`` — paired with ``<base>_output.csv``
     by ``build_memmap``'s discovery walk.
 
@@ -163,7 +148,6 @@ def run_tokenizer(
     task: Task,
     backend: str = "angr",
     variant_info: VariantInfo | None = None,
-    output_stem: str | None = None,
     source_relative_path: Path | None = None,
 ) -> tuple[int, int]:
     """Tokenize one binary; return ``(warnings, filtered)``.
@@ -172,19 +156,19 @@ def run_tokenizer(
     can map that to the framework's "already done" Done envelope (a
     convention the local manager treats as a no-warning skip).
 
-    Per-variant metadata flows through three optional parameters that
+    Per-variant metadata flows through two optional parameters that
     the standalone CLI doesn't need to wire:
 
-    * ``variant_info``: persisted next to the CSV as
-      ``<base>_meta.json``. ``None`` → recovered from
-      ``binary_path.name`` via ``VariantInfo.from_legacy_filename``,
-      preserving byte-identical output for the standalone CLI's legacy
-      4-axis filenames.
-    * ``output_stem``: prefix for the CSV / meta filenames. ``None`` →
-      ``binary_path.name`` (legacy convention). Sidecar mode passes the
-      JSON sidecar's filename here so the CSV/meta names match the
-      task-side ``get_output_filename_pattern`` projection (which uses
-      ``TaskInfo.path.name`` — the JSON path in sidecar mode).
+    * ``variant_info``: drives both the per-variant metadata
+      ``<base>_meta.json`` sidecar AND the canonical-format output
+      filename composed by ``tokenizer.output_filename`` (the single
+      source of truth shared with
+      ``dynrunner.tokenize.tokenizer_task.get_output_filename_pattern``).
+      ``None`` → recovered from ``binary_path.name`` via
+      ``VariantInfo.from_legacy_filename``, preserving byte-identical
+      output for the standalone CLI's legacy 4-axis filenames (the
+      canonical reconstruction round-trips legacy filenames bit-for-bit
+      because ``pkg`` equals the parsed ``binary_name`` slot).
     * ``source_relative_path``: subdir under ``output_dir`` to write
       into (mirrors the source-tree layout). ``None`` → derived from
       ``binary_path.relative_to(source_dir)`` like before. Sidecar
@@ -291,16 +275,24 @@ def run_tokenizer(
     pickle_file_path = pickle_folder / f"{binary_name}.pkl"
     pickle_mainloop_file_path = pickle_folder / f"{binary_name}.mainloop.pkl"
 
-    # Resolve the (variant_info, output_stem) pair the call uses to
-    # name the published outputs. Standalone CLI callers pass neither;
-    # the worker handler (sidecar-aware) passes both. Defaults match
-    # the legacy filename convention so unflagged callers see no
-    # behavioural change.
+    # Resolve the VariantInfo that drives both the meta sidecar and
+    # the canonical-format output filename. Standalone CLI callers
+    # pass nothing → recover from the binary's legacy 4-axis filename;
+    # worker handler passes the decoded payload. The output basename
+    # is composed from the variant's canonical-4 + pkg + variant_id
+    # via ``tokenizer.output_filename`` so the task-side
+    # ``get_output_filename_pattern`` and this writeout agree on the
+    # filename byte-for-byte.
     if variant_info is None:
         variant_info = VariantInfo.from_legacy_filename(binary_path)
-    if output_stem is None:
-        output_stem = binary_path.name
-    output_basename = _format_output_basename(output_stem, variant_info.variant_id)
+    output_basename = format_output_basename(
+        variant_info.arch,
+        variant_info.compiler,
+        variant_info.compiler_version,
+        variant_info.opt,
+        variant_info.pkg,
+        variant_info.variant_id,
+    )
     csv_filename = f"{output_basename}{_OUTPUT_CSV_SUFFIX}"
     csv_final_path = out_folder / csv_filename
 
