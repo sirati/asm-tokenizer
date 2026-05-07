@@ -340,13 +340,6 @@ def handle(task: Task) -> WorkerOutput | None:
     tarball_str = payload.get(_PAYLOAD_TARBALL_KEY)
     tarball_path = Path(tarball_str) if tarball_str else None
 
-    # The output stem (CSV/meta filename prefix before _output.csv /
-    # _meta.json) must match the task-side projection
-    # (TokenizerTask.get_output_filename_pattern uses TaskInfo.path.name
-    # — i.e. task.relative_path's basename here). Sidecar mode keeps
-    # the .json infix; legacy mode is the binary's filename.
-    output_stem = Path(task.relative_path).name
-
     # The source-tree-relative path used for output layout +
     # staged_publish scope. For legacy this equals
     # binary_path.relative_to(source_dir); for sidecar the binary lives
@@ -366,7 +359,6 @@ def handle(task: Task) -> WorkerOutput | None:
                 task=task,
                 backend=_BACKEND,
                 variant_info=variant,
-                output_stem=output_stem,
                 source_relative_path=source_relative_path,
             )
     except NonRecoverableTokenizerError as e:
