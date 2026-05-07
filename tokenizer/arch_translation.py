@@ -92,3 +92,14 @@ def arch_to_platform(arch: str) -> Platform:
         raise ValueError(
             f"unknown sidecar arch {arch!r}; accepted: {accepted}"
         ) from None
+
+
+def all_known_arch_strings() -> tuple[str, ...]:
+    """Every arch alias understood by the translator, sorted.
+
+    Used by the dispatcher to seed a permissive ``--platform`` allowlist
+    that admits both canonical ``Platform`` literals and the sidecar
+    arch strings that filename-based discovery walks see in
+    ``<arch>-<compiler>-...`` outputs.
+    """
+    return tuple(sorted(_ARCH_TO_PLATFORM))
