@@ -1,3 +1,5 @@
+import dataclasses
+import json
 import logging
 import time
 from pathlib import Path
@@ -18,9 +20,56 @@ from tokenizer.main_loop import main_loop
 from tokenizer.output_staging import staged_publish
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
+from tokenizer.variant_info import VariantInfo
 from tokenizer.vocab_unifier.loader import load_vocab_manager
 
 DO_PICKLES: bool = True
+
+# Output-filename naming rule (mirrors
+# ``dynrunner.tokenize.tokenizer_task._format_output_filename``):
+# ``variant_id == 0`` → bare stem; ``variant_id != 0`` → ``<stem>__<8hex>``.
+# The CSV adds ``_output.csv``, the meta sidecar adds ``_meta.json`` to
+# the same base, so ``build_memmap`` (which looks for
+# ``<base>_meta.json`` next to ``<base>_output.csv``) pairs them by
+# stripping the suffix. Mirror — not import — because the task side
+# constructs filenames pre-dispatch from ``TaskInfo.path.name`` whereas
+# the worker constructs them post-dispatch from a caller-supplied
+# ``output_stem``; both shapes converge on the same string by passing
+# the same ``(stem, variant_id)`` pair.
+_OUTPUT_CSV_SUFFIX = "_output.csv"
+_META_SIDECAR_SUFFIX = "_meta.json"
+
+
+def _format_output_basename(stem: str, variant_id: int) -> str:
+    """Return ``<base>``: the prefix shared by ``<base>_output.csv`` and
+    ``<base>_meta.json``. Bare ``stem`` for legacy variants
+    (``variant_id == 0``); ``<stem>__<8hex>`` for sidecar variants so
+    same-canonical-4 builds disambiguate.
+    """
+    if variant_id == 0:
+        return stem
+    return f"{stem}__{variant_id:08x}"
+
+
+def _write_meta_sidecar(
+    stage_dir: Path, output_basename: str, variant_info: VariantInfo
+) -> None:
+    """Persist the per-variant metadata next to the staged CSV.
+
+    The file is written into the staging dir so ``staged_publish``'s
+    rglob picks it up alongside the CSV + ``_consts.txt`` and atomic-
+    publishes all three under one transaction. ``output_basename`` is
+    the shared prefix (see ``_format_output_basename``); the meta
+    filename is ``<base>_meta.json`` — paired with ``<base>_output.csv``
+    by ``build_memmap``'s discovery walk.
+
+    The serialised payload is a verbatim ``dataclasses.asdict`` of the
+    VariantInfo. ``extra_metadata`` flows through opaque (the dataclass
+    field type is already ``dict[str, Any]``, JSON-serialisable by
+    construction).
+    """
+    meta_path = stage_dir / f"{output_basename}{_META_SIDECAR_SUFFIX}"
+    meta_path.write_text(json.dumps(dataclasses.asdict(variant_info), indent=2))
 
 
 class NonRecoverableTokenizerError(Exception):
@@ -113,12 +162,36 @@ def run_tokenizer(
     output_dir: Path,
     task: Task,
     backend: str = "angr",
+    variant_info: VariantInfo | None = None,
+    output_stem: str | None = None,
+    source_relative_path: Path | None = None,
 ) -> tuple[int, int]:
     """Tokenize one binary; return ``(warnings, filtered)``.
 
     Returns ``(-1, -1)`` for the skip-existing fast-path so the caller
     can map that to the framework's "already done" Done envelope (a
     convention the local manager treats as a no-warning skip).
+
+    Per-variant metadata flows through three optional parameters that
+    the standalone CLI doesn't need to wire:
+
+    * ``variant_info``: persisted next to the CSV as
+      ``<base>_meta.json``. ``None`` → recovered from
+      ``binary_path.name`` via ``VariantInfo.from_legacy_filename``,
+      preserving byte-identical output for the standalone CLI's legacy
+      4-axis filenames.
+    * ``output_stem``: prefix for the CSV / meta filenames. ``None`` →
+      ``binary_path.name`` (legacy convention). Sidecar mode passes the
+      JSON sidecar's filename here so the CSV/meta names match the
+      task-side ``get_output_filename_pattern`` projection (which uses
+      ``TaskInfo.path.name`` — the JSON path in sidecar mode).
+    * ``source_relative_path``: subdir under ``output_dir`` to write
+      into (mirrors the source-tree layout). ``None`` → derived from
+      ``binary_path.relative_to(source_dir)`` like before. Sidecar
+      mode passes the JSON sidecar's path-under-source so output
+      lands next to where the binary "logically" lives in the source
+      tree, not under the per-task scratch dir where the tarball got
+      extracted.
     """
     logger, warning_handler = setup_logger("tokenizer")
     logger.info("STARTING DISASSEMBLY")
@@ -157,7 +230,17 @@ def run_tokenizer(
             )
         platform = cast(Platform, detected_platform)
         logger.info(f"[*] Detected platform: {platform}")
-    else:
+    elif variant_info is None:
+        # The "filename starts with platform" guard exists to catch a
+        # mis-routed legacy binary (where the filename encodes the
+        # platform). It only applies to legacy callers (standalone
+        # CLI): no variant_info → identity is filename-derived → the
+        # startswith check is meaningful. Sidecar callers pass
+        # ``variant_info`` from a JSON sidecar; the extracted binary's
+        # on-disk name (``hello``, ``busybox``, ...) carries no
+        # platform prefix, so the variant's arch is the authoritative
+        # source instead and the filename-startswith guard would
+        # spuriously fire.
         assert binary_name.startswith(platform), (
             f"Binary name '{binary_name}' must start with platform '{platform}'. Wrong platform's file in queue?"
         )
@@ -175,10 +258,17 @@ def run_tokenizer(
         )
         backend = "ghidra"
 
-    try:
-        relative_path = file_path.relative_to(source_dir.absolute())
-    except ValueError:
-        relative_path = Path(file_path.parent.name) / file_path.name
+    if source_relative_path is not None:
+        # Caller supplied the canonical source-relative path (sidecar
+        # mode: the JSON sidecar's path-under-source, NOT the
+        # per-task scratch dir where the binary got extracted). Use
+        # it verbatim so output mirrors source-tree layout.
+        relative_path = source_relative_path
+    else:
+        try:
+            relative_path = file_path.relative_to(source_dir.absolute())
+        except ValueError:
+            relative_path = Path(file_path.parent.name) / file_path.name
 
     out_folder = output_dir / relative_path.parent
     out_folder.mkdir(parents=True, exist_ok=True)
@@ -200,7 +290,18 @@ def run_tokenizer(
         pickle_folder = out_folder
     pickle_file_path = pickle_folder / f"{binary_name}.pkl"
     pickle_mainloop_file_path = pickle_folder / f"{binary_name}.mainloop.pkl"
-    csv_filename = f"{binary_name}_output.csv"
+
+    # Resolve the (variant_info, output_stem) pair the call uses to
+    # name the published outputs. Standalone CLI callers pass neither;
+    # the worker handler (sidecar-aware) passes both. Defaults match
+    # the legacy filename convention so unflagged callers see no
+    # behavioural change.
+    if variant_info is None:
+        variant_info = VariantInfo.from_legacy_filename(binary_path)
+    if output_stem is None:
+        output_stem = binary_path.name
+    output_basename = _format_output_basename(output_stem, variant_info.variant_id)
+    csv_filename = f"{output_basename}{_OUTPUT_CSV_SUFFIX}"
     csv_final_path = out_folder / csv_filename
 
     if csv_final_path.exists() and skip_existing_csv:
@@ -319,6 +420,16 @@ def run_tokenizer(
                 errors={warning_handler.error_count}, \
                 filtered={filtered}"
             )
+
+            # Persist the per-variant metadata next to the CSV so the
+            # build_memmap phase can reconstruct VariantInfo for
+            # `_versions.json`. Lives inside `staged_publish` so the
+            # rglob-walk picks it up and atomic-publishes it together
+            # with the CSV + `_consts.txt`. Written after a successful
+            # `disassemble_to_tokens` only — partial runs have no
+            # metadata sidecar, matching the staging contract that
+            # nothing reaches the durable destination on failure.
+            _write_meta_sidecar(stage_dir, output_basename, variant_info)
         finally:
             if provider is not None:
                 provider.close()
