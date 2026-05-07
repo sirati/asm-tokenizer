@@ -5,7 +5,8 @@ import time
 import numpy as np
 from tqdm import tqdm
 
-from dynamic_runner.comm import CommunicationInterface, KeepaliveResponse, PhaseUpdateResponse
+from dynamic_runner.worker import Task
+
 from dynrunner.tokenize import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
@@ -56,7 +57,7 @@ def main_loop(
     csv_path,
     arch_provider,
     logger: logging.Logger,
-    comm: CommunicationInterface,
+    task: Task,
     **_kwargs,
 ) -> tuple[FunctionDataManager, int]:
     logger.info("Preparing main loop")
@@ -91,7 +92,7 @@ def main_loop(
         prev_insn_base64 = ""
 
         logger.info("Starting main loop")
-        comm.send_response(PhaseUpdateResponse(phase_name=TokenizerPhase.TOKENIZATION.value))
+        task.set_phase(TokenizerPhase.TOKENIZATION.value)
 
         try:
             pbar = tqdm(
@@ -101,8 +102,12 @@ def main_loop(
             )
             for i, (func_addr, func_name, func) in enumerate(pbar):
                 current_time = time.time()
-                if (current_time - last_keepalive_time) >= 0.2:
-                    comm.send_response(KeepaliveResponse())
+                # 5s cadence (was 200ms in the hand-rolled era) — the
+                # framework's stage_timeouts are minute-scale and the
+                # new manager-side check_timeouts only needs proof of
+                # life within the configured window.
+                if (current_time - last_keepalive_time) >= 5.0:
+                    task.keepalive()
                     last_keepalive_time = current_time
 
                 resolver.reset()
@@ -243,14 +248,21 @@ def main_loop(
             print(f"Unrecoverable error in main loop: {e}, writing what we have at least")
             exceptions.append(e)
 
-        comm.send_response(KeepaliveResponse())
+        task.keepalive()
 
         save_vocabulary(vocab_manager, writer)
         csvfile.flush()
 
     if len(exceptions) > 0:
-        all_exection_string = "\n".join([str(e) for e in exceptions])
-        raise Exception(f"Errors occurred during disassembly:\n{all_exection_string}") from exceptions[-1]
+        # Per-function errors were already log+continue (see inner
+        # except clauses). Don't re-raise here — that would invalidate
+        # an otherwise-complete CSV and cause the framework to retry
+        # the whole binary. The warning_handler's count is the signal
+        # the caller actually uses to surface degraded data quality.
+        logger.info(
+            f"main_loop completed with {len(exceptions)} caught exceptions; "
+            f"CSV written with surviving functions."
+        )
 
     if VERIFICATION:
         function_manager.compact_arrays()

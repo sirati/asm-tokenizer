@@ -42,6 +42,27 @@ class DisassemblyProvider(ABC):
     @abstractmethod
     def iter_functions(self) -> Iterable[tuple[int, str, Any]]: ...
 
+    def close(self) -> None:
+        """Release backend-held resources for this binary.
+
+        Worker processes are reused across tasks (the framework
+        respawns only when `always_restart_worker=True`). Backends
+        with process-global state — notably Ghidra's JVM, which
+        holds a Project + Program plus analysis threads — must
+        unload the current binary here so the next task gets a
+        clean slate. Backends that hold only Python-side state
+        (angr) can leave this as the default no-op.
+
+        Callers are expected to invoke `close()` from a
+        `try`/`finally` block surrounding all uses of the provider.
+        """
+
+    def __enter__(self) -> "DisassemblyProvider":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
 
 def get_disassembly_provider(backend: str, binary_path: Path) -> DisassemblyProvider:
     if backend == "angr":

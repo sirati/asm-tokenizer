@@ -18,6 +18,8 @@ import argparse
 import importlib
 import sys
 
+from tokenizer.arch import Platform as _CanonicalPlatform
+
 
 _TASK_TO_MODULE: dict[str, str] = {
     "tokenize": "dynrunner.tokenize",
@@ -26,6 +28,33 @@ _TASK_TO_MODULE: dict[str, str] = {
 }
 
 _PIPELINE_ORDER: tuple[str, ...] = ("tokenize", "unify-vocab", "build-memmap")
+
+
+# Framework's `--platform` default is `["x86", "x64"]` (see
+# `dynamic_runner._shared.selection_args.add_selection_arguments`).
+# That silently drops arm/mips/ppc/riscv CSVs at discovery in phases
+# 2 and 3, leaving the user with a half-dataset and no warning. We
+# inject all ISAs here when the user didn't pass `--platform`, so
+# the asm-tokenizer dispatcher's default is "process everything" and
+# users opt INTO a subset rather than out.
+_ALL_PLATFORMS: tuple[str, ...] = tuple(_CanonicalPlatform.__args__)
+
+
+def _ensure_full_platform_default(rest: list[str]) -> list[str]:
+    """If --platform isn't in `rest`, append the full ISA list.
+
+    Detecting "user passed --platform" purely from `rest` is robust:
+    argparse hasn't run yet, so any presence of the flag (with or
+    without `=`-form) means the user is making an explicit choice and
+    we leave it alone.
+    """
+    has_platform = any(
+        arg == "--platform" or arg.startswith("--platform=")
+        for arg in rest
+    )
+    if has_platform:
+        return rest
+    return [*rest, "--platform", *_ALL_PLATFORMS]
 
 
 def _dispatch(task: str, rest: list[str]) -> None:
@@ -64,6 +93,8 @@ def main() -> None:
     if args.help:
         parser.print_help()
         rest = [*rest, "--help"]
+
+    rest = _ensure_full_platform_default(rest)
 
     if args.task == "all":
         for sub in _PIPELINE_ORDER:

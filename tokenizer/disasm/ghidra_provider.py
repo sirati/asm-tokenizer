@@ -509,10 +509,29 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             pyghidra.start()
 
         self.binary_path = binary_path
+
+        # pyghidra defaults `project_location` to the binary's parent
+        # directory, which is the read-only `--source-already-staged`
+        # bind-mount in the SLURM container. Redirect into the
+        # writable ephemeral root (`/app/out-tmp` if the container
+        # provides it, else `/tmp`). Per-binary subdir keyed off the
+        # binary's parent dir name (unique per variant in our corpus
+        # layout) so concurrent variants don't collide on the
+        # `<binary-name>_ghidra` project name pyghidra derives.
+        out_tmp_root = Path("/app/out-tmp")
+        project_root = out_tmp_root if out_tmp_root.is_dir() else Path("/tmp")
+        project_location = project_root / "ghidra-projects" / binary_path.parent.name
+        project_location.mkdir(parents=True, exist_ok=True)
+        self._project_location = project_location
+
         # open_program is the simplest API: import, auto-analyze, return
         # a FlatProgramAPI context manager.  We defer analysis (analyze=False)
         # so build_cfg() controls when it happens.
-        self._ctx = pyghidra.open_program(binary_path, analyze=False)
+        self._ctx = pyghidra.open_program(
+            binary_path,
+            project_location=project_location,
+            analyze=False,
+        )
         self._flat_api = self._ctx.__enter__()
         self._program = self._flat_api.getCurrentProgram()
         self._fm = self._program.getFunctionManager()
@@ -520,6 +539,38 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         self._memory = self._program.getMemory()
         self._reg_map = _RegisterMap(self._program)
         self._analyzed = False
+        self._closed = False
+
+    def close(self) -> None:
+        """Unload the current Program + close the Project so the
+        next task in this worker (worker processes are reused
+        unless `always_restart_worker=True`) can `open_program`
+        again without tripping ``GhidraScriptUtil initialized
+        multiple times`` or accumulating analysis threads. Idempotent.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        # `pyghidra.open_program` returns a generator-based context
+        # manager. Driving its `__exit__` is the documented way to
+        # release the imported Program, the in-memory project, and
+        # the analysis-thread pool. Errors on close (e.g. if a
+        # prior failure left Ghidra in a half-state) must not
+        # mask the original task's exception.
+        try:
+            self._ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        # Drop Java-object references so the next provider in this
+        # worker can acquire fresh ones without lingering CFG/listing
+        # objects pinning the previous program.
+        self._flat_api = None
+        self._program = None
+        self._fm = None
+        self._listing = None
+        self._memory = None
+        self._reg_map = None
+        self._ctx = None
 
     def build_cfg(self) -> None:
         """Run Ghidra's auto-analysis (the equivalent of CFGFast)."""
