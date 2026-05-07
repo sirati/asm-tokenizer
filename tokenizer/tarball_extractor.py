@@ -1,19 +1,18 @@
-"""Sidecar-tarball extraction: ``.tar.zst`` → on-disk binary path.
+"""Sidecar-tarball extraction: ``.tar.zst`` → on-disk binary paths.
 
-Single concern: turn a sidecar archive into a ready-to-tokenize binary
-file on the local filesystem. The dataset convention is "exactly one
-binary per archive" (see ``src/dataset/<pkg>/clang10_*_<8hex>.tar.zst``
-— each archive contains a single regular file, the package binary). On
-the rare chance an archive carries auxiliary files (manpages, debug
-symbols), the largest regular file is selected — heuristic borrowed
-from the dataset producer's invariant that the binary dominates archive
-size.
+Single concern: turn a sidecar archive into ready-to-tokenize binary
+files on the local filesystem. A package may contain any number of
+binaries (executables and shared libraries), so the extractor yields
+*every* regular-file member as a ``(extracted_path, member_name)``
+pair — the worker fans out one tokenization run per member.
 
-The extractor owns ONE boundary: ``(tarball_path, scratch_dir, pkg) →
-binary_path``. It does not own scratch-dir lifecycle (the caller decides
-when to clean up — typically the same lifetime as ``staged_publish``)
-nor binary-content interpretation (the tokenizer library reads
-whatever's at the returned path).
+The extractor owns ONE boundary: ``(tarball_path, scratch_dir) →
+Iterator[(binary_path, member_name)]``. It does not own scratch-dir
+lifecycle (the caller decides when to clean up — typically the same
+lifetime as ``staged_publish``) nor binary-content interpretation (the
+tokenizer library reads whatever's at each yielded path). Symlinks,
+directories, and device nodes are skipped (filtered to ``m.isfile()``)
+so callers don't have to special-case archive layout.
 
 Python 3.14's ``tarfile`` reads ``r:zst`` natively via the stdlib
 ``compression.zstd`` module, so no third-party dependency is required.
@@ -27,69 +26,56 @@ from __future__ import annotations
 
 import logging
 import tarfile
+from collections.abc import Iterator
 from pathlib import Path
 
-__all__ = ["extract_binary"]
+__all__ = ["extract_all_binaries"]
 
 _logger = logging.getLogger(__name__)
 
-# Member names whose **stem** (or full name) matches the package are
-# preferred when picking the binary out of a multi-file archive. The
-# dataset's invariant is single-binary archives, so this disambiguator
-# only matters for hypothetical future variants; keeping the rule simple
-# (exact basename match) avoids ambiguity-driven heuristics.
-def _pick_member(members: list[tarfile.TarInfo], pkg: str) -> tarfile.TarInfo:
-    """Pick the binary member from a tarball's regular-file members.
 
-    Selection rules, in priority order:
-    * Exact basename match against ``pkg``.
-    * Largest regular file (the binary dominates archive size in the
-      sidecar dataset's convention).
+def extract_all_binaries(
+    tarball_path: Path,
+    scratch_dir: Path,
+) -> Iterator[tuple[Path, str]]:
+    """Extract every regular-file member of ``tarball_path`` into
+    ``scratch_dir``; yield ``(extracted_path, archive_member_name)``
+    pairs in archive order.
 
-    Raises ``ValueError`` if no regular file is present — an empty or
-    directory-only archive cannot be tokenized.
-    """
-    regular_files = [m for m in members if m.isfile()]
-    if not regular_files:
-        raise ValueError("tarball contains no regular files")
+    ``scratch_dir`` must already exist; the caller (``staged_publish``
+    in the worker) owns its lifecycle. The archive is opened in
+    ``r:zst`` mode (Python 3.14's stdlib zstd-backed reader). Each
+    regular-file member is extracted via the ``data`` filter so setuid
+    bits, escaping symlinks, and device nodes are stripped.
 
-    for m in regular_files:
-        if Path(m.name).name == pkg:
-            return m
+    The yielded ``extracted_path`` is ``scratch_dir`` joined with the
+    member's archive-relative path (preserving any internal subdir
+    layout the archive uses, e.g. ``./hello`` → ``scratch_dir/hello``).
+    The yielded ``archive_member_name`` is the member name verbatim
+    from the archive (e.g. ``./hello`` or ``libssl.so.1.1``); callers
+    that need just the basename must call ``Path(name).name`` themselves.
 
-    return max(regular_files, key=lambda m: m.size)
-
-
-def extract_binary(tarball_path: Path, scratch_dir: Path, pkg: str) -> Path:
-    """Extract the binary member of ``tarball_path`` into ``scratch_dir``;
-    return the on-disk path of the extracted file.
-
-    ``scratch_dir`` must already exist; the caller (``staged_publish`` in
-    the worker) owns its lifecycle. The archive is opened in ``r:zst``
-    mode (Python 3.14's stdlib zstd-backed reader) and a single member
-    is extracted via the ``data`` filter so setuid bits, escaping
-    symlinks, and device nodes are stripped.
-
-    The returned path is ``scratch_dir`` joined with the member's
-    archive-relative path (preserving any internal subdir layout the
-    archive uses, e.g. ``./hello`` → ``scratch_dir/hello``).
+    Members whose ``isfile()`` is false (directories, symlinks, device
+    nodes, hardlinks) are skipped silently — they're never tokenization
+    targets. An archive with zero regular-file members yields nothing;
+    the caller decides whether that is a soft skip or an error.
     """
     with tarfile.open(tarball_path, "r:zst") as tf:
-        members = tf.getmembers()
-        chosen = _pick_member(members, pkg)
-        _logger.info(
-            "extracting %s from %s into %s (size=%d)",
-            chosen.name,
-            tarball_path,
-            scratch_dir,
-            chosen.size,
-        )
-        tf.extract(chosen, path=scratch_dir, filter="data")
-
-    extracted = scratch_dir / chosen.name
-    if not extracted.is_file():
-        raise FileNotFoundError(
-            f"expected extracted binary at {extracted} not found "
-            f"after extracting {tarball_path}"
-        )
-    return extracted
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            _logger.info(
+                "extracting %s from %s into %s (size=%d)",
+                member.name,
+                tarball_path,
+                scratch_dir,
+                member.size,
+            )
+            tf.extract(member, path=scratch_dir, filter="data")
+            extracted = scratch_dir / member.name
+            if not extracted.is_file():
+                raise FileNotFoundError(
+                    f"expected extracted binary at {extracted} not found "
+                    f"after extracting {tarball_path}"
+                )
+            yield extracted, member.name
