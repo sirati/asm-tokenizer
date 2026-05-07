@@ -1,8 +1,9 @@
+import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
@@ -20,17 +21,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class VersionKey:
-    """Represents a unique version of a binary."""
+    """Identity of a single build of a binary used as the pairing key
+    inside ``build_memmap_files`` and as the lookup key over which
+    matched/unmatched function tables are indexed.
+
+    The canonical 4 axes (`arch`, `compiler`, `compilerversion`, `opt`)
+    are augmented with `variant_id` so that two builds sharing the
+    canonical 4 but differing in opaque sidecar metadata
+    (`flag_set`, `hardening`, ...) are *not* coalesced into a single
+    version. Legacy callers that don't supply `variant_id` get the
+    default `0` and remain behaviorally identical.
+
+    Frozen: hash and equality are auto-derived over all 5 fields.
+    """
 
     arch: str
     compiler: str
     compilerversion: str
     opt: str
+    variant_id: int = 0
 
 
 @dataclass
 class BinaryVersionInfo:
-    """Information about a specific binary version."""
+    """Information about a specific binary version.
+
+    `extra_metadata` is the opaque pass-through dict reconstructed from
+    the per-variant sidecar (`<basename>_meta.json`) during worker
+    decoding. Legacy versions without a sidecar carry an empty dict —
+    the metadata is forwarded verbatim to the per-binary
+    `<binary>_versions.json` writer and is never inspected by the
+    builder itself.
+    """
 
     path: Path
     mapping_path: Path
@@ -38,6 +60,9 @@ class BinaryVersionInfo:
     compiler: str
     compilerversion: str
     opt: str
+    pkg: str = ""
+    variant_id: int = 0
+    extra_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def get_mapping(mapping_path: Path):
@@ -46,6 +71,43 @@ def get_mapping(mapping_path: Path):
         with open(mapping_path, "r", encoding="ascii") as f:
             return base64_to_ndarray_vec(f.read())
     return None
+
+
+def _write_versions_sidecar(
+    versions: List[BinaryVersionInfo],
+    output_dir: Path,
+    binary_name: str,
+) -> None:
+    """Emit ``<binary>_versions.json`` with one entry per version in
+    the same iteration order as ``build_memmap_files`` consumes
+    ``versions``. The reader matches a section row to its version
+    record by the canonical-4 axes plus ``variant_id``; the
+    ``version_idx`` field is a positional convenience and equals the
+    list position.
+
+    `_sections.csv` deliberately stays flat (no `variant_id` column,
+    no embedded metadata) — the sidecar is purely additive lookup.
+    """
+    payload = []
+    for idx, version in enumerate(versions):
+        payload.append(
+            {
+                "version_idx": idx,
+                "variant_id": version.variant_id,
+                "arch": version.arch,
+                "compiler": version.compiler,
+                "compiler_version": version.compilerversion,
+                "opt": version.opt,
+                "pkg": version.pkg,
+                "extra_metadata": version.extra_metadata,
+            }
+        )
+
+    versions_path = output_dir / f"{binary_name}_versions.json"
+    logger.info(f"  Creating: {versions_path}")
+    with open(versions_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=False)
+    logger.info(f"  Closed: {versions_path}")
 
 
 def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, binary_name: str) -> None:
@@ -65,6 +127,7 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
             compiler=version.compiler,
             compilerversion=version.compilerversion,
             opt=version.opt,
+            variant_id=version.variant_id,
         )
 
         mapping_dict[vkey] = mapping
@@ -182,3 +245,9 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     logger.info(f"  Closed: {unmatched_index_path}")
     warn_log.close()
     logger.info(f"  Closed: {warn_log_path}")
+
+    # Per-binary metadata sidecar: one record per version in the same
+    # iteration order as the matched/unmatched CSV writers consumed
+    # `versions`. Empty `extra_metadata` for legacy versions; populated
+    # from the per-variant `_meta.json` for sidecar-format inputs.
+    _write_versions_sidecar(versions, output_dir, binary_name)
