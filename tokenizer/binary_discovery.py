@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -66,6 +67,35 @@ class BinaryHandle:
 
     path: Path
     tarball: Path | None = None
+
+    def binary_size(self) -> int:
+        """Uncompressed size of the binary content this handle locates.
+
+        Single source of truth for "how big is the thing tokenization
+        will operate on", regardless of transport. Legacy: the
+        filesystem size of the binary file. Sidecar: the sum of regular-
+        file member sizes from the tarball's tar header (read without
+        decompressing the data payload — header-only walk via
+        ``tarfile.getmembers()``). Both flavors return *uncompressed*
+        bytes, so downstream RAM estimators see a consistent number
+        across the dataset's two layouts.
+        """
+        if self.tarball is None:
+            return self.path.stat().st_size
+        return _tarball_uncompressed_size(self.tarball)
+
+
+def _tarball_uncompressed_size(tarball_path: Path) -> int:
+    """Sum of regular-file member sizes from the tarball's tar header.
+
+    Opens the archive in ``r:zst`` mode and walks ``getmembers()``;
+    member sizes come from the tar header so the data payload is never
+    decompressed. The "regular file" filter mirrors the convention the
+    extractor uses (``tarball_extractor._pick_member``): directory and
+    symlink entries don't contribute to the binary content.
+    """
+    with tarfile.open(tarball_path, "r:zst") as tf:
+        return sum(m.size for m in tf.getmembers() if m.isfile())
 
 
 def _classify_dir_files(filenames: list[str]) -> set[str]:

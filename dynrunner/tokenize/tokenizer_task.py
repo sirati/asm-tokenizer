@@ -176,10 +176,12 @@ class TokenizerTask:
             if not _path_passes_subfolder_filter(handle.path, source_dir, filters):
                 continue
             try:
-                # TODO(S5): sidecar size from tarball header — today this
-                # is the JSON sidecar size (~500 B) for sidecar tasks,
-                # which feeds estimate_memory wrong; S5 fixes the seam.
-                size = handle.path.stat().st_size
+                # ``BinaryHandle.binary_size()`` returns the uncompressed
+                # size of the binary content regardless of transport
+                # (legacy filesystem stat / sidecar tarball-header sum).
+                # The duality lives inside the handle so this loop
+                # doesn't branch on layout.
+                size = handle.binary_size()
             except OSError:
                 continue
             yield handle, variant, size
