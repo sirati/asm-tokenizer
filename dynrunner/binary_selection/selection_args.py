@@ -114,8 +114,14 @@ def add_asm_selection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--opt-regex",
         type=str,
-        default="[oO]?([0123s])",
-        help="Custom regex for matching optimization level field. Default: [oO]([0123s])",
+        default="[oO]?([0123s]|fast|z)",
+        help=(
+            "Custom regex for matching optimization level field. Default: "
+            "[oO]?([0123s]|fast|z) — covers O0..O3, Os, Oz, Ofast (the "
+            "sidecar-corpus opt set). The capture group is the bare token "
+            "(e.g. ``z``, ``fast``); ``normalize_opt_levels`` re-prepends "
+            "``O`` to recover the canonical name."
+        ),
     )
 
     parser.add_argument(
