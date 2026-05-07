@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from collections.abc import Iterable
@@ -57,6 +58,36 @@ _TYPE_ID = "memmap"
 # Pairing is by `BinaryIdentifier` equality after parsing.
 _CSV_SUFFIX = "_out\\put.\\csv"
 _MAPPING_SUFFIX = "_out\\put.ma\\p\\ping.b64\\c"
+# Per-version metadata sidecar emitted by the tokenize worker beside
+# each `_output.csv`. Forward-compat: legacy outputs from before the
+# sidecar emitter shipped have no `_meta.json`, in which case the
+# corresponding payload entry's `meta_path` is null. Unlike the CSV
+# and mapping suffixes, none of the literal characters here collide
+# with field-name shorthands (no `p`/`c`/`opt`/`name` substring), so
+# no `\\` escapes are needed.
+_META_SUFFIX = "_meta.json"
+
+# Variant-id suffix on the binary_name slot of sidecar-emitted
+# filenames: `<binary>__<8hex>` (e.g. `helloworld__15f3f338`). The
+# greedy `binary_name = ".+"` regex in the file-format parser swallows
+# the `__<8hex>` into `binary_name`; this regex peels it back off so
+# the pairing key collapses to the same group across legacy and
+# sidecar variants while still distinguishing different variants of
+# the same binary.
+_VARIANT_SUFFIX_RE = re.compile(r"^(?P<binary>.*)__(?P<hex>[0-9a-fA-F]{8})$")
+
+
+def _split_variant_suffix(binary_name: str) -> tuple[str, int]:
+    """Strip the optional ``__<8hex>`` suffix from a parsed binary_name.
+
+    Returns ``(stripped_name, variant_id)``. Legacy filenames without
+    the suffix yield ``(binary_name, 0)`` — preserves the canonical
+    default per the variant-info spec.
+    """
+    match = _VARIANT_SUFFIX_RE.match(binary_name)
+    if match is None:
+        return binary_name, 0
+    return match.group("binary"), int(match.group("hex"), 16)
 
 
 def _csv_format(base_format: str) -> str:
@@ -65,6 +96,10 @@ def _csv_format(base_format: str) -> str:
 
 def _mapping_format(base_format: str) -> str:
     return base_format + _MAPPING_SUFFIX
+
+
+def _meta_format(base_format: str) -> str:
+    return base_format + _META_SUFFIX
 
 
 class _FormatVisitor:
@@ -236,28 +271,48 @@ class MemmapBuilderTask:
         mapping_filters = compile_selection_filters(
             _config_with_format(config, _mapping_format(config.file_format))
         )
+        meta_filters = compile_selection_filters(
+            _config_with_format(config, _meta_format(config.file_format))
+        )
 
         csv_items = _walk_with_filters(source_root, gateway_url, csv_filters)
         mapping_items = _walk_with_filters(vocab_root, gateway_url, mapping_filters)
+        # Meta sidecars live next to the CSVs (tokenize phase emits both
+        # together), so the meta walk shares the CSV walk root. A meta
+        # file's absence is benign: legacy build_memmap output predates
+        # the sidecar writer, so each entry's `meta_path` defaults to
+        # `None` when no sibling `_meta.json` is found.
+        meta_items = _walk_with_filters(source_root, gateway_url, meta_filters)
 
-        # Pair CSV ↔ mapping by explicit tuple key.
+        # Pair CSV ↔ mapping ↔ meta by explicit tuple key.
         # `_native.find_items` returns `PyTaskInfo` objects whose
         # `.identifier` is a Rust pyclass (`PyBinaryIdentifier`). The
         # Rust pyclass doesn't implement `__eq__`/`__hash__` semantically,
         # so a dict keyed on the identifier object compares by Python
         # default (pointer identity) — pairing fails. Tuple keys force
-        # value equality on the relevant 5 fields.
-        def _key(item) -> tuple[str, str, str, str, str]:
+        # value equality on the relevant fields.
+        #
+        # The 5th field `variant_id` distinguishes sidecar variants
+        # whose other 4 axes collide (e.g. two builds of the same
+        # `<arch,compiler,version,opt>` differing only in flag_set).
+        # Legacy filenames without a `__<8hex>` suffix yield
+        # `variant_id=0`, so legacy and sidecar items co-exist in one
+        # `binary_name` group and pair correctly within their
+        # canonical-4 + variant_id partition.
+        def _key(item) -> tuple[str, str, str, str, str, int]:
             ident = item.identifier
+            stripped_name, variant_id = _split_variant_suffix(ident.binary_name)
             return (
-                ident.binary_name,
+                stripped_name,
                 ident.platform,
                 ident.compiler,
                 ident.version,
                 ident.opt_level,
+                variant_id,
             )
 
         mapping_by_key = {_key(m): m for m in mapping_items}
+        meta_by_key = {_key(m): m for m in meta_items}
         matched_csv_items = []
         unmatched_csv = []
         for csv_item in csv_items:
@@ -272,18 +327,24 @@ class MemmapBuilderTask:
             for csv_item in unmatched_csv:
                 _logger.warning("  %s", _key(csv_item))
 
-        # Group by binary_name. Each group becomes one TaskInfo with the
-        # per-version pairing inline in payload.
+        # Group by stripped binary_name (the variant_id is part of the
+        # pairing key, NOT the group key — same binary built with
+        # different metadata still belongs to one memmap group).
         groups: dict[str, list] = defaultdict(list)
         for csv_item in matched_csv_items:
-            groups[csv_item.identifier.binary_name].append(csv_item)
+            stripped_name, _vid = _split_variant_suffix(
+                csv_item.identifier.binary_name
+            )
+            groups[stripped_name].append(csv_item)
 
         group_items: list[TaskInfo] = []
         for binary_name, group in groups.items():
             entries = []
             total_size = 0
             for csv_item in group:
-                map_item = mapping_by_key[_key(csv_item)]
+                key = _key(csv_item)
+                map_item = mapping_by_key[key]
+                meta_item = meta_by_key.get(key)
                 total_size += csv_item.size
                 entries.append(
                     {
@@ -300,10 +361,27 @@ class MemmapBuilderTask:
                         # resolve through its bind-mount.
                         "csv_path": str(csv_item.path),
                         "mapping_path": str(map_item.path),
+                        # `meta_path` is forward-compat scaffolding for
+                        # the per-variant metadata sidecar that the
+                        # tokenize worker emits (`_meta.json`). Null
+                        # when absent (legacy outputs predating the
+                        # sidecar). Worker consumption is downstream:
+                        # `meta_path` reconstructs `VariantInfo` so the
+                        # builder library can persist `_versions.json`.
+                        "meta_path": (
+                            str(meta_item.path) if meta_item is not None else None
+                        ),
                         "arch": csv_item.identifier.platform,
                         "compiler": csv_item.identifier.compiler,
                         "compilerversion": csv_item.identifier.version,
                         "opt": csv_item.identifier.opt_level,
+                        # `variant_id` is the integer suffix peeled off
+                        # the parsed binary_name (see
+                        # `_split_variant_suffix`). 0 for legacy
+                        # filenames, otherwise the 8-hex suffix decoded
+                        # as base-16. Disambiguates same-`pkg` variants
+                        # that share the canonical-4 axes.
+                        "variant_id": key[5],
                     }
                 )
 
