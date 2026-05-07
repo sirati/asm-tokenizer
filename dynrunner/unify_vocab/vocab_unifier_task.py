@@ -47,6 +47,20 @@ _TYPE_ID = "unify_vocab"
 # Tokenize phase emits *_output.csv next to each binary's auxiliary
 # files. The unifier reads these to build the shared vocab + per-CSV
 # mapping files.
+#
+# Two filename shapes appear in the wild and both must be picked up
+# by this walker:
+#   * legacy   — `<platform>-<compiler>-<version>-<opt>_<binary>_output.csv`
+#   * sidecar  — `<platform>-<compiler>-<version>-<opt>_<binary>__<8hex>_output.csv`
+# The 8-hex suffix encodes a per-variant disambiguator emitted when
+# the source binary came from a JSON-sidecar dataset (multiple builds
+# of the same canonical-4 tuple). The compiled regex's binary_name
+# field defaults to `.+` (permissive), so the suffix `__<8hex>` is
+# absorbed greedily into the binary_name capture and the `_output.csv`
+# tail still anchors the match — both shapes parse cleanly without a
+# format-string change. The parsed binary_name carries the variant
+# disambiguator only as a side effect; this task does not key on it
+# (the unifier builds one shared vocab across all CSVs regardless).
 _CSV_SUFFIX = "_out\\put.\\csv"
 
 
@@ -58,6 +72,11 @@ class _CsvVisitor:
     """Visitor for `_native.find_items`: marks every CSV output file
     matching the compiled selection filters with its parsed
     `BinaryIdentifier` as the per-file payload.
+
+    Accepts both legacy and sidecar-suffixed output filenames — see
+    the `_CSV_SUFFIX` block above for the two shapes and why the
+    default permissive `binary_name=".+"` regex absorbs both without
+    a format-string change.
     """
 
     def __init__(self, filters: SelectionFilters) -> None:
