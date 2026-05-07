@@ -31,6 +31,7 @@ from dynrunner.binary_selection import (
     match_filename,
     process_selection_arguments,
 )
+from tokenizer.arch_translation import arch_to_platform
 from tokenizer.binary_discovery import BinaryHandle, walk_dataset
 from tokenizer.output_filename import format_output_csv_filename
 from tokenizer.variant_info import VariantInfo
@@ -470,8 +471,24 @@ def _variant_passes_filters(
     already-parsed VariantInfo so both legacy and sidecar pathways
     share the same gate without re-parsing the source filename.
     """
-    if filters.platforms is not None and variant.arch not in filters.platforms:
-        return False
+    if filters.platforms is not None:
+        # Sidecar archs like `armv7l-hf` / `x86_64` aren't in the
+        # canonical Platform allowlist (`x64`, `arm32`, ...). Translate
+        # to the canonical form before comparing so the dispatcher's
+        # default Platform-allowlist accepts both layouts uniformly.
+        # Legacy variants already carry canonical arch names verbatim
+        # from `parse_binary_filename`, so the translator is a no-op
+        # for them — but we still try-translate first to avoid two
+        # comparison branches.
+        try:
+            canonical_arch = arch_to_platform(variant.arch)
+        except ValueError:
+            canonical_arch = variant.arch
+        if (
+            variant.arch not in filters.platforms
+            and canonical_arch not in filters.platforms
+        ):
+            return False
     if filters.compiler and variant.compiler != filters.compiler:
         return False
     if (

@@ -19,6 +19,7 @@ import importlib
 import sys
 
 from tokenizer.arch import Platform as _CanonicalPlatform
+from tokenizer.arch_translation import all_known_arch_strings
 
 
 _TASK_TO_MODULE: dict[str, str] = {
@@ -34,10 +35,20 @@ _PIPELINE_ORDER: tuple[str, ...] = ("tokenize", "unify-vocab", "build-memmap")
 # `dynamic_runner._shared.selection_args.add_selection_arguments`).
 # That silently drops arm/mips/ppc/riscv CSVs at discovery in phases
 # 2 and 3, leaving the user with a half-dataset and no warning. We
-# inject all ISAs here when the user didn't pass `--platform`, so
+# inject the full set here when the user didn't pass `--platform`, so
 # the asm-tokenizer dispatcher's default is "process everything" and
 # users opt INTO a subset rather than out.
-_ALL_PLATFORMS: tuple[str, ...] = tuple(_CanonicalPlatform.__args__)
+#
+# The full set is the union of the canonical Platform literals
+# (matching legacy filenames like `x64-clang-7-O0_minigzip`) and the
+# sidecar arch aliases the translator knows about (`x86_64`,
+# `armv7l-hf`, ...). The sidecar canonical-format outputs preserve
+# the sidecar's verbose arch in the filename (e.g.
+# `x86_64-clang-10.0.1-Oz_hello__cf70c518_output.csv`), so the
+# discovery walks in phases 2 and 3 must accept BOTH spellings.
+_ALL_PLATFORMS: tuple[str, ...] = tuple(
+    sorted({*_CanonicalPlatform.__args__, *all_known_arch_strings()})
+)
 
 
 def _ensure_full_platform_default(rest: list[str]) -> list[str]:
