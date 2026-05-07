@@ -1,8 +1,11 @@
 import argparse
+import contextlib
+import json
 import logging
 import os
 import random
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +23,77 @@ from dynamic_runner.worker import (
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.arch import Platform
 from tokenizer.run_tokenizer import NonRecoverableTokenizerError, run_tokenizer
+from tokenizer.tarball_extractor import extract_binary
+from tokenizer.variant_info import VariantInfo
+
+# Payload-key constants mirror the task-side encoder
+# (``dynrunner.tokenize.tokenizer_task._build_payload``); kept verbatim
+# so a rename on either side surfaces as a missing-key fail rather
+# than a silent default. The variant sub-dict exactly matches
+# ``VariantInfo``'s field names — see ``_decode_variant``.
+_PAYLOAD_VARIANT_KEY = "variant"
+_PAYLOAD_TARBALL_KEY = "tarball"
+
+# Per-task tarball extraction lives under this root so it's isolated
+# from the durable output directory and from concurrent tasks. Each
+# task gets a unique TemporaryDirectory under here scoped by
+# ``relative_path`` so collisions across worker reuse can't happen.
+# The directory is removed on handler exit (success or failure)
+# regardless of which path through the worker fired.
+_EXTRACT_ROOT = Path(tempfile.gettempdir()) / "tokenizer-extract"
+
+
+def _decode_variant(variant_dict: dict) -> VariantInfo:
+    """Reconstruct ``VariantInfo`` from the JSON-decoded payload.
+
+    The payload encoder (``tokenizer_task._variant_to_payload_dict``)
+    serialises every dataclass field verbatim, so the decoder can
+    round-trip via the constructor — no field-by-field defensive
+    rebuild needed. ``extra_metadata`` is forwarded as-is (a JSON dict
+    decoded by the runtime), preserving the opaque pass-through
+    contract for downstream consumers.
+    """
+    return VariantInfo(
+        arch=variant_dict["arch"],
+        compiler=variant_dict["compiler"],
+        compiler_version=variant_dict["compiler_version"],
+        opt=variant_dict["opt"],
+        pkg=variant_dict["pkg"],
+        variant_id=int(variant_dict.get("variant_id", 0)),
+        extra_metadata=variant_dict.get("extra_metadata", {}) or {},
+    )
+
+
+@contextlib.contextmanager
+def _resolve_binary_for_task(
+    source_path: Path,
+    variant: VariantInfo,
+    tarball: Path | None,
+):
+    """Yield the on-disk binary path the tokenizer reads.
+
+    Two pathways converge:
+
+    * Legacy (``tarball is None``): ``source_path`` is the binary file
+      itself; yielded unchanged. No scratch dir.
+    * Sidecar (``tarball`` is set): the archive is extracted into a
+      per-task scratch dir under ``/tmp/tokenizer-extract/`` (scoped
+      by variant pkg + id so concurrent tasks don't collide); the
+      yielded path is the extracted binary inside that scratch.
+      Cleanup runs unconditionally on context exit.
+    """
+    if tarball is None:
+        yield source_path
+        return
+
+    _EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f"{variant.pkg}-{variant.variant_id:08x}-",
+        dir=_EXTRACT_ROOT,
+    ) as scratch_str:
+        scratch_dir = Path(scratch_str)
+        binary_path = extract_binary(tarball, scratch_dir, variant.pkg)
+        yield binary_path
 
 
 @dataclass(frozen=True)
@@ -249,29 +323,58 @@ def handle(task: Task) -> WorkerOutput | None:
                                             (default: RECOVERABLE).
     """
     logger = logging.getLogger()
-    binary_path = _SOURCE_DIR / task.relative_path
-    logger.info(f"[*] Processing: {binary_path}")
+    source_path = _SOURCE_DIR / task.relative_path
+    logger.info(f"[*] Processing: {source_path}")
 
     if _SIMULATE_ERRORS > 0 and random.random() * 100 < _SIMULATE_ERRORS:
-        logger.warning(f"[!] SIMULATED Error for task {binary_path.name}")
+        logger.warning(f"[!] SIMULATED Error for task {source_path.name}")
         raise NonRecoverableError(f"Simulated error ({_SIMULATE_ERRORS}% chance)")
 
+    # Decode the task payload (encoded by tokenizer_task._build_payload)
+    # into a VariantInfo and an optional sidecar tarball path. Both
+    # downstream concerns (binary resolution and meta-sidecar emission)
+    # receive their own slice of this decoded shape, so the decode runs
+    # once per task at the handler boundary.
+    payload = json.loads(task.payload_str) if task.payload_str else {}
+    variant = _decode_variant(payload[_PAYLOAD_VARIANT_KEY])
+    tarball_str = payload.get(_PAYLOAD_TARBALL_KEY)
+    tarball_path = Path(tarball_str) if tarball_str else None
+
+    # The output stem (CSV/meta filename prefix before _output.csv /
+    # _meta.json) must match the task-side projection
+    # (TokenizerTask.get_output_filename_pattern uses TaskInfo.path.name
+    # — i.e. task.relative_path's basename here). Sidecar mode keeps
+    # the .json infix; legacy mode is the binary's filename.
+    output_stem = Path(task.relative_path).name
+
+    # The source-tree-relative path used for output layout +
+    # staged_publish scope. For legacy this equals
+    # binary_path.relative_to(source_dir); for sidecar the binary lives
+    # in a scratch dir outside source_dir, so we pass the original
+    # task-relative path (the JSON sidecar's location under source)
+    # explicitly to keep outputs mirroring the source tree's layout.
+    source_relative_path = Path(task.relative_path)
+
     try:
-        warnings, filtered = run_tokenizer(
-            binary_path,
-            platform=cast(Platform | str, _PLATFORM),
-            skip_existing_csv=_SKIP_EXISTING,
-            source_dir=_SOURCE_DIR,
-            output_dir=_OUTPUT_DIR,
-            task=task,
-            backend=_BACKEND,
-        )
+        with _resolve_binary_for_task(source_path, variant, tarball_path) as binary_path:
+            warnings, filtered = run_tokenizer(
+                binary_path,
+                platform=cast(Platform | str, _PLATFORM),
+                skip_existing_csv=_SKIP_EXISTING,
+                source_dir=_SOURCE_DIR,
+                output_dir=_OUTPUT_DIR,
+                task=task,
+                backend=_BACKEND,
+                variant_info=variant,
+                output_stem=output_stem,
+                source_relative_path=source_relative_path,
+            )
     except NonRecoverableTokenizerError as e:
         # Binary-deterministic tokenizer failures (e.g.
         # angr arm_elf_fast.py:89 IndexError on certain
         # ARM ELF indirect jumps). Retry won't help.
         tb_str = traceback.format_exc()
-        logger.error(f"[!] Non-recoverable tokenizer error processing {binary_path}:\n{tb_str}")
+        logger.error(f"[!] Non-recoverable tokenizer error processing {source_path}:\n{tb_str}")
         raise NonRecoverableError(str(e)) from e
     except (RecoverableError, NonRecoverableError, MemoryError):
         raise
@@ -281,7 +384,7 @@ def handle(task: Task) -> WorkerOutput | None:
         # exhaustion logic catches truly-permanent cases). The
         # traceback ships with the response.
         tb_str = traceback.format_exc()
-        logger.error(f"[!] Error processing {binary_path}:\n{tb_str}")
+        logger.error(f"[!] Error processing {source_path}:\n{tb_str}")
         raise
 
     return WorkerOutput(warnings=warnings, filtered=filtered)
