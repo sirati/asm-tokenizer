@@ -34,7 +34,6 @@ from tokenizer.variant_info import VariantInfo
 # than a silent default. The variant sub-dict exactly matches
 # ``VariantInfo``'s field names — see ``_decode_variant``.
 _PAYLOAD_VARIANT_KEY = "variant"
-_PAYLOAD_TARBALL_KEY = "tarball"
 
 # Per-task tarball extraction lives under this root so it's isolated
 # from the durable output directory and from concurrent tasks. Each
@@ -410,14 +409,13 @@ def handle(task: Task) -> WorkerOutput | None:
         raise NonRecoverableError(f"Simulated error ({_SIMULATE_ERRORS}% chance)")
 
     # Decode the task payload (encoded by tokenizer_task._build_payload)
-    # into a VariantInfo and an optional sidecar tarball path. Both
-    # downstream concerns (binary resolution and meta-sidecar emission)
-    # receive their own slice of this decoded shape, so the decode runs
-    # once per task at the handler boundary.
+    # into a VariantInfo. Tarball location is no longer carried in
+    # the payload — for sidecar tasks ``task.relative_path`` IS the
+    # tarball under source_dir, and the worker treats source_path as
+    # the archive when ``variant.variant_id != 0``.
     payload = json.loads(task.payload_str) if task.payload_str else {}
     variant = _decode_variant(payload[_PAYLOAD_VARIANT_KEY])
-    tarball_str = payload.get(_PAYLOAD_TARBALL_KEY)
-    tarball_path = Path(tarball_str) if tarball_str else None
+    tarball_path = source_path if variant.variant_id != 0 else None
 
     # The source-tree-relative path used for output layout +
     # staged_publish scope. For legacy this equals

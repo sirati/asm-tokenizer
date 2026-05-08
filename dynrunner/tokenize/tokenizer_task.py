@@ -288,8 +288,16 @@ class TokenizerTask:
 
         for _, _, group in group_averages:
             for handle, variant, size in group:
+                # `TaskInfo.path` is the file the framework uploads /
+                # stages / hashes for this task. For sidecar tasks
+                # that's the .tar.zst (the archive carries the binaries
+                # to tokenize); the JSON sidecar is metadata-only and
+                # already fully decoded into `variant` at discovery
+                # time, so it doesn't need to travel across the wire.
+                # Legacy tasks emit the binary file directly.
+                wire_path = handle.tarball if handle.tarball is not None else handle.path
                 yield TaskInfo(
-                    path=handle.path,
+                    path=wire_path,
                     size=size,
                     identifier=BinaryIdentifier(
                         binary_name=variant.pkg,
@@ -300,7 +308,7 @@ class TokenizerTask:
                     ),
                     phase_id=_PHASE_ID,
                     type_id=_TYPE_ID,
-                    payload=_build_payload(variant, handle.tarball),
+                    payload=_build_payload(variant),
                 )
 
     # ── Per-type plumbing ──────────────────────────────────────────────
@@ -395,7 +403,6 @@ class TokenizerTask:
 
 
 _PAYLOAD_VARIANT_KEY = "variant"
-_PAYLOAD_TARBALL_KEY = "tarball"
 
 
 def _variant_to_payload_dict(variant: VariantInfo) -> dict[str, Any]:
@@ -419,18 +426,22 @@ def _variant_to_payload_dict(variant: VariantInfo) -> dict[str, Any]:
     }
 
 
-def _build_payload(variant: VariantInfo, tarball: Path | None) -> dict[str, Any]:
-    """Build the ``TaskInfo.payload`` dict for one ``(variant, tarball)``.
+def _build_payload(variant: VariantInfo) -> dict[str, Any]:
+    """Build the ``TaskInfo.payload`` dict for one variant.
 
     The framework FFI serialises the dict to JSON on the wire (see
     ``_native.TaskInfo.payload_json``); the worker decodes back to a
     dict and reconstructs ``VariantInfo`` from
-    ``payload[_PAYLOAD_VARIANT_KEY]``. ``payload[_PAYLOAD_TARBALL_KEY]``
-    is the absolute tarball path (sidecar mode) or ``None`` (legacy).
+    ``payload[_PAYLOAD_VARIANT_KEY]``.
+
+    Tarball location is no longer carried in the payload — for
+    sidecar tasks ``TaskInfo.path`` IS the tarball (so the framework
+    uploads/stages the right file), and the worker resolves it via
+    ``source_dir / task.relative_path``. The sidecar/legacy fork on
+    the worker side is driven by ``variant.variant_id != 0``.
     """
     return {
         _PAYLOAD_VARIANT_KEY: _variant_to_payload_dict(variant),
-        _PAYLOAD_TARBALL_KEY: str(tarball) if tarball is not None else None,
     }
 
 
