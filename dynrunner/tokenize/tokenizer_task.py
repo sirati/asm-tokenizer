@@ -119,7 +119,19 @@ class TokenizerTask:
         )
 
         pairs = self._iter_filtered_pairs(args, config, filters)
-        sorted_items = list(self._sort_and_tag_pairs(pairs))
+        # `source_root` is the absolute prefix the discovery walks
+        # produced their `BinaryHandle.path` / `.tarball` against. The
+        # framework treats `TaskInfo.path` as the wire identifier and
+        # forwards it to the worker as `task.relative_path`; emitting
+        # absolute paths here makes the wire identifier non-portable
+        # across primary/secondary FS-views, so we strip the prefix
+        # at the TaskInfo boundary.
+        source_root = (
+            Path(args.source_already_staged)
+            if getattr(args, "source_already_staged", None)
+            else config.source_dir
+        )
+        sorted_items = list(self._sort_and_tag_pairs(pairs, source_root))
 
         if getattr(args, "skip_existing", False):
             output_root = getattr(args, "resolved_output_root", None)
@@ -254,6 +266,7 @@ class TokenizerTask:
     @staticmethod
     def _sort_and_tag_pairs(
         pairs: Iterable[tuple[BinaryHandle, VariantInfo, int]],
+        source_root: Path,
     ) -> Iterable[TaskInfo]:
         """Group by ``variant.pkg``; sort within group by size DESC; order
         groups by group-average size DESC; emit ``TaskInfo`` instances
@@ -295,7 +308,20 @@ class TokenizerTask:
                 # already fully decoded into `variant` at discovery
                 # time, so it doesn't need to travel across the wire.
                 # Legacy tasks emit the binary file directly.
-                wire_path = handle.tarball if handle.tarball is not None else handle.path
+                #
+                # Emit RELATIVE-to-source-root paths so the wire
+                # identifier is portable across primary/secondary
+                # filesystem views. The framework forwards
+                # `TaskInfo.path` as `task.relative_path` to workers,
+                # which then resolve it via `_SOURCE_DIR / rel`.
+                # Absolute primary-side paths break that semantics
+                # in SLURM dispatch (the secondary's source mount is
+                # at a different absolute location).
+                abs_path = handle.tarball if handle.tarball is not None else handle.path
+                try:
+                    wire_path = abs_path.relative_to(source_root)
+                except ValueError:
+                    wire_path = abs_path
                 yield TaskInfo(
                     path=wire_path,
                     size=size,

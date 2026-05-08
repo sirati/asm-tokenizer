@@ -401,7 +401,20 @@ def handle(task: Task) -> WorkerOutput | None:
                                             (default: RECOVERABLE).
     """
     logger = logging.getLogger()
-    source_path = _SOURCE_DIR / task.relative_path
+    # ``task.relative_path`` is the wire identifier emitted by the
+    # primary's ``discover_items`` — strictly relative to the source
+    # root (see tokenizer_task._iter_local_pairs / _to_taskinfo where
+    # absolute on-disk paths get stripped to <rel>). When the
+    # framework's extraction cache stages the file at a different
+    # local location, ``task.resolved_path`` is set to that absolute
+    # path and ``open_path`` returns it; otherwise ``open_path`` is
+    # the relative wire identifier and we join it against
+    # ``_SOURCE_DIR``.
+    raw_open = Path(task.open_path) if hasattr(task, "open_path") else Path(task.relative_path)
+    if raw_open.is_absolute():
+        source_path = raw_open
+    else:
+        source_path = _SOURCE_DIR / raw_open
     logger.info(f"[*] Processing: {source_path}")
 
     if _SIMULATE_ERRORS > 0 and random.random() * 100 < _SIMULATE_ERRORS:
@@ -410,19 +423,17 @@ def handle(task: Task) -> WorkerOutput | None:
 
     # Decode the task payload (encoded by tokenizer_task._build_payload)
     # into a VariantInfo. Tarball location is no longer carried in
-    # the payload — for sidecar tasks ``task.relative_path`` IS the
-    # tarball under source_dir, and the worker treats source_path as
-    # the archive when ``variant.variant_id != 0``.
+    # the payload — for sidecar tasks the on-disk file at source_path
+    # IS the tarball, and the worker treats source_path as the
+    # archive when ``variant.variant_id != 0``.
     payload = json.loads(task.payload_str) if task.payload_str else {}
     variant = _decode_variant(payload[_PAYLOAD_VARIANT_KEY])
     tarball_path = source_path if variant.variant_id != 0 else None
 
-    # The source-tree-relative path used for output layout +
-    # staged_publish scope. For legacy this equals
-    # binary_path.relative_to(source_dir); for sidecar the binary lives
-    # in a scratch dir outside source_dir, so we pass the original
-    # task-relative path (the JSON sidecar's location under source)
-    # explicitly to keep outputs mirroring the source tree's layout.
+    # Source-tree-relative path used for output layout + staged_publish
+    # scope. ``task.relative_path`` is wire-supplied relative to the
+    # source root; we use it verbatim for both legacy and sidecar
+    # modes so outputs mirror the source tree's layout.
     source_relative_path = Path(task.relative_path)
 
     # Sidecar tasks (``variant_id != 0``) carry a distro-style ``arch``
