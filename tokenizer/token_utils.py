@@ -1,5 +1,5 @@
 import typing
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 from numpy import typing as npt
@@ -247,3 +247,94 @@ class TokenUtils:
                 decoded_value = -decoded_value
 
             return decoded_value
+
+    """V2 wire format: inline-digit encoding.
+
+    In v2 the vocab IDs 0-255 are reserved implicitly as digit tokens (the
+    byte value IS the token id). IDs >= 256 are real vocab tokens.
+    A token id < 256 means "continuation digit of the previous metatoken";
+    >= 256 starts a new metatoken. No Lit_Start/Lit_End framing.
+    """
+
+    @staticmethod
+    def encode_v2_inline_digits(type_token_id: int, payload: bytes) -> List[int]:
+        """V2 inline-digit encoding: returns [type_token_id, *payload_bytes].
+
+        Each payload byte (0-255) IS a digit token id (vocab IDs 0-255 are
+        reserved implicitly for digit tokens). No Lit_Start/Lit_End framing.
+        """
+        assert type_token_id >= 256, f"type_token_id must be >= 256, got {type_token_id}"
+        return [type_token_id, *payload]
+
+    @staticmethod
+    def decode_v2_inline_digits(token_ids: List[int]) -> Tuple[int, bytes]:
+        """V2 inline-digit decoding. Walks ``token_ids``:
+
+          - First element: type_token_id (asserted >= 256).
+          - Subsequent: while token_id < 256, append byte to payload; stop at
+            first element >= 256 (next metatoken boundary) or end of slice.
+
+        Returns ``(type_token_id, payload_bytes)``. Does NOT consume the
+        boundary token.
+        """
+        assert len(token_ids) >= 1, "token_ids must contain at least the type token"
+        type_token_id = token_ids[0]
+        assert type_token_id >= 256, f"type_token_id must be >= 256, got {type_token_id}"
+
+        payload = bytearray()
+        for token_id in token_ids[1:]:
+            if token_id >= 256:
+                break
+            payload.append(token_id)
+
+        return type_token_id, bytes(payload)
+
+    @staticmethod
+    def int_to_minimum_bytes(value: int, *, big_endian: bool = True) -> bytes:
+        """Pack non-negative int as minimum-width unsigned bytes.
+
+        ``value=0`` -> ``b'\\x00'`` (1 byte). ``value=255`` -> ``b'\\xff'``.
+        ``value=256`` -> ``b'\\x01\\x00'``. Negative values raise ``ValueError``.
+        """
+        if value < 0:
+            raise ValueError(f"int_to_minimum_bytes requires non-negative value, got {value}")
+        width = max(1, (value.bit_length() + 7) // 8)
+        return value.to_bytes(width, byteorder="big" if big_endian else "little", signed=False)
+
+    @staticmethod
+    def bytes_to_int(payload: bytes, *, big_endian: bool = True) -> int:
+        """Inverse of :meth:`int_to_minimum_bytes`. Empty bytes raises ``ValueError``."""
+        if len(payload) == 0:
+            raise ValueError("bytes_to_int requires at least one byte, got empty payload")
+        return int.from_bytes(payload, byteorder="big" if big_endian else "little", signed=False)
+
+    @staticmethod
+    def encode_v2_float(type_token_id: int, bits: int, width_bytes: int) -> List[int]:
+        """V2 float encoding (inline value): ``type_token_id`` followed by exactly
+        ``width_bytes`` big-endian bytes of ``bits`` (zero-padded if
+        ``bits.bit_length() < 8*width_bytes``).
+
+        Used when the float token carries an inline value (as opposed to acting
+        as a postfix type annotation on a preceding ptr token).
+        """
+        assert type_token_id >= 256, f"type_token_id must be >= 256, got {type_token_id}"
+        assert width_bytes >= 1, f"width_bytes must be >= 1, got {width_bytes}"
+        if bits < 0:
+            raise ValueError(f"encode_v2_float requires non-negative bits, got {bits}")
+        if bits.bit_length() > 8 * width_bytes:
+            raise ValueError(
+                f"bits 0x{bits:x} does not fit in {width_bytes} bytes ({bits.bit_length()} bits)"
+            )
+        payload = bits.to_bytes(width_bytes, byteorder="big", signed=False)
+        return [type_token_id, *payload]
+
+    @staticmethod
+    def encode_v2_float_postfix(type_token_id: int) -> List[int]:
+        """V2 float postfix annotation: just ``[type_token_id]``.
+
+        The next token (>= 256) starts the next metatoken; no inline value
+        bytes. Used to annotate a preceding ptr token with the FP type loaded
+        from the pointed-to address (e.g. ``movss [ro_data_ptr], xmm0``).
+        """
+        assert type_token_id >= 256, f"type_token_id must be >= 256, got {type_token_id}"
+        return [type_token_id]
