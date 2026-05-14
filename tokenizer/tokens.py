@@ -791,30 +791,130 @@ class TokenRaw(Tokens, ABC):
             return TokenRawInner
 
 
+class Category(Enum):
+    """v2 token categories that own a per-function identity space.
+
+    Each member corresponds to a `TokenType` whose wire form carries an
+    integer identity (counter-allocated, optionally address-cached, with
+    parallel human-readable metadata). Modifier tokens (`thread_local`,
+    `vtable`, `code_ptr_table`), `valued_const`, and `floatXX` deliberately
+    do NOT appear here -- they have no identity (they ride as either inline
+    digits or as fixed pure-type tokens prefixing the following identity).
+    """
+
+    BLOCK = "block"
+    LOCAL_FUNC = "local_func"
+    PLT_FUNC = "plt_func"
+    EXT_FUNC = "ext_func"
+    RO_DATA_PTR = "ro_data_ptr"
+    RW_DATA_PTR = "rw_data_ptr"
+    STRING_PTR = "string_ptr"
+    JUMP_TABLE = "jump_table"
+
+
 class TokenResolver:
-    """Manages ID resolution for different token types"""
+    """Manages per-function identity allocation for v2 categories.
+
+    Internal state is dict-keyed by `Category`:
+
+    - ``counters[c]``: next-id-to-allocate for category ``c``
+    - ``id_maps[c]``: address -> identity cache for category ``c``
+    - ``metadata[c]``: identity-indexed list of human-readable metadata dicts
+
+    `get_identity(category, addr, meta=None)` is the v2 entry point. The v1
+    methods `get_block_id`, `get_opaque_id`, `get_local_function_id`, and
+    `reset` remain available for legacy callers; `get_block_id` and
+    `get_local_function_id` are thin shims over the BLOCK/LOCAL_FUNC
+    categories (state is shared), while `get_opaque_id` keeps its own
+    counter/dict because v1 "opaque" doesn't map cleanly to a single v2
+    category (it splits across `ro_data_ptr`/`rw_data_ptr`/`string_ptr`/
+    `valued_const`).
+    """
 
     def __init__(self):
-        self.block_counter = 0
+        self.counters: dict[Category, int] = {c: 0 for c in Category}
+        self.id_maps: dict[Category, dict[int, int]] = {c: {} for c in Category}
+        self.metadata: dict[Category, list[dict]] = {c: [] for c in Category}
+
+        # v1-only opaque state -- intentionally separate from any `Category`
+        # because v1 "opaque" maps to multiple v2 categories. Removed once
+        # all v1 call sites are migrated to `get_identity(...)`.
         self.opaque_counter = 0
-        self.local_function_counter = 0
-        self.block_ids: dict[int, int] = {}  # addr(int) -> id
-        self.opaque_ids: dict[int, int] = {}  # addr(int) -> id
-        self.local_function_ids: dict[int, int] = {}  # addr(int) -> id
+        self.opaque_ids: dict[int, int] = {}
+
+    def get_identity(
+        self, category: Category, addr: int, meta: Optional[dict] = None
+    ) -> int:
+        """Get or allocate an identity within `category`.
+
+        If `addr` is truthy and already cached for this category, the cached
+        identity is returned (idempotent; `meta` is ignored on a cache hit).
+        Otherwise a fresh identity is allocated from `counters[category]`,
+        cached under `addr` (when truthy), and `meta or {}` is appended to
+        `metadata[category]` so that `metadata[category][identity]` is the
+        description for that identity.
+
+        Passing `addr=0` (or any falsy value) allocates an identity without
+        caching, preserving v1 semantics for "no address available".
+        """
+        cache = self.id_maps[category]
+        if addr and addr in cache:
+            return cache[addr]
+
+        identity = self.counters[category]
+        if addr:
+            cache[addr] = identity
+        self.counters[category] += 1
+        self.metadata[category].append(meta or {})
+        return identity
+
+    def reset_function(self):
+        """Zero all per-category counters and clear maps + metadata.
+
+        Invoked at function boundary so identities restart from 0 each
+        function (matching v1's per-function reset semantics).
+        """
+        for c in Category:
+            self.counters[c] = 0
+            self.id_maps[c].clear()
+            self.metadata[c].clear()
+
+    # ------------------------------------------------------------------
+    # v1 backward-compatibility surface
+    # ------------------------------------------------------------------
+
+    @property
+    def block_counter(self) -> int:
+        return self.counters[Category.BLOCK]
+
+    @property
+    def block_ids(self) -> dict[int, int]:
+        return self.id_maps[Category.BLOCK]
+
+    @property
+    def local_function_counter(self) -> int:
+        return self.counters[Category.LOCAL_FUNC]
+
+    @property
+    def local_function_ids(self) -> dict[int, int]:
+        return self.id_maps[Category.LOCAL_FUNC]
 
     def get_block_id(self, addr: int) -> int:
-        """Get or create a block ID"""
-        if addr and addr in self.block_ids:
-            return self.block_ids[addr]
+        """v1 shim: allocate within `Category.BLOCK`."""
+        return self.get_identity(Category.BLOCK, addr)
 
-        block_id = self.block_counter
-        if addr:
-            self.block_ids[addr] = block_id
-        self.block_counter += 1
-        return block_id
+    def get_local_function_id(self, addr: int) -> int:
+        """v1 shim: allocate within `Category.LOCAL_FUNC`."""
+        return self.get_identity(Category.LOCAL_FUNC, addr)
 
     def get_opaque_id(self, addr: int) -> int:
-        """Get or create an opaque constant ID"""
+        """v1-only opaque-constant identity (NOT a v2 category).
+
+        v1 "opaque" splits across multiple v2 categories
+        (`ro_data_ptr`/`rw_data_ptr`/`string_ptr`/`valued_const`), so this
+        keeps its own counter/dict until callers migrate to the appropriate
+        `get_identity(Category.*, ...)` call.
+        """
         if addr and addr in self.opaque_ids:
             return self.opaque_ids[addr]
 
@@ -824,25 +924,11 @@ class TokenResolver:
         self.opaque_counter += 1
         return opaque_id
 
-    def get_local_function_id(self, addr: int) -> int:
-        """Get or create a local function ID"""
-        if addr and addr in self.local_function_ids:
-            return self.local_function_ids[addr]
-
-        local_function_id = self.local_function_counter
-        if addr:
-            self.local_function_ids[addr] = local_function_id
-        self.local_function_counter += 1
-        return local_function_id
-
     def reset(self):
-        """Reset the block counter and block IDs for a new function"""
-        self.block_counter = 0
+        """v1 reset: per-category state + v1-only opaque state."""
+        self.reset_function()
         self.opaque_counter = 0
-        self.local_function_counter = 0
-        self.block_ids.clear()
         self.opaque_ids.clear()
-        self.local_function_ids.clear()
 
 
 class LitTokenType(Enum):

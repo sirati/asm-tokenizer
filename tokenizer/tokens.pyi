@@ -317,15 +317,40 @@ class MemoryOperandToken(Tokens, ABC):
     @abstractmethod
     def __init__(self, symbol: MemoryOperandSymbol) -> None: ...
 
+class Category(Enum):
+    BLOCK: "Category"
+    LOCAL_FUNC: "Category"
+    PLT_FUNC: "Category"
+    EXT_FUNC: "Category"
+    RO_DATA_PTR: "Category"
+    RW_DATA_PTR: "Category"
+    STRING_PTR: "Category"
+    JUMP_TABLE: "Category"
+
 class TokenResolver:
-    block_counter: int
+    counters: dict[Category, int]
+    id_maps: dict[Category, dict[int, int]]
+    metadata: dict[Category, list[dict]]
+
+    # v1-only opaque state
     opaque_counter: int
-    local_function_counter: int
-    block_ids: dict[int, int]
     opaque_ids: dict[int, int]
-    local_function_ids: dict[int, int]
+
+    # v1-backed read-only views over BLOCK / LOCAL_FUNC category state
+    @property
+    def block_counter(self) -> int: ...
+    @property
+    def block_ids(self) -> dict[int, int]: ...
+    @property
+    def local_function_counter(self) -> int: ...
+    @property
+    def local_function_ids(self) -> dict[int, int]: ...
 
     def __init__(self) -> None: ...
+    def get_identity(
+        self, category: Category, addr: int, meta: Optional[dict] = ...
+    ) -> int: ...
+    def reset_function(self) -> None: ...
     def get_block_id(self, addr: int) -> int: ...
     def get_opaque_id(self, addr: int) -> int: ...
     def get_local_function_id(self, addr: int) -> int: ...
