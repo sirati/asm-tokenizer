@@ -117,6 +117,31 @@ class TokenType(IntEnum):
     TOKEN_SET = 7
     IDENTIFIER_LITERAL = 8
     LOCAL_FUNCTION = 9
+    # v2 category tokens — see plan vivid-tinkering-wilkes.md "Target taxonomy".
+    # Identity- or value-carrying categories whose payload (if any) rides
+    # inline as digit tokens at vocab IDs 0–255 after the type-id.
+    LOCAL_FUNC = 10
+    PLT_FUNC = 11
+    EXT_FUNC = 12
+    RO_DATA_PTR = 13
+    RW_DATA_PTR = 14
+    STRING_PTR = 15
+    JUMP_TABLE = 16
+    VALUED_CONST_V2 = 17
+    BLOCK_V2 = 18
+    # v2 float tokens — fixed-width payloads (in bytes: 2, 2, 4, 8, 10, 16).
+    # Dual-mode: inline-value (digit tokens follow) OR postfix annotation
+    # (no digits follow; annotates the preceding ptr token's load type).
+    FLOAT16 = 19
+    BFLOAT16 = 20
+    FLOAT32 = 21
+    FLOAT64 = 22
+    FLOAT80 = 23
+    FLOAT128 = 24
+    # v2 modifiers — no identity, no payload; precede a base category token.
+    THREAD_LOCAL = 25
+    VTABLE = 26
+    CODE_PTR_TABLE = 27
     UNRESOLVED = -1
 
 
@@ -343,6 +368,329 @@ class LocalFunctionToken(IdentifierToken, ABC):
 
     @abstractmethod
     def __init__(self, local_function_id: int) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# v2 token classes (plan vivid-tinkering-wilkes.md)
+#
+# Identity-carrying category tokens reuse the existing IdentifierToken ABC
+# (id: int + _register_on -> cls_other(self.id) + _get_basename) and only
+# override `token_type` and `_get_basename` per category. This honors the
+# project rule against duplicated logic: the inline-digit encoding for a v2
+# identity is the same shape as the legacy IdentifierToken digit framing —
+# only the vocab basename and TokenType differ. Concrete *Inner subclasses
+# (added separately in token_manager.py) supply the per-category encoding
+# path; these ABCs are stubs that establish the type hierarchy + register
+# the TokenType.
+# ---------------------------------------------------------------------------
+
+
+class LocalFuncToken(IdentifierToken, ABC):
+    """Protocol for v2 local-function category tokens (function entry in main object).
+
+    Identity is per-function: the i-th distinct local function encountered in
+    a function body gets id i. Decomposable=no; the pointer is to executable
+    code in the main object and has no further structure.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.LOCAL_FUNC
+
+    @abstractmethod
+    def __init__(self, local_func_id: int) -> None: ...
+
+
+class PltFuncToken(IdentifierToken, ABC):
+    """Protocol for v2 PLT-stub category tokens (PLT entry in any loaded object)."""
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.PLT_FUNC
+
+    @abstractmethod
+    def __init__(self, plt_func_id: int) -> None: ...
+
+
+class ExtFuncToken(IdentifierToken, ABC):
+    """Protocol for v2 external-function category tokens.
+
+    Covers both real function entries in other loaded objects AND CLE
+    synthetic extern slots; provider metadata distinguishes the two via the
+    `synthetic` flag, but the token itself is identity-only.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.EXT_FUNC
+
+    @abstractmethod
+    def __init__(self, ext_func_id: int) -> None: ...
+
+
+class RoDataPtrToken(IdentifierToken, ABC):
+    """Protocol for v2 pointer-into-rodata category tokens.
+
+    Decomposable=yes; emitters may decompose into `[ro_data_ptr_base + valued_const_offset]`
+    when an exact slot identity isn't available.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.RO_DATA_PTR
+
+    @abstractmethod
+    def __init__(self, ro_data_ptr_id: int) -> None: ...
+
+
+class RwDataPtrToken(IdentifierToken, ABC):
+    """Protocol for v2 pointer-into-rw-data category tokens.
+
+    Covers `.data`, `.bss`, `.tdata`, `.tbss` — TLS sections additionally get
+    a leading `ThreadLocalToken` modifier. Decomposable=yes.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.RW_DATA_PTR
+
+    @abstractmethod
+    def __init__(self, rw_data_ptr_id: int) -> None: ...
+
+
+class StringPtrToken(IdentifierToken, ABC):
+    """Protocol for v2 string-pointer category tokens.
+
+    Identity refers to a provider-confirmed string; the string content lives
+    in the per-binary `<binary>_strings.bin` sidecar, addressed via the
+    function's `metadata.string_ptr[id] = {line, start_offset, encoding}`.
+    Decomposable=yes (substring access at non-zero start_offset).
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.STRING_PTR
+
+    @abstractmethod
+    def __init__(self, string_ptr_id: int) -> None: ...
+
+
+class JumpTableToken(IdentifierToken, ABC):
+    """Protocol for v2 jump-table category tokens (switch-statement target arrays).
+
+    Identity is per-function; the table's definition (slot block-ids in slot
+    order) is appended to the function's footer as a `block_def jump_table <id>`
+    region. Decomposable=no.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.JUMP_TABLE
+
+    @abstractmethod
+    def __init__(self, jump_table_id: int) -> None: ...
+
+
+class BlockTokenV2(IdentifierToken, ABC):
+    """Protocol for v2 block identifiers.
+
+    Distinct from the legacy `BlockToken` (TokenType.BLOCK) so the v1 emission
+    path and its vocab entries (`Block_0..N`) remain valid for class-stability,
+    while v2 emits a single `block` vocab entry whose identity rides as inline
+    digits.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.BLOCK_V2
+
+    @abstractmethod
+    def __init__(self, block_id: int) -> None: ...
+
+
+class ValuedConstTokenV2(ValuedConstToken, ABC):
+    """Protocol for v2 valued-constant tokens.
+
+    Same `value: int` shape as the legacy `ValuedConstToken`, but the wire
+    encoding is the v2 inline-digit form: one type-id followed by N variable-
+    width bytes (1..64) of the value, MSB-first. Distinct from legacy
+    `ValuedConstToken` to keep v1 vocab entries (`VALUED_CONST_00..FF`,
+    Lit_Start / Lit_End framing) untouched.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.VALUED_CONST_V2
+
+    @abstractmethod
+    def __init__(self, value: int) -> None: ...
+
+
+class FloatToken(Tokens, ABC):
+    """Protocol common to all v2 float tokens (16 / bfloat16 / 32 / 64 / 80 / 128).
+
+    Dual-mode payload:
+      * Inline-value form: `bits` holds the IEEE bit pattern as an unsigned
+        int; the wire stream is `[type_id, *byte_to_digit(b) for b in bits.to_bytes(width_bytes, "big")]`.
+      * Postfix-annotation form: `bits is None`; the float token immediately
+        follows a pointer token (e.g., `ro_data_ptr <id> float32`) and carries
+        no inline digits — the reader's "next token >= 256" check distinguishes
+        the two forms.
+
+    Each width is a separate concrete subclass with a `width_bytes` classvar
+    so the reader can pick the right consumption length without a runtime
+    switch on `token_type`.
+    """
+
+    width_bytes: int
+    bits: Optional[int]
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+    def _register_on(self, cls_other):
+        return cls_other(self.bits)
+
+
+class Float16Token(FloatToken, ABC):
+    """Protocol for v2 IEEE-754 half (2-byte) float tokens."""
+
+    width_bytes = 2
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.FLOAT16
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+
+class BFloat16Token(FloatToken, ABC):
+    """Protocol for v2 Google brain-float (2-byte) tokens.
+
+    Distinct enum + class from `Float16Token` because the bit layout differs
+    (8-bit exponent + 7-bit mantissa vs. 5-bit exponent + 10-bit mantissa);
+    a reader must know which to apply.
+    """
+
+    width_bytes = 2
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.BFLOAT16
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+
+class Float32Token(FloatToken, ABC):
+    """Protocol for v2 IEEE-754 single (4-byte) float tokens."""
+
+    width_bytes = 4
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.FLOAT32
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+
+class Float64Token(FloatToken, ABC):
+    """Protocol for v2 IEEE-754 double (8-byte) float tokens."""
+
+    width_bytes = 8
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.FLOAT64
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+
+class Float80Token(FloatToken, ABC):
+    """Protocol for v2 x87 extended-precision (10-byte) float tokens.
+
+    No IEEE-754 standard width matches; the bit pattern is the raw x87 80-bit
+    layout (1 sign + 15 exponent + 64 significand including explicit integer
+    bit). Stored MSB-first as 10 inline digit bytes.
+    """
+
+    width_bytes = 10
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.FLOAT80
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+
+class Float128Token(FloatToken, ABC):
+    """Protocol for v2 IEEE-754 quad (16-byte) float tokens."""
+
+    width_bytes = 16
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.FLOAT128
+
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = None) -> None: ...
+
+
+class ModifierToken(Tokens, ABC):
+    """Protocol common to v2 modifier tokens.
+
+    Modifiers carry no identity and no payload — they're parameterless category
+    markers that precede a base category token to refine its meaning. Multiple
+    modifiers may stack (e.g., `thread_local rw_data_ptr <id>`). The wire form
+    is exactly one vocab id and no inline digits.
+    """
+
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+    def _register_on(self, cls_other):
+        return cls_other()
+
+
+class ThreadLocalToken(ModifierToken, ABC):
+    """Protocol for the v2 `thread_local` modifier (TLS access marker)."""
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.THREAD_LOCAL
+
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+
+class VtableToken(ModifierToken, ABC):
+    """Protocol for the v2 `vtable` modifier (RTTI-confirmed C++ vtable slot)."""
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.VTABLE
+
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+
+class CodePtrTableToken(ModifierToken, ABC):
+    """Protocol for the v2 `code_ptr_table` modifier.
+
+    Covers non-vtable function-pointer-array slots: `.init_array`, `.fini_array`,
+    `.dtors`, dispatch tables, etc.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.CODE_PTR_TABLE
+
+    @abstractmethod
+    def __init__(self) -> None: ...
 
 
 @EnumTokenCls(MemoryOperandSymbol)
