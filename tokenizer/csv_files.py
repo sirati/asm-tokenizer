@@ -1,6 +1,7 @@
 import csv
 import re
 from pathlib import Path
+from typing import Iterator, TextIO
 
 import numpy as np
 
@@ -8,6 +9,54 @@ from tokenizer.compact_base64_utils import base64_to_ndarray, base64_to_ndarray_
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.utils import register_name_range
+
+
+# ---------------------------------------------------------------------------
+# Wire-format version detection
+# ---------------------------------------------------------------------------
+#
+# v2 tokenizer outputs prefix the CSV with a single-cell prelude row
+# ``["version=2"]`` (see ``tokenizer.main_loop``). v1 outputs have no
+# prelude and start directly with the header row.
+#
+# ``open_versioned_csv_reader`` is the single entry point all readers in
+# this module use to obtain a ``csv.reader`` that has already consumed
+# the prelude (if present) along with the detected version. Per-reader
+# logic stays version-agnostic: positional column indices are unchanged
+# between v1 and v2 (v2 only renamed the metadata column from
+# ``opaque_metadata`` to ``metadata``).
+
+
+def open_versioned_csv_reader(csvfile: TextIO) -> tuple["csv.reader", int]:
+    """Return ``(reader, format_version)`` for an opened tokenizer CSV.
+
+    Peeks the first row to detect the v2 ``version=2`` prelude. If
+    present it is consumed and ``format_version == 2``; otherwise the
+    row is replayed via a chained iterator and ``format_version == 1``
+    so the caller sees the original first row at its first ``next()``.
+
+    The returned object is a normal iterator yielding rows (it is not a
+    real ``csv.reader`` instance after replay, but the iteration
+    contract is identical, which is all callers use).
+    """
+
+    raw_reader = csv.reader(csvfile)
+    try:
+        first_row = next(raw_reader)
+    except StopIteration:
+        return raw_reader, 1
+
+    if len(first_row) == 1 and first_row[0] == "version=2":
+        # Prelude consumed; remaining rows start with the header.
+        return raw_reader, 2
+
+    # v1: replay the first row so callers' first ``next()`` sees it.
+    return _chain_first_row(first_row, raw_reader), 1
+
+
+def _chain_first_row(first_row: list[str], rest: Iterator[list[str]]) -> Iterator[list[str]]:
+    yield first_row
+    yield from rest
 
 
 def extract_ldis_blocks_from_file(file_path):
@@ -19,7 +68,7 @@ def extract_ldis_blocks_from_file(file_path):
     result = {}
 
     with file_path.open(encoding="utf-8") as f:
-        reader = csv.reader(f)
+        reader, _format_version = open_versioned_csv_reader(f)
         for row in reader:
             if len(row) < 4:
                 continue
@@ -146,7 +195,7 @@ def reverse_tokenization(
 
 def vocab_from_output(output_path: str) -> list[str]:
     with open(output_path, newline="") as csvfile:
-        reader = csv.reader(csvfile)
+        reader, _format_version = open_versioned_csv_reader(csvfile)
         csv_iter = iter(reader)
         vocab: list[str] = []
         for func_name, token in enumerate(next(csv_iter)[6][1:-1].split(",")):
@@ -156,7 +205,7 @@ def vocab_from_output(output_path: str) -> list[str]:
 
 def token_to_insn(input_path: str, output_path: str, vocab_manager: VocabularyManager):
     with open(input_path, newline="") as csvfile:
-        reader = csv.reader(csvfile)
+        reader, _format_version = open_versioned_csv_reader(csvfile)
         token_list: list[tuple[str, str]] = []
         vocab: dict[int, str] = {}
         csv_iter = iter(reader)
@@ -186,7 +235,7 @@ def token_to_insn(input_path: str, output_path: str, vocab_manager: VocabularyMa
 
 def token_to_functions(input_path: str):
     with open(input_path, newline="") as csvfile:
-        reader = csv.reader(csvfile)
+        reader, _format_version = open_versioned_csv_reader(csvfile)
 
         vocab = []
         for token in next(iter(reader))[6][1:-1].split(","):
@@ -245,8 +294,8 @@ def compare_csv_files(file1: str, file2: str):
     csv.field_size_limit(10_000_000)
 
     with open(file1, newline="", encoding="utf-8") as f1, open(file2, newline="", encoding="utf-8") as f2:
-        reader1 = csv.reader(f1)
-        reader2 = csv.reader(f2)
+        reader1, _v1 = open_versioned_csv_reader(f1)
+        reader2, _v2 = open_versioned_csv_reader(f2)
 
         line_num = 1
         for row1, row2 in zip(reader1, reader2):
@@ -269,7 +318,7 @@ def compare_csv_files(file1: str, file2: str):
 def csv_to_dict(filepath):
     result = {}
     with open(filepath, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
+        reader, _format_version = open_versioned_csv_reader(f)
         for row in reader:
             if len(row) != 2:
                 continue  # skip malformed lines
