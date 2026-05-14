@@ -47,7 +47,13 @@ def unify_vocab(
             "preserved on the output side."
         )
 
-    unified_vm = VocabularyManager(platform=None)
+    # `unified_vm` is constructed lazily once we know the format_version of
+    # the inputs. Mixed v1/v2 inputs are rejected (a unified vocab would
+    # have inconsistent reserved-id semantics — IDs 0..255 are real entries
+    # under v1 but protocol-reserved digits under v2). Either-version is
+    # acceptable in isolation; the all-same check happens on first load.
+    unified_vm: VocabularyManager | None = None
+    unified_format_version: int | None = None
 
     if mapping_output_dir is not None:
         mapping_output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,7 +67,33 @@ def unify_vocab(
             continue
         loaded_count += 1
 
+        current_format_version = current_vocab_manager.format_version
+        if unified_format_version is None:
+            unified_format_version = current_format_version
+            unified_vm = VocabularyManager(
+                platform=None, format_version=unified_format_version
+            )
+        elif current_format_version != unified_format_version:
+            raise ValueError(
+                f"unify_vocab: cannot mix vocab format versions in one run. "
+                f"Earlier inputs were format_version={unified_format_version}; "
+                f"{csv_file} reports format_version={current_format_version}. "
+                f"Re-tokenize the older corpus to v2, or run the unifier on "
+                f"each version separately."
+            )
+
         mappings = np.full_like(current_vocab_manager.id_to_token_type, -1, dtype=np.int32)
+
+        # Under format_version=2, IDs 0..255 are protocol-reserved digit
+        # slots. The plan requires explicit identity remap for that range —
+        # both per-binary VM and unified VM agree on those positions by
+        # construction, so the inline-digit stream survives `mapping[tokens]`
+        # unchanged. Filling here before the representative loop is
+        # idempotent (the loop only touches IDs >= 256 under v2 since
+        # `iter_representative_tokens` skips reserved digits).
+        if current_format_version == 2:
+            reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+            mappings[:reserved] = np.arange(reserved, dtype=mappings.dtype)
 
         for tokens in current_vocab_manager.iter_representative_tokens():
             original = tokens.get_token_ids()

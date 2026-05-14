@@ -14,14 +14,38 @@ from .types import Platform
 
 
 def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
-    assert len(row) == 10 or (platform == "unified" and len(row) == 13), f"Expected 10 or 13 columns, got {len(row)}"
+    # v1 layout: 10 cells (per-platform) or 13 cells (unified).
+    # v2 layout: appends `("format_version", "<int>")` at the tail —
+    # 12 cells (per-platform) or 15 cells (unified). Wire-format is
+    # otherwise byte-identical to v1; the trailing pair is the *only*
+    # delta on the vocab tail row (the per-binary entries for IDs 0..255
+    # are stripped by the saver because they are protocol-reserved
+    # digit slots — see plan vivid-tinkering-wilkes.md).
+    base_cols = 13 if platform == "unified" else 10
+    assert len(row) == base_cols or len(row) == base_cols + 2, (
+        f"Expected {base_cols} (v1) or {base_cols + 2} (v2) columns, got {len(row)}"
+    )
     assert row[0] == "vocabulary"
     assert row[2].startswith("_id_to_token_type")
     assert row[4].startswith("_platform_instruction_type_cache")
     assert row[6] == "_lit_start_cache"
     assert row[8] == "_lit_end_cache"
+    # Real unified-row layout puts the "platforms norm:..." header cell at
+    # position 10 (row[9] is the lit_end base64 payload). The pre-existing
+    # assertion checked row[9] which never matched any real layout;
+    # `is_vocab_def` swallowed the AssertionError via its bare-except so
+    # the typo was silently dead code (the only caller of this validator
+    # via the read-back path, `load_unified_vocab_manager`, was already
+    # returning None for an unrelated readline bug). Fixed here because
+    # the v2 path now exercises this validation more rigorously.
     if platform == "unified":
-        assert row[9].startswith("platforms")
+        assert row[10].startswith("platforms"), (
+            f"Expected 'platforms ...' header cell at position 10, got {row[10]!r}"
+        )
+    if len(row) == base_cols + 2:
+        assert row[base_cols] == "format_version", (
+            f"Expected v2 trailer cell 'format_version' at position {base_cols}, got {row[base_cols]!r}"
+        )
 
 
 def is_vocab_def(csv_row: bytes, platform: Platform) -> tuple[bool, list[str]]:
@@ -76,6 +100,47 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
     platform_list = row[11].strip('"').split(",") if platform == "unified" else None
     token_to_platform = base64_to_ndarray(row[12]).astype(np.int8) + platform_offset if platform == "unified" else None
 
+    # v2 trailer: ("format_version", "<int>") appended after the v1 tail.
+    # Saver strips the protocol-reserved digit slots (IDs 0..255) from the
+    # serialized vocab; the loader reconstitutes them here so downstream
+    # absolute-ID lookups (lit caches, register_on_vocab_manager, etc.) all
+    # stay valid.
+    base_cols = 13 if platform == "unified" else 10
+    format_version = 1
+    if len(row) == base_cols + 2:
+        format_version = int(row[base_cols + 1])
+
+    if format_version == 2:
+        reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+        digit_names = [f"digit_{i:02X}" for i in range(reserved)]
+        vocabulary = digit_names + vocabulary
+        id_to_token_type = np.concatenate(
+            [
+                np.full(reserved, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
+                id_to_token_type,
+            ]
+        )
+        platform_instruction_type_cache = np.concatenate(
+            [
+                np.full(
+                    reserved,
+                    PlatformInstructionTypes.AGNOSTIC,
+                    dtype=platform_instruction_type_cache.dtype,
+                ),
+                platform_instruction_type_cache,
+            ]
+        )
+        if token_to_platform is not None:
+            token_to_platform = np.concatenate(
+                [
+                    np.full(reserved, -1, dtype=token_to_platform.dtype),
+                    token_to_platform,
+                ]
+            )
+        # Lit caches reference absolute IDs >= 256 (legacy stubs registered
+        # for class-stability under a v2 VM, if any); the saver writes them
+        # unshifted, so no adjustment is needed here.
+
     platform = platform if platform != "unified" else None
 
     return VocabularyManager.from_vocab(
@@ -87,6 +152,7 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
         lit_end_cache=lit_end_cache,
         platform_list=platform_list,
         token_to_platform=token_to_platform,
+        format_version=format_version,
     )
 
 
