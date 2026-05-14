@@ -4,14 +4,82 @@ import numpy as np
 
 from tokenizer.arch.provider import ArchitectureProvider
 from tokenizer.constant_handler import ConstantHandler
-from tokenizer.disasm import MetadataLookup
+from tokenizer.disasm import DisassemblyProvider, MetadataLookup
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.instruction_sets import InstructionSets
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
-from tokenizer.tokens import BlockToken, TokenResolver, Tokens
+from tokenizer.tokens import BlockToken, Category, TokenResolver, Tokens
 
 VERIFICATION: bool = False
+
+
+def _emit_jump_table_footer(
+    func: Any,
+    func_tokens: FunctionTokenList,
+    disasm_provider: Optional[DisassemblyProvider],
+    resolver: TokenResolver,
+    vocab_manager: VocabularyManager,
+) -> None:
+    """Append one ``block_def jump_table <id> block_v2 <t0> ...`` block per
+    switch table the provider recovers within ``func``.
+
+    Single-concern: this function owns the v2 jump-table-footer concern.
+    Identity allocation goes through ``TokenResolver.get_identity`` so the
+    per-function metadata accumulator records both the table address and
+    each target's address; identities for already-known targets are shared
+    with the per-block emission earlier in ``fill_constant_candidates``
+    (same ``Category.BLOCK`` cache, same ``hex(addr)`` key).
+
+    No-ops when the vocab is v1 (the v2 ``Jump_Table`` / ``Block_V2``
+    Inner classes assert ``format_version == 2``) or when the provider
+    yields no tables (the abstract base's default returns an empty
+    iterator, so angr inherits a clean no-op).
+    """
+    if disasm_provider is None:
+        return
+    if getattr(vocab_manager, "format_version", 1) != 2:
+        return
+
+    for table_addr, target_addrs in disasm_provider.iter_switch_tables(func):
+        if not target_addrs:
+            # Provider gave us a table with no resolved slots — nothing to
+            # emit (would produce a `block_def jump_table` with zero slots,
+            # which is structurally a free-floating identity declaration).
+            continue
+
+        jt_meta = {
+            "jump_table_addr": hex(int(table_addr)),
+            "target_block_addrs": [hex(int(a)) for a in target_addrs],
+        }
+        jt_id = resolver.get_identity(Category.JUMP_TABLE, int(table_addr), jt_meta)
+        jt_token = vocab_manager.Jump_Table(jt_id)
+
+        target_tokens: list[Tokens] = []
+        for target_addr in target_addrs:
+            target_key = hex(int(target_addr))
+            # Mirror the per-block emission's key shape (line ~63 above)
+            # so that targets which are already known blocks of this
+            # function share identity via the existing cache entry —
+            # ``get_identity`` returns the cached id and ignores ``meta``
+            # on cache hits, so the "comes_from_jump_table" annotation
+            # only attaches to brand-new targets (slots that were never
+            # emitted as a regular block of this function).
+            target_meta = {"addr": target_key, "comes_from_jump_table": jt_id}
+            target_id = resolver.get_identity(Category.BLOCK, target_key, target_meta)
+            target_tokens.append(vocab_manager.Block_V2(target_id))
+
+        footer_tokens: list[Tokens] = [vocab_manager.Block_Def(), jt_token, *target_tokens]
+        # One synthetic instruction holding the whole footer: keeps the
+        # run-length arithmetic consistent (BlockTokenList expects at
+        # least one instruction per block). The insn-str is a debug
+        # label only.
+        footer_block = BlockTokenList(num_insns=1, vocab_manager=vocab_manager)
+        footer_block.append_as_insn(
+            insn_str=f"jump_table {jt_meta['jump_table_addr']}",
+            tokens=footer_tokens,
+        )
+        func_tokens.add_block(footer_block, jt_meta["jump_table_addr"])
 
 
 def fill_constant_candidates(
@@ -25,6 +93,7 @@ def fill_constant_candidates(
     resolver: TokenResolver,
     vocab_manager: VocabularyManager,
     arch_provider: ArchitectureProvider,
+    disasm_provider: Optional[DisassemblyProvider] = None,
 ) -> Optional[
     tuple[
         list[tuple[str, list[list[Tokens]]]],
@@ -114,6 +183,19 @@ def fill_constant_candidates(
         if VERIFICATION:
             temp_bbs.append((block_addr, disassembly_list2))
         func_tokens.add_block(disassembly_list, block_addr)
+
+    # v2 jump-table footer: one synthetic block per switch table the
+    # provider could recover for ``func``. Guarded inside the helper
+    # against v1 vocabs and against providers without switch-table
+    # recovery (default returns empty iter — angr is a no-op).
+    _emit_jump_table_footer(
+        func=func,
+        func_tokens=func_tokens,
+        disasm_provider=disasm_provider,
+        resolver=resolver,
+        vocab_manager=vocab_manager,
+    )
+
     return (
         temp_bbs,
         block_list,

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, Tuple
 
 
 class MetadataLookup(Protocol):
@@ -41,6 +41,25 @@ class DisassemblyProvider(ABC):
 
     @abstractmethod
     def iter_functions(self) -> Iterable[tuple[int, str, Any]]: ...
+
+    def iter_switch_tables(self, function: Any) -> Iterable[Tuple[int, list[int]]]:
+        """Yield ``(jump_table_addr, [target_block_addrs])`` per switch table.
+
+        Recovers indirect-jump (switch-statement) tables within
+        ``function``. ``jump_table_addr`` is the address of the
+        backing pointer-array in rodata; ``target_block_addrs`` is the
+        slot-order list of resolved target block start addresses.
+
+        Default implementation returns an empty iterator. Providers
+        whose backends support switch-table recovery (e.g. Ghidra)
+        override this; providers that don't (angr, per
+        ``angr_limitations.md`` §3) inherit the empty default and
+        the function-finalization hook emits no jump-table footer.
+        Kept on the abstract base (not as an extra Protocol) so the
+        finalization hook in ``fill_constant_candidates`` can call
+        it uniformly without provider-specific branching.
+        """
+        return iter(())
 
     def close(self) -> None:
         """Release backend-held resources for this binary.
