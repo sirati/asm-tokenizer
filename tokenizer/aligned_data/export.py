@@ -2,6 +2,7 @@ import csv
 import logging
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,11 +75,48 @@ def collect_binaries(output_path):
     return binaries
 
 
+@contextmanager
+def _open_versioned_dictreader(csv_path):
+    """Open a tokenizer-output CSV as a ``csv.DictReader``, transparently
+    handling both v1 and v2 wire formats.
+
+    v2 files prefix the data with a single-cell prelude row
+    ``["version=2"]`` (see ``tokenizer/main_loop.py``). v1 files start
+    directly with the header row whose first cell is ``function_name``.
+
+    This helper peeks the first row to detect the format, consumes the
+    prelude row when present, and yields a ``DictReader`` configured with
+    explicit ``fieldnames`` (the next row, which is the actual header) so
+    that the version dispatch is fully local to this opener -- callers
+    iterate rows as dicts keyed by the file's own column names. The
+    column-name difference between v1 (``opaque_metadata``) and v2
+    (``metadata``) therefore surfaces in row keys and is handled by
+    downstream consumers (e.g. ``get_called_functions_from_row``).
+    """
+    with open(csv_path, newline="", encoding="ascii") as f:
+        reader = csv.reader(f)
+        first_row = next(reader, None)
+        if first_row is None:
+            # Empty file: yield an empty DictReader-shaped iterator.
+            yield iter(())
+            return
+        if first_row and first_row[0].startswith("version="):
+            # v2+: prelude consumed; the next row is the real header.
+            header = next(reader, None)
+            if header is None:
+                yield iter(())
+                return
+        else:
+            # v1: ``first_row`` *is* the header.
+            header = first_row
+        dict_reader = csv.DictReader(f, fieldnames=header)
+        yield dict_reader
+
+
 def load_function_data(csv_path):
     """Load function data from a csv file."""
     functions = {}
-    with open(csv_path, newline="", encoding="ascii") as f:
-        reader = csv.DictReader(f)
+    with _open_versioned_dictreader(csv_path) as reader:
         for row in reader:
             name = row["function_name"]
             if name.startswith(".L"):
@@ -113,8 +151,7 @@ def get_function_names_across_versions(versions):
     """Return set of function names present in all versions (excluding .L*)."""
     name_sets = []
     for v in versions:
-        with open(v["file"], newline="", encoding="ascii") as f:
-            reader = csv.DictReader(f)
+        with _open_versioned_dictreader(v["file"]) as reader:
             names = set()
             for row in reader:
                 name = row["function_name"]
@@ -134,8 +171,7 @@ def load_all_function_data(versions, function_names):
     for v in versions:
         key = (v["arch"], v["compiler"], v["compilerversion"], v["opt"])
         data[key] = {}
-        with open(v["file"], newline="", encoding="ascii") as f:
-            reader = csv.DictReader(f)
+        with _open_versioned_dictreader(v["file"]) as reader:
             for row in reader:
                 name = row["function_name"]
                 if name in function_names:
