@@ -75,6 +75,14 @@ class _CapOperand:
         2 (IMM)  -> ``imm``
         3 (MEM)  -> ``mem``
        64 (CRX, PPC only) -> ``crx``
+
+    ``fp_width_bytes`` is the per-operand FP width derived from Ghidra's
+    ``OperandType.FLOAT`` bitmask (one of {2, 4, 8, 10, 16}) or ``None``
+    when the operand is not FP-typed. Populated at decode time by
+    ``_ghidra_insn_to_cap``; angr-path operands (raw Capstone CsOpnd) do
+    not carry this attribute, so call sites read it via
+    ``getattr(op, "fp_width_bytes", None)``. See ``angr_limitations.md``
+    §1 for why the angr path stays None.
     """
 
     type: int = 0
@@ -84,6 +92,7 @@ class _CapOperand:
     size: int = 0  # x86 operand size in bytes
     shift: _CapShift = field(default_factory=_CapShift)
     ghidra_raw_data: _GhidraMemRawData | None = None
+    fp_width_bytes: Optional[int] = None
 
     @dataclass
     class _CRX:
@@ -811,6 +820,63 @@ def _extract_x86_prefixes(ghidra_insn: Any) -> set[int]:
     return prefixes
 
 
+def _compute_fp_width_bytes(ghidra_insn: Any, operand_index: int) -> Optional[int]:
+    """Module-level helper backing ``operand_fp_width_bytes``.
+
+    Pulled out so the decode path in ``_ghidra_insn_to_cap`` can call it
+    once per operand to stamp the resulting width on ``_CapOperand``,
+    keeping the public ``GhidraDisassemblyProvider.operand_fp_width_bytes``
+    method as a thin wrapper. Returns one of {2, 4, 8, 10, 16} when the
+    operand is FP-typed (Ghidra ``OperandType.FLOAT`` bitmask) or ``None``
+    otherwise. See ``GhidraDisassemblyProvider.operand_fp_width_bytes``
+    docstring for the full derivation order and the BFloat16/Float16
+    ambiguity note.
+    """
+    from ghidra.program.model.lang import OperandType, Register
+    from ghidra.program.model.scalar import Scalar
+
+    try:
+        op_type = ghidra_insn.getOperandType(operand_index)
+    except Exception:
+        return None
+    if not bool(op_type & OperandType.FLOAT):
+        return None
+
+    max_width_bits = 0
+    try:
+        objects = ghidra_insn.getOpObjects(operand_index)
+    except Exception:
+        objects = ()
+    for obj in objects or ():
+        try:
+            if isinstance(obj, Register):
+                width = int(obj.getBitLength())
+            elif isinstance(obj, Scalar):
+                width = int(obj.bitLength())
+            else:
+                continue
+        except Exception:
+            continue
+        if width > max_width_bits:
+            max_width_bits = width
+
+    if max_width_bits == 0:
+        # Fall back to the reference-type's reported access size
+        # (memory FP loads/stores).
+        try:
+            ref_type = ghidra_insn.getOperandRefType(operand_index)
+            if ref_type is not None:
+                size_bytes = int(ref_type.getSize())
+                if size_bytes > 0:
+                    return size_bytes
+        except Exception:
+            pass
+        return None
+
+    width_bytes = max_width_bits // 8
+    return width_bytes if width_bytes > 0 else None
+
+
 def _ghidra_insn_to_cap(
     ghidra_insn: Any,
     reg_map: _RegisterMap,
@@ -865,6 +931,13 @@ def _ghidra_insn_to_cap(
             )
         )
 
+        # Per-operand FP width (Ghidra OperandType.FLOAT bitmask). Stamped on
+        # every _CapOperand we build below so the operand tokenizer can pass
+        # it to ``ConstantHandler.process_constant_v2`` without re-deriving
+        # the signal at call-site granularity. See ``precedence.md`` step 1
+        # for how the classifier consumes it.
+        fp_width = _compute_fp_width_bytes(ghidra_insn, i)
+
         if is_memory:
             # Attach raw Ghidra objects for native tokenization in X86GhidraProvider
             raw_data = _GhidraMemRawData(
@@ -872,16 +945,16 @@ def _ghidra_insn_to_cap(
                 op_objects=list(objects),
                 reg_map=reg_map,
             )
-            operands.append(_CapOperand(type=_OP_MEM, ghidra_raw_data=raw_data))
+            operands.append(_CapOperand(type=_OP_MEM, ghidra_raw_data=raw_data, fp_width_bytes=fp_width))
         else:
             first = objects[0]
             if isinstance(first, Register):
                 reg_id = reg_map.get_id(str(first.getName()))
-                operands.append(_CapOperand(type=_OP_REG, reg=reg_id))
+                operands.append(_CapOperand(type=_OP_REG, reg=reg_id, fp_width_bytes=fp_width))
             elif isinstance(first, Scalar):
-                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue())))
+                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue()), fp_width_bytes=fp_width))
             elif isinstance(first, Address):
-                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset())))
+                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset()), fp_width_bytes=fp_width))
 
     insn_inner = _CapInsnInner(_insn_name=base_mnemonic)
 
@@ -1130,50 +1203,15 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         receiving width=2 default to ``Float16`` in the classifier.
         Documented here so the precedence-list implementation can
         cite the limitation.
+
+        Implementation note: the decode path in ``_ghidra_insn_to_cap``
+        stamps this width on every ``_CapOperand.fp_width_bytes`` at
+        instruction-translation time, so operand tokenizers don't need
+        to call this method per-operand. The public method stays on the
+        provider for direct callers and for symmetry with the
+        Phase 1.B.1 provider-interface contract.
         """
-        from ghidra.program.model.lang import OperandType, Register
-        from ghidra.program.model.scalar import Scalar
-
-        try:
-            op_type = ghidra_insn.getOperandType(operand_index)
-        except Exception:
-            return None
-        if not bool(op_type & OperandType.FLOAT):
-            return None
-
-        max_width_bits = 0
-        try:
-            objects = ghidra_insn.getOpObjects(operand_index)
-        except Exception:
-            objects = ()
-        for obj in objects or ():
-            try:
-                if isinstance(obj, Register):
-                    width = int(obj.getBitLength())
-                elif isinstance(obj, Scalar):
-                    width = int(obj.bitLength())
-                else:
-                    continue
-            except Exception:
-                continue
-            if width > max_width_bits:
-                max_width_bits = width
-
-        if max_width_bits == 0:
-            # Fall back to the reference-type's reported access size
-            # (memory FP loads/stores).
-            try:
-                ref_type = ghidra_insn.getOperandRefType(operand_index)
-                if ref_type is not None:
-                    size_bytes = int(ref_type.getSize())
-                    if size_bytes > 0:
-                        return size_bytes
-            except Exception:
-                pass
-            return None
-
-        width_bytes = max_width_bits // 8
-        return width_bytes if width_bytes > 0 else None
+        return _compute_fp_width_bytes(ghidra_insn, operand_index)
 
     # ----------------------------------------------------------------------
     # Switch-table recovery
