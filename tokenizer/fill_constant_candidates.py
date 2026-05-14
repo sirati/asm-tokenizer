@@ -130,7 +130,10 @@ def fill_constant_candidates(
 
         block_addr = hex(block.addr)
         block_id = resolver.get_block_id(block_addr)
-        block_token = vocab_manager.Block(block_id)
+        if vocab_manager.format_version == 2:
+            block_token = vocab_manager.Block_V2(block_id)
+        else:
+            block_token = vocab_manager.Block(block_id)
         block_list.append(
             {
                 block_token: (
