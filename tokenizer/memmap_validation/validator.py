@@ -24,6 +24,7 @@ flagging any mismatch as a validation error. Memmaps without the sidecar
 (legacy builds) skip the cross-check unconditionally.
 """
 
+import csv
 import json
 import logging
 from dataclasses import dataclass
@@ -42,6 +43,55 @@ from ..token_manager import VocabularyManager
 from ..vocab_unifier.loader import load_unified_vocab_manager
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-version CSV format-version detection
+# ---------------------------------------------------------------------------
+#
+# v2 tokenizer outputs prepend a single-cell ``version=2`` prelude row
+# before the CSV header (see ``tokenizer.main_loop``). v1 outputs have
+# no prelude and start directly with the header.
+#
+# Consumption of the prelude is owned by
+# ``aligned_data.match.open_csv_skip_vocab`` (the reader factory shared
+# by every lockstep consumer). The validator only needs to *detect* the
+# version of each per-version CSV so it can (1) fail fast on a mixed
+# v1/v2 input set, (2) log the detected version, and (3) gate any
+# future version-specific behaviour through a single switch. The
+# token-equality cross-checks themselves are unchanged: the token
+# stream is byte-identical between memmap and CSV in both v1 and v2
+# (v2 inline-digit IDs ride in the same uint16 stream).
+
+
+def _detect_csv_format_version(csv_path: Path) -> int:
+    """Return the wire-format version of a per-version tokenizer CSV.
+
+    Peeks only the first CSV row. v2 files start with a single-cell
+    ``["version=2"]`` prelude; v1 files start directly with the header.
+    Raises ``ValueError`` for an empty file or an unrecognised prelude
+    payload so a corrupt input is surfaced rather than silently treated
+    as v1.
+
+    Prelude *consumption* during data iteration is handled by
+    ``aligned_data.match.open_csv_skip_vocab``; this helper deliberately
+    only peeks (it does not advance any shared reader state).
+    """
+    with open(csv_path, "r", newline="", encoding="ascii") as f:
+        reader = csv.reader(f)
+        try:
+            first_row = next(reader)
+        except StopIteration as exc:
+            raise ValueError(f"empty CSV: {csv_path}") from exc
+
+    if len(first_row) == 1 and first_row[0].startswith("version="):
+        payload = first_row[0][len("version=") :]
+        if payload == "2":
+            return 2
+        raise ValueError(f"unrecognised CSV version prelude {first_row[0]!r} in {csv_path}")
+
+    # No prelude row: v1 by construction. The first row is the header.
+    return 1
 
 
 def _load_versions_sidecar(output_dir: Path, binary_name: str) -> Optional[List[dict]]:
@@ -326,6 +376,7 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
     mapping_dict = {}
     csv_paths = []
     version_keys = []
+    detected_formats: List[int] = []
 
     for version in config.versions:
         mapping = load_mapping(version.mapping_path)
@@ -340,6 +391,21 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         mapping_dict[vkey] = mapping
         csv_paths.append(str(version.csv_path))
         version_keys.append(vkey)
+        detected_formats.append(_detect_csv_format_version(version.csv_path))
+
+    # Refuse mixed v1/v2 inputs: lockstep validation joins per-function
+    # rows across all per-version CSVs, so a single mismatched wire
+    # format would mean comparing semantically different header
+    # schemas. ``open_csv_skip_vocab`` already normalises the prelude,
+    # but a mixed set still indicates a broken build pipeline.
+    unique_formats = set(detected_formats)
+    if len(unique_formats) > 1:
+        raise ValueError(
+            f"per-version CSVs have inconsistent format versions {sorted(unique_formats)}: "
+            f"{list(zip(csv_paths, detected_formats))}"
+        )
+    csv_format_version = detected_formats[0] if detected_formats else 1
+    logger.info(f"  Per-version CSV format: v{csv_format_version}")
 
     # Cross-check `<binary>_versions.json` if present. Legacy memmaps
     # without the sidecar skip this step (returns None). Mismatches are
