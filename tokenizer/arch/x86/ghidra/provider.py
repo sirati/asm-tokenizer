@@ -96,8 +96,15 @@ class X86GhidraProvider(ArchitectureProvider):
                     )
                     insn_tokens.extend(immediate_tokens)
                 elif op.type == 3:  # memory — Ghidra-native path
+                    # Forward the per-operand FP width Ghidra stamped on the
+                    # _CapOperand at decode time (see
+                    # ``tokenizer/disasm/ghidra_provider.py::_ghidra_insn_to_cap``).
+                    # The Ghidra-native memory tokenizer doesn't see ``op``
+                    # itself (only its ``ghidra_raw_data`` payload), so the
+                    # FP-width hint is threaded explicitly.
                     memory_tokens = tokenize_operand_memory_ghidra(
                         op.ghidra_raw_data,
+                        op.fp_width_bytes,
                         insn,
                         lookup,
                         text_end,

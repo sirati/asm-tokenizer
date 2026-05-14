@@ -114,13 +114,18 @@ def tokenize_operand_memory(
 
         meta, kind = lookup.lookup(disp)
 
+        # Memory operand → if the load is FP-typed Ghidra stamps the width
+        # on this _CapOperand at decode time; the v2 emitter appends a
+        # postfix ``floatXX`` after the ptr token (precedence.md "Postfix
+        # FP"). The angr path leaves this None (``angr_limitations.md`` §1).
+        fp_postfix = getattr(op, "fp_width_bytes", None)
+
         if force_opaque:
-            disp_token = constant_handler.process_constant(
+            disp_token = constant_handler.process_constant_v2(
                 disp,
-                is_arithmetic=False,
                 meta=meta,
-                library_type=meta.get("library", "unknown") if meta else "unknown",
-                insn_mnemonic=insn.mnemonic,
+                is_arithmetic=False,
+                fp_postfix_width_bytes=fp_postfix,
             )
             tokens.extend(disp_token)
         # For larger displacements, check if pointing to known constant or code or opaque
@@ -128,21 +133,20 @@ def tokenize_operand_memory(
         if meta is not None:
             # Check if displacement is in text section or outside function bounds
             if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
-                disp_token = constant_handler.process_constant(
+                disp_token = constant_handler.process_constant_v2(
                     disp,
-                    is_arithmetic=False,
                     meta=meta,
-                    library_type=meta.get("library", "unknown"),
-                    insn_mnemonic=insn.mnemonic,
+                    is_arithmetic=False,
+                    fp_postfix_width_bytes=fp_postfix,
                 )
                 tokens.extend(disp_token)
             else:
                 # Local constant - treat as valued constant literal
-                disp_token = constant_handler.process_constant(disp, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
+                disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
                 tokens.extend(disp_token)
         else:
             # No metadata found - treat as valued constant literal
-            disp_token = constant_handler.process_constant(disp, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
+            disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
             tokens.extend(disp_token)
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
@@ -171,13 +175,26 @@ def tokenize_operand_immediate(
     imm_val = abs(op.imm)
     imm_val_hex_len = num_hex_digits(imm_val)
 
+    # Immediate operand → an FP-tagged immediate (precedence.md step 1) is
+    # an inline ``floatXX`` with IEEE bit pattern. Only the Ghidra path
+    # stamps ``fp_width_bytes`` on _CapOperand; angr/Capstone CsOpnd has no
+    # such attribute (see ``angr_limitations.md`` §1).
+    fp_immediate = getattr(op, "fp_width_bytes", None)
+
     if imm_val_hex_len <= 2:  # Small immediate (0x00 to 0xFF)
-        imm_token = constant_handler.process_constant(imm_val, insn_mnemonic=insn.mnemonic)
+        imm_token = constant_handler.process_constant_v2(
+            imm_val,
+            fp_immediate_width_bytes=fp_immediate,
+        )
         tokens.extend(imm_token)
     elif imm_val_hex_len <= (128 / 4):  # Larger immediate (up to 128-bit)
         if insn.mnemonic in arithmetic_instructions:
             # Arithmetic instruction - treat as valued constant literal
-            imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
+            imm_token = constant_handler.process_constant_v2(
+                imm_val,
+                is_arithmetic=True,
+                fp_immediate_width_bytes=fp_immediate,
+            )
             tokens.extend(imm_token)
         elif insn.mnemonic in addressing_control_flow_instructions:
             # Addressing/control flow instruction - check for metadata
@@ -186,27 +203,35 @@ def tokenize_operand_immediate(
             if meta is not None:
                 if kind == "range":
                     if func_min_addr <= imm_val < func_max_addr:  # Local
-                        imm_token = constant_handler.process_constant(
-                            imm_val, is_arithmetic=True, insn_mnemonic=insn.mnemonic
+                        imm_token = constant_handler.process_constant_v2(
+                            imm_val,
+                            is_arithmetic=True,
+                            fp_immediate_width_bytes=fp_immediate,
                         )
                         tokens.extend(imm_token)
                     else:  # External
-                        imm_token = constant_handler.process_constant(
+                        imm_token = constant_handler.process_constant_v2(
                             imm_val,
-                            is_arithmetic=False,
                             meta=meta,
-                            library_type="function",
-                            insn_mnemonic=insn.mnemonic,
+                            is_arithmetic=False,
+                            fp_immediate_width_bytes=fp_immediate,
                         )
                         tokens.extend(imm_token)
                 else:
-                    imm_token = constant_handler.process_constant(
-                        imm_val, is_arithmetic=False, meta=meta, library_type="unknown", insn_mnemonic=insn.mnemonic
+                    imm_token = constant_handler.process_constant_v2(
+                        imm_val,
+                        meta=meta,
+                        is_arithmetic=False,
+                        fp_immediate_width_bytes=fp_immediate,
                     )
                     tokens.extend(imm_token)
             else:
                 # No metadata - treat as valued constant literal
-                imm_token = constant_handler.process_constant(imm_val, is_arithmetic=True, insn_mnemonic=insn.mnemonic)
+                imm_token = constant_handler.process_constant_v2(
+                    imm_val,
+                    is_arithmetic=True,
+                    fp_immediate_width_bytes=fp_immediate,
+                )
                 tokens.extend(imm_token)
         else:  # Fallback - create opaque constant
             meta, kind = lookup.lookup(imm_val)
@@ -219,8 +244,11 @@ def tokenize_operand_immediate(
                     "type": "unknown",
                     "library": "unknown",
                 }
-            imm_token = constant_handler.process_constant(
-                imm_val, is_arithmetic=False, meta=meta, library_type="unknown", insn_mnemonic=insn.mnemonic
+            imm_token = constant_handler.process_constant_v2(
+                imm_val,
+                meta=meta,
+                is_arithmetic=False,
+                fp_immediate_width_bytes=fp_immediate,
             )
             tokens.extend(imm_token)
 
