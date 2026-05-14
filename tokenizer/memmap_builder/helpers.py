@@ -80,8 +80,54 @@ def process_function_binary_data(
 
 
 def get_called_functions_from_row(row: dict) -> List[str]:
-    """Extract called function names from opaque_metadata field."""
-    opaque_metadata = row.get("opaque_metadata", "")
+    """Extract called function names from the per-function metadata column.
+
+    Schema dispatch is driven by which column key the row carries — that
+    key is the one the writer chose based on ``vocab_manager.format_version``
+    (see ``tokenizer/main_loop.py``: ``metadata`` for v2, ``opaque_metadata``
+    for v1) and the column-mapping step in ``lockstep_function_match``
+    propagates the original column name into the row dict verbatim, so the
+    presence of one key vs the other unambiguously identifies the wire
+    format without any caller-side plumbing.
+
+    v2 (``metadata`` key): the column is a JSON object with the shape
+    documented in ``main_loop._build_v2_metadata_json`` — categories
+    ``local_funcs``, ``plt_funcs``, ``ext_funcs`` each hold a list of
+    ``{"name": ..., ...}`` entries; the per-function callee set is the
+    union of names across all three (callees regardless of binding kind
+    are call targets for inlining-lookup purposes in v2).
+
+    v1 (``opaque_metadata`` key): the column is the Python ``repr`` of a
+    list of tuples; only entries whose 4th field equals ``"local_function"``
+    are callees. Preserved verbatim from the pre-v2 implementation.
+    """
+    if "metadata" in row:
+        return _called_from_v2_metadata(row["metadata"])
+    return _called_from_v1_opaque_metadata(row.get("opaque_metadata", ""))
+
+
+def _called_from_v2_metadata(metadata_cell: str) -> List[str]:
+    if not metadata_cell:
+        return []
+    try:
+        import json
+
+        meta = json.loads(metadata_cell)
+    except Exception:
+        return []
+    if not isinstance(meta, dict):
+        return []
+    called = set()
+    for category_key in ("local_funcs", "plt_funcs", "ext_funcs"):
+        for entry in meta.get(category_key, ()) or ():
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str):
+                    called.add(name)
+    return sorted(called)
+
+
+def _called_from_v1_opaque_metadata(opaque_metadata: str) -> List[str]:
     try:
         import ast
 
