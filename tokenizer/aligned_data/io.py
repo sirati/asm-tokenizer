@@ -15,6 +15,14 @@ from .csv_format import format_compiler_sets, format_inlining_dict
 
 
 def decode_and_translate_tokens(row, mapping=None):
+    # `mapping` is the per-binary local-ID → unified-ID lookup written by
+    # `vocab_unifier`. Under format_version=2 the unifier identity-maps IDs
+    # 0..255 (the protocol-reserved digit slots), so inline-digit
+    # continuations survive `mapping[tokens]` byte-for-byte: digit 0x42
+    # in the per-binary stream stays digit 0x42 in the unified stream.
+    # No v2-specific branch needed here — the fancy-indexing semantics
+    # do the right thing as long as the unifier emits identity for that
+    # range (see `tokenizer/vocab_unifier/unifier.py`).
     tokens = base64_to_ndarray_vec(row["tokens_base64"])
     if mapping is not None:
         tokens = mapping[tokens]

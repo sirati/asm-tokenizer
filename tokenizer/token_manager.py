@@ -469,7 +469,14 @@ class VocabularyManager:
         lit_ends = set(self.lit_ends.tolist())
         lits = lit_starts.union(lit_ends)
         self.Valued_Const._token_ids = np.array([], dtype=np.int_)
-        for i in range(self.size):
+        # Under format_version=2 the first `_V2_RESERVED_DIGIT_COUNT` IDs are
+        # protocol-reserved digit slots (carrying TokenType.UNRESOLVED). They
+        # are not real vocab entries — no registration, no string, no
+        # representative token. Skip them so the dispatch table never sees
+        # the placeholder UNRESOLVED type.
+        v2 = self.format_version == 2
+        start_id = self._V2_RESERVED_DIGIT_COUNT if v2 else 0
+        for i in range(start_id, self.size):
             if i in lits:
                 continue
 
@@ -479,6 +486,12 @@ class VocabularyManager:
                 continue
             elif token_type == TokenType.VALUED_CONST:
                 valued_const_ids.append(i)
+
+            if v2:
+                v2_token = self._make_v2_representative(token_type)
+                if v2_token is not None:
+                    yield v2_token
+                    continue
 
             yield self._reconstruct_token_from_ids(token_type, [i])
 
@@ -507,6 +520,62 @@ class VocabularyManager:
         if has_blocks:
             bs, be = lits[TokenType.BLOCK]
             yield self._reconstruct_token_from_ids(TokenType.BLOCK, [bs] + identifier_token_blocks + [be])
+
+    # v2 category tokens cannot be reconstructed from a single type-id via
+    # `_reconstruct_token_from_ids` because their `_from_token_ids` asserts
+    # the full wire shape (`>= 2` ids for identity/valued_const_v2, exact
+    # `1` or `1 + width_bytes` for floats). For the unifier's representative
+    # iteration we only need ONE instance per registered type so the
+    # remap-table builder can resolve `mappings[type_id] = unified_type_id`;
+    # the identity payload is irrelevant to that mapping.
+    #
+    # Construct a minimal-payload representative per category instead:
+    #   * identity tokens and valued_const_v2 → `cls(0)` (1 digit byte for 0)
+    #   * float tokens → `cls(None)` (postfix-annotation form: type id only)
+    #   * modifier tokens → `cls()` (no payload)
+    #
+    # Returns `None` for non-v2 token types so the caller falls back to the
+    # legacy `_reconstruct_token_from_ids` path (PLATFORM, BLOCK_DEF,
+    # MEMORY_OPERAND, etc. all still work as singletons under v2 too).
+    _V2_IDENTITY_TOKEN_TYPES = frozenset({
+        TokenType.LOCAL_FUNC,
+        TokenType.PLT_FUNC,
+        TokenType.EXT_FUNC,
+        TokenType.RO_DATA_PTR,
+        TokenType.RW_DATA_PTR,
+        TokenType.STRING_PTR,
+        TokenType.JUMP_TABLE,
+        TokenType.BLOCK_V2,
+    })
+    _V2_FLOAT_TOKEN_TYPES = frozenset({
+        TokenType.FLOAT16,
+        TokenType.BFLOAT16,
+        TokenType.FLOAT32,
+        TokenType.FLOAT64,
+        TokenType.FLOAT80,
+        TokenType.FLOAT128,
+    })
+    _V2_MODIFIER_TOKEN_TYPES = frozenset({
+        TokenType.THREAD_LOCAL,
+        TokenType.VTABLE,
+        TokenType.CODE_PTR_TABLE,
+    })
+
+    def _make_v2_representative(self, token_type: TokenType):
+        """Return a single representative Tokens instance for a v2 category,
+        or None if `token_type` is not a v2 category (caller falls back to
+        the legacy singleton dispatch)."""
+        token_cls = self.get_token_class_for_type(token_type)
+        if token_type in self._V2_IDENTITY_TOKEN_TYPES:
+            return token_cls(0)
+        if token_type == TokenType.VALUED_CONST_V2:
+            return token_cls(0)
+        if token_type in self._V2_FLOAT_TOKEN_TYPES:
+            # Postfix-annotation form: bits=None ⇒ wire = `[type_id]`.
+            return token_cls(None)
+        if token_type in self._V2_MODIFIER_TOKEN_TYPES:
+            return token_cls()
+        return None
 
     def _create_inner_classes(self):
         """Create inner classes that have access to this VocabularyManager instance"""
