@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import List, Type, TypeVar
+from typing import List, Optional, Type, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -21,6 +21,24 @@ class TokenType(IntEnum):
     TOKEN_SET: "TokenType"
     IDENTIFIER_LITERAL: "TokenType"
     LOCAL_FUNCTION: "TokenType"
+    LOCAL_FUNC: "TokenType"
+    PLT_FUNC: "TokenType"
+    EXT_FUNC: "TokenType"
+    RO_DATA_PTR: "TokenType"
+    RW_DATA_PTR: "TokenType"
+    STRING_PTR: "TokenType"
+    JUMP_TABLE: "TokenType"
+    VALUED_CONST_V2: "TokenType"
+    BLOCK_V2: "TokenType"
+    FLOAT16: "TokenType"
+    BFLOAT16: "TokenType"
+    FLOAT32: "TokenType"
+    FLOAT64: "TokenType"
+    FLOAT80: "TokenType"
+    FLOAT128: "TokenType"
+    THREAD_LOCAL: "TokenType"
+    VTABLE: "TokenType"
+    CODE_PTR_TABLE: "TokenType"
     UNRESOLVED: "TokenType"
 
 class MemoryOperandSymbol(Enum):
@@ -110,6 +128,153 @@ class LocalFunctionToken(IdentifierToken, ABC):
     def token_type(cls) -> TokenType: ...
     @abstractmethod
     def __init__(self, local_function_id: int) -> None: ...
+
+# v2 identity-carrying category tokens (see plan vivid-tinkering-wilkes.md)
+class LocalFuncToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, local_func_id: int) -> None: ...
+
+class PltFuncToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, plt_func_id: int) -> None: ...
+
+class ExtFuncToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, ext_func_id: int) -> None: ...
+
+class RoDataPtrToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, ro_data_ptr_id: int) -> None: ...
+
+class RwDataPtrToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, rw_data_ptr_id: int) -> None: ...
+
+class StringPtrToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, string_ptr_id: int) -> None: ...
+
+class JumpTableToken(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, jump_table_id: int) -> None: ...
+
+class BlockTokenV2(IdentifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, block_id: int) -> None: ...
+
+class ValuedConstTokenV2(ValuedConstToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, value: int) -> None: ...
+
+# v2 float tokens — dual-mode: inline-value when `bits` is set, postfix
+# annotation when `bits is None`. The reader distinguishes them by the
+# next-token-< 256 rule, not by the in-memory type.
+class FloatToken(Tokens, ABC):
+    width_bytes: int
+    bits: Optional[int]
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+class Float16Token(FloatToken, ABC):
+    width_bytes: int
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+class BFloat16Token(FloatToken, ABC):
+    width_bytes: int
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+class Float32Token(FloatToken, ABC):
+    width_bytes: int
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+class Float64Token(FloatToken, ABC):
+    width_bytes: int
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+class Float80Token(FloatToken, ABC):
+    width_bytes: int
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+class Float128Token(FloatToken, ABC):
+    width_bytes: int
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, bits: Optional[int] = ...) -> None: ...
+
+# v2 modifier tokens — no identity, no payload; precede a base category token.
+class ModifierToken(Tokens, ABC):
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+class ThreadLocalToken(ModifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+class VtableToken(ModifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+class CodePtrTableToken(ModifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self) -> None: ...
 
 class MemoryOperandToken(Tokens, ABC):
     symbol: MemoryOperandSymbol
