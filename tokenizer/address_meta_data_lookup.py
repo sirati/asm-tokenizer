@@ -1,7 +1,17 @@
 import logging
+import re
 
 import angr
+import cle
 from intervaltree import IntervalTree
+
+# ASCII printable run of length >=4 terminated by NUL byte.
+# Mirrors the heuristic in tokenizer/disasm/angr_provider.py:parse_data_sections;
+# v2's string sidecar is built there, but the metadata-lookup also needs
+# per-address `is_string` membership so the classifier can emit `string_ptr`
+# at precedence step 7 on the angr path. UTF-16 / Pascal / non-ASCII strings
+# are out of scope here per `tokenizer/disasm/angr_limitations.md`.
+_ASCII_STRING_RE = re.compile(rb"[\x20-\x7e]{4,}\x00")
 
 
 class AngrMetadataLookup:
@@ -44,14 +54,89 @@ class AngrMetadataLookup:
         name = section.name or ""
         if name in {".init", ".fini", ".plt"}:
             return "code"
-        elif name == ".bss":
+        elif name == ".bss" or name == ".tbss":
+            # TLS BSS keeps the bss base type; TLS-ness is signalled
+            # orthogonally via the `tls` meta flag (precedence step 10).
             return "bss"
+        elif name == ".tdata":
+            return "data"
         elif section.is_executable:
             return "code"
         elif section.is_writable:
             return "data"
         else:
             return "rodata"
+
+    def _section_is_tls(self, section) -> bool:
+        """ELF TLS sections (`.tdata`, `.tbss`) host thread-local storage.
+
+        The classifier (precedence step 10) prepends a `thread_local` modifier
+        before `rw_data_ptr` whenever this flag is set on the looked-up meta.
+        We detect TLS by section name; CLE does not expose SHF_TLS as a
+        per-section attribute on every backend.
+        """
+        return (section.name or "") in {".tdata", ".tbss"}
+
+    def _find_section_for_addr(self, addr):
+        """Return the main-object section containing `addr`, or None."""
+        for section in self.project.loader.main_object.sections:
+            if section.memsize == 0:
+                continue
+            if section.vaddr <= addr < section.vaddr + section.memsize:
+                return section
+        return None
+
+    def _build_symbol_meta(self, sym, sym_type):
+        """Build an exact-lookup meta dict for a non-function ELF symbol.
+
+        `sym_type` is the CLE `SymbolType` enum. Returns None for symbol
+        kinds the v2 classifier does not consume (sections, `TYPE_NONE`,
+        `TYPE_OTHER`) so we don't pollute exact_lookup with addresses
+        that should fall through to range-based section lookup instead.
+
+        TLS objects are tagged `tls=True`; the type-string is derived from
+        the section the symbol lives in (so a TLS object in `.tdata` gets
+        `type="data"` matching how the range lookup labels `.tdata`).
+        Regular `TYPE_OBJECT` symbols pick up their section's type
+        (`rodata` / `data` / `bss`) so the classifier sees the same shape
+        whether the address hit exact_lookup or range_lookup.
+        """
+        if sym_type in (
+            cle.SymbolType.TYPE_SECTION,
+            cle.SymbolType.TYPE_NONE,
+            cle.SymbolType.TYPE_OTHER,
+        ):
+            return None
+
+        section = self._find_section_for_addr(sym.rebased_addr)
+        if sym_type == cle.SymbolType.TYPE_TLS_OBJECT:
+            # TLS symbols' addresses are module-relative offsets, not virtual
+            # addresses in the main object's section layout. The section
+            # lookup may miss; default to `data` and let the classifier
+            # treat the `tls` flag as authoritative.
+            type_str = self._get_section_type(section) if section is not None else "data"
+            tls = True
+        elif sym_type == cle.SymbolType.TYPE_OBJECT:
+            type_str = self._get_section_type(section) if section is not None else "data"
+            tls = section is not None and self._section_is_tls(section)
+        else:
+            # Unknown/forward-compatible enum value: fall back to the section
+            # if any, otherwise mark as a bare data symbol.
+            type_str = self._get_section_type(section) if section is not None else "data"
+            tls = section is not None and self._section_is_tls(section)
+
+        meta: dict = {
+            "name": sym.name,
+            "type": type_str,
+            "binding": sym.binding,
+            "size": sym.size,
+            "source": "symbol",
+            "tls": tls,
+        }
+        if sym.size and sym.size > 0:
+            meta["start_addr"] = sym.rebased_addr
+            meta["end_addr"] = sym.rebased_addr + sym.size
+        return meta
 
     def _build_indices(self):
         loader = self.project.loader
@@ -72,6 +157,7 @@ class AngrMetadataLookup:
                     },
                     "size": section.memsize,
                     "source": "section",
+                    "tls": self._section_is_tls(section),
                 }
                 self.range_lookup[section.vaddr : section.vaddr + section.memsize] = meta
         except Exception as e:
@@ -80,25 +166,44 @@ class AngrMetadataLookup:
             raise LookupError
             pass
 
-        # -- Symbols (exact)
+        # -- Symbols (exact). Walk CLE's loader symbol table directly so we
+        # can read each symbol's ELF `st_type` (TYPE_OBJECT / TYPE_FUNCTION /
+        # TYPE_TLS_OBJECT) — the angr `kb.symbols` plugin does not expose
+        # this without going back through CLE anyway. TYPE_FUNCTION entries
+        # are left for the function-indexing pass below (it overwrites the
+        # exact_lookup slot with richer per-function metadata).
         try:
-            if self.project.kb.has_plugin("symbols"):
-                for sym in self.project.kb.symbols:
-                    if sym.rebased_addr is None:
-                        continue
-                    self.exact_lookup[sym.rebased_addr] = {
-                        "name": sym.name,
-                        "type": "symbol",
-                        "binding": sym.binding,
-                        "size": sym.size,
-                        "source": "symbol",
-                    }
+            for sym in main_obj.symbols:
+                if sym.rebased_addr is None:
+                    continue
+                sym_type = getattr(sym, "type", None)
+                if sym_type == cle.SymbolType.TYPE_FUNCTION:
+                    # Functions are reclassified below with library / plt
+                    # / extern-synthetic information; skip here so we don't
+                    # write a less-informative slot that the function pass
+                    # later has to overwrite.
+                    continue
+                meta = self._build_symbol_meta(sym, sym_type)
+                if meta is None:
+                    continue
+                self.exact_lookup[sym.rebased_addr] = meta
         except Exception as e:
             print(f"EXCEPTION: {e}")
             raise LookupError
             pass  # stripped binary fallback
 
-        # -- Functions (range) with local vs library classification
+        # -- Functions (range) with PLT / SimProcedure / extern / local split.
+        # The v2 precedence list (see tokenizer/disasm/precedence.md) routes
+        # each of these to a distinct token category:
+        #   - step 2: `plt_func`     ← PLT stub in any loaded object
+        #   - step 3: `local_func`   ← real entry in main object
+        #   - step 4: `block`        ← inside main-object function body
+        #     (range_lookup hit on a `local_function` meta, address != entry)
+        #   - step 5: `ext_func` synthetic=false ← real entry in another
+        #     loaded object (resolved import target)
+        #   - step 6: `ext_func` synthetic=true  ← CLE SimProcedure stub
+        # The is_plt / is_extern_synthetic booleans on the meta dict let the
+        # classifier route without re-reading angr internals.
         try:
             for func in self.cfg.kb.functions.values():
                 # Always include, but infer a minimal size if unknown
@@ -106,15 +211,37 @@ class AngrMetadataLookup:
 
                 library = self._find_library_for_addr(func.addr)
 
-                if func.binary == main_obj:
+                is_plt = bool(func.is_plt)
+                is_simprocedure = bool(func.is_simprocedure)
+
+                # PLT stub: dispatch through the procedure linkage table. A
+                # SimProcedure that also happens to be flagged is_plt is the
+                # CLE-installed import resolver for the PLT slot; we keep it
+                # under `plt_func` because the address still lives in `.plt`
+                # of a real loaded object.
+                if is_plt:
+                    func_type = "plt_function"
+                    source = "plt"
+                    is_extern_synthetic = False
+                elif is_simprocedure:
+                    # SimProcedure outside `.plt`: a CLE synthetic extern-
+                    # object slot for an unresolved or stub import.
+                    func_type = "extern_function"
+                    source = "extern"
+                    is_extern_synthetic = True
+                elif func.binary == main_obj:
                     func_type = "local_function"
                     source = "function"
-                elif func.is_simprocedure or func.is_plt:
-                    func_type = "library_function"
-                    source = "library"
+                    is_extern_synthetic = False
+                elif func.binary is not None:
+                    # Real function entry in another loaded object.
+                    func_type = "extern_function"
+                    source = "extern"
+                    is_extern_synthetic = False
                 else:
                     func_type = "unknown_function"
                     source = "function"
+                    is_extern_synthetic = False
 
                 # Fallback to synthetic name if name is empty or autogenerated
                 func_name = func.name
@@ -134,6 +261,8 @@ class AngrMetadataLookup:
                     end_addr=func.addr + size,
                     source=source,
                     library=library,
+                    is_plt=is_plt,
+                    is_extern_synthetic=is_extern_synthetic,
                 )
 
                 self.exact_lookup[func.addr] = meta
@@ -147,12 +276,93 @@ class AngrMetadataLookup:
                 if seg.memsize > seg.filesize:  # bss usually has memsize > filesize
                     bss_vaddr = seg.vaddr + seg.filesize
                     bss_size = seg.memsize - seg.filesize
-                    meta = {"name": ".bss", "type": "bss", "size": bss_size, "source": "segment-inferred"}
+                    meta = {
+                        "name": ".bss",
+                        "type": "bss",
+                        "size": bss_size,
+                        "source": "segment-inferred",
+                        "tls": False,
+                    }
                     self.range_lookup[bss_vaddr : bss_vaddr + bss_size] = meta
         except Exception as e:
             print(e)
             raise LookupError
             pass
+
+        # -- ASCII string heuristic over read-only data. The classifier reads
+        # `is_string` / `string_encoding` / `string_bytes` from the meta dict
+        # at precedence step 7 (`string_ptr`). Encoding is always "ascii"
+        # here — UTF-16 and other encodings are Ghidra-only (see
+        # tokenizer/disasm/angr_limitations.md). False positives on
+        # ASCII-byte runs inside non-string rodata are expected.
+        self._string_tree: IntervalTree = IntervalTree()
+        try:
+            for section in main_obj.sections:
+                if section.name != ".rodata":
+                    continue
+                if not section.is_readable or section.memsize == 0:
+                    continue
+                data = self.project.loader.memory.load(section.vaddr, section.memsize)
+                for match in _ASCII_STRING_RE.finditer(data):
+                    start = section.vaddr + match.start()
+                    # Match length includes the trailing NUL; keep the NUL
+                    # in `string_bytes` so byte-offset arithmetic by callers
+                    # matches the on-disk layout (start_offset semantics in
+                    # the v2 string sidecar).
+                    raw = match.group()
+                    self._string_tree[start : start + len(raw)] = raw
+        except Exception as e:
+            # Stripped or unusual binaries: skip string detection rather
+            # than fail the whole lookup build. Conservative default
+            # `is_string=False` will fire.
+            print(f"EXCEPTION during string indexing: {e}")
+
+    def _finalize_meta(self, meta: dict, addr: int) -> dict:
+        """Apply enriched-field defaults the v2 classifier expects.
+
+        Single shape regardless of source path (`exact`, `range`,
+        `synthetic`). Uses setdefault so per-entry values populated at
+        build time (e.g., `tls=True` on a `.tdata` section, `is_plt=True`
+        on a PLT function) are preserved. Conservative defaults match
+        what `tokenizer/disasm/angr_limitations.md` documents as
+        angr-unavailable signals — Ghidra fills these authoritatively
+        on its side; here they always come back False / None so the
+        downstream classifier (`constant_handler.py`) sees a uniform
+        dict shape.
+
+        String membership is the one query-time enrichment: the
+        `_string_tree` is consulted on every `lookup()` call so a
+        ptr that lands inside a recognized ASCII run picks up
+        `is_string=True` plus the captured bytes, regardless of
+        whether the same address also hit a section/symbol/function
+        index.
+        """
+        meta.setdefault("is_plt", False)
+        meta.setdefault("is_extern_synthetic", False)
+        meta.setdefault("tls", False)
+        # Conservative defaults for signals angr cannot produce reliably
+        # (see angr_limitations.md sections 2, 3 and the code-pointer
+        # table discussion in precedence.md step 8). Ghidra populates
+        # these authoritatively on its side; here they stay False so
+        # the classifier demotes to a lower precedence step.
+        meta.setdefault("is_vtable", False)
+        meta.setdefault("is_jump_table_slot", False)
+        meta.setdefault("is_code_ptr_table_slot", False)
+
+        # String membership: query-time, since the same address can land
+        # in a section-meta and inside an ASCII run simultaneously.
+        string_hit = self._string_tree[addr]
+        if string_hit:
+            iv = min(string_hit, key=lambda iv: iv.end - iv.begin)
+            meta["is_string"] = True
+            meta["string_encoding"] = "ascii"
+            meta["string_bytes"] = iv.data
+        else:
+            meta.setdefault("is_string", False)
+            meta.setdefault("string_encoding", None)
+            meta.setdefault("string_bytes", None)
+
+        return meta
 
     def lookup(self, addr) -> tuple[dict, str]:
         """
@@ -189,13 +399,15 @@ class AngrMetadataLookup:
             if match is not None and match.data != exact:
                 logger.fatal(f"Exact lookup mismatch for {addr:x}")
 
-            return exact, "exact"
+            # Copy before finalizing so query-time enrichment (string
+            # membership) doesn't mutate the stored index entry.
+            return self._finalize_meta(exact.copy(), addr), "exact"
 
         if match:
             meta = match.data.copy()
             meta["start_addr"] = match.begin
             meta["end_addr"] = match.end
-            return meta, "range"
+            return self._finalize_meta(meta, addr), "range"
 
         # Fallback to synthetic metadata to guarantee no empty result
         fallback_meta = {
@@ -207,7 +419,7 @@ class AngrMetadataLookup:
             "source": "synthetic",
             "library": self._find_library_for_addr(addr),
         }
-        return fallback_meta, "synthetic"
+        return self._finalize_meta(fallback_meta, addr), "synthetic"
 
 
 # Backward-compat alias
