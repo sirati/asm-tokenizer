@@ -93,6 +93,53 @@ class BinaryDataset:
             return None
         return self._versions[version_idx]
 
+    def _open_sections_csv(self, path: Path) -> Tuple[object, int]:
+        """Open a ``_sections.csv`` file, transparently consuming a
+        ``version=N`` wire-format prelude if one is present.
+
+        Background: the v2 wire format prepends a single-cell
+        ``version=2`` row before the header. The per-section byte-offset
+        index (``*_index.bin``) is written by the memmap-builder pipeline
+        in lockstep with the CSV; today that writer (``passes.py``) does
+        not emit a prelude into ``_sections.csv`` and the loader's seek
+        offsets land correctly without intervention.
+
+        This helper future-proofs the loader against a v2 ``_sections.csv``
+        whose index file was inherited from a v1 layout — i.e. offsets
+        are relative to the *content* (post-prelude) start while the CSV
+        on disk now begins with a prelude row. The peek consumes that
+        prelude and reports its byte width as a *content offset* that
+        seek-based callers add to stored offsets. Iteration-based callers
+        simply continue reading from the returned handle's current
+        position (which is already past the prelude).
+
+        Contract for writers: if the memmap-builder is ever updated to
+        emit a v2 prelude into ``_sections.csv``, it MUST keep stored
+        offsets relative to the post-prelude content start (i.e. compute
+        ``section_start = sections_file.tell()`` BEFORE the first
+        function row but AFTER the prelude row). Mixing a
+        prelude-stamped CSV with a post-prelude-tell()-based index would
+        double-bias every seek. The two valid configurations are:
+          1. v1 CSV (no prelude) + v1 index (no bias). Current state.
+          2. v2 CSV (with prelude) + v1-content-relative index (prelude
+             skipped here, then content offsets applied verbatim).
+
+        Returns:
+            (file_handle, content_offset_bytes). ``content_offset_bytes``
+            is ``0`` for v1 (no prelude) and the prelude row's byte
+            width for v2.
+        """
+        f = open(path, "r", newline="", encoding="ascii")
+        start_pos = f.tell()
+        first_line = f.readline()
+        if first_line.startswith("version="):
+            # Prelude consumed; file pointer now at the header line.
+            # Byte width = current tell() since start_pos was 0.
+            return f, f.tell() - start_pos
+        # No prelude: rewind so callers see a virgin file.
+        f.seek(start_pos)
+        return f, 0
+
     def _load_index_once(
         self, index_path: Path
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -215,13 +262,16 @@ class BinaryDataset:
 
                 # Build function name index from sections file, following index file order
                 self.matched_func_names = []
-                with open(self.matched_sections, "r", newline="", encoding="ascii") as f:
+                f, content_offset = self._open_sections_csv(self.matched_sections)
+                try:
                     for i in range(len(self.matched_starts)):
-                        f.seek(self.matched_starts[i])
+                        f.seek(int(self.matched_starts[i]) + content_offset)
                         first_line = f.readline()
                         row = list(csv.reader([first_line]))[0]
                         if row and len(row) >= 1:
                             self.matched_func_names.append(row[0])
+                finally:
+                    f.close()
             else:
                 self.matched_count = 0
                 self.matched_starts = np.array([], dtype=np.uint32)
@@ -256,13 +306,16 @@ class BinaryDataset:
                 # Build function names from unmatched sections file
                 self.unmatched_func_names = []
                 if self.unmatched_sections.exists():
-                    with open(self.unmatched_sections, "r", newline="", encoding="ascii") as f:
+                    f, _content_offset = self._open_sections_csv(self.unmatched_sections)
+                    try:
                         reader = csv.reader(f)
                         for row in reader:
                             if (
                                 row and len(row) == 6
                             ):  # Unmatched format: func_name, compiler_sets, called_funcs, inlining_data, offset, len
                                 self.unmatched_func_names.append(row[0])
+                    finally:
+                        f.close()
                 else:
                     self.unmatched_func_names = []
             else:
@@ -412,9 +465,12 @@ class BinaryDataset:
         length = int(self.matched_lengths[idx])
 
         # Read section from CSV
-        with open(self.matched_sections, "r", newline="", encoding="ascii") as f:
-            f.seek(start)
+        f, content_offset = self._open_sections_csv(self.matched_sections)
+        try:
+            f.seek(start + content_offset)
             section_data = f.read(length)
+        finally:
+            f.close()
 
         lines = section_data.strip().split("\n")
 
@@ -473,7 +529,8 @@ class BinaryDataset:
         if self.unmatched_sections.exists() and idx < len(self.unmatched_func_names):
             func_name = self.unmatched_func_names[idx]
             # Parse sections file for this function
-            with open(self.unmatched_sections, "r", newline="", encoding="ascii") as f:
+            f, _content_offset = self._open_sections_csv(self.unmatched_sections)
+            try:
                 reader = csv.reader(f)
                 for i, row in enumerate(reader):
                     if i == idx and row and len(row) == 6:
@@ -492,6 +549,8 @@ class BinaryDataset:
 
                         inlining_data = parse_inlining_data(inlining_str)
                         break
+            finally:
+                f.close()
 
         metadata = {
             "arch": "unknown",
