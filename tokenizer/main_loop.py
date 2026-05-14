@@ -124,6 +124,7 @@ def main_loop(
                         resolver=resolver,
                         vocab_manager=vocab_manager,
                         arch_provider=arch_provider,
+                        disasm_provider=provider,
                     )
                 except Exception as e:
                     logger.warning(f"Error processing {func_name}: {e}. Skipping function.")
