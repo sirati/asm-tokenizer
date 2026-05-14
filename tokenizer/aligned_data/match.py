@@ -25,11 +25,24 @@ def is_vocab_row(row: List[str]) -> bool:
     return row[0] == "vocabulary" and (not row[1] or not row[1][0].isdigit())
 
 
+def is_version_prelude_row(row: List[str]) -> bool:
+    # v2 prelude: a single-cell row whose only field starts with "version=".
+    # Written by tokenizer/main_loop.py before the header. v1 files lack
+    # this row entirely (their first row is the header itself).
+    return len(row) == 1 and row[0].startswith("version=")
+
+
 def open_csv_skip_vocab(path: str):
     wrapper = PositionTrackingWrapper(path)
     reader = csv.reader(wrapper.file)
-    # Skip header
-    header = next(reader)
+    # Read first row. If it's a v2 version prelude, consume it and read
+    # the next row as the header. v1 files have no prelude, so the first
+    # row is already the header.
+    first = next(reader)
+    if is_version_prelude_row(first):
+        header = next(reader)
+    else:
+        header = first
 
     # Create an iterator that filters out all vocab rows
     def row_iterator():
