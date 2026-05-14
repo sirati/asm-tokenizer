@@ -64,9 +64,41 @@ class FunctionTokenList:
 
         # Token-level arrays (level 0)
         result.token_ids = tokens.astype(np.int16)
-        metatoken_idx_run_length, metatoken_first_idx = run_length_and_last_type(
-            tokens, vocab_manager.lit_starts, vocab_manager.lit_ends
-        )
+
+        # Derive metatoken run lengths + the first-token id of each
+        # metatoken. The rule depends on the wire-format version held by
+        # the VocabularyManager:
+        #
+        # * v1 (legacy): metatoken framing uses paired `Lit_Start`/`Lit_End`
+        #   sentinels. `run_length_and_last_type` walks the stream, treats
+        #   each balanced segment as a single multi-id metatoken, and emits
+        #   length-1 metatokens for everything outside such a segment.
+        # * v2: ids 0..255 are reserved digit slots that always continue
+        #   the previous metatoken; ids >= 256 are real vocab tokens and
+        #   each one starts a new metatoken. The boundary mask is therefore
+        #   `tokens >= 256`, and run-lengths fall out of the gaps between
+        #   consecutive boundary positions.
+        #
+        # Both branches produce the same downstream shape: a per-metatoken
+        # run-length array (used to build `metatoken_start_lookup` as a
+        # cumulative *end* index, matching every reader site in
+        # token_lists.py / function_token_list.py) and a per-metatoken
+        # representative-id array used to look up TokenTypes.
+        v2 = vocab_manager is not None and getattr(vocab_manager, "format_version", 1) == 2
+        if v2:
+            boundary_positions = np.flatnonzero(tokens >= 256).astype(np.int32)
+            num_metatokens = boundary_positions.size
+            # Run lengths = gaps between successive boundary positions,
+            # with the final gap running to the end of the stream.
+            metatoken_idx_run_length = np.empty(num_metatokens, dtype=np.uint8)
+            if num_metatokens > 0:
+                metatoken_idx_run_length[:-1] = (boundary_positions[1:] - boundary_positions[:-1]).astype(np.uint8)
+                metatoken_idx_run_length[-1] = np.uint8(len(tokens) - int(boundary_positions[-1]))
+            metatoken_first_idx = tokens[boundary_positions]
+        else:
+            metatoken_idx_run_length, metatoken_first_idx = run_length_and_last_type(
+                tokens, vocab_manager.lit_starts, vocab_manager.lit_ends
+            )
         result.metatoken_start_lookup = metatoken_idx_run_length.cumsum(dtype=np.int32)
         if vocab_manager is None:
             result.metatoken_type_ids = np.full_like(
