@@ -107,8 +107,21 @@ def apply_opaque_mapping_raw_optimized(
         # Add the updated block to the function
         updated_function.add_block(updated_block, block_addr)
 
-    # If constant_handler is provided, also reorder metadata
-    if constant_handler is not None and opaque_mapping:
+    # If constant_handler is provided, also reorder metadata.
+    # v1-only: the frequency-sort remapping concept does not apply under
+    # ``format_version == 2`` (per-category identities are monotonic and
+    # final at emission time). v2 callers never reach this path because
+    # main_loop skips ``create_opaque_mapping`` for v2 (the v2 stub
+    # raises NotImplementedError, so a non-empty ``opaque_mapping`` here
+    # implies the caller is on the v1 path). The format-version gate is
+    # belt-and-suspenders: if a stray v2 caller ever passes a non-empty
+    # mapping (which would itself be a bug), we short-circuit rather
+    # than tripping the NotImplementedError stub.
+    if (
+        constant_handler is not None
+        and opaque_mapping
+        and getattr(vocab_manager, "format_version", 1) == 1
+    ):
         constant_handler.reorder_metadata_for_mapping(opaque_mapping)
 
     return updated_function

@@ -440,12 +440,18 @@ class ConstantHandler:
         register the bytes and rewrite the placeholders to real line
         numbers.
         """
+        # ``_start_addr`` is the string's base address from the lookup
+        # metadata (NOT ``value`` itself — ``value`` may be a substring
+        # access pointing N bytes into the string). The CSV writer in
+        # Phase 2.A.1 computes ``start_offset = value - _start_addr``
+        # before stripping the underscore-prefixed internal keys.
         emitter_meta = {
             "line": -1,
             "start_offset": -1,
             "encoding": meta.get("string_encoding"),
             "_string_bytes": meta.get("string_bytes"),
             "_string_encoding": meta.get("string_encoding"),
+            "_start_addr": meta.get("start_addr"),
             "addr": hex(value),
         }
         ident = self.resolver.get_identity(Category.STRING_PTR, value, emitter_meta)
