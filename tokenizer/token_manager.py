@@ -1,6 +1,6 @@
 import typing
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -8,26 +8,89 @@ import numpy.typing as npt
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.token_utils import TokenUtils
 from tokenizer.tokens import (
+    BFloat16Token,
     BlockDefToken,
     BlockToken,
+    BlockTokenV2,
+    CodePtrTableToken,
+    ExtFuncToken,
+    Float16Token,
+    Float32Token,
+    Float64Token,
+    Float80Token,
+    Float128Token,
+    FloatToken,
     IdentifierToken,
+    JumpTableToken,
     LitTokenType,
+    LocalFuncToken,
     LocalFunctionToken,
     MemoryOperandSymbol,
     MemoryOperandToken,
+    ModifierToken,
     OpaqueConstToken,
     PlatformToken,
+    PltFuncToken,
+    RoDataPtrToken,
+    RwDataPtrToken,
+    StringPtrToken,
+    ThreadLocalToken,
     Tokens,
     TokenType,
     ValuedConstToken,
+    ValuedConstTokenV2,
+    VtableToken,
 )
+
+
+# v2 inline-digit byte-packing helpers. These are the local fallback for
+# the Phase 1.A.3 `TokenUtils.int_to_minimum_bytes` /
+# `TokenUtils.decode_v2_inline_digits` helpers. Both 1.A.2 (this task)
+# and 1.A.3 land independently on parallel branches and merge into the
+# v2 base; once 1.A.3 is in, the orchestrator can switch the Inner
+# classes below to call `TokenUtils.*` directly and drop these locals.
+# Behavior contract:
+#   _v2_int_to_minimum_bytes(0)   -> b'\x00'         (1 byte; never 0-byte)
+#   _v2_int_to_minimum_bytes(255) -> b'\xff'
+#   _v2_int_to_minimum_bytes(256) -> b'\x01\x00'
+# Negative values are rejected at the caller; this helper is unsigned.
+def _v2_int_to_minimum_bytes(value: int) -> bytes:
+    """Encode a non-negative integer as minimum-width big-endian bytes (>=1 byte)."""
+    if value < 0:
+        raise ValueError(f"_v2_int_to_minimum_bytes is unsigned-only, got {value}")
+    if value == 0:
+        return b"\x00"
+    width = (value.bit_length() + 7) // 8
+    return value.to_bytes(width, "big")
+
+
+def _v2_bytes_to_int(byte_ids: typing.Iterable[int]) -> int:
+    """Decode a big-endian byte sequence (each int in 0..255) to an int."""
+    result = 0
+    for b in byte_ids:
+        if not (0 <= b < 256):
+            raise ValueError(f"v2 digit byte out of range: {b}")
+        result = (result << 8) | b
+    return result
 
 
 class VocabularyManager:
     """Manages vocabulary for token-to-ID mapping"""
 
-    def __init__(self, platform: typing.Optional[str], _init=True):
+    # IDs 0..255 are protocol-reserved digit slots under format_version=2.
+    # `_V2_RESERVED_DIGIT_COUNT` is the literal boundary — the first vocab
+    # entry registered on a v2 VM lands at id _V2_RESERVED_DIGIT_COUNT.
+    _V2_RESERVED_DIGIT_COUNT = 256
+
+    def __init__(self, platform: typing.Optional[str], _init=True, format_version: int = 1):
         self.platform = platform
+        # Wire-format version: 1 = legacy (Block_<HEX>, Lit_Start framing);
+        # 2 = inline-digit category-token stream (see plan
+        # vivid-tinkering-wilkes.md). Under v2, `_private_add_token` skips
+        # IDs 0..255 so they remain free for digit continuations in the
+        # token stream. Saver (Phase 4.1) reads this attribute to emit the
+        # `format_version=2` prelude in vocab.csv.
+        self.format_version = format_version
         if platform is None:
             self.platform_list: list[str] = []
             self.platform_reverse: dict[str, int] = {}
@@ -52,6 +115,18 @@ class VocabularyManager:
                 256, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8
             )
 
+            # Under v2, pre-populate ids 0..255 with debug-friendly
+            # `digit_<HH>` placeholders and mark their token_type as
+            # UNRESOLVED so the array stays self-consistent. The
+            # `token_to_id` dict deliberately stays empty for these
+            # positions — they are addressed by their literal numeric
+            # value in the token stream, not by name.
+            if format_version == 2:
+                self.id_to_token.extend(
+                    f"digit_{i:02X}" for i in range(self._V2_RESERVED_DIGIT_COUNT)
+                )
+                self._id_to_token_type[: self._V2_RESERVED_DIGIT_COUNT] = TokenType.UNRESOLVED
+
         # Create unique inner classes for this instance
         self._create_inner_classes()
 
@@ -65,9 +140,19 @@ class VocabularyManager:
         lit_end_cache: npt.NDArray[np.int_] = None,
         platform_list: list[str] = None,
         token_to_platform: npt.NDArray[np.int8] = None,
+        format_version: int = 1,
     ) -> "VocabularyManager":
-        """Creates vocab from tokenizer output."""
-        v_man = VocabularyManager(platform)
+        """Creates vocab from tokenizer output.
+
+        `format_version=2` callers are responsible for passing a `vocab_list`
+        and `id_to_token_type` whose first 256 entries are the reserved
+        digit slots (the loader in Phase 4.1 reconstitutes those from the
+        protocol convention since vocab.csv writes no entries for them).
+        """
+        v_man = VocabularyManager(platform, format_version=format_version)
+        # Reassigning id_to_token wholesale replaces the constructor's
+        # placeholder population (intentional — the caller has the
+        # authoritative list).
         v_man.id_to_token = vocab_list
         v_man.last_id = len(vocab_list)
         platform_token = f"{platform}_"
@@ -151,6 +236,18 @@ class VocabularyManager:
         assert (not (token.startswith("Block") or token.startswith("OPAQUE_CONST"))) or (
             token[-2] == "_" or "Lit" in token or token == "Block_Def"
         ), f"Warning: two digit token thats shouldnt: {token}"
+
+        # Under v2 the constructor pre-populates `id_to_token[0..255]` with
+        # `digit_<HH>` placeholders so `self.size` is already >= 256 here —
+        # the ID-skip is automatic, no manual bump needed. Guard against
+        # callers accidentally registering a token literally named
+        # `digit_XX` which would shadow a digit slot.
+        assert not (
+            self.format_version == 2
+            and len(token) == 8
+            and token.startswith("digit_")
+            and all(c in "0123456789ABCDEFabcdef" for c in token[6:])
+        ), f"Cannot register token with reserved digit-slot name: {token}"
 
         # Add new token
         token_id = self.size
@@ -318,6 +415,45 @@ class VocabularyManager:
             return self.MemoryOperand
         elif token_type == TokenType.TOKEN_SET:
             return self.TokenSet
+        # v2 category tokens (plan vivid-tinkering-wilkes.md). Dispatch
+        # table parallels the registration table at the bottom of
+        # `_create_inner_classes`.
+        elif token_type == TokenType.LOCAL_FUNC:
+            return self.Local_Func
+        elif token_type == TokenType.PLT_FUNC:
+            return self.Plt_Func
+        elif token_type == TokenType.EXT_FUNC:
+            return self.Ext_Func
+        elif token_type == TokenType.RO_DATA_PTR:
+            return self.Ro_Data_Ptr
+        elif token_type == TokenType.RW_DATA_PTR:
+            return self.Rw_Data_Ptr
+        elif token_type == TokenType.STRING_PTR:
+            return self.String_Ptr
+        elif token_type == TokenType.JUMP_TABLE:
+            return self.Jump_Table
+        elif token_type == TokenType.BLOCK_V2:
+            return self.Block_V2
+        elif token_type == TokenType.VALUED_CONST_V2:
+            return self.Valued_Const_V2
+        elif token_type == TokenType.FLOAT16:
+            return self.Float16
+        elif token_type == TokenType.BFLOAT16:
+            return self.BFloat16
+        elif token_type == TokenType.FLOAT32:
+            return self.Float32
+        elif token_type == TokenType.FLOAT64:
+            return self.Float64
+        elif token_type == TokenType.FLOAT80:
+            return self.Float80
+        elif token_type == TokenType.FLOAT128:
+            return self.Float128
+        elif token_type == TokenType.THREAD_LOCAL:
+            return self.Thread_Local
+        elif token_type == TokenType.VTABLE:
+            return self.Vtable
+        elif token_type == TokenType.CODE_PTR_TABLE:
+            return self.Code_Ptr_Table
         else:
             raise ValueError(f"Unknown token type: {token_type}")
 
@@ -739,6 +875,486 @@ class VocabularyManager:
         assert issubclass(LocalFunctionInner, IdentifierToken)
         assert issubclass(LocalFunctionInner, LocalFunctionToken)
 
+        # ------------------------------------------------------------------
+        # v2 inline-digit Inner classes (plan vivid-tinkering-wilkes.md).
+        #
+        # Design boundary: every v2 Inner class lives in this nest, owns
+        # exactly one vocab entry (registered on first instance), and emits
+        # `[type_token_id, *digit_bytes]` where digit bytes are raw uint8
+        # values that double as vocab ids 0..255 (reserved at construction
+        # in `__init__`). The encoding shape is identical across categories
+        # — the only per-category data is the basename, so the encoding
+        # logic lives ONCE on the abstract `_V2IdentityInner` /
+        # `_V2FloatInner` / `_V2ModifierInner` mixins below; concrete
+        # subclasses are 3-line glue (basename + ABC binding + `to_asm_like`).
+        #
+        # Decoding mirrors the same one-place rule: each mixin's
+        # `_from_token_ids` strips the type-id and reassembles the payload.
+        #
+        # All v2 Inner classes assert `vocab_manager.format_version == 2`
+        # on instantiation to enforce the reserved-id-protocol invariant —
+        # a v1 VM has no reserved digit slots, so a v2 token would silently
+        # collide with low-id legacy entries.
+        # ------------------------------------------------------------------
+
+        class _V2IdentityInner(TokensInner, IdentifierToken, ABC):
+            """Mixin for v2 identity-carrying category tokens.
+
+            Concrete subclasses bind a v2 ABC (`LocalFuncToken`, `PltFuncToken`,
+            ...) and supply `_get_basename`. The vocab basename strings are
+            the literal lowercase names from the plan (e.g., `local_func`,
+            `block_v2`) — distinct from v1 names so v1 and v2 entries can
+            coexist in a unified vocab when the unifier merges per-binary
+            outputs in a mixed-version corpus.
+            """
+
+            __slots__ = ("id", "_token_ids", "_type_token_id")
+
+            def __init__(self, identifier_id: int):
+                # IdentifierToken's __init__ stores `id`; replicate that
+                # contract without delegating to legacy `IdentifierInner`'s
+                # encode_tokens path.
+                assert vocab_manager.format_version == 2, (
+                    "v2 Inner classes require format_version=2 VocabularyManager; "
+                    f"got format_version={vocab_manager.format_version}"
+                )
+                assert identifier_id >= 0, f"v2 identity must be non-negative, got {identifier_id}"
+                self.id = identifier_id
+
+                basename = self._get_basename()
+                self._type_token_id = vocab_manager._private_add_token(basename, self.__class__)
+                payload = _v2_int_to_minimum_bytes(identifier_id)
+                self._token_ids = [self._type_token_id, *payload]
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "_V2IdentityInner":
+                """Reconstruct a v2 identity token from its `[type_id, *digits]` slice."""
+                if len(token_ids) < 2:
+                    raise ValueError(
+                        f"v2 identity token must have >=2 ids (type + >=1 digit), got {token_ids}"
+                    )
+                identifier_id = _v2_bytes_to_int(token_ids[1:])
+                return cls(identifier_id)
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array(self._token_ids, dtype=np.int_)
+
+            def to_string(self) -> str:
+                # Debug string mirrors the wire format: basename followed
+                # by hex digits of each payload byte.
+                basename = self._get_basename()
+                digits = " ".join(f"digit_{b:02X}" for b in self._token_ids[1:])
+                return f"{basename} {digits}" if digits else basename
+
+        # Concrete v2 identity Inner classes — one per category. Each is a
+        # thin glue that picks a basename + binds its v2 ABC + renders
+        # `to_asm_like`. The encoding/decoding logic lives in
+        # `_V2IdentityInner` (single-concern rule).
+
+        class LocalFuncInner(_V2IdentityInner, LocalFuncToken):
+            __slots__ = ()
+
+            def __init__(self, local_func_id: int):
+                super().__init__(local_func_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "local_func"
+
+            def to_asm_like(self) -> str:
+                return f"local_func:{self.id}"
+
+        assert issubclass(LocalFuncInner, IdentifierToken)
+        assert issubclass(LocalFuncInner, LocalFuncToken)
+
+        class PltFuncInner(_V2IdentityInner, PltFuncToken):
+            __slots__ = ()
+
+            def __init__(self, plt_func_id: int):
+                super().__init__(plt_func_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "plt_func"
+
+            def to_asm_like(self) -> str:
+                return f"plt_func:{self.id}"
+
+        assert issubclass(PltFuncInner, IdentifierToken)
+        assert issubclass(PltFuncInner, PltFuncToken)
+
+        class ExtFuncInner(_V2IdentityInner, ExtFuncToken):
+            __slots__ = ()
+
+            def __init__(self, ext_func_id: int):
+                super().__init__(ext_func_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "ext_func"
+
+            def to_asm_like(self) -> str:
+                return f"ext_func:{self.id}"
+
+        assert issubclass(ExtFuncInner, IdentifierToken)
+        assert issubclass(ExtFuncInner, ExtFuncToken)
+
+        class RoDataPtrInner(_V2IdentityInner, RoDataPtrToken):
+            __slots__ = ()
+
+            def __init__(self, ro_data_ptr_id: int):
+                super().__init__(ro_data_ptr_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "ro_data_ptr"
+
+            def to_asm_like(self) -> str:
+                return f"ro_data_ptr:{self.id}"
+
+        assert issubclass(RoDataPtrInner, IdentifierToken)
+        assert issubclass(RoDataPtrInner, RoDataPtrToken)
+
+        class RwDataPtrInner(_V2IdentityInner, RwDataPtrToken):
+            __slots__ = ()
+
+            def __init__(self, rw_data_ptr_id: int):
+                super().__init__(rw_data_ptr_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "rw_data_ptr"
+
+            def to_asm_like(self) -> str:
+                return f"rw_data_ptr:{self.id}"
+
+        assert issubclass(RwDataPtrInner, IdentifierToken)
+        assert issubclass(RwDataPtrInner, RwDataPtrToken)
+
+        class StringPtrInner(_V2IdentityInner, StringPtrToken):
+            __slots__ = ()
+
+            def __init__(self, string_ptr_id: int):
+                super().__init__(string_ptr_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "string_ptr"
+
+            def to_asm_like(self) -> str:
+                return f"string_ptr:{self.id}"
+
+        assert issubclass(StringPtrInner, IdentifierToken)
+        assert issubclass(StringPtrInner, StringPtrToken)
+
+        class JumpTableInner(_V2IdentityInner, JumpTableToken):
+            __slots__ = ()
+
+            def __init__(self, jump_table_id: int):
+                super().__init__(jump_table_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "jump_table"
+
+            def to_asm_like(self) -> str:
+                return f"jump_table:{self.id}"
+
+        assert issubclass(JumpTableInner, IdentifierToken)
+        assert issubclass(JumpTableInner, JumpTableToken)
+
+        class BlockV2Inner(_V2IdentityInner, BlockTokenV2):
+            __slots__ = ()
+
+            def __init__(self, block_id: int):
+                super().__init__(block_id)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "block_v2"
+
+            def to_asm_like(self) -> str:
+                return f"block_v2:{self.id}"
+
+        assert issubclass(BlockV2Inner, IdentifierToken)
+        assert issubclass(BlockV2Inner, BlockTokenV2)
+
+        # ValuedConstV2 — same wire shape as identity tokens (minimum-width
+        # big-endian payload), but the ABC exposes `value` instead of `id`,
+        # so it can't share `_V2IdentityInner`. Implementation parallels it
+        # to avoid duplicating the encoding rule: payload bytes come from
+        # `_v2_int_to_minimum_bytes` and decoding from `_v2_bytes_to_int`.
+
+        class ValuedConstV2Inner(TokensInner, ValuedConstTokenV2):
+            """Represents a v2 valued-constant with variable-width inline payload."""
+
+            __slots__ = ("value", "_token_ids", "_type_token_id")
+
+            def __init__(self, value: int):
+                assert vocab_manager.format_version == 2, (
+                    "v2 Inner classes require format_version=2 VocabularyManager; "
+                    f"got format_version={vocab_manager.format_version}"
+                )
+                # Plan reserves negative-value semantics; current impl
+                # restricts to non-negative until the ConstantHandler
+                # rewrite (Phase 1.C.1) settles on a two's-complement vs.
+                # MEM_MINUS-prefix vs. sign-byte choice. Failing fast here
+                # surfaces the gap rather than silently emitting a corrupt
+                # stream.
+                assert value >= 0, (
+                    f"v2 valued_const negative-value encoding is not yet specified; got {value}"
+                )
+                self.value = value
+                self._type_token_id = vocab_manager._private_add_token("valued_const_v2", self.__class__)
+                payload = _v2_int_to_minimum_bytes(value)
+                self._token_ids = [self._type_token_id, *payload]
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "ValuedConstV2Inner":
+                if len(token_ids) < 2:
+                    raise ValueError(
+                        f"v2 valued_const token must have >=2 ids (type + >=1 digit), got {token_ids}"
+                    )
+                value = _v2_bytes_to_int(token_ids[1:])
+                return cls(value)
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array(self._token_ids, dtype=np.int_)
+
+            def to_string(self) -> str:
+                digits = " ".join(f"digit_{b:02X}" for b in self._token_ids[1:])
+                return f"valued_const_v2 {digits}" if digits else "valued_const_v2"
+
+            def to_asm_like(self) -> str:
+                return f"v2:{self.value:x}"
+
+        assert issubclass(ValuedConstV2Inner, ValuedConstToken)
+        assert issubclass(ValuedConstV2Inner, ValuedConstTokenV2)
+
+        # Float Inner classes. Two-mode payload: `bits is None` emits only
+        # the type id (postfix annotation form); `bits` set emits the type
+        # id followed by exactly `width_bytes` big-endian digit bytes
+        # (fixed width so the reader can consume the right count without
+        # ambiguity). Width is per-subclass — taken from the ABC's
+        # `width_bytes` classvar (already set on Float16Token/.../
+        # Float128Token).
+
+        class _V2FloatInner(TokensInner, FloatToken, ABC):
+            """Mixin for v2 float-category tokens (fixed-width or postfix)."""
+
+            __slots__ = ("bits", "_token_ids", "_type_token_id")
+
+            def __init__(self, bits: Optional[int] = None):
+                assert vocab_manager.format_version == 2, (
+                    "v2 Inner classes require format_version=2 VocabularyManager; "
+                    f"got format_version={vocab_manager.format_version}"
+                )
+                if bits is not None:
+                    assert bits >= 0, f"float bits must be unsigned bit pattern, got {bits}"
+                    max_bits = 1 << (self.width_bytes * 8)
+                    assert bits < max_bits, (
+                        f"float bits 0x{bits:x} does not fit in {self.width_bytes} bytes"
+                    )
+                self.bits = bits
+                self._type_token_id = vocab_manager._private_add_token(self._get_basename(), self.__class__)
+                if bits is None:
+                    self._token_ids = [self._type_token_id]
+                else:
+                    payload = bits.to_bytes(self.width_bytes, "big")
+                    self._token_ids = [self._type_token_id, *payload]
+
+            @classmethod
+            @abstractmethod
+            def _get_basename(cls) -> str:
+                ...
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "_V2FloatInner":
+                if len(token_ids) == 1:
+                    return cls(None)
+                if len(token_ids) - 1 != cls.width_bytes:
+                    raise ValueError(
+                        f"v2 {cls._get_basename()} expects 1 (postfix) or "
+                        f"{1 + cls.width_bytes} (inline) ids, got {len(token_ids)}"
+                    )
+                bits = _v2_bytes_to_int(token_ids[1:])
+                return cls(bits)
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array(self._token_ids, dtype=np.int_)
+
+            def to_string(self) -> str:
+                basename = self._get_basename()
+                if self.bits is None:
+                    return basename
+                digits = " ".join(f"digit_{b:02X}" for b in self._token_ids[1:])
+                return f"{basename} {digits}"
+
+            def to_asm_like(self) -> str:
+                basename = self._get_basename()
+                if self.bits is None:
+                    return basename  # postfix annotation; value lives elsewhere
+                return f"{basename}:{self.bits:0{self.width_bytes * 2}x}"
+
+        class Float16Inner(_V2FloatInner, Float16Token):
+            __slots__ = ()
+
+            def __init__(self, bits: Optional[int] = None):
+                super().__init__(bits)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "float16"
+
+        assert issubclass(Float16Inner, FloatToken)
+        assert issubclass(Float16Inner, Float16Token)
+        assert Float16Inner.width_bytes == 2
+
+        class BFloat16Inner(_V2FloatInner, BFloat16Token):
+            __slots__ = ()
+
+            def __init__(self, bits: Optional[int] = None):
+                super().__init__(bits)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "bfloat16"
+
+        assert issubclass(BFloat16Inner, FloatToken)
+        assert issubclass(BFloat16Inner, BFloat16Token)
+        assert BFloat16Inner.width_bytes == 2
+
+        class Float32Inner(_V2FloatInner, Float32Token):
+            __slots__ = ()
+
+            def __init__(self, bits: Optional[int] = None):
+                super().__init__(bits)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "float32"
+
+        assert issubclass(Float32Inner, FloatToken)
+        assert issubclass(Float32Inner, Float32Token)
+        assert Float32Inner.width_bytes == 4
+
+        class Float64Inner(_V2FloatInner, Float64Token):
+            __slots__ = ()
+
+            def __init__(self, bits: Optional[int] = None):
+                super().__init__(bits)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "float64"
+
+        assert issubclass(Float64Inner, FloatToken)
+        assert issubclass(Float64Inner, Float64Token)
+        assert Float64Inner.width_bytes == 8
+
+        class Float80Inner(_V2FloatInner, Float80Token):
+            __slots__ = ()
+
+            def __init__(self, bits: Optional[int] = None):
+                super().__init__(bits)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "float80"
+
+        assert issubclass(Float80Inner, FloatToken)
+        assert issubclass(Float80Inner, Float80Token)
+        assert Float80Inner.width_bytes == 10
+
+        class Float128Inner(_V2FloatInner, Float128Token):
+            __slots__ = ()
+
+            def __init__(self, bits: Optional[int] = None):
+                super().__init__(bits)
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "float128"
+
+        assert issubclass(Float128Inner, FloatToken)
+        assert issubclass(Float128Inner, Float128Token)
+        assert Float128Inner.width_bytes == 16
+
+        # Modifier Inner classes — parameterless category markers. Wire
+        # form is exactly one type id, no payload. Single mixin captures
+        # the trivial encoding; subclasses pick a basename.
+
+        class _V2ModifierInner(TokensInner, ModifierToken, ABC):
+            __slots__ = ("_type_token_id",)
+
+            def __init__(self):
+                assert vocab_manager.format_version == 2, (
+                    "v2 Inner classes require format_version=2 VocabularyManager; "
+                    f"got format_version={vocab_manager.format_version}"
+                )
+                self._type_token_id = vocab_manager._private_add_token(self._get_basename(), self.__class__)
+
+            @classmethod
+            @abstractmethod
+            def _get_basename(cls) -> str:
+                ...
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "_V2ModifierInner":
+                if len(token_ids) != 1:
+                    raise ValueError(
+                        f"v2 modifier token must have exactly one id, got {token_ids}"
+                    )
+                return cls()
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array([self._type_token_id], dtype=np.int_)
+
+            def to_string(self) -> str:
+                return self._get_basename()
+
+            def to_asm_like(self) -> str:
+                return self._get_basename()
+
+        class ThreadLocalInner(_V2ModifierInner, ThreadLocalToken):
+            __slots__ = ()
+
+            def __init__(self):
+                super().__init__()
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "thread_local"
+
+        assert issubclass(ThreadLocalInner, ModifierToken)
+        assert issubclass(ThreadLocalInner, ThreadLocalToken)
+
+        class VtableInner(_V2ModifierInner, VtableToken):
+            __slots__ = ()
+
+            def __init__(self):
+                super().__init__()
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "vtable"
+
+        assert issubclass(VtableInner, ModifierToken)
+        assert issubclass(VtableInner, VtableToken)
+
+        class CodePtrTableInner(_V2ModifierInner, CodePtrTableToken):
+            __slots__ = ()
+
+            def __init__(self):
+                super().__init__()
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "code_ptr_table"
+
+        assert issubclass(CodePtrTableInner, ModifierToken)
+        assert issubclass(CodePtrTableInner, CodePtrTableToken)
+
         class MemoryOperandTokenInner(TokensInner, MemoryOperandToken):
             """Represents memory operand symbols like [, ], +, *"""
 
@@ -827,3 +1443,25 @@ class VocabularyManager:
         self.Opaque_Const = OpaqueConstInner
         self.MemoryOperand = MemoryOperandTokenInner
         self.TokenSet = TokenSetInner
+        # v2 category factories. Available on every VM (v1 or v2) but
+        # guarded at construction time — instantiating any of these on a
+        # v1 VM fails the `format_version == 2` assertion in
+        # `_V2IdentityInner.__init__` (and peers).
+        self.Local_Func = LocalFuncInner
+        self.Plt_Func = PltFuncInner
+        self.Ext_Func = ExtFuncInner
+        self.Ro_Data_Ptr = RoDataPtrInner
+        self.Rw_Data_Ptr = RwDataPtrInner
+        self.String_Ptr = StringPtrInner
+        self.Jump_Table = JumpTableInner
+        self.Block_V2 = BlockV2Inner
+        self.Valued_Const_V2 = ValuedConstV2Inner
+        self.Float16 = Float16Inner
+        self.BFloat16 = BFloat16Inner
+        self.Float32 = Float32Inner
+        self.Float64 = Float64Inner
+        self.Float80 = Float80Inner
+        self.Float128 = Float128Inner
+        self.Thread_Local = ThreadLocalInner
+        self.Vtable = VtableInner
+        self.Code_Ptr_Table = CodePtrTableInner
