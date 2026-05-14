@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import cast
@@ -124,7 +125,29 @@ def disassemble_to_tokens(
         kwargs.update(dict(provider=provider, constant_list=constant_list))
         func_names = kwargs["func_names"]
 
-    vocab_manager = VocabularyManager(platform)
+    # Wire-format version is selected via the
+    # ``ASM_TOKENIZER_FORMAT_VERSION`` environment variable. Default is 2
+    # because the v1 call-site chain (``ConstantHandler.create_opaque_mapping``
+    # and friends) was deliberately stubbed out during the v2 classifier
+    # migration — the operand call sites in ``tokenizer/arch/operands_base.py``
+    # only emit v2-shaped metadata now and ``main_loop`` raises through the
+    # stubs the moment a v1 vocab manager reaches them.
+    #
+    # The env-var override exists for two reasons: (1) cross-checking the
+    # plumbing against the stub messages while the migration is in
+    # progress (set to ``1`` to confirm the v1 path is properly inert),
+    # and (2) leaving a single boundary every downstream consumer
+    # (main_loop writer, CSV readers, memmap pipeline) already branches
+    # on via ``vocab_manager.format_version``. Once the v1 stubs are
+    # removed altogether (post-Phase 4 cleanup), the env var and the
+    # conditional both come out in favour of an unconditional
+    # ``format_version=2`` construction.
+    fmt_version = int(os.environ.get("ASM_TOKENIZER_FORMAT_VERSION", "2"))
+    if fmt_version not in (1, 2):
+        raise ValueError(
+            f"ASM_TOKENIZER_FORMAT_VERSION must be 1 or 2 (got {fmt_version})"
+        )
+    vocab_manager = VocabularyManager(platform, format_version=fmt_version)
 
     resolver = TokenResolver()
     arch_provider = get_provider(platform, backend)
