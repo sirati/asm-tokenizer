@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from tokenizer.disasm import DisassemblyProvider, MetadataLookup
 
@@ -174,13 +174,200 @@ class _CapFunction:
 
 
 # ---------------------------------------------------------------------------
+# Section-name -> v2 section-type mapping
+# ---------------------------------------------------------------------------
+# Used by both the symbol-type fix (replacing bare ``"symbol"`` with the
+# containing-section's type) and the memory-block fallback branch in
+# ``GhidraMetadataLookup.lookup``. ELF section names are the source of truth;
+# Ghidra preserves them verbatim as ``MemoryBlock.getName()``.
+_SECTION_TYPE_BY_NAME: dict[str, str] = {
+    # executable / code-bearing
+    ".text": "code",
+    ".init": "code",
+    ".fini": "code",
+    ".plt": "code",
+    ".plt.got": "code",
+    ".plt.sec": "code",
+    # read-only data
+    ".rodata": "rodata",
+    ".rodata1": "rodata",
+    ".data.rel.ro": "rodata",
+    ".data.rel.ro.local": "rodata",
+    ".eh_frame": "rodata",
+    ".eh_frame_hdr": "rodata",
+    ".gcc_except_table": "rodata",
+    # code-pointer arrays (rodata-flavored but tagged for the classifier)
+    ".init_array": "code_ptr_table",
+    ".fini_array": "code_ptr_table",
+    ".preinit_array": "code_ptr_table",
+    ".ctors": "code_ptr_table",
+    ".dtors": "code_ptr_table",
+    # writable data
+    ".data": "data",
+    ".data1": "data",
+    ".bss": "data",
+    ".sbss": "data",
+    # TLS
+    ".tdata": "thread_local_data",
+    ".tbss": "thread_local_data",
+}
+
+
+def _section_type_from_block(block: Any) -> str:
+    """Map a Ghidra ``MemoryBlock`` to a v2 section-type string.
+
+    Looks up the block's name in ``_SECTION_TYPE_BY_NAME`` first; falls
+    back to permission-bit inference so unknown / vendor-specific section
+    names still get a sensible type. ``block`` must be non-None.
+    """
+    name = str(block.getName())
+    if name in _SECTION_TYPE_BY_NAME:
+        return _SECTION_TYPE_BY_NAME[name]
+    # Permission-bit fallback for unrecognized section names. Matches the
+    # angr-side ``_get_section_type`` logic in ``address_meta_data_lookup.py``.
+    if block.isExecute():
+        return "code"
+    if block.isWrite():
+        return "data"
+    return "rodata"
+
+
+def _is_plt_block_name(name: str) -> bool:
+    """Return True if ``name`` is any of the PLT-variant section names."""
+    return name == ".plt" or name.startswith(".plt.")
+
+
+def _is_code_ptr_table_block_name(name: str) -> bool:
+    """Return True if ``name`` is a known function-pointer-array section."""
+    return name in {".init_array", ".fini_array", ".preinit_array", ".ctors", ".dtors"}
+
+
+def _is_tls_block_name(name: str) -> bool:
+    """Return True if ``name`` is a TLS section."""
+    return name in {".tdata", ".tbss"}
+
+
+def _is_rodata_block_name(name: str) -> bool:
+    """Return True if ``name`` is a rodata-flavored section (vtables live here)."""
+    return name in {".rodata", ".rodata1", ".data.rel.ro", ".data.rel.ro.local"}
+
+
+# ---------------------------------------------------------------------------
+# String DataType detection
+# ---------------------------------------------------------------------------
+# Ghidra's string analyzers create ``Data`` objects whose ``DataType`` is a
+# subclass of ``AbstractStringDataType`` (or, in older Ghidra, individual
+# concrete classes like ``StringDataType`` / ``UnicodeDataType``). The pyghidra
+# interface exposes ``data.hasStringValue()`` as the authoritative cross-version
+# check; the data type's name then yields the encoding.
+_STRING_TYPE_NAME_TO_ENCODING: dict[str, str] = {
+    "string": "ascii",
+    "string-utf8": "utf-8",
+    "TerminatedCString": "ascii",
+    "TerminatedAsciiString": "ascii",
+    "TerminatedUTF8": "utf-8",
+    "unicode": "utf-16-le",
+    "unicode32": "utf-32-le",
+    "TerminatedUnicode": "utf-16-le",
+    "TerminatedUnicode32": "utf-32-le",
+    "PascalString": "ascii",
+    "PascalUnicode": "utf-16-le",
+    "PascalString255": "ascii",
+    "MBCString": "mbcs",
+}
+
+
+def _encoding_from_string_datatype(dt: Any) -> str:
+    """Map a Ghidra string ``DataType`` to a Python codec name.
+
+    Falls back to ``"ascii"`` when the type's name isn't recognized;
+    callers can downgrade gracefully (the byte payload is preserved
+    regardless of encoding).
+    """
+    if dt is None:
+        return "ascii"
+    name = str(dt.getName())
+    # Direct hit
+    if name in _STRING_TYPE_NAME_TO_ENCODING:
+        return _STRING_TYPE_NAME_TO_ENCODING[name]
+    # Substring heuristics for vendor-spelling variations
+    lname = name.lower()
+    if "unicode32" in lname or "utf32" in lname or "utf-32" in lname:
+        return "utf-32-le"
+    if "unicode" in lname or "utf16" in lname or "utf-16" in lname:
+        return "utf-16-le"
+    if "utf8" in lname or "utf-8" in lname:
+        return "utf-8"
+    return "ascii"
+
+
+def _java_bytes_to_python(raw: Any) -> bytes:
+    """Convert a Java ``byte[]`` (JPype-wrapped) into a Python ``bytes``.
+
+    Java bytes are signed; mask each element to the unsigned 0–255 range
+    before assembling. ``raw`` may be None when the Data object hasn't
+    materialized its byte payload — in that case return ``b""``.
+    """
+    if raw is None:
+        return b""
+    return bytes(int(b) & 0xFF for b in raw)
+
+
+# ---------------------------------------------------------------------------
+# Vtable detection
+# ---------------------------------------------------------------------------
+# Ghidra's GCC-RTTI analyzer (``GccRttiAnalyzer``) creates ``Data`` objects
+# for vftables with a symbol whose name includes ``vftable`` (case-insensitive
+# variants exist: ``ClassName::vftable``, ``Vftable``, ``_ZTV...``). The data
+# type's own name often contains ``Vftable`` as well. We check both
+# signals because Ghidra versions vary in which one they populate.
+def _looks_like_vtable_symbol_name(name: str) -> bool:
+    lower = name.lower()
+    return "vftable" in lower or "vtable" in lower
+
+
+def _looks_like_vtable_datatype_name(dt_name: str) -> bool:
+    lower = dt_name.lower()
+    return "vftable" in lower or "vtable" in lower
+
+
+# ---------------------------------------------------------------------------
 # Ghidra metadata lookup
 # ---------------------------------------------------------------------------
 class GhidraMetadataLookup:
     """Address metadata lookup built from Ghidra's analysis results.
 
-    Conforms to the ``MetadataLookup`` protocol (just needs a
-    ``lookup(addr) -> (dict, str)`` method).
+    Conforms to the ``MetadataLookup`` protocol (``lookup(addr) -> (dict, str)``).
+
+    The returned ``dict`` carries the legacy keys (``name``, ``type``,
+    ``size``, ``start_addr``, ``end_addr``, ``source``, ``library``) plus
+    the v2-classifier enrichments below. All enrichment keys are always
+    present; conservative defaults (``False`` / ``None``) are used when the
+    Ghidra analyzers did not flag the address.
+
+    v2 enrichment keys:
+        is_plt              -- addr inside a ``.plt`` / PLT-thunk region
+        is_extern_synthetic -- addr in Ghidra's external/synthetic-extern
+                               namespace (Ghidra's analogue of CLE's synthetic
+                               extern object)
+        is_vtable           -- addr is a C++ vtable slot (RTTI-analyzer output)
+        is_string           -- addr is the start of a typed string Data
+        string_encoding     -- Python codec name for the string ("ascii",
+                               "utf-8", "utf-16-le", ...) or None
+        string_bytes        -- the raw string bytes or None
+        is_jump_table_slot  -- addr is inside a Ghidra-recovered switch-table
+                               (AddressTable / pointer-array referenced by a
+                               computed-jump)
+        is_code_ptr_table_slot
+                            -- addr is inside ``.init_array`` / ``.fini_array``
+                               / ``.dtors`` / ``.ctors`` / ``.preinit_array``
+        tls                 -- addr is in ``.tdata`` / ``.tbss``
+
+    Cross-provider parity: matches the keys the angr-side lookup will
+    populate (Phase 1.B.2). When Ghidra has no signal the field is False/None
+    just as on the angr side; the v2 classifier then routes to a lower
+    precedence step (see ``tokenizer/disasm/precedence.md`` and
+    ``tokenizer/disasm/angr_limitations.md``).
     """
 
     def __init__(self, program: Any, function_manager: Any) -> None:
@@ -190,26 +377,255 @@ class GhidraMetadataLookup:
         self._symbol_table = program.getSymbolTable()
         self._listing = program.getListing()
 
+    # -- Enrichment helpers (one concern each) ------------------------------
+    def _block_at(self, addr_obj: Any) -> Any:
+        """Return the ``MemoryBlock`` containing ``addr_obj`` or None."""
+        try:
+            return self._memory.getBlock(addr_obj)
+        except Exception:
+            return None
+
+    def _data_at(self, addr_obj: Any) -> Any:
+        """Return the ``Data`` defined at ``addr_obj`` (exact start) or None.
+
+        ``getDataAt`` returns None when the address is not the start of a
+        Data unit; ``getDataContaining`` returns the Data whose body covers
+        the address. We try exact first (matches v2's "addr is a slot start"
+        semantics for jump tables / vtables); callers needing containment
+        can ask separately.
+        """
+        try:
+            return self._listing.getDataAt(addr_obj)
+        except Exception:
+            return None
+
+    def _data_containing(self, addr_obj: Any) -> Any:
+        """Return the ``Data`` whose body covers ``addr_obj`` or None."""
+        try:
+            return self._listing.getDataContaining(addr_obj)
+        except Exception:
+            return None
+
+    def _classify_string(self, addr_obj: Any) -> tuple[bool, Optional[str], Optional[bytes]]:
+        """Decide whether ``addr_obj`` starts a typed string Data.
+
+        Returns ``(is_string, encoding, bytes)``. When the address is in
+        the middle of a string Data (substring access) we still report
+        ``is_string=True`` and return the *containing* string's bytes;
+        the classifier consumes ``start_addr`` from the Data's min-address
+        if it needs the offset.
+        """
+        data = self._data_at(addr_obj) or self._data_containing(addr_obj)
+        if data is None:
+            return False, None, None
+        try:
+            if not data.hasStringValue():
+                return False, None, None
+        except Exception:
+            return False, None, None
+        try:
+            dt = data.getDataType()
+        except Exception:
+            dt = None
+        encoding = _encoding_from_string_datatype(dt)
+        try:
+            raw = data.getBytes()
+        except Exception:
+            raw = None
+        return True, encoding, _java_bytes_to_python(raw)
+
+    def _is_vtable(self, addr_obj: Any, block: Any) -> bool:
+        """Decide whether ``addr_obj`` is a C++ vtable slot.
+
+        Two signals (either triggers): a symbol at the address whose
+        name contains ``vftable``/``vtable``, OR a Data object whose
+        DataType name contains the same substring. Only meaningful for
+        rodata-flavored sections (``.rodata`` / ``.data.rel.ro``).
+        """
+        if block is None:
+            return False
+        if not _is_rodata_block_name(str(block.getName())):
+            return False
+        # Symbol-name signal — exact match at this address.
+        try:
+            symbols = self._symbol_table.getSymbols(addr_obj)
+        except Exception:
+            symbols = ()
+        for sym in symbols or ():
+            try:
+                if _looks_like_vtable_symbol_name(str(sym.getName())):
+                    return True
+            except Exception:
+                continue
+        # DataType-name signal — Ghidra's GccRttiAnalyzer stamps the Data.
+        data = self._data_containing(addr_obj)
+        if data is not None:
+            try:
+                dt = data.getDataType()
+                if dt is not None and _looks_like_vtable_datatype_name(str(dt.getName())):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _is_jump_table_slot(self, addr_obj: Any, block: Any) -> bool:
+        """Decide whether ``addr_obj`` is a slot in a Ghidra-recovered switch table.
+
+        First-pass implementation: check that the Data at/around the
+        address is a pointer-array element AND the containing block
+        is rodata-flavored. A precise cross-check against computed-jump
+        inbound references is feasible but expensive (per-address ref
+        walk); the function-level ``iter_switch_tables`` consumer below
+        does that more cheaply by walking from the dispatch site.
+        """
+        if block is None:
+            return False
+        if not _is_rodata_block_name(str(block.getName())):
+            return False
+        data = self._data_at(addr_obj) or self._data_containing(addr_obj)
+        if data is None:
+            return False
+        try:
+            dt = data.getDataType()
+        except Exception:
+            return False
+        if dt is None:
+            return False
+        # Pointer or Array-of-Pointer is the canonical jump-table shape.
+        # We check by class name to avoid a hard import of Ghidra DataType
+        # classes here; the type hierarchy in Ghidra has ``Pointer`` and
+        # ``Array`` as stable interface names.
+        try:
+            from ghidra.program.model.data import Array, Pointer
+
+            if isinstance(dt, Pointer):
+                return True
+            if isinstance(dt, Array):
+                try:
+                    inner = dt.getDataType()
+                    return isinstance(inner, Pointer)
+                except Exception:
+                    return False
+        except Exception:
+            # Fallback if the Ghidra import fails for any reason
+            tname = str(dt.getName()).lower()
+            if "pointer" in tname or tname.endswith("*"):
+                return True
+        return False
+
+    def _is_extern_synthetic(self, func: Any, block: Any) -> bool:
+        """Detect Ghidra's analogue of CLE's synthetic-extern object.
+
+        Ghidra represents unresolved imports through an "EXTERNAL" memory
+        block (``isExternalBlock``) plus the Function's ``isExternal()``
+        flag. When the address lives in that block, the v2 classifier
+        treats it the same way CLE's externs are treated.
+        """
+        if block is not None:
+            try:
+                if block.isExternalBlock():
+                    return True
+            except Exception:
+                pass
+            try:
+                # Older Ghidra exposes the same concept through the block name.
+                if str(block.getName()).upper() == "EXTERNAL":
+                    return True
+            except Exception:
+                pass
+        if func is not None:
+            try:
+                if func.isExternal():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # -- Public API ---------------------------------------------------------
     def lookup(self, addr: int) -> tuple[dict, str]:
-        from ghidra.program.model.address import AddressSet
-
         addr_obj = self._program.getAddressFactory().getDefaultAddressSpace().getAddress(addr)
+        block = self._block_at(addr_obj)
+        block_name = str(block.getName()) if block is not None else ""
 
-        # Exact symbol match
+        # Enrichments computed once; reused across all classification branches.
+        is_plt = _is_plt_block_name(block_name) if block is not None else False
+        is_code_ptr_table_slot = _is_code_ptr_table_block_name(block_name) if block is not None else False
+        tls = _is_tls_block_name(block_name) if block is not None else False
+        is_string, string_encoding, string_bytes = self._classify_string(addr_obj)
+        is_vtable = self._is_vtable(addr_obj, block)
+        is_jump_table_slot = self._is_jump_table_slot(addr_obj, block)
+
+        def _enrich(meta: dict, *, func: Any = None) -> dict:
+            """Stamp the v2 enrichment keys onto an existing meta dict.
+
+            ``func`` is optional; when present it is forwarded to the
+            extern-synthetic check (a function-entry address that lives
+            in Ghidra's EXTERNAL block).
+            """
+            meta["is_plt"] = bool(is_plt) or (func is not None and bool(getattr(func, "isThunk", lambda: False)()))
+            meta["is_extern_synthetic"] = self._is_extern_synthetic(func, block)
+            meta["is_vtable"] = bool(is_vtable)
+            meta["is_string"] = bool(is_string)
+            meta["string_encoding"] = string_encoding
+            meta["string_bytes"] = string_bytes
+            meta["is_jump_table_slot"] = bool(is_jump_table_slot)
+            meta["is_code_ptr_table_slot"] = bool(is_code_ptr_table_slot)
+            meta["tls"] = bool(tls)
+            return meta
+
+        # 1. Exact symbol match -- legacy bare ``"symbol"`` is replaced with
+        #    a section-derived type. The symbol's name is preserved as-is.
         symbols = self._symbol_table.getSymbols(addr_obj)
         if symbols:
             sym = symbols[0]
+            sym_name = str(sym.getName())
+            # Derive type from the containing section (if any). For a symbol
+            # in ``.text`` whose Ghidra ``SymbolType`` is ``FUNCTION`` we
+            # tag it ``local_function``; everything else uses the section's
+            # natural type (``rodata`` / ``data`` / ``thread_local_data`` / ...).
+            sym_type = "unknown"
+            if block is not None:
+                base_type = _section_type_from_block(block)
+                if base_type == "code":
+                    is_function_symbol = False
+                    try:
+                        st = sym.getSymbolType()
+                        # ``SymbolType.FUNCTION`` is the canonical enum value;
+                        # compare by name to avoid importing the enum class.
+                        is_function_symbol = str(st).upper() == "FUNCTION"
+                    except Exception:
+                        is_function_symbol = False
+                    sym_type = "local_function" if is_function_symbol else base_type
+                else:
+                    sym_type = base_type
             meta = {
-                "name": str(sym.getName()),
-                "type": "symbol",
+                "name": sym_name,
+                "type": sym_type,
                 "size": 0,
                 "source": "symbol",
                 "start_addr": addr,
                 "end_addr": addr,
+                "library": "unknown",
             }
-            return meta, "exact"
+            # If the symbol is an actual function and we have its body, give
+            # the classifier accurate range bounds rather than a zero-width.
+            try:
+                func = self._fm.getFunctionAt(addr_obj)
+            except Exception:
+                func = None
+            if func is not None:
+                try:
+                    body = func.getBody()
+                    size = int(body.getNumAddresses())
+                    entry = int(func.getEntryPoint().getOffset())
+                    meta["size"] = size
+                    meta["start_addr"] = entry
+                    meta["end_addr"] = entry + size
+                except Exception:
+                    pass
+            return _enrich(meta, func=func), "exact"
 
-        # Function match
+        # 2. Function match (covers calls/jumps into known functions).
         func = self._fm.getFunctionContaining(addr_obj)
         if func is not None:
             entry = int(func.getEntryPoint().getOffset())
@@ -225,26 +641,23 @@ class GhidraMetadataLookup:
                 "source": "function",
                 "library": "unknown",
             }
-            return meta, "range"
+            return _enrich(meta, func=func), "range"
 
-        # Memory block match
-        block = self._memory.getBlock(addr_obj)
+        # 3. Memory-block match -- the address is in a known section but
+        #    not inside any function. Use the section-type mapping.
         if block is not None:
             meta = {
-                "name": str(block.getName()),
-                "type": "rodata"
-                if not block.isWrite() and not block.isExecute()
-                else "code"
-                if block.isExecute()
-                else "data",
+                "name": block_name,
+                "type": _section_type_from_block(block),
                 "size": int(block.getSize()),
                 "start_addr": int(block.getStart().getOffset()),
                 "end_addr": int(block.getEnd().getOffset()) + 1,
                 "source": "section",
+                "library": "unknown",
             }
-            return meta, "range"
+            return _enrich(meta), "range"
 
-        # Fallback
+        # 4. Fallback -- address not in any known memory region.
         fallback = {
             "start_addr": addr,
             "end_addr": addr,
@@ -254,7 +667,7 @@ class GhidraMetadataLookup:
             "source": "synthetic",
             "library": "unknown",
         }
-        return fallback, "synthetic"
+        return _enrich(fallback), "synthetic"
 
 
 # ---------------------------------------------------------------------------
@@ -690,3 +1103,177 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
                 continue
 
             yield addr, name, _CapFunction(_blocks=cap_blocks)
+
+    # ----------------------------------------------------------------------
+    # Per-operand FP-immediate detection
+    # ----------------------------------------------------------------------
+    def operand_fp_width_bytes(self, ghidra_insn: Any, operand_index: int) -> Optional[int]:
+        """Return the FP width in bytes for ``operand_index`` of ``ghidra_insn``.
+
+        Returns one of {2, 4, 8, 10, 16} when the operand is FP-typed
+        (per Ghidra's ``OperandType.FLOAT`` bitmask) and None otherwise.
+        Width derivation order:
+
+        1. Inspect each ``getOpObjects(i)`` element. For ``Register``
+           operands, return ``Register.getBitLength() / 8``. For ``Scalar``
+           operands, return ``Scalar.bitLength() / 8``. Take the largest
+           value seen (x87 ``fld dword ptr [...]`` carries an FP-tagged
+           memory operand whose size is the load size).
+        2. If no op-object width is available, fall back to
+           ``ghidra_insn.getOperandRefType(i).getSize()``.
+        3. If neither yields a positive value, return ``None`` (the
+           classifier then routes this operand through step 11 of the
+           precedence list rather than emitting a malformed ``floatXX``).
+
+        BFloat16-vs-Float16 distinction: width 2 alone is ambiguous;
+        SLEIGH does not currently tag bfloat16 distinctly. Callers
+        receiving width=2 default to ``Float16`` in the classifier.
+        Documented here so the precedence-list implementation can
+        cite the limitation.
+        """
+        from ghidra.program.model.lang import OperandType, Register
+        from ghidra.program.model.scalar import Scalar
+
+        try:
+            op_type = ghidra_insn.getOperandType(operand_index)
+        except Exception:
+            return None
+        if not bool(op_type & OperandType.FLOAT):
+            return None
+
+        max_width_bits = 0
+        try:
+            objects = ghidra_insn.getOpObjects(operand_index)
+        except Exception:
+            objects = ()
+        for obj in objects or ():
+            try:
+                if isinstance(obj, Register):
+                    width = int(obj.getBitLength())
+                elif isinstance(obj, Scalar):
+                    width = int(obj.bitLength())
+                else:
+                    continue
+            except Exception:
+                continue
+            if width > max_width_bits:
+                max_width_bits = width
+
+        if max_width_bits == 0:
+            # Fall back to the reference-type's reported access size
+            # (memory FP loads/stores).
+            try:
+                ref_type = ghidra_insn.getOperandRefType(operand_index)
+                if ref_type is not None:
+                    size_bytes = int(ref_type.getSize())
+                    if size_bytes > 0:
+                        return size_bytes
+            except Exception:
+                pass
+            return None
+
+        width_bytes = max_width_bits // 8
+        return width_bytes if width_bytes > 0 else None
+
+    # ----------------------------------------------------------------------
+    # Switch-table recovery
+    # ----------------------------------------------------------------------
+    def iter_switch_tables(self, function: Any) -> Iterable[tuple[int, list[int]]]:
+        """Yield ``(jump_table_addr, [target_block_addrs])`` for ``function``.
+
+        Walks every instruction in the function's body; for any computed-jump
+        instruction, follows the ``COMPUTED_JUMP`` references to gather the
+        list of resolved targets, and locates the backing pointer-array data
+        in rodata (the table's address) via the instruction's outbound READ
+        references when present. Tables are yielded in dispatch-instruction
+        order; duplicate-table elision is the consumer's responsibility.
+
+        Phase-1 scope: pragmatic recovery from Ghidra's reference graph.
+        A processor-specific ``SwitchAnalyzer`` cross-check is a Phase 2
+        refinement (Phase 2.C.1 jump-table-analysis pass).
+        """
+        if function is None:
+            return
+
+        from ghidra.program.model.symbol import RefType
+
+        body = function.getBody()
+        insn_iter = self._listing.getInstructions(body, True)
+        while insn_iter.hasNext():
+            insn = insn_iter.next()
+            try:
+                flow_type = insn.getFlowType()
+                if not (flow_type.isJump() and flow_type.isComputed()):
+                    continue
+            except Exception:
+                continue
+
+            # Outbound references from the dispatch instruction. Computed
+            # jumps surface their resolved targets as COMPUTED_JUMP refs.
+            try:
+                refs_from = list(insn.getReferencesFrom() or ())
+            except Exception:
+                refs_from = []
+
+            targets: list[int] = []
+            table_addr: Optional[int] = None
+            for ref in refs_from:
+                try:
+                    rtype = ref.getReferenceType()
+                except Exception:
+                    continue
+                # READ references typically point at the table base in rodata.
+                try:
+                    if rtype.isData() and rtype.isRead():
+                        to_addr = int(ref.getToAddress().getOffset())
+                        if table_addr is None:
+                            table_addr = to_addr
+                        continue
+                except Exception:
+                    pass
+                # COMPUTED_JUMP / CONDITIONAL_COMPUTED_JUMP / COMPUTED_CALL
+                # references list the resolved target blocks.
+                try:
+                    if rtype.isJump() and rtype.isComputed():
+                        to_addr = int(ref.getToAddress().getOffset())
+                        targets.append(to_addr)
+                        continue
+                except Exception:
+                    pass
+                # ``RefType.COMPUTED_JUMP`` direct comparison as a fallback
+                # for older Ghidra versions where the predicates above
+                # are missing.
+                try:
+                    if rtype == RefType.COMPUTED_JUMP:
+                        to_addr = int(ref.getToAddress().getOffset())
+                        targets.append(to_addr)
+                except Exception:
+                    pass
+
+            if not targets:
+                continue
+
+            # If we did not find a READ reference, fall back to scanning
+            # the instruction's data-typed operand for a memory-base address.
+            if table_addr is None:
+                try:
+                    num_ops = insn.getNumOperands()
+                except Exception:
+                    num_ops = 0
+                for i in range(num_ops):
+                    try:
+                        for obj in insn.getOpObjects(i) or ():
+                            # ghidra.program.model.address.Address has getOffset()
+                            if hasattr(obj, "getOffset"):
+                                table_addr = int(obj.getOffset())
+                                break
+                    except Exception:
+                        continue
+                    if table_addr is not None:
+                        break
+
+            if table_addr is None:
+                # No locatable table base; skip rather than emit a synthetic.
+                continue
+
+            yield table_addr, targets
