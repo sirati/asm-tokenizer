@@ -86,7 +86,8 @@ def tokenize_operand_memory(
         assert scale > 0
         if has_index:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MULTIPLY))
-            tokens.append(vocab_manager.Valued_Const(abs(scale)))
+            valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
+            tokens.append(valued_const(abs(scale)))
         else:
             warnings.warn(f"Scale {scale} used without index register in instruction {insn}")
 
@@ -101,7 +102,8 @@ def tokenize_operand_memory(
     elif (
         disp <= 0xFF
     ):  # if we are in range 00 to 0xFF we always use constant, same if we are negative as its defo not an addr
-        tokens.append(vocab_manager.Valued_Const(abs(disp)))
+        valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
+        tokens.append(valued_const(abs(disp)))
 
     else:
         force_opaque = False
