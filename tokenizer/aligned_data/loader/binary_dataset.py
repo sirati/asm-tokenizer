@@ -153,6 +153,18 @@ class BinaryDataset:
             raise ValueError(f"Index file size {filesize} is not a multiple of 8")
 
         n_entries = filesize // 8
+        # numpy refuses to mmap a zero-byte file (mmap() returns
+        # EINVAL for length=0). Skip the memmap and return empty
+        # arrays in lockstep with the index-absent branch so a
+        # binary that has only unmatched (or only matched) functions
+        # — e.g. a single-version validation run — loads cleanly.
+        if n_entries == 0:
+            return (
+                np.zeros(0, dtype=np.uint32),
+                np.zeros(0, dtype=np.uint32),
+                np.zeros(0, dtype=np.uint8),
+            )
+
         index_memmap = np.memmap(index_path, dtype=np.uint8, mode="r", shape=(n_entries, 8))
 
         # Extract all needed data before closing
