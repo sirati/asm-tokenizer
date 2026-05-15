@@ -12,8 +12,9 @@ tokenizer at ``tokenizer/arch/x86/ghidra/operands.py`` (the
 ``tokenize_operand_memory_ghidra``). The ARM and base+disp paths
 expose the same (base, index, scale, disp, segment) wire-shape that
 the typed ``MemoryOperandView`` exposes to consumers, plus the ARM-
-specific writeback / pre-indexed / post-indexed flags surfaced from
-``getDefaultOperandRepresentationList(op_idx)``.
+specific writeback / pre-indexed / post-indexed flags derived from
+PCode rich IR via ``pcode_inspect.classify_memory_addressing`` and
+the shifted-index modifier via ``pcode_inspect.find_shift_on_register``.
 
 In addition, this module surfaces ``resolved_target`` -- the address
 that Ghidra's analyzer has resolved this memory operand to point at,
@@ -29,22 +30,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from tokenizer.disasm.ghidra_provider.mnemonic import _SEGMENT_REGISTERS, _RegisterMap
+from tokenizer.disasm.ghidra_provider.pcode_inspect import (
+    classify_memory_addressing,
+    find_shift_on_register,
+)
 from tokenizer.disasm.types import ShiftKind
-
-
-# ARM shift-keyword (case-insensitive) -> typed ShiftKind. Used to lift the
-# shift modifier on shifted-index memory operands like
-# ``ldrb r5, [r7, r5, lsl #0x1]`` from
-# ``getDefaultOperandRepresentationList(op_idx)``. The keyword lives as a
-# bare ``String``/``Character`` item in the representation list (Ghidra
-# does not allocate a dedicated typed wrapper for it).
-_SHIFT_KEYWORD_TO_KIND: dict[str, ShiftKind] = {
-    "lsl": ShiftKind.LSL,
-    "lsr": ShiftKind.LSR,
-    "asr": ShiftKind.ASR,
-    "ror": ShiftKind.ROR,
-    "rrx": ShiftKind.RRX,
-}
 
 
 @dataclass
@@ -147,117 +137,63 @@ def _inspect_arm_index_shift(
     """Detect the shift modifier on a shifted-index ARM mem operand.
 
     ARM allows the index register to be shifted as part of the address
-    computation, e.g. ``ldrb r5, [r7, r5, lsl #0x1]``. Ghidra surfaces
-    this in two places:
+    computation, e.g. ``ldrb r5, [r7, r5, lsl #0x1]``. The shift is
+    surfaced richly in Ghidra's PCode IR — the index register flows into
+    a typed ``INT_LEFT``/``INT_RIGHT``/``INT_SRIGHT`` op whose constant
+    second input IS the shift amount.
 
-    - ``getOpObjects(op_idx)`` reports ``[Register(base), Register(index),
-      Scalar(amount)]`` (the Scalar is the *shift* amount, NOT a disp).
-    - ``getDefaultOperandRepresentationList(op_idx)`` renders the shift
-      keyword character-by-character as individual ``Character`` items
-      (the Ghidra ARM SLEIGH spec does not coalesce them into a single
-      ``String`` token). The keyword is sandwiched between the index
-      register and the shift-amount Scalar item.
+    The Ghidra SLEIGH operand convention places the index as the SECOND
+    Register in ``getOpObjects(op_idx)``; we delegate to
+    ``find_shift_on_register`` which walks PCode for a shift op consuming
+    (possibly via COPY chains) the index register's varnode.
 
-    Returns ``(kind, amount)``. ``kind == ShiftKind.NONE`` when no shift
-    modifier is present (the common case). ``rrx`` carries an implicit
-    1-bit rotate and ARM's asm spec forbids an explicit amount; the
-    returned ``amount`` mirrors whatever Ghidra emits (typically 0).
+    Returns ``(kind, amount)``; ``(ShiftKind.NONE, 0)`` when no shift
+    modifier is present.
     """
-    from ghidra.program.model.scalar import Scalar
+    from ghidra.program.model.lang import Register
 
     try:
-        items = list(ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ())
+        objects = ghidra_insn.getOpObjects(op_idx)
     except Exception:
         return (ShiftKind.NONE, 0)
-
-    # Build a flat string view of the representation list so the
-    # character-by-character keyword rendering can be substring-
-    # matched. ``items_str`` retains the per-item indexing semantics:
-    # ``items_str[i]`` corresponds 1:1 with ``items[i]`` for non-multi-
-    # character items (Register / Scalar pretty-printed forms are
-    # themselves multi-char but they live OUTSIDE the keyword span, so
-    # substring-position decoding stays unambiguous).
-    items_str = [str(it).lower() for it in items]
-    flat = "".join(items_str)
-
-    found_kw: str | None = None
-    found_pos: int = -1
-    for kw in _SHIFT_KEYWORD_TO_KIND:
-        pos = flat.find(kw)
-        if pos != -1:
-            found_kw = kw
-            found_pos = pos
-            break
-
-    if found_kw is None:
+    regs = [o for o in (objects or ()) if isinstance(o, Register)]
+    if len(regs) < 2:
         return (ShiftKind.NONE, 0)
-
-    # Map the flat-string position back to a repr-list index so we can
-    # find the first Scalar AFTER the keyword. Walk items in order,
-    # accumulating their pretty-printed widths, until the cursor
-    # crosses ``found_pos + len(found_kw)``.
-    cursor = 0
-    kw_end_item_idx = 0
-    target_end = found_pos + len(found_kw)
-    for i, s in enumerate(items_str):
-        cursor += len(s)
-        if cursor >= target_end:
-            kw_end_item_idx = i + 1
-            break
-
-    amount = 0
-    for after in items[kw_end_item_idx:]:
-        if isinstance(after, Scalar):
-            amount = int(after.getValue())
-            break
-        if str(after) == "]":
-            break
-
-    return (_SHIFT_KEYWORD_TO_KIND[found_kw], amount)
+    index_reg = regs[1]
+    return find_shift_on_register(ghidra_insn, index_reg)
 
 
 def _inspect_arm_mem_addressing(
     ghidra_insn: Any, op_idx: int
 ) -> tuple[bool, bool, bool]:
-    """Classify ARM memory-operand addressing mode from its representation list.
+    """Classify ARM memory-operand addressing mode from PCode IR.
 
-    Walks ``getDefaultOperandRepresentationList(op_idx)`` (a Java List of
-    ``Register`` / ``Scalar`` / ``Character`` / ``String`` items) and
-    returns ``(writeback, pre_indexed, post_indexed)``:
+    Returns ``(writeback, pre_indexed, post_indexed)``:
 
     - ``[base, #imm]`` (offset-only)        -> (False, False, False)
     - ``[base, #imm]!`` (pre-indexed wb)    -> (True,  True,  False)
     - ``[base], #imm`` (post-indexed)       -> (False, False, True)
     - ``[base, index, lsl #N]`` (shifted-index, offset-only) -> (False, False, False)
 
-    The bracket close-position separates "inside" from "outside" the
-    address brackets. A Scalar inside the brackets is a pre-indexed
-    displacement (or shift amount, but the shift case still leaves
-    pre/post both False because there is no separate writeback-style
-    update). A Scalar outside is a post-index displacement. The
-    explicit ``!`` character anywhere after the close-bracket marks
-    writeback.
+    Delegates to ``classify_memory_addressing`` which derives the answer
+    from PCode rich IR: ``getResultObjects()`` membership for writeback,
+    LOAD/STORE address-varnode shape (base register directly vs uniq
+    COPYed from base) for pre vs post.
+
+    The base register is the FIRST Register in ``getOpObjects(op_idx)``
+    per the Ghidra SLEIGH operand convention.
     """
-    from ghidra.program.model.scalar import Scalar
+    from ghidra.program.model.lang import Register
 
     try:
-        items = list(ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ())
+        objects = ghidra_insn.getOpObjects(op_idx)
     except Exception:
         return (False, False, False)
-
-    bracket_close: int | None = None
-    for i, item in enumerate(items):
-        if str(item) == "]":
-            bracket_close = i
-            break
-    if bracket_close is None:
+    regs = [o for o in (objects or ()) if isinstance(o, Register)]
+    if not regs:
         return (False, False, False)
-
-    writeback = any(str(x) == "!" for x in items[bracket_close + 1:])
-    scalar_outside = any(isinstance(x, Scalar) for x in items[bracket_close + 1:])
-    pre_indexed = writeback
-    post_indexed = scalar_outside and not pre_indexed
-    return (writeback, pre_indexed, post_indexed)
+    base_reg = regs[0]
+    return classify_memory_addressing(ghidra_insn, base_reg)
 
 
 def _infer_mem_access_size(ghidra_insn: Any, op_idx: int, default: int = 8) -> int:

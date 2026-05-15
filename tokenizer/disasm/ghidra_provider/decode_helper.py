@@ -27,6 +27,10 @@ from tokenizer.disasm.ghidra_provider.mnemonic import (
     _split_ghidra_mnemonic,
     _strip_arm_cc_suffix,
 )
+from tokenizer.disasm.ghidra_provider.pcode_inspect import (
+    has_load_store,
+    register_is_addressing_mode_written,
+)
 from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
     _ghidra_processor_to_architecture,
@@ -181,17 +185,13 @@ class _GhidraDecodeHelper:
         the asm); the remaining Registers are the list members (the
         registers *inside* the braces).
 
-        Writeback (`!`) detection: Ghidra's ``OperandType`` bitmask
-        does not carry a documented writeback bit. The flag IS surfaced
-        through ``getDefaultOperandRepresentationList(op_idx)``, which
-        returns the operand's formatted components as a Java List of
-        ``Register`` / ``Scalar`` / ``Character`` / ``String`` items;
-        ARM stmdb/ldmia/push/pop with writeback include a
-        ``Character('!')`` entry immediately after the base register.
-        We scan that list for any ``!`` token to derive ``writeback``.
-        This avoids parsing the raw mnemonic string (which is just
-        ``stmdb`` either way -- the ``!`` is positional on the operand)
-        and avoids PCode self-assignment inspection.
+        Writeback (``!``) detection: the rich-IR signal is that the
+        instruction's PCode mutates the base register. The framework-
+        level ``getResultObjects()`` enumerates the Registers (and
+        Addresses) the instruction writes; the base register being in
+        that set is the typed equivalent of Capstone's
+        ``cs_insn.writeback`` flag. No string parsing of the rendered
+        representation list required.
         """
         from ghidra.program.model.lang import Register
 
@@ -203,17 +203,16 @@ class _GhidraDecodeHelper:
             except Exception:
                 objects = ()
 
-            try:
-                repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx)
-                writeback = any(str(item) == "!" for item in repr_list or ())
-            except Exception:
-                writeback = False
-
             regs: list[tuple[str, int]] = []
+            base_reg_obj: Any = None
             for obj in objects or ():
                 if isinstance(obj, Register):
                     name = str(obj.getName()).lower()
                     regs.append((name, reg_map.get_id(name)))
+                    if base_reg_obj is None:
+                        base_reg_obj = obj
+
+            writeback = register_is_addressing_mode_written(ghidra_insn, base_reg_obj)
 
             if regs:
                 base_name, base_id = regs[0]
@@ -355,32 +354,32 @@ class _GhidraDecodeHelper:
         # Without this arm the Scalar + bracket framing + writeback marker
         # are silently dropped.
         #
-        # Bracket gate: Ghidra's ``OperandType.DYNAMIC`` bit also fires
-        # on ARM shifted-register operands like
-        # ``sbc r1, r1, r1, lsl #N`` (a register operand with an
-        # explicit shift modifier — NOT a memory access). Those operands
-        # carry no brackets in
-        # ``getDefaultOperandRepresentationList(op_idx)`` because the
-        # syntax is ``rN, lsl #M`` (no ``[`` framing). Real memory
-        # operands ALWAYS carry the bracket framing in the
-        # representation list, so requiring a ``[`` item discriminates
-        # cleanly. Without this gate the shifted-register operands were
-        # mis-classified as MEM and rendered as a degenerate
-        # ``mem[ rN ]mem``; downstream the per-ISA mem-decompose helper
-        # would also fail its ``>=2 GP-reg`` invariant assert because
-        # the operand carries only one register.
+        # ARM shifted-register vs ARM memory: ``OperandType.DYNAMIC`` is
+        # set on BOTH (e.g. ``sbc r1, r1, r1, lsl #N`` operand 2 and
+        # ``ldr r0, [r3, r0, lsl #2]`` operand 1 share the bit). Object
+        # shape (1 register + 1 scalar) is also indistinguishable. The
+        # rich-IR discriminator is the instruction-level PCode shape:
+        # memory operands force a ``LOAD``/``STORE`` op into the PCode;
+        # shifted-register operands appear in arithmetic instructions
+        # that produce only INT_*/COPY ops and no LOAD/STORE. We gate
+        # the DYNAMIC-only arm of is_memory on
+        # ``pcode_inspect.has_load_store(ghidra_insn)`` for ARM/AArch64
+        # to reject the shifted-register false positive. Other ISAs
+        # don't have ARM-style shifted-register operand modifiers; x86
+        # ``LEA RAX, [RSP+0x14]`` legitimately classifies as MEM with
+        # no LOAD/STORE in PCode (LEA computes the address into RAX),
+        # so we keep the unguarded DYNAMIC path there.
         scalar_in_objects = any(isinstance(o, Scalar) for o in objects or ())
-        try:
-            repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ()
-        except Exception:
-            repr_list = ()
-        # `[` is the ARM/x86/RISC-V bracket char; `(` is the PPC/MIPS
-        # bracket char (e.g. `std rN, -8(r1)`). Both indicate a real
-        # memory operand structure. Shifted-register operands like
-        # `sbc r1, r1, r1, lsl #N` have neither.
-        has_bracket = any(str(item) in ("[", "(") for item in repr_list)
-        is_memory = bool(register_objs) and has_bracket and (
+        instruction_has_mem_access = has_load_store(ghidra_insn)
+
+        arm_family = arch in (Architecture.ARM32, Architecture.AARCH64)
+        dynamic_admits_memory = (
             bool(op_type & OperandType.DYNAMIC)
+            and (not arm_family or instruction_has_mem_access)
+        )
+
+        is_memory = bool(register_objs) and (
+            dynamic_admits_memory
             or bool(op_type & OperandType.INDIRECT)
             or (
                 bool(op_type & OperandType.ADDRESS)
