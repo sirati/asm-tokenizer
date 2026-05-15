@@ -171,13 +171,26 @@ def _pred_string_ptr(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx)
     return not ctx.is_arithmetic and meta is not None and meta.kind == AddressKind.STRING
 
 
+def _pred_jump_table_slot(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    # Step 8a: jump-table slot — distinct emission shape from vtable /
+    # code_ptr_table slots (no modifier; emits a Jump_Table identity that
+    # bridges to the function-level footer via Category.JUMP_TABLE).
+    return (
+        not ctx.is_arithmetic
+        and meta is not None
+        and meta.kind == AddressKind.JUMP_TABLE_SLOT
+    )
+
+
 def _pred_slot_with_modifier(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
     if ctx.is_arithmetic or meta is None:
         return False
     # Vtables surface as CODE_PTR_TABLE_SLOT (precedence above the bare
     # rodata/data kinds). ``is_vtable`` is also exposed as a separate
     # boolean for the modifier-selection step in the emitter.
-    return meta.kind in {AddressKind.CODE_PTR_TABLE_SLOT, AddressKind.JUMP_TABLE_SLOT} or meta.is_vtable
+    # JUMP_TABLE_SLOT is handled by ``_pred_jump_table_slot`` (placed
+    # above this predicate in the precedence list) and never reaches here.
+    return meta.kind == AddressKind.CODE_PTR_TABLE_SLOT or meta.is_vtable
 
 
 def _pred_ro_data_ptr(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
@@ -249,7 +262,11 @@ class ConstantHandler:
             (_pred_ext_func_synthetic, "_emit_ext_func_synthetic"),
             # 7. String pointer
             (_pred_string_ptr,         "_emit_string_ptr"),
-            # 8. Vtable / code_ptr_table / jump_table slot with modifier
+            # 8a. Jump-table slot — own emitter (no modifier; bridges to
+            # the function-level footer via shared Category.JUMP_TABLE
+            # identity). MUST appear before the slot-with-modifier rule.
+            (_pred_jump_table_slot,    "_emit_jump_table_slot"),
+            # 8b. Vtable / code_ptr_table slot with modifier
             (_pred_slot_with_modifier, "_emit_slot_with_modifier"),
             # 9. Read-only data pointer
             (_pred_ro_data_ptr,        "_emit_ro_data_ptr"),
@@ -420,8 +437,31 @@ class ConstantHandler:
         tokens.extend(self._postfix_fp_annotation(ctx))
         return tokens
 
+    def _emit_jump_table_slot(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
+        """Step 8a: jump-table slot → ``[jump_table(id), valued_const(offset)]``.
+
+        Distinct from the vtable / code_ptr_table emission shape: NO
+        modifier prefix; instead emits the same ``Category.JUMP_TABLE``
+        identity used by the function-level footer in
+        ``fill_constant_candidates._emit_jump_table_footer``. Sharing the
+        identity bridges the two paths — a slot accessed before the
+        footer fires registers the table with the resolver, and the
+        footer-fallback path (Phase E.1 unified-emit) picks it up so the
+        function still emits a footer for the table.
+        """
+        jt_id = self.resolver.get_identity(
+            Category.JUMP_TABLE,
+            meta.jump_table_base_addr,
+            {"jump_table_addr": hex(meta.jump_table_base_addr)},
+        )
+        return [
+            self.vocab_manager.Jump_Table(jt_id),
+            self.vocab_manager.Valued_Const_V2(meta.jump_table_offset),
+            *self._postfix_fp_annotation(ctx),
+        ]
+
     def _emit_slot_with_modifier(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
-        """Step 8: code-pointer-array slot → modifier + decomposed target.
+        """Step 8b: code-pointer-array slot → modifier + decomposed target.
 
         Without slot-target resolution available from the providers today,
         we always decompose into the base-pointer + offset form documented
@@ -431,16 +471,17 @@ class ConstantHandler:
         offset. When a future provider enrichment exposes the resolved
         target, this emitter swaps the decomposition for the resolved
         token.
+
+        Jump-table slots are handled by ``_emit_jump_table_slot`` (Phase
+        E.1) and never reach this emitter — the precedence list routes
+        ``AddressKind.JUMP_TABLE_SLOT`` to the dedicated emitter first.
         """
-        # Pick the modifier — vtable beats code_ptr_table beats jump_table
-        # for stable ordering. precedence.md treats jump_table slots under
-        # step 8 with the ``code_ptr_table`` modifier semantically (a
-        # jump table is also a code-pointer array), so the precedence
-        # collapses to vtable-vs-code_ptr_table at emission time.
+        # Pick the modifier — vtable beats code_ptr_table for stable
+        # ordering (vtable is the more specific signal).
         if meta.is_vtable:
             modifier = self.vocab_manager.Vtable()
         else:
-            # CODE_PTR_TABLE_SLOT or JUMP_TABLE_SLOT
+            # CODE_PTR_TABLE_SLOT
             modifier = self.vocab_manager.Code_Ptr_Table()
 
         # Decompose: emit a ro_data_ptr for the base + valued_const for
