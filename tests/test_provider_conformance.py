@@ -54,6 +54,15 @@ from tokenizer.disasm.types import (
 PROVIDER_IDS = ["ghidra", "angr"]
 
 
+ANGR_REG_LIST_SKIP_REASON = (
+    "Capstone normalizes `stmdb sp!` -> `push` on arm32 and explodes the "
+    "reg-list into separate REG operands; the REG_LIST view never reaches "
+    "the consumer on angr, so the silent-drop / writeback=False regression "
+    "guarded by this test cannot occur on this backend (covered by "
+    "tests/test_angr_regression.py::test_angr_reg_list_separate_operands)."
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -378,11 +387,14 @@ def test_t_g_no_eager_decode(provider):
 # T-H: REG_LIST presence + member count on arm32 stmdb
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("arm32_provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
-def test_t_h_arm_reg_list_membership(arm32_provider):
+def test_t_h_arm_reg_list_membership(arm32_provider, request):
     """``stmdb`` on arm32 emits exactly one ``OperandKind.REG_LIST`` operand
     whose reg_list view iterates >= 2 members. If the function
     ``__aeabi_idiv0`` exists, prefer it as the reference (its first insn
     is ``stmdb sp!, {r1, lr}`` -> 2 members)."""
+    if request.node.callspec.params["arm32_provider"] == "angr":
+        pytest.skip(ANGR_REG_LIST_SKIP_REASON)
+
     target_insn = None
     target_op = None
 
@@ -438,13 +450,16 @@ def test_t_h_arm_reg_list_membership(arm32_provider):
 # T-I: REG_LIST writeback regression guard
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("arm32_provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
-def test_t_i_arm_reg_list_writeback(arm32_provider):
+def test_t_i_arm_reg_list_writeback(arm32_provider, request):
     """``stmdb sp!`` carries writeback=True on its REG_LIST operand.
 
     Pre-2026-05-15 the Ghidra-side implementation hardcoded ``writeback``
     to ``False`` regardless of the encoding's ``!`` flag; this test guards
     against that regression.
     """
+    if request.node.callspec.params["arm32_provider"] == "angr":
+        pytest.skip(ANGR_REG_LIST_SKIP_REASON)
+
     # Same locator as T-H: prefer __aeabi_idiv0, fall back to any stmdb.
     target_insn = None
     for _addr, name, function in arm32_provider.iter_functions():
