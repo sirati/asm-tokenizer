@@ -290,15 +290,13 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
            operands, ``Scalar.bitLength() / 8``. Take the largest value
            seen (x87 ``fld dword ptr [...]`` carries an FP-tagged
            memory operand whose size is the load size).
-        2. If no op-object width is available, fall back to
-           ``ghidra_insn.getOperandRefType(i).getSize()``.
-        3. Map width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
-        4. At width=2, reclassify Float16 -> BFloat16 when the
+        2. Map width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
+        3. At width=2, reclassify Float16 -> BFloat16 when the
            instruction's mnemonic appears in the per-ISA table
            (``_bfloat16_mnemonic_for_arch``). SLEIGH does not currently
            tag bfloat16 distinctly, so the mnemonic-based reclassification
            is the only signal available.
-        5. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
+        4. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
            classifier then routes through step 11 of the precedence list
            rather than emitting a malformed ``floatXX``).
 

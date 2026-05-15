@@ -108,15 +108,13 @@ def _compute_fp_type(
        ``Scalar.bitLength() / 8``. Take the largest value seen (x87
        ``fld dword ptr [...]`` carries an FP-tagged memory operand whose
        size is the load size).
-    2. If no op-object width is available, fall back to
-       ``ghidra_insn.getOperandRefType(i).getSize()``.
-    3. Map the resulting width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
-    4. At width=2, consult ``_bfloat16_mnemonic_for_arch(arch)`` against
+    2. Map the resulting width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
+    3. At width=2, consult ``_bfloat16_mnemonic_for_arch(arch)`` against
        the instruction's ``base_mnemonic`` (uppercase-compared) and
        reclassify Float16 -> BFloat16 on a hit. SLEIGH does not currently
        tag bfloat16 distinctly, so the mnemonic-based reclassification
        is the only signal available.
-    5. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
+    4. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
        classifier then routes through step 11 of the precedence list
        rather than emitting a malformed ``floatXX``).
     """
@@ -149,18 +147,6 @@ def _compute_fp_type(
             max_width_bits = width
 
     width_bytes = max_width_bits // 8
-    if width_bytes == 0:
-        # Fall back to the reference-type's reported access size
-        # (memory FP loads/stores).
-        try:
-            ref_type = ghidra_insn.getOperandRefType(operand_index)
-            if ref_type is not None:
-                size_bytes = int(ref_type.getSize())
-                if size_bytes > 0:
-                    width_bytes = size_bytes
-        except Exception:
-            pass
-
     fp_type = _FP_WIDTH_TO_TYPE.get(width_bytes)
     if fp_type is None:
         return None
