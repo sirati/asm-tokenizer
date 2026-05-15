@@ -119,6 +119,15 @@ class PPCProvider(ArchitectureProvider):
                     insn_tokens.append(
                         vocab_manager.get_registry_token(crx_reg.name, crx_reg.id)
                     )
+            elif op.kind == OperandKind.REG_LIST:
+                # No reg-list family instructions exist on PPC; the
+                # provider classifier should never produce this kind on
+                # PPC. Crash visibly rather than silently dropping.
+                raise AssertionError(
+                    f"Unexpected REG_LIST operand on PPC "
+                    f"(no reg-list family instructions known); operand at "
+                    f"insn 0x{insn.address:x}"
+                )
             elif op.kind == OperandKind.INVALID:
                 pass
             else:

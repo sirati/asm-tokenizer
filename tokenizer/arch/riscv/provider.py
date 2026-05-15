@@ -76,6 +76,16 @@ class RISCVProvider(ArchitectureProvider):
                         constant_handler,
                     )
                 )
+            elif op.kind == OperandKind.REG_LIST:
+                # No reg-list family instructions exist on RISC-V (the
+                # base ISA + standard extensions); the provider
+                # classifier should never produce this kind on RISC-V.
+                # Crash visibly rather than silently dropping.
+                raise AssertionError(
+                    f"Unexpected REG_LIST operand on RISC-V "
+                    f"(no reg-list family instructions known); operand at "
+                    f"insn 0x{insn.address:x}"
+                )
             elif op.kind == OperandKind.INVALID:
                 pass
             else:

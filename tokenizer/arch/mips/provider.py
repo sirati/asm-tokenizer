@@ -76,6 +76,15 @@ class MIPSProvider(ArchitectureProvider):
                         constant_handler,
                     )
                 )
+            elif op.kind == OperandKind.REG_LIST:
+                # No reg-list family instructions exist on MIPS; the
+                # provider classifier should never produce this kind on
+                # MIPS. Crash visibly rather than silently dropping.
+                raise AssertionError(
+                    f"Unexpected REG_LIST operand on MIPS "
+                    f"(no reg-list family instructions known); operand at "
+                    f"insn 0x{insn.address:x}"
+                )
             elif op.kind == OperandKind.INVALID:
                 pass
             else:

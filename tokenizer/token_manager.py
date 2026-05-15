@@ -31,6 +31,8 @@ from tokenizer.tokens import (
     OpaqueConstToken,
     PlatformToken,
     PltFuncToken,
+    RegisterListSymbol,
+    RegisterListToken,
     RoDataPtrToken,
     RwDataPtrToken,
     StringPtrToken,
@@ -202,6 +204,8 @@ class VocabularyManager:
                     token_type = TokenType.OPAQUE_CONST
                 elif value.startswith("MEM_"):
                     token_type = TokenType.MEMORY_OPERAND
+                elif value.startswith("REG_LIST_"):
+                    token_type = TokenType.REGISTER_LIST
 
                 token_types.append(token_type)
 
@@ -413,6 +417,8 @@ class VocabularyManager:
             return self.Opaque_Const
         elif token_type == TokenType.MEMORY_OPERAND:
             return self.MemoryOperand
+        elif token_type == TokenType.REGISTER_LIST:
+            return self.RegisterList
         elif token_type == TokenType.TOKEN_SET:
             return self.TokenSet
         # v2 category tokens (plan vivid-tinkering-wilkes.md). Dispatch
@@ -1480,6 +1486,52 @@ class VocabularyManager:
         assert issubclass(MemoryOperandTokenInner, MemoryOperandToken)
         assert MemoryOperandTokenInner.token_type == TokenType.MEMORY_OPERAND
 
+        class RegisterListTokenInner(TokensInner, RegisterListToken):
+            """Represents ARM register-list bracketing symbols (reglist{, }reglist, !)."""
+
+            __slots__ = ("symbol", "_token_id")
+            _token_cache = RegisterListToken.EnumTokenCache()
+
+            def __init__(self, symbol: RegisterListSymbol):
+                self.symbol = symbol
+                # Register the token and cache its ID
+                self._token_id = vocab_manager._private_add_token(symbol.token_str(), self.__class__)
+
+            @classmethod
+            def _from_enum(cls, symbol):
+                return cls(symbol)
+
+            @classmethod
+            def _get_enum_token_cache(cls) -> RegisterListToken.EnumTokenCache:
+                return cls._token_cache
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "RegisterListTokenInner":
+                """Reconstruct a RegisterListToken from token IDs"""
+                if len(token_ids) != 1:
+                    raise ValueError(f"Register list token must have exactly one ID, got {len(token_ids)}")
+
+                token_str = vocab_manager.get_token_str(token_ids[0])
+                for symbol in RegisterListSymbol:
+                    if symbol.token_str() == token_str:
+                        return cls(symbol)
+
+                raise ValueError(f"Invalid register list token string: {token_str}")
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array([self._token_id], dtype=np.int_)
+
+            def to_string(self) -> str:
+                return self.symbol.token_str()
+
+            def to_asm_like(self) -> str:
+                return str(self.symbol.value)
+
+        # Ensure RegisterListTokenInner conforms to both protocols
+        assert issubclass(RegisterListTokenInner, Tokens)
+        assert issubclass(RegisterListTokenInner, RegisterListToken)
+        assert RegisterListTokenInner.token_type == TokenType.REGISTER_LIST
+
         class TokenSetInner(TokensInner):
             """Represents a collection of tokens"""
 
@@ -1521,6 +1573,7 @@ class VocabularyManager:
         self.Block = BlockInner
         self.Opaque_Const = OpaqueConstInner
         self.MemoryOperand = MemoryOperandTokenInner
+        self.RegisterList = RegisterListTokenInner
         self.TokenSet = TokenSetInner
         # v2 category factories. Available on every VM (v1 or v2) but
         # guarded at construction time — instantiating any of these on a

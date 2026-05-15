@@ -89,6 +89,15 @@ class X86GhidraProvider(ArchitectureProvider):
                     constant_handler,
                 )
                 insn_tokens.extend(memory_tokens)
+            elif op.kind == OperandKind.REG_LIST:
+                # No reg-list family instructions exist on x86; the
+                # provider classifier should never produce this kind on
+                # x86. Crash visibly rather than silently dropping.
+                raise AssertionError(
+                    f"Unexpected REG_LIST operand on x86 "
+                    f"(no reg-list family instructions known); operand at "
+                    f"insn 0x{insn.address:x}"
+                )
             elif op.kind == OperandKind.INVALID:
                 raise Exception(f"Unsupported x86 operand type: {op.type_int}")
             else:
