@@ -398,11 +398,15 @@ def main_loop(
                             tokens_base64=tokens_base64,
                             block_runlength_base64=block_base64,
                             instruction_runlength_base64=insn_base64,
-                            # FunctionData's field name remains
-                            # ``opaque_metadata`` for v1 compatibility; v2
-                            # stores the JSON cell here so VERIFICATION
-                            # mode still has a readable artifact.
-                            opaque_metadata=metadata_cell,
+                            # ``metadata_cell`` carries whichever
+                            # metadata payload was written to the CSV:
+                            # the v1 ``opaque_metadata`` repr or the v2
+                            # ``metadata`` JSON cell. The wire-format
+                            # column name (chosen above via
+                            # ``metadata_column_name``) is the only
+                            # version-dependent thing; the in-memory
+                            # field is just the cell's content.
+                            metadata_cell=metadata_cell,
                         )
                         final_func_name = function_manager.add_function_data(
                             func_name, func_addr, temp_bbs, func_tokens, function_data

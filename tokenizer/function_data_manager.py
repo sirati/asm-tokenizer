@@ -17,7 +17,7 @@ class FunctionData:
     tokens_base64: str
     block_runlength_base64: str
     instruction_runlength_base64: str
-    opaque_metadata: str
+    metadata_cell: str
 
 
 class FunctionDataManager:
