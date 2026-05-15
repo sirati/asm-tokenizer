@@ -513,9 +513,20 @@ class _GhidraDecodeHelper:
             # literal-pool slot). Reuse the same helper the MEM path
             # uses; ``disp=0`` here disables the equal-to-disp filter
             # (a REG operand has no disp, so the filter is moot).
-            spec["resolved_target"] = _compute_resolved_target(
-                ghidra_insn, op_idx, disp=0
-            )
+            #
+            # Gate on instruction-has-LOAD/STORE: Ghidra's analyzer also
+            # propagates value-flow refs through pure-register
+            # instructions (e.g. aarch64 ``csel x1, x3, x1, ne`` —
+            # x1 inherits a string_ptr data-ref from an upstream
+            # ``adrp+add`` sequence). Without the gate, the resolved
+            # target on those operands surfaces a spurious string_ptr
+            # token mid-operand-list. Only LOAD-class instructions
+            # legitimately attach a string_ptr to the destination
+            # register (the literal-pool-load pattern).
+            if instruction_has_mem_access:
+                spec["resolved_target"] = _compute_resolved_target(
+                    ghidra_insn, op_idx, disp=0
+                )
             return spec
         if isinstance(first, Scalar):
             spec["kind"] = OperandKind.IMM
