@@ -374,7 +374,11 @@ class _GhidraDecodeHelper:
             repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ()
         except Exception:
             repr_list = ()
-        has_bracket = any(str(item) == "[" for item in repr_list)
+        # `[` is the ARM/x86/RISC-V bracket char; `(` is the PPC/MIPS
+        # bracket char (e.g. `std rN, -8(r1)`). Both indicate a real
+        # memory operand structure. Shifted-register operands like
+        # `sbc r1, r1, r1, lsl #N` have neither.
+        has_bracket = any(str(item) in ("[", "(") for item in repr_list)
         is_memory = bool(register_objs) and has_bracket and (
             bool(op_type & OperandType.DYNAMIC)
             or bool(op_type & OperandType.INDIRECT)
