@@ -64,6 +64,7 @@ class _GhidraMemoryOperandView:
         "_writeback",
         "_pre_indexed",
         "_post_indexed",
+        "_index_shift",
     )
 
     def __init__(self, arch: Architecture) -> None:
@@ -76,6 +77,11 @@ class _GhidraMemoryOperandView:
         self._writeback: bool = False
         self._pre_indexed: bool = False
         self._post_indexed: bool = False
+        # Index-shift sub-view is REUSED across operands (no per-operand
+        # allocation); ``_populate`` repoints the underlying kind+amount
+        # in-place each call so consumers re-reading ``mem.index_shift``
+        # after the parent operand advances see the new cursor's state.
+        self._index_shift = _GhidraShiftModifierView()
 
     def _populate(
         self,
@@ -91,6 +97,8 @@ class _GhidraMemoryOperandView:
         writeback: bool = False,
         pre_indexed: bool = False,
         post_indexed: bool = False,
+        index_shift_kind: ShiftKind = ShiftKind.NONE,
+        index_shift_amount: int = 0,
     ) -> None:
         if base_id != _REG_ID_ABSENT or base_name != _REG_NAME_ABSENT:
             self._base._advance(base_name, base_id)
@@ -109,6 +117,7 @@ class _GhidraMemoryOperandView:
         self._writeback = writeback
         self._pre_indexed = pre_indexed
         self._post_indexed = post_indexed
+        self._index_shift._populate(index_shift_kind, index_shift_amount)
 
     @property
     def base(self) -> RegisterView:
@@ -142,6 +151,10 @@ class _GhidraMemoryOperandView:
     def post_indexed(self) -> bool:
         return self._post_indexed
 
+    @property
+    def index_shift(self) -> ShiftModifierView:
+        return self._index_shift
+
     def __deepcopy__(self, memo) -> "_GhidraMemoryOperandView":
         clone = _GhidraMemoryOperandView(self._arch)
         clone._base = copy.deepcopy(self._base, memo)
@@ -152,6 +165,7 @@ class _GhidraMemoryOperandView:
         clone._writeback = self._writeback
         clone._pre_indexed = self._pre_indexed
         clone._post_indexed = self._post_indexed
+        clone._index_shift = copy.deepcopy(self._index_shift, memo)
         return clone
 
 

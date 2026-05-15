@@ -3,7 +3,12 @@ from typing import List
 from tokenizer.arch.operands_base import tokenize_operand_immediate_generic
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
-from tokenizer.disasm.types import InstructionView, OperandView, ShiftKind
+from tokenizer.disasm.types import (
+    InstructionView,
+    OperandView,
+    ShiftKind,
+    ShiftModifierView,
+)
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, RegisterListSymbol, Tokens
 
@@ -129,6 +134,12 @@ def tokenize_operand_memory(
         if has_base:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
         tokens.append(vocab_manager.get_registry_token(index.name, index.id))
+        # Shifted-index addressing (``[base, index, lsl #N]``): the
+        # shift modifier annotates the index register itself, so it
+        # sits BEFORE the close-bracket and AFTER the index-register
+        # token. ``index_shift.kind == ShiftKind.NONE`` covers every
+        # non-shifted-index addressing mode (no tokens emitted).
+        tokens.extend(_emit_shift_modifier_tokens(op.mem.index_shift, vocab_manager))
 
     # Offset / pre-indexed: disp INSIDE the brackets. Post-indexed: skip
     # the in-bracket disp emission; the disp is rendered after the
@@ -208,6 +219,29 @@ def tokenize_operand_reg_list(
     return tokens
 
 
+def _emit_shift_modifier_tokens(
+    shift: ShiftModifierView,
+    vocab_manager: VocabularyManager,
+) -> List[Tokens]:
+    """Emit shift-keyword + amount tokens for a ``ShiftModifierView``.
+
+    Shared core used by both ``tokenize_operand_shift`` (operand-level
+    shift, e.g. ``mov r0, r1, lsl #2``) and the memory-operand
+    ``index_shift`` emission (e.g. ``ldr r0, [r1, r2, lsl #1]``):
+    ``ShiftKind.NONE`` yields no tokens; otherwise emit the keyword
+    (lsl/lsr/asr/ror/rrx) as an ARITHMETIC platform token, followed by
+    a ValuedConst when the amount is non-zero.
+    """
+    tokens: List[Tokens] = []
+    if shift.kind != ShiftKind.NONE:
+        shift_name = _SHIFT_KIND_NAMES.get(shift.kind)
+        if shift_name is not None:
+            tokens.append(vocab_manager.PlatformToken(shift_name, PlatformInstructionTypes.ARITHMETIC))
+            if shift.amount != 0:
+                tokens.append(vocab_manager.ValuedConst(shift.amount))
+    return tokens
+
+
 def tokenize_operand_shift(
     insn: InstructionView,
     op: OperandView,
@@ -220,12 +254,4 @@ def tokenize_operand_shift(
     replacing the legacy ``hasattr(op, "shift") and op.shift.type != 0``
     probe.
     """
-    tokens = []
-    shift = op.shift
-    if shift.kind != ShiftKind.NONE:
-        shift_name = _SHIFT_KIND_NAMES.get(shift.kind)
-        if shift_name is not None:
-            tokens.append(vocab_manager.PlatformToken(shift_name, PlatformInstructionTypes.ARITHMETIC))
-            if shift.amount != 0:
-                tokens.append(vocab_manager.ValuedConst(shift.amount))
-    return tokens
+    return _emit_shift_modifier_tokens(op.shift, vocab_manager)

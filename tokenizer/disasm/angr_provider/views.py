@@ -112,7 +112,16 @@ class _AngrMemoryOperandView:
     segment register view is permanently absent.
     """
 
-    __slots__ = ("_op", "_cs_insn", "_arch", "_base", "_index", "_segment", "_segment_supported")
+    __slots__ = (
+        "_op",
+        "_cs_insn",
+        "_arch",
+        "_base",
+        "_index",
+        "_segment",
+        "_segment_supported",
+        "_index_shift",
+    )
 
     def __init__(self, arch: Architecture) -> None:
         self._op: Any = None
@@ -122,6 +131,13 @@ class _AngrMemoryOperandView:
         self._index = _AngrRegisterView(arch)
         self._segment = _AngrRegisterView(arch)
         self._segment_supported: bool = arch == Architecture.X86
+        # Index-shift sentinel: Capstone's mem sub-view doesn't carry an
+        # independent shift-on-index field (the ``op.shift`` on an ARM
+        # operand applies to the whole operand, which on x86/etc. is
+        # unrelated to a mem-index shift). Sentinel-NONE keeps the
+        # Protocol shape clean without engineering parity for the angr
+        # path (see ``angr_limitations.md``).
+        self._index_shift = _AngrShiftModifierView()
 
     def _set(self, cs_insn: Any, op: Any) -> None:
         self._cs_insn = cs_insn
@@ -181,6 +197,12 @@ class _AngrMemoryOperandView:
     @property
     def post_indexed(self) -> bool:
         return False
+
+    @property
+    def index_shift(self) -> ShiftModifierView:
+        # Sentinel-NONE shift; ``_op`` is not bound so the underlying
+        # reader returns ``ShiftKind.NONE`` + amount=0 unconditionally.
+        return self._index_shift
 
     def __deepcopy__(self, memo) -> "_AngrMemoryOperandView":
         clone = _AngrMemoryOperandView(self._arch)

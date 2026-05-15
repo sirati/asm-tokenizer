@@ -176,6 +176,12 @@ class MemoryOperandView(Protocol):
     @property
     def post_indexed(self) -> bool: ...     # ARM [base], #imm (base updated AFTER access)
 
+    @property
+    def index_shift(self) -> "ShiftModifierView": ...
+    # ARM [base, index, lsl #N] shift on the index register. ``kind ==
+    # ShiftKind.NONE`` on every non-shifted-index addressing mode and
+    # on non-ARM ISAs.
+
     def __deepcopy__(self, memo) -> "MemoryOperandView": ...
 
 

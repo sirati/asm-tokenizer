@@ -22,6 +22,22 @@ from dataclasses import dataclass
 from typing import Any
 
 from tokenizer.disasm.ghidra_provider.mnemonic import _SEGMENT_REGISTERS, _RegisterMap
+from tokenizer.disasm.types import ShiftKind
+
+
+# ARM shift-keyword (case-insensitive) -> typed ShiftKind. Used to lift the
+# shift modifier on shifted-index memory operands like
+# ``ldrb r5, [r7, r5, lsl #0x1]`` from
+# ``getDefaultOperandRepresentationList(op_idx)``. The keyword lives as a
+# bare ``String``/``Character`` item in the representation list (Ghidra
+# does not allocate a dedicated typed wrapper for it).
+_SHIFT_KEYWORD_TO_KIND: dict[str, ShiftKind] = {
+    "lsl": ShiftKind.LSL,
+    "lsr": ShiftKind.LSR,
+    "asr": ShiftKind.ASR,
+    "ror": ShiftKind.ROR,
+    "rrx": ShiftKind.RRX,
+}
 
 
 @dataclass
@@ -33,7 +49,11 @@ class MemoryDecomposition:
     ISA; the ARM-specific addressing-mode flags
     (``writeback``/``pre_indexed``/``post_indexed``) are mutually
     exclusive within their cluster and default to False on ISAs whose
-    addressing modes do not surface them.
+    addressing modes do not surface them. ``index_shift_kind`` /
+    ``index_shift_amount`` carry the shift modifier on a shifted-index
+    addressing mode like ``[base, index, lsl #N]``; the
+    ``ShiftKind.NONE`` default applies on every other addressing mode
+    and on non-ARM ISAs.
 
     Pre-indexed (``[base, #imm]!``): base register is updated by the
     offset BEFORE the memory access (``writeback`` is also True).
@@ -54,6 +74,83 @@ class MemoryDecomposition:
     writeback: bool = False
     pre_indexed: bool = False
     post_indexed: bool = False
+    index_shift_kind: ShiftKind = ShiftKind.NONE
+    index_shift_amount: int = 0
+
+
+def _inspect_arm_index_shift(
+    ghidra_insn: Any, op_idx: int
+) -> tuple[ShiftKind, int]:
+    """Detect the shift modifier on a shifted-index ARM mem operand.
+
+    ARM allows the index register to be shifted as part of the address
+    computation, e.g. ``ldrb r5, [r7, r5, lsl #0x1]``. Ghidra surfaces
+    this in two places:
+
+    - ``getOpObjects(op_idx)`` reports ``[Register(base), Register(index),
+      Scalar(amount)]`` (the Scalar is the *shift* amount, NOT a disp).
+    - ``getDefaultOperandRepresentationList(op_idx)`` renders the shift
+      keyword character-by-character as individual ``Character`` items
+      (the Ghidra ARM SLEIGH spec does not coalesce them into a single
+      ``String`` token). The keyword is sandwiched between the index
+      register and the shift-amount Scalar item.
+
+    Returns ``(kind, amount)``. ``kind == ShiftKind.NONE`` when no shift
+    modifier is present (the common case). ``rrx`` carries an implicit
+    1-bit rotate and ARM's asm spec forbids an explicit amount; the
+    returned ``amount`` mirrors whatever Ghidra emits (typically 0).
+    """
+    from ghidra.program.model.scalar import Scalar
+
+    try:
+        items = list(ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ())
+    except Exception:
+        return (ShiftKind.NONE, 0)
+
+    # Build a flat string view of the representation list so the
+    # character-by-character keyword rendering can be substring-
+    # matched. ``items_str`` retains the per-item indexing semantics:
+    # ``items_str[i]`` corresponds 1:1 with ``items[i]`` for non-multi-
+    # character items (Register / Scalar pretty-printed forms are
+    # themselves multi-char but they live OUTSIDE the keyword span, so
+    # substring-position decoding stays unambiguous).
+    items_str = [str(it).lower() for it in items]
+    flat = "".join(items_str)
+
+    found_kw: str | None = None
+    found_pos: int = -1
+    for kw in _SHIFT_KEYWORD_TO_KIND:
+        pos = flat.find(kw)
+        if pos != -1:
+            found_kw = kw
+            found_pos = pos
+            break
+
+    if found_kw is None:
+        return (ShiftKind.NONE, 0)
+
+    # Map the flat-string position back to a repr-list index so we can
+    # find the first Scalar AFTER the keyword. Walk items in order,
+    # accumulating their pretty-printed widths, until the cursor
+    # crosses ``found_pos + len(found_kw)``.
+    cursor = 0
+    kw_end_item_idx = 0
+    target_end = found_pos + len(found_kw)
+    for i, s in enumerate(items_str):
+        cursor += len(s)
+        if cursor >= target_end:
+            kw_end_item_idx = i + 1
+            break
+
+    amount = 0
+    for after in items[kw_end_item_idx:]:
+        if isinstance(after, Scalar):
+            amount = int(after.getValue())
+            break
+        if str(after) == "]":
+            break
+
+    return (_SHIFT_KEYWORD_TO_KIND[found_kw], amount)
 
 
 def _inspect_arm_mem_addressing(
@@ -260,13 +357,28 @@ def _compute_arm_memory_components(
     general_reg_ids: list[int] = []
     disp: int = 0
 
+    # Detect a shifted-index addressing mode BEFORE we walk the Scalar
+    # slots, so the Scalar that lives in ``getOpObjects()`` can be
+    # correctly attributed to the index-shift amount instead of being
+    # spuriously taken as a displacement. Without this guard,
+    # ``ldrb r5, [r7, r5, lsl #0x1]`` reads the ``#0x1`` as ``disp=1``
+    # and emits a bogus ``[r7+r5+1]`` rendering.
+    index_shift_kind, index_shift_amount = _inspect_arm_index_shift(
+        ghidra_insn, op_idx
+    )
+    has_index_shift = index_shift_kind != ShiftKind.NONE
+
     for obj in objects or ():
         if isinstance(obj, Register):
             name = str(obj.getName()).lower()
             general_reg_names.append(name)
             general_reg_ids.append(reg_map.get_id(name))
         elif isinstance(obj, Scalar):
-            disp = int(obj.getSignedValue())
+            # In a shifted-index addressing mode the Scalar is the
+            # shift amount, NOT a displacement; ``index_shift_amount``
+            # already captured it from the representation list.
+            if not has_index_shift:
+                disp = int(obj.getSignedValue())
         elif isinstance(obj, Address):
             disp = int(obj.getOffset())
 
@@ -296,6 +408,8 @@ def _compute_arm_memory_components(
         writeback=writeback,
         pre_indexed=pre_indexed,
         post_indexed=post_indexed,
+        index_shift_kind=index_shift_kind,
+        index_shift_amount=index_shift_amount,
     )
 
 

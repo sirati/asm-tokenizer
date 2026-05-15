@@ -150,6 +150,8 @@ class _GhidraDecodeHelper:
                 writeback=decomp.writeback,
                 pre_indexed=decomp.pre_indexed,
                 post_indexed=decomp.post_indexed,
+                index_shift_kind=decomp.index_shift_kind,
+                index_shift_amount=decomp.index_shift_amount,
             )
 
         return _populate
