@@ -64,12 +64,31 @@
         };
       };
 
+      # Patch Ghidra 12.0's broken riscv.opinion (every variant constraint
+      # references a deprecated 'RV(32|64)*' name that was retired from
+      # riscv.ldefs when 64- and 32-bit subvariants were consolidated to a
+      # single variant="default" entry; the result is "No load spec found"
+      # for every riscv ELF). Upstream commit 6208df2 ("GP-1 Corrected
+      # RISCV import opinion file") rolled the fix into Ghidra 12.0.1.
+      # Nixpkgs master is on 12.0.4, but bumping our nixpkgs pin cascades
+      # to angr-9.2.193 which requires setuptools-rust we don't provide
+      # here; surgical patch is cheaper.
+      ghidraOverlay = final: prev: {
+        ghidra = prev.ghidra.overrideAttrs (old: {
+          postPatch = (old.postPatch or "") + ''
+            sed -i -E 's/variant="RV(32|64)[A-Z]+"/variant="default"/g' \
+              Ghidra/Processors/RISCV/data/languages/riscv.opinion
+          '';
+        });
+      };
+
       pkgsFor =
         system:
         import nixpkgs {
           inherit system;
           overlays = [
             pyghidraOverlay
+            ghidraOverlay
             # Injects `dynamic-runner` into every Python package set,
             # so `pkgs.python314.pkgs.dynamic-runner` is in scope.
             dynamic-runner.overlays.default
