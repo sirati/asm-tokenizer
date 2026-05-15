@@ -4,6 +4,7 @@ from typing import List
 from tokenizer.arch.arm32.operands import (
     tokenize_operand_immediate,
     tokenize_operand_memory,
+    tokenize_operand_reg_list,
     tokenize_operand_shift,
 )
 from tokenizer.arch.provider import ArchitectureProvider
@@ -134,6 +135,12 @@ class ARM32Provider(ArchitectureProvider):
                     constant_handler,
                 )
                 insn_tokens.extend(memory_tokens)
+            elif op.kind == OperandKind.REG_LIST:
+                # ARM stm/ldm/push/pop/vpush/vpop/vstm/vldm family — the
+                # provider classifies any operand with >= 3 Register objects
+                # as REG_LIST so we never lose registers to silent truncation
+                # in the MEM-decompose helpers.
+                insn_tokens.extend(tokenize_operand_reg_list(op, vocab_manager))
             elif op.kind == OperandKind.INVALID:
                 pass  # invalid/unused operand slot
             else:

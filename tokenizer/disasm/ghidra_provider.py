@@ -1331,6 +1331,13 @@ def _compute_x86_memory_components(
         2 general regs   -> first Scalar = scale, remaining Scalars = disp
         0-1 general regs -> all Scalars = disp
         Address objects  -> disp
+
+    The first GP Register in ``getOpObjects()`` is the base; the second is
+    the index. This is the Ghidra SLEIGH spec's documented convention.
+    Operands not conforming (3+ regs => reg-list) MUST have been
+    classified upstream as ``OperandKind.REG_LIST`` so this function
+    never sees them; the assert at the end of the object-walk enforces
+    that invariant.
     """
     from ghidra.program.model.address import Address
     from ghidra.program.model.lang import Register
@@ -1362,6 +1369,16 @@ def _compute_x86_memory_components(
         elif isinstance(obj, Address):
             disp = int(obj.getOffset())
 
+    assert len(general_reg_names) <= 2, (
+        f"x86 MEM operand should have at most 2 GP registers, got "
+        f"{len(general_reg_names)}: {general_reg_names!r}. If this fires, "
+        f"the operand should have classified as REG_LIST upstream."
+    )
+    assert len(scalars) <= 2, (
+        f"x86 MEM operand should have at most 2 Scalar slots (scale + "
+        f"disp), got {len(scalars)}: {scalars!r}"
+    )
+
     base_name = general_reg_names[0] if general_reg_names else ""
     base_id = general_reg_ids[0] if general_reg_ids else 0
     index_name = general_reg_names[1] if len(general_reg_names) >= 2 else ""
@@ -1390,7 +1407,12 @@ def _compute_arm_memory_components(
     as the x86 helper, with scale=1 fixed and segment slots absent.
 
     First general-purpose Register -> base; second -> index; first
-    Scalar/Address -> disp.
+    Scalar/Address -> disp. This is the Ghidra SLEIGH spec's documented
+    convention. Operands not conforming (3+ regs => reg-list)
+    MUST have been classified upstream as ``OperandKind.REG_LIST`` so
+    this function never sees them (stm/ldm/push/pop/vpush/vpop/vstm/vldm
+    family); the assert at the end of the object-walk enforces that
+    invariant.
     """
     from ghidra.program.model.address import Address
     from ghidra.program.model.lang import Register
@@ -1412,6 +1434,13 @@ def _compute_arm_memory_components(
         elif isinstance(obj, Address):
             disp = int(obj.getOffset())
 
+    assert len(general_reg_names) <= 2, (
+        f"ARM MEM operand should have at most 2 GP registers, got "
+        f"{len(general_reg_names)}: {general_reg_names!r}. If this fires, "
+        f"the operand should have classified as REG_LIST upstream "
+        f"(stm/ldm/push/pop/vpush/vpop/vstm/vldm family)."
+    )
+
     base_name = general_reg_names[0] if general_reg_names else ""
     base_id = general_reg_ids[0] if general_reg_ids else 0
     index_name = general_reg_names[1] if len(general_reg_names) >= 2 else ""
@@ -1430,6 +1459,12 @@ def _compute_base_disp_memory_components(
     These ISAs only ever have one base register + one displacement; no
     index, no scale, no segment. Returns the 8-tuple with index slot
     absent, scale=1, segment slots absent.
+
+    The first GP Register in ``getOpObjects()`` is the base. This is the
+    Ghidra SLEIGH spec's documented convention. Operands not conforming
+    (3+ regs => reg-list) MUST have been classified upstream as
+    ``OperandKind.REG_LIST`` so this function never sees them; the
+    assert below enforces the invariant.
     """
     from ghidra.program.model.address import Address
     from ghidra.program.model.lang import Register
@@ -1440,16 +1475,24 @@ def _compute_base_disp_memory_components(
     base_name: str = ""
     base_id: int = 0
     disp: int = 0
+    general_regs: list[str] = []
 
     for obj in objects or ():
         if isinstance(obj, Register):
+            name = str(obj.getName()).lower()
+            general_regs.append(name)
             if base_name == "":
-                base_name = str(obj.getName()).lower()
+                base_name = name
                 base_id = reg_map.get_id(base_name)
         elif isinstance(obj, Scalar):
             disp = int(obj.getSignedValue())
         elif isinstance(obj, Address):
             disp = int(obj.getOffset())
+
+    assert len(general_regs) <= 1, (
+        f"base+disp MEM operand should have at most 1 GP register, "
+        f"got {len(general_regs)}: {general_regs!r}"
+    )
 
     return base_name, base_id, "", 0, 1, disp, "", 0
 
@@ -1672,6 +1715,65 @@ class _GhidraDecodeHelper:
 
         return _populate
 
+    def _decompose_reg_list_callback(
+        self,
+        ghidra_insn: Any,
+        op_idx: int,
+        arch: Architecture,
+    ) -> Any:
+        """Return a zero-arg callable that decomposes a REG_LIST operand
+        into a passed-in ``_GhidraRegisterListView``.
+
+        ARM stm/ldm-family operands surface in ``getOpObjects()`` as a
+        flat sequence of Register objects. The Ghidra SLEIGH convention
+        for these encodings is: the FIRST Register is the writeback
+        target (the base register that lives *outside* the braces in
+        the asm); the remaining Registers are the list members (the
+        registers *inside* the braces).
+
+        Writeback (`!`) detection is currently unsupported: Ghidra's
+        ``OperandType`` bitmask has no documented writeback bit, and the
+        existing ``_build_prefixes_arm`` is a stub. We therefore set
+        ``writeback=False`` here for every reg-list operand.
+        TODO: writeback detection (likely via raw mnemonic parsing or
+        PCode self-assignment inspection) is deferred.
+        """
+        from ghidra.program.model.lang import Register
+
+        reg_map = self._reg_map
+
+        def _populate(reg_list_view) -> None:
+            try:
+                objects = ghidra_insn.getOpObjects(op_idx)
+            except Exception:
+                objects = ()
+
+            regs: list[tuple[str, int]] = []
+            for obj in objects or ():
+                if isinstance(obj, Register):
+                    name = str(obj.getName()).lower()
+                    regs.append((name, reg_map.get_id(name)))
+
+            if regs:
+                base_name, base_id = regs[0]
+                member_specs = regs[1:]
+            else:
+                # Sentinel-absent: name="" + id=0 matches _GhidraRegisterView
+                # 's `_set_absent` shape (sentinels are private to
+                # ghidra_views.py; using their values directly keeps the
+                # cross-module surface clean).
+                base_name, base_id = "", 0
+                member_specs = []
+
+            reg_list_view._advance(
+                base_name=base_name,
+                base_id=base_id,
+                writeback=False,
+                member_specs=member_specs,
+            )
+
+        return _populate
+
     def operand_spec(
         self,
         ghidra_insn: Any,
@@ -1733,9 +1835,27 @@ class _GhidraDecodeHelper:
             shift_amount=0,
             crx_reg_name="",
             crx_reg_id=0,
+            decompose_reg_list=None,
         )
 
         if not objects:
+            return spec
+
+        # Reg-list classification (ARM stm/ldm/push/pop/vpush/vpop/vstm/
+        # vldm family). Ghidra's SLEIGH spec emits a flat sequence of
+        # Register objects for reg-list operands; standard MEM operands
+        # on every supported ISA carry at most 2 Registers (base+index
+        # on x86/ARM, base-only on MIPS/PPC/RISC-V). Three or more
+        # Registers in a single operand can therefore only be a
+        # reg-list; classify accordingly so the MEM-decompose helpers
+        # never see them (asserts in those helpers enforce the
+        # invariant downstream).
+        register_objs = [o for o in objects if isinstance(o, Register)]
+        if len(register_objs) >= 3:
+            spec["kind"] = OperandKind.REG_LIST
+            spec["decompose_reg_list"] = self._decompose_reg_list_callback(
+                ghidra_insn, op_idx, arch
+            )
             return spec
 
         if is_memory:

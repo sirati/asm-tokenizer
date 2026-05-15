@@ -55,6 +55,7 @@ from tokenizer.disasm.types import (
     PpcBranchConditionPrefixView,
     PpcUpdateCr0PrefixView,
     PrefixesView,
+    RegisterListView,
     RegisterView,
     RepPrefixView,
     SegmentOverridePrefixView,
@@ -301,6 +302,116 @@ class _GhidraCrxFieldView:
 
 
 # ---------------------------------------------------------------------------
+# Register-list sub-view (ARM stm/ldm-family)
+# ---------------------------------------------------------------------------
+class _GhidraRegisterListView:
+    """Sub-view bound to the parent operand's cursor for ARM reg-list operands.
+
+    Holds the decomposed (base, writeback, [members]) for the current
+    reg-list operand. The parent ``_GhidraOperandView`` populates this
+    once on first ``op.reg_list`` access (via the provider's reg-list
+    decomposition callback) and re-populates whenever the parent
+    advances.
+
+    Member registers are exposed as reusable ``_GhidraRegisterView``
+    cursors. ``__iter__`` mutates ``_active_member`` to point at
+    consecutive members and yields the SAME cursor instance per member;
+    ``__getitem__`` returns a per-slot wrapper (small finite count, the
+    member-view pool grows lazily on demand).
+    """
+
+    __slots__ = (
+        "_arch",
+        "_reg_map",
+        "_base_view",
+        "_writeback",
+        "_member_views",
+        "_member_specs",
+        "_active_member",
+    )
+
+    def __init__(self, arch: Architecture, reg_map: Any) -> None:
+        self._arch: Architecture = arch
+        self._reg_map = reg_map
+        self._base_view = _GhidraRegisterView(arch)
+        self._writeback: bool = False
+        # Per-member reusable register cursors; grown lazily on demand.
+        self._member_views: list[_GhidraRegisterView] = []
+        # Snapshot of (name, id) tuples for the current cursor's members.
+        # `__iter__` walks this list and repoints `_member_views[i]` per slot.
+        self._member_specs: list[tuple[str, int]] = []
+        self._active_member: int = -1
+
+    def _advance(
+        self,
+        *,
+        base_name: str,
+        base_id: int,
+        writeback: bool,
+        member_specs: list[tuple[str, int]],
+    ) -> None:
+        """Repoint at the next reg-list operand.
+
+        ``base_name``/``base_id`` describe the writeback target outside
+        the braces (may be absent when Ghidra reports the base as a
+        separate sibling operand); ``member_specs`` is the list of
+        (name, id) tuples for each register inside the braces.
+        """
+        if base_id != _REG_ID_ABSENT or base_name != _REG_NAME_ABSENT:
+            self._base_view._advance(base_name, base_id)
+        else:
+            self._base_view._set_absent()
+        self._writeback = writeback
+        self._member_specs = member_specs
+        # Ensure we have enough reusable register cursors for this list.
+        while len(self._member_views) < len(member_specs):
+            self._member_views.append(_GhidraRegisterView(self._arch))
+        self._active_member = -1
+
+    @property
+    def base(self) -> RegisterView:
+        return self._base_view
+
+    @property
+    def writeback(self) -> bool:
+        return self._writeback
+
+    def __len__(self) -> int:
+        return len(self._member_specs)
+
+    def __iter__(self) -> Iterator[RegisterView]:
+        for i, (name, rid) in enumerate(self._member_specs):
+            self._active_member = i
+            view = self._member_views[i]
+            view._advance(name, rid)
+            yield view
+
+    def __getitem__(self, idx: int) -> RegisterView:
+        if idx < 0:
+            idx += len(self._member_specs)
+        if not (0 <= idx < len(self._member_specs)):
+            raise IndexError(idx)
+        name, rid = self._member_specs[idx]
+        # Member views are small/finite; reuse the slot's cursor.
+        while len(self._member_views) <= idx:
+            self._member_views.append(_GhidraRegisterView(self._arch))
+        view = self._member_views[idx]
+        view._advance(name, rid)
+        return view
+
+    def __deepcopy__(self, memo) -> "_GhidraRegisterListView":
+        clone = _GhidraRegisterListView(self._arch, self._reg_map)
+        clone._base_view = copy.deepcopy(self._base_view, memo)
+        clone._writeback = self._writeback
+        # Snapshot the member-spec list (tuples are immutable).
+        clone._member_specs = list(self._member_specs)
+        # Pre-allocate matching cursors so the clone's iteration works
+        # without re-checking growth.
+        clone._member_views = [_GhidraRegisterView(self._arch) for _ in clone._member_specs]
+        return clone
+
+
+# ---------------------------------------------------------------------------
 # Operand
 # ---------------------------------------------------------------------------
 class _GhidraOperandView:
@@ -331,14 +442,17 @@ class _GhidraOperandView:
         "_mem",
         "_shift",
         "_crx",
+        "_reg_list",
         "_size",
         "_fp_type",
         "_type_int",
         "_decompose_mem",
         "_mem_decomposed",
+        "_decompose_reg_list",
+        "_reg_list_decomposed",
     )
 
-    def __init__(self, arch: Architecture) -> None:
+    def __init__(self, arch: Architecture, reg_map: Any = None) -> None:
         self._arch: Architecture = arch
         self._kind: OperandKind = OperandKind.INVALID
         self._reg = _GhidraRegisterView(arch)
@@ -346,11 +460,14 @@ class _GhidraOperandView:
         self._mem = _GhidraMemoryOperandView(arch)
         self._shift = _GhidraShiftModifierView()
         self._crx = _GhidraCrxFieldView(arch)
+        self._reg_list = _GhidraRegisterListView(arch, reg_map)
         self._size: int = 0
         self._fp_type: Optional[FpType] = None
         self._type_int: int = 0
         self._decompose_mem: Optional[Any] = None
         self._mem_decomposed: bool = False
+        self._decompose_reg_list: Optional[Any] = None
+        self._reg_list_decomposed: bool = False
 
     def _advance(
         self,
@@ -367,16 +484,19 @@ class _GhidraOperandView:
         shift_amount: int,
         crx_reg_name: str,
         crx_reg_id: int,
+        decompose_reg_list: Optional[Any] = None,
     ) -> None:
         """Repoint the operand wrapper at the next operand.
 
-        Resets sub-view state (mem-decomposition cache, shift, crx) so
-        bound sub-views reflect the new operand on next access.
+        Resets sub-view state (mem-decomposition cache, shift, crx,
+        reg-list decomposition cache) so bound sub-views reflect the new
+        operand on next access.
 
         ``decompose_mem`` is a zero-argument callable that mutates
         ``self._mem`` via its ``_populate`` method. Provided ONLY when
         ``kind == OperandKind.MEM``; ``None`` otherwise (no MEM access
-        is expected on non-MEM kinds).
+        is expected on non-MEM kinds). Mirror semantics apply to
+        ``decompose_reg_list`` for ``kind == OperandKind.REG_LIST``.
         """
         self._kind = kind
         if reg_id != _REG_ID_ABSENT or reg_name != _REG_NAME_ABSENT:
@@ -389,6 +509,8 @@ class _GhidraOperandView:
         self._type_int = type_int
         self._decompose_mem = decompose_mem
         self._mem_decomposed = False
+        self._decompose_reg_list = decompose_reg_list
+        self._reg_list_decomposed = False
         self._shift._populate(shift_kind, shift_amount)
         self._crx._populate(crx_reg_name, crx_reg_id)
 
@@ -422,6 +544,15 @@ class _GhidraOperandView:
         return self._shift
 
     @property
+    def reg_list(self) -> RegisterListView:
+        if not self._reg_list_decomposed and self._decompose_reg_list is not None:
+            # Decompose lazily on first access; per-cursor cache so
+            # repeated reads of ``reg_list`` etc. don't redo the work.
+            self._decompose_reg_list(self._reg_list)
+            self._reg_list_decomposed = True
+        return self._reg_list
+
+    @property
     def size(self) -> int:
         return self._size
 
@@ -434,7 +565,7 @@ class _GhidraOperandView:
         return self._type_int
 
     def __deepcopy__(self, memo) -> "_GhidraOperandView":
-        clone = _GhidraOperandView(self._arch)
+        clone = _GhidraOperandView(self._arch, self._reg_list._reg_map)
         clone._kind = self._kind
         clone._reg = copy.deepcopy(self._reg, memo)
         clone._imm = self._imm
@@ -446,6 +577,12 @@ class _GhidraOperandView:
         clone._mem = copy.deepcopy(self._mem, memo)
         clone._shift = copy.deepcopy(self._shift, memo)
         clone._crx = copy.deepcopy(self._crx, memo)
+        # Mirror MEM materialization for REG_LIST so the clone's reg_list
+        # reflects the current cursor's data.
+        if not self._reg_list_decomposed and self._decompose_reg_list is not None:
+            self._decompose_reg_list(self._reg_list)
+            self._reg_list_decomposed = True
+        clone._reg_list = copy.deepcopy(self._reg_list, memo)
         clone._size = self._size
         clone._fp_type = self._fp_type
         clone._type_int = self._type_int
@@ -454,6 +591,8 @@ class _GhidraOperandView:
         # materialized above) so we don't need to carry it.
         clone._decompose_mem = None
         clone._mem_decomposed = True
+        clone._decompose_reg_list = None
+        clone._reg_list_decomposed = True
         return clone
 
 
@@ -606,7 +745,7 @@ class _GhidraInstructionView:
         self._op_str: str = ""
         self._operand_count: int = 0
         self._prefixes = _GhidraPrefixesView()
-        self._operand_view = _GhidraOperandView(arch)
+        self._operand_view = _GhidraOperandView(arch, reg_map)
         self._operands_view = _GhidraOperandsView(self)
 
     def _advance(self, ghidra_insn: Any) -> None:

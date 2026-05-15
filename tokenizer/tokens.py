@@ -142,6 +142,11 @@ class TokenType(IntEnum):
     THREAD_LOCAL = 25
     VTABLE = 26
     CODE_PTR_TABLE = 27
+    # ARM register-list bracketing (stm/ldm/push/pop/vpush/vpop/vstm/vldm).
+    # Parallel to MEMORY_OPERAND in shape: a small fixed enum of bracket /
+    # writeback symbols, paired open/close framing around the register-token
+    # members.
+    REGISTER_LIST = 28
     UNRESOLVED = -1
 
 
@@ -168,6 +173,31 @@ class MemoryOperandSymbol(Enum):
             return "MEM_MULTIPLY"
         else:
             raise ValueError(f"Unknown memory operand symbol: {self}")
+
+
+class RegisterListSymbol(Enum):
+    """Enum for ARM register-list bracketing + writeback symbols.
+
+    Mirrors the real ARM asm syntax ``stmdb sp!, {r4, lr}``: open/close
+    braces frame the list members; the writeback ``!`` marks the base
+    register as updated. The asm-form values are used as the asm-like
+    debug string; ``token_str()`` returns the vocab-stable name.
+    """
+
+    OPEN_BRACE = "reglist{"
+    CLOSE_BRACE = "}reglist"
+    WRITEBACK = "!"
+
+    def token_str(self) -> str:
+        """Get the vocab-stable string for the register-list symbol."""
+        if self == RegisterListSymbol.OPEN_BRACE:
+            return "REG_LIST_OPEN_BRACE"
+        elif self == RegisterListSymbol.CLOSE_BRACE:
+            return "REG_LIST_CLOSE_BRACE"
+        elif self == RegisterListSymbol.WRITEBACK:
+            return "REG_LIST_WRITEBACK"
+        else:
+            raise ValueError(f"Unknown register-list symbol: {self}")
 
 
 class Tokens(ABC):
@@ -706,6 +736,29 @@ class MemoryOperandToken(Tokens, ABC):
 
     @abstractmethod
     def __init__(self, symbol: MemoryOperandSymbol) -> None: ...
+
+    def _register_on(self, cls_other):
+        return cls_other(self.symbol)
+
+
+@EnumTokenCls(RegisterListSymbol)
+class RegisterListToken(Tokens, ABC):
+    """Protocol for ARM register-list bracketing tokens.
+
+    Parallel shape to ``MemoryOperandToken``: a fixed enum of symbols
+    (OPEN_BRACE / CLOSE_BRACE / WRITEBACK), one vocab entry per symbol,
+    framing inline register tokens for stm/ldm-family ARM instructions.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        """Return the type of this token representation"""
+        return TokenType.REGISTER_LIST
+
+    symbol: RegisterListSymbol
+
+    @abstractmethod
+    def __init__(self, symbol: RegisterListSymbol) -> None: ...
 
     def _register_on(self, cls_other):
         return cls_other(self.symbol)

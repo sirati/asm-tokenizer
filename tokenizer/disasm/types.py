@@ -48,6 +48,7 @@ class OperandKind(IntEnum):
     IMM = 2
     MEM = 3
     CRX = 4         # PPC condition-register field
+    REG_LIST = 5    # ARM stm/ldm/push/pop/vpush/vpop/vstm/vldm register list
     OTHER = 99      # ARM FP/CIMM/PIMM/SETEND/SYSREG passthrough
 
 
@@ -168,6 +169,39 @@ class CrxFieldView(Protocol):
     def __deepcopy__(self, memo) -> "CrxFieldView": ...
 
 
+@runtime_checkable
+class RegisterListView(Protocol):
+    """Sub-view bound to the parent OperandView for ARM register-list operands.
+
+    Modelled after the real ARM asm shape ``stmdb sp!, {r4, lr}``:
+    ``base`` is the writeback target (the register *outside* the braces; e.g.
+    ``sp`` in ``stmdb``), ``writeback`` is the ``!`` flag, and iterating the
+    view yields one ``RegisterView`` per list member (the registers *inside*
+    the braces). ``base.is_absent`` when the encoding does not carry a
+    separate base slot (e.g. Ghidra may report a standalone reg-list operand
+    where the base is a separate sibling operand).
+
+    Like the other sub-views, this object is REUSABLE - bound to its parent
+    ``OperandView``'s cursor; member-register sub-views are also reused
+    across ``__iter__`` (see lifecycle docstring at top of this module).
+    ``deepcopy`` snapshots the current member spec into a fresh wrapper.
+    """
+
+    @property
+    def base(self) -> RegisterView: ...   # writeback target; is_absent if absent
+
+    @property
+    def writeback(self) -> bool: ...      # the `!` flag
+
+    def __len__(self) -> int: ...         # list-member count (excluding base)
+
+    def __iter__(self) -> Iterator[RegisterView]: ...  # iterates members
+
+    def __getitem__(self, idx: int) -> RegisterView: ...  # small finite count
+
+    def __deepcopy__(self, memo) -> "RegisterListView": ...
+
+
 # ---- INSTRUCTION PREFIXES (general concept; typed list per instruction) ----
 class InstructionPrefixView(ABC):
     """Base for typed instruction prefixes. Count per instruction is small
@@ -250,6 +284,9 @@ class OperandView(Protocol):
 
     @property
     def shift(self) -> ShiftModifierView: ...
+
+    @property
+    def reg_list(self) -> RegisterListView: ...  # valid when kind == OperandKind.REG_LIST
 
     @property
     def size(self) -> int: ...                # bytes

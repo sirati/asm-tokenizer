@@ -5,7 +5,7 @@ from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
 from tokenizer.disasm.types import InstructionView, OperandView, ShiftKind
 from tokenizer.token_manager import VocabularyManager
-from tokenizer.tokens import MemoryOperandSymbol, Tokens
+from tokenizer.tokens import MemoryOperandSymbol, RegisterListSymbol, Tokens
 
 # Typed ShiftKind -> ARM asm-form shift word. Mirrors the legacy
 # Capstone-int table 1..5 -> {lsl, lsr, asr, ror, rrx}; the typed enum
@@ -100,6 +100,33 @@ def tokenize_operand_memory(
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
 
+    return tokens
+
+
+def tokenize_operand_reg_list(
+    op: OperandView,
+    vocab_manager: VocabularyManager,
+) -> List[Tokens]:
+    """Tokenize an ARM register-list operand (stm/ldm/push/pop/vpush/vpop/
+    vstm/vldm family).
+
+    Asm shape: ``[base [!]] { r0, r1, ... }``. The base register (writeback
+    target) is emitted first when present, optionally followed by the
+    writeback marker; then the open-brace, the list members in order, and
+    the close-brace. Mirrors ``tokenize_operand_memory``'s use of the
+    typed ``MemoryOperandSymbol`` enum but uses ``RegisterListSymbol``.
+    """
+    tokens: List[Tokens] = []
+    rl = op.reg_list
+    base = rl.base
+    if not base.is_absent:
+        tokens.append(vocab_manager.get_registry_token(base.name, base.id))
+        if rl.writeback:
+            tokens.append(vocab_manager.RegisterList(RegisterListSymbol.WRITEBACK))
+    tokens.append(vocab_manager.RegisterList(RegisterListSymbol.OPEN_BRACE))
+    for member in rl:
+        tokens.append(vocab_manager.get_registry_token(member.name, member.id))
+    tokens.append(vocab_manager.RegisterList(RegisterListSymbol.CLOSE_BRACE))
     return tokens
 
 

@@ -80,6 +80,15 @@ class X86AngrProvider(ArchitectureProvider):
                     constant_handler,
                 )
                 insn_tokens.extend(memory_tokens)
+            elif op.kind == OperandKind.REG_LIST:
+                # No reg-list family instructions exist on x86; Capstone
+                # never surfaces this kind on the angr/Capstone path
+                # either. Crash visibly rather than silently dropping.
+                raise AssertionError(
+                    f"Unexpected REG_LIST operand on x86 "
+                    f"(no reg-list family instructions known); operand at "
+                    f"insn 0x{insn.address:x}"
+                )
             elif op.kind == OperandKind.INVALID:
                 # Empty operand slot (Capstone reports type 0). The legacy
                 # consumer raised here; the typed path treats it the same
