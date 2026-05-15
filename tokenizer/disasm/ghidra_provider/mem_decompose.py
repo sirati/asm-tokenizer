@@ -21,36 +21,42 @@ from typing import Any
 from tokenizer.disasm.ghidra_provider.mnemonic import _SEGMENT_REGISTERS, _RegisterMap
 
 
-def _infer_mem_size_from_ghidra_insn(ghidra_insn: Any, default: int = 8) -> int:
-    """Infer x86 memory-operand size from sibling register operands.
+def _infer_mem_access_size(ghidra_insn: Any, op_idx: int, default: int = 8) -> int:
+    """Return the memory-access size in bytes for operand ``op_idx``.
 
-    Ported verbatim from the legacy
-    ``tokenizer/arch/x86/ghidra/operands.py::_infer_size_from_ghidra_insn``
-    (deleted in G.3); the post-G.3 consumer (the shared
-    ``arch/x86/operands.py::tokenize_operand_memory``) reads ``op.size``
-    uniformly across both providers, so the inference now stamps the
-    operand spec at decode time.
+    Reads SLEIGH-emitted PCode ``LOAD`` output-varnode size and ``STORE``
+    value-input size. This is the only reliable oracle - sibling-
+    register width conflates address-computation regs (pointer-width,
+    e.g. r14 = 8B on x64) with value regs (actual memory-access width),
+    breaking 0x66 operand-size-override (``or word ptr [r14+...], ax``
+    seen as qword) and MOVZX/MOVSX byte/word -> wider destination.
 
-    Checks ``getResultObjects()`` then ``getInputObjects()`` for
-    general-purpose ``Register`` operands and returns the largest
-    ``getMinimumByteSize()``. The segment-register filter avoids picking
-    up 1-byte flags registers (CF / PF / ZF / SF / OF) that surface in
-    result objects for arithmetic instructions.
+    ``op_idx`` is currently unused (x86 mem-operand instructions have
+    exactly one LOAD/STORE per operand), but kept in the signature to
+    future-proof against multi-mem-operand instructions (string ops)
+    where the access size could differ per operand.
     """
-    from ghidra.program.model.lang import Register
+    from ghidra.program.model.pcode import PcodeOp
 
-    max_size = 0
-    for source in (ghidra_insn.getResultObjects(), ghidra_insn.getInputObjects()):
-        if source is None:
-            continue
-        for obj in source:
-            if isinstance(obj, Register):
-                name = str(obj.getName()).lower()
-                if name not in _SEGMENT_REGISTERS:
-                    size = int(obj.getMinimumByteSize())
-                    if size > max_size:
-                        max_size = size
-    return max_size if max_size > 0 else default
+    sizes: set[int] = set()
+    for pop in ghidra_insn.getPcode():
+        opcode = pop.getOpcode()
+        if opcode == PcodeOp.LOAD:
+            out = pop.getOutput()
+            if out is not None:
+                sizes.add(int(out.getSize()))
+        elif opcode == PcodeOp.STORE:
+            inputs = pop.getInputs()
+            # STORE: (space_id_const, addr_varnode, value_varnode)
+            if len(inputs) >= 3:
+                sizes.add(int(inputs[2].getSize()))
+    nonzero = {s for s in sizes if s > 0}
+    if not nonzero:
+        return default
+    # x86 mem-operand instructions have exactly one LOAD/STORE per
+    # operand. When multiple distinct sizes appear (rare; string ops),
+    # the value-side width is the smallest non-zero.
+    return min(nonzero)
 
 
 def _compute_x86_memory_components(

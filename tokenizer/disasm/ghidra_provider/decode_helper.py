@@ -18,7 +18,7 @@ from tokenizer.disasm.ghidra_provider.mem_decompose import (
     _compute_arm_memory_components,
     _compute_base_disp_memory_components,
     _compute_x86_memory_components,
-    _infer_mem_size_from_ghidra_insn,
+    _infer_mem_access_size,
 )
 from tokenizer.disasm.ghidra_provider.mnemonic import (
     _GHIDRA_MNEMONIC_ALIASES,
@@ -390,17 +390,16 @@ class _GhidraDecodeHelper:
 
         if is_memory:
             spec["kind"] = OperandKind.MEM
-            # Memory size: inferred from sibling register operands. The
-            # legacy ``tokenize_operand_memory_ghidra`` ran this inference
-            # at tokenization time via ``_infer_size_from_ghidra_insn``;
-            # we hoist it into the operand spec so the post-G.3 consumer
-            # (the shared ``arch/x86/operands.py::tokenize_operand_memory``)
-            # can read ``op.size`` uniformly across both providers.
-            # Default 8 mirrors the legacy ``_infer_size_from_ghidra_insn``
-            # signature; ARM / MIPS / PPC / RISC-V consumers do not look
-            # at ``op.size`` for MEM operands so the value is harmless on
+            # Memory access size: derived from SLEIGH-emitted PCode
+            # LOAD/STORE varnode sizes. This is the only reliable
+            # oracle - the legacy sibling-register-width heuristic
+            # conflated pointer-width address-computation regs (e.g.
+            # x64 r14 = 8B) with value regs, breaking 0x66 operand-
+            # size-override and MOVZX/MOVSX byte/word -> wider dest.
+            # ARM / MIPS / PPC / RISC-V consumers do not look at
+            # ``op.size`` for MEM operands so the value is harmless on
             # non-x86 ISAs.
-            spec["size"] = _infer_mem_size_from_ghidra_insn(ghidra_insn)
+            spec["size"] = _infer_mem_access_size(ghidra_insn, op_idx)
             spec["decompose_mem"] = self._decompose_mem_callback(ghidra_insn, op_idx, arch)
             return spec
 
