@@ -45,6 +45,7 @@ from tokenizer.disasm.types import (
     OperandsView,
     OperandView,
     PrefixesView,
+    RegisterListView,
     RegisterView,
     ShiftKind,
     ShiftModifierView,
@@ -240,6 +241,49 @@ class _AngrCrxFieldView:
         return clone
 
 
+class _AngrRegisterListView:
+    """Sentinel reg-list sub-view for the angr/Capstone path.
+
+    Capstone splits ARM stm/ldm reg-list members into independent REG
+    operands (see ``angr_limitations.md``); the angr-backed
+    ``_AngrOperandView`` therefore never reports
+    ``OperandKind.REG_LIST``. This sentinel exists only to satisfy the
+    runtime-checkable ``OperandView`` / ``RegisterListView`` Protocol
+    isinstance check: ``base`` is permanently ``is_absent``,
+    ``writeback`` is False, the container is empty.
+
+    Consumers gate reg-list reads on ``op.kind == OperandKind.REG_LIST``
+    (see ``tokenizer/arch/arm32/provider.py``) so this property is
+    unreachable in normal flow on the angr path.
+    """
+
+    __slots__ = ("_base",)
+
+    def __init__(self, arch: Architecture) -> None:
+        # _AngrRegisterView defaults to _reg_id = 0 -> is_absent True.
+        self._base = _AngrRegisterView(arch)
+
+    @property
+    def base(self) -> RegisterView:
+        return self._base
+
+    @property
+    def writeback(self) -> bool:
+        return False
+
+    def __len__(self) -> int:
+        return 0
+
+    def __iter__(self) -> Iterator[RegisterView]:
+        return iter(())
+
+    def __getitem__(self, idx: int) -> RegisterView:
+        raise IndexError(idx)
+
+    def __deepcopy__(self, memo) -> "_AngrRegisterListView":
+        return _AngrRegisterListView(self._base._arch)
+
+
 # ---- OperandView ----------------------------------------------------------
 class _AngrOperandView:
     """Reusable per-operand cursor over a Capstone operand object.
@@ -254,7 +298,7 @@ class _AngrOperandView:
     see top of file + ``angr_limitations.md`` §1).
     """
 
-    __slots__ = ("_cs_insn", "_op", "_arch", "_reg", "_mem", "_shift", "_crx")
+    __slots__ = ("_cs_insn", "_op", "_arch", "_reg", "_mem", "_shift", "_crx", "_reg_list")
 
     def __init__(self, arch: Architecture) -> None:
         self._cs_insn: Any = None
@@ -264,6 +308,7 @@ class _AngrOperandView:
         self._mem = _AngrMemoryOperandView(arch)
         self._shift = _AngrShiftModifierView()
         self._crx = _AngrCrxFieldView(arch)
+        self._reg_list = _AngrRegisterListView(arch)
 
     def _set(self, cs_insn: Any, op: Any) -> None:
         self._cs_insn = cs_insn
@@ -297,6 +342,13 @@ class _AngrOperandView:
     def crx(self) -> CrxFieldView:
         self._crx._set(self._cs_insn, self._op)
         return self._crx
+
+    @property
+    def reg_list(self) -> RegisterListView:
+        # Sentinel: Capstone never emits OperandKind.REG_LIST on the angr
+        # path (see op_classify.py + angr_limitations.md). Property is
+        # Protocol-satisfying and unreachable in normal flow.
+        return self._reg_list
 
     @property
     def shift(self) -> ShiftModifierView:
