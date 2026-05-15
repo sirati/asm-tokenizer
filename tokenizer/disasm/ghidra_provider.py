@@ -1601,6 +1601,14 @@ class _GhidraDecodeHelper:
         return _split_ghidra_mnemonic(raw)
 
     def alias_mnemonic(self, base: str) -> str:
+        # Ghidra's MIPS SLEIGH spec emits `_sra` / `_li` / ... for the
+        # delay-slot variants of `sra` / `li` / .... The underscore is a
+        # Ghidra display convention, not a real MIPS-ISA mnemonic
+        # distinction (gas/objdump/Capstone all just write `sra`).
+        # Delay-slot membership is already encoded positionally by the
+        # token sequence, so the duplicate vocab entry is noise.
+        if self._arch == Architecture.MIPS and base.startswith("_") and len(base) > 1:
+            base = base[1:]
         return _GHIDRA_MNEMONIC_ALIASES.get(base, base)
 
     def architecture(self, _program: Any) -> Architecture:
