@@ -6,6 +6,10 @@ Owns:
 - ``_X86_PREFIX_BYTES``: x86 legacy prefix-byte set.
 - ``_GHIDRA_SUFFIX_TO_PREFIX``: Ghidra ``.REPE`` / ``.LOCK`` suffix table.
 - ``_GHIDRA_MNEMONIC_ALIASES``: Ghidra form -> Capstone canonical form.
+- ``_ARM_CC_LITERAL_TO_ENUM`` / ``_ARM_COND_MNEMONIC_ALLOWLIST`` /
+  ``_strip_arm_cc_suffix``: detect Ghidra SLEIGH's ``^COND`` mnemonic
+  concatenation (``bne``, ``beq``, ``mvneq``, ``b.eq``, ...) and split
+  off the condition code.
 - ``_split_ghidra_mnemonic``: factor Ghidra's suffix-encoded prefix off
   a raw mnemonic.
 - ``_extract_x86_prefixes``: raw-byte scanner for x86 legacy prefixes.
@@ -14,6 +18,8 @@ Owns:
 from __future__ import annotations
 
 from typing import Any
+
+from tokenizer.disasm.types import ArmConditionCode
 
 
 # ---------------------------------------------------------------------------
@@ -151,3 +157,107 @@ def _extract_x86_prefixes(ghidra_insn: Any) -> set[int]:
         else:
             break  # first non-prefix byte = opcode start
     return prefixes
+
+
+# ---------------------------------------------------------------------------
+# ARM / AArch64 condition-code mnemonic-suffix detection
+# ---------------------------------------------------------------------------
+# Ghidra's ARM SLEIGH spec encodes condition codes as a mnemonic SUFFIX
+# via ``^COND`` (and AArch64 via ``^"."^BranchCondOp``): ``bne``, ``beq``,
+# ``mvneq``, ``streq``, ``ldmiaeq``, ``cmpne``, ``b.eq``, ``bc.eq``, ...
+# So ``getMnemonicString()`` returns the cc-suffixed form, and the
+# ``ConditionCodePrefixView`` signal must be recovered by splitting that
+# string. The split needs an allow-list of base stems because a blind
+# 2-char suffix check false-positives on ``teq`` (looks like ``t``+``eq``)
+# and ``tst``-style bases that happen to end in cc-like letters.
+
+_ARM_CC_LITERAL_TO_ENUM: dict[str, ArmConditionCode] = {
+    "eq": ArmConditionCode.EQ, "ne": ArmConditionCode.NE,
+    "cs": ArmConditionCode.CS, "cc": ArmConditionCode.CC,
+    "mi": ArmConditionCode.MI, "pl": ArmConditionCode.PL,
+    "vs": ArmConditionCode.VS, "vc": ArmConditionCode.VC,
+    "hi": ArmConditionCode.HI, "ls": ArmConditionCode.LS,
+    "ge": ArmConditionCode.GE, "lt": ArmConditionCode.LT,
+    "gt": ArmConditionCode.GT, "le": ArmConditionCode.LE,
+}
+
+# Base mnemonics known to take ``^COND`` per Ghidra's ARM SLEIGH spec.
+# Derived by grepping
+#   ``Ghidra/Processors/ARM/data/languages/*.sinc`` (and AArch64) for
+#   ``^:<mnemonic>\^(COND|cc|thcc|part2thcc|ItCond|".\"^BranchCondOp)``
+# (see ARM SLEIGH ``COND`` macro family). The allow-list is essential:
+# without it, a blind 2-char suffix check would false-positively strip
+# ``eq`` off ``teq`` (yielding stem ``t``) and so on.
+_ARM_COND_MNEMONIC_ALLOWLIST: frozenset[str] = frozenset({
+    "adc", "add", "addw", "adr", "and", "b", "bfc", "bfi", "bic", "bl",
+    "blx", "bx", "bxj", "cbnz", "cbz", "cdp", "cdp2", "chka", "clrex",
+    "clz", "cmn", "cmp", "cpsid", "cpsie", "cpy", "dbg", "dmb", "dsb",
+    "enterx", "eor", "fldmdbx", "fldmiax", "fstmdbx", "fstmiax", "hb",
+    "isb", "lda", "ldab", "ldaex", "ldaexb", "ldaexd", "ldaexh", "ldah",
+    "ldc", "ldc2", "ldc2l", "ldcl", "ldm", "ldmdb", "ldmia", "ldr",
+    "ldrb", "ldrbt", "ldrd", "ldrex", "ldrexb", "ldrexd", "ldrexh",
+    "ldrh", "ldrht", "ldrsb", "ldrsbt", "ldrsh", "ldrsht", "ldrt",
+    "leavex", "mcr", "mcr2", "mcrr", "mla", "mls", "mov", "movt",
+    "movw", "mrc", "mrc2", "mrrc", "mrrc2", "mrs", "msr", "mul", "mvn",
+    "nop", "orr", "pkhbt", "pkhtb", "pld", "pldw", "pli", "pop", "push",
+    "qadd", "qadd16", "qadd8", "qasx", "qdadd", "qdsub", "qsax", "qsub",
+    "qsub16", "qsub8", "rbit", "rev", "rev16", "revsh", "rsb", "rsc",
+    "sadd16", "sadd8", "sasx", "sbfx", "sdiv", "sel", "setend", "sev",
+    "sevl", "shadd16", "shadd8", "shasx", "shsax", "shsub16", "shsub8",
+    "smc", "smlad", "smladx", "smlal", "smlald", "smlaldx", "smlsd",
+    "smlsdx", "smlsld", "smlsldx", "smmla", "smmlar", "smmls", "smmlsr",
+    "smmul", "smmulr", "smuad", "smuadx", "smulbb", "smulbt", "smull",
+    "smultb", "smultt", "smusd", "smusdx", "srsdb", "srsia", "srsib",
+    "ssat", "ssat16", "ssax", "ssub16", "ssub8", "stc", "stc2", "stc2l",
+    "stcl", "stl", "stlb", "stlex", "stlexb", "stlexd", "stlexh", "stlh",
+    "stm", "stmdb", "stmia", "str", "strb", "strbt", "strd", "strex",
+    "strexb", "strexd", "strexh", "strh", "strht", "strt", "sub",
+    "subw", "svc", "swi", "swp", "swpb", "sxtab", "sxtab16", "sxtah",
+    "sxtb", "sxtb16", "sxth", "tbb", "tbh", "teq", "tst", "tt", "tta",
+    "ttat", "ttt", "uadd16", "uadd8", "uasx", "ubfx", "udf", "udiv",
+    "uhadd16", "uhadd8", "uhasx", "uhsax", "uhsub16", "uhsub8", "umaal",
+    "umlal", "umull", "uqadd16", "uqadd8", "uqasx", "uqsax", "uqsub16",
+    "uqsub8", "usad8", "usada8", "usat", "usat16", "usax", "usub16",
+    "usub8", "uxtab", "uxtab16", "uxtah", "uxtb", "uxtb16", "uxth",
+    "vabs", "vadd", "vcvt", "vcvtb", "vcvtr", "vcvtt", "vdiv", "vdup",
+    "vfma", "vfms", "vfnma", "vfnms", "vldmdb", "vldmia", "vldr", "vmla",
+    "vmls", "vmov", "vmrs", "vmsr", "vmul", "vneg", "vnmla", "vnmls",
+    "vnmul", "vpop", "vpush", "vsqrt", "vstmdb", "vstmia", "vstr",
+    "vsub", "wfe", "wfi", "yield",
+    # AArch64 conditional branches: ``b.eq`` / ``bc.eq`` use a literal
+    # dot separator. The 3-char tail path covers the dot form; the
+    # bare stems are already in the ARM list above (``b``, plus we add
+    # ``bc`` for AArch64-only).
+    "bc",
+})
+
+
+def _strip_arm_cc_suffix(
+    mnemonic: str,
+) -> tuple[str, ArmConditionCode | None]:
+    """Split a Ghidra ARM/AArch64 mnemonic into ``(stem, cc_or_None)``.
+
+    Recognized forms:
+
+    - 2-char suffix (ARM ``^COND``): ``bne`` -> (``b``, NE).
+    - 3-char suffix with literal dot (AArch64 ``b^"."^BranchCondOp``):
+      ``b.eq`` -> (``b``, EQ).
+
+    The allow-list guards against false-positive strips on bases whose
+    last two characters happen to be cc-like (``teq``, ``tst``, ``tt``,
+    ``adr``, ...). When the stem is not in the allow-list, the input is
+    returned unchanged with ``cc = None``.
+    """
+    for tail_len in (3, 2):
+        if tail_len > len(mnemonic):
+            continue
+        if tail_len == 3 and mnemonic[-3] != ".":
+            continue
+        cc_chars = mnemonic[-2:]
+        cc_enum = _ARM_CC_LITERAL_TO_ENUM.get(cc_chars)
+        if cc_enum is None:
+            continue
+        stem = mnemonic[:-tail_len]
+        if stem in _ARM_COND_MNEMONIC_ALLOWLIST:
+            return (stem, cc_enum)
+    return (mnemonic, None)

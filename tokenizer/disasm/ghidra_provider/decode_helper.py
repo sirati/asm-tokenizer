@@ -24,13 +24,19 @@ from tokenizer.disasm.ghidra_provider.mnemonic import (
     _GHIDRA_MNEMONIC_ALIASES,
     _RegisterMap,
     _split_ghidra_mnemonic,
+    _strip_arm_cc_suffix,
 )
 from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
     _ghidra_processor_to_architecture,
     _prefix_builder_for_arch,
 )
-from tokenizer.disasm.types import Architecture, FpType, OperandKind
+from tokenizer.disasm.types import (
+    Architecture,
+    ArmConditionCode,
+    FpType,
+    OperandKind,
+)
 
 if TYPE_CHECKING:
     from tokenizer.disasm.ghidra_views import _GhidraMemoryOperandView
@@ -74,6 +80,13 @@ class _GhidraDecodeHelper:
 
     def split_mnemonic(self, raw: str) -> tuple[str, str | None, int | None]:
         return _split_ghidra_mnemonic(raw)
+
+    def strip_arm_cc(
+        self,
+        mnemonic: str,
+    ) -> tuple[str, ArmConditionCode | None]:
+        """Strip the Ghidra ARM/AArch64 cc-suffix from ``mnemonic``."""
+        return _strip_arm_cc_suffix(mnemonic)
 
     def alias_mnemonic(self, base: str) -> str:
         # Ghidra's MIPS SLEIGH spec emits `_sra` / `_li` / ... for the

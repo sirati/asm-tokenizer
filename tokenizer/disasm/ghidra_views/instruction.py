@@ -153,11 +153,21 @@ class _GhidraInstructionView:
         raw_mnemonic = str(ghidra_insn.getMnemonicString())
         base_mnemonic, suffix_prefix_name, _suffix_prefix_byte = self._decode.split_mnemonic(raw_mnemonic)
         base_mnemonic = self._decode.alias_mnemonic(base_mnemonic)
-        self._base_mnemonic = base_mnemonic
+        # ``self._mnemonic`` is the post-alias-but-pre-cc-strip form. The
+        # legacy ``insn.mnemonic`` lookup keys in ``arch/operands_base.py``
+        # (``arithmetic_instructions`` / ``addressing_control_flow_instructions``)
+        # are populated with the cc-suffixed entries (e.g. ``bne``), so
+        # ``self._mnemonic`` must retain the suffix. Only ``base_mnemonic``
+        # (the stem) is cc-stripped, and only for ARM / AArch64 where the
+        # cc-suffix surfaces; the dedicated ``ConditionCodePrefixView``
+        # carries the cc onward.
         if suffix_prefix_name is not None:
             self._mnemonic = f"{suffix_prefix_name} {base_mnemonic}"
         else:
             self._mnemonic = base_mnemonic
+        if self._arch in (Architecture.ARM32, Architecture.AARCH64):
+            base_mnemonic, _cc = self._decode.strip_arm_cc(base_mnemonic)
+        self._base_mnemonic = base_mnemonic
 
         # op_str: comma-joined per-operand default representation
         try:

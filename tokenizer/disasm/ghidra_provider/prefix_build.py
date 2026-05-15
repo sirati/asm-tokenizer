@@ -18,7 +18,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from tokenizer.disasm.ghidra_provider.mnemonic import _extract_x86_prefixes
+from tokenizer.disasm.ghidra_provider.mnemonic import (
+    _extract_x86_prefixes,
+    _strip_arm_cc_suffix,
+)
 from tokenizer.disasm.types import Architecture, FpType
 
 
@@ -241,14 +244,22 @@ def _build_prefixes_x86(ghidra_insn: Any) -> list[Any]:
 
 
 def _build_prefixes_arm(ghidra_insn: Any) -> list[Any]:
-    """Build typed prefix-view instances for an ARM instruction.
+    """Build typed prefix-view instances for an ARM / AArch64 instruction.
 
-    Stub for forward-compat: ARM-side condition-code / update-flags /
-    writeback signals are not extracted by the Ghidra path today, so
-    consumers see them as zero/false defaults. Returns an empty list
-    until ARM extraction is wired up.
+    Recovers the condition-code prefix from Ghidra's mnemonic-suffix
+    encoding (SLEIGH's ``^COND`` concatenation). The raw mnemonic
+    surfaces forms like ``bne`` / ``beq`` / ``streq`` / ``b.eq``;
+    ``_strip_arm_cc_suffix`` returns the cc enum when the stem is on the
+    SLEIGH-derived allow-list. When present, emit a
+    ``ConditionCodePrefixView`` carrying the cc.
     """
-    return []
+    from tokenizer.disasm.ghidra_views import _ConditionCodePrefix
+
+    raw = str(ghidra_insn.getMnemonicString()).lower()
+    _stem, cc = _strip_arm_cc_suffix(raw)
+    if cc is None:
+        return []
+    return [_ConditionCodePrefix(cc=cc)]
 
 
 def _build_prefixes_ppc(ghidra_insn: Any) -> list[Any]:
