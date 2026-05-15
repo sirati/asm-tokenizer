@@ -151,8 +151,7 @@ def tokenize_operand_memory_ghidra(
         assert scale > 0
         if has_index:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MULTIPLY))
-            valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
-            tokens.append(valued_const(abs(scale)))
+            tokens.append(vocab_manager.ValuedConst(abs(scale)))
         else:
             warnings.warn(f"Scale {scale} used without index register")
 
@@ -166,8 +165,7 @@ def tokenize_operand_memory_ghidra(
     if not has_disp:
         pass
     elif disp <= 0xFF:
-        valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
-        tokens.append(valued_const(abs(disp)))
+        tokens.append(vocab_manager.ValuedConst(abs(disp)))
     else:
         force_opaque = False
 

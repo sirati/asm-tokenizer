@@ -53,8 +53,7 @@ def tokenize_operand_memory_base_disp(
         # and the v2 emitter degrades to a bare ptr token.
         fp_postfix = getattr(op, "fp_width_bytes", None)
         if abs_disp <= 0xFF:
-            valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
-            tokens.append(valued_const(abs_disp))
+            tokens.append(vocab_manager.ValuedConst(abs_disp))
         else:
             force_opaque = not has_base
             meta, _kind = lookup.lookup(abs_disp)
