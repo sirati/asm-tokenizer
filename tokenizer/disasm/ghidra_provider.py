@@ -26,7 +26,7 @@ from tokenizer.disasm.metadata import (
     encoding_from_string,
     section_kind_from_type_string,
 )
-from tokenizer.disasm.types import Architecture, FpType
+from tokenizer.disasm.types import Architecture, FpType, OperandKind
 
 # ---------------------------------------------------------------------------
 # Section-name -> v2 section-type mapping
