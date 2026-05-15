@@ -346,6 +346,23 @@ class OperandView(Protocol):
     @property
     def type_int(self) -> int: ...            # passthrough for OperandKind.OTHER
 
+    @property
+    def resolved_target(self) -> Optional[int]: ...
+    # Analyzer-resolved data target that the provider's value-flow
+    # analyzer associated with this operand's reference, when any.
+    # ``None`` when no such reference exists or when the operand is not
+    # part of a PC-relative load (the common case).
+    #
+    # Parallels ``MemoryOperandView.resolved_target`` for the REG-operand
+    # side: ARM literal-pool patterns like ``ldr r4, [pc, #0x44]``
+    # surface the lifted data-pointer on the DESTINATION REG operand
+    # (``r4``) rather than on the MEM operand (the literal-pool slot),
+    # so the v2 classifier needs both sides covered to fire
+    # precedence steps 7 (string_ptr) / 9 (ro_data_ptr) on every
+    # PC-relative load shape. Ghidra-only signal; the angr/Capstone
+    # path always reports ``None`` (Capstone does not perform
+    # value-flow analysis at decode time).
+
     def __deepcopy__(self, memo) -> "OperandView": ...
 
 

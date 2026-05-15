@@ -297,6 +297,7 @@ class _GhidraDecodeHelper:
             crx_reg_name="",
             crx_reg_id=0,
             decompose_reg_list=None,
+            resolved_target=None,
         )
         return spec
 
@@ -407,6 +408,7 @@ class _GhidraDecodeHelper:
             crx_reg_name="",
             crx_reg_id=0,
             decompose_reg_list=None,
+            resolved_target=None,
         )
 
         if not objects:
@@ -453,6 +455,15 @@ class _GhidraDecodeHelper:
                 spec["size"] = int(first.getMinimumByteSize())
             except Exception:
                 spec["size"] = 0
+            # PC-relative literal-pool loads (ARM ``ldr r4, [pc, #0x44]``)
+            # surface the analyzer-lifted data-pointer on the destination
+            # REG operand, NOT on the MEM operand (the MEM is just the
+            # literal-pool slot). Reuse the same helper the MEM path
+            # uses; ``disp=0`` here disables the equal-to-disp filter
+            # (a REG operand has no disp, so the filter is moot).
+            spec["resolved_target"] = _compute_resolved_target(
+                ghidra_insn, op_idx, disp=0
+            )
             return spec
         if isinstance(first, Scalar):
             spec["kind"] = OperandKind.IMM

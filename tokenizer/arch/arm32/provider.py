@@ -110,6 +110,25 @@ class ARM32Provider(ArchitectureProvider):
                 # Shifted register operand
                 shift_tokens = tokenize_operand_shift(insn, op, vocab_manager)
                 insn_tokens.extend(shift_tokens)
+                # PC-relative literal-pool loads (``ldr r4, [pc, #0x44]``)
+                # surface the analyzer-lifted data-pointer on the
+                # destination REG operand (parallel to the MEM-side
+                # ``MemoryOperandView.resolved_target``). Emit the typed
+                # classifier tokens AFTER the register so the model sees
+                # the structural reality (``arm32_r4 string_ptr <id>``):
+                # the register token retains its identity, and the
+                # resolved data target gets precedence-classified
+                # (steps 7 / 9 fire for string_ptr / ro_data_ptr).
+                resolved_target = op.resolved_target
+                if resolved_target is not None:
+                    meta = lookup.lookup(resolved_target)
+                    insn_tokens.extend(
+                        constant_handler.process_constant_v2(
+                            resolved_target,
+                            meta=meta,
+                            is_arithmetic=False,
+                        )
+                    )
             elif op.kind == OperandKind.IMM:
                 immediate_tokens = tokenize_operand_immediate(
                     instr_sets.addressing_control_flow,

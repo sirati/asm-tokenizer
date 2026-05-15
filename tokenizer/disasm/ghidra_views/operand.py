@@ -286,6 +286,7 @@ class _GhidraOperandView:
         "_mem_decomposed",
         "_decompose_reg_list",
         "_reg_list_decomposed",
+        "_resolved_target",
     )
 
     def __init__(self, arch: Architecture, reg_map: Any = None) -> None:
@@ -304,6 +305,7 @@ class _GhidraOperandView:
         self._mem_decomposed: bool = False
         self._decompose_reg_list: Optional[Any] = None
         self._reg_list_decomposed: bool = False
+        self._resolved_target: Optional[int] = None
 
     def _advance(
         self,
@@ -321,6 +323,7 @@ class _GhidraOperandView:
         crx_reg_name: str,
         crx_reg_id: int,
         decompose_reg_list: Optional[Any] = None,
+        resolved_target: Optional[int] = None,
     ) -> None:
         """Repoint the operand wrapper at the next operand.
 
@@ -333,6 +336,15 @@ class _GhidraOperandView:
         ``kind == OperandKind.MEM``; ``None`` otherwise (no MEM access
         is expected on non-MEM kinds). Mirror semantics apply to
         ``decompose_reg_list`` for ``kind == OperandKind.REG_LIST``.
+
+        ``resolved_target`` is the parent-level analyzer-resolved data
+        pointer Ghidra surfaces on a REG operand that participates in a
+        PC-relative literal-pool load (e.g. ARM ``ldr r4, [pc, #0x44]``
+        where r4 ends up holding the resolved string pointer). ``None``
+        on every operand that is not part of such a pattern (the common
+        case). The MEM-side parallel signal continues to live on
+        ``MemoryOperandView.resolved_target`` (set inside the lazy
+        ``decompose_mem`` callback).
         """
         self._kind = kind
         if reg_id != _REG_ID_ABSENT or reg_name != _REG_NAME_ABSENT:
@@ -349,6 +361,7 @@ class _GhidraOperandView:
         self._reg_list_decomposed = False
         self._shift._populate(shift_kind, shift_amount)
         self._crx._populate(crx_reg_name, crx_reg_id)
+        self._resolved_target = resolved_target
 
     @property
     def kind(self) -> OperandKind:
@@ -400,6 +413,10 @@ class _GhidraOperandView:
     def type_int(self) -> int:
         return self._type_int
 
+    @property
+    def resolved_target(self) -> Optional[int]:
+        return self._resolved_target
+
     def __deepcopy__(self, memo) -> "_GhidraOperandView":
         clone = _GhidraOperandView(self._arch, self._reg_list._reg_map)
         clone._kind = self._kind
@@ -422,6 +439,7 @@ class _GhidraOperandView:
         clone._size = self._size
         clone._fp_type = self._fp_type
         clone._type_int = self._type_int
+        clone._resolved_target = self._resolved_target
         # The decompose callback closes over the original cursor's Java
         # handles; the clone freezes the decomposition (already
         # materialized above) so we don't need to carry it.

@@ -425,6 +425,16 @@ class _AngrOperandView:
     def type_int(self) -> int:
         return int(self._op.type) if self._op is not None else 0
 
+    @property
+    def resolved_target(self) -> Optional[int]:
+        # Capstone does not perform value-flow / PC-relative analysis
+        # at decode time, so the angr-path operand never surfaces a
+        # parent-level resolved target. The angr CFG analyzer COULD
+        # lift it post-hoc, but the parity work is out of scope here
+        # (see ``angr_limitations.md`` — parallels the MEM-sub-view
+        # ``resolved_target`` sentinel).
+        return None
+
     def __deepcopy__(self, memo) -> "_AngrOperandView":
         clone = _AngrOperandView(self._arch)
         clone._cs_insn = self._cs_insn
