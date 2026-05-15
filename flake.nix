@@ -2,7 +2,7 @@
   description = "Python 3.14 development environment for asm-tokenizer";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/e4bae1bd10c9c57b2cf517953ab70060a828ee6f";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # External runner: provides `python3Packages.dynamic-runner` via its
     # overlay (replaces the previous in-tree `dynamic-batch-rs` path-flake).
     dynamic-runner.url = "github:sirati/dynamic-runner";
@@ -33,43 +33,11 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      # Add pyghidra (not yet in this nixpkgs pin)
-      pyghidraOverlay = final: prev: {
-        python314 = prev.python314.override {
-          packageOverrides = pyFinal: pyPrev: {
-            pyghidra = pyFinal.buildPythonPackage {
-              pname = "pyghidra";
-              version = "3.0.2";
-              pyproject = true;
-              src = prev.fetchPypi {
-                pname = "pyghidra";
-                version = "3.0.2";
-                hash = "sha256-ea1P1XHjLzQ88/zb2E/G4zPvGiZHWjqPcrYpqfPIedo=";
-              };
-              pythonRelaxDeps = [ "jpype1" ];
-              build-system = [ pyFinal.setuptools ];
-              dependencies = [
-                pyFinal.jpype1
-                pyFinal.packaging
-              ];
-              pythonImportsCheck = [ "pyghidra" ];
-              doCheck = false;
-              meta = {
-                description = "Native CPython for Ghidra";
-                homepage = "https://pypi.org/project/pyghidra";
-                license = prev.lib.licenses.asl20;
-              };
-            };
-          };
-        };
-      };
-
       pkgsFor =
         system:
         import nixpkgs {
           inherit system;
           overlays = [
-            pyghidraOverlay
             # Injects `dynamic-runner` into every Python package set,
             # so `pkgs.python314.pkgs.dynamic-runner` is in scope.
             dynamic-runner.overlays.default
