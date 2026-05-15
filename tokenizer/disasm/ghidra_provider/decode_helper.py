@@ -29,6 +29,7 @@ from tokenizer.disasm.ghidra_provider.mnemonic import (
 )
 from tokenizer.disasm.ghidra_provider.pcode_inspect import (
     has_load_store,
+    operand_is_bracketed,
     register_is_addressing_mode_written,
 )
 from tokenizer.disasm.ghidra_provider.prefix_build import (
@@ -351,26 +352,36 @@ class _GhidraDecodeHelper:
         # surfaces the displacement as a ``Scalar`` inside ``getOpObjects``.
         # The disambiguator vs a bare register operand is the presence of
         # at least one Scalar (a plain REG operand carries no Scalar).
-        # Without this arm the Scalar + bracket framing + writeback marker
-        # are silently dropped.
         #
-        # ARM shifted-register vs ARM memory: ``OperandType.DYNAMIC`` is
-        # set on BOTH (e.g. ``sbc r1, r1, r1, lsl #N`` operand 2 and
-        # ``ldr r0, [r3, r0, lsl #2]`` operand 1 share the bit). Object
-        # shape (1 register + 1 scalar) is also indistinguishable. The
-        # rich-IR discriminator is the instruction-level PCode shape:
-        # memory operands force a ``LOAD``/``STORE`` op into the PCode;
-        # shifted-register operands appear in arithmetic instructions
-        # that produce only INT_*/COPY ops and no LOAD/STORE. We gate
-        # the DYNAMIC-only arm of is_memory on
-        # ``pcode_inspect.has_load_store(ghidra_insn)`` for ARM/AArch64
-        # to reject the shifted-register false positive. Other ISAs
-        # don't have ARM-style shifted-register operand modifiers; x86
-        # ``LEA RAX, [RSP+0x14]`` legitimately classifies as MEM with
-        # no LOAD/STORE in PCode (LEA computes the address into RAX),
-        # so we keep the unguarded DYNAMIC path there.
+        # The is-memory question has TWO orthogonal axes:
+        #
+        # 1. SEMANTIC: does this instruction access memory at all? The
+        #    rich-IR signal is whether ``getPcode()`` contains a LOAD or
+        #    STORE op. We use this for ARM/AArch64 to reject shifted-
+        #    register operands like ``sbc r1, r1, r1, lsl #N`` operand
+        #    2: they have ``OperandType.DYNAMIC`` (same as memory
+        #    operands) but the instruction is pure-arithmetic with no
+        #    LOAD/STORE PCode. x86 LEA legitimately is bracketed
+        #    syntactically but does not LOAD, so we don't gate x86 on
+        #    has_load_store.
+        #
+        # 2. SYNTACTIC: was this specific operand written with bracket
+        #    framing? The rich-typed signal is the presence of the
+        #    per-ISA bracket-open ``java.lang.Character`` item in
+        #    ``getDefaultOperandRepresentationList``. This rejects
+        #    operands like x86 ``rep stosb rdi`` (RDI is rendered
+        #    without brackets despite being the implicit memory
+        #    pointer) and arm64 ``strh wzr, [...]`` (WZR — the zero
+        #    register, semantically a constant source — is rendered
+        #    without brackets despite carrying the DYNAMIC bit because
+        #    Ghidra surfaces WZR as a runtime-valued operand). No
+        #    OperandType bit reliably discriminates these from real
+        #    bracketed-mem operands; ``operand_is_bracketed`` reads the
+        #    rich-typed Character via isinstance + charValue without
+        #    string parsing.
         scalar_in_objects = any(isinstance(o, Scalar) for o in objects or ())
         instruction_has_mem_access = has_load_store(ghidra_insn)
+        operand_has_brackets = operand_is_bracketed(ghidra_insn, op_idx, arch)
 
         arm_family = arch in (Architecture.ARM32, Architecture.AARCH64)
         dynamic_admits_memory = (
@@ -378,7 +389,7 @@ class _GhidraDecodeHelper:
             and (not arm_family or instruction_has_mem_access)
         )
 
-        is_memory = bool(register_objs) and (
+        is_memory = bool(register_objs) and operand_has_brackets and (
             dynamic_admits_memory
             or bool(op_type & OperandType.INDIRECT)
             or (

@@ -24,7 +24,62 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from tokenizer.disasm.types import ShiftKind
+from tokenizer.disasm.types import Architecture, ShiftKind
+
+
+# Per-ISA bracket-open characters. The presence of this rich-typed
+# ``java.lang.Character`` item in ``getDefaultOperandRepresentationList``
+# is the SYNTACTIC discriminator for "operand was written with bracket
+# framing in the asm" — orthogonal to the SEMANTIC has_load_store check
+# (which says "instruction accesses memory"). Both are needed: x86
+# ``rep stosb rdi`` has DYNAMIC + has_load_store but RDI is rendered
+# WITHOUT brackets (implicit-memory register), so it's a syntactic REG;
+# arm64 ``strh wzr, [...]`` has WZR as DYNAMIC + has_load_store but WZR
+# (the zero register, semantically a constant-zero source) is rendered
+# WITHOUT brackets, so it's also a syntactic REG. No PCode/OperandType
+# bit reliably discriminates these from real bracketed-mem operands,
+# but the rich-typed Character marker in the print rendering does.
+_BRACKET_OPEN_CHARS: dict[Architecture, frozenset[str]] = {
+    Architecture.ARM32: frozenset({"["}),
+    Architecture.AARCH64: frozenset({"["}),
+    Architecture.X86: frozenset({"["}),
+    Architecture.PPC: frozenset({"("}),
+    Architecture.MIPS: frozenset({"("}),
+    Architecture.RISCV: frozenset({"("}),
+}
+
+
+def operand_is_bracketed(ghidra_insn: Any, op_idx: int, arch: Architecture) -> bool:
+    """True iff operand ``op_idx``'s representation list contains the
+    per-ISA bracket-open Character marker.
+
+    Uses typed ``java.lang.Character`` ``isinstance`` + ``charValue()``
+    against the per-ISA char set; no raw ``str()`` cast. The bracket
+    Characters are the only repr-list items we read at this layer; we
+    don't need a complete role map for every Character because the
+    is-memory classifier only asks one yes/no question (is there a
+    bracket?). Hard-error on unknown Characters belongs in a future
+    full-role-map module if/when we extend operand-CC / vector-arrangement
+    extraction.
+    """
+    chars = _BRACKET_OPEN_CHARS.get(arch)
+    if not chars:
+        return False
+    try:
+        repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ()
+    except Exception:
+        return False
+    from java.lang import Character as JavaCharacter
+
+    for item in repr_list:
+        if isinstance(item, JavaCharacter):
+            try:
+                c = chr(item.charValue())
+            except Exception:
+                continue
+            if c in chars:
+                return True
+    return False
 
 
 _PCODE_SHIFT_OPCODE_TO_KIND: dict[int, ShiftKind] = {}
@@ -274,56 +329,58 @@ def classify_memory_addressing(
 ) -> tuple[bool, bool, bool]:
     """Return (writeback, pre_indexed, post_indexed) from PCode shape.
 
-    Discrimination, in rich-IR terms:
-    - writeback ↔ ``base_register`` is in the instruction's result-objects
-      (the instruction modifies the base).
-    - When writeback is on, look at the FIRST ``LOAD``/``STORE`` op:
-        - if its address varnode IS ``base_register`` directly: pre-indexed
-          (the base self-update PCode op runs BEFORE the LOAD/STORE; the
-          LOAD/STORE sees the updated base).
-        - if its address varnode is a uniq that was ``COPY``ed from
-          ``base_register``: post-indexed (the snapshot of the un-updated
-          base is what the LOAD/STORE consumes; the base self-update
-          happens out-of-band).
-    - When writeback is off: plain offset addressing (all three False).
+    Both pre-indexed (``[r, #imm]!``) and post-indexed (``[r], #imm``)
+    forms cause the base register to be self-updated by the addressing-
+    mode displacement; the rich-IR signal alone cannot distinguish them
+    by self-update alone. The discriminator is which value the LOAD/STORE
+    consumes:
+    - Pre-indexed: the base self-update PCode op runs BEFORE the
+      LOAD/STORE; the LOAD/STORE's address varnode IS ``base_register``
+      (the updated value).
+    - Post-indexed: the SLEIGH spec emits ``COPY base → uniq`` (snapshot)
+      first, then the self-update of ``base``, then ``LOAD/STORE uniq``
+      using the snapshot of the un-updated base.
+
+    The TUPLE convention matches the consumer's emission grammar:
+    - ``(True,  True,  False)`` -> pre-indexed: render disp inside
+      brackets + ``!`` writeback marker.
+    - ``(False, False, True)``  -> post-indexed: render brackets without
+      disp, then post-index separator + disp tokens.
+    - ``(False, False, False)`` -> plain offset: render disp inside
+      brackets, no marker.
+
+    ``writeback`` here is ONLY the asm-renderable ``!`` flag (pre-indexed
+    only). The semantic "base register is auto-updated" is true for both
+    pre and post but the consumer uses two separate tokens for the two
+    forms; this function picks the right one.
     """
     if base_register is None:
         return (False, False, False)
 
-    writeback = register_is_addressing_mode_written(ghidra_insn, base_register)
-    if not writeback:
+    if not register_is_addressing_mode_written(ghidra_insn, base_register):
         return (False, False, False)
 
     from ghidra.program.model.pcode import PcodeOp
 
     pcode_ops = list(ghidra_insn.getPcode() or ())
 
-    # Find the first LOAD or STORE op + its address varnode.
     addr_varnode = None
     for pop in pcode_ops:
         opc = pop.getOpcode()
         inputs = pop.getInputs()
-        if opc == PcodeOp.LOAD and len(inputs) >= 2:
-            addr_varnode = inputs[1]
-            break
-        if opc == PcodeOp.STORE and len(inputs) >= 2:
+        if opc in (PcodeOp.LOAD, PcodeOp.STORE) and len(inputs) >= 2:
             addr_varnode = inputs[1]
             break
 
     if addr_varnode is None:
-        # writeback claimed but no LOAD/STORE — unexpected; treat as plain
-        # writeback without pre/post discrimination so caller surfaces it.
-        return (writeback, False, False)
+        return (False, False, False)
 
     if _varnode_matches_register(addr_varnode, base_register):
-        # Pre-indexed: LOAD/STORE reads the updated base directly.
         return (True, True, False)
 
-    # Otherwise: post-indexed iff a COPY of base_register flows to
-    # addr_varnode. Build the propagation set and check membership.
     addr_key = _varnode_key(addr_varnode)
     if addr_key is None:
-        return (True, False, False)
+        return (False, False, False)
 
     register_key = _varnode_key_for_register(base_register)
     propagated: set[tuple[str, int, int]] = set()
@@ -347,8 +404,6 @@ def classify_memory_addressing(
             break
 
     if addr_key in propagated:
-        return (True, False, True)
+        return (False, False, True)
 
-    # Writeback claimed but neither pre nor post pattern matched — surface
-    # to caller; this means an unexpected PCode shape we should investigate.
-    return (True, False, False)
+    return (False, False, False)
