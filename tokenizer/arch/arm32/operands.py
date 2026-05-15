@@ -28,7 +28,7 @@ tokenize_operand_immediate = tokenize_operand_immediate_generic
 
 
 def _emit_arm_disp_value_tokens(
-    disp: int,
+    value: int,
     has_base: bool,
     op: OperandView,
     lookup,
@@ -38,49 +38,57 @@ def _emit_arm_disp_value_tokens(
     func_max_addr: int,
     constant_handler: ConstantHandler,
     vocab_manager: VocabularyManager,
+    is_resolved_target: bool = False,
 ) -> List[Tokens]:
     """Tokenize the displacement *value* of an ARM memory operand.
 
-    Shared between the offset-only / pre-indexed (disp INSIDE the
-    brackets) and post-indexed (disp OUTSIDE the brackets, after an
+    Shared between the offset-only / pre-indexed (value INSIDE the
+    brackets) and post-indexed (value OUTSIDE the brackets, after an
     ``asm_post_index_separator``) emission paths. The caller is
     responsible for the surrounding bracket framing / sign prefix /
     separator tokens; this function emits only the constant tokens for
     the magnitude (per precedence.md value-classification flow).
+
+    ``is_resolved_target`` signals that ``value`` is a provider-resolved
+    data address (``op.mem.resolved_target``) rather than a literal
+    operand displacement, in which case the small-disp short-circuit
+    is skipped and the metadata-based classification path is always
+    taken (otherwise a resolved string at e.g. ``0x42`` would collapse
+    to a bare ``valued_const`` and lose the ``string_ptr`` emission).
     """
     tokens: List[Tokens] = []
-    abs_disp = abs(disp)
+    abs_value = abs(value)
     # Memory operand → an FP load against a resolved pointer gets a
     # postfix ``floatXX`` (precedence.md "Postfix FP"). Only Ghidra
     # stamps a non-None ``fp_type`` on the operand (see
     # ``angr_limitations.md`` §1); the angr/Capstone path uniformly
     # reports None.
     fp_postfix = op.fp_type
-    if abs_disp <= 0xFF:
-        tokens.append(vocab_manager.ValuedConst(abs_disp))
+    if abs_value <= 0xFF and not is_resolved_target:
+        tokens.append(vocab_manager.ValuedConst(abs_value))
     else:
         force_opaque = not has_base
-        meta = lookup.lookup(abs_disp)
+        meta = lookup.lookup(abs_value)
 
-        if force_opaque or (abs_disp > (1 << 18)):
+        if force_opaque or (abs_value > (1 << 18)) or is_resolved_target:
             disp_tokens = constant_handler.process_constant_v2(
-                abs_disp,
+                abs_value,
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
             )
             tokens.extend(disp_tokens)
         else:
-            if (text_start <= abs_disp < text_end) or (abs_disp < func_min_addr or abs_disp > func_max_addr):
+            if (text_start <= abs_value < text_end) or (abs_value < func_min_addr or abs_value > func_max_addr):
                 disp_tokens = constant_handler.process_constant_v2(
-                    abs_disp,
+                    abs_value,
                     meta=meta,
                     is_arithmetic=False,
                     fp_postfix_type=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
             else:
-                disp_tokens = constant_handler.process_constant_v2(abs_disp, is_arithmetic=True)
+                disp_tokens = constant_handler.process_constant_v2(abs_value, is_arithmetic=True)
                 tokens.extend(disp_tokens)
     return tokens
 
@@ -120,10 +128,18 @@ def tokenize_operand_memory(
     disp = op.mem.disp
     post_indexed = op.mem.post_indexed
     writeback = op.mem.writeback
+    resolved_target = op.mem.resolved_target
 
     has_base = not base.is_absent
     has_index = not index.is_absent
-    has_disp = disp != 0
+    # Resolved-target case (Ghidra-only): substitute the analyzer-
+    # resolved data address for the literal disp during classification
+    # so precedence step 7 (string_ptr) / step 9 (ro_data_ptr) fire
+    # for ARM literal-pool indirections like ``ldrb r3, [r4, #0]``
+    # where r4 was loaded from a slot pointing at a string in .rodata.
+    has_resolved = resolved_target is not None
+    classified_value = resolved_target if has_resolved else disp
+    has_disp = classified_value != 0 or has_resolved
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET))
 
@@ -145,13 +161,13 @@ def tokenize_operand_memory(
     # the in-bracket disp emission; the disp is rendered after the
     # close-bracket + separator below.
     if has_disp and not post_indexed:
-        if disp < 0:
+        if classified_value < 0:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
         elif has_base or has_index:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
         tokens.extend(
             _emit_arm_disp_value_tokens(
-                disp,
+                classified_value,
                 has_base,
                 op,
                 lookup,
@@ -161,6 +177,7 @@ def tokenize_operand_memory(
                 func_max_addr,
                 constant_handler,
                 vocab_manager,
+                is_resolved_target=has_resolved,
             )
         )
 
@@ -172,11 +189,11 @@ def tokenize_operand_memory(
         tokens.append(
             vocab_manager.MemoryOperand(MemoryOperandSymbol.POST_INDEX_SEPARATOR)
         )
-        if disp < 0:
+        if classified_value < 0:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
         tokens.extend(
             _emit_arm_disp_value_tokens(
-                disp,
+                classified_value,
                 has_base,
                 op,
                 lookup,
@@ -186,6 +203,7 @@ def tokenize_operand_memory(
                 func_max_addr,
                 constant_handler,
                 vocab_manager,
+                is_resolved_target=has_resolved,
             )
         )
 

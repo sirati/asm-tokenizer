@@ -182,6 +182,20 @@ class MemoryOperandView(Protocol):
     # ShiftKind.NONE`` on every non-shifted-index addressing mode and
     # on non-ARM ISAs.
 
+    @property
+    def resolved_target(self) -> Optional[int]: ...
+    # Analyzer-resolved data target for the memory access, when the
+    # provider's value-flow / PC-relative analyzer has lifted an
+    # address that differs from the operand's literal ``disp``. The
+    # v2 classifier should call ``lookup()`` on this address (when
+    # not None) instead of ``disp`` so precedence step 7 (string_ptr)
+    # and 9 (ro_data_ptr) fire correctly for ARM literal-pool reads
+    # like ``ldrb r3, [r4, #0]`` where r4 was loaded from a literal
+    # slot resolving to a string. ``None`` whenever Ghidra has no
+    # qualifying resolved-target ref (every angr-path operand returns
+    # ``None`` as Capstone does not perform value-flow analysis at
+    # decode time).
+
     def __deepcopy__(self, memo) -> "MemoryOperandView": ...
 
 

@@ -31,9 +31,17 @@ def tokenize_operand_memory_base_disp(
 
     base = op.mem.base
     disp = op.mem.disp
+    resolved_target = op.mem.resolved_target
 
     has_base = not base.is_absent
-    has_disp = disp != 0
+    # Resolved-target case (Ghidra-only): the provider's analyzer has
+    # lifted the actual data address the access points at, distinct
+    # from the operand's literal disp. The v2 classifier MUST receive
+    # the resolved address to reach precedence step 7 (string_ptr) /
+    # step 9 (ro_data_ptr); without it the bare-disp lookup either
+    # returns UNKNOWN (literal-pool indirection) or misses entirely.
+    has_resolved = resolved_target is not None
+    has_disp = disp != 0 or has_resolved
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET))
 
@@ -41,12 +49,17 @@ def tokenize_operand_memory_base_disp(
         tokens.append(vocab_manager.get_registry_token(base.name, base.id))
 
     if has_disp:
-        if disp < 0:
+        # For the resolved-target case the displayed value IS the
+        # resolved address (the original tiny disp is folded into the
+        # provider-side analysis). Sign tracking follows the chosen
+        # value.
+        classified_value = resolved_target if has_resolved else disp
+        if classified_value < 0:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
         elif has_base:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
 
-        abs_disp = abs(disp)
+        abs_value = abs(classified_value)
         # Memory operand → an FP load against the resolved address gets a
         # postfix ``floatXX`` annotation (precedence.md "Postfix FP"). The
         # angr/Capstone path uniformly reports ``op.fp_type is None`` (see
@@ -54,24 +67,27 @@ def tokenize_operand_memory_base_disp(
         # bare ptr token there. Ghidra populates the typed signal at
         # decode time.
         fp_postfix = op.fp_type
-        if abs_disp <= 0xFF:
-            tokens.append(vocab_manager.ValuedConst(abs_disp))
+        if abs_value <= 0xFF and not has_resolved:
+            # Short-circuit only applies to small literal disps; a
+            # resolved-target address can never collapse to a bare
+            # valued_const without losing the classification.
+            tokens.append(vocab_manager.ValuedConst(abs_value))
         else:
             force_opaque = not has_base
-            meta = lookup.lookup(abs_disp)
+            meta = lookup.lookup(abs_value)
 
-            if force_opaque or (abs_disp > (1 << 18)):
+            if force_opaque or (abs_value > (1 << 18)) or has_resolved:
                 disp_tokens = constant_handler.process_constant_v2(
-                    abs_disp,
+                    abs_value,
                     meta=meta,
                     is_arithmetic=False,
                     fp_postfix_type=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
             else:
-                if (text_start <= abs_disp < text_end) or (abs_disp < func_min_addr or abs_disp > func_max_addr):
+                if (text_start <= abs_value < text_end) or (abs_value < func_min_addr or abs_value > func_max_addr):
                     disp_tokens = constant_handler.process_constant_v2(
-                        abs_disp,
+                        abs_value,
                         meta=meta,
                         is_arithmetic=False,
                         fp_postfix_type=fp_postfix,
@@ -79,7 +95,7 @@ def tokenize_operand_memory_base_disp(
                     tokens.extend(disp_tokens)
                 else:
                     disp_tokens = constant_handler.process_constant_v2(
-                        abs_disp,
+                        abs_value,
                         is_arithmetic=True,
                     )
                     tokens.extend(disp_tokens)

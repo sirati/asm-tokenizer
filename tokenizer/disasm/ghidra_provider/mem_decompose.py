@@ -14,12 +14,19 @@ expose the same (base, index, scale, disp, segment) wire-shape that
 the typed ``MemoryOperandView`` exposes to consumers, plus the ARM-
 specific writeback / pre-indexed / post-indexed flags surfaced from
 ``getDefaultOperandRepresentationList(op_idx)``.
+
+In addition, this module surfaces ``resolved_target`` -- the address
+that Ghidra's analyzer has resolved this memory operand to point at,
+when it differs from the operand's literal displacement. This is the
+hook that lets the v2 precedence classifier reach the right metadata
+for PC-relative loads on ARM (``ldrb r3, [r4, #0]`` where r4 was
+loaded from a literal-pool slot resolving to a string in .rodata).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from tokenizer.disasm.ghidra_provider.mnemonic import _SEGMENT_REGISTERS, _RegisterMap
 from tokenizer.disasm.types import ShiftKind
@@ -76,6 +83,62 @@ class MemoryDecomposition:
     post_indexed: bool = False
     index_shift_kind: ShiftKind = ShiftKind.NONE
     index_shift_amount: int = 0
+    resolved_target: Optional[int] = None
+
+
+def _compute_resolved_target(
+    ghidra_insn: Any, op_idx: int, disp: int
+) -> Optional[int]:
+    """Return the analyzer-resolved data target for memory operand ``op_idx``.
+
+    Ghidra's CFG analyzer recovers value-flow information on memory
+    accesses whose base register was loaded from a known-pointer slot
+    (typical for ARM ``ldrb rN, [rM, #0]`` patterns where rM came from
+    a literal pool). The resolved target is surfaced on the operand
+    via ``getOperandReferences(op_idx)`` as a primary data reference
+    whose target address differs from the operand's literal disp.
+
+    When the data reference points to the SAME address as the operand
+    disp (the common x86 ``lea rax, [0x...]`` case), there is no
+    resolved-target distinction to surface -- the v2 classifier will
+    already lookup the disp directly. Return ``None`` in that case so
+    consumers know to keep the disp-based lookup path.
+
+    Returns the resolved address as a signed Python int, or ``None``
+    when no qualifying ref is present.
+    """
+    try:
+        refs = ghidra_insn.getOperandReferences(op_idx)
+    except Exception:
+        return None
+    for ref in refs or ():
+        try:
+            ref_type = ref.getReferenceType()
+            if not ref_type.isData():
+                continue
+            # Exclude stack-frame analyzer references: Ghidra surfaces
+            # stack-frame slot positions as data refs in a separate
+            # ``stack`` address space. The numeric offset is a frame-
+            # relative slot identifier, NOT a loadable data address;
+            # feeding it through ``lookup()`` produces meaningless
+            # metadata. ``Reference.isStackReference()`` is the
+            # authoritative discriminator over the also-applicable
+            # ``isMemoryReference()`` check.
+            if ref.isStackReference():
+                continue
+            if not ref.isMemoryReference():
+                continue
+            target = int(ref.getToAddress().getOffset())
+        except Exception:
+            continue
+        # Exclude the same-as-disp case so x86 ``lea`` operands (where
+        # disp itself is the absolute address) do not redundantly
+        # surface a "resolved" target identical to disp; the disp-based
+        # ``lookup()`` already classifies them correctly.
+        if target == disp:
+            continue
+        return target
+    return None
 
 
 def _inspect_arm_index_shift(

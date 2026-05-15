@@ -152,10 +152,20 @@ def tokenize_operand_memory(
     segment = mem.segment
     scale = mem.scale
     disp = mem.disp
+    resolved_target = mem.resolved_target
 
     has_reg = not base.is_absent
     has_index = not index.is_absent
-    has_disp = disp != 0
+    # Resolved-target case (Ghidra-only): when the provider's analyzer
+    # has lifted a data address distinct from the operand's literal
+    # disp, substitute it for classification so precedence step 7
+    # (string_ptr) / step 9 (ro_data_ptr) fire. For typical x86
+    # ``lea rsi, [rip+offset]`` Ghidra resolves the disp directly so
+    # ``resolved_target`` is None and the existing disp-based lookup
+    # path runs unchanged.
+    has_resolved = resolved_target is not None
+    classified_value = resolved_target if has_resolved else disp
+    has_disp = classified_value != 0 or has_resolved
 
     if op.size in SIZE_MAP:
         tokens.append(vocab_manager.PlatformToken(SIZE_MAP[op.size], PlatformInstructionTypes.POINTER_LENGTHS))
@@ -198,7 +208,7 @@ def tokenize_operand_memory(
                 f"{insn.mnemonic} {insn.op_str}"
             )
 
-    if disp < 0:
+    if classified_value < 0:
         tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
     elif has_disp and (has_reg or has_index):
         tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
@@ -207,9 +217,12 @@ def tokenize_operand_memory(
     if not has_disp:
         pass  # noop ignore
     elif (
-        disp <= 0xFF
+        classified_value <= 0xFF and not has_resolved
     ):  # if we are in range 00 to 0xFF we always use constant, same if we are negative as its defo not an addr
-        tokens.append(vocab_manager.ValuedConst(abs(disp)))
+        # The resolved-target path always takes the metadata-aware
+        # emitter below; a resolved string at e.g. 0x42 would otherwise
+        # collapse to a bare ``valued_const`` and lose precedence step 7.
+        tokens.append(vocab_manager.ValuedConst(abs(classified_value)))
 
     else:
         force_opaque = False
@@ -217,10 +230,18 @@ def tokenize_operand_memory(
         if has_disp and not has_reg:
             force_opaque = True
 
-        elif disp > (1 << 18):  # = 262,144
+        elif classified_value > (1 << 18):  # = 262,144
             force_opaque = True
 
-        meta = lookup.lookup(disp)
+        elif has_resolved:
+            # Provider-resolved address: skip the in-text / arithmetic
+            # heuristic and let the metadata-aware emitter classify
+            # directly. Without this, a resolved-target in the .text
+            # range (e.g. a literal-pool slot itself) would route to
+            # the arithmetic path.
+            force_opaque = True
+
+        meta = lookup.lookup(classified_value)
 
         # Memory operand → if the load is FP-typed Ghidra stamps the typed
         # ``fp_type`` on this OperandView at decode time; the v2 emitter
@@ -231,7 +252,7 @@ def tokenize_operand_memory(
 
         if force_opaque:
             disp_token = constant_handler.process_constant_v2(
-                disp,
+                classified_value,
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
@@ -242,11 +263,11 @@ def tokenize_operand_memory(
         # path runs unconditionally below). The double-emission for
         # ``force_opaque`` displacements is a pre-existing quirk; D.3 only
         # migrates the lookup return type.
-        meta = lookup.lookup(disp)
+        meta = lookup.lookup(classified_value)
         # Check if displacement is in text section or outside function bounds
-        if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
+        if (text_start <= classified_value < text_end) or (classified_value < func_min_addr or classified_value > func_max_addr):
             disp_token = constant_handler.process_constant_v2(
-                disp,
+                classified_value,
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
@@ -254,7 +275,7 @@ def tokenize_operand_memory(
             tokens.extend(disp_token)
         else:
             # Local constant - treat as valued constant literal
-            disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
+            disp_token = constant_handler.process_constant_v2(classified_value, is_arithmetic=True)
             tokens.extend(disp_token)
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))

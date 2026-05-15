@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from tokenizer.disasm.ghidra_provider.mem_decompose import (
     _compute_arm_memory_components,
     _compute_base_disp_memory_components,
+    _compute_resolved_target,
     _compute_x86_memory_components,
     _infer_mem_access_size,
 )
@@ -138,6 +139,13 @@ class _GhidraDecodeHelper:
 
         def _populate(mem_view) -> None:
             decomp = compute(ghidra_insn, op_idx, reg_map)
+            # Resolved-target capture depends on the computed disp so
+            # the equal-to-disp filter inside the helper can suppress
+            # the trivially-redundant x86-style case where the operand
+            # disp IS the absolute address.
+            resolved_target = _compute_resolved_target(
+                ghidra_insn, op_idx, decomp.disp
+            )
             mem_view._populate(
                 base_name=decomp.base_name,
                 base_id=decomp.base_id,
@@ -152,6 +160,7 @@ class _GhidraDecodeHelper:
                 post_indexed=decomp.post_indexed,
                 index_shift_kind=decomp.index_shift_kind,
                 index_shift_amount=decomp.index_shift_amount,
+                resolved_target=resolved_target,
             )
 
         return _populate

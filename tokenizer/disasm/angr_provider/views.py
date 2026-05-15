@@ -204,6 +204,15 @@ class _AngrMemoryOperandView:
         # reader returns ``ShiftKind.NONE`` + amount=0 unconditionally.
         return self._index_shift
 
+    @property
+    def resolved_target(self) -> Optional[int]:
+        # Capstone does not perform value-flow / PC-relative analysis
+        # at decode time, so the angr-path operand never surfaces a
+        # resolved target distinct from the operand disp. The angr CFG
+        # analyzer COULD lift it post-hoc, but the parity work is out
+        # of scope here (see ``angr_limitations.md``).
+        return None
+
     def __deepcopy__(self, memo) -> "_AngrMemoryOperandView":
         clone = _AngrMemoryOperandView(self._arch)
         clone._op = self._op
