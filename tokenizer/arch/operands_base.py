@@ -98,12 +98,22 @@ def tokenize_operand_immediate_generic(
     func_max_addr: int,
     func_min_addr: int,
     constant_handler: ConstantHandler,
+    vocab_manager: VocabularyManager,
 ) -> List[Tokens]:
     """Tokenize an immediate operand (shared across simple architectures)."""
     tokens = []
 
-    imm_val = abs(op.imm)
+    raw_imm = op.imm
+    imm_val = abs(raw_imm)
     imm_val_hex_len = num_hex_digits(imm_val)
+
+    # Negative immediates: valued_const is a typeless byte-stream token
+    # (no size, no signedness embedded in the token), so we surface the
+    # sign as a leading MEM_MINUS token OUTSIDE any mem[ ]mem context.
+    # Float immediates take a separate path (FP-postfix annotation on
+    # the constant); only integer-immediate negatives need this branch.
+    if raw_imm < 0:
+        tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
 
     # Immediate operand → an FP-tagged immediate (precedence.md step 1) is
     # an inline ``floatXX`` whose value is the IEEE bit pattern. Only the
