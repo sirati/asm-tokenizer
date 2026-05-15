@@ -461,20 +461,38 @@ class ConstantHandler:
         ]
 
     def _emit_slot_with_modifier(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
-        """Step 8b: code-pointer-array slot → modifier + decomposed target.
+        """Step 8b: code-pointer-array slot → modifier + (resolved target | decomposed base+offset).
 
-        Without slot-target resolution available from the providers today,
-        we always decompose into the base-pointer + offset form documented
-        in precedence.md: ``[<modifier> <ro_data_ptr> <valued_const_v2>]``
-        where ``ro_data_ptr`` identifies the table's base (the slot's
-        containing range start) and ``valued_const_v2`` is the slot
-        offset. When a future provider enrichment exposes the resolved
-        target, this emitter swaps the decomposition for the resolved
-        token.
+        Modifier selection: ``vtable`` beats ``code_ptr_table`` (vtable is
+        the more specific signal — see ``tokenizer/disasm/precedence.md``).
+
+        Two emission shapes share this emitter, both prefixed by the
+        modifier and post-fixed by the operand-level FP annotation:
+
+        - **Resolved-target branch (Ghidra path, Phase D.1).** When the
+          provider has pre-resolved ``meta.slot_target`` to the typed view
+          of the *target* of the slot (the function/data the slot points
+          to), recursively classify the target via ``process_constant_v2``
+          and splice its tokens between the modifier and the postfix. The
+          recursion is bounded: the provider guarantees
+          ``slot_target.kind`` is never itself a slot kind, so the inner
+          call cannot recurse back into this emitter.
+        - **Decomposed fallback (angr path always; Ghidra path when the
+          slot target could not be resolved — e.g. null slot or out of
+          any recognized region).** Emit a ``ro_data_ptr`` for the
+          table's base + ``valued_const_v2`` for the in-range offset.
+          ``start_addr`` is the slot table's base; if absent (unusual for
+          step-8 enrichments), the base IS ``value`` and the offset is 0.
 
         Jump-table slots are handled by ``_emit_jump_table_slot`` (Phase
         E.1) and never reach this emitter — the precedence list routes
         ``AddressKind.JUMP_TABLE_SLOT`` to the dedicated emitter first.
+
+        Provider parity. Resolved-target emission is Ghidra-only by
+        current provider capability; angr always leaves
+        ``slot_target=None`` (see
+        ``tokenizer/disasm/angr_limitations.md``) so the angr path always
+        takes the decomposed fallback.
         """
         # Pick the modifier — vtable beats code_ptr_table for stable
         # ordering (vtable is the more specific signal).
@@ -484,10 +502,29 @@ class ConstantHandler:
             # CODE_PTR_TABLE_SLOT
             modifier = self.vocab_manager.Code_Ptr_Table()
 
-        # Decompose: emit a ro_data_ptr for the base + valued_const for
-        # the in-range offset. ``start_addr`` is the slot table's base.
-        # If meta lacks a start_addr (unusual for step-8 enrichments), the
-        # base IS the value and the offset is zero.
+        # Resolved-target branch (Ghidra-only; angr always leaves
+        # slot_target=None). Recursively classify the target itself —
+        # bounded recursion: provider guarantees slot_target.kind is never
+        # a slot kind. Pass fp_*_type=None because the recursive classify
+        # is for the slot's referent, not the operand-level FP context;
+        # the OUTER postfix annotation below preserves the original
+        # operand-level FP postfix on the outside of the target tokens.
+        if meta.slot_target is not None:
+            target_value = meta.slot_target.start_addr or value
+            target_tokens = self.process_constant_v2(
+                value=target_value,
+                meta=meta.slot_target,
+                is_arithmetic=False,
+                fp_immediate_type=None,
+                fp_postfix_type=None,
+            )
+            return [modifier, *target_tokens, *self._postfix_fp_annotation(ctx)]
+
+        # Decomposed fallback: emit a ro_data_ptr for the base +
+        # valued_const for the in-range offset. ``start_addr`` is the
+        # slot table's base. If meta lacks a start_addr (unusual for
+        # step-8 enrichments), the base IS the value and the offset is
+        # zero.
         base_addr = meta.start_addr if meta.start_addr is not None else value
         offset = value - base_addr
 
