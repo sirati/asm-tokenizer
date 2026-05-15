@@ -223,7 +223,7 @@ def tokenize_operand_memory(
         meta = lookup.lookup(disp)
 
         # Memory operand → if the load is FP-typed Ghidra stamps the typed
-        # ``fp_type`` on this _CapOperand at decode time; the v2 emitter
+        # ``fp_type`` on this OperandView at decode time; the v2 emitter
         # appends a postfix ``floatXX`` after the ptr token (precedence.md
         # "Postfix FP"). The angr path uniformly reports None
         # (``angr_limitations.md`` §1).

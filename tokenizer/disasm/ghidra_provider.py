@@ -13,7 +13,6 @@ Requirements:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -28,178 +27,6 @@ from tokenizer.disasm.metadata import (
     section_kind_from_type_string,
 )
 from tokenizer.disasm.types import Architecture, FpType
-
-# ---------------------------------------------------------------------------
-# Capstone-compatible adapter objects
-# ---------------------------------------------------------------------------
-# The existing ArchitectureProviders access deeply ISA-specific Capstone
-# attributes.  Rather than abstracting those away (which would create a
-# bloated union type), we produce thin wrappers that expose the same
-# attribute surface as Capstone objects.
-#
-# Capstone operand type constants (mirrored here so we don't need capstone
-# installed when only Ghidra is used):
-_OP_REG = 1
-_OP_IMM = 2
-_OP_MEM = 3
-
-
-@dataclass
-class _CapMemOperand:
-    """Capstone-compatible memory operand fields."""
-
-    base: int = 0
-    index: int = 0
-    scale: int = 1
-    disp: int = 0
-    segment: int = 0
-
-
-@dataclass
-class _GhidraMemRawData:
-    """Raw Ghidra data for native memory operand tokenization.
-
-    Carried on _CapOperand so the Ghidra arch provider can tokenize
-    MEM operands directly from Ghidra API objects without string parsing.
-    """
-
-    ghidra_insn: Any  # Ghidra Instruction object (for size inference)
-    op_objects: list[Any]  # getOpObjects() result
-    reg_map: Any  # _RegisterMap instance (for name -> id conversion)
-
-
-@dataclass
-class _CapShift:
-    """Capstone-compatible shift descriptor (ARM32)."""
-
-    type: int = 0
-    value: int = 0
-
-
-@dataclass
-class _CapOperand:
-    """Capstone-compatible operand object.
-
-    Fields are set depending on ``type``:
-        1 (REG)  -> ``reg``
-        2 (IMM)  -> ``imm``
-        3 (MEM)  -> ``mem``
-       64 (CRX, PPC only) -> ``crx``
-
-    ``fp_type`` is the per-operand FP type derived from Ghidra's
-    ``OperandType.FLOAT`` bitmask + the operand width (and, at width=2,
-    the per-ISA BFloat16 mnemonic table, see
-    ``_bfloat16_mnemonic_for_arch``). ``None`` when the operand is not
-    FP-typed. Populated at decode time by ``_ghidra_insn_to_cap``;
-    the angr provider stamps ``None`` uniformly via the class default
-    on Capstone operand types (see ``angr_provider.py``) so consumers
-    read ``op.fp_type`` directly without ``getattr`` soft-probes. See
-    ``angr_limitations.md`` §1 for why the angr path stays ``None``.
-    """
-
-    type: int = 0
-    reg: int = 0
-    imm: int = 0
-    mem: _CapMemOperand = field(default_factory=_CapMemOperand)
-    size: int = 0  # x86 operand size in bytes
-    shift: _CapShift = field(default_factory=_CapShift)
-    ghidra_raw_data: _GhidraMemRawData | None = None
-    fp_type: Optional[FpType] = None
-
-    @dataclass
-    class _CRX:
-        reg: int = 0
-
-    crx: _CRX = field(default_factory=_CRX)
-
-
-@dataclass
-class _CapInsnInner:
-    """Stands in for ``insn.insn`` — the raw Capstone CsInsn that
-    ArchitectureProviders access for ISA-specific fields."""
-
-    _insn_name: str = ""
-    cc: int = 0  # ARM32 condition code
-    update_flags: bool = False  # ARM32 S suffix
-    writeback: bool = False  # ARM32 ! suffix
-    bc: int = 0  # PPC branch condition
-    update_cr0: bool = False  # PPC Rc bit
-
-    def insn_name(self) -> str:
-        return self._insn_name
-
-
-class _CapInstruction:
-    """Capstone-compatible instruction adapter wrapping a Ghidra Instruction.
-
-    Attributes consumed by existing code:
-        mnemonic, op_str, operands, prefix, insn (._CapInsnInner),
-        reg_name(reg_id)
-    """
-
-    __slots__ = ("mnemonic", "op_str", "operands", "prefix", "insn", "_reg_map")
-
-    def __init__(
-        self,
-        mnemonic: str,
-        op_str: str,
-        operands: list[_CapOperand],
-        prefix: bytes,
-        insn_inner: _CapInsnInner,
-        reg_map: dict[int, str],
-    ):
-        self.mnemonic = mnemonic
-        self.op_str = op_str
-        self.operands = operands
-        self.prefix = prefix
-        self.insn = insn_inner
-        self._reg_map = reg_map
-
-    def reg_name(self, reg_id: int) -> str:
-        return self._reg_map.get(reg_id, f"reg{reg_id}")
-
-
-@dataclass
-class _CapBlock:
-    """Capstone-compatible block adapter.
-
-    ``fill_constant_candidates`` accesses:
-        block.addr, block.size, block.capstone.insns
-    """
-
-    addr: int
-    size: int
-    capstone: Any = None  # set after construction
-
-    @dataclass
-    class _CapstoneHolder:
-        insns: list[_CapInstruction]
-
-    def set_insns(self, insns: list[_CapInstruction]) -> None:
-        self.capstone = self._CapstoneHolder(insns)
-
-
-@dataclass
-class _CapFunction:
-    """Capstone-compatible function adapter.
-
-    ``fill_constant_candidates`` accesses:
-        func.blocks  (iterable, used multiple times — must be a list)
-
-    ``_raw`` carries the underlying Ghidra ``Function`` object for
-    Ghidra-side provider consumers (e.g. ``iter_switch_tables``) that
-    need to reach back into the Ghidra API. Defaults to ``None`` so the
-    angr-side provider, which constructs the wrapper differently, is
-    unaffected.
-    """
-
-    _blocks: list[_CapBlock]
-    _raw: Any = None
-
-    @property
-    def blocks(self) -> list[_CapBlock]:
-        return self._blocks
-
 
 # ---------------------------------------------------------------------------
 # Section-name -> v2 section-type mapping
@@ -1191,10 +1018,6 @@ class _RegisterMap:
     def get_name(self, reg_id: int) -> str:
         return self._id_to_name.get(reg_id, f"reg{reg_id}")
 
-    def as_dict(self) -> dict[int, str]:
-        """Return id->name dict for _CapInstruction.reg_name()."""
-        return dict(self._id_to_name)
-
 
 # ---------------------------------------------------------------------------
 # x86/x64 instruction translation constants
@@ -1337,9 +1160,9 @@ def _bfloat16_mnemonic_for_arch(arch: Architecture) -> frozenset[str]:
 def _ghidra_processor_to_architecture(program: Any) -> Architecture:
     """Map ``program.getLanguage().getProcessor()`` to the owned ``Architecture``.
 
-    Used by ``_ghidra_insn_to_cap`` once per instruction to thread the ISA
-    into the FP-type computation. Unknown processors map to
-    ``Architecture.UNKNOWN``; the BFloat16 reclassification then no-ops.
+    Threads the ISA into the FP-type computation that runs per operand.
+    Unknown processors map to ``Architecture.UNKNOWN``; the BFloat16
+    reclassification then no-ops.
     """
     try:
         processor = str(program.getLanguage().getProcessor()).lower()
@@ -1368,10 +1191,10 @@ def _compute_fp_type(
 ) -> Optional[FpType]:
     """Module-level helper backing ``operand_fp_type``.
 
-    Pulled out so the decode path in ``_ghidra_insn_to_cap`` can call it
-    once per operand to stamp the resulting ``FpType`` on ``_CapOperand``,
-    keeping the public ``GhidraDisassemblyProvider.operand_fp_type``
-    method as a thin wrapper. Returns the matching ``FpType`` when the
+    Called per operand from the decode path so the resulting ``FpType``
+    can be stamped on the owned operand view, keeping the public
+    ``GhidraDisassemblyProvider.operand_fp_type`` method as a thin
+    wrapper. Returns the matching ``FpType`` when the
     operand is FP-typed (Ghidra ``OperandType.FLOAT`` bitmask) or
     ``None`` otherwise. The width derivation order is:
 
@@ -1457,10 +1280,9 @@ def _compute_fp_type(
 # The x86 path is faithfully ported from the legacy Ghidra-side memory
 # tokenizer at ``tokenizer/arch/x86/ghidra/operands.py`` (the
 # ``_classify_objects + assign_base_index_scale_disp`` block of
-# ``tokenize_operand_memory_ghidra``); the token-emission half stays in
-# the legacy file until G.3 retires it. The ARM and base+disp paths are
-# new in this commit; they expose the same wire-shape consumers expect
-# from a populated ``_CapMemOperand`` (base/index/scale/disp/segment).
+# ``tokenize_operand_memory_ghidra``). The ARM and base+disp paths
+# expose the same (base, index, scale, disp, segment) wire-shape that
+# the typed ``MemoryOperandView`` exposes to consumers.
 
 
 def _infer_mem_size_from_ghidra_insn(ghidra_insn: Any, default: int = 8) -> int:
@@ -1636,10 +1458,9 @@ def _compute_base_disp_memory_components(
 # Per-ISA prefix builders
 # ---------------------------------------------------------------------------
 # Build typed ``InstructionPrefixView`` instances for a Ghidra Instruction.
-# x86 reads the legacy prefix-byte set; ARM / PPC / MIPS / RISC-V return
-# empty lists for now (the legacy ``_CapInsnInner`` defaults make their
-# typed-prefix fields all-zero, so consumers' ``insn.insn.cc != 0`` etc.
-# always falls through - see G.3 migration when those signals become
+# x86 reads the prefix-byte set; ARM / PPC / MIPS / RISC-V return empty
+# lists for now (their typed-prefix fields stay at defaults, so
+# consumer predicates always fall through until those signals become
 # available).
 
 _X86_BYTE_TO_PREFIX_BUILDER: dict[int, Any] = {
@@ -1706,11 +1527,10 @@ def _build_prefixes_x86(ghidra_insn: Any) -> list[Any]:
 def _build_prefixes_arm(ghidra_insn: Any) -> list[Any]:
     """Build typed prefix-view instances for an ARM instruction.
 
-    Stub for forward-compat: the legacy ``_CapInsnInner`` ARM-side fields
-    (``cc`` / ``update_flags`` / ``writeback``) are never populated by the
-    Ghidra path today, so consumers see them as zero/false. Returns an
-    empty list; G.3 migrates ARM extraction once the consumer side moves
-    to typed prefixes.
+    Stub for forward-compat: ARM-side condition-code / update-flags /
+    writeback signals are not extracted by the Ghidra path today, so
+    consumers see them as zero/false defaults. Returns an empty list
+    until ARM extraction is wired up.
     """
     return []
 
@@ -1718,10 +1538,9 @@ def _build_prefixes_arm(ghidra_insn: Any) -> list[Any]:
 def _build_prefixes_ppc(ghidra_insn: Any) -> list[Any]:
     """Build typed prefix-view instances for a PPC instruction.
 
-    Stub for forward-compat; same shape as ``_build_prefixes_arm``. The
-    ``bc`` and ``update_cr0`` legacy fields are never populated by the
-    Ghidra path today. G.3 migrates PPC extraction once the consumer
-    side moves to typed prefixes.
+    Stub for forward-compat; same shape as ``_build_prefixes_arm``.
+    The ``bc`` and ``update_cr0`` signals are not extracted by the
+    Ghidra path today.
     """
     return []
 
@@ -1957,333 +1776,6 @@ class _GhidraDecodeHelper:
         return spec
 
 
-def _ghidra_insn_to_cap(
-    ghidra_insn: Any,
-    reg_map: _RegisterMap,
-    program: Any,
-) -> _CapInstruction:
-    """Translate a single Ghidra Instruction into a _CapInstruction."""
-    from ghidra.program.model.address import Address
-    from ghidra.program.model.lang import OperandType, Register
-    from ghidra.program.model.scalar import Scalar
-
-    # -- Mnemonic / prefix handling -------------------------------------------
-    raw_mnemonic = str(ghidra_insn.getMnemonicString())
-    base_mnemonic, suffix_prefix_name, suffix_prefix_byte = _split_ghidra_mnemonic(raw_mnemonic)
-    base_mnemonic = _GHIDRA_MNEMONIC_ALIASES.get(base_mnemonic, base_mnemonic)
-
-    prefix_set = _extract_x86_prefixes(ghidra_insn)
-    if suffix_prefix_byte is not None:
-        prefix_set.add(suffix_prefix_byte)
-    prefix_bytes = bytes(sorted(prefix_set))
-
-    # Capstone-compatible mnemonic: X86Provider checks mnemonic.startswith("repe") etc.
-    if suffix_prefix_name is not None:
-        mnemonic = f"{suffix_prefix_name} {base_mnemonic}"
-    else:
-        mnemonic = base_mnemonic
-
-    # ISA derived once per instruction so the BFloat16 mnemonic
-    # reclassification at width=2 can dispatch to the right per-ISA table
-    # without re-querying ``program.getLanguage()`` per operand.
-    arch = _ghidra_processor_to_architecture(program)
-
-    # -- Operand handling -----------------------------------------------------
-    num_ops = ghidra_insn.getNumOperands()
-    op_strs: list[str] = []
-    operands: list[_CapOperand] = []
-
-    for i in range(num_ops):
-        op_repr = str(ghidra_insn.getDefaultOperandRepresentation(i))
-        op_strs.append(op_repr)
-        objects = ghidra_insn.getOpObjects(i)
-
-        if not objects:
-            continue
-
-        # Detect memory operands via OperandType bitmask (no string parsing).
-        # DYNAMIC: register-based memory (e.g. [RSP + 0x10], FS:[0x28])
-        # INDIRECT: indirect memory reference (e.g. jmp [0x301f28])
-        # SCALAR|ADDRESS w/o REGISTER|CODE: absolute memory in LEA (e.g. [0x10168c])
-        op_type = ghidra_insn.getOperandType(i)
-        is_memory = (
-            bool(op_type & OperandType.DYNAMIC)
-            or bool(op_type & OperandType.INDIRECT)
-            or (
-                bool(op_type & OperandType.ADDRESS)
-                and bool(op_type & OperandType.SCALAR)
-                and not (op_type & (OperandType.REGISTER | OperandType.CODE))
-            )
-        )
-
-        # Per-operand FP type (Ghidra OperandType.FLOAT bitmask + per-ISA
-        # BFloat16 mnemonic reclassification at width=2). Stamped on every
-        # _CapOperand we build below so the operand tokenizer can pass it
-        # to ``ConstantHandler.process_constant_v2`` without re-deriving
-        # the signal at call-site granularity. See ``precedence.md`` step 1
-        # for how the classifier consumes it.
-        fp_type = _compute_fp_type(ghidra_insn, i, arch, base_mnemonic)
-
-        if is_memory:
-            # Attach raw Ghidra objects for native tokenization in X86GhidraProvider
-            raw_data = _GhidraMemRawData(
-                ghidra_insn=ghidra_insn,
-                op_objects=list(objects),
-                reg_map=reg_map,
-            )
-            operands.append(_CapOperand(type=_OP_MEM, ghidra_raw_data=raw_data, fp_type=fp_type))
-        else:
-            first = objects[0]
-            if isinstance(first, Register):
-                reg_id = reg_map.get_id(str(first.getName()))
-                operands.append(_CapOperand(type=_OP_REG, reg=reg_id, fp_type=fp_type))
-            elif isinstance(first, Scalar):
-                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue()), fp_type=fp_type))
-            elif isinstance(first, Address):
-                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset()), fp_type=fp_type))
-
-    insn_inner = _CapInsnInner(_insn_name=base_mnemonic)
-
-    return _CapInstruction(
-        mnemonic=mnemonic,
-        op_str=", ".join(op_strs),
-        operands=operands,
-        prefix=prefix_bytes,
-        insn_inner=insn_inner,
-        reg_map=reg_map.as_dict(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# LEGACY COMPAT PROXY -- REMOVE IN PHASE H.1
-# ---------------------------------------------------------------------------
-# The proxy bridges owned-view shapes (FunctionView/BlockView/...) to the
-# legacy ``_Cap*`` consumer shape so ``arch/`` modules and
-# ``fill_constant_candidates`` keep working until Phase G.3 migrates them.
-#
-# Lifecycle: each ``_LegacyCompatFunction`` is built FRESH per ``iter_functions``
-# step from a snapshot of the function's blocks/instructions/operands. The
-# proxy's snapshot is materialized at construction time (lists of
-# sub-proxies) so it stays stable when the owned view's cursor advances to
-# the next function. The reused owned ``_GhidraFunctionView`` is held as
-# ``proxy._view`` for forward-compatible callers - migrated consumers in
-# G.3 will read ``proxy._view`` for typed access; the proxy goes away in
-# Phase H.1 and consumers will read the owned view directly off
-# ``iter_functions``.
-#
-# The proxy faithfully reproduces every accessor the legacy ``_Cap*``
-# classes expose:
-#   - _LegacyCompatFunction: ``blocks`` (list), ``entry`` (int)
-#   - _LegacyCompatBlock: ``addr`` (int), ``size`` (int),
-#       ``capstone.insns`` (list of _LegacyCompatInstruction)
-#   - _LegacyCompatInstruction: ``mnemonic``, ``op_str``, ``operands``
-#       (list), ``prefix`` (bytes), ``insn`` (_LegacyCompatInsnInner),
-#       ``reg_name(reg_id)``
-#   - _LegacyCompatInsnInner: ``insn_name()``, ``cc``, ``update_flags``,
-#       ``writeback``, ``bc``, ``update_cr0``
-#   - _LegacyCompatOperand: ``type``, ``reg``, ``imm``, ``mem``, ``size``,
-#       ``shift``, ``crx``, ``fp_type``, ``ghidra_raw_data``
-#
-# Construction strategy: the proxy reuses the existing ``_ghidra_insn_to_cap``
-# helper to build a legacy ``_CapInstruction`` per Ghidra Instruction (the
-# helper's behavior is canonical per the legacy contract). Each
-# ``_LegacyCompatInstruction`` wraps that ``_CapInstruction`` plus an
-# optional reference to the owned ``_GhidraInstructionView`` for forward
-# callers. This avoids duplicating the per-instruction decoding logic and
-# keeps the proxy a thin shim.
-
-
-class _LegacyCompatInsnInner:
-    """Proxy mirror of ``_CapInsnInner``.
-
-    Re-exports the legacy ``insn_name()`` method and the ARM/PPC
-    per-instruction signal fields. Today these signal fields are always
-    at their defaults (the legacy ``_ghidra_insn_to_cap`` doesn't
-    populate them - see _build_prefixes_arm/ppc stubs); the proxy
-    exposes the same defaults.
-    """
-
-    __slots__ = ("_legacy_inner",)
-
-    def __init__(self, legacy_inner: _CapInsnInner) -> None:
-        self._legacy_inner = legacy_inner
-
-    def insn_name(self) -> str:
-        return self._legacy_inner.insn_name()
-
-    @property
-    def cc(self) -> int:
-        return self._legacy_inner.cc
-
-    @property
-    def update_flags(self) -> bool:
-        return self._legacy_inner.update_flags
-
-    @property
-    def writeback(self) -> bool:
-        return self._legacy_inner.writeback
-
-    @property
-    def bc(self) -> int:
-        return self._legacy_inner.bc
-
-    @property
-    def update_cr0(self) -> bool:
-        return self._legacy_inner.update_cr0
-
-
-class _LegacyCompatOperand:
-    """Proxy mirror of ``_CapOperand``.
-
-    Wraps a legacy ``_CapOperand`` directly - the proxy exposes the
-    same attribute surface (``type``, ``reg``, ``imm``, ``mem``,
-    ``size``, ``shift``, ``crx``, ``fp_type``, ``ghidra_raw_data``).
-    Trivial pass-through; kept as a distinct class so consumer-side
-    isinstance checks (none today) can target the proxy specifically.
-    """
-
-    __slots__ = ("_legacy_op",)
-
-    def __init__(self, legacy_op: _CapOperand) -> None:
-        self._legacy_op = legacy_op
-
-    @property
-    def type(self) -> int:
-        return self._legacy_op.type
-
-    @property
-    def reg(self) -> int:
-        return self._legacy_op.reg
-
-    @property
-    def imm(self) -> int:
-        return self._legacy_op.imm
-
-    @property
-    def mem(self) -> _CapMemOperand:
-        return self._legacy_op.mem
-
-    @property
-    def size(self) -> int:
-        return self._legacy_op.size
-
-    @property
-    def shift(self) -> _CapShift:
-        return self._legacy_op.shift
-
-    @property
-    def crx(self) -> Any:
-        return self._legacy_op.crx
-
-    @property
-    def fp_type(self) -> Optional[FpType]:
-        return self._legacy_op.fp_type
-
-    @property
-    def ghidra_raw_data(self) -> Optional[_GhidraMemRawData]:
-        return self._legacy_op.ghidra_raw_data
-
-
-class _LegacyCompatInstruction:
-    """Proxy mirror of ``_CapInstruction`` over a (legacy CapInstruction +
-    owned InstructionView) pair.
-
-    The wrapped ``_CapInstruction`` is the canonical legacy data
-    container (built by ``_ghidra_insn_to_cap``); the optional ``_view``
-    is the owned ``_GhidraInstructionView`` for forward-compatible
-    callers (migrated G.3 consumers would read ``proxy._view`` for
-    typed access).
-    """
-
-    __slots__ = ("_legacy_insn", "_view", "_operands", "_inner")
-
-    def __init__(
-        self,
-        legacy_insn: _CapInstruction,
-        view: Optional[Any] = None,
-    ) -> None:
-        self._legacy_insn = legacy_insn
-        self._view = view
-        # Materialize operands list ONCE so the proxy is stable across
-        # owned-view cursor advances.
-        self._operands: list[_LegacyCompatOperand] = [
-            _LegacyCompatOperand(op) for op in legacy_insn.operands
-        ]
-        self._inner = _LegacyCompatInsnInner(legacy_insn.insn)
-
-    @property
-    def mnemonic(self) -> str:
-        return self._legacy_insn.mnemonic
-
-    @property
-    def op_str(self) -> str:
-        return self._legacy_insn.op_str
-
-    @property
-    def operands(self) -> list[_LegacyCompatOperand]:
-        return self._operands
-
-    @property
-    def prefix(self) -> bytes:
-        return self._legacy_insn.prefix
-
-    @property
-    def insn(self) -> _LegacyCompatInsnInner:
-        return self._inner
-
-    def reg_name(self, reg_id: int) -> str:
-        return self._legacy_insn.reg_name(reg_id)
-
-
-class _LegacyCompatBlock:
-    """Proxy mirror of ``_CapBlock``.
-
-    Exposes ``addr``, ``size``, and ``capstone.insns`` (a list of
-    ``_LegacyCompatInstruction``). The instructions list is materialized
-    at construction time.
-    """
-
-    __slots__ = ("addr", "size", "capstone")
-
-    def __init__(self, addr: int, size: int, insns: list[_LegacyCompatInstruction]) -> None:
-        self.addr = addr
-        self.size = size
-        # Mirror the legacy ``_CapBlock._CapstoneHolder`` shape so
-        # ``block.capstone.insns`` works.
-        self.capstone = _CapBlock._CapstoneHolder(insns=insns)
-
-
-class _LegacyCompatFunction:
-    """Proxy mirror of ``_CapFunction``.
-
-    Exposes ``blocks`` (list of ``_LegacyCompatBlock``) for the legacy
-    consumer surface AND ``entry`` (int) so ``iter_switch_tables`` can
-    look up the underlying Ghidra Function via the provider's
-    ``_funcs_by_entry`` map without the legacy ``function._raw`` unwrap
-    dance. The owned ``_GhidraFunctionView`` reference is exposed as
-    ``_view`` for forward-compatible callers; G.3 migrates consumers
-    to read it directly.
-    """
-
-    __slots__ = ("entry", "name", "_blocks", "_view")
-
-    def __init__(
-        self,
-        entry: int,
-        name: str,
-        blocks: list[_LegacyCompatBlock],
-        view: Optional[Any] = None,
-    ) -> None:
-        self.entry = entry
-        self.name = name
-        self._blocks = blocks
-        self._view = view
-
-    @property
-    def blocks(self) -> list[_LegacyCompatBlock]:
-        return self._blocks
-
-
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -2463,16 +1955,11 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             * One reusable ``_GhidraFunctionView`` is mutated each step to
               point at the current Ghidra Function (lazy/reuse contract,
               per ``tokenizer/disasm/types.py``). The reused view is the
-              source of truth for consumers (post-G.3).
+              source of truth for consumers.
             * ``self._funcs_by_entry`` is populated as we iterate so
               ``iter_switch_tables(function)`` can look up the Ghidra
               Java handle via ``function.entry`` (no more
               ``isinstance/_raw`` dance).
-
-        The transitional ``_LegacyCompat{Function,Block,Instruction,Operand}``
-        snapshot is still built per-iteration (via
-        ``_ghidra_insn_to_cap``) but is no longer yielded; Phase H.1
-        deletes those classes once nothing references them.
         """
         assert self._analyzed, "Analysis not run -- call build_cfg() first"
 
@@ -2515,55 +2002,19 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             body = ghidra_func.getBody()
             block_iter = block_model.getCodeBlocksContaining(body, monitor)
 
-            # Walk blocks once to build the legacy proxy snapshot. Block
-            # count is computed during this walk; we use it to advance
-            # the owned function view's cursor with an O(1) ``len(blocks)``.
-            legacy_blocks: list[_LegacyCompatBlock] = []
+            # Count code blocks so the reused FunctionView can expose an
+            # O(1) ``len(blocks)`` once we advance it. Functions with zero
+            # code blocks are skipped.
+            block_count = 0
             while block_iter.hasNext():
-                gblock = block_iter.next()
-                block_start = int(gblock.getMinAddress().getOffset())
-                block_size = int(gblock.getMaxAddress().getOffset()) - block_start + 1
+                block_iter.next()
+                block_count += 1
 
-                legacy_insns: list[_LegacyCompatInstruction] = []
-                insn_iter = self._listing.getInstructions(gblock, True)
-                while insn_iter.hasNext():
-                    ghidra_insn = insn_iter.next()
-                    if not body.contains(ghidra_insn.getAddress()):
-                        continue
-                    # Reuse the canonical legacy-instruction builder so
-                    # legacy ``_CapInstruction`` semantics are preserved
-                    # exactly. The proxy wraps the result and exposes
-                    # the legacy shape.
-                    cap_insn = _ghidra_insn_to_cap(ghidra_insn, self._reg_map, self._program)
-                    legacy_insns.append(_LegacyCompatInstruction(cap_insn))
-
-                legacy_blocks.append(
-                    _LegacyCompatBlock(
-                        addr=block_start,
-                        size=block_size,
-                        insns=legacy_insns,
-                    )
-                )
-
-            if not legacy_blocks:
-                # Mirror the legacy filter: functions with no decoded
-                # blocks are skipped entirely (no proxy yielded, no
-                # entry written to _funcs_by_entry).
+            if block_count == 0:
                 continue
 
-            # Advance the reused owned function view at this step. The
-            # view knows how to walk its own blocks lazily on demand;
-            # we already have the block count from the snapshot above.
-            function_view._advance(ghidra_func, len(legacy_blocks))
+            function_view._advance(ghidra_func, block_count)
             self._funcs_by_entry[addr] = ghidra_func
-
-            # Yield the typed ``_GhidraFunctionView`` directly (matching
-            # ``AngrDisassemblyProvider.iter_functions``). The legacy
-            # ``_LegacyCompat{Function,Block,Instruction,Operand}``
-            # snapshot is still built above (the per-instruction
-            # ``_ghidra_insn_to_cap`` call eagerly walks the listing) but
-            # no consumer reads it after Phase G.3; Phase H.1 deletes
-            # the proxy classes and drops that wasted decode pass.
             yield addr, name, function_view
 
     # ----------------------------------------------------------------------
@@ -2596,12 +2047,12 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
            classifier then routes through step 11 of the precedence list
            rather than emitting a malformed ``floatXX``).
 
-        Implementation note: the decode path in ``_ghidra_insn_to_cap``
-        stamps this type on every ``_CapOperand.fp_type`` at
-        instruction-translation time, so operand tokenizers don't need
-        to call this method per-operand. The public method stays on the
-        provider for direct callers and for symmetry with the
-        Phase 1.B.1 provider-interface contract.
+        Implementation note: the owned-view decode path stamps this type
+        on every operand view's ``fp_type`` at instruction-translation
+        time, so operand tokenizers don't need to call this method
+        per-operand. The public method stays on the provider for direct
+        callers and for symmetry with the Phase 1.B.1
+        provider-interface contract.
         """
         arch = _ghidra_processor_to_architecture(self._program)
         try:
@@ -2630,13 +2081,13 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         refinement (Phase 2.C.1 jump-table-analysis pass).
 
         ``function`` accepts any object with an ``entry`` attribute - the
-        legacy ``_LegacyCompatFunction`` proxy yielded by ``iter_functions``,
-        the typed ``FunctionView``, or any future shape that exposes the
-        function's entry-point address. The Ghidra Java handle is looked
-        up via ``self._funcs_by_entry`` (populated lazily by
-        ``iter_functions`` as it walks each function); calling
-        ``iter_switch_tables`` without first iterating ``iter_functions``
-        on the same provider returns an empty iterator.
+        typed ``FunctionView`` yielded by ``iter_functions`` or any
+        future shape that exposes the function's entry-point address.
+        The Ghidra Java handle is looked up via ``self._funcs_by_entry``
+        (populated lazily by ``iter_functions`` as it walks each
+        function); calling ``iter_switch_tables`` without first
+        iterating ``iter_functions`` on the same provider returns an
+        empty iterator.
         """
         if function is None:
             return

@@ -1,4 +1,3 @@
-import copy
 import re
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
@@ -53,7 +52,7 @@ from tokenizer.disasm.types import (
 # The angr path delivers raw Capstone CsOpnd objects (X86Op, ArmOp, ...) to
 # consumer code. Capstone never populates an FP-precision signal on these,
 # so the angr-side ``op.fp_type`` is uniformly ``None`` (matches the typed
-# ``Optional[FpType]`` shape exposed by the Ghidra path's ``_CapOperand``;
+# ``Optional[FpType]`` shape exposed by the Ghidra path's ``OperandView``;
 # see ``tokenizer/disasm/types.py``). Stamping the default at module load
 # (rather than per-instance per-instruction) keeps the consumer API uniform
 # across providers — ``op.fp_type`` is a direct typed read with no
@@ -1171,245 +1170,11 @@ def __getattr__(name: str):
     raise AttributeError(f"module 'tokenizer.disasm.angr_provider' has no attribute {name!r}")
 
 
-# ===========================================================================
-# LEGACY COMPAT PROXY -- REMOVE IN PHASE H.1
-# ===========================================================================
-# Bridges the OWNED ``*View`` classes back to the legacy ``_Cap*`` shape that
-# pre-G.3 consumers in ``tokenizer/arch/*`` and
-# ``tokenizer/fill_constant_candidates.py`` still read against. Each proxy
-# instance wraps a STASH-SAFE owned-view snapshot (see the lifecycle
-# docstring at the top of ``tokenizer/disasm/types.py`` -- ``copy.deepcopy``
-# binds a fresh wrapper to the same backing object), so iterating over
-# ``func.blocks`` then ``block.capstone.insns`` then ``insn.operands``
-# produces independent objects per iteration step the way consumers expect.
-#
-# Slated for removal once G.3 migrates ``tokenizer/arch/*`` +
-# ``fill_constant_candidates.py`` to read the owned views directly.
-# Auditable scope: every legacy attribute the audit
-# ``grep -rn 'block\.capstone\.insns | insn\.insn\.insn_name | op\.type ==
-#   | op\.mem\. | op\.reg | insn\.reg_name | \.prefix\b | \.cc\b
-#   | \.update_flags | \.writeback | \.crx' tokenizer/arch
-#   tokenizer/fill_constant_candidates.py``
-# surfaces is bridged here; nothing more.
-
-
-class _LegacyCompatMem:
-    """Legacy ``op.mem`` shape -- direct integer reads off the owned
-    ``MemoryOperandView``. Registers are exposed as raw ids (``RegisterView.id``)
-    to match the legacy ``op.mem.base = 0``-means-absent convention.
-    """
-
-    __slots__ = ("base", "index", "scale", "disp", "segment")
-
-    def __init__(self, mem_view: MemoryOperandView) -> None:
-        self.base: int = mem_view.base.id
-        self.index: int = mem_view.index.id
-        self.scale: int = mem_view.scale
-        self.disp: int = mem_view.disp
-        self.segment: int = mem_view.segment.id
-
-
-class _LegacyCompatShift:
-    """Legacy ``op.shift`` shape -- carries Capstone's raw ``type`` integer
-    (NOT the typed ``ShiftKind`` enum). Pre-G.3 consumer code in
-    ``tokenizer/arch/arm32/operands.py`` indexes the integer through its
-    own ``_ARM_SFT_NAMES`` table.
-
-    The owned ``ShiftModifierView`` has already mapped Capstone's encoding
-    onto ``ShiftKind``; to preserve the legacy expectation we reach back to
-    the Capstone-native ``type`` integer via the deep-copied operand handle
-    that the parent ``_LegacyCompatOperand`` carries.
-    """
-
-    __slots__ = ("type", "value")
-
-    def __init__(self, type_: int, value: int) -> None:
-        self.type: int = type_
-        self.value: int = value
-
-
-class _LegacyCompatCrx:
-    """Legacy ``op.crx`` shape -- exposes ``reg`` as a raw integer."""
-
-    __slots__ = ("reg",)
-
-    def __init__(self, reg_id: int) -> None:
-        self.reg: int = reg_id
-
-
-class _LegacyCompatOperand:
-    """Legacy ``_CapOperand`` shape, populated from an owned ``OperandView``.
-
-    Materialised eagerly per operand so the consumer can hold the reference
-    across iteration steps the way the pre-G.3 ``_CapOperand`` (a dataclass
-    instance per operand) allowed.
-    """
-
-    __slots__ = ("type", "reg", "imm", "mem", "size", "shift", "crx", "fp_type")
-
-    def __init__(self, op_view: OperandView, raw_op: Any) -> None:
-        self.type: int = op_view.type_int
-        self.reg: int = op_view.reg.id
-        self.imm: int = op_view.imm
-        self.mem: _LegacyCompatMem = _LegacyCompatMem(op_view.mem)
-        self.size: int = op_view.size
-        # Capstone shift type is the raw int the legacy consumers index
-        # through (`tokenizer/arch/arm32/operands.py::_ARM_SFT_NAMES`); we
-        # read it off the underlying Capstone op directly.
-        raw_shift = getattr(raw_op, "shift", None) if raw_op is not None else None
-        if raw_shift is None:
-            self.shift = _LegacyCompatShift(0, 0)
-        else:
-            self.shift = _LegacyCompatShift(int(raw_shift.type), int(raw_shift.value))
-        self.crx: _LegacyCompatCrx = _LegacyCompatCrx(op_view.crx.reg.id)
-        self.fp_type: Optional[FpType] = op_view.fp_type
-
-
-class _LegacyCompatInsnInner:
-    """Stands in for ``insn.insn`` in the legacy shape.
-
-    Pre-G.3 consumers in ``tokenizer/arch/{arm32,ppc,riscv,mips,x86}``
-    access ``insn.insn.insn_name()`` for the base mnemonic and the ARM
-    (``cc`` / ``update_flags`` / ``writeback``) and PPC (``bc`` /
-    ``update_cr0``) modifier fields. We reconstruct each modifier by
-    walking the typed ``PrefixesView`` once at construction time so the
-    legacy attribute read is a flat integer / bool lookup.
-    """
-
-    __slots__ = ("_insn_name", "cc", "update_flags", "writeback", "bc", "update_cr0")
-
-    def __init__(self, insn_view: InstructionView, raw_cs_insn: Any) -> None:
-        self._insn_name: str = insn_view.base_mnemonic
-        # Pull the raw integer ARM cc / PPC bc / bool flags directly off
-        # the underlying ``cs_insn`` so the ARM "AL = 15" sentinel and any
-        # other Capstone-native value the legacy consumer compares against
-        # are preserved verbatim. ``getattr`` is safe -- the field is
-        # absent on ISAs where it does not apply.
-        self.cc: int = int(getattr(raw_cs_insn, "cc", 0) or 0) if raw_cs_insn is not None else 0
-        self.update_flags: bool = bool(getattr(raw_cs_insn, "update_flags", False)) if raw_cs_insn is not None else False
-        self.writeback: bool = bool(getattr(raw_cs_insn, "writeback", False)) if raw_cs_insn is not None else False
-        self.bc: int = int(getattr(raw_cs_insn, "bc", 0) or 0) if raw_cs_insn is not None else 0
-        self.update_cr0: bool = bool(getattr(raw_cs_insn, "update_cr0", False)) if raw_cs_insn is not None else False
-
-    def insn_name(self) -> str:
-        return self._insn_name
-
-
-class _LegacyCompatInstruction:
-    """Legacy ``_CapInstruction`` shape, populated from an owned
-    ``InstructionView``.
-
-    Carries an eagerly materialised ``operands`` list and an ``insn``
-    inner-object that bundles the ARM/PPC modifier fields. ``prefix`` is
-    the underlying Capstone ``cs_insn.prefix`` 4-byte array verbatim --
-    pre-G.3 x86 consumers iterate it directly to match prefix opcode
-    bytes against ``instr_sets.prefixes``. ``reg_name(reg_id)`` proxies
-    to Capstone's per-instruction reg-name table on the same ``cs_insn``.
-    """
-
-    __slots__ = ("mnemonic", "op_str", "operands", "prefix", "insn", "_cs_insn")
-
-    def __init__(self, insn_view: InstructionView) -> None:
-        # Pull the raw Capstone instruction off the view so the legacy
-        # ``reg_name`` and ``prefix`` reads bypass the owned-view layer
-        # (we cannot expose Capstone-native reg-name lookup from the
-        # owned ``RegisterView`` -- the consumer still passes raw int reg
-        # ids around, and resolves the name per-call). This dependency
-        # vanishes with the legacy proxy in Phase H.1.
-        cs_insn = getattr(insn_view, "_cs_insn", None)
-        self._cs_insn = cs_insn
-        self.mnemonic: str = insn_view.mnemonic
-        self.op_str: str = insn_view.op_str
-        self.operands: list[_LegacyCompatOperand] = self._materialise_operands(insn_view, cs_insn)
-        # Raw 4-byte prefix array from Capstone -- consumers iterate it
-        # as ``for byte in insn.prefix``. ``b""`` for ISAs without
-        # prefix bytes (ARM / PPC / MIPS / RISC-V).
-        self.prefix = getattr(cs_insn, "prefix", b"") if cs_insn is not None else b""
-        self.insn: _LegacyCompatInsnInner = _LegacyCompatInsnInner(insn_view, cs_insn)
-
-    @staticmethod
-    def _materialise_operands(insn_view: InstructionView, cs_insn: Any) -> list[_LegacyCompatOperand]:
-        # The owned ``OperandsView`` reuses one cursor across iteration --
-        # we have to materialise per element to match the legacy semantics
-        # (operand list is a real list of independent dataclasses).
-        out: list[_LegacyCompatOperand] = []
-        raw_ops = getattr(cs_insn, "operands", None) or () if cs_insn is not None else ()
-        ops_iter = iter(insn_view.operands)
-        for raw_op in raw_ops:
-            try:
-                op_view = next(ops_iter)
-            except StopIteration:
-                break
-            out.append(_LegacyCompatOperand(op_view, raw_op))
-        return out
-
-    def reg_name(self, reg_id: int) -> str:
-        if self._cs_insn is None:
-            return ""
-        return self._cs_insn.reg_name(reg_id) or ""
-
-
-class _LegacyCompatBlock:
-    """Legacy ``_CapBlock`` shape -- ``addr``, ``size``, and
-    ``capstone.insns`` (a list of ``_LegacyCompatInstruction``).
-
-    ``capstone`` mirrors the angr ``Block.capstone`` -> ``CapstoneBlock``
-    indirection the legacy ``_CapBlock`` already aped via its inner
-    ``_CapstoneHolder``.
-    """
-
-    class _CapstoneHolder:
-        __slots__ = ("insns",)
-
-        def __init__(self, insns: list[_LegacyCompatInstruction]) -> None:
-            self.insns = insns
-
-    __slots__ = ("addr", "size", "capstone")
-
-    def __init__(self, block_view: BlockView) -> None:
-        self.addr: int = block_view.addr
-        self.size: int = block_view.size
-        # Materialise every instruction eagerly: the OWNED ``InstructionsView``
-        # reuses one cursor, so we deep-copy each cursor mid-iteration to
-        # bind the legacy wrapper to a stable backing ``cs_insn``.
-        insns: list[_LegacyCompatInstruction] = []
-        for insn_view in block_view.instructions:
-            insns.append(_LegacyCompatInstruction(copy.deepcopy(insn_view)))
-        self.capstone = self._CapstoneHolder(insns)
-
-
-class _LegacyCompatFunction:
-    """Legacy ``_CapFunction`` shape -- ``blocks`` is an eagerly-materialised
-    list of ``_LegacyCompatBlock``.
-
-    ``fill_constant_candidates`` calls ``list(func.blocks)`` then iterates
-    multiple times; the legacy contract requires per-block independent
-    objects, which we secure by deep-copying each reused ``BlockView``
-    cursor as iteration advances.
-    """
-
-    __slots__ = ("blocks",)
-
-    def __init__(self, func_view: FunctionView) -> None:
-        blocks: list[_LegacyCompatBlock] = []
-        for block_view in func_view.blocks:
-            blocks.append(_LegacyCompatBlock(copy.deepcopy(block_view)))
-        self.blocks = blocks
-
-
-# ===========================================================================
-# END LEGACY COMPAT PROXY
-# ===========================================================================
-
-
 __all__ = [  # noqa: F822 - "AngrMetadataLookup" / "AddressMetaDataLookup" resolved by __getattr__
     "AddressMetaDataLookup",
     "AngrDisassemblyProvider",
     "AngrMetadataLookup",
     "_AngrAddressMetadataView",
-    "_LegacyCompatBlock",
-    "_LegacyCompatFunction",
-    "_LegacyCompatInstruction",
 ]
 
 
@@ -1494,12 +1259,6 @@ class AngrDisassemblyProvider(DisassemblyProvider):
         docstring at the top of ``tokenizer/disasm/types.py``). Consumers
         that need to hold a function reference across an advance must
         ``copy.deepcopy(view)`` the snapshot.
-
-        Pre-G.3 consumers in ``tokenizer/arch/*`` and
-        ``tokenizer/fill_constant_candidates.py`` still read the legacy
-        ``_Cap*`` shape; they wrap the yielded view through
-        ``_LegacyCompatFunction(view)`` (slated for removal in Phase H.1
-        once G.3 migrates them to the owned-view interface).
         """
         assert self.cfg is not None, "CFG not built yet — call build_cfg() first"
         for func_addr, func in sorted(self.cfg.functions.items(), key=lambda item: item[1].name):
