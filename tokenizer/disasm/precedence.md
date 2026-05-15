@@ -111,6 +111,27 @@ exhaustive angr-side catalog lives in [`angr_limitations.md`](angr_limitations.m
   through to step 9 (`ro_data_ptr`) on the angr path. See
   [`angr_limitations.md`](angr_limitations.md).
 
+#### 8a. Jump-table-slot routing
+
+If the address lands inside a known switch jump table
+(`kind == JUMP_TABLE_SLOT`), the classifier emits
+`[jump_table(id), valued_const(offset)]` instead of decomposing the slot
+via the `code_ptr_table` / `vtable` modifier. The `id` is shared with the
+function-level footer's `Jump_Table` token (same `Category.JUMP_TABLE`
+identity), so a constant-side reference and the footer-side declaration
+resolve to the same referent.
+
+#### 8b. Resolved-target branch (`meta.slot_target`)
+
+When `meta.slot_target` is non-None (Ghidra-only — angr always leaves it
+None per [`angr_limitations.md`](angr_limitations.md)), the modifier-slot
+path recursively classifies the target itself rather than decomposing to
+`ro_data_ptr + valued_const(offset)`. The emitted shape becomes
+`[modifier, *target_classified_tokens]` — e.g. a vtable slot pointing at
+a local function emits `[vtable, local_func(id)]`. Recursion is bounded
+by the provider (`slot_target.kind` is guaranteed never to itself be a
+slot kind), so the recursion terminates after one level.
+
 ### 9. Address in a rodata section → `ro_data_ptr`
 
 - **Rule.** Address falls inside a read-only data section (`.rodata`,
@@ -191,3 +212,14 @@ Categories with identity (per the v2 token table): `block`, `local_func`,
 `jump_table`. Modifier tokens (`thread_local`, `vtable`, `code_ptr_table`),
 `valued_const`, and all `floatXX` tokens carry no identity — they are
 either intrinsic-valued (digit bytes inline) or pure-prefix modifiers.
+
+## Function-level jump-table footer
+
+The jump-table footer pass at function finalization ALWAYS runs. It emits
+a `[Block_Def, Jump_Table(id), Block_V2(target0), ...]` footer per known
+table, regardless of whether any constant pointing into the table was
+seen during instruction tokenization. If a slot registered an identity
+(via the Step-8a routing above) but the dispatch instruction wasn't
+recovered by `iter_switch_tables`, the footer still emits a target-less
+`[Block_Def, Jump_Table(id)]` declaration so the constant-side
+`jump_table(id)` token has a resolvable referent.
