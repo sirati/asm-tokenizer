@@ -403,6 +403,21 @@ class _GhidraDecodeHelper:
                 and not (op_type & OperandType.CODE)
                 and scalar_in_objects
             )
+            or (
+                # ARM32 pre-indexed STORE: ``strb r9, [r8, #0x1]!`` op_type
+                # is REGISTER-only (no ADDRESS, no DYNAMIC; Ghidra's
+                # arm32 SLEIGH spec is asymmetric vs pre-indexed LOAD
+                # which DOES carry ADDRESS). The disambiguator vs a
+                # plain REGISTER operand is the Scalar in objects (the
+                # pre-disp) plus the instruction-level rich-IR signal
+                # that it accesses memory (LOAD/STORE in PCode). The
+                # outer ``operand_has_brackets`` gate keeps this from
+                # claiming non-bracketed register operands.
+                bool(op_type & OperandType.REGISTER)
+                and not (op_type & OperandType.CODE)
+                and scalar_in_objects
+                and instruction_has_mem_access
+            )
         )
 
         fp_type = _compute_fp_type(ghidra_insn, op_idx, arch, base_mnemonic)
