@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from tokenizer.disasm.ghidra_provider.mnemonic import (
     _extract_x86_prefixes,
+    _split_ghidra_mnemonic,
     _strip_arm_cc_suffix,
 )
 from tokenizer.disasm.types import Architecture, FpType
@@ -563,10 +564,25 @@ def _build_prefixes_x86(ghidra_insn: Any) -> list[Any]:
     would corrupt FP-heavy code with false-positive repeat semantics.
     """
     prefix_bytes = _extract_x86_prefixes(ghidra_insn)
-    if (0xF2 in prefix_bytes or 0xF3 in prefix_bytes) and not _instruction_has_rep_loop(
-        ghidra_insn
-    ):
-        prefix_bytes = {b for b in prefix_bytes if b not in (0xF2, 0xF3)}
+    if 0xF2 in prefix_bytes or 0xF3 in prefix_bytes:
+        # Belt-and-braces: emit REPNE/REP iff EITHER the PCode shows the
+        # SLEIGH-unrolled REP-loop self-branch OR the Ghidra mnemonic
+        # carries a typed ``.REP``/``.REPE``/``.REPNE`` suffix
+        # (``_GHIDRA_SUFFIX_TO_PREFIX``). Both signals say the same thing
+        # in practice today, but they survive different categories of
+        # future Ghidra-side change — the OR makes the discriminator
+        # robust against a SLEIGH-lifting refactor that swaps the
+        # unrolled-loop for a CALLOTHER pseudo-op (mnemonic-suffix path
+        # still fires) or a mnemonic-rendering change (PCode path still
+        # fires).
+        if not _instruction_has_rep_loop(ghidra_insn):
+            try:
+                raw_mnemonic = str(ghidra_insn.getMnemonicString())
+            except Exception:
+                raw_mnemonic = ""
+            _stem, suffix_name, _suffix_byte = _split_ghidra_mnemonic(raw_mnemonic)
+            if suffix_name not in ("rep", "repe", "repz", "repne", "repnz"):
+                prefix_bytes = {b for b in prefix_bytes if b not in (0xF2, 0xF3)}
     out: list[Any] = []
     for byte in sorted(prefix_bytes):
         view = _x86_byte_to_prefix(byte)
