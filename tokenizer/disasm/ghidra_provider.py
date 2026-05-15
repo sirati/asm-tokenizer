@@ -173,9 +173,16 @@ class _CapFunction:
 
     ``fill_constant_candidates`` accesses:
         func.blocks  (iterable, used multiple times — must be a list)
+
+    ``_raw`` carries the underlying Ghidra ``Function`` object for
+    Ghidra-side provider consumers (e.g. ``iter_switch_tables``) that
+    need to reach back into the Ghidra API. Defaults to ``None`` so the
+    angr-side provider, which constructs the wrapper differently, is
+    unaffected.
     """
 
     _blocks: list[_CapBlock]
+    _raw: Any = None
 
     @property
     def blocks(self) -> list[_CapBlock]:
@@ -1175,7 +1182,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             if not cap_blocks:
                 continue
 
-            yield addr, name, _CapFunction(_blocks=cap_blocks)
+            yield addr, name, _CapFunction(_blocks=cap_blocks, _raw=ghidra_func)
 
     # ----------------------------------------------------------------------
     # Per-operand FP-immediate detection
@@ -1230,6 +1237,14 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         A processor-specific ``SwitchAnalyzer`` cross-check is a Phase 2
         refinement (Phase 2.C.1 jump-table-analysis pass).
         """
+        if function is None:
+            return
+
+        # ``fill_constant_candidates`` hands us the capstone-compat wrapper
+        # produced by ``iter_functions``; unwrap to the underlying Ghidra
+        # ``Function`` so we can drive the Ghidra reference graph below.
+        if isinstance(function, _CapFunction):
+            function = function._raw
         if function is None:
             return
 
