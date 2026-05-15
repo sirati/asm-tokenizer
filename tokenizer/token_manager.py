@@ -462,6 +462,16 @@ class VocabularyManager:
         token_class = self.get_token_class_for_type(token_type)
         return token_class._from_token_ids(token_ids)
 
+    # Format-aware factory dispatchers. Consumer code that needs to emit a
+    # valued constant or block identifier in the active wire format should
+    # call these instead of branching on `format_version` at the call site
+    # (single-source-of-truth for v1/v2 dispatch).
+    def ValuedConst(self, value):
+        return self.Valued_Const_V2(value) if self.format_version == 2 else self.Valued_Const(value)
+
+    def BlockId(self, block_id):
+        return self.Block_V2(block_id) if self.format_version == 2 else self.Block(block_id)
+
     def iter_representative_tokens(self):
         identifier_token_ids = []
         valued_const_ids = []
