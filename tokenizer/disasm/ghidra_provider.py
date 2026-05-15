@@ -2420,25 +2420,23 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
     def function_count(self) -> int:
         return int(self._fm.getFunctionCount())
 
-    def iter_functions(self) -> Iterable[tuple[int, str, _LegacyCompatFunction]]:
-        """Iterate functions, yielding (addr, name, legacy_compat_proxy) triples.
+    def iter_functions(self) -> Iterable[tuple[int, str, "_GhidraFunctionView"]]:
+        """Iterate functions, yielding (addr, name, function_view) triples.
 
         Internal model:
             * One reusable ``_GhidraFunctionView`` is mutated each step to
               point at the current Ghidra Function (lazy/reuse contract,
               per ``tokenizer/disasm/types.py``). The reused view is the
-              source of truth for migrated consumers (G.3+).
-            * The yielded value is a ``_LegacyCompatFunction`` proxy that
-              exposes the legacy ``_Cap*`` shape (``.blocks`` list,
-              ``block.capstone.insns`` list, ``insn.operands`` list, ...)
-              so non-migrated consumers in ``arch/`` and
-              ``fill_constant_candidates`` keep working through the
-              transition. The proxy snapshots its data at construction
-              so it stays valid across owned-view cursor advances.
+              source of truth for consumers (post-G.3).
             * ``self._funcs_by_entry`` is populated as we iterate so
               ``iter_switch_tables(function)`` can look up the Ghidra
               Java handle via ``function.entry`` (no more
               ``isinstance/_raw`` dance).
+
+        The transitional ``_LegacyCompat{Function,Block,Instruction,Operand}``
+        snapshot is still built per-iteration (via
+        ``_ghidra_insn_to_cap``) but is no longer yielded; Phase H.1
+        deletes those classes once nothing references them.
         """
         assert self._analyzed, "Analysis not run -- call build_cfg() first"
 
@@ -2523,12 +2521,14 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             function_view._advance(ghidra_func, len(legacy_blocks))
             self._funcs_by_entry[addr] = ghidra_func
 
-            yield addr, name, _LegacyCompatFunction(
-                entry=addr,
-                name=name,
-                blocks=legacy_blocks,
-                view=function_view,
-            )
+            # Yield the typed ``_GhidraFunctionView`` directly (matching
+            # ``AngrDisassemblyProvider.iter_functions``). The legacy
+            # ``_LegacyCompat{Function,Block,Instruction,Operand}``
+            # snapshot is still built above (the per-instruction
+            # ``_ghidra_insn_to_cap`` call eagerly walks the listing) but
+            # no consumer reads it after Phase G.3; Phase H.1 deletes
+            # the proxy classes and drops that wasted decode pass.
+            yield addr, name, function_view
 
     # ----------------------------------------------------------------------
     # Per-operand FP-immediate detection

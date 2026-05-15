@@ -1,10 +1,11 @@
-from typing import Any, Optional
+import copy
+from typing import Optional
 
 import numpy as np
 
 from tokenizer.arch.provider import ArchitectureProvider
 from tokenizer.constant_handler import ConstantHandler
-from tokenizer.disasm import DisassemblyProvider, MetadataLookup
+from tokenizer.disasm import DisassemblyProvider, FunctionView, MetadataLookup
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.instruction_sets import InstructionSets
 from tokenizer.token_lists import BlockTokenList
@@ -59,7 +60,7 @@ def _emit_jump_table_footer_for(
 
 
 def _emit_jump_table_footer(
-    func: Any,
+    func: FunctionView,
     func_tokens: FunctionTokenList,
     disasm_provider: Optional[DisassemblyProvider],
     resolver: TokenResolver,
@@ -148,7 +149,7 @@ def _emit_jump_table_footer(
 
 def fill_constant_candidates(
     func_addr: int,
-    func: Any,
+    func: FunctionView,
     instr_sets: InstructionSets,
     constant_dict: dict[str, list[str]],
     lookup: MetadataLookup,
@@ -170,11 +171,17 @@ def fill_constant_candidates(
     func_min_addr: int = int(func_addr)
     blocks: set = set()
 
-    block_objs = list(func.blocks)
-    num_blocks = len(block_objs)
+    # `func.blocks` yields the SAME reused `BlockView` instance per step
+    # (see ``tokenizer/disasm/types.py`` lifecycle docstring). To hold
+    # multiple block references across iteration advances we deepcopy each
+    # cursor — `BlockView.__deepcopy__` returns a fresh wrapper bound to
+    # the same provider-side block handle; nested instruction iteration
+    # stays lazy on each clone.
+    block_snapshots: list = [copy.deepcopy(block) for block in func.blocks]
+    num_blocks = len(block_snapshots)
     block_ranges: np.ndarray = np.empty((num_blocks, 2), dtype=np.uint64)
 
-    for i, block in enumerate(block_objs):
+    for i, block in enumerate(block_snapshots):
         block_ranges[i, 0] = block.addr
         block_ranges[i, 1] = block.addr + block.size
 
@@ -184,11 +191,11 @@ def fill_constant_candidates(
     block_list: list[dict[BlockToken, tuple[int, int]]] = []
     block_dict: dict[str, BlockToken] = {}
 
-    if num_blocks == 1 and not block_objs[0].capstone.insns:
+    if num_blocks == 1 and len(block_snapshots[0].instructions) == 0:
         return None
 
     func_tokens = FunctionTokenList(num_blocks, vocab_manager=vocab_manager)
-    ordered_blocks = sorted(block_objs, key=lambda b: b.addr)
+    ordered_blocks = sorted(block_snapshots, key=lambda b: b.addr)
     for block in ordered_blocks:
         func_max_addr = max(block.addr, block.addr + block.size)
 
@@ -205,18 +212,20 @@ def fill_constant_candidates(
         )
         blocks.add(block_addr)
 
-        assert block.capstone.insns is not None, "Block has no instructions, cannot disassemble"
-
         block_dict[block_addr] = block_token
 
         block_def = [vocab_manager.Block_Def(), block_token]
 
-        disassembly_list = BlockTokenList(len(block.capstone.insns) + 1, vocab_manager=vocab_manager)
+        disassembly_list = BlockTokenList(len(block.instructions) + 1, vocab_manager=vocab_manager)
         disassembly_list.append_as_insn(insn_str=f"block {block_addr}", tokens=block_def)
 
         disassembly_list2 = [block_def]
 
-        for insn in block.capstone.insns:
+        # `block.instructions` yields the SAME reused `InstructionView`
+        # per step; the per-iteration body emits tokens immediately and
+        # never stashes the wrapper across advances, satisfying the
+        # owned-view reuse contract.
+        for insn in block.instructions:
             insn_tokens = disassembly_list.view(insn_str=f"{insn.mnemonic} {insn.op_str}")
 
             insn_tokens = arch_provider.parse_instruction(
