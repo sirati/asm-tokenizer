@@ -338,7 +338,7 @@ class _GhidraDecodeHelper:
 
         # Pre-collect Register objects: used both by the is_memory check
         # below (a memory operand MUST involve at least one base/index
-        # register) and the reg-list classifier (>= 3 registers => REG_LIST).
+        # register) and the ARM/AArch64 reg-list classifier below.
         register_objs = [o for o in objects if isinstance(o, Register)]
 
         # A memory operand MUST involve at least one base/index register.
@@ -419,15 +419,20 @@ class _GhidraDecodeHelper:
             return spec
 
         # Reg-list classification (ARM stm/ldm/push/pop/vpush/vpop/vstm/
-        # vldm family). Ghidra's SLEIGH spec emits a flat sequence of
-        # Register objects for reg-list operands; standard MEM operands
-        # on every supported ISA carry at most 2 Registers (base+index
-        # on x86/ARM, base-only on MIPS/PPC/RISC-V). Three or more
-        # Registers in a single operand can therefore only be a
-        # reg-list; classify accordingly so the MEM-decompose helpers
-        # never see them (asserts in those helpers enforce the
-        # invariant downstream).
-        if len(register_objs) >= 3:
+        # vldm + AArch64 stp/ldp + VFP vstm/vldm family). Ghidra's
+        # SLEIGH spec emits a flat sequence of Register objects for
+        # reg-list operands on those ISAs; >=3 Registers on a single
+        # operand is a reliable signal there.
+        #
+        # The "reg-list" concept does NOT apply to x86/MIPS/PPC/RISC-V:
+        # x86 in particular legitimately surfaces 3 Registers on a
+        # segment-prefixed base+index memory operand (e.g.
+        # ``NOP word ptr CS:[RAX + RAX*0x1]`` exposes CS + RAX + RAX
+        # in getOpObjects). Gating the classifier on ARM32/AArch64
+        # keeps those x86 MEM operands flowing into
+        # ``_compute_x86_memory_components`` (which already separates
+        # segment from base/index by name).
+        if arch in (Architecture.ARM32, Architecture.AARCH64) and len(register_objs) >= 3:
             spec["kind"] = OperandKind.REG_LIST
             spec["decompose_reg_list"] = self._decompose_reg_list_callback(
                 ghidra_insn, op_idx, arch

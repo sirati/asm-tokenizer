@@ -318,10 +318,11 @@ def _compute_x86_memory_components(
 
     The first GP Register in ``getOpObjects()`` is the base; the second is
     the index. This is the Ghidra SLEIGH spec's documented convention.
-    Operands not conforming (3+ regs => reg-list) MUST have been
-    classified upstream as ``OperandKind.REG_LIST`` so this function
-    never sees them; the assert at the end of the object-walk enforces
-    that invariant.
+    Segment-override registers (CS/SS/DS/ES/FS/GS) are partitioned out
+    by name into their own slot and do NOT count against the 2-GP-register
+    invariant — a segment-prefixed base+index operand legitimately
+    carries 3 Registers in ``getOpObjects()`` (e.g.
+    ``NOP word ptr CS:[RAX + RAX*0x1]``).
     """
     from ghidra.program.model.address import Address
     from ghidra.program.model.lang import Register
@@ -354,9 +355,10 @@ def _compute_x86_memory_components(
             disp = int(obj.getOffset())
 
     assert len(general_reg_names) <= 2, (
-        f"x86 MEM operand should have at most 2 GP registers, got "
-        f"{len(general_reg_names)}: {general_reg_names!r}. If this fires, "
-        f"the operand should have classified as REG_LIST upstream."
+        f"x86 MEM operand should have at most 2 GP registers (base + "
+        f"index), got {len(general_reg_names)}: {general_reg_names!r}. "
+        f"Segment-override registers are partitioned out by name; if this "
+        f"fires the operand carries an unexpected third GP register."
     )
     assert len(scalars) <= 2, (
         f"x86 MEM operand should have at most 2 Scalar slots (scale + "
@@ -488,10 +490,10 @@ def _compute_base_disp_memory_components(
     the index slot absent, scale=1, and segment slots absent.
 
     The first GP Register in ``getOpObjects()`` is the base. This is the
-    Ghidra SLEIGH spec's documented convention. Operands not conforming
-    (3+ regs => reg-list) MUST have been classified upstream as
-    ``OperandKind.REG_LIST`` so this function never sees them; the
-    assert below enforces the invariant.
+    Ghidra SLEIGH spec's documented convention. These ISAs have no
+    reg-list family, so a base+disp MEM operand here always carries at
+    most 1 Register; the assert below enforces the invariant (and would
+    catch a Ghidra SLEIGH-spec quirk on a future ISA addition).
     """
     from ghidra.program.model.address import Address
     from ghidra.program.model.lang import Register
