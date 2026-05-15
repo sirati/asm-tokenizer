@@ -1463,6 +1463,38 @@ def _compute_fp_type(
 # from a populated ``_CapMemOperand`` (base/index/scale/disp/segment).
 
 
+def _infer_mem_size_from_ghidra_insn(ghidra_insn: Any, default: int = 8) -> int:
+    """Infer x86 memory-operand size from sibling register operands.
+
+    Ported verbatim from the legacy
+    ``tokenizer/arch/x86/ghidra/operands.py::_infer_size_from_ghidra_insn``
+    (deleted in G.3); the post-G.3 consumer (the shared
+    ``arch/x86/operands.py::tokenize_operand_memory``) reads ``op.size``
+    uniformly across both providers, so the inference now stamps the
+    operand spec at decode time.
+
+    Checks ``getResultObjects()`` then ``getInputObjects()`` for
+    general-purpose ``Register`` operands and returns the largest
+    ``getMinimumByteSize()``. The segment-register filter avoids picking
+    up 1-byte flags registers (CF / PF / ZF / SF / OF) that surface in
+    result objects for arithmetic instructions.
+    """
+    from ghidra.program.model.lang import Register
+
+    max_size = 0
+    for source in (ghidra_insn.getResultObjects(), ghidra_insn.getInputObjects()):
+        if source is None:
+            continue
+        for obj in source:
+            if isinstance(obj, Register):
+                name = str(obj.getName()).lower()
+                if name not in _SEGMENT_REGISTERS:
+                    size = int(obj.getMinimumByteSize())
+                    if size > max_size:
+                        max_size = size
+    return max_size if max_size > 0 else default
+
+
 def _compute_x86_memory_components(
     ghidra_insn: Any,
     op_idx: int,
@@ -1881,13 +1913,17 @@ class _GhidraDecodeHelper:
 
         if is_memory:
             spec["kind"] = OperandKind.MEM
-            # Memory size: defer to per-ISA inference at decompose time
-            # for byte-accurate width; legacy x86 uses
-            # ``_infer_size_from_ghidra_insn`` which inspects sibling
-            # operands. The owned-view ``size`` is tracked in the operand
-            # itself for non-MEM kinds; MEM size is computed by the
-            # consumer at tokenization time today (legacy parity).
-            spec["size"] = 0
+            # Memory size: inferred from sibling register operands. The
+            # legacy ``tokenize_operand_memory_ghidra`` ran this inference
+            # at tokenization time via ``_infer_size_from_ghidra_insn``;
+            # we hoist it into the operand spec so the post-G.3 consumer
+            # (the shared ``arch/x86/operands.py::tokenize_operand_memory``)
+            # can read ``op.size`` uniformly across both providers.
+            # Default 8 mirrors the legacy ``_infer_size_from_ghidra_insn``
+            # signature; ARM / MIPS / PPC / RISC-V consumers do not look
+            # at ``op.size`` for MEM operands so the value is harmless on
+            # non-x86 ISAs.
+            spec["size"] = _infer_mem_size_from_ghidra_insn(ghidra_insn)
             spec["decompose_mem"] = self._decompose_mem_callback(ghidra_insn, op_idx, arch)
             return spec
 
