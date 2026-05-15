@@ -3,16 +3,19 @@ from typing import List
 from tokenizer.arch.operands_base import tokenize_operand_immediate_generic
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm.types import InstructionView, OperandView, ShiftKind
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, Tokens
 
-# ARM32 shift types (from Capstone)
-_ARM_SFT_NAMES: dict[int, str] = {
-    1: "lsl",
-    2: "lsr",
-    3: "asr",
-    4: "ror",
-    5: "rrx",
+# Typed ShiftKind -> ARM asm-form shift word. Mirrors the legacy
+# Capstone-int table 1..5 -> {lsl, lsr, asr, ror, rrx}; the typed enum
+# drops the magic integers entirely.
+_SHIFT_KIND_NAMES: dict[ShiftKind, str] = {
+    ShiftKind.LSL: "lsl",
+    ShiftKind.LSR: "lsr",
+    ShiftKind.ASR: "asr",
+    ShiftKind.ROR: "ror",
+    ShiftKind.RRX: "rrx",
 }
 
 # Re-export the generic immediate tokenizer under the name used by the provider
@@ -20,9 +23,9 @@ tokenize_operand_immediate = tokenize_operand_immediate_generic
 
 
 def tokenize_operand_memory(
-    insn,
+    insn: InstructionView,
     lookup,
-    op,
+    op: OperandView,
     text_end: int,
     text_start: int,
     func_max_addr: int,
@@ -41,19 +44,19 @@ def tokenize_operand_memory(
     index = op.mem.index
     disp = op.mem.disp
 
-    has_base = base != 0
-    has_index = index != 0
+    has_base = not base.is_absent
+    has_index = not index.is_absent
     has_disp = disp != 0
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET))
 
     if has_base:
-        tokens.append(vocab_manager.get_registry_token(insn.reg_name(base), base))
+        tokens.append(vocab_manager.get_registry_token(base.name, base.id))
 
     if has_index:
         if has_base:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
-        tokens.append(vocab_manager.get_registry_token(insn.reg_name(index), index))
+        tokens.append(vocab_manager.get_registry_token(index.name, index.id))
 
     if has_disp:
         if disp < 0:
@@ -101,16 +104,23 @@ def tokenize_operand_memory(
 
 
 def tokenize_operand_shift(
-    insn,
-    op,
+    insn: InstructionView,
+    op: OperandView,
     vocab_manager: VocabularyManager,
 ) -> List[Tokens]:
-    """Tokenize a shift modifier on an ARM operand (e.g. LSL #2, ASR R3)."""
+    """Tokenize a shift modifier on an ARM operand (e.g. LSL #2, ASR R3).
+
+    ``op.shift`` is always present on the typed ``OperandView`` -
+    ``ShiftKind.NONE`` signals "no shift modifier on this operand",
+    replacing the legacy ``hasattr(op, "shift") and op.shift.type != 0``
+    probe.
+    """
     tokens = []
-    if hasattr(op, "shift") and op.shift.type != 0:
-        shift_name = _ARM_SFT_NAMES.get(op.shift.type)
+    shift = op.shift
+    if shift.kind != ShiftKind.NONE:
+        shift_name = _SHIFT_KIND_NAMES.get(shift.kind)
         if shift_name is not None:
             tokens.append(vocab_manager.PlatformToken(shift_name, PlatformInstructionTypes.ARITHMETIC))
-            if op.shift.value != 0:
-                tokens.append(vocab_manager.ValuedConst(op.shift.value))
+            if shift.amount != 0:
+                tokens.append(vocab_manager.ValuedConst(shift.amount))
     return tokens
