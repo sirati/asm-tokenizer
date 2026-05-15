@@ -294,12 +294,23 @@ def test_fp_detection_emits_float_token_anywhere() -> None:
     an FP-typed load's ptr token). Either way a float token must
     appear in the vocab + at least one function's token stream.
 
-    The minigzip + hello fixtures in the current corpus do not exercise
-    FP-typed operands (gcc-compiled zlib's checksum loops are all
-    integer, clang-compiled hello-world's ppc64 / riscv64 ABI uses int
-    arg-passing). FLAG via skip rather than fail — adapting requires a
-    fixture with a real FP instruction (e.g. an x86-64 ``movss xmm0,
-    DWORD PTR [rip+...]`` against a ``.rodata`` float constant).
+    Provider-side gap: ``_compute_fp_type`` keys off
+    ``Instruction.getOperandType(i) & OperandType.FLOAT`` (per-operand
+    SLEIGH spec tag) but the FP-typed-ness of an SSE op like ``MULSD``
+    is only available at the P-code level (``FLOAT_MULT`` p-code op),
+    NOT on the instruction's operand-type bitmask. Probed on the
+    clamscan x64 corpus (e.g. ``src/clamav/x64-clang-3.5-O2_clamscan``,
+    ``x64-gcc-7-O2_clamscan``): every SSE FP mnemonic
+    (MULSD/DIVSD/ADDSD/CVTSI2SD/...) returns ``OperandType``s of 0x200
+    (REGISTER) or 0x2080 (ADDRESS|SCALAR) — zero FLOAT-tagged operands
+    across the whole binary. So even staging a FP-bearing fixture into
+    the smoke wouldn't trip the v2 classifier's FP path.
+
+    This is the same shape of provider-side architectural gap as the
+    ``string_ptr`` case below: the data Ghidra has IS sufficient (the
+    p-code carries ``FLOAT_*`` ops with width-from-output-varnode), but
+    ``_compute_fp_type`` consumes the wrong API surface. Fixing it
+    needs a p-code-walk fallback that's a separate (larger) refactor.
     """
     # Scan every available fixture's vocab for a float token. If none
     # has any, skip (no FP-typed instruction in any current fixture).
@@ -327,9 +338,12 @@ def test_fp_detection_emits_float_token_anywhere() -> None:
 
     if not fixtures_with_fp:
         pytest.skip(
-            "no fixture vocab contains a floatXX token; FP-detection "
-            "surface needs a fixture with an FP-typed operand (e.g. "
-            "movss xmm, [rip+rodata_const]). FLAGGED."
+            "no fixture vocab contains a floatXX token; the FP-detection "
+            "surface is provider-side gated on Instruction.getOperandType "
+            "& OperandType.FLOAT, which Ghidra's x86 SLEIGH spec does NOT "
+            "set on SSE FP mnemonics (MULSD/DIVSD/ADDSD/...) — only on "
+            "p-code FLOAT_* ops. FLAGGED: needs a p-code-walk fallback in "
+            "_compute_fp_type before any real-world corpus exercises it."
         )
 
     # At least one fixture has a float token in vocab — assert it also
