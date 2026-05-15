@@ -14,6 +14,50 @@ from tokenizer.tokens import BlockToken, Category, TokenResolver, Tokens
 VERIFICATION: bool = False
 
 
+def _emit_jump_table_footer_for(
+    jt_id: int,
+    base_addr: int,
+    target_addrs: list[int],
+    func_tokens: FunctionTokenList,
+    resolver: TokenResolver,
+    vocab_manager: VocabularyManager,
+) -> None:
+    """Single emission helper used by BOTH the iter_switch_tables path and
+    the slot-classification fallback. Produces one synthetic footer block:
+    ``[Block_Def, Jump_Table(jt_id), Block_V2(t0), Block_V2(t1), ...]``.
+
+    The caller has already allocated ``jt_id`` via
+    ``resolver.get_identity(Category.JUMP_TABLE, base_addr, ...)`` and is
+    responsible for dedup (the helper does not check
+    ``id_maps[Category.JUMP_TABLE]``).
+    """
+    jt_token = vocab_manager.Jump_Table(jt_id)
+    target_tokens: list[Tokens] = []
+    for target_addr in target_addrs:
+        target_key = hex(int(target_addr))
+        # Mirror the per-block emission's key shape so that targets which
+        # are already known blocks of this function share identity via
+        # the existing cache entry — ``get_identity`` returns the cached
+        # id and ignores ``meta`` on cache hits, so the
+        # "comes_from_jump_table" annotation only attaches to brand-new
+        # targets (slots that were never emitted as a regular block).
+        target_meta = {"addr": target_key, "comes_from_jump_table": jt_id}
+        target_id = resolver.get_identity(Category.BLOCK, target_key, target_meta)
+        target_tokens.append(vocab_manager.Block_V2(target_id))
+
+    footer_tokens: list[Tokens] = [vocab_manager.Block_Def(), jt_token, *target_tokens]
+    # One synthetic instruction holding the whole footer: keeps the
+    # run-length arithmetic consistent (BlockTokenList expects at least
+    # one instruction per block). The insn-str is a debug label only.
+    base_addr_hex = hex(int(base_addr))
+    footer_block = BlockTokenList(num_insns=1, vocab_manager=vocab_manager)
+    footer_block.append_as_insn(
+        insn_str=f"jump_table {base_addr_hex}",
+        tokens=footer_tokens,
+    )
+    func_tokens.add_block(footer_block, base_addr_hex)
+
+
 def _emit_jump_table_footer(
     func: Any,
     func_tokens: FunctionTokenList,
@@ -22,7 +66,17 @@ def _emit_jump_table_footer(
     vocab_manager: VocabularyManager,
 ) -> None:
     """Append one ``block_def jump_table <id> block_v2 <t0> ...`` block per
-    switch table the provider recovers within ``func``.
+    switch table known for ``func`` — UNIONED across two sources:
+
+    1. Provider-recovered tables via ``disasm_provider.iter_switch_tables``
+       (canonical path; carries resolved target addresses).
+    2. Slot-classification fallback: any ``Category.JUMP_TABLE`` identity
+       that was registered during instruction tokenization (via
+       ``ConstantHandler._emit_jump_table_slot``) but whose base addr was
+       NOT yielded by ``iter_switch_tables`` — the dispatch instruction
+       wasn't recovered but a constant pointed into the table, so the
+       footer pass still emits a (target-less) declaration so the slot
+       reference resolves.
 
     Single-concern: this function owns the v2 jump-table-footer concern.
     Identity allocation goes through ``TokenResolver.get_identity`` so the
@@ -31,55 +85,65 @@ def _emit_jump_table_footer(
     with the per-block emission earlier in ``fill_constant_candidates``
     (same ``Category.BLOCK`` cache, same ``hex(addr)`` key).
 
+    Dedup: footer-emit must be deterministic. When BOTH the provider
+    yields a table and a slot-classification call has registered the
+    same base addr, exactly ONE footer emits — the provider's (carries
+    targets). The fallback iterates ``id_maps[Category.JUMP_TABLE]`` and
+    skips any addr already emitted via the iter_switch_tables loop.
+
     No-ops when the vocab is v1 (the v2 ``Jump_Table`` / ``Block_V2``
-    Inner classes assert ``format_version == 2``) or when the provider
-    yields no tables (the abstract base's default returns an empty
-    iterator, so angr inherits a clean no-op).
+    Inner classes assert ``format_version == 2``) or when neither source
+    has any tables for ``func``.
     """
-    if disasm_provider is None:
-        return
     if getattr(vocab_manager, "format_version", 1) != 2:
         return
 
-    for table_addr, target_addrs in disasm_provider.iter_switch_tables(func):
-        if not target_addrs:
-            # Provider gave us a table with no resolved slots — nothing to
-            # emit (would produce a `block_def jump_table` with zero slots,
-            # which is structurally a free-floating identity declaration).
+    emitted_base_addrs: set[int] = set()
+
+    if disasm_provider is not None:
+        for table_addr, target_addrs in disasm_provider.iter_switch_tables(func):
+            base_addr = int(table_addr)
+            if not target_addrs:
+                # Provider gave us a table with no resolved slots — nothing to
+                # emit (would produce a `block_def jump_table` with zero slots,
+                # which is structurally a free-floating identity declaration).
+                # Skipping here is the canonical-path policy; the slot-fallback
+                # below intentionally DOES emit a target-less declaration when
+                # the table is known only via slot classification.
+                continue
+
+            jt_meta = {
+                "jump_table_addr": hex(base_addr),
+                "target_block_addrs": [hex(int(a)) for a in target_addrs],
+            }
+            jt_id = resolver.get_identity(Category.JUMP_TABLE, base_addr, jt_meta)
+            _emit_jump_table_footer_for(
+                jt_id=jt_id,
+                base_addr=base_addr,
+                target_addrs=list(target_addrs),
+                func_tokens=func_tokens,
+                resolver=resolver,
+                vocab_manager=vocab_manager,
+            )
+            emitted_base_addrs.add(base_addr)
+
+    # Slot-classification fallback: pick up any JUMP_TABLE identity that
+    # was registered by ``ConstantHandler._emit_jump_table_slot`` but
+    # never yielded by the provider's iter_switch_tables. The resolver's
+    # per-function reset (called at function boundaries) means the map
+    # only contains entries this function recorded.
+    for base_addr, jt_id in list(resolver.id_maps[Category.JUMP_TABLE].items()):
+        if base_addr in emitted_base_addrs:
             continue
-
-        jt_meta = {
-            "jump_table_addr": hex(int(table_addr)),
-            "target_block_addrs": [hex(int(a)) for a in target_addrs],
-        }
-        jt_id = resolver.get_identity(Category.JUMP_TABLE, int(table_addr), jt_meta)
-        jt_token = vocab_manager.Jump_Table(jt_id)
-
-        target_tokens: list[Tokens] = []
-        for target_addr in target_addrs:
-            target_key = hex(int(target_addr))
-            # Mirror the per-block emission's key shape (line ~63 above)
-            # so that targets which are already known blocks of this
-            # function share identity via the existing cache entry —
-            # ``get_identity`` returns the cached id and ignores ``meta``
-            # on cache hits, so the "comes_from_jump_table" annotation
-            # only attaches to brand-new targets (slots that were never
-            # emitted as a regular block of this function).
-            target_meta = {"addr": target_key, "comes_from_jump_table": jt_id}
-            target_id = resolver.get_identity(Category.BLOCK, target_key, target_meta)
-            target_tokens.append(vocab_manager.Block_V2(target_id))
-
-        footer_tokens: list[Tokens] = [vocab_manager.Block_Def(), jt_token, *target_tokens]
-        # One synthetic instruction holding the whole footer: keeps the
-        # run-length arithmetic consistent (BlockTokenList expects at
-        # least one instruction per block). The insn-str is a debug
-        # label only.
-        footer_block = BlockTokenList(num_insns=1, vocab_manager=vocab_manager)
-        footer_block.append_as_insn(
-            insn_str=f"jump_table {jt_meta['jump_table_addr']}",
-            tokens=footer_tokens,
+        _emit_jump_table_footer_for(
+            jt_id=jt_id,
+            base_addr=base_addr,
+            target_addrs=[],
+            func_tokens=func_tokens,
+            resolver=resolver,
+            vocab_manager=vocab_manager,
         )
-        func_tokens.add_block(footer_block, jt_meta["jump_table_addr"])
+        emitted_base_addrs.add(base_addr)
 
 
 def fill_constant_candidates(
