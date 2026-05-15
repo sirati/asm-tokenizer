@@ -3,12 +3,24 @@
 Owns:
 - ``_ghidra_processor_to_architecture``: ``program.getLanguage().getProcessor()``
   -> owned ``Architecture``.
-- ``_compute_fp_type``: per-operand FP-type computation (Ghidra
-  ``OperandType.FLOAT`` -> ``FpType``).
+- ``_compute_fp_type``: per-operand FP-type computation. Fast path reads
+  ``OperandType.FLOAT`` (set by SLEIGH on ISAs like ARM VFP). Slow path
+  walks ``insn.getPcode()`` for ``FLOAT_*`` opcodes -- the only reliable
+  oracle on x86 SSE, where SLEIGH never sets ``OperandType.FLOAT`` on
+  ``MULSD``/``DIVSD``/``ADDSD``/... operands but emits ``FLOAT_ADD`` /
+  ``FLOAT_MULT`` / ... p-code ops. Same shape as the PCode mem-size
+  oracle in ``mem_decompose._infer_mem_access_size``.
 - ``ARM_BF16_MNEMONICS`` / ``X86_BF16_MNEMONICS``: BFloat16 mnemonic
   tables consulted at width=2.
 - ``_FP_WIDTH_TO_TYPE``: width-in-bytes -> ``FpType`` dispatch.
 - ``_bfloat16_mnemonic_for_arch``: per-ISA BFloat16 mnemonic dispatcher.
+- ``_FLOAT_PCODE_OPCODES`` + ``_FLOAT_PCODE_INT_INPUT_OPCODES`` +
+  ``_FLOAT_PCODE_INT_OUTPUT_OPCODES``: lazily-resolved integer opcode
+  sets (see ``_resolve_float_pcode_sets``) that classify which side of
+  each ``FLOAT_*`` p-code op is integer-typed (the rest is FP-typed).
+  Lets the slow path attribute FP status to the correct operand for
+  conversions (``CVTSI2SD`` = int input, FP output; ``CVTSD2SI`` = FP
+  input, int output).
 - ``_build_prefixes_*``: per-ISA typed-prefix-list builders.
 - ``_x86_byte_to_prefix``: lazy x86 prefix-byte -> typed-prefix factory.
 - ``_prefix_builder_for_arch``: per-ISA prefix-builder dispatcher.
@@ -88,35 +100,116 @@ def _ghidra_processor_to_architecture(program: Any) -> Architecture:
     return Architecture.UNKNOWN
 
 
-def _compute_fp_type(
+# ---------------------------------------------------------------------------
+# FLOAT_* p-code opcode classification (slow-path oracle)
+# ---------------------------------------------------------------------------
+# The set of FP-semantic p-code opcodes (resolved to integer opcode values
+# at module load via ``_resolve_float_pcode_sets``), partitioned by which
+# side of the op carries integer-typed data:
+#
+#   - ``_FLOAT_PCODE_OPCODES``: every FLOAT_* opcode (the master scan set).
+#   - ``_FLOAT_PCODE_INT_INPUT_OPCODES``: opcodes whose input varnode is
+#     integer-typed (``FLOAT_INT2FLOAT``: integer source -> FP destination).
+#     The output is still FP.
+#   - ``_FLOAT_PCODE_INT_OUTPUT_OPCODES``: opcodes whose output varnode is
+#     integer-typed (``FLOAT_TRUNC`` truncate-to-int; the boolean
+#     comparison opcodes ``FLOAT_EQUAL`` / ``FLOAT_NOTEQUAL`` /
+#     ``FLOAT_LESS`` / ``FLOAT_LESSEQUAL`` / ``FLOAT_NAN`` produce a
+#     1-byte bool). The inputs are still FP.
+#
+# Binding to integer opcode values (rather than ``PcodeOp.getMnemonic``
+# strings) is mandatory: Ghidra's mnemonic strings drop the ``FLOAT_``
+# prefix for several conversion/rounding opcodes (``INT2FLOAT``,
+# ``FLOAT2FLOAT``, ``TRUNC``, ``CEIL``, ``FLOOR``, ``ROUND``) even though
+# the class constants are named ``FLOAT_INT2FLOAT`` / ``FLOAT_FLOAT2FLOAT``
+# / ``FLOAT_TRUNC`` / etc. The class constants are the only stable handle.
+_FLOAT_PCODE_OPCODES: frozenset[int] = frozenset()
+_FLOAT_PCODE_INT_INPUT_OPCODES: frozenset[int] = frozenset()
+_FLOAT_PCODE_INT_OUTPUT_OPCODES: frozenset[int] = frozenset()
+
+
+def _resolve_float_pcode_sets() -> tuple[frozenset[int], frozenset[int], frozenset[int]]:
+    """Resolve the FLOAT_* PcodeOp class-constant names to integer opcode
+    values; cache on the module globals so the lookup runs once.
+
+    Lazy because importing ``ghidra.program.model.pcode`` at module load
+    would require Ghidra to be started -- the import here happens on
+    first slow-path entry, mirroring ``_x86_byte_to_prefix``'s lazy
+    initialisation pattern in this module.
+    """
+    global _FLOAT_PCODE_OPCODES, _FLOAT_PCODE_INT_INPUT_OPCODES, _FLOAT_PCODE_INT_OUTPUT_OPCODES
+    if _FLOAT_PCODE_OPCODES:
+        return (
+            _FLOAT_PCODE_OPCODES,
+            _FLOAT_PCODE_INT_INPUT_OPCODES,
+            _FLOAT_PCODE_INT_OUTPUT_OPCODES,
+        )
+    from ghidra.program.model.pcode import PcodeOp
+
+    # Master FLOAT_* set: enumerate the class-constant names directly so
+    # adding a new FLOAT_* opcode upstream (e.g. FLOAT_HALF support)
+    # would surface here without code changes if the constant follows
+    # the FLOAT_ prefix convention.
+    master = frozenset(
+        getattr(PcodeOp, name)
+        for name in dir(PcodeOp)
+        if name.startswith("FLOAT_") and isinstance(getattr(PcodeOp, name, None), int)
+    )
+    int_input = frozenset({PcodeOp.FLOAT_INT2FLOAT})
+    int_output = frozenset({
+        PcodeOp.FLOAT_TRUNC,
+        PcodeOp.FLOAT_EQUAL,
+        PcodeOp.FLOAT_NOTEQUAL,
+        PcodeOp.FLOAT_LESS,
+        PcodeOp.FLOAT_LESSEQUAL,
+        PcodeOp.FLOAT_NAN,
+    })
+    _FLOAT_PCODE_OPCODES = master
+    _FLOAT_PCODE_INT_INPUT_OPCODES = int_input
+    _FLOAT_PCODE_INT_OUTPUT_OPCODES = int_output
+    return master, int_input, int_output
+
+
+def _apply_bfloat16_reclassification(
+    fp_type: FpType,
+    arch: Architecture,
+    base_mnemonic: str,
+) -> FpType:
+    """Reclassify a width=2 Float16 to BFloat16 when ``base_mnemonic`` is on
+    the per-ISA BFloat16 mnemonic table. Identity for every other ``FpType``.
+
+    Shared by both ``_compute_fp_type`` paths so the BFloat16 signal is
+    derived uniformly regardless of whether the FpType came from the
+    ``OperandType.FLOAT`` fast path or the FLOAT_* p-code slow path.
+    """
+    if fp_type != FpType.FLOAT16:
+        return fp_type
+    bf16_set = _bfloat16_mnemonic_for_arch(arch)
+    if bf16_set and base_mnemonic.upper() in bf16_set:
+        return FpType.BFLOAT16
+    return fp_type
+
+
+def _fp_type_from_operand_type_bit(
     ghidra_insn: Any,
     operand_index: int,
     arch: Architecture,
     base_mnemonic: str,
 ) -> Optional[FpType]:
-    """Module-level helper backing ``operand_fp_type``.
+    """Fast path: ``OperandType.FLOAT`` bit -> FpType.
 
-    Called per operand from the decode path so the resulting ``FpType``
-    can be stamped on the owned operand view, keeping the public
-    ``GhidraDisassemblyProvider.operand_fp_type`` method as a thin
-    wrapper. Returns the matching ``FpType`` when the
-    operand is FP-typed (Ghidra ``OperandType.FLOAT`` bitmask) or
-    ``None`` otherwise. The width derivation order is:
+    Width derivation: inspect each ``getOpObjects(i)`` element. For
+    ``Register`` operands, use ``Register.getBitLength() / 8``. For
+    ``Scalar`` operands, use ``Scalar.bitLength() / 8``. Take the
+    largest value seen (x87 ``fld dword ptr [...]`` carries an FP-tagged
+    memory operand whose size is the load size). Maps the resulting
+    width-in-bytes through ``_FP_WIDTH_TO_TYPE``; widths outside the
+    table return ``None``.
 
-    1. Inspect each ``getOpObjects(i)`` element. For ``Register`` operands,
-       use ``Register.getBitLength() / 8``. For ``Scalar`` operands, use
-       ``Scalar.bitLength() / 8``. Take the largest value seen (x87
-       ``fld dword ptr [...]`` carries an FP-tagged memory operand whose
-       size is the load size).
-    2. Map the resulting width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
-    3. At width=2, consult ``_bfloat16_mnemonic_for_arch(arch)`` against
-       the instruction's ``base_mnemonic`` (uppercase-compared) and
-       reclassify Float16 -> BFloat16 on a hit. SLEIGH does not currently
-       tag bfloat16 distinctly, so the mnemonic-based reclassification
-       is the only signal available.
-    4. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
-       classifier then routes through step 11 of the precedence list
-       rather than emitting a malformed ``floatXX``).
+    Preserves fidelity on ISAs where SLEIGH sets ``OperandType.FLOAT``
+    (e.g. ARM VFP). On x86 SLEIGH the bit is never set on SSE FP
+    mnemonics; the slow path (``_fp_type_from_pcode_scan``) handles
+    those.
     """
     from ghidra.program.model.lang import OperandType, Register
     from ghidra.program.model.scalar import Scalar
@@ -150,13 +243,208 @@ def _compute_fp_type(
     fp_type = _FP_WIDTH_TO_TYPE.get(width_bytes)
     if fp_type is None:
         return None
+    return _apply_bfloat16_reclassification(fp_type, arch, base_mnemonic)
 
-    if fp_type == FpType.FLOAT16:
-        bf16_set = _bfloat16_mnemonic_for_arch(arch)
-        if bf16_set and base_mnemonic.upper() in bf16_set:
-            fp_type = FpType.BFLOAT16
 
-    return fp_type
+def _collect_fp_pcode_signature(ghidra_insn: Any) -> tuple[set, int]:
+    """Walk ``insn.getPcode()`` and collect FP-tainted varnode addresses.
+
+    Returns ``(fp_varnode_keys, fp_width_bytes)`` where ``fp_varnode_keys``
+    is the set of ``(address_string, size)`` tuples covered by FP-typed
+    sides of every ``FLOAT_*`` p-code op (skipping the int-input side of
+    ``FLOAT_INT2FLOAT`` and the int-output side of ``FLOAT_TRUNC`` /
+    comparison opcodes), and ``fp_width_bytes`` is the smallest nonzero
+    size seen in those FP varnodes (0 if none).
+
+    Returning a stringified address key avoids relying on
+    ``ghidra.program.model.address.Address`` being hashable consistently
+    across pyghidra; the (addr-string, size) pair uniquely identifies
+    the register slice or temp the FLOAT_* op touches.
+
+    Empty result (``(set(), 0)``) when no FLOAT_* opcode fires; the
+    caller short-circuits to ``None``.
+    """
+    float_ops, int_input_ops, int_output_ops = _resolve_float_pcode_sets()
+
+    fp_keys: set = set()
+    sizes: set[int] = set()
+    for pop in ghidra_insn.getPcode():
+        opcode = pop.getOpcode()
+        if opcode not in float_ops:
+            continue
+        # FP-typed sides per the int-input/int-output classification.
+        int_input = opcode in int_input_ops
+        int_output = opcode in int_output_ops
+        if not int_input:
+            for v in pop.getInputs():
+                size = int(v.getSize())
+                if size <= 0:
+                    continue
+                fp_keys.add((str(v.getAddress()), size))
+                sizes.add(size)
+        out = pop.getOutput()
+        if out is not None and not int_output:
+            size = int(out.getSize())
+            if size > 0:
+                fp_keys.add((str(out.getAddress()), size))
+                sizes.add(size)
+
+    fp_width = min(sizes) if sizes else 0
+    return fp_keys, fp_width
+
+
+def _operand_touches_fp_pcode(
+    ghidra_insn: Any,
+    operand_index: int,
+    fp_keys: set,
+) -> bool:
+    """Decide whether operand ``operand_index`` carries FP data based on
+    the p-code FP-varnode set returned by ``_collect_fp_pcode_signature``.
+
+    Attribution rules:
+
+    - REG / CRX operand: a ``Register`` in ``getOpObjects(i)`` whose
+      address matches the address of any FP-tainted varnode.
+    - MEM operand (RIP-relative folded into FLOAT_*): a direct
+      ``Address`` object in ``getOpObjects(i)`` whose string-form
+      matches an FP-tainted varnode address. x86 SLEIGH folds memory
+      loads with constant addresses directly into the FLOAT_* op's
+      input varnode (no separate LOAD pcode) -- e.g. ``mulsd xmm0,
+      qword ptr [rip+0x1197b]`` emits a single ``FLOAT_MULT`` op whose
+      second input varnode is the absolute load address.
+    - MEM operand (LOAD/STORE-routed): any ``LOAD`` output varnode or
+      ``STORE`` value-input varnode in the instruction's p-code whose
+      key appears in ``fp_keys``. Captures register-indirect FP loads
+      (``addsd xmm0, qword ptr [rax]``) where SLEIGH does emit a
+      separate LOAD pcode that feeds the FLOAT_* op.
+    - Other kinds: never attributed by the slow path (IMM FP literals
+      are exceedingly rare on FP-arithmetic mnemonics and are handled
+      by the ``OperandType.FLOAT`` fast path on ISAs that surface them).
+
+    The LOAD/STORE rule scans the full pcode rather than tying a
+    specific LOAD to a specific operand because x86 instructions with
+    FP semantics have at most one memory operand; multi-MEM instructions
+    (string ops) do not emit FLOAT_* p-code.
+    """
+    from ghidra.program.model.address import Address
+    from ghidra.program.model.lang import Register
+    from ghidra.program.model.pcode import PcodeOp
+
+    try:
+        op_type_objs = ghidra_insn.getOpObjects(operand_index)
+    except Exception:
+        op_type_objs = ()
+
+    # REG / direct-mem-address path: match Register / Address objects in
+    # the operand against the FP-tainted varnode keys. Both share the
+    # same address-string namespace (Ghidra prints register-space addrs
+    # as ``register:0000XXXX`` and ram-space addrs as bare hex).
+    for obj in op_type_objs or ():
+        try:
+            if isinstance(obj, Register):
+                obj_addr = str(obj.getAddress())
+            elif isinstance(obj, Address):
+                obj_addr = str(obj)
+            else:
+                continue
+        except Exception:
+            continue
+        for key_addr, _size in fp_keys:
+            if key_addr == obj_addr:
+                return True
+
+    # LOAD/STORE-routed MEM path: any LOAD output or STORE value-input
+    # that participates in the FP-tainted varnode set.
+    for pop in ghidra_insn.getPcode():
+        opcode = pop.getOpcode()
+        if opcode == PcodeOp.LOAD:
+            out = pop.getOutput()
+            if out is None:
+                continue
+            key = (str(out.getAddress()), int(out.getSize()))
+            if key in fp_keys:
+                return True
+        elif opcode == PcodeOp.STORE:
+            inputs = pop.getInputs()
+            # STORE = (space_id_const, addr_varnode, value_varnode)
+            if len(inputs) >= 3:
+                v = inputs[2]
+                key = (str(v.getAddress()), int(v.getSize()))
+                if key in fp_keys:
+                    return True
+    return False
+
+
+def _fp_type_from_pcode_scan(
+    ghidra_insn: Any,
+    operand_index: int,
+    arch: Architecture,
+    base_mnemonic: str,
+) -> Optional[FpType]:
+    """Slow path: scan ``getPcode()`` for ``FLOAT_*`` opcodes and attribute
+    FP status per operand from varnode-address overlap.
+
+    Returns ``None`` when:
+    - no ``FLOAT_*`` opcode fires (instruction has no FP semantics), or
+    - the FP-tainted varnode set carries a width not in
+      ``_FP_WIDTH_TO_TYPE``, or
+    - the operand neither holds a register matching an FP varnode nor
+      participates in a LOAD/STORE that flows into an FP varnode.
+
+    Same shape as ``mem_decompose._infer_mem_access_size`` (PCode is the
+    only reliable oracle on x86 SLEIGH).
+    """
+    fp_keys, fp_width = _collect_fp_pcode_signature(ghidra_insn)
+    if not fp_keys:
+        return None
+    fp_type = _FP_WIDTH_TO_TYPE.get(fp_width)
+    if fp_type is None:
+        return None
+    if not _operand_touches_fp_pcode(ghidra_insn, operand_index, fp_keys):
+        return None
+    return _apply_bfloat16_reclassification(fp_type, arch, base_mnemonic)
+
+
+def _compute_fp_type(
+    ghidra_insn: Any,
+    operand_index: int,
+    arch: Architecture,
+    base_mnemonic: str,
+) -> Optional[FpType]:
+    """Module-level helper backing ``operand_fp_type``.
+
+    Called per operand from the decode path so the resulting ``FpType``
+    can be stamped on the owned operand view, keeping the public
+    ``GhidraDisassemblyProvider.operand_fp_type`` method as a thin
+    wrapper. Returns the matching ``FpType`` when the operand is
+    FP-typed, ``None`` otherwise.
+
+    Two-tier oracle:
+
+    1. ``_fp_type_from_operand_type_bit`` (fast path): reads Ghidra's
+       ``OperandType.FLOAT`` bit. Preserves fidelity on ISAs where
+       SLEIGH sets the bit (e.g. ARM VFP).
+    2. ``_fp_type_from_pcode_scan`` (slow path): when the fast path
+       returns ``None``, walks ``insn.getPcode()`` for ``FLOAT_*``
+       opcodes -- the only reliable oracle on x86 SLEIGH, where
+       ``OperandType.FLOAT`` is never set on SSE FP mnemonics
+       (``MULSD`` / ``DIVSD`` / ``ADDSD`` / ``SUBSD`` / ``CVTSI2SD`` /
+       ...) but the FP semantics live in ``FLOAT_ADD`` / ``FLOAT_MULT``
+       / ``FLOAT_INT2FLOAT`` / ... p-code ops. Same shape as
+       ``mem_decompose._infer_mem_access_size``.
+
+    The BFloat16 reclassification at width=2 (consulting
+    ``_bfloat16_mnemonic_for_arch(arch)`` against ``base_mnemonic``)
+    applies in both paths via ``_apply_bfloat16_reclassification``.
+    """
+    fast = _fp_type_from_operand_type_bit(
+        ghidra_insn, operand_index, arch, base_mnemonic
+    )
+    if fast is not None:
+        return fast
+    return _fp_type_from_pcode_scan(
+        ghidra_insn, operand_index, arch, base_mnemonic
+    )
 
 
 # ---------------------------------------------------------------------------
