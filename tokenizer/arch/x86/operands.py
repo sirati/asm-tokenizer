@@ -115,18 +115,19 @@ def tokenize_operand_memory(
 
         meta = lookup.lookup(disp)
 
-        # Memory operand → if the load is FP-typed Ghidra stamps the width
-        # on this _CapOperand at decode time; the v2 emitter appends a
-        # postfix ``floatXX`` after the ptr token (precedence.md "Postfix
-        # FP"). The angr path leaves this None (``angr_limitations.md`` §1).
-        fp_postfix = getattr(op, "fp_width_bytes", None)
+        # Memory operand → if the load is FP-typed Ghidra stamps the typed
+        # ``fp_type`` on this _CapOperand at decode time; the v2 emitter
+        # appends a postfix ``floatXX`` after the ptr token (precedence.md
+        # "Postfix FP"). The angr path uniformly reports None
+        # (``angr_limitations.md`` §1).
+        fp_postfix = op.fp_type
 
         if force_opaque:
             disp_token = constant_handler.process_constant_v2(
                 disp,
                 meta=meta,
                 is_arithmetic=False,
-                fp_postfix_width_bytes=fp_postfix,
+                fp_postfix_type=fp_postfix,
             )
             tokens.extend(disp_token)
         # For larger displacements, check if pointing to known constant or code or opaque
@@ -141,7 +142,7 @@ def tokenize_operand_memory(
                 disp,
                 meta=meta,
                 is_arithmetic=False,
-                fp_postfix_width_bytes=fp_postfix,
+                fp_postfix_type=fp_postfix,
             )
             tokens.extend(disp_token)
         else:
@@ -177,14 +178,14 @@ def tokenize_operand_immediate(
 
     # Immediate operand → an FP-tagged immediate (precedence.md step 1) is
     # an inline ``floatXX`` with IEEE bit pattern. Only the Ghidra path
-    # stamps ``fp_width_bytes`` on _CapOperand; angr/Capstone CsOpnd has no
-    # such attribute (see ``angr_limitations.md`` §1).
-    fp_immediate = getattr(op, "fp_width_bytes", None)
+    # stamps a non-None ``fp_type`` on the operand; the angr/Capstone path
+    # uniformly reports None (see ``angr_limitations.md`` §1).
+    fp_immediate = op.fp_type
 
     if imm_val_hex_len <= 2:  # Small immediate (0x00 to 0xFF)
         imm_token = constant_handler.process_constant_v2(
             imm_val,
-            fp_immediate_width_bytes=fp_immediate,
+            fp_immediate_type=fp_immediate,
         )
         tokens.extend(imm_token)
     elif imm_val_hex_len <= (128 / 4):  # Larger immediate (up to 128-bit)
@@ -193,7 +194,7 @@ def tokenize_operand_immediate(
             imm_token = constant_handler.process_constant_v2(
                 imm_val,
                 is_arithmetic=True,
-                fp_immediate_width_bytes=fp_immediate,
+                fp_immediate_type=fp_immediate,
             )
             tokens.extend(imm_token)
         elif insn.mnemonic in addressing_control_flow_instructions:
@@ -215,7 +216,7 @@ def tokenize_operand_immediate(
                 imm_token = constant_handler.process_constant_v2(
                     imm_val,
                     is_arithmetic=True,
-                    fp_immediate_width_bytes=fp_immediate,
+                    fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
             else:
@@ -223,7 +224,7 @@ def tokenize_operand_immediate(
                     imm_val,
                     meta=meta,
                     is_arithmetic=False,
-                    fp_immediate_width_bytes=fp_immediate,
+                    fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
         else:  # Fallback - create opaque constant
@@ -232,7 +233,7 @@ def tokenize_operand_immediate(
                 imm_val,
                 meta=meta,
                 is_arithmetic=False,
-                fp_immediate_width_bytes=fp_immediate,
+                fp_immediate_type=fp_immediate,
             )
             tokens.extend(imm_token)
 

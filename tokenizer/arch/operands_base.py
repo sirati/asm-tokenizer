@@ -49,10 +49,11 @@ def tokenize_operand_memory_base_disp(
         abs_disp = abs(disp)
         # Memory operand → an FP load against the resolved address gets a
         # postfix ``floatXX`` annotation (precedence.md "Postfix FP"). The
-        # angr/Capstone path doesn't carry per-operand FP tags (see
-        # ``angr_limitations.md`` §1), so ``getattr`` falls through to None
-        # and the v2 emitter degrades to a bare ptr token.
-        fp_postfix = getattr(op, "fp_width_bytes", None)
+        # angr/Capstone path uniformly reports ``op.fp_type is None`` (see
+        # ``angr_limitations.md`` §1), so the v2 emitter degrades to a
+        # bare ptr token there. Ghidra populates the typed signal at
+        # decode time.
+        fp_postfix = op.fp_type
         if abs_disp <= 0xFF:
             tokens.append(vocab_manager.ValuedConst(abs_disp))
         else:
@@ -64,7 +65,7 @@ def tokenize_operand_memory_base_disp(
                     abs_disp,
                     meta=meta,
                     is_arithmetic=False,
-                    fp_postfix_width_bytes=fp_postfix,
+                    fp_postfix_type=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
             else:
@@ -73,7 +74,7 @@ def tokenize_operand_memory_base_disp(
                         abs_disp,
                         meta=meta,
                         is_arithmetic=False,
-                        fp_postfix_width_bytes=fp_postfix,
+                        fp_postfix_type=fp_postfix,
                     )
                     tokens.extend(disp_tokens)
                 else:
@@ -106,16 +107,16 @@ def tokenize_operand_immediate_generic(
 
     # Immediate operand → an FP-tagged immediate (precedence.md step 1) is
     # an inline ``floatXX`` whose value is the IEEE bit pattern. Only the
-    # Ghidra path stamps ``fp_width_bytes`` on _CapOperand at decode time;
-    # angr/Capstone CsOpnd has no such field (see ``angr_limitations.md``
-    # §1) so this falls through to None and the value flows through as an
+    # Ghidra path stamps a non-None ``fp_type`` on the operand at decode
+    # time; the angr/Capstone path uniformly reports ``op.fp_type is None``
+    # (see ``angr_limitations.md`` §1) so the value flows through as an
     # integer ``valued_const``.
-    fp_immediate = getattr(op, "fp_width_bytes", None)
+    fp_immediate = op.fp_type
 
     if imm_val_hex_len <= 2:
         imm_token = constant_handler.process_constant_v2(
             imm_val,
-            fp_immediate_width_bytes=fp_immediate,
+            fp_immediate_type=fp_immediate,
         )
         tokens.extend(imm_token)
     elif imm_val_hex_len <= 16:
@@ -124,7 +125,7 @@ def tokenize_operand_immediate_generic(
             imm_token = constant_handler.process_constant_v2(
                 imm_val,
                 is_arithmetic=True,
-                fp_immediate_width_bytes=fp_immediate,
+                fp_immediate_type=fp_immediate,
             )
             tokens.extend(imm_token)
         elif base_mnemonic in addressing_control_flow_instructions:
@@ -144,7 +145,7 @@ def tokenize_operand_immediate_generic(
                 imm_token = constant_handler.process_constant_v2(
                     imm_val,
                     is_arithmetic=True,
-                    fp_immediate_width_bytes=fp_immediate,
+                    fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
             else:
@@ -152,7 +153,7 @@ def tokenize_operand_immediate_generic(
                     imm_val,
                     meta=meta,
                     is_arithmetic=False,
-                    fp_immediate_width_bytes=fp_immediate,
+                    fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
         else:
@@ -161,7 +162,7 @@ def tokenize_operand_immediate_generic(
                 imm_val,
                 meta=meta,
                 is_arithmetic=False,
-                fp_immediate_width_bytes=fp_immediate,
+                fp_immediate_type=fp_immediate,
             )
             tokens.extend(imm_token)
 

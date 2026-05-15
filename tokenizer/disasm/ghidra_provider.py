@@ -27,6 +27,7 @@ from tokenizer.disasm.metadata import (
     encoding_from_string,
     section_kind_from_type_string,
 )
+from tokenizer.disasm.types import Architecture, FpType
 
 # ---------------------------------------------------------------------------
 # Capstone-compatible adapter objects
@@ -85,13 +86,15 @@ class _CapOperand:
         3 (MEM)  -> ``mem``
        64 (CRX, PPC only) -> ``crx``
 
-    ``fp_width_bytes`` is the per-operand FP width derived from Ghidra's
-    ``OperandType.FLOAT`` bitmask (one of {2, 4, 8, 10, 16}) or ``None``
-    when the operand is not FP-typed. Populated at decode time by
-    ``_ghidra_insn_to_cap``; angr-path operands (raw Capstone CsOpnd) do
-    not carry this attribute, so call sites read it via
-    ``getattr(op, "fp_width_bytes", None)``. See ``angr_limitations.md``
-    §1 for why the angr path stays None.
+    ``fp_type`` is the per-operand FP type derived from Ghidra's
+    ``OperandType.FLOAT`` bitmask + the operand width (and, at width=2,
+    the per-ISA BFloat16 mnemonic table, see
+    ``_bfloat16_mnemonic_for_arch``). ``None`` when the operand is not
+    FP-typed. Populated at decode time by ``_ghidra_insn_to_cap``;
+    the angr provider stamps ``None`` uniformly via the class default
+    on Capstone operand types (see ``angr_provider.py``) so consumers
+    read ``op.fp_type`` directly without ``getattr`` soft-probes. See
+    ``angr_limitations.md`` §1 for why the angr path stays ``None``.
     """
 
     type: int = 0
@@ -101,7 +104,7 @@ class _CapOperand:
     size: int = 0  # x86 operand size in bytes
     shift: _CapShift = field(default_factory=_CapShift)
     ghidra_raw_data: _GhidraMemRawData | None = None
-    fp_width_bytes: Optional[int] = None
+    fp_type: Optional[FpType] = None
 
     @dataclass
     class _CRX:
@@ -1294,17 +1297,100 @@ def _extract_x86_prefixes(ghidra_insn: Any) -> set[int]:
     return prefixes
 
 
-def _compute_fp_width_bytes(ghidra_insn: Any, operand_index: int) -> Optional[int]:
-    """Module-level helper backing ``operand_fp_width_bytes``.
+# BFloat16 mnemonic tables (per-ISA). Width=2 alone cannot distinguish IEEE-754
+# Float16 from Google's BFloat16 — SLEIGH does not tag the bfloat16 type
+# distinctly. The reclassification at width=2 consults these per-ISA mnemonic
+# sets; ISAs not represented here keep the default Float16 mapping.
+ARM_BF16_MNEMONICS: frozenset[str] = frozenset({
+    "BFCVT", "BFCVTN", "BFCVTN2", "BFDOT", "BFMMLA",
+    "BFMLAL", "BFMLALB", "BFMLALT", "VFMAB", "VFMAT",
+})
+X86_BF16_MNEMONICS: frozenset[str] = frozenset({
+    "VCVTNE2PS2BF16", "VCVTNEPS2BF16", "VDPBF16PS",
+})
+
+# width-in-bytes -> FpType dispatch (default mapping; width=2 may be
+# reclassified to BFLOAT16 by ``_compute_fp_type``).
+_FP_WIDTH_TO_TYPE: dict[int, FpType] = {
+    2: FpType.FLOAT16,
+    4: FpType.FLOAT32,
+    8: FpType.FLOAT64,
+    10: FpType.FLOAT80,
+    16: FpType.FLOAT128,
+}
+
+
+def _bfloat16_mnemonic_for_arch(arch: Architecture) -> frozenset[str]:
+    """Return the BFloat16 mnemonic set for ``arch`` (empty when unsupported).
+
+    Single dispatcher consulted at width=2 by ``_compute_fp_type`` to decide
+    whether to reclassify Float16 -> BFloat16 for this instruction. ISAs
+    without a curated table fall through with the default Float16 mapping.
+    """
+    if arch in (Architecture.ARM32, Architecture.AARCH64):
+        return ARM_BF16_MNEMONICS
+    if arch == Architecture.X86:
+        return X86_BF16_MNEMONICS
+    return frozenset()
+
+
+def _ghidra_processor_to_architecture(program: Any) -> Architecture:
+    """Map ``program.getLanguage().getProcessor()`` to the owned ``Architecture``.
+
+    Used by ``_ghidra_insn_to_cap`` once per instruction to thread the ISA
+    into the FP-type computation. Unknown processors map to
+    ``Architecture.UNKNOWN``; the BFloat16 reclassification then no-ops.
+    """
+    try:
+        processor = str(program.getLanguage().getProcessor()).lower()
+    except Exception:
+        return Architecture.UNKNOWN
+    if processor.startswith("aarch64"):
+        return Architecture.AARCH64
+    if processor.startswith("arm"):
+        return Architecture.ARM32
+    if processor in ("x86", "x64") or processor.startswith("x86"):
+        return Architecture.X86
+    if processor.startswith("mips"):
+        return Architecture.MIPS
+    if processor.startswith("powerpc") or processor.startswith("ppc"):
+        return Architecture.PPC
+    if processor.startswith("riscv"):
+        return Architecture.RISCV
+    return Architecture.UNKNOWN
+
+
+def _compute_fp_type(
+    ghidra_insn: Any,
+    operand_index: int,
+    arch: Architecture,
+    base_mnemonic: str,
+) -> Optional[FpType]:
+    """Module-level helper backing ``operand_fp_type``.
 
     Pulled out so the decode path in ``_ghidra_insn_to_cap`` can call it
-    once per operand to stamp the resulting width on ``_CapOperand``,
-    keeping the public ``GhidraDisassemblyProvider.operand_fp_width_bytes``
-    method as a thin wrapper. Returns one of {2, 4, 8, 10, 16} when the
-    operand is FP-typed (Ghidra ``OperandType.FLOAT`` bitmask) or ``None``
-    otherwise. See ``GhidraDisassemblyProvider.operand_fp_width_bytes``
-    docstring for the full derivation order and the BFloat16/Float16
-    ambiguity note.
+    once per operand to stamp the resulting ``FpType`` on ``_CapOperand``,
+    keeping the public ``GhidraDisassemblyProvider.operand_fp_type``
+    method as a thin wrapper. Returns the matching ``FpType`` when the
+    operand is FP-typed (Ghidra ``OperandType.FLOAT`` bitmask) or
+    ``None`` otherwise. The width derivation order is:
+
+    1. Inspect each ``getOpObjects(i)`` element. For ``Register`` operands,
+       use ``Register.getBitLength() / 8``. For ``Scalar`` operands, use
+       ``Scalar.bitLength() / 8``. Take the largest value seen (x87
+       ``fld dword ptr [...]`` carries an FP-tagged memory operand whose
+       size is the load size).
+    2. If no op-object width is available, fall back to
+       ``ghidra_insn.getOperandRefType(i).getSize()``.
+    3. Map the resulting width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
+    4. At width=2, consult ``_bfloat16_mnemonic_for_arch(arch)`` against
+       the instruction's ``base_mnemonic`` (uppercase-compared) and
+       reclassify Float16 -> BFloat16 on a hit. SLEIGH does not currently
+       tag bfloat16 distinctly, so the mnemonic-based reclassification
+       is the only signal available.
+    5. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
+       classifier then routes through step 11 of the precedence list
+       rather than emitting a malformed ``floatXX``).
     """
     from ghidra.program.model.lang import OperandType, Register
     from ghidra.program.model.scalar import Scalar
@@ -1334,7 +1420,8 @@ def _compute_fp_width_bytes(ghidra_insn: Any, operand_index: int) -> Optional[in
         if width > max_width_bits:
             max_width_bits = width
 
-    if max_width_bits == 0:
+    width_bytes = max_width_bits // 8
+    if width_bytes == 0:
         # Fall back to the reference-type's reported access size
         # (memory FP loads/stores).
         try:
@@ -1342,13 +1429,20 @@ def _compute_fp_width_bytes(ghidra_insn: Any, operand_index: int) -> Optional[in
             if ref_type is not None:
                 size_bytes = int(ref_type.getSize())
                 if size_bytes > 0:
-                    return size_bytes
+                    width_bytes = size_bytes
         except Exception:
             pass
+
+    fp_type = _FP_WIDTH_TO_TYPE.get(width_bytes)
+    if fp_type is None:
         return None
 
-    width_bytes = max_width_bits // 8
-    return width_bytes if width_bytes > 0 else None
+    if fp_type == FpType.FLOAT16:
+        bf16_set = _bfloat16_mnemonic_for_arch(arch)
+        if bf16_set and base_mnemonic.upper() in bf16_set:
+            fp_type = FpType.BFLOAT16
+
+    return fp_type
 
 
 def _ghidra_insn_to_cap(
@@ -1376,6 +1470,11 @@ def _ghidra_insn_to_cap(
         mnemonic = f"{suffix_prefix_name} {base_mnemonic}"
     else:
         mnemonic = base_mnemonic
+
+    # ISA derived once per instruction so the BFloat16 mnemonic
+    # reclassification at width=2 can dispatch to the right per-ISA table
+    # without re-querying ``program.getLanguage()`` per operand.
+    arch = _ghidra_processor_to_architecture(program)
 
     # -- Operand handling -----------------------------------------------------
     num_ops = ghidra_insn.getNumOperands()
@@ -1405,12 +1504,13 @@ def _ghidra_insn_to_cap(
             )
         )
 
-        # Per-operand FP width (Ghidra OperandType.FLOAT bitmask). Stamped on
-        # every _CapOperand we build below so the operand tokenizer can pass
-        # it to ``ConstantHandler.process_constant_v2`` without re-deriving
+        # Per-operand FP type (Ghidra OperandType.FLOAT bitmask + per-ISA
+        # BFloat16 mnemonic reclassification at width=2). Stamped on every
+        # _CapOperand we build below so the operand tokenizer can pass it
+        # to ``ConstantHandler.process_constant_v2`` without re-deriving
         # the signal at call-site granularity. See ``precedence.md`` step 1
         # for how the classifier consumes it.
-        fp_width = _compute_fp_width_bytes(ghidra_insn, i)
+        fp_type = _compute_fp_type(ghidra_insn, i, arch, base_mnemonic)
 
         if is_memory:
             # Attach raw Ghidra objects for native tokenization in X86GhidraProvider
@@ -1419,16 +1519,16 @@ def _ghidra_insn_to_cap(
                 op_objects=list(objects),
                 reg_map=reg_map,
             )
-            operands.append(_CapOperand(type=_OP_MEM, ghidra_raw_data=raw_data, fp_width_bytes=fp_width))
+            operands.append(_CapOperand(type=_OP_MEM, ghidra_raw_data=raw_data, fp_type=fp_type))
         else:
             first = objects[0]
             if isinstance(first, Register):
                 reg_id = reg_map.get_id(str(first.getName()))
-                operands.append(_CapOperand(type=_OP_REG, reg=reg_id, fp_width_bytes=fp_width))
+                operands.append(_CapOperand(type=_OP_REG, reg=reg_id, fp_type=fp_type))
             elif isinstance(first, Scalar):
-                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue()), fp_width_bytes=fp_width))
+                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getValue()), fp_type=fp_type))
             elif isinstance(first, Address):
-                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset()), fp_width_bytes=fp_width))
+                operands.append(_CapOperand(type=_OP_IMM, imm=int(first.getOffset()), fp_type=fp_type))
 
     insn_inner = _CapInsnInner(_insn_name=base_mnemonic)
 
@@ -1654,38 +1754,48 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
     # ----------------------------------------------------------------------
     # Per-operand FP-immediate detection
     # ----------------------------------------------------------------------
-    def operand_fp_width_bytes(self, ghidra_insn: Any, operand_index: int) -> Optional[int]:
-        """Return the FP width in bytes for ``operand_index`` of ``ghidra_insn``.
+    def operand_fp_type(self, ghidra_insn: Any, operand_index: int) -> Optional[FpType]:
+        """Return the typed ``FpType`` for ``operand_index`` of ``ghidra_insn``.
 
-        Returns one of {2, 4, 8, 10, 16} when the operand is FP-typed
-        (per Ghidra's ``OperandType.FLOAT`` bitmask) and None otherwise.
-        Width derivation order:
+        Returns one of ``FpType.FLOAT16`` / ``FpType.BFLOAT16`` /
+        ``FpType.FLOAT32`` / ``FpType.FLOAT64`` / ``FpType.FLOAT80`` /
+        ``FpType.FLOAT128`` when the operand is FP-typed (per Ghidra's
+        ``OperandType.FLOAT`` bitmask + the per-ISA BFloat16 mnemonic
+        table at width=2) and ``None`` otherwise. Width derivation
+        order:
 
         1. Inspect each ``getOpObjects(i)`` element. For ``Register``
-           operands, return ``Register.getBitLength() / 8``. For ``Scalar``
-           operands, return ``Scalar.bitLength() / 8``. Take the largest
-           value seen (x87 ``fld dword ptr [...]`` carries an FP-tagged
+           operands, ``Register.getBitLength() / 8``. For ``Scalar``
+           operands, ``Scalar.bitLength() / 8``. Take the largest value
+           seen (x87 ``fld dword ptr [...]`` carries an FP-tagged
            memory operand whose size is the load size).
         2. If no op-object width is available, fall back to
            ``ghidra_insn.getOperandRefType(i).getSize()``.
-        3. If neither yields a positive value, return ``None`` (the
-           classifier then routes this operand through step 11 of the
-           precedence list rather than emitting a malformed ``floatXX``).
-
-        BFloat16-vs-Float16 distinction: width 2 alone is ambiguous;
-        SLEIGH does not currently tag bfloat16 distinctly. Callers
-        receiving width=2 default to ``Float16`` in the classifier.
-        Documented here so the precedence-list implementation can
-        cite the limitation.
+        3. Map width-in-bytes through ``_FP_WIDTH_TO_TYPE``.
+        4. At width=2, reclassify Float16 -> BFloat16 when the
+           instruction's mnemonic appears in the per-ISA table
+           (``_bfloat16_mnemonic_for_arch``). SLEIGH does not currently
+           tag bfloat16 distinctly, so the mnemonic-based reclassification
+           is the only signal available.
+        5. Widths outside ``_FP_WIDTH_TO_TYPE`` return ``None`` (the
+           classifier then routes through step 11 of the precedence list
+           rather than emitting a malformed ``floatXX``).
 
         Implementation note: the decode path in ``_ghidra_insn_to_cap``
-        stamps this width on every ``_CapOperand.fp_width_bytes`` at
+        stamps this type on every ``_CapOperand.fp_type`` at
         instruction-translation time, so operand tokenizers don't need
         to call this method per-operand. The public method stays on the
         provider for direct callers and for symmetry with the
         Phase 1.B.1 provider-interface contract.
         """
-        return _compute_fp_width_bytes(ghidra_insn, operand_index)
+        arch = _ghidra_processor_to_architecture(self._program)
+        try:
+            raw_mnemonic = str(ghidra_insn.getMnemonicString())
+        except Exception:
+            raw_mnemonic = ""
+        base_mnemonic, _, _ = _split_ghidra_mnemonic(raw_mnemonic)
+        base_mnemonic = _GHIDRA_MNEMONIC_ALIASES.get(base_mnemonic, base_mnemonic)
+        return _compute_fp_type(ghidra_insn, operand_index, arch, base_mnemonic)
 
     # ----------------------------------------------------------------------
     # Switch-table recovery

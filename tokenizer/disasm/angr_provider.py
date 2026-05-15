@@ -14,6 +14,49 @@ from tokenizer.disasm.metadata import (
 
 
 # ---------------------------------------------------------------------------
+# Capstone-operand uniform ``fp_type`` default
+# ---------------------------------------------------------------------------
+# The angr path delivers raw Capstone CsOpnd objects (X86Op, ArmOp, ...) to
+# consumer code. Capstone never populates an FP-precision signal on these,
+# so the angr-side ``op.fp_type`` is uniformly ``None`` (matches the typed
+# ``Optional[FpType]`` shape exposed by the Ghidra path's ``_CapOperand``;
+# see ``tokenizer/disasm/types.py``). Stamping the default at module load
+# (rather than per-instance per-instruction) keeps the consumer API uniform
+# across providers — ``op.fp_type`` is a direct typed read with no
+# ``getattr`` soft-probe — and avoids touching the Capstone object on the
+# hot path. ``angr_limitations.md`` §1 documents why this field stays
+# ``None`` on the angr side.
+def _stamp_fp_type_default() -> None:
+    """Attach class-level ``fp_type = None`` defaults to every Capstone
+    operand class the angr-backed providers deliver to consumers.
+
+    Only the classes we actually traverse are stamped; per-ISA imports are
+    wrapped so an ISA whose Capstone bindings are unavailable in the active
+    install (e.g. a stripped Capstone build) is silently skipped.
+    """
+    for module_name, class_name in (
+        ("capstone.x86", "X86Op"),
+        ("capstone.arm", "ArmOp"),
+        ("capstone.arm64", "Arm64Op"),
+        ("capstone.mips", "MipsOp"),
+        ("capstone.ppc", "PpcOp"),
+        ("capstone.riscv", "RiscvOp"),
+    ):
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        # Skip if a value is already present (e.g. a future Capstone release
+        # exposes the field natively or another module already stamped it).
+        if "fp_type" not in cls.__dict__:
+            cls.fp_type = None
+
+
+_stamp_fp_type_default()
+
+
+# ---------------------------------------------------------------------------
 # Typed view for the angr-side MetadataLookup
 # ---------------------------------------------------------------------------
 class _AngrAddressMetadataView:

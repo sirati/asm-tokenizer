@@ -64,10 +64,10 @@ def tokenize_operand_memory(
         abs_disp = abs(disp)
         # Memory operand → an FP load against a resolved pointer gets a
         # postfix ``floatXX`` (precedence.md "Postfix FP"). Only Ghidra
-        # stamps ``fp_width_bytes`` on _CapOperand (see
-        # ``angr_limitations.md`` §1); the angr/Capstone path falls
-        # through to ``None`` via ``getattr``.
-        fp_postfix = getattr(op, "fp_width_bytes", None)
+        # stamps a non-None ``fp_type`` on the operand (see
+        # ``angr_limitations.md`` §1); the angr/Capstone path uniformly
+        # reports None.
+        fp_postfix = op.fp_type
         if abs_disp <= 0xFF:
             tokens.append(vocab_manager.ValuedConst(abs_disp))
         else:
@@ -79,7 +79,7 @@ def tokenize_operand_memory(
                     abs_disp,
                     meta=meta,
                     is_arithmetic=False,
-                    fp_postfix_width_bytes=fp_postfix,
+                    fp_postfix_type=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
             else:
@@ -88,7 +88,7 @@ def tokenize_operand_memory(
                         abs_disp,
                         meta=meta,
                         is_arithmetic=False,
-                        fp_postfix_width_bytes=fp_postfix,
+                        fp_postfix_type=fp_postfix,
                     )
                     tokens.extend(disp_tokens)
                 else:
