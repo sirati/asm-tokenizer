@@ -9,6 +9,7 @@ from typing import List
 
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm.metadata import AddressKind
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, Tokens
 from tokenizer.utils import num_hex_digits
@@ -56,7 +57,7 @@ def tokenize_operand_memory_base_disp(
             tokens.append(vocab_manager.ValuedConst(abs_disp))
         else:
             force_opaque = not has_base
-            meta, _kind = lookup.lookup(abs_disp)
+            meta = lookup.lookup(abs_disp)
 
             if force_opaque or (abs_disp > (1 << 18)):
                 disp_tokens = constant_handler.process_constant_v2(
@@ -66,7 +67,7 @@ def tokenize_operand_memory_base_disp(
                     fp_postfix_width_bytes=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
-            elif meta is not None:
+            else:
                 if (text_start <= abs_disp < text_end) or (abs_disp < func_min_addr or abs_disp > func_max_addr):
                     disp_tokens = constant_handler.process_constant_v2(
                         abs_disp,
@@ -81,12 +82,6 @@ def tokenize_operand_memory_base_disp(
                         is_arithmetic=True,
                     )
                     tokens.extend(disp_tokens)
-            else:
-                disp_tokens = constant_handler.process_constant_v2(
-                    abs_disp,
-                    is_arithmetic=True,
-                )
-                tokens.extend(disp_tokens)
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
 
@@ -133,49 +128,35 @@ def tokenize_operand_immediate_generic(
             )
             tokens.extend(imm_token)
         elif base_mnemonic in addressing_control_flow_instructions:
-            meta, kind = lookup.lookup(imm_val)
-            if meta is not None:
-                if kind == "range":
-                    if func_min_addr <= imm_val < func_max_addr:
-                        imm_token = constant_handler.process_constant_v2(
-                            imm_val,
-                            is_arithmetic=True,
-                            fp_immediate_width_bytes=fp_immediate,
-                        )
-                        tokens.extend(imm_token)
-                    else:
-                        imm_token = constant_handler.process_constant_v2(
-                            imm_val,
-                            meta=meta,
-                            is_arithmetic=False,
-                            fp_immediate_width_bytes=fp_immediate,
-                        )
-                        tokens.extend(imm_token)
-                else:
-                    imm_token = constant_handler.process_constant_v2(
-                        imm_val,
-                        meta=meta,
-                        is_arithmetic=False,
-                        fp_immediate_width_bytes=fp_immediate,
-                    )
-                    tokens.extend(imm_token)
-            else:
+            meta = lookup.lookup(imm_val)
+            # Internal-jump heuristic: a control-flow target inside the
+            # current function body (and not at the function entry) is
+            # treated as a raw arithmetic value rather than a typed
+            # ``block`` token. Function entries (``start_addr == imm_val``)
+            # — including recursive calls — fall through to the typed
+            # path so the ``local_func`` precedence rule fires.
+            if (
+                meta.kind == AddressKind.LOCAL_FUNCTION
+                and meta.start_addr is not None
+                and meta.start_addr != imm_val
+                and func_min_addr <= imm_val < func_max_addr
+            ):
                 imm_token = constant_handler.process_constant_v2(
                     imm_val,
                     is_arithmetic=True,
                     fp_immediate_width_bytes=fp_immediate,
                 )
                 tokens.extend(imm_token)
+            else:
+                imm_token = constant_handler.process_constant_v2(
+                    imm_val,
+                    meta=meta,
+                    is_arithmetic=False,
+                    fp_immediate_width_bytes=fp_immediate,
+                )
+                tokens.extend(imm_token)
         else:
-            meta, kind = lookup.lookup(imm_val)
-            if meta is None:
-                meta = {
-                    "start_addr": imm_val,
-                    "end_addr": imm_val,
-                    "name": "unknown",
-                    "type": "unknown",
-                    "library": "unknown",
-                }
+            meta = lookup.lookup(imm_val)
             imm_token = constant_handler.process_constant_v2(
                 imm_val,
                 meta=meta,

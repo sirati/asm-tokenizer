@@ -19,8 +19,13 @@ from typing import Any, Iterable, Optional
 
 from tokenizer.disasm import DisassemblyProvider, MetadataLookup
 from tokenizer.disasm.metadata import (
+    AddressKind,
     AddressMetadataView,
-    _DictBackedAddressMetadataView,
+    Encoding,
+    SectionKind,
+    address_kind_from_string,
+    encoding_from_string,
+    section_kind_from_type_string,
 )
 
 # ---------------------------------------------------------------------------
@@ -354,95 +359,189 @@ def _looks_like_vtable_datatype_name(dt_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Ghidra metadata lookup + typed view
 # ---------------------------------------------------------------------------
-class _GhidraAddressMetadataView(_DictBackedAddressMetadataView):
-    """Concrete typed-view for the Ghidra-side ``MetadataLookup``.
+class _GhidraAddressMetadataView:
+    """Concrete typed view returned by ``GhidraMetadataLookup.lookup()``.
 
-    Extends the dict-backed base with Ghidra-specific:
+    Pure storage + read-only typed properties. ``GhidraMetadataLookup``
+    populates every typed slot at lookup time via ``_populate``;
+    consumers read typed properties exclusively. ``slot_target`` is
+    resolved lazily on first access by re-entering
+    ``GhidraMetadataLookup._classify_address`` with
+    ``allow_slot_recursion=False`` (so the inner call writes to a
+    fresh view rather than disturbing the cursor and the inner view's
+    ``slot_target`` is guaranteed ``None``).
 
-    - ``section_name``: raw ELF section name from the containing
-      ``MemoryBlock`` (kept separate from ``section_kind`` per audit-2).
-    - ``slot_target``: lazily resolved code-pointer-array / vtable /
-      jump-table slot target, looked up by re-classifying the resolved
-      target address with ``allow_slot_recursion=False`` so the slot
-      target's own ``slot_target`` is guaranteed ``None`` (no infinite
-      regress).
-    - ``jump_table_base_addr`` / ``jump_table_offset``: populated for
-      ``JUMP_TABLE_SLOT`` addresses by walking back to the containing
-      ``Data`` array's min-address.
-
-    The wrapper carries an extra ``_resolution_state`` slot for the
-    Ghidra ``Data`` / table-base information needed to compute slot
-    targets without re-running the lookup pipeline.
+    LIFECYCLE: instance is REUSED across ``lookup()`` calls. Use
+    ``copy.deepcopy(view)`` to stash across lookups.
     """
 
-    __slots__ = ("_lookup", "_resolution_state")
+    __slots__ = (
+        "_lookup",
+        "_kind",
+        "_section_kind",
+        "_section_name",
+        "_string_encoding",
+        "_string_bytes",
+        "_name",
+        "_start_addr",
+        "_end_addr",
+        "_size",
+        "_library",
+        "_is_vtable",
+        "_tls",
+        "_slot_target_addr",
+        "_jump_table_base_addr",
+        "_jump_table_offset",
+    )
 
     def __init__(self, lookup: "GhidraMetadataLookup") -> None:
-        super().__init__()
         self._lookup = lookup
-        # Per-address resolution state, refreshed each ``_set_state`` call
-        # by ``GhidraMetadataLookup`` (which has the Ghidra raw refs).
-        self._resolution_state: dict = {}
+        self._kind: AddressKind = AddressKind.NONE
+        self._section_kind: SectionKind = SectionKind.UNKNOWN
+        self._section_name: Optional[str] = None
+        self._string_encoding: Encoding = Encoding.UNKNOWN
+        self._string_bytes: Optional[bytes] = None
+        self._name: Optional[str] = None
+        self._start_addr: Optional[int] = None
+        self._end_addr: Optional[int] = None
+        self._size: Optional[int] = None
+        self._library: Optional[str] = None
+        self._is_vtable: bool = False
+        self._tls: bool = False
+        # Slot-target resolution state: populated alongside the typed
+        # slots below for slot-bearing addresses; ``slot_target``
+        # property reads ``_slot_target_addr`` and re-classifies
+        # lazily on first access.
+        self._slot_target_addr: Optional[int] = None
+        self._jump_table_base_addr: Optional[int] = None
+        self._jump_table_offset: Optional[int] = None
 
-    def _refresh_resolution_state(self, state: dict) -> None:
-        """Replace per-address resolution state. Called by the lookup
-        immediately before ``_set_state`` so ``slot_target`` /
-        ``jump_table_*`` properties read the correct addresses for the
-        current cursor position.
+    def _populate(
+        self,
+        *,
+        kind: AddressKind,
+        section_kind: SectionKind,
+        section_name: Optional[str],
+        string_encoding: Encoding,
+        string_bytes: Optional[bytes],
+        name: Optional[str],
+        start_addr: Optional[int],
+        end_addr: Optional[int],
+        size: Optional[int],
+        library: Optional[str],
+        is_vtable: bool,
+        tls: bool,
+        slot_target_addr: Optional[int],
+        jump_table_base_addr: Optional[int],
+        jump_table_offset: Optional[int],
+    ) -> None:
+        """Replace all typed slot state in one call. Used by the lookup
+        at the start of every ``lookup()`` so the consumer sees a
+        consistent view bound to the current address.
         """
-        self._resolution_state = state
+        self._kind = kind
+        self._section_kind = section_kind
+        self._section_name = section_name
+        self._string_encoding = string_encoding
+        self._string_bytes = string_bytes
+        self._name = name
+        self._start_addr = start_addr
+        self._end_addr = end_addr
+        self._size = size
+        self._library = library
+        self._is_vtable = is_vtable
+        self._tls = tls
+        self._slot_target_addr = slot_target_addr
+        self._jump_table_base_addr = jump_table_base_addr
+        self._jump_table_offset = jump_table_offset
+
+    # -- Typed property surface (AddressMetadataView Protocol) --------------
+    @property
+    def kind(self) -> AddressKind:
+        return self._kind
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._name
+
+    @property
+    def section_kind(self) -> SectionKind:
+        return self._section_kind
 
     @property
     def section_name(self) -> Optional[str]:
-        # Ghidra-only: raw ELF section name kept separate from
-        # ``section_kind``. Default base-class behavior reads from
-        # ``meta["section_name"]`` which the Ghidra ``_enrich`` populates.
-        return super().section_name
+        return self._section_name
+
+    @property
+    def start_addr(self) -> Optional[int]:
+        return self._start_addr
+
+    @property
+    def end_addr(self) -> Optional[int]:
+        return self._end_addr
+
+    @property
+    def size(self) -> Optional[int]:
+        return self._size
+
+    @property
+    def library(self) -> Optional[str]:
+        return self._library
+
+    @property
+    def string_encoding(self) -> Encoding:
+        return self._string_encoding
+
+    @property
+    def string_bytes(self) -> Optional[bytes]:
+        return self._string_bytes
+
+    @property
+    def is_vtable(self) -> bool:
+        return self._is_vtable
+
+    @property
+    def tls(self) -> bool:
+        return self._tls
 
     @property
     def slot_target(self) -> Optional[AddressMetadataView]:
-        target_addr = self._resolution_state.get("slot_target_addr")
-        if target_addr is None:
+        if self._slot_target_addr is None:
             return None
         # Recursion-bounded re-classification: the lookup builds a
         # FRESH (non-cursor) view for the target so the kind is
         # guaranteed not to be a slot kind itself, and the active
         # cursor view's state is not disturbed.
-        return self._lookup._classify_address(int(target_addr), allow_slot_recursion=False)
+        return self._lookup._classify_address(
+            int(self._slot_target_addr), allow_slot_recursion=False
+        )
 
     @property
     def jump_table_base_addr(self) -> Optional[int]:
-        v = self._resolution_state.get("jump_table_base_addr")
-        return None if v is None else int(v)
+        return self._jump_table_base_addr
 
     @property
     def jump_table_offset(self) -> Optional[int]:
-        v = self._resolution_state.get("jump_table_offset")
-        return None if v is None else int(v)
+        return self._jump_table_offset
 
-    def __deepcopy__(self, memo) -> "AddressMetadataView":
-        import copy as _copy
-        cls = type(self)
-        clone = cls.__new__(cls)
-        clone._dict = _copy.deepcopy(self._dict, memo)
-        clone._kind_string = self._kind_string
-        # Share the lookup ref (it's the data source, not a per-cursor
-        # detail); resolution state is per-address so it's snapshot-copied.
-        clone._lookup = self._lookup
-        clone._resolution_state = _copy.deepcopy(self._resolution_state, memo)
+    def __deepcopy__(self, memo) -> "_GhidraAddressMetadataView":
+        clone = _GhidraAddressMetadataView(self._lookup)
+        clone._kind = self._kind
+        clone._section_kind = self._section_kind
+        clone._section_name = self._section_name
+        clone._string_encoding = self._string_encoding
+        clone._string_bytes = self._string_bytes
+        clone._name = self._name
+        clone._start_addr = self._start_addr
+        clone._end_addr = self._end_addr
+        clone._size = self._size
+        clone._library = self._library
+        clone._is_vtable = self._is_vtable
+        clone._tls = self._tls
+        clone._slot_target_addr = self._slot_target_addr
+        clone._jump_table_base_addr = self._jump_table_base_addr
+        clone._jump_table_offset = self._jump_table_offset
         return clone
-
-    def legacy_dict(self) -> tuple[dict, str]:
-        """Phase-D.2 transitional adapter - returns ``(v1_dict, kind_str)``.
-
-        Thin override of the base implementation so the canonical
-        location is co-located with the rest of the Ghidra-side typed
-        view; the actual delegation lives in
-        ``_DictBackedAddressMetadataView.legacy_dict``. Removed when
-        Phase D.3 retires every ``meta.get(...)`` / ``meta[...]`` call
-        site.
-        """
-        return super().legacy_dict()
 
 
 class GhidraMetadataLookup:
@@ -451,42 +550,41 @@ class GhidraMetadataLookup:
     Conforms to the ``MetadataLookup`` protocol (``lookup(addr) ->
     AddressMetadataView``). The returned ``_GhidraAddressMetadataView`` is
     REUSED across ``lookup()`` calls (lifecycle per ``AddressMetadataView``
-    docstring); valid only until the next ``lookup()``. Tuple unpacking
-    ``meta, kind = lookup.lookup(addr)`` is preserved through the view's
-    ``__iter__`` until Phase D.3 retires the legacy dict-shaped surface.
+    docstring); valid only until the next ``lookup()``.
 
-    The view's v1 dict carries the legacy keys (``name``, ``type``,
-    ``size``, ``start_addr``, ``end_addr``, ``source``, ``library``) plus
-    the v2-classifier enrichments below. All enrichment keys are always
-    present; conservative defaults (``False`` / ``None``) are used when the
-    Ghidra analyzers did not flag the address.
+    Per ``lookup()`` the lookup walks Ghidra's symbol/function/memory
+    state, derives every typed slot the view exposes, and stamps them in
+    one ``_populate`` call. The string -> enum mapping happens here at
+    population time, never on the read path.
 
-    v2 enrichment keys:
-        is_plt              -- addr inside a ``.plt`` / PLT-thunk region
-        is_extern_synthetic -- addr in Ghidra's external/synthetic-extern
-                               namespace (Ghidra's analogue of CLE's synthetic
-                               extern object)
-        is_vtable           -- addr is a C++ vtable slot (RTTI-analyzer output)
-        is_string           -- addr is the start of a typed string Data
-        string_encoding     -- Python codec name for the string ("ascii",
-                               "utf-8", "utf-16-le", ...) or None
-        string_bytes        -- the raw string bytes or None
-        is_jump_table_slot  -- addr is inside a Ghidra-recovered switch-table
-                               (AddressTable / pointer-array referenced by a
-                               computed-jump)
-        is_code_ptr_table_slot
-                            -- addr is inside ``.init_array`` / ``.fini_array``
-                               / ``.dtors`` / ``.ctors`` / ``.preinit_array``
-        tls                 -- addr is in ``.tdata`` / ``.tbss``
-        section_name        -- raw ELF section name (``.rodata`` etc.) when
-                               the address has a containing ``MemoryBlock``.
-                               Phase D.2 separation: distinct from
-                               ``section_kind``, which is derived enum.
+    Typed slots populated per address:
+        kind                -- ``AddressKind`` (precedence-aware: STRING >
+                               vtable / code_ptr / jump_table-as-slot >
+                               PLT > extern_synthetic > base type)
+        section_kind        -- ``SectionKind`` derived from the containing
+                               ``MemoryBlock``'s name + permission bits
+        section_name        -- raw ELF section name (``.rodata`` etc.) of
+                               the containing ``MemoryBlock`` (separate
+                               from ``name``, which holds the function /
+                               symbol label)
+        name                -- function / symbol / section label
+        start_addr/end_addr -- range bounds for the matched entity
+        size                -- entity size in bytes
+        library             -- non-None only for resolved extern targets
+        string_encoding     -- ``Encoding`` enum from the Ghidra DataType
+        string_bytes        -- raw string bytes when ``kind == STRING``
+        is_vtable           -- C++ vtable slot (RTTI-analyzer output)
+        tls                 -- TLS section (``.tdata`` / ``.tbss``)
+        slot_target         -- lazily resolved on first read; uses
+                               ``_slot_target_addr`` populated here
+        jump_table_base_addr / jump_table_offset
+                            -- populated for ``JUMP_TABLE_SLOT`` addresses
 
-    Cross-provider parity: matches the keys the angr-side lookup populates.
-    When Ghidra has no signal the field is False/None just as on the angr
-    side; the v2 classifier then routes to a lower precedence step (see
-    ``tokenizer/disasm/precedence.md`` and ``tokenizer/disasm/angr_limitations.md``).
+    Cross-provider parity: ``AngrMetadataLookup`` exposes the same typed
+    slots; angr-only lookups leave Ghidra-only signals at their
+    conservative defaults (``Encoding.UNKNOWN`` for non-ASCII strings,
+    ``slot_target=None``, no jump-table info; see
+    ``tokenizer/disasm/angr_limitations.md``).
     """
 
     def __init__(self, program: Any, function_manager: Any) -> None:
@@ -501,7 +599,7 @@ class GhidraMetadataLookup:
         # via ``GhidraDisassemblyProvider.iter_switch_tables``.
         self._switch_table_cache: Optional[dict[int, list[int]]] = None
         # REUSED view wrapper - per-`lookup()` call we mutate its state
-        # via `_set_state` and return the same instance.
+        # via `_populate` and return the same instance.
         self._view = _GhidraAddressMetadataView(self)
 
     # -- Enrichment helpers (one concern each) ------------------------------
@@ -673,9 +771,8 @@ class GhidraMetadataLookup:
         """Resolve ``addr`` to the typed cursor view.
 
         Mutates the per-lookup ``_GhidraAddressMetadataView`` and returns
-        it. Callers still doing ``meta, kind = lookup.lookup(addr)`` get
-        the view + the v1 kind string via the view's ``__iter__`` bridge
-        (Phase D.3 retires that bridge).
+        it. Consumers read typed properties exclusively (``meta.kind``,
+        ``meta.name``, ``meta.string_encoding`` etc.).
         """
         return self._classify_address(addr, allow_slot_recursion=True)
 
@@ -687,7 +784,8 @@ class GhidraMetadataLookup:
     ) -> AddressMetadataView:
         """Classify ``addr`` and return a typed view.
 
-        ``allow_slot_recursion`` controls the active wrapper:
+        ``allow_slot_recursion`` controls the active wrapper AND the
+        slot-detection branch:
 
         - ``True`` (public ``lookup()`` path): mutate the cursor view
           (``self._view``) in place and return it. Slot-target resolution
@@ -696,10 +794,11 @@ class GhidraMetadataLookup:
           ``allow_slot_recursion=False`` so the inner call writes to a
           fresh wrapper instead of disturbing the cursor.
         - ``False`` (slot-target resolution path): build a FRESH
-          standalone view bound to this lookup. Its ``slot_target`` is
-          guaranteed ``None`` so there is no infinite regress; the
-          returned kind cannot itself be a slot kind
-          (CODE_PTR_TABLE_SLOT, JUMP_TABLE_SLOT) per task contract.
+          standalone view bound to this lookup. Slot-detection signals
+          are suppressed so the inner view's kind is guaranteed NOT to
+          be a slot kind (CODE_PTR_TABLE_SLOT / JUMP_TABLE_SLOT) per
+          task contract; ``slot_target`` is also guaranteed ``None`` so
+          there is no infinite regress.
         """
         addr_obj = self._program.getAddressFactory().getDefaultAddressSpace().getAddress(addr)
         block = self._block_at(addr_obj)
@@ -709,7 +808,7 @@ class GhidraMetadataLookup:
         is_plt = _is_plt_block_name(block_name) if block is not None else False
         is_code_ptr_table_slot = _is_code_ptr_table_block_name(block_name) if block is not None else False
         tls = _is_tls_block_name(block_name) if block is not None else False
-        is_string, string_encoding, string_bytes = self._classify_string(addr_obj)
+        is_string, string_encoding_str, string_bytes = self._classify_string(addr_obj)
         # Slot-detection signals are suppressed when re-entering for slot
         # resolution: the slot_target's kind must NOT itself be a slot kind.
         if allow_slot_recursion:
@@ -720,39 +819,28 @@ class GhidraMetadataLookup:
             is_jump_table_slot = False
             is_code_ptr_table_slot = False
 
-        def _enrich(meta: dict, *, func: Any = None) -> dict:
-            """Stamp the v2 enrichment keys onto an existing meta dict.
-
-            ``func`` is optional; when present it is forwarded to the
-            extern-synthetic check (a function-entry address that lives
-            in Ghidra's EXTERNAL block).
-            """
-            meta["is_plt"] = bool(is_plt) or (func is not None and bool(getattr(func, "isThunk", lambda: False)()))
-            meta["is_extern_synthetic"] = self._is_extern_synthetic(func, block)
-            meta["is_vtable"] = bool(is_vtable)
-            meta["is_string"] = bool(is_string)
-            meta["string_encoding"] = string_encoding
-            meta["string_bytes"] = string_bytes
-            meta["is_jump_table_slot"] = bool(is_jump_table_slot)
-            meta["is_code_ptr_table_slot"] = bool(is_code_ptr_table_slot)
-            meta["tls"] = bool(tls)
-            # Phase D.2: section_name as a separate v1 key (audit-2:
-            # don't conflate with ``meta["name"]`` which holds the
-            # function/symbol name in non-section sources).
-            meta["section_name"] = block_name if block is not None else None
-            return meta
+        # Per-branch raw fields (name / type-string / size / range bounds /
+        # func ref). Branches set them; the final populate-typed-state step
+        # at the bottom translates string -> enum once.
+        type_str: str
+        name: Optional[str]
+        size: Optional[int]
+        start_addr: Optional[int]
+        end_addr: Optional[int]
+        func: Any = None
+        section_name: Optional[str] = block_name if block is not None else None
 
         # 1. Exact symbol match -- legacy bare ``"symbol"`` is replaced with
         #    a section-derived type. The symbol's name is preserved as-is.
         symbols = self._symbol_table.getSymbols(addr_obj)
         if symbols:
             sym = symbols[0]
-            sym_name = str(sym.getName())
+            name = str(sym.getName())
             # Derive type from the containing section (if any). For a symbol
             # in ``.text`` whose Ghidra ``SymbolType`` is ``FUNCTION`` we
             # tag it ``local_function``; everything else uses the section's
             # natural type (``rodata`` / ``data`` / ``thread_local_data`` / ...).
-            sym_type = "unknown"
+            type_str = "unknown"
             if block is not None:
                 base_type = _section_type_from_block(block)
                 if base_type == "code":
@@ -764,18 +852,12 @@ class GhidraMetadataLookup:
                         is_function_symbol = str(st).upper() == "FUNCTION"
                     except Exception:
                         is_function_symbol = False
-                    sym_type = "local_function" if is_function_symbol else base_type
+                    type_str = "local_function" if is_function_symbol else base_type
                 else:
-                    sym_type = base_type
-            meta = {
-                "name": sym_name,
-                "type": sym_type,
-                "size": 0,
-                "source": "symbol",
-                "start_addr": addr,
-                "end_addr": addr,
-                "library": "unknown",
-            }
+                    type_str = base_type
+            size = 0
+            start_addr = addr
+            end_addr = addr
             # If the symbol is an actual function and we have its body, give
             # the classifier accurate range bounds rather than a zero-width.
             try:
@@ -787,153 +869,142 @@ class GhidraMetadataLookup:
                     body = func.getBody()
                     size = int(body.getNumAddresses())
                     entry = int(func.getEntryPoint().getOffset())
-                    meta["size"] = size
-                    meta["start_addr"] = entry
-                    meta["end_addr"] = entry + size
+                    start_addr = entry
+                    end_addr = entry + size
                 except Exception:
                     pass
-            return self._materialize_view(
-                allow_slot_recursion,
-                _enrich(meta, func=func),
-                "exact",
-                addr,
-                block,
-            )
-
-        # 2. Function match (covers calls/jumps into known functions).
-        func = self._fm.getFunctionContaining(addr_obj)
-        if func is not None:
-            entry = int(func.getEntryPoint().getOffset())
-            body = func.getBody()
-            size = int(body.getNumAddresses())
-            is_external = func.isExternal() or func.isThunk()
-            meta = {
-                "name": str(func.getName()),
-                "type": "library_function" if is_external else "local_function",
-                "size": size,
-                "start_addr": entry,
-                "end_addr": entry + size,
-                "source": "function",
-                "library": "unknown",
-            }
-            return self._materialize_view(
-                allow_slot_recursion,
-                _enrich(meta, func=func),
-                "range",
-                addr,
-                block,
-            )
-
-        # 3. Memory-block match -- the address is in a known section but
-        #    not inside any function. Use the section-type mapping.
-        if block is not None:
-            meta = {
-                "name": block_name,
-                "type": _section_type_from_block(block),
-                "size": int(block.getSize()),
-                "start_addr": int(block.getStart().getOffset()),
-                "end_addr": int(block.getEnd().getOffset()) + 1,
-                "source": "section",
-                "library": "unknown",
-            }
-            return self._materialize_view(
-                allow_slot_recursion,
-                _enrich(meta),
-                "range",
-                addr,
-                block,
-            )
-
-        # 4. Fallback -- address not in any known memory region.
-        fallback = {
-            "start_addr": addr,
-            "end_addr": addr,
-            "name": f"unknown_{addr:x}",
-            "type": "unknown",
-            "size": 0,
-            "source": "synthetic",
-            "library": "unknown",
-        }
-        return self._materialize_view(
-            allow_slot_recursion,
-            _enrich(fallback),
-            "synthetic",
-            addr,
-            block,
-        )
-
-    def _materialize_view(
-        self,
-        allow_slot_recursion: bool,
-        meta_dict: dict,
-        kind_string: str,
-        addr: int,
-        block: Any,
-    ) -> AddressMetadataView:
-        """Stamp the classified state onto either the cursor view (public
-        ``lookup()`` path, ``allow_slot_recursion=True``) or a freshly
-        allocated view (slot-target resolution path).
-
-        Slot-target / jump-table resolution happens here so the
-        per-cursor ``_resolution_state`` dict reflects the address that
-        was just classified, not the previous one. Resolution is
-        suppressed on the slot-recursion path because the inner view's
-        ``slot_target`` must be ``None`` per the task contract.
-        """
-        resolution_state: dict = {}
-        if allow_slot_recursion:
-            resolution_state = self._build_resolution_state(meta_dict, addr, block)
-
-        if allow_slot_recursion:
-            view = self._view
         else:
-            view = _GhidraAddressMetadataView(self)
-        view._refresh_resolution_state(resolution_state)
-        view._set_state(meta_dict, kind_string)
+            # 2. Function match (covers calls/jumps into known functions).
+            func = self._fm.getFunctionContaining(addr_obj)
+            if func is not None:
+                entry = int(func.getEntryPoint().getOffset())
+                body = func.getBody()
+                size = int(body.getNumAddresses())
+                is_external = func.isExternal() or func.isThunk()
+                name = str(func.getName())
+                type_str = "library_function" if is_external else "local_function"
+                start_addr = entry
+                end_addr = entry + size
+            elif block is not None:
+                # 3. Memory-block match -- the address is in a known section
+                # but not inside any function. Use the section-type mapping.
+                name = block_name
+                type_str = _section_type_from_block(block)
+                size = int(block.getSize())
+                start_addr = int(block.getStart().getOffset())
+                end_addr = int(block.getEnd().getOffset()) + 1
+            else:
+                # 4. Fallback -- address not in any known memory region.
+                name = f"unknown_{addr:x}"
+                type_str = "unknown"
+                size = 0
+                start_addr = addr
+                end_addr = addr
+
+        # Final enrichments that depend on ``func`` / ``block`` and apply
+        # uniformly across all four branches above.
+        is_thunk = func is not None and bool(getattr(func, "isThunk", lambda: False)())
+        is_plt_combined = is_plt or is_thunk
+        is_extern_synthetic = self._is_extern_synthetic(func, block)
+
+        # Translate raw signals into typed slots ONCE here (no per-property
+        # work on the read path).
+        kind = self._derive_address_kind(
+            type_str=type_str,
+            is_string=is_string,
+            is_vtable=is_vtable,
+            is_jump_table_slot=is_jump_table_slot,
+            is_code_ptr_table_slot=is_code_ptr_table_slot,
+            is_plt=is_plt_combined,
+            is_extern_synthetic=is_extern_synthetic,
+        )
+        section_kind = section_kind_from_type_string(type_str)
+        string_encoding = encoding_from_string(string_encoding_str)
+
+        # Slot-target / jump-table resolution. Only meaningful on the
+        # public lookup path (``allow_slot_recursion=True``); the inner
+        # slot_target re-classification path leaves these at None per
+        # the task contract.
+        slot_target_addr: Optional[int] = None
+        jump_table_base_addr: Optional[int] = None
+        jump_table_offset: Optional[int] = None
+        if allow_slot_recursion:
+            if is_vtable or is_code_ptr_table_slot:
+                target = self._resolve_pointer_array_slot(addr)
+                if target is not None:
+                    slot_target_addr = target
+            if is_jump_table_slot:
+                jt_base = self._jump_table_base_addr(addr)
+                if jt_base is not None:
+                    jump_table_base_addr = jt_base
+                    jump_table_offset = addr - jt_base
+                    target = self._jump_table_target(jt_base, addr - jt_base)
+                    if target is not None:
+                        slot_target_addr = target
+
+        # Library label: index entries currently leave it as the
+        # "unknown" sentinel; surface None on the typed view so downstream
+        # readers don't accidentally consume the placeholder string.
+        library: Optional[str] = None
+
+        view = self._view if allow_slot_recursion else _GhidraAddressMetadataView(self)
+        view._populate(
+            kind=kind,
+            section_kind=section_kind,
+            section_name=section_name,
+            string_encoding=string_encoding,
+            string_bytes=string_bytes,
+            name=name,
+            start_addr=start_addr,
+            end_addr=end_addr,
+            size=size,
+            library=library,
+            is_vtable=bool(is_vtable),
+            tls=bool(tls),
+            slot_target_addr=slot_target_addr,
+            jump_table_base_addr=jump_table_base_addr,
+            jump_table_offset=jump_table_offset,
+        )
         return view
 
-    def _build_resolution_state(
-        self,
-        meta_dict: dict,
-        addr: int,
-        block: Any,
-    ) -> dict:
-        """Compute slot-target / jump-table-base info for ``addr``.
+    @staticmethod
+    def _derive_address_kind(
+        *,
+        type_str: str,
+        is_string: bool,
+        is_vtable: bool,
+        is_jump_table_slot: bool,
+        is_code_ptr_table_slot: bool,
+        is_plt: bool,
+        is_extern_synthetic: bool,
+    ) -> AddressKind:
+        """Combine raw signals into the precedence-aware ``AddressKind``.
 
-        Result keys (all optional):
-        - ``slot_target_addr``: target address for ``CODE_PTR_TABLE_SLOT``
-          (vtable / init_array / fini_array / dtors slots). Resolved via
-          ``Listing.getDataAt(addr).getValue()`` for pointer arrays;
-          looked up in ``_switch_table_cache`` for jump-table slots.
-        - ``jump_table_base_addr`` / ``jump_table_offset``: the table's
-          own base address + this slot's offset, for ``JUMP_TABLE_SLOT``.
-
-        Pure read of Ghidra state; safe to call from the cursor-mutation
-        path because it does not invoke ``_classify_address`` (slot
-        re-classification happens lazily in the view's ``slot_target``
-        property accessor).
+        Order matches ``constant_handler._PRECEDENCE``:
+            1. is_string                      -> STRING
+            2. is_jump_table_slot             -> JUMP_TABLE_SLOT
+            3. is_vtable / is_code_ptr_slot   -> CODE_PTR_TABLE_SLOT
+            4. is_plt                         -> PLT_FUNCTION
+            5. is_extern_synthetic on a func  -> EXT_FUNCTION_SYNTHETIC
+            6. base type-string               -> base AddressKind
         """
-        state: dict = {}
-        is_vtable = bool(meta_dict.get("is_vtable"))
-        is_code_ptr_slot = bool(meta_dict.get("is_code_ptr_table_slot"))
-        is_jump_table_slot = bool(meta_dict.get("is_jump_table_slot"))
-
-        if is_vtable or is_code_ptr_slot:
-            target = self._resolve_pointer_array_slot(addr)
-            if target is not None:
-                state["slot_target_addr"] = target
-
+        if is_string:
+            return AddressKind.STRING
         if is_jump_table_slot:
-            jt_base = self._jump_table_base_addr(addr)
-            if jt_base is not None:
-                state["jump_table_base_addr"] = jt_base
-                state["jump_table_offset"] = addr - jt_base
-                # Slot-target via switch-table cache (lazy build).
-                target = self._jump_table_target(jt_base, addr - jt_base)
-                if target is not None:
-                    state["slot_target_addr"] = target
-
-        return state
+            return AddressKind.JUMP_TABLE_SLOT
+        if is_vtable or is_code_ptr_table_slot:
+            return AddressKind.CODE_PTR_TABLE_SLOT
+        if is_plt:
+            return AddressKind.PLT_FUNCTION
+        lowered = (type_str or "").lower()
+        if is_extern_synthetic and lowered in {
+            "extern_function",
+            "library_function",
+            "plt_function",
+            "unknown_function",
+        }:
+            return AddressKind.EXT_FUNCTION_SYNTHETIC
+        return address_kind_from_string(type_str)
 
     def _resolve_pointer_array_slot(self, addr: int) -> Optional[int]:
         """Read the pointer value stored at ``addr``.

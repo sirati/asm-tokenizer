@@ -72,7 +72,7 @@ def tokenize_operand_memory(
             tokens.append(vocab_manager.ValuedConst(abs_disp))
         else:
             force_opaque = not has_base
-            meta, _kind = lookup.lookup(abs_disp)
+            meta = lookup.lookup(abs_disp)
 
             if force_opaque or (abs_disp > (1 << 18)):
                 disp_tokens = constant_handler.process_constant_v2(
@@ -82,7 +82,7 @@ def tokenize_operand_memory(
                     fp_postfix_width_bytes=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
-            elif meta is not None:
+            else:
                 if (text_start <= abs_disp < text_end) or (abs_disp < func_min_addr or abs_disp > func_max_addr):
                     disp_tokens = constant_handler.process_constant_v2(
                         abs_disp,
@@ -94,9 +94,6 @@ def tokenize_operand_memory(
                 else:
                     disp_tokens = constant_handler.process_constant_v2(abs_disp, is_arithmetic=True)
                     tokens.extend(disp_tokens)
-            else:
-                disp_tokens = constant_handler.process_constant_v2(abs_disp, is_arithmetic=True)
-                tokens.extend(disp_tokens)
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
 

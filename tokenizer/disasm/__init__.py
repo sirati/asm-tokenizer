@@ -48,14 +48,13 @@ class MetadataLookup(Protocol):
     def lookup(self, addr: int) -> AddressMetadataView:
         """Resolve ``addr`` to a typed ``AddressMetadataView``.
 
-        Phase D.1+D.2: the returned view is the SAME wrapper instance per
-        ``MetadataLookup`` (lifecycle per ``AddressMetadataView`` docstring).
-        Until Phase D.3 migrates ``ConstantHandler`` off of dict-shaped
-        access, the concrete view classes also implement a transitional
-        ``Mapping``-shaped surface (``__getitem__`` / ``get`` / ``keys`` /
-        ``__contains__``) and yield ``(self, kind_string)`` from
-        ``__iter__`` so ``meta, kind = lookup.lookup(addr)`` keeps working.
-        Use ``view.legacy_dict()`` for an explicit v1 ``(dict, kind)`` tuple.
+        The returned view is the SAME wrapper instance per
+        ``MetadataLookup`` (lifecycle per ``AddressMetadataView``
+        docstring). Consumers read typed properties exclusively
+        (``meta.kind``, ``meta.name``, ``meta.string_encoding`` etc.);
+        the transitional dict-shim and v1-tuple-unpacking adapters from
+        Phase D.1/D.2 are gone (Phase D.3 / task #40). Use
+        ``copy.deepcopy(meta)`` to stash across lookups.
         """
         ...
 

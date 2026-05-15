@@ -3,6 +3,7 @@ from typing import List
 
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm.metadata import AddressKind
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, Tokens
 from tokenizer.utils import num_hex_digits
@@ -112,7 +113,7 @@ def tokenize_operand_memory(
         elif disp > (1 << 18):  # = 262,144
             force_opaque = True
 
-        meta, kind = lookup.lookup(disp)
+        meta = lookup.lookup(disp)
 
         # Memory operand → if the load is FP-typed Ghidra stamps the width
         # on this _CapOperand at decode time; the v2 emitter appends a
@@ -129,23 +130,22 @@ def tokenize_operand_memory(
             )
             tokens.extend(disp_token)
         # For larger displacements, check if pointing to known constant or code or opaque
-        meta, kind = lookup.lookup(disp)
-        if meta is not None:
-            # Check if displacement is in text section or outside function bounds
-            if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
-                disp_token = constant_handler.process_constant_v2(
-                    disp,
-                    meta=meta,
-                    is_arithmetic=False,
-                    fp_postfix_width_bytes=fp_postfix,
-                )
-                tokens.extend(disp_token)
-            else:
-                # Local constant - treat as valued constant literal
-                disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
-                tokens.extend(disp_token)
+        # NOTE: this mirrors the pre-D.3 behavior verbatim (a second emission
+        # path runs unconditionally below). The double-emission for
+        # ``force_opaque`` displacements is a pre-existing quirk; D.3 only
+        # migrates the lookup return type.
+        meta = lookup.lookup(disp)
+        # Check if displacement is in text section or outside function bounds
+        if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
+            disp_token = constant_handler.process_constant_v2(
+                disp,
+                meta=meta,
+                is_arithmetic=False,
+                fp_postfix_width_bytes=fp_postfix,
+            )
+            tokens.extend(disp_token)
         else:
-            # No metadata found - treat as valued constant literal
+            # Local constant - treat as valued constant literal
             disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
             tokens.extend(disp_token)
 
@@ -197,53 +197,37 @@ def tokenize_operand_immediate(
             )
             tokens.extend(imm_token)
         elif insn.mnemonic in addressing_control_flow_instructions:
-            # Addressing/control flow instruction - check for metadata
-            meta, kind = lookup.lookup(imm_val)
+            # Addressing/control flow instruction - check for metadata.
             # todo we have a major issue here: a lot of targets are NOI in this table, e.g. I got .plt but angr can resolve it cfg.kb.functions.get(call_target_addr)
-            if meta is not None:
-                if kind == "range":
-                    if func_min_addr <= imm_val < func_max_addr:  # Local
-                        imm_token = constant_handler.process_constant_v2(
-                            imm_val,
-                            is_arithmetic=True,
-                            fp_immediate_width_bytes=fp_immediate,
-                        )
-                        tokens.extend(imm_token)
-                    else:  # External
-                        imm_token = constant_handler.process_constant_v2(
-                            imm_val,
-                            meta=meta,
-                            is_arithmetic=False,
-                            fp_immediate_width_bytes=fp_immediate,
-                        )
-                        tokens.extend(imm_token)
-                else:
-                    imm_token = constant_handler.process_constant_v2(
-                        imm_val,
-                        meta=meta,
-                        is_arithmetic=False,
-                        fp_immediate_width_bytes=fp_immediate,
-                    )
-                    tokens.extend(imm_token)
-            else:
-                # No metadata - treat as valued constant literal
+            meta = lookup.lookup(imm_val)
+            # Internal-jump heuristic: a control-flow target inside the
+            # current function body (and not at the function entry) is
+            # treated as a raw arithmetic value rather than a typed
+            # ``block`` token. Function entries (``start_addr == imm_val``)
+            # — including recursive calls — fall through to the typed
+            # path so the ``local_func`` precedence rule fires.
+            if (
+                meta.kind == AddressKind.LOCAL_FUNCTION
+                and meta.start_addr is not None
+                and meta.start_addr != imm_val
+                and func_min_addr <= imm_val < func_max_addr
+            ):
                 imm_token = constant_handler.process_constant_v2(
                     imm_val,
                     is_arithmetic=True,
                     fp_immediate_width_bytes=fp_immediate,
                 )
                 tokens.extend(imm_token)
+            else:
+                imm_token = constant_handler.process_constant_v2(
+                    imm_val,
+                    meta=meta,
+                    is_arithmetic=False,
+                    fp_immediate_width_bytes=fp_immediate,
+                )
+                tokens.extend(imm_token)
         else:  # Fallback - create opaque constant
-            meta, kind = lookup.lookup(imm_val)
-            if meta is None:
-                # Default/fallback meta if lookup fails
-                meta = {
-                    "start_addr": imm_val,
-                    "end_addr": imm_val,
-                    "name": "unknown",
-                    "type": "unknown",
-                    "library": "unknown",
-                }
+            meta = lookup.lookup(imm_val)
             imm_token = constant_handler.process_constant_v2(
                 imm_val,
                 meta=meta,
