@@ -1,6 +1,6 @@
 """Pytest configuration for the test suite.
 
-Two concerns merged here:
+Three concerns:
 
 1. Import-path bootstrap. The asm-tokenizer codebase is a flat package
    tree (``tokenizer/``, ``shared/``, ``dynrunner/``, ...) at the repo
@@ -13,6 +13,10 @@ Two concerns merged here:
    provider is opened once on a known fixture binary (x64 for default,
    arm32 for ARM-specific tests) and shared across all tests in a
    session.
+
+3. Custom markers (``slow``) registered up-front so ``pytest -m "slow"``
+   selection doesn't trip ``PytestUnknownMarkWarning``. ``slow`` flags
+   multi-second tests (e.g. the J.2 multi-binary Ghidra E2E smoke).
 """
 
 from __future__ import annotations
@@ -31,6 +35,18 @@ from tokenizer.disasm import DisassemblyProvider, get_disassembly_provider
 
 X64_FIXTURE = Path("/home/sirati/devel/python/asm-tokenizer/src/zlib/x64-gcc-7-Os_minigzip")
 ARM32_FIXTURE = Path("/home/sirati/devel/python/asm-tokenizer/src/zlib/arm32-gcc-7-Os_minigzip")
+
+
+def pytest_configure(config):
+    """Register custom markers so ``-m slow`` selection doesn't trip
+    PytestUnknownMarkWarning. ``slow`` flags multi-second tests (e.g.
+    the J.2 multi-binary Ghidra E2E smoke).
+    """
+    config.addinivalue_line(
+        "markers",
+        "slow: tests that take more than a few seconds (typically because "
+        "they shell out to Ghidra / tokenize a whole binary).",
+    )
 
 
 def _build_provider(backend: str, binary: Path) -> DisassemblyProvider:
