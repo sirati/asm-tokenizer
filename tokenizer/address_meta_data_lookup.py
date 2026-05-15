@@ -5,6 +5,9 @@ import angr
 import cle
 from intervaltree import IntervalTree
 
+from tokenizer.disasm.angr_provider import _AngrAddressMetadataView
+from tokenizer.disasm.metadata import AddressMetadataView
+
 # ASCII printable run of length >=4 terminated by NUL byte.
 # Mirrors the heuristic in tokenizer/disasm/angr_provider.py:parse_data_sections;
 # v2's string sidecar is built there, but the metadata-lookup also needs
@@ -27,6 +30,10 @@ class AngrMetadataLookup:
         self.range_lookup = IntervalTree()
         self.library_ranges = self._build_library_ranges()
         self._build_indices()
+        # REUSED view wrapper - per-`lookup()` call we mutate its state
+        # via `_set_state` and return the same instance. See
+        # `AddressMetadataView` docstring for the lifecycle contract.
+        self._view = _AngrAddressMetadataView()
 
     def _build_library_ranges(self):
         """
@@ -364,27 +371,17 @@ class AngrMetadataLookup:
 
         return meta
 
-    def lookup(self, addr) -> tuple[dict, str]:
-        """
-        Returns a tuple: (metadata_dict, source-type)
-        source_type is one of 'exact', 'range', 'synthetic'
+    def lookup(self, addr) -> AddressMetadataView:
+        """Resolve ``addr`` to a typed ``AddressMetadataView``.
+
+        Mutates and returns the same per-lookup ``_AngrAddressMetadataView``
+        instance each call (see ``AddressMetadataView`` lifecycle
+        docstring). The view's ``__iter__`` yields ``(self, kind_string)``
+        for callers still doing ``meta, kind = lookup.lookup(addr)`` tuple
+        unpacking - that bridge goes away in Phase D.3 (task #40) when
+        ``ConstantHandler`` consumes typed properties directly.
         """
         logger = logging.getLogger(__name__)
-
-        # fn_result = self.cfg.kb.functions.get(addr)
-        # if fn_result is not None and addr not in self.exact_lookup:
-        #     logger.warning(f"Function {fn_result.name} at {addr:x} is not in exact lookup")
-
-        #     meta = {
-        #         "start_addr": addr,
-        #         "end_addr": addr + fn_result.size,
-        #         "name": fn_result.name,
-        #         "type": "function",
-        #         "size": fn_result.size,
-        #         "source": "function",
-        #         "library": self._find_library_for_addr(addr),
-        #     }
-        #     return meta, "exact"
 
         match = self.range_lookup[addr]
         # Find the most constrained (smallest) match
@@ -401,13 +398,15 @@ class AngrMetadataLookup:
 
             # Copy before finalizing so query-time enrichment (string
             # membership) doesn't mutate the stored index entry.
-            return self._finalize_meta(exact.copy(), addr), "exact"
+            self._view._set_state(self._finalize_meta(exact.copy(), addr), "exact")
+            return self._view
 
         if match:
             meta = match.data.copy()
             meta["start_addr"] = match.begin
             meta["end_addr"] = match.end
-            return self._finalize_meta(meta, addr), "range"
+            self._view._set_state(self._finalize_meta(meta, addr), "range")
+            return self._view
 
         # Fallback to synthetic metadata to guarantee no empty result
         fallback_meta = {
@@ -419,7 +418,8 @@ class AngrMetadataLookup:
             "source": "synthetic",
             "library": self._find_library_for_addr(addr),
         }
-        return self._finalize_meta(fallback_meta, addr), "synthetic"
+        self._view._set_state(self._finalize_meta(fallback_meta, addr), "synthetic")
+        return self._view
 
 
 # Backward-compat alias
