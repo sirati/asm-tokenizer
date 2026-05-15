@@ -1445,6 +1445,482 @@ def _compute_fp_type(
     return fp_type
 
 
+# ---------------------------------------------------------------------------
+# Memory-operand decomposition helpers (per-ISA)
+# ---------------------------------------------------------------------------
+# Each helper inspects ``ghidra_insn.getOpObjects(op_idx)`` and computes the
+# decomposed (base, index, scale, disp, segment) tuple for a single MEM
+# operand. Helpers are PURE w.r.t. Ghidra Java state - they read but do not
+# mutate. Each returns a tuple-of-strings-and-ints suitable for
+# ``_GhidraMemoryOperandView._populate``.
+#
+# The x86 path is faithfully ported from the legacy Ghidra-side memory
+# tokenizer at ``tokenizer/arch/x86/ghidra/operands.py`` (the
+# ``_classify_objects + assign_base_index_scale_disp`` block of
+# ``tokenize_operand_memory_ghidra``); the token-emission half stays in
+# the legacy file until G.3 retires it. The ARM and base+disp paths are
+# new in this commit; they expose the same wire-shape consumers expect
+# from a populated ``_CapMemOperand`` (base/index/scale/disp/segment).
+
+
+def _compute_x86_memory_components(
+    ghidra_insn: Any,
+    op_idx: int,
+    reg_map: "_RegisterMap",
+) -> tuple[str, int, str, int, int, int, str, int]:
+    """Decompose an x86/x64 MEM operand from raw Ghidra objects.
+
+    Returns ``(base_name, base_id, index_name, index_id, scale, disp,
+    segment_name, segment_id)``. Empty name + id=0 means the slot is absent.
+
+    Object-count rules from getOpObjects() (faithful port):
+        2 general regs   -> first Scalar = scale, remaining Scalars = disp
+        0-1 general regs -> all Scalars = disp
+        Address objects  -> disp
+    """
+    from ghidra.program.model.address import Address
+    from ghidra.program.model.lang import Register
+    from ghidra.program.model.scalar import Scalar
+
+    objects = ghidra_insn.getOpObjects(op_idx)
+
+    segment_reg_name: str = ""
+    segment_reg_id: int = 0
+    general_reg_names: list[str] = []
+    general_reg_ids: list[int] = []
+    scalars: list[int] = []
+    signed_scalars: list[int] = []
+    disp: int = 0
+
+    for obj in objects or ():
+        if isinstance(obj, Register):
+            name = str(obj.getName()).lower()
+            rid = reg_map.get_id(name)
+            if name in _SEGMENT_REGISTERS:
+                segment_reg_name = name
+                segment_reg_id = rid
+            else:
+                general_reg_names.append(name)
+                general_reg_ids.append(rid)
+        elif isinstance(obj, Scalar):
+            scalars.append(int(obj.getValue()))
+            signed_scalars.append(int(obj.getSignedValue()))
+        elif isinstance(obj, Address):
+            disp = int(obj.getOffset())
+
+    base_name = general_reg_names[0] if general_reg_names else ""
+    base_id = general_reg_ids[0] if general_reg_ids else 0
+    index_name = general_reg_names[1] if len(general_reg_names) >= 2 else ""
+    index_id = general_reg_ids[1] if len(general_reg_ids) >= 2 else 0
+    scale: int = 1
+
+    if len(general_reg_ids) >= 2 and scalars:
+        scale = scalars[0]
+        if len(scalars) > 1:
+            disp = signed_scalars[1]
+    elif len(general_reg_ids) <= 1 and scalars:
+        disp = signed_scalars[0]
+
+    return base_name, base_id, index_name, index_id, scale, disp, segment_reg_name, segment_reg_id
+
+
+def _compute_arm_memory_components(
+    ghidra_insn: Any,
+    op_idx: int,
+    reg_map: "_RegisterMap",
+) -> tuple[str, int, str, int, int, int, str, int]:
+    """Decompose an ARM MEM operand from raw Ghidra objects.
+
+    ARM addressing modes use base + optional index register + optional
+    displacement (no scale, no segment). Returns the same 8-tuple shape
+    as the x86 helper, with scale=1 fixed and segment slots absent.
+
+    First general-purpose Register -> base; second -> index; first
+    Scalar/Address -> disp.
+    """
+    from ghidra.program.model.address import Address
+    from ghidra.program.model.lang import Register
+    from ghidra.program.model.scalar import Scalar
+
+    objects = ghidra_insn.getOpObjects(op_idx)
+
+    general_reg_names: list[str] = []
+    general_reg_ids: list[int] = []
+    disp: int = 0
+
+    for obj in objects or ():
+        if isinstance(obj, Register):
+            name = str(obj.getName()).lower()
+            general_reg_names.append(name)
+            general_reg_ids.append(reg_map.get_id(name))
+        elif isinstance(obj, Scalar):
+            disp = int(obj.getSignedValue())
+        elif isinstance(obj, Address):
+            disp = int(obj.getOffset())
+
+    base_name = general_reg_names[0] if general_reg_names else ""
+    base_id = general_reg_ids[0] if general_reg_ids else 0
+    index_name = general_reg_names[1] if len(general_reg_names) >= 2 else ""
+    index_id = general_reg_ids[1] if len(general_reg_ids) >= 2 else 0
+
+    return base_name, base_id, index_name, index_id, 1, disp, "", 0
+
+
+def _compute_base_disp_memory_components(
+    ghidra_insn: Any,
+    op_idx: int,
+    reg_map: "_RegisterMap",
+) -> tuple[str, int, str, int, int, int, str, int]:
+    """Decompose a base+disp MEM operand (MIPS/PPC/RISC-V).
+
+    These ISAs only ever have one base register + one displacement; no
+    index, no scale, no segment. Returns the 8-tuple with index slot
+    absent, scale=1, segment slots absent.
+    """
+    from ghidra.program.model.address import Address
+    from ghidra.program.model.lang import Register
+    from ghidra.program.model.scalar import Scalar
+
+    objects = ghidra_insn.getOpObjects(op_idx)
+
+    base_name: str = ""
+    base_id: int = 0
+    disp: int = 0
+
+    for obj in objects or ():
+        if isinstance(obj, Register):
+            if base_name == "":
+                base_name = str(obj.getName()).lower()
+                base_id = reg_map.get_id(base_name)
+        elif isinstance(obj, Scalar):
+            disp = int(obj.getSignedValue())
+        elif isinstance(obj, Address):
+            disp = int(obj.getOffset())
+
+    return base_name, base_id, "", 0, 1, disp, "", 0
+
+
+# ---------------------------------------------------------------------------
+# Per-ISA prefix builders
+# ---------------------------------------------------------------------------
+# Build typed ``InstructionPrefixView`` instances for a Ghidra Instruction.
+# x86 reads the legacy prefix-byte set; ARM / PPC / MIPS / RISC-V return
+# empty lists for now (the legacy ``_CapInsnInner`` defaults make their
+# typed-prefix fields all-zero, so consumers' ``insn.insn.cc != 0`` etc.
+# always falls through - see G.3 migration when those signals become
+# available).
+
+_X86_BYTE_TO_PREFIX_BUILDER: dict[int, Any] = {
+    # Filled lazily on first use to avoid importing the prefix subclasses
+    # at module load time.
+}
+
+
+def _x86_byte_to_prefix(byte: int) -> Any:
+    """Return a typed ``InstructionPrefixView`` for an x86 prefix byte.
+
+    Returns ``None`` for bytes outside the recognized prefix set (caller
+    skips). Lazy-initializes the byte->builder map to avoid pulling in
+    typed prefix classes at module import time.
+    """
+    if not _X86_BYTE_TO_PREFIX_BUILDER:
+        from tokenizer.disasm.ghidra_views import (
+            _AddressSizePrefix,
+            _LockPrefix,
+            _OperandSizePrefix,
+            _RepPrefix,
+            _SegmentOverridePrefix,
+        )
+        from tokenizer.disasm.types import X86Segment
+
+        _X86_BYTE_TO_PREFIX_BUILDER.update({
+            0xF0: lambda: _LockPrefix(),
+            0xF2: lambda: _RepPrefix(repeat_until_zero=False),  # REPNE
+            0xF3: lambda: _RepPrefix(repeat_until_zero=True),   # REPE/REP
+            0x26: lambda: _SegmentOverridePrefix(X86Segment.ES),
+            0x2E: lambda: _SegmentOverridePrefix(X86Segment.CS),
+            0x36: lambda: _SegmentOverridePrefix(X86Segment.SS),
+            0x3E: lambda: _SegmentOverridePrefix(X86Segment.DS),
+            0x64: lambda: _SegmentOverridePrefix(X86Segment.FS),
+            0x65: lambda: _SegmentOverridePrefix(X86Segment.GS),
+            0x66: lambda: _OperandSizePrefix(),
+            0x67: lambda: _AddressSizePrefix(),
+        })
+    builder = _X86_BYTE_TO_PREFIX_BUILDER.get(byte)
+    if builder is None:
+        return None
+    return builder()
+
+
+def _build_prefixes_x86(ghidra_insn: Any) -> list[Any]:
+    """Build typed prefix-view instances for an x86 instruction.
+
+    Reads the same legacy prefix-byte set ``_extract_x86_prefixes``
+    populates, then translates each byte into a typed
+    ``InstructionPrefixView`` instance via ``_x86_byte_to_prefix``.
+    Order: the byte-set is sorted so the produced list is stable across
+    calls (the per-byte translation is independent of original encoding
+    order).
+    """
+    prefix_bytes = _extract_x86_prefixes(ghidra_insn)
+    out: list[Any] = []
+    for byte in sorted(prefix_bytes):
+        view = _x86_byte_to_prefix(byte)
+        if view is not None:
+            out.append(view)
+    return out
+
+
+def _build_prefixes_arm(ghidra_insn: Any) -> list[Any]:
+    """Build typed prefix-view instances for an ARM instruction.
+
+    Stub for forward-compat: the legacy ``_CapInsnInner`` ARM-side fields
+    (``cc`` / ``update_flags`` / ``writeback``) are never populated by the
+    Ghidra path today, so consumers see them as zero/false. Returns an
+    empty list; G.3 migrates ARM extraction once the consumer side moves
+    to typed prefixes.
+    """
+    return []
+
+
+def _build_prefixes_ppc(ghidra_insn: Any) -> list[Any]:
+    """Build typed prefix-view instances for a PPC instruction.
+
+    Stub for forward-compat; same shape as ``_build_prefixes_arm``. The
+    ``bc`` and ``update_cr0`` legacy fields are never populated by the
+    Ghidra path today. G.3 migrates PPC extraction once the consumer
+    side moves to typed prefixes.
+    """
+    return []
+
+
+def _build_prefixes_empty(ghidra_insn: Any) -> list[Any]:
+    """No-prefix builder for MIPS/RISC-V."""
+    return []
+
+
+def _prefix_builder_for_arch(arch: Architecture) -> Any:
+    """Dispatch the per-ISA prefix builder."""
+    if arch == Architecture.X86:
+        return _build_prefixes_x86
+    if arch in (Architecture.ARM32, Architecture.AARCH64):
+        return _build_prefixes_arm
+    if arch == Architecture.PPC:
+        return _build_prefixes_ppc
+    return _build_prefixes_empty
+
+
+# ---------------------------------------------------------------------------
+# Decode helper - injected into _GhidraInstructionView wrappers
+# ---------------------------------------------------------------------------
+class _GhidraDecodeHelper:
+    """Provider-owned helper exposing the per-instruction decode surface
+    the owned-view wrappers (``ghidra_views.py``) need.
+
+    Construction: one instance per ``GhidraDisassemblyProvider`` (program
+    + reg_map are stable for the program's lifetime). The helper is
+    passed to each ``_GhidraFunctionView`` -> ``_GhidraBlockView`` ->
+    ``_GhidraInstructionView`` constructor so the view chain stays
+    self-contained without cross-importing the provider.
+
+    The helper centralizes:
+      - mnemonic split + alias canonicalization
+      - architecture detection (cached per program)
+      - per-operand FP-type computation
+      - per-instruction typed-prefix list build
+      - per-operand decompose-mem callback construction (lazy: returns a
+        zero-arg callable that, when invoked, populates a passed
+        ``_GhidraMemoryOperandView``)
+      - per-operand spec dict (kwargs ready for
+        ``_GhidraOperandView._advance``)
+    """
+
+    __slots__ = ("_program", "_reg_map", "_arch")
+
+    def __init__(self, program: Any, reg_map: "_RegisterMap") -> None:
+        self._program = program
+        self._reg_map = reg_map
+        self._arch: Architecture = _ghidra_processor_to_architecture(program)
+
+    @property
+    def arch(self) -> Architecture:
+        return self._arch
+
+    def split_mnemonic(self, raw: str) -> tuple[str, str | None, int | None]:
+        return _split_ghidra_mnemonic(raw)
+
+    def alias_mnemonic(self, base: str) -> str:
+        return _GHIDRA_MNEMONIC_ALIASES.get(base, base)
+
+    def architecture(self, _program: Any) -> Architecture:
+        return self._arch
+
+    def compute_fp_type(
+        self,
+        ghidra_insn: Any,
+        operand_index: int,
+        arch: Architecture,
+        base_mnemonic: str,
+    ) -> Optional[FpType]:
+        return _compute_fp_type(ghidra_insn, operand_index, arch, base_mnemonic)
+
+    def build_prefixes(self, ghidra_insn: Any, arch: Architecture) -> list[Any]:
+        return _prefix_builder_for_arch(arch)(ghidra_insn)
+
+    def _decompose_mem_callback(
+        self,
+        ghidra_insn: Any,
+        op_idx: int,
+        arch: Architecture,
+    ) -> Any:
+        """Return a zero-arg callable that decomposes the MEM operand into
+        a passed-in ``_GhidraMemoryOperandView``.
+
+        Selects the per-ISA helper. The closure captures ``ghidra_insn``,
+        ``op_idx``, and the provider's ``reg_map`` so the operand wrapper
+        only needs to invoke the callback at lazy-decomposition time
+        (first ``op.mem`` access).
+        """
+        reg_map = self._reg_map
+        if arch == Architecture.X86:
+            compute = _compute_x86_memory_components
+        elif arch in (Architecture.ARM32, Architecture.AARCH64):
+            compute = _compute_arm_memory_components
+        else:
+            compute = _compute_base_disp_memory_components
+
+        def _populate(mem_view) -> None:
+            (
+                base_name,
+                base_id,
+                index_name,
+                index_id,
+                scale,
+                disp,
+                segment_name,
+                segment_id,
+            ) = compute(ghidra_insn, op_idx, reg_map)
+            mem_view._populate(
+                base_name=base_name,
+                base_id=base_id,
+                index_name=index_name,
+                index_id=index_id,
+                segment_name=segment_name,
+                segment_id=segment_id,
+                scale=scale,
+                disp=disp,
+            )
+
+        return _populate
+
+    def operand_spec(
+        self,
+        ghidra_insn: Any,
+        op_idx: int,
+        arch: Architecture,
+        base_mnemonic: str,
+        reg_map: "_RegisterMap",
+    ) -> dict:
+        """Return a kwargs dict for ``_GhidraOperandView._advance``.
+
+        Classifies the operand kind (REG/IMM/MEM/CRX/OTHER) from
+        Ghidra's ``OperandType`` bitmask + ``getOpObjects()`` shape,
+        computes per-operand size + FP type, and produces the
+        decompose-mem callback when the operand is MEM. Non-MEM
+        operands carry ``decompose_mem=None`` so the operand wrapper
+        skips lazy MEM decomposition.
+
+        ``reg_map`` is passed explicitly (not read from ``self._reg_map``)
+        so the spec composes cleanly with the views' constructor wiring;
+        in practice they are the same object.
+        """
+        from ghidra.program.model.address import Address
+        from ghidra.program.model.lang import OperandType, Register
+        from ghidra.program.model.scalar import Scalar
+        from tokenizer.disasm.types import ShiftKind as _ShiftKind
+
+        try:
+            objects = ghidra_insn.getOpObjects(op_idx)
+        except Exception:
+            objects = ()
+        try:
+            op_type = ghidra_insn.getOperandType(op_idx)
+        except Exception:
+            op_type = 0
+
+        is_memory = (
+            bool(op_type & OperandType.DYNAMIC)
+            or bool(op_type & OperandType.INDIRECT)
+            or (
+                bool(op_type & OperandType.ADDRESS)
+                and bool(op_type & OperandType.SCALAR)
+                and not (op_type & (OperandType.REGISTER | OperandType.CODE))
+            )
+        )
+
+        fp_type = _compute_fp_type(ghidra_insn, op_idx, arch, base_mnemonic)
+
+        # Default spec - filled per kind below.
+        spec = dict(
+            kind=OperandKind.INVALID,
+            reg_name="",
+            reg_id=0,
+            imm=0,
+            size=0,
+            fp_type=fp_type,
+            type_int=int(op_type),
+            decompose_mem=None,
+            shift_kind=_ShiftKind.NONE,
+            shift_amount=0,
+            crx_reg_name="",
+            crx_reg_id=0,
+        )
+
+        if not objects:
+            return spec
+
+        if is_memory:
+            spec["kind"] = OperandKind.MEM
+            # Memory size: defer to per-ISA inference at decompose time
+            # for byte-accurate width; legacy x86 uses
+            # ``_infer_size_from_ghidra_insn`` which inspects sibling
+            # operands. The owned-view ``size`` is tracked in the operand
+            # itself for non-MEM kinds; MEM size is computed by the
+            # consumer at tokenization time today (legacy parity).
+            spec["size"] = 0
+            spec["decompose_mem"] = self._decompose_mem_callback(ghidra_insn, op_idx, arch)
+            return spec
+
+        first = objects[0]
+        if isinstance(first, Register):
+            name = str(first.getName()).lower()
+            spec["kind"] = OperandKind.REG
+            spec["reg_name"] = name
+            spec["reg_id"] = reg_map.get_id(name)
+            try:
+                spec["size"] = int(first.getMinimumByteSize())
+            except Exception:
+                spec["size"] = 0
+            return spec
+        if isinstance(first, Scalar):
+            spec["kind"] = OperandKind.IMM
+            spec["imm"] = int(first.getValue())
+            try:
+                spec["size"] = int(first.bitLength()) // 8
+            except Exception:
+                spec["size"] = 0
+            return spec
+        if isinstance(first, Address):
+            spec["kind"] = OperandKind.IMM
+            spec["imm"] = int(first.getOffset())
+            return spec
+
+        # Unknown op kind - treat as OTHER passthrough so consumers that
+        # gate on ``op.kind == OperandKind.OTHER`` can route correctly.
+        spec["kind"] = OperandKind.OTHER
+        return spec
+
+
 def _ghidra_insn_to_cap(
     ghidra_insn: Any,
     reg_map: _RegisterMap,
