@@ -1,14 +1,28 @@
-"""Pytest configuration for the owned-view conformance suite.
+"""Pytest configuration for the test suite.
 
-Session-scoped fixtures open each provider once on a known x86_64 fixture
-binary and share the CFG across all tests. ARM-specific tests open their
-own arm32 provider on demand via the ``arm32_*_provider`` fixtures (also
-session-scoped) so the build_cfg cost is paid once per arch per provider.
+Two concerns merged here:
+
+1. Import-path bootstrap. The asm-tokenizer codebase is a flat package
+   tree (``tokenizer/``, ``shared/``, ``dynrunner/``, ...) at the repo
+   root without an installable ``pyproject.toml``. ``python -m tokenizer``
+   works from the repo root because the cwd is auto-added to
+   ``sys.path``; pytest invocations from any other cwd need explicit
+   injection.
+
+2. Session-scoped provider fixtures for the conformance suite. Each
+   provider is opened once on a known fixture binary (x64 for default,
+   arm32 for ARM-specific tests) and shared across all tests in a
+   session.
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import pytest
 
