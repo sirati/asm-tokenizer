@@ -489,6 +489,24 @@ class _GhidraDecodeHelper:
                 spec["size"] = int(first.getMinimumByteSize())
             except Exception:
                 spec["size"] = 0
+            # ARM shifted-register operand (data-processing barrel-shifter
+            # form, e.g. ``add r6, r4, r1, lsl #0x2``). On ARM/AArch64 a
+            # REG operand whose object list also contains a Scalar is the
+            # ``Rn, <shift> #imm`` form; the typed shift kind comes from
+            # the rich-IR PCode (``INT_LEFT`` / ``INT_RIGHT`` /
+            # ``INT_SRIGHT`` on the operand's register varnode) and the
+            # amount from that op's constant second input.
+            if (
+                arch in (Architecture.ARM32, Architecture.AARCH64)
+                and scalar_in_objects
+            ):
+                from tokenizer.disasm.ghidra_provider.pcode_inspect import (
+                    find_shift_on_register,
+                )
+
+                kind, amount = find_shift_on_register(ghidra_insn, first)
+                spec["shift_kind"] = kind
+                spec["shift_amount"] = amount
             # PC-relative literal-pool loads (ARM ``ldr r4, [pc, #0x44]``)
             # surface the analyzer-lifted data-pointer on the destination
             # REG operand, NOT on the MEM operand (the MEM is just the

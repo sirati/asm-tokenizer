@@ -288,6 +288,21 @@ def find_shift_on_register(
             break
 
     # Step 2: find a shift PCode op consuming a propagated varnode.
+    #
+    # ARM ``s_flag`` (update-flags) instructions like ``movs``/``adds`` and
+    # the SLEIGH spec for any shift-with-flags emit BOTH:
+    #   (a) a shift-CARRY-detection op (e.g. ``INT_RIGHT r1, uniq`` where
+    #       ``uniq = shift_amount - 1`` — the LSB of the result is the
+    #       carry bit out of the value shift).
+    #   (b) the VALUE shift op (``INT_LEFT r1, const(amount)``) whose
+    #       result feeds the actual arithmetic.
+    # The carry op carries a UNIQ second input (the precomputed
+    # ``amount - 1``), the value op carries a CONST second input (the
+    # actual shift amount). We want the value shift, not the carry. The
+    # rich-IR discriminator is exactly that: prefer ops with a constant
+    # second input. Fall back to a non-constant-amount match only when
+    # NO constant-amount op exists (shift-by-register form, rare).
+    fallback: Optional[tuple[ShiftKind, int]] = None
     for pop in pcode_ops:
         opc = int(pop.getOpcode())
         if opc not in shift_table:
@@ -300,13 +315,16 @@ def find_shift_on_register(
             continue
         second = inputs[1]
         try:
-            if not second.isConstant():
-                # Variable shift amount (rare in mem operands); fall back to 0.
-                return (shift_table[opc], 0)
-            return (shift_table[opc], int(second.getOffset()))
+            if second.isConstant():
+                return (shift_table[opc], int(second.getOffset()))
+            if fallback is None:
+                fallback = (shift_table[opc], 0)
         except Exception:
-            return (shift_table[opc], 0)
+            if fallback is None:
+                fallback = (shift_table[opc], 0)
 
+    if fallback is not None:
+        return fallback
     return (ShiftKind.NONE, 0)
 
 
