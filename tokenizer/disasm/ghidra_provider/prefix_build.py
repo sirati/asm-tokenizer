@@ -498,6 +498,53 @@ def _x86_byte_to_prefix(byte: int) -> Any:
     return builder()
 
 
+def _instruction_has_rep_loop(ghidra_insn: Any) -> bool:
+    """True iff the instruction's PCode encodes a REP-loop self-branch.
+
+    Ghidra's SLEIGH spec for the x86 string-op family (MOVS, STOS, CMPS,
+    SCAS, LODS, INS, OUTS) expands a REP/REPNE-prefixed instance into an
+    unrolled PCode loop:
+
+      [0] INT_EQUAL ECX, 0 -> uniq
+      [1] CBRANCH <addr_after_this_insn>, uniq   ; jump past if counter exhausted
+      [2..n] STORE/LOAD/INT_SUB ECX, ...         ; body + decrement
+      [n+1] BRANCH <addr_of_this_insn>            ; loop back
+
+    The smoking gun is the unconditional ``BRANCH`` whose target IS the
+    instruction's own address (a self-loop). SSE/SSE2 instructions with
+    F2/F3 MANDATORY prefix (ADDSD, MULSD, MOVSS, CVTSI2SD, ...) have NO
+    self-loop in their PCode — their F2/F3 byte is an encoding-
+    disambiguation prefix, not a repeat semantic.
+
+    This is the rich-IR discriminator for "is this F2/F3 byte a real
+    REPNE/REP prefix or an SSE mandatory prefix" — no mnemonic-string
+    parsing involved.
+    """
+    from ghidra.program.model.pcode import PcodeOp
+
+    try:
+        insn_addr = int(ghidra_insn.getAddress().getOffset())
+    except Exception:
+        return False
+    try:
+        pcode_ops = ghidra_insn.getPcode() or ()
+    except Exception:
+        return False
+    for pop in pcode_ops:
+        if pop.getOpcode() != PcodeOp.BRANCH:
+            continue
+        inputs = pop.getInputs()
+        if not inputs:
+            continue
+        try:
+            target_addr = inputs[0].getAddress()
+            if target_addr is not None and int(target_addr.getOffset()) == insn_addr:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _build_prefixes_x86(ghidra_insn: Any) -> list[Any]:
     """Build typed prefix-view instances for an x86 instruction.
 
@@ -507,8 +554,19 @@ def _build_prefixes_x86(ghidra_insn: Any) -> list[Any]:
     Order: the byte-set is sorted so the produced list is stable across
     calls (the per-byte translation is independent of original encoding
     order).
+
+    Filters out the F2 / F3 bytes when the instruction's PCode does NOT
+    show the REP-loop self-branch pattern (see
+    ``_instruction_has_rep_loop``). Those F2 / F3 bytes are the SSE/SSE2
+    MANDATORY prefix on every non-string-op instruction (ADDSD, MULSD,
+    MOVSS, CVTSI2SD, ...) — emitting a spurious ``repne`` token there
+    would corrupt FP-heavy code with false-positive repeat semantics.
     """
     prefix_bytes = _extract_x86_prefixes(ghidra_insn)
+    if (0xF2 in prefix_bytes or 0xF3 in prefix_bytes) and not _instruction_has_rep_loop(
+        ghidra_insn
+    ):
+        prefix_bytes = {b for b in prefix_bytes if b not in (0xF2, 0xF3)}
     out: list[Any] = []
     for byte in sorted(prefix_bytes):
         view = _x86_byte_to_prefix(byte)
