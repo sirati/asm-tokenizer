@@ -2,6 +2,41 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Iterable, Protocol, Tuple
 
+from tokenizer.disasm.types import (
+    AddressSizePrefixView,
+    Architecture,
+    ArmConditionCode,
+    BlockView,
+    BlocksView,
+    BranchHintPrefixView,
+    ConditionCodePrefixView,
+    CrxFieldView,
+    FpType,
+    FunctionView,
+    InstructionPrefixView,
+    InstructionView,
+    InstructionsView,
+    JumpTableView,
+    LockPrefixView,
+    MemoryOperandView,
+    OperandKind,
+    OperandSizePrefixView,
+    OperandView,
+    OperandsView,
+    PpcBranchConditionPrefixView,
+    PpcUpdateCr0PrefixView,
+    PrefixesView,
+    RegisterView,
+    RepPrefixView,
+    SegmentOverridePrefixView,
+    ShiftKind,
+    ShiftModifierView,
+    UpdateFlagsPrefixView,
+    WritebackPrefixView,
+    X86BranchHint,
+    X86Segment,
+)
+
 
 class MetadataLookup(Protocol):
     def lookup(self, addr: int) -> tuple[dict, str]: ...
