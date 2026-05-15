@@ -45,7 +45,19 @@ from tokenizer.disasm.types import (
 
 
 class MetadataLookup(Protocol):
-    def lookup(self, addr: int) -> tuple[dict, str]: ...
+    def lookup(self, addr: int) -> AddressMetadataView:
+        """Resolve ``addr`` to a typed ``AddressMetadataView``.
+
+        Phase D.1+D.2: the returned view is the SAME wrapper instance per
+        ``MetadataLookup`` (lifecycle per ``AddressMetadataView`` docstring).
+        Until Phase D.3 migrates ``ConstantHandler`` off of dict-shaped
+        access, the concrete view classes also implement a transitional
+        ``Mapping``-shaped surface (``__getitem__`` / ``get`` / ``keys`` /
+        ``__contains__``) and yield ``(self, kind_string)`` from
+        ``__iter__`` so ``meta, kind = lookup.lookup(addr)`` keeps working.
+        Use ``view.legacy_dict()`` for an explicit v1 ``(dict, kind)`` tuple.
+        """
+        ...
 
 
 class DisassemblyProvider(ABC):
