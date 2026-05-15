@@ -195,7 +195,12 @@ class RegisterListSymbol(Enum):
         elif self == RegisterListSymbol.CLOSE_BRACE:
             return "REG_LIST_CLOSE_BRACE"
         elif self == RegisterListSymbol.WRITEBACK:
-            return "REG_LIST_WRITEBACK"
+            # Vocab name is ISA-neutral and uniquely identifies the
+            # writeback semantic (sp != sp!, but the register itself
+            # stays `arm32_sp` for both -- the writeback is a separate
+            # marker token). The enum value `"!"` above is the
+            # to_asm_like render; this string is the vocab identifier.
+            return "asm_writeback_detect"
         else:
             raise ValueError(f"Unknown register-list symbol: {self}")
 

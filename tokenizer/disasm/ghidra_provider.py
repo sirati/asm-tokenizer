@@ -1731,12 +1731,17 @@ class _GhidraDecodeHelper:
         the asm); the remaining Registers are the list members (the
         registers *inside* the braces).
 
-        Writeback (`!`) detection is currently unsupported: Ghidra's
-        ``OperandType`` bitmask has no documented writeback bit, and the
-        existing ``_build_prefixes_arm`` is a stub. We therefore set
-        ``writeback=False`` here for every reg-list operand.
-        TODO: writeback detection (likely via raw mnemonic parsing or
-        PCode self-assignment inspection) is deferred.
+        Writeback (`!`) detection: Ghidra's ``OperandType`` bitmask
+        does not carry a documented writeback bit. The flag IS surfaced
+        through ``getDefaultOperandRepresentationList(op_idx)``, which
+        returns the operand's formatted components as a Java List of
+        ``Register`` / ``Scalar`` / ``Character`` / ``String`` items;
+        ARM stmdb/ldmia/push/pop with writeback include a
+        ``Character('!')`` entry immediately after the base register.
+        We scan that list for any ``!`` token to derive ``writeback``.
+        This avoids parsing the raw mnemonic string (which is just
+        ``stmdb`` either way -- the ``!`` is positional on the operand)
+        and avoids PCode self-assignment inspection.
         """
         from ghidra.program.model.lang import Register
 
@@ -1747,6 +1752,12 @@ class _GhidraDecodeHelper:
                 objects = ghidra_insn.getOpObjects(op_idx)
             except Exception:
                 objects = ()
+
+            try:
+                repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx)
+                writeback = any(str(item) == "!" for item in repr_list or ())
+            except Exception:
+                writeback = False
 
             regs: list[tuple[str, int]] = []
             for obj in objects or ():
@@ -1768,7 +1779,7 @@ class _GhidraDecodeHelper:
             reg_list_view._advance(
                 base_name=base_name,
                 base_id=base_id,
-                writeback=False,
+                writeback=writeback,
                 member_specs=member_specs,
             )
 
