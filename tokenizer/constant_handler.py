@@ -20,10 +20,10 @@ Boundary contract for v2:
   dereference candidate). Per ``precedence.md`` the address steps 2–10
   short-circuit; step 1 (disassembler-reported FP type) and step 11
   (``valued_const``) still apply.
-- Caller passes ``fp_immediate_width_bytes`` (∈ {2, 4, 8, 10, 16}) when
-  the disassembler reports the operand itself is an FP **immediate** (the
+- Caller passes ``fp_immediate_type`` (an ``FpType`` member) when the
+  disassembler reports the operand itself is an FP **immediate** (the
   value at hand IS the IEEE bit pattern) — triggers step 1's inline-FP
-  emission. Caller passes ``fp_postfix_width_bytes`` when the disassembler
+  emission. Caller passes ``fp_postfix_type`` when the disassembler
   reports the **load instruction** is FP-typed for an address-bearing
   operand — triggers a postfix ``floatXX`` annotation appended after the
   ptr token emitted by steps 7–10. Two separate signals because precedence
@@ -58,6 +58,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from tokenizer.disasm.metadata import AddressKind, AddressMetadataView
+from tokenizer.disasm.types import FpType
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import (
     BlockToken,
@@ -69,14 +70,6 @@ from tokenizer.tokens import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-# Valid FP widths in bytes. float16 / bfloat16 share width=2 — see the
-# class-level note: a 2-byte FP operand is emitted as ``Float16`` by
-# default because the Ghidra-side detection cannot distinguish IEEE-754
-# half-precision from Google's bfloat16. BFloat16 is reachable only
-# when a future provider exposes an unambiguous signal.
-_VALID_FP_WIDTHS = {2, 4, 8, 10, 16}
 
 
 # --------------------------------------------------------------------------
@@ -96,8 +89,8 @@ class _Ctx:
     discriminator at steps 3 and 4).
     """
     is_arithmetic: bool
-    fp_immediate_width_bytes: Optional[int]
-    fp_postfix_width_bytes: Optional[int]
+    fp_immediate_type: Optional[FpType]
+    fp_postfix_type: Optional[FpType]
 
 
 # Predicate type. Returns True when the emitter should fire for this
@@ -125,7 +118,7 @@ def _is_function_entry(meta: AddressMetadataView, value: int) -> bool:
 # included ``not is_arithmetic`` here — deviation documented in the
 # commit message because precedence.md is canonical.
 def _pred_fp_immediate(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
-    return ctx.fp_immediate_width_bytes is not None
+    return ctx.fp_immediate_type is not None
 
 
 # Steps 2–10 are gated on ``not is_arithmetic`` per the plan's
@@ -276,8 +269,8 @@ class ConstantHandler:
         *,
         meta: Optional[AddressMetadataView] = None,
         is_arithmetic: bool = False,
-        fp_immediate_width_bytes: Optional[int] = None,
-        fp_postfix_width_bytes: Optional[int] = None,
+        fp_immediate_type: Optional[FpType] = None,
+        fp_postfix_type: Optional[FpType] = None,
     ) -> List[Tokens]:
         """Resolve a constant into v2 tokens following ``precedence.md``.
 
@@ -295,27 +288,18 @@ class ConstantHandler:
                 are skipped (the value is a pure arithmetic operand).
                 Step 1 (FP immediate) and step 11 (valued_const) still
                 fire — see precedence.md "is_arithmetic short-circuit".
-            fp_immediate_width_bytes: width in bytes ∈ {2,4,8,10,16}
-                when the operand IS an FP immediate (the value is the
-                IEEE bit pattern). Triggers step 1's inline-FP emission.
-            fp_postfix_width_bytes: width in bytes ∈ {2,4,8,10,16}
-                when the operand is an address with FP-typed load
-                instruction. Appended as a postfix annotation after the
-                ptr token emitted by steps 7–10 (no inline digits).
+            fp_immediate_type: typed ``FpType`` when the operand IS an FP
+                immediate (the value is the IEEE bit pattern). Triggers
+                step 1's inline-FP emission. ``None`` skips step 1.
+            fp_postfix_type: typed ``FpType`` when the operand is an
+                address with FP-typed load instruction. Appended as a
+                postfix annotation after the ptr token emitted by
+                steps 7–10 (no inline digits).
         """
-        if fp_immediate_width_bytes is not None and fp_immediate_width_bytes not in _VALID_FP_WIDTHS:
-            raise ValueError(
-                f"fp_immediate_width_bytes={fp_immediate_width_bytes} not in {_VALID_FP_WIDTHS}"
-            )
-        if fp_postfix_width_bytes is not None and fp_postfix_width_bytes not in _VALID_FP_WIDTHS:
-            raise ValueError(
-                f"fp_postfix_width_bytes={fp_postfix_width_bytes} not in {_VALID_FP_WIDTHS}"
-            )
-
         ctx = _Ctx(
             is_arithmetic=bool(is_arithmetic),
-            fp_immediate_width_bytes=fp_immediate_width_bytes,
-            fp_postfix_width_bytes=fp_postfix_width_bytes,
+            fp_immediate_type=fp_immediate_type,
+            fp_postfix_type=fp_postfix_type,
         )
 
         for predicate, emitter_name in self._precedence:
@@ -329,27 +313,28 @@ class ConstantHandler:
     # v2 emitters — one per precedence step
     # ----------------------------------------------------------------------
 
-    def _fp_factory(self, width_bytes: int):
-        """Map width-in-bytes to the v2 Inner-class factory.
+    def _fp_factory(self, fp_type: FpType):
+        """Map ``FpType`` to the v2 Inner-class factory.
 
-        Note: ``width_bytes == 2`` returns ``Float16`` (IEEE-754 half) by
-        default. ``BFloat16`` is indistinguishable from ``Float16`` on the
-        Ghidra side today (both report a 2-byte FP operand). If a future
-        provider exposes an unambiguous bfloat16 signal, the caller can
-        invoke ``vocab_manager.BFloat16`` directly.
+        BFloat16 is reachable: the Ghidra provider reclassifies width=2
+        FP operands to ``FpType.BFLOAT16`` based on the per-ISA mnemonic
+        tables in ``ghidra_provider.py`` (ARM ``BFCVT``/``BFDOT``/...,
+        x86 ``VCVTNE2PS2BF16``/...). Other widths map directly through
+        the ``FpType`` -> Inner-class table below.
         """
         vm = self.vocab_manager
         return {
-            2: vm.Float16,
-            4: vm.Float32,
-            8: vm.Float64,
-            10: vm.Float80,
-            16: vm.Float128,
-        }[width_bytes]
+            FpType.FLOAT16:  vm.Float16,
+            FpType.BFLOAT16: vm.BFloat16,
+            FpType.FLOAT32:  vm.Float32,
+            FpType.FLOAT64:  vm.Float64,
+            FpType.FLOAT80:  vm.Float80,
+            FpType.FLOAT128: vm.Float128,
+        }[fp_type]
 
     def _emit_fp_immediate(self, value: int, meta: Optional[AddressMetadataView], ctx: _Ctx) -> List[Tokens]:
         """Step 1: operand IS the FP bit pattern → inline ``floatXX``."""
-        factory = self._fp_factory(ctx.fp_immediate_width_bytes)
+        factory = self._fp_factory(ctx.fp_immediate_type)
         return [factory(value)]
 
     def _emit_plt_func(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
@@ -487,9 +472,9 @@ class ConstantHandler:
         """Step 9: read-only data pointer → ``ro_data_ptr`` identity.
 
         Postfix FP annotation rule (precedence.md): if the load is
-        FP-typed (``ctx.fp_postfix_width_bytes`` set), append a
-        ``floatXX`` token with no inline payload — the actual value
-        lives at the pointed-to address.
+        FP-typed (``ctx.fp_postfix_type`` set), append a ``floatXX``
+        token with no inline payload — the actual value lives at the
+        pointed-to address.
         """
         emitter_meta = {
             "section": meta.name,
@@ -549,9 +534,9 @@ class ConstantHandler:
         token ≥ 256 (i.e., no inline digits) annotates the previous
         ptr token's load type.
         """
-        if ctx.fp_postfix_width_bytes is None:
+        if ctx.fp_postfix_type is None:
             return []
-        factory = self._fp_factory(ctx.fp_postfix_width_bytes)
+        factory = self._fp_factory(ctx.fp_postfix_type)
         return [factory(None)]
 
     # ----------------------------------------------------------------------

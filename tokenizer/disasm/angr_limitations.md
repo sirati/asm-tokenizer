@@ -57,6 +57,19 @@ flags the load instruction via `OperandType.FLOAT` on the destination
 register operand, letting the classifier append `floatXX` after the
 emitted ptr token without inline digits.
 
+**Consumer API.** FP operand width detection requires Ghidra's data-type
+analysis; angr's path always reports `op.fp_type is None`. To keep the
+consumer-side read uniform across providers (no `getattr` soft-probe,
+no per-provider branching in `tokenizer/arch/*`), `angr_provider.py`
+stamps `fp_type = None` as a class-level default on every Capstone
+operand class (`X86Op`, `ArmOp`, `Arm64Op`, `MipsOp`, `PpcOp`,
+`RiscvOp`) at module load time. Consumers should treat absent
+`fp_type` (i.e., `None`) as "no FP postfix annotation" per
+`precedence.md` §Postfix FP. The Ghidra-backed `BFloat16` mnemonic
+reclassification at width=2 (see `ghidra_provider.py::_compute_fp_type`)
+is unreachable on the angr path for the same reason — Capstone never
+emits the FP signal that would let the reclassification trigger.
+
 ## 2. Vtable detection (RTTI)
 
 **Symptom (angr-side).** Slots of C++ virtual function tables in

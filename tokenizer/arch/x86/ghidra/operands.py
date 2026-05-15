@@ -10,11 +10,12 @@ Object-count rules for getOpObjects():
 """
 
 import warnings
-from typing import Any, List
+from typing import Any, List, Optional
 
 from tokenizer.arch.x86.operands import SIZE_MAP
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm.types import FpType
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, Tokens
 
@@ -47,7 +48,7 @@ def _infer_size_from_ghidra_insn(ghidra_insn: Any, default: int = 8) -> int:
 
 def tokenize_operand_memory_ghidra(
     ghidra_raw_data: Any,
-    op_fp_width_bytes: int | None,
+    op_fp_type: Optional[FpType],
     insn: Any,
     lookup: Any,
     text_end: int,
@@ -62,13 +63,13 @@ def tokenize_operand_memory_ghidra(
     Produces the same token sequence as the angr/Capstone path:
         size_ptr [segment:] mem[ base [+ index [* scale]] [+/- disp] ]mem
 
-    ``op_fp_width_bytes`` is the per-operand FP width Ghidra stamped on
-    the parent ``_CapOperand`` at decode time (one of {2, 4, 8, 10, 16}
-    when the load instruction is FP-typed, ``None`` otherwise). It flows
-    to ``ConstantHandler.process_constant_v2`` as the
-    ``fp_postfix_width_bytes`` hint so an FP load against a resolved
-    rodata pointer gets the postfix ``floatXX`` annotation per
-    ``precedence.md`` "Postfix FP annotation rule".
+    ``op_fp_type`` is the per-operand ``FpType`` Ghidra stamped on the
+    parent ``_CapOperand`` at decode time (when the load instruction is
+    FP-typed, ``None`` otherwise). It flows to
+    ``ConstantHandler.process_constant_v2`` as the ``fp_postfix_type``
+    hint so an FP load against a resolved rodata pointer gets the
+    postfix ``floatXX`` annotation per ``precedence.md`` "Postfix FP
+    annotation rule".
     """
     from ghidra.program.model.address import Address
     from ghidra.program.model.lang import Register
@@ -181,7 +182,7 @@ def tokenize_operand_memory_ghidra(
                 disp,
                 meta=meta,
                 is_arithmetic=False,
-                fp_postfix_width_bytes=op_fp_width_bytes,
+                fp_postfix_type=op_fp_type,
             )
             tokens.extend(disp_token)
         else:
@@ -190,7 +191,7 @@ def tokenize_operand_memory_ghidra(
                     disp,
                     meta=meta,
                     is_arithmetic=False,
-                    fp_postfix_width_bytes=op_fp_width_bytes,
+                    fp_postfix_type=op_fp_type,
                 )
                 tokens.extend(disp_token)
             else:
