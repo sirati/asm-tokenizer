@@ -2,6 +2,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Iterable, Protocol, Tuple
 
+from tokenizer.disasm.metadata import (
+    AddressKind,
+    AddressMetadataView,
+    Encoding,
+    SectionKind,
+)
 from tokenizer.disasm.types import (
     AddressSizePrefixView,
     Architecture,
