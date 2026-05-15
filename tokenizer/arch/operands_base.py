@@ -1,24 +1,24 @@
 """Shared operand tokenization for architectures with simple base+disp memory operands.
 
-Used by MIPS, PowerPC, RISC-V, and ARM. These architectures all use Capstone's
-standard operand types (1=REG, 2=IMM, 3=MEM) with memory operands consisting
-of only base register + displacement (no index register or scale factor).
+Used by MIPS, PowerPC, RISC-V, and ARM. These architectures all expose
+``OperandKind.MEM`` operands whose memory sub-view consists of base register +
+displacement only (no index register or scale factor).
 """
 
 from typing import List
 
-from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
 from tokenizer.disasm.metadata import AddressKind
+from tokenizer.disasm.types import InstructionView, OperandView
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import MemoryOperandSymbol, Tokens
 from tokenizer.utils import num_hex_digits
 
 
 def tokenize_operand_memory_base_disp(
-    insn,
+    insn: InstructionView,
     lookup,
-    op,
+    op: OperandView,
     text_end: int,
     text_start: int,
     func_max_addr: int,
@@ -32,13 +32,13 @@ def tokenize_operand_memory_base_disp(
     base = op.mem.base
     disp = op.mem.disp
 
-    has_base = base != 0
+    has_base = not base.is_absent
     has_disp = disp != 0
 
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET))
 
     if has_base:
-        tokens.append(vocab_manager.get_registry_token(insn.reg_name(base), base))
+        tokens.append(vocab_manager.get_registry_token(base.name, base.id))
 
     if has_disp:
         if disp < 0:
@@ -92,9 +92,9 @@ def tokenize_operand_memory_base_disp(
 def tokenize_operand_immediate_generic(
     addressing_control_flow_instructions: set[str],
     arithmetic_instructions: set[str],
-    insn,
+    insn: InstructionView,
     lookup,
-    op,
+    op: OperandView,
     func_max_addr: int,
     func_min_addr: int,
     constant_handler: ConstantHandler,
@@ -120,6 +120,13 @@ def tokenize_operand_immediate_generic(
         )
         tokens.extend(imm_token)
     elif imm_val_hex_len <= 16:
+        # Preserve the legacy ``base_mnemonic = insn.mnemonic`` behavior:
+        # the variable name is misleading but the original consumer indexed
+        # ``arithmetic_instructions`` / ``addressing_control_flow_instructions``
+        # against the Capstone ``mnemonic`` string verbatim (which on ARM
+        # includes the condition-code suffix). The owned ``InstructionView``
+        # surfaces the same string as ``insn.mnemonic`` (vs ``base_mnemonic``
+        # which strips the cc).
         base_mnemonic = insn.mnemonic
         if base_mnemonic in arithmetic_instructions:
             imm_token = constant_handler.process_constant_v2(
