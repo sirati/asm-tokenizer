@@ -353,8 +353,28 @@ class _GhidraDecodeHelper:
         # at least one Scalar (a plain REG operand carries no Scalar).
         # Without this arm the Scalar + bracket framing + writeback marker
         # are silently dropped.
+        #
+        # Bracket gate: Ghidra's ``OperandType.DYNAMIC`` bit also fires
+        # on ARM shifted-register operands like
+        # ``sbc r1, r1, r1, lsl #N`` (a register operand with an
+        # explicit shift modifier — NOT a memory access). Those operands
+        # carry no brackets in
+        # ``getDefaultOperandRepresentationList(op_idx)`` because the
+        # syntax is ``rN, lsl #M`` (no ``[`` framing). Real memory
+        # operands ALWAYS carry the bracket framing in the
+        # representation list, so requiring a ``[`` item discriminates
+        # cleanly. Without this gate the shifted-register operands were
+        # mis-classified as MEM and rendered as a degenerate
+        # ``mem[ rN ]mem``; downstream the per-ISA mem-decompose helper
+        # would also fail its ``>=2 GP-reg`` invariant assert because
+        # the operand carries only one register.
         scalar_in_objects = any(isinstance(o, Scalar) for o in objects or ())
-        is_memory = bool(register_objs) and (
+        try:
+            repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ()
+        except Exception:
+            repr_list = ()
+        has_bracket = any(str(item) == "[" for item in repr_list)
+        is_memory = bool(register_objs) and has_bracket and (
             bool(op_type & OperandType.DYNAMIC)
             or bool(op_type & OperandType.INDIRECT)
             or (
