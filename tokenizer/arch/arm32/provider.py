@@ -120,6 +120,7 @@ class ARM32Provider(ArchitectureProvider):
                     func_max_addr,
                     func_min_addr,
                     constant_handler,
+                    vocab_manager,
                 )
                 insn_tokens.extend(immediate_tokens)
             elif op.kind == OperandKind.MEM:

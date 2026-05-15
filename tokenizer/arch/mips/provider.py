@@ -60,6 +60,7 @@ class MIPSProvider(ArchitectureProvider):
                         func_max_addr,
                         func_min_addr,
                         constant_handler,
+                        vocab_manager,
                     )
                 )
             elif op.kind == OperandKind.MEM:

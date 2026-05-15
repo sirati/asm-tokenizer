@@ -722,6 +722,7 @@ class _GhidraInstructionView:
         "_base_mnemonic",
         "_op_str",
         "_operand_count",
+        "_op_specs",
         "_prefixes",
         "_operand_view",
         "_operands_view",
@@ -744,6 +745,11 @@ class _GhidraInstructionView:
         self._base_mnemonic: str = ""
         self._op_str: str = ""
         self._operand_count: int = 0
+        # Per-instruction operand specs, computed eagerly in ``_advance``
+        # so we can pair-merge SLEIGH-split disp+base operands before
+        # iteration (e.g. RISC-V c.sdsp / c.lwsp variants). Iteration
+        # walks this list rather than re-asking the decode helper.
+        self._op_specs: list[dict] = []
         self._prefixes = _GhidraPrefixesView()
         self._operand_view = _GhidraOperandView(arch, reg_map)
         self._operands_view = _GhidraOperandsView(self)
@@ -772,7 +778,6 @@ class _GhidraInstructionView:
             num_ops = int(ghidra_insn.getNumOperands())
         except Exception:
             num_ops = 0
-        self._operand_count = num_ops
         op_strs: list[str] = []
         for i in range(num_ops):
             try:
@@ -780,6 +785,53 @@ class _GhidraInstructionView:
             except Exception:
                 op_strs.append("")
         self._op_str = ", ".join(op_strs)
+
+        # Eager operand-spec decode + SLEIGH disp+base pair merge. Done
+        # here (rather than lazily inside ``_iter_operands``) because the
+        # pair-merge collapses two source operands into one synthetic
+        # MEM operand: ``len(insn.operands)`` (which reads
+        # ``self._operand_count``) must reflect the post-merge count, so
+        # we cannot defer until iteration.
+        #
+        # Disp+base pairs occur on RISC-V compressed-instruction
+        # encodings (``c.sdsp ra, 0x8(sp)``) where Ghidra's SLEIGH spec
+        # reports the disp scalar and the base register as adjacent
+        # flat operands (op[1]=DYNAMIC scalar 0x8, op[2]=REGISTER sp)
+        # instead of bundling them into one composite memory operand.
+        from ghidra.program.model.lang import OperandType
+        from tokenizer.disasm.types import OperandKind as _OperandKind
+
+        raw_specs = [
+            self._decode.operand_spec(
+                ghidra_insn,
+                i,
+                self._arch,
+                self._base_mnemonic,
+                self._reg_map,
+            )
+            for i in range(num_ops)
+        ]
+        merged_specs: list[dict] = []
+        i = 0
+        while i < len(raw_specs):
+            cur = raw_specs[i]
+            if (
+                i + 1 < len(raw_specs)
+                and cur["kind"] == _OperandKind.IMM
+                and bool(int(cur["type_int"]) & OperandType.DYNAMIC)
+                and raw_specs[i + 1]["kind"] == _OperandKind.REG
+            ):
+                merged_specs.append(
+                    self._decode.synthesize_disp_base_mem_spec(
+                        cur, raw_specs[i + 1]
+                    )
+                )
+                i += 2
+            else:
+                merged_specs.append(cur)
+                i += 1
+        self._op_specs = merged_specs
+        self._operand_count = len(merged_specs)
 
         # Prefixes (typed list) - rebuilt fresh per instruction; they are
         # typed-distinct, low-count instances so the small allocation is
@@ -790,18 +842,12 @@ class _GhidraInstructionView:
     def _iter_operands(self) -> Iterator[OperandView]:
         """Yield the reusable ``_GhidraOperandView`` for each operand of
         the current instruction. The same wrapper instance is yielded
-        each time, mutated to point at the next operand."""
+        each time, mutated to point at the next operand. Specs are
+        pre-computed (and pair-merged) by ``_advance``."""
         if self._ghidra_insn is None:
             return
         op_view = self._operand_view
-        for i in range(self._operand_count):
-            spec = self._decode.operand_spec(
-                self._ghidra_insn,
-                i,
-                self._arch,
-                self._base_mnemonic,
-                self._reg_map,
-            )
+        for spec in self._op_specs:
             op_view._advance(**spec)
             yield op_view
 
@@ -837,6 +883,12 @@ class _GhidraInstructionView:
         clone._base_mnemonic = self._base_mnemonic
         clone._op_str = self._op_str
         clone._operand_count = self._operand_count
+        # Carry the pre-computed (already pair-merged) operand specs so
+        # the clone iterates the same operand sequence without re-decoding.
+        # Spec dicts hold closures over the stable ghidra_insn Java handle
+        # so reference-sharing the list is safe; deep-copying the dicts
+        # would also deep-copy the closures (no value gain).
+        clone._op_specs = list(self._op_specs)
         # Snapshot the prefix list (each prefix instance is itself
         # immutable per typed protocol).
         clone._prefixes._populate(list(self._prefixes._prefixes))

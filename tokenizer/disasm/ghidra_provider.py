@@ -1774,6 +1774,71 @@ class _GhidraDecodeHelper:
 
         return _populate
 
+    def synthesize_disp_base_mem_spec(
+        self,
+        disp_spec: dict,
+        base_spec: dict,
+    ) -> dict:
+        """Synthesize a MEM operand spec from a (disp IMM, base REG) pair.
+
+        Used when Ghidra's SLEIGH spec splits a disp(base) memory
+        operand into two adjacent flat operands - notably the RISC-V
+        compressed-instruction encodings (``c.sdsp ra, 0x8(sp)`` is
+        reported as 3 operands: ``ra``, ``0x8`` [DYNAMIC scalar],
+        ``sp``). Caller pair-detects adjacent IMM-DYNAMIC + REG operands
+        and asks us to fuse them into one synthetic MEM operand whose
+        decomposition reads the captured base_name + disp directly
+        (rather than going back to ``getOpObjects()`` which only sees
+        the disjoint Scalar and Register on separate operand indices).
+
+        The values are pre-captured into the closure on this call so
+        subsequent calls (e.g. the next instruction) don't rebind the
+        closure-bound values mid-iteration.
+
+        ``type_int`` is the bitwise OR of the two halves so consumers
+        peeking the raw OperandType bitmask see both the DYNAMIC bit
+        (from the disp half) and the REGISTER bit (from the base half).
+        """
+        base_name = base_spec["reg_name"]
+        base_id = base_spec["reg_id"]
+        disp = disp_spec["imm"]
+        fp_type = disp_spec["fp_type"]
+        type_int = int(disp_spec["type_int"]) | int(base_spec["type_int"])
+
+        def _decompose(view: "_GhidraMemoryOperandView") -> None:
+            view._populate(
+                base_name=base_name,
+                base_id=base_id,
+                index_name="",
+                index_id=0,
+                scale=1,
+                disp=disp,
+                segment_name="",
+                segment_id=0,
+            )
+
+        # Mirror the default spec shape from ``operand_spec`` so the
+        # consumer's ``_GhidraOperandView._advance(**spec)`` accepts
+        # every kwarg without surprise.
+        from tokenizer.disasm.types import ShiftKind as _ShiftKind
+
+        spec = dict(
+            kind=OperandKind.MEM,
+            reg_name="",
+            reg_id=0,
+            imm=0,
+            size=base_spec.get("size", 0),
+            fp_type=fp_type,
+            type_int=type_int,
+            decompose_mem=_decompose,
+            shift_kind=_ShiftKind.NONE,
+            shift_amount=0,
+            crx_reg_name="",
+            crx_reg_id=0,
+            decompose_reg_list=None,
+        )
+        return spec
+
     def operand_spec(
         self,
         ghidra_insn: Any,
@@ -1809,7 +1874,17 @@ class _GhidraDecodeHelper:
         except Exception:
             op_type = 0
 
-        is_memory = (
+        # Pre-collect Register objects: used both by the is_memory check
+        # below (a memory operand MUST involve at least one base/index
+        # register) and the reg-list classifier (>= 3 registers => REG_LIST).
+        register_objs = [o for o in objects if isinstance(o, Register)]
+
+        # A memory operand MUST involve at least one base/index register.
+        # Without that, Ghidra's DYNAMIC bit on a pure-scalar operand
+        # (e.g. RISC-V c.addi's immediate, or c.sdsp's disp scalar that
+        # SLEIGH split off from its base register) is misleading and
+        # produces a degenerate base-less mem-bracket rendering.
+        is_memory = bool(register_objs) and (
             bool(op_type & OperandType.DYNAMIC)
             or bool(op_type & OperandType.INDIRECT)
             or (
@@ -1850,7 +1925,6 @@ class _GhidraDecodeHelper:
         # reg-list; classify accordingly so the MEM-decompose helpers
         # never see them (asserts in those helpers enforce the
         # invariant downstream).
-        register_objs = [o for o in objects if isinstance(o, Register)]
         if len(register_objs) >= 3:
             spec["kind"] = OperandKind.REG_LIST
             spec["decompose_reg_list"] = self._decompose_reg_list_callback(
