@@ -1,12 +1,21 @@
 import logging
 import re
+from typing import Optional
 
 import angr
 import cle
 from intervaltree import IntervalTree
 
 from tokenizer.disasm.angr_provider import _AngrAddressMetadataView
-from tokenizer.disasm.metadata import AddressMetadataView
+from tokenizer.disasm.metadata import (
+    AddressKind,
+    AddressMetadataView,
+    Encoding,
+    SectionKind,
+    address_kind_from_string,
+    encoding_from_string,
+    section_kind_from_type_string,
+)
 
 # ASCII printable run of length >=4 terminated by NUL byte.
 # Mirrors the heuristic in tokenizer/disasm/angr_provider.py:parse_data_sections;
@@ -30,8 +39,8 @@ class AngrMetadataLookup:
         self.range_lookup = IntervalTree()
         self.library_ranges = self._build_library_ranges()
         self._build_indices()
-        # REUSED view wrapper - per-`lookup()` call we mutate its state
-        # via `_set_state` and return the same instance. See
+        # REUSED view wrapper - per-`lookup()` call we mutate its slots
+        # via `_populate` and return the same instance. See
         # `AddressMetadataView` docstring for the lifecycle contract.
         self._view = _AngrAddressMetadataView()
 
@@ -324,62 +333,116 @@ class AngrMetadataLookup:
             # `is_string=False` will fire.
             print(f"EXCEPTION during string indexing: {e}")
 
-    def _finalize_meta(self, meta: dict, addr: int) -> dict:
-        """Apply enriched-field defaults the v2 classifier expects.
+    # ------------------------------------------------------------------
+    # Typed-view population
+    # ------------------------------------------------------------------
+    # The lookup keeps its index entries as raw dicts (a pure indexing
+    # concern, no consumer reads them). Per `lookup()` call, we translate
+    # the matched index entry plus the per-address string-tree query into
+    # the typed view's __slots__ in a single sweep — string -> enum
+    # mapping happens here, ONCE per lookup, not at each property read.
 
-        Single shape regardless of source path (`exact`, `range`,
-        `synthetic`). Uses setdefault so per-entry values populated at
-        build time (e.g., `tls=True` on a `.tdata` section, `is_plt=True`
-        on a PLT function) are preserved. Conservative defaults match
-        what `tokenizer/disasm/angr_limitations.md` documents as
-        angr-unavailable signals — Ghidra fills these authoritatively
-        on its side; here they always come back False / None so the
-        downstream classifier (`constant_handler.py`) sees a uniform
-        dict shape.
-
-        String membership is the one query-time enrichment: the
-        `_string_tree` is consulted on every `lookup()` call so a
-        ptr that lands inside a recognized ASCII run picks up
-        `is_string=True` plus the captured bytes, regardless of
-        whether the same address also hit a section/symbol/function
-        index.
+    def _populate_view_slots(
+        self,
+        index_meta: dict,
+        addr: int,
+    ) -> None:
+        """Translate ``index_meta`` + per-address string-tree query into
+        typed slots on ``self._view``.
         """
-        meta.setdefault("is_plt", False)
-        meta.setdefault("is_extern_synthetic", False)
-        meta.setdefault("tls", False)
-        # Conservative defaults for signals angr cannot produce reliably
-        # (see angr_limitations.md sections 2, 3 and the code-pointer
-        # table discussion in precedence.md step 8). Ghidra populates
-        # these authoritatively on its side; here they stay False so
-        # the classifier demotes to a lower precedence step.
-        meta.setdefault("is_vtable", False)
-        meta.setdefault("is_jump_table_slot", False)
-        meta.setdefault("is_code_ptr_table_slot", False)
+        type_str: Optional[str] = index_meta.get("type")
+        is_plt = bool(index_meta.get("is_plt"))
+        is_extern_synthetic = bool(index_meta.get("is_extern_synthetic"))
+        tls = bool(index_meta.get("tls"))
 
-        # String membership: query-time, since the same address can land
-        # in a section-meta and inside an ASCII run simultaneously.
+        # String-membership query is per-address, NOT per-index entry,
+        # because the same address can land in a section meta and inside
+        # an ASCII run simultaneously.
         string_hit = self._string_tree[addr]
         if string_hit:
             iv = min(string_hit, key=lambda iv: iv.end - iv.begin)
-            meta["is_string"] = True
-            meta["string_encoding"] = "ascii"
-            meta["string_bytes"] = iv.data
+            is_string = True
+            string_encoding = Encoding.ASCII
+            string_bytes: Optional[bytes] = bytes(iv.data)
         else:
-            meta.setdefault("is_string", False)
-            meta.setdefault("string_encoding", None)
-            meta.setdefault("string_bytes", None)
+            is_string = False
+            string_encoding = Encoding.UNKNOWN
+            string_bytes = None
 
-        return meta
+        # AddressKind precedence (matches what address_kind_from_meta did
+        # in the transitional shim). Order corresponds to the v2 precedence
+        # list in constant_handler._PRECEDENCE: string > vtable/code-ptr
+        # > plt > extern_synthetic > base type.
+        if is_string:
+            kind = AddressKind.STRING
+        elif is_plt:
+            kind = AddressKind.PLT_FUNCTION
+        elif is_extern_synthetic and (type_str or "").lower() in {
+            "extern_function",
+            "library_function",
+            "plt_function",
+            "unknown_function",
+        }:
+            kind = AddressKind.EXT_FUNCTION_SYNTHETIC
+        else:
+            kind = address_kind_from_string(type_str)
+
+        section_kind = section_kind_from_type_string(type_str)
+
+        # angr's index never carries a separate `section_name`; the meta
+        # dict's `name` doubles as section name when source == "section".
+        # The typed view exposes them separately so we conservatively
+        # surface the section name only when the source IS a section.
+        section_name: Optional[str] = None
+        if index_meta.get("source") == "section":
+            raw = index_meta.get("name")
+            section_name = None if raw is None else str(raw)
+
+        # `library` from the index has placeholder "unknown" for non-extern
+        # entries; we surface None in that case so the typed property is
+        # not accidentally populated with the placeholder string.
+        raw_lib = index_meta.get("library")
+        if raw_lib is None or raw_lib == "unknown":
+            library: Optional[str] = None
+        else:
+            library = str(raw_lib)
+
+        # Numeric / name fields: pass through, normalizing types.
+        raw_name = index_meta.get("name")
+        name: Optional[str] = None if raw_name is None else str(raw_name)
+
+        raw_size = index_meta.get("size")
+        size: Optional[int] = None if raw_size is None else int(raw_size)
+
+        raw_start = index_meta.get("start_addr")
+        start_addr: Optional[int] = None if raw_start is None else int(raw_start)
+
+        raw_end = index_meta.get("end_addr")
+        end_addr: Optional[int] = None if raw_end is None else int(raw_end)
+
+        self._view._populate(
+            kind=kind,
+            section_kind=section_kind,
+            section_name=section_name,
+            string_encoding=string_encoding,
+            string_bytes=string_bytes,
+            name=name,
+            start_addr=start_addr,
+            end_addr=end_addr,
+            size=size,
+            library=library,
+            # angr cannot detect vtables (angr_limitations.md sec 2/3).
+            is_vtable=False,
+            tls=tls,
+        )
 
     def lookup(self, addr) -> AddressMetadataView:
         """Resolve ``addr`` to a typed ``AddressMetadataView``.
 
         Mutates and returns the same per-lookup ``_AngrAddressMetadataView``
         instance each call (see ``AddressMetadataView`` lifecycle
-        docstring). The view's ``__iter__`` yields ``(self, kind_string)``
-        for callers still doing ``meta, kind = lookup.lookup(addr)`` tuple
-        unpacking - that bridge goes away in Phase D.3 (task #40) when
-        ``ConstantHandler`` consumes typed properties directly.
+        docstring). All typed slots are populated in one sweep here;
+        consumers read typed properties exclusively.
         """
         logger = logging.getLogger(__name__)
 
@@ -396,16 +459,16 @@ class AngrMetadataLookup:
             if match is not None and match.data != exact:
                 logger.fatal(f"Exact lookup mismatch for {addr:x}")
 
-            # Copy before finalizing so query-time enrichment (string
-            # membership) doesn't mutate the stored index entry.
-            self._view._set_state(self._finalize_meta(exact.copy(), addr), "exact")
+            self._populate_view_slots(exact, addr)
             return self._view
 
         if match:
-            meta = match.data.copy()
-            meta["start_addr"] = match.begin
-            meta["end_addr"] = match.end
-            self._view._set_state(self._finalize_meta(meta, addr), "range")
+            # Section-style entries don't carry start_addr/end_addr in
+            # their stored dict; surface the matched interval bounds.
+            meta = dict(match.data)
+            meta.setdefault("start_addr", match.begin)
+            meta.setdefault("end_addr", match.end)
+            self._populate_view_slots(meta, addr)
             return self._view
 
         # Fallback to synthetic metadata to guarantee no empty result
@@ -418,7 +481,7 @@ class AngrMetadataLookup:
             "source": "synthetic",
             "library": self._find_library_for_addr(addr),
         }
-        self._view._set_state(self._finalize_meta(fallback_meta, addr), "synthetic")
+        self._populate_view_slots(fallback_meta, addr)
         return self._view
 
 

@@ -9,8 +9,12 @@ remains for v1 callers until Phase 1.C.3 migrates them.
 
 Boundary contract for v2:
 
-- Caller does the address lookup (``metadata_lookup.lookup(addr) -> (meta,
-  kind)``) once, then hands ``value`` + ``meta`` to ``process_constant_v2``.
+- Caller does the address lookup (``metadata_lookup.lookup(addr) ->
+  AddressMetadataView``) once, then hands ``value`` + the typed view to
+  ``process_constant_v2``. The typed view exposes typed enums
+  (``meta.kind``, ``meta.string_encoding``) and concrete fields
+  (``meta.name``, ``meta.start_addr``, ...) — ConstantHandler reads them
+  exclusively (no dict access, no string-keyed lookups).
 - Caller passes ``is_arithmetic=True`` when the operand context is
   arithmetic (the value being arithmetically combined, not an address
   dereference candidate). Per ``precedence.md`` the address steps 2–10
@@ -29,7 +33,8 @@ Boundary contract for v2:
 Identity allocation (per-function category counters) goes through
 ``TokenResolver.get_identity(Category.*, addr, meta_dict)`` — the
 accumulated ``meta_dict`` becomes the per-function metadata JSON consumed
-by Phase 2.A.1 (CSV writer).
+by Phase 2.A.1 (CSV writer). The dict is built from typed view fields by
+each emitter, never echoed from the lookup payload directly.
 
 Removed in this rewrite (legacy v1 frequency-sort + metadata aggregation,
 to be replaced in Phase 2.A.1 / 2.B.7):
@@ -52,6 +57,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from tokenizer.disasm.metadata import AddressKind, AddressMetadataView
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import (
     BlockToken,
@@ -83,8 +89,11 @@ class _Ctx:
     """Per-call context bundle, passed to every emitter predicate.
 
     Bundles the orthogonal signals the predicates discriminate on so that
-    each predicate is a clean lambda of ``(meta, ctx)`` and no positional
-    argument shuffle leaks into the precedence list itself.
+    each predicate is a clean callable of ``(meta, value, ctx)`` and no
+    positional argument shuffle leaks into the precedence list itself.
+    ``meta`` is an ``AddressMetadataView`` (typed); ``value`` is the
+    constant being processed (needed by the local_func vs. block
+    discriminator at steps 3 and 4).
     """
     is_arithmetic: bool
     fp_immediate_width_bytes: Optional[int]
@@ -92,32 +101,19 @@ class _Ctx:
 
 
 # Predicate type. Returns True when the emitter should fire for this
-# ``(meta, ctx)`` pair. Predicates are total — they look only at the
-# ``meta`` dict and the context flags; no side effects.
-_Predicate = Callable[[dict, _Ctx], bool]
+# ``(meta, value, ctx)`` triple. Predicates are total — they look only at
+# the typed view, the value, and the context flags; no side effects.
+_Predicate = Callable[[Optional[AddressMetadataView], int, _Ctx], bool]
 
 
-def _meta_type(meta: dict) -> str:
-    """Provider-string for the address category, normalized to lowercase.
-
-    Both providers' ``lookup()`` populate ``meta["type"]`` with a small
-    fixed vocabulary documented in ``address_meta_data_lookup.py`` /
-    ``ghidra_provider.py``: ``local_function`` / ``library_function`` /
-    ``extern_function`` / ``unknown_function`` / ``rodata`` / ``data`` /
-    ``bss`` / ``thread_local_data`` / ``code`` / ``unknown``.
-    """
-    return str(meta.get("type", "") or "").lower()
-
-
-def _is_function_entry(meta: dict, value: int) -> bool:
+def _is_function_entry(meta: AddressMetadataView, value: int) -> bool:
     """True iff ``value`` is exactly the entry point of a function range.
 
     The provider reports a function range as ``[start_addr, end_addr)``
     with ``start_addr == entry``. Any value strictly inside the range is
     a ``block`` (step 4), not the entry.
     """
-    start = meta.get("start_addr")
-    return start is not None and value == start
+    return meta.start_addr is not None and value == meta.start_addr
 
 
 # ---- Step predicates -----------------------------------------------------
@@ -128,97 +124,83 @@ def _is_function_entry(meta: dict, value: int) -> bool:
 # floatXX value, not an integer valued_const"). The task pseudocode
 # included ``not is_arithmetic`` here — deviation documented in the
 # commit message because precedence.md is canonical.
-def _pred_fp_immediate(meta: dict, ctx: _Ctx) -> bool:
+def _pred_fp_immediate(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
     return ctx.fp_immediate_width_bytes is not None
 
 
 # Steps 2–10 are gated on ``not is_arithmetic`` per the plan's
 # is_arithmetic short-circuit ("steps 2–10 are skipped" for arithmetic
-# operands; step 11 catches them).
-def _pred_plt_func(meta: dict, ctx: _Ctx) -> bool:
-    return not ctx.is_arithmetic and bool(meta.get("is_plt"))
+# operands; step 11 catches them). They also short-circuit when ``meta``
+# is None (no lookup performed); only step 11 fires in that case.
+def _pred_plt_func(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    return not ctx.is_arithmetic and meta is not None and meta.kind == AddressKind.PLT_FUNCTION
 
 
-def _pred_local_func(meta: dict, ctx: _Ctx) -> bool:
+def _pred_local_func(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
     # Step 3: address EQUALS function entry in main object.
     return (
         not ctx.is_arithmetic
-        and _meta_type(meta) == "local_function"
-        and _is_function_entry(meta, _ctx_value(ctx, meta))
+        and meta is not None
+        and meta.kind == AddressKind.LOCAL_FUNCTION
+        and _is_function_entry(meta, value)
     )
 
 
-def _pred_block(meta: dict, ctx: _Ctx) -> bool:
+def _pred_block(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
     # Step 4: address STRICTLY INSIDE a function in main object.
     return (
         not ctx.is_arithmetic
-        and _meta_type(meta) == "local_function"
-        and not _is_function_entry(meta, _ctx_value(ctx, meta))
+        and meta is not None
+        and meta.kind == AddressKind.LOCAL_FUNCTION
+        and not _is_function_entry(meta, value)
     )
 
 
-def _pred_ext_func_real(meta: dict, ctx: _Ctx) -> bool:
-    # Step 5: extern function, NOT a CLE synthetic stub.
-    if ctx.is_arithmetic:
-        return False
-    t = _meta_type(meta)
-    if t not in {"extern_function", "library_function"}:
-        return False
-    return not bool(meta.get("is_extern_synthetic"))
-
-
-def _pred_ext_func_synthetic(meta: dict, ctx: _Ctx) -> bool:
-    # Step 6: extern function, IS a CLE synthetic stub.
-    if ctx.is_arithmetic:
-        return False
-    t = _meta_type(meta)
-    if t not in {"extern_function", "library_function"}:
-        return False
-    return bool(meta.get("is_extern_synthetic"))
-
-
-def _pred_string_ptr(meta: dict, ctx: _Ctx) -> bool:
-    return not ctx.is_arithmetic and bool(meta.get("is_string"))
-
-
-def _pred_slot_with_modifier(meta: dict, ctx: _Ctx) -> bool:
-    if ctx.is_arithmetic:
-        return False
+def _pred_ext_func_real(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    # Step 5: extern function, NOT a synthetic stub.
     return (
-        bool(meta.get("is_vtable"))
-        or bool(meta.get("is_code_ptr_table_slot"))
-        or bool(meta.get("is_jump_table_slot"))
+        not ctx.is_arithmetic
+        and meta is not None
+        and meta.kind == AddressKind.EXT_FUNCTION_REAL
     )
 
 
-def _pred_ro_data_ptr(meta: dict, ctx: _Ctx) -> bool:
-    return not ctx.is_arithmetic and _meta_type(meta) == "rodata"
+def _pred_ext_func_synthetic(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    # Step 6: extern function, IS a synthetic stub.
+    return (
+        not ctx.is_arithmetic
+        and meta is not None
+        and meta.kind == AddressKind.EXT_FUNCTION_SYNTHETIC
+    )
 
 
-def _pred_rw_data_ptr(meta: dict, ctx: _Ctx) -> bool:
-    return not ctx.is_arithmetic and _meta_type(meta) in {
-        "data",
-        "bss",
-        "thread_local_data",
-    }
+def _pred_string_ptr(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    return not ctx.is_arithmetic and meta is not None and meta.kind == AddressKind.STRING
 
 
-def _pred_fallback(meta: dict, ctx: _Ctx) -> bool:
+def _pred_slot_with_modifier(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    if ctx.is_arithmetic or meta is None:
+        return False
+    # Vtables surface as CODE_PTR_TABLE_SLOT (precedence above the bare
+    # rodata/data kinds). ``is_vtable`` is also exposed as a separate
+    # boolean for the modifier-selection step in the emitter.
+    return meta.kind in {AddressKind.CODE_PTR_TABLE_SLOT, AddressKind.JUMP_TABLE_SLOT} or meta.is_vtable
+
+
+def _pred_ro_data_ptr(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    return not ctx.is_arithmetic and meta is not None and meta.kind == AddressKind.RODATA
+
+
+def _pred_rw_data_ptr(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
+    return (
+        not ctx.is_arithmetic
+        and meta is not None
+        and meta.kind in {AddressKind.DATA, AddressKind.BSS, AddressKind.THREAD_LOCAL_DATA}
+    )
+
+
+def _pred_fallback(meta: Optional[AddressMetadataView], value: int, ctx: _Ctx) -> bool:
     return True
-
-
-# Threading helper — predicates don't carry the ``value`` directly so we
-# stash it in ctx's caller-visible scope via a thin wrapper. Keeping the
-# value out of ``_Ctx`` lets the predicates be value-agnostic except for
-# the two precedence steps that need it (local_func entry, block); those
-# read it from the closure-supplied ``meta["__value__"]`` slot the
-# dispatcher stamps in. This is internal protocol, never escapes the
-# module.
-_VALUE_KEY = "__value__"
-
-
-def _ctx_value(ctx: _Ctx, meta: dict) -> int:
-    return int(meta[_VALUE_KEY])
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +274,7 @@ class ConstantHandler:
         self,
         value: int,
         *,
-        meta: Optional[dict] = None,
+        meta: Optional[AddressMetadataView] = None,
         is_arithmetic: bool = False,
         fp_immediate_width_bytes: Optional[int] = None,
         fp_postfix_width_bytes: Optional[int] = None,
@@ -305,10 +287,10 @@ class ConstantHandler:
                 emits ``[MEM_MINUS, valued_const_v2(abs(value))]`` per
                 the v2 sign convention (memory file
                 ``open_design_v2_negative_valued_const.md`` option 2).
-            meta: provider-side metadata dict (the first element of
-                ``MetadataLookup.lookup(addr)``'s return tuple). May be
-                ``None`` when the caller hasn't done a lookup; the
-                fallback emitter still handles that.
+            meta: typed ``AddressMetadataView`` returned by
+                ``MetadataLookup.lookup(addr)``. May be ``None`` when the
+                caller hasn't done a lookup; the fallback emitter still
+                handles that.
             is_arithmetic: when True, address-classification steps 2–10
                 are skipped (the value is a pure arithmetic operand).
                 Step 1 (FP immediate) and step 11 (valued_const) still
@@ -330,14 +312,6 @@ class ConstantHandler:
                 f"fp_postfix_width_bytes={fp_postfix_width_bytes} not in {_VALID_FP_WIDTHS}"
             )
 
-        # Normalize meta: predicates read keys uniformly; missing meta is
-        # an empty dict so the fallback predicate is the only one that
-        # fires. Stash ``value`` on the meta dict under an internal key
-        # so the entry-vs-block predicates can compare against start_addr
-        # without threading ``value`` through every predicate signature.
-        local_meta = dict(meta) if meta is not None else {}
-        local_meta[_VALUE_KEY] = value
-
         ctx = _Ctx(
             is_arithmetic=bool(is_arithmetic),
             fp_immediate_width_bytes=fp_immediate_width_bytes,
@@ -345,8 +319,8 @@ class ConstantHandler:
         )
 
         for predicate, emitter_name in self._precedence:
-            if predicate(local_meta, ctx):
-                return getattr(self, emitter_name)(value, local_meta, ctx)
+            if predicate(meta, value, ctx):
+                return getattr(self, emitter_name)(value, meta, ctx)
 
         # Unreachable: _pred_fallback returns True unconditionally.
         raise AssertionError("v2 precedence table is missing a fallback rule")
@@ -373,31 +347,31 @@ class ConstantHandler:
             16: vm.Float128,
         }[width_bytes]
 
-    def _emit_fp_immediate(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_fp_immediate(self, value: int, meta: Optional[AddressMetadataView], ctx: _Ctx) -> List[Tokens]:
         """Step 1: operand IS the FP bit pattern → inline ``floatXX``."""
         factory = self._fp_factory(ctx.fp_immediate_width_bytes)
         return [factory(value)]
 
-    def _emit_plt_func(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_plt_func(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 2: PLT stub address → ``plt_func`` identity."""
         emitter_meta = {
-            "name": meta.get("name"),
-            "library": meta.get("library"),
+            "name": meta.name,
+            "library": meta.library,
             "addr": hex(value),
         }
         ident = self.resolver.get_identity(Category.PLT_FUNC, value, emitter_meta)
         return [self.vocab_manager.Plt_Func(ident)]
 
-    def _emit_local_func(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_local_func(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 3: function entry in main object → ``local_func`` identity."""
         emitter_meta = {
-            "name": meta.get("name"),
+            "name": meta.name,
             "addr": hex(value),
         }
         ident = self.resolver.get_identity(Category.LOCAL_FUNC, value, emitter_meta)
         return [self.vocab_manager.Local_Func(ident)]
 
-    def _emit_block(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_block(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 4: address inside a function body → ``block`` identity.
 
         ``Block_V2`` carries a per-function block identity counter (resets
@@ -409,27 +383,27 @@ class ConstantHandler:
         ident = self.resolver.get_identity(Category.BLOCK, value, {})
         return [self.vocab_manager.Block_V2(ident)]
 
-    def _emit_ext_func_real(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_ext_func_real(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 5: real function entry in another loaded object."""
         emitter_meta = {
-            "name": meta.get("name"),
-            "library": meta.get("library"),
+            "name": meta.name,
+            "library": meta.library,
             "synthetic": False,
         }
         ident = self.resolver.get_identity(Category.EXT_FUNC, value, emitter_meta)
         return [self.vocab_manager.Ext_Func(ident)]
 
-    def _emit_ext_func_synthetic(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
-        """Step 6: CLE synthetic extern-object slot."""
+    def _emit_ext_func_synthetic(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
+        """Step 6: synthetic extern-object slot."""
         emitter_meta = {
-            "name": meta.get("name"),
-            "library": meta.get("library"),
+            "name": meta.name,
+            "library": meta.library,
             "synthetic": True,
         }
         ident = self.resolver.get_identity(Category.EXT_FUNC, value, emitter_meta)
         return [self.vocab_manager.Ext_Func(ident)]
 
-    def _emit_string_ptr(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_string_ptr(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 7: provider-confirmed string → ``string_ptr`` identity.
 
         The metadata entry references ``{line, start_offset, encoding}``
@@ -448,10 +422,10 @@ class ConstantHandler:
         emitter_meta = {
             "line": -1,
             "start_offset": -1,
-            "encoding": meta.get("string_encoding"),
-            "_string_bytes": meta.get("string_bytes"),
-            "_string_encoding": meta.get("string_encoding"),
-            "_start_addr": meta.get("start_addr"),
+            "encoding": meta.string_encoding,
+            "_string_bytes": meta.string_bytes,
+            "_string_encoding": meta.string_encoding,
+            "_start_addr": meta.start_addr,
             "addr": hex(value),
         }
         ident = self.resolver.get_identity(Category.STRING_PTR, value, emitter_meta)
@@ -461,7 +435,7 @@ class ConstantHandler:
         tokens.extend(self._postfix_fp_annotation(ctx))
         return tokens
 
-    def _emit_slot_with_modifier(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_slot_with_modifier(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 8: code-pointer-array slot → modifier + decomposed target.
 
         Without slot-target resolution available from the providers today,
@@ -478,24 +452,24 @@ class ConstantHandler:
         # step 8 with the ``code_ptr_table`` modifier semantically (a
         # jump table is also a code-pointer array), so the precedence
         # collapses to vtable-vs-code_ptr_table at emission time.
-        if meta.get("is_vtable"):
+        if meta.is_vtable:
             modifier = self.vocab_manager.Vtable()
         else:
-            # is_code_ptr_table_slot OR is_jump_table_slot
+            # CODE_PTR_TABLE_SLOT or JUMP_TABLE_SLOT
             modifier = self.vocab_manager.Code_Ptr_Table()
 
         # Decompose: emit a ro_data_ptr for the base + valued_const for
         # the in-range offset. ``start_addr`` is the slot table's base.
         # If meta lacks a start_addr (unusual for step-8 enrichments), the
         # base IS the value and the offset is zero.
-        base_addr = meta.get("start_addr", value)
+        base_addr = meta.start_addr if meta.start_addr is not None else value
         offset = value - base_addr
 
         base_emitter_meta = {
-            "section": meta.get("name"),
+            "section": meta.name,
             "addr": hex(base_addr),
-            "name": meta.get("name"),
-            "size": meta.get("size", 0),
+            "name": meta.name,
+            "size": meta.size if meta.size is not None else 0,
         }
         base_ident = self.resolver.get_identity(
             Category.RO_DATA_PTR, base_addr, base_emitter_meta
@@ -509,7 +483,7 @@ class ConstantHandler:
         tokens.extend(self._postfix_fp_annotation(ctx))
         return tokens
 
-    def _emit_ro_data_ptr(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_ro_data_ptr(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 9: read-only data pointer → ``ro_data_ptr`` identity.
 
         Postfix FP annotation rule (precedence.md): if the load is
@@ -518,37 +492,37 @@ class ConstantHandler:
         lives at the pointed-to address.
         """
         emitter_meta = {
-            "section": meta.get("name"),
+            "section": meta.name,
             "addr": hex(value),
-            "name": meta.get("name"),
-            "size": meta.get("size", 0),
+            "name": meta.name,
+            "size": meta.size if meta.size is not None else 0,
         }
         ident = self.resolver.get_identity(Category.RO_DATA_PTR, value, emitter_meta)
         tokens: List[Tokens] = [self.vocab_manager.Ro_Data_Ptr(ident)]
         tokens.extend(self._postfix_fp_annotation(ctx))
         return tokens
 
-    def _emit_rw_data_ptr(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_rw_data_ptr(self, value: int, meta: AddressMetadataView, ctx: _Ctx) -> List[Tokens]:
         """Step 10: data / bss / TLS pointer → ``rw_data_ptr``.
 
         TLS sections (``tls=True``) get a ``thread_local`` modifier prefix.
         """
         emitter_meta = {
-            "section": meta.get("name"),
+            "section": meta.name,
             "addr": hex(value),
-            "name": meta.get("name"),
-            "size": meta.get("size", 0),
-            "tls": bool(meta.get("tls")),
+            "name": meta.name,
+            "size": meta.size if meta.size is not None else 0,
+            "tls": meta.tls,
         }
         ident = self.resolver.get_identity(Category.RW_DATA_PTR, value, emitter_meta)
         tokens: List[Tokens] = []
-        if meta.get("tls"):
+        if meta.tls:
             tokens.append(self.vocab_manager.Thread_Local())
         tokens.append(self.vocab_manager.Rw_Data_Ptr(ident))
         tokens.extend(self._postfix_fp_annotation(ctx))
         return tokens
 
-    def _emit_valued_const(self, value: int, meta: dict, ctx: _Ctx) -> List[Tokens]:
+    def _emit_valued_const(self, value: int, meta: Optional[AddressMetadataView], ctx: _Ctx) -> List[Tokens]:
         """Step 11: fallback → ``valued_const_v2``.
 
         Negative values use the MEM_MINUS-prefix convention (memory file
@@ -590,19 +564,20 @@ class ConstantHandler:
         self,
         value: int,
         is_arithmetic: bool = False,
-        meta: Optional[Dict] = None,
+        meta: Optional[AddressMetadataView] = None,
         library_type: str = "unknown",
         insn_mnemonic: Optional[str] = None,
     ) -> List[Tokens]:
         """v1 legacy entry — heuristic-driven Block / Opaque / Valued_Const.
 
-        See ``process_constant_v2`` for the v2 successor. Behavior here
-        is byte-for-byte the pre-rewrite logic; do not modify without
-        coordinating with Phase 1.C.3.
+        See ``process_constant_v2`` for the v2 successor. The decision
+        logic is byte-for-byte the pre-rewrite behavior; only the read
+        API has been migrated from dict-shaped ``meta`` to typed
+        ``AddressMetadataView`` (Phase D.3).
         """
         # Metadata ranges starting at 0 represent abstract constant
         # domains, not real memory segments — treat as arithmetic.
-        if meta is not None and meta.get("start_addr") == 0:
+        if meta is not None and meta.start_addr == 0:
             is_arithmetic = True
 
         # Small-constant / arithmetic short-circuit (legacy 0..0xFF rule).
@@ -621,17 +596,42 @@ class ConstantHandler:
             ]
         return self._create_opaque_const_with_offset(value, meta, library_type, insn_mnemonic)
 
+    # v1 mapping from typed ``AddressKind`` back to the legacy decision
+    # vocabulary. Used by ``_create_opaque_const_with_offset`` to keep the
+    # heuristic predicates (function-range guard, decomposable-type list)
+    # readable without spelling out the AddressKind set inline.
+    _V1_FUNCTION_KINDS = frozenset({
+        AddressKind.LOCAL_FUNCTION,
+        AddressKind.EXT_FUNCTION_REAL,
+        AddressKind.EXT_FUNCTION_SYNTHETIC,
+        AddressKind.PLT_FUNCTION,
+        AddressKind.UNKNOWN,  # legacy "unknown_function" mapped to UNKNOWN
+    })
+    _V1_DECOMPOSABLE_KINDS = frozenset({
+        AddressKind.DATA,
+        AddressKind.RODATA,
+        AddressKind.BSS,
+        # legacy "code" was decomposable; AddressKind.UNKNOWN covers it
+        # (provider mapping for "code" -> UNKNOWN per metadata.py).
+        AddressKind.UNKNOWN,
+    })
+
     def _create_opaque_const_with_offset(
         self,
         value: int,
-        meta: Optional[Dict] = None,
+        meta: Optional[AddressMetadataView] = None,
         library_type: str = "unknown",
         insn_mnemonic: Optional[str] = None,
     ) -> List[Tokens]:
         """Create an opaque constant token, decomposing into base+offset if pointing into a range."""
-        if meta is not None and "start_addr" in meta and "end_addr" in meta and value > meta["start_addr"]:
-            start_addr = meta["start_addr"]
-            end_addr = meta["end_addr"]
+        if (
+            meta is not None
+            and meta.start_addr is not None
+            and meta.end_addr is not None
+            and value > meta.start_addr
+        ):
+            start_addr = meta.start_addr
+            end_addr = meta.end_addr
             range_length = end_addr - start_addr
             offset = value - start_addr
 
@@ -641,9 +641,9 @@ class ConstantHandler:
 
             # Heuristic 5: Don't decompose local_function / library_function /
             # unknown_function ranges (they should be exact).
-            if meta.get("type") in ["local_function", "library_function", "unknown_function"]:
+            if meta.kind in self._V1_FUNCTION_KINDS:
                 should_decompose = False
-                reason = f"function range (type={meta.get('type')})"
+                reason = f"function range (kind={meta.kind.name})"
 
             # Heuristic 3: Call instructions should not be decomposed
             # (must point to function header).
@@ -662,15 +662,15 @@ class ConstantHandler:
                 reason = f"range too large (length={range_length:#x} > 0x10000)"
 
             # Heuristic 6: Prefer decomposing data/rodata/bss sections.
-            elif meta.get("type") not in ["data", "rodata", "bss", "code"]:
+            elif meta.kind not in self._V1_DECOMPOSABLE_KINDS:
                 should_decompose = False
-                reason = f"unexpected metadata type: {meta.get('type')}"
+                reason = f"unexpected metadata kind: {meta.kind.name}"
 
             # If value points into the range (not at the start), consider decomposition.
             if start_addr < value < end_addr and should_decompose:
                 insn_info = f" in {insn_mnemonic}" if insn_mnemonic else ""
                 logger.debug(
-                    f"Decomposing: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
+                    f"Decomposing: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, kind={meta.kind.name}) "
                     f"for target {value:#x}, offset={offset:#x}{insn_info}"
                 )
                 base_token = self._create_opaque_const(start_addr, meta, library_type)
@@ -684,7 +684,7 @@ class ConstantHandler:
             elif start_addr < value < end_addr and not should_decompose:
                 insn_info = f" in {insn_mnemonic}" if insn_mnemonic else ""
                 logger.debug(
-                    f"Skipping decomposition: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, type={meta.get('type')}) "
+                    f"Skipping decomposition: range {start_addr:#x}-{end_addr:#x} (length={range_length:#x}, kind={meta.kind.name}) "
                     f"for target {value:#x}, offset={offset:#x}{insn_info}, reason: {reason}"
                 )
 
@@ -694,7 +694,7 @@ class ConstantHandler:
     def _create_opaque_const(
         self,
         value: int,
-        meta: Optional[Dict] = None,
+        meta: Optional[AddressMetadataView] = None,
         library_type: str = "unknown",
     ) -> Tokens:
         """Create an opaque constant token (v1)."""
@@ -705,11 +705,15 @@ class ConstantHandler:
             self.opaque_const_usage[value] = 1
 
             if meta is not None:
+                # Mirrors the v1 tuple shape; ``library_type`` is the
+                # caller-supplied label (kept separate from the typed
+                # view's ``library`` because v1 callers passed
+                # heuristic library tags here).
                 self.opaque_metadata[value] = (
-                    hex(meta["start_addr"]),
-                    hex(meta["end_addr"]),
-                    meta["name"],
-                    meta["type"],
+                    hex(meta.start_addr) if meta.start_addr is not None else "",
+                    hex(meta.end_addr) if meta.end_addr is not None else "",
+                    meta.name,
+                    meta.kind.name,
                     library_type,
                 )
         else:

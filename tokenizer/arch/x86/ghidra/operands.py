@@ -174,7 +174,7 @@ def tokenize_operand_memory_ghidra(
         elif disp > (1 << 18):
             force_opaque = True
 
-        meta, kind = lookup.lookup(disp)
+        meta = lookup.lookup(disp)
 
         if force_opaque:
             disp_token = constant_handler.process_constant_v2(
@@ -184,7 +184,7 @@ def tokenize_operand_memory_ghidra(
                 fp_postfix_width_bytes=op_fp_width_bytes,
             )
             tokens.extend(disp_token)
-        elif meta is not None:
+        else:
             if (text_start <= disp < text_end) or (disp < func_min_addr or disp > func_max_addr):
                 disp_token = constant_handler.process_constant_v2(
                     disp,
@@ -196,9 +196,6 @@ def tokenize_operand_memory_ghidra(
             else:
                 disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
                 tokens.extend(disp_token)
-        else:
-            disp_token = constant_handler.process_constant_v2(disp, is_arithmetic=True)
-            tokens.extend(disp_token)
 
     # -- Close bracket --------------------------------------------------------
     tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET))
