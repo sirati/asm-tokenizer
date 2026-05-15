@@ -69,8 +69,7 @@ def tokenize_operand_memory(
         # through to ``None`` via ``getattr``.
         fp_postfix = getattr(op, "fp_width_bytes", None)
         if abs_disp <= 0xFF:
-            valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
-            tokens.append(valued_const(abs_disp))
+            tokens.append(vocab_manager.ValuedConst(abs_disp))
         else:
             force_opaque = not has_base
             meta, _kind = lookup.lookup(abs_disp)
@@ -116,6 +115,5 @@ def tokenize_operand_shift(
         if shift_name is not None:
             tokens.append(vocab_manager.PlatformToken(shift_name, PlatformInstructionTypes.ARITHMETIC))
             if op.shift.value != 0:
-                valued_const = vocab_manager.Valued_Const_V2 if vocab_manager.format_version == 2 else vocab_manager.Valued_Const
-                tokens.append(valued_const(op.shift.value))
+                tokens.append(vocab_manager.ValuedConst(op.shift.value))
     return tokens
