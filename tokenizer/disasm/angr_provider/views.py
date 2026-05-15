@@ -162,6 +162,26 @@ class _AngrMemoryOperandView:
         self._segment._set(self._cs_insn, seg_id)
         return self._segment
 
+    # ARM writeback / pre-/post-indexed addressing-mode flags. Capstone
+    # encodes writeback as an instruction-level flag (``ARM_OP_INVALID``
+    # placeholder + ``writeback`` on the instruction struct), not on the
+    # per-operand mem sub-view; the consumer side currently treats the
+    # angr/Capstone path as the best-effort backend and the v2 emitter
+    # falls back to plain offset rendering when these flags are False
+    # (see ``angr_limitations.md``). Sentinel-False keeps the Protocol
+    # shape clean without engineering parity for the angr path.
+    @property
+    def writeback(self) -> bool:
+        return False
+
+    @property
+    def pre_indexed(self) -> bool:
+        return False
+
+    @property
+    def post_indexed(self) -> bool:
+        return False
+
     def __deepcopy__(self, memo) -> "_AngrMemoryOperandView":
         clone = _AngrMemoryOperandView(self._arch)
         clone._op = self._op

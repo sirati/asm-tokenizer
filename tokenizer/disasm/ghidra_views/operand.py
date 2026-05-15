@@ -61,6 +61,9 @@ class _GhidraMemoryOperandView:
         "_segment",
         "_scale",
         "_disp",
+        "_writeback",
+        "_pre_indexed",
+        "_post_indexed",
     )
 
     def __init__(self, arch: Architecture) -> None:
@@ -70,6 +73,9 @@ class _GhidraMemoryOperandView:
         self._segment = _GhidraRegisterView(arch)
         self._scale: int = 1
         self._disp: int = 0
+        self._writeback: bool = False
+        self._pre_indexed: bool = False
+        self._post_indexed: bool = False
 
     def _populate(
         self,
@@ -82,6 +88,9 @@ class _GhidraMemoryOperandView:
         segment_id: int,
         scale: int,
         disp: int,
+        writeback: bool = False,
+        pre_indexed: bool = False,
+        post_indexed: bool = False,
     ) -> None:
         if base_id != _REG_ID_ABSENT or base_name != _REG_NAME_ABSENT:
             self._base._advance(base_name, base_id)
@@ -97,6 +106,9 @@ class _GhidraMemoryOperandView:
             self._segment._set_absent()
         self._scale = scale
         self._disp = disp
+        self._writeback = writeback
+        self._pre_indexed = pre_indexed
+        self._post_indexed = post_indexed
 
     @property
     def base(self) -> RegisterView:
@@ -118,6 +130,18 @@ class _GhidraMemoryOperandView:
     def segment(self) -> RegisterView:
         return self._segment
 
+    @property
+    def writeback(self) -> bool:
+        return self._writeback
+
+    @property
+    def pre_indexed(self) -> bool:
+        return self._pre_indexed
+
+    @property
+    def post_indexed(self) -> bool:
+        return self._post_indexed
+
     def __deepcopy__(self, memo) -> "_GhidraMemoryOperandView":
         clone = _GhidraMemoryOperandView(self._arch)
         clone._base = copy.deepcopy(self._base, memo)
@@ -125,6 +149,9 @@ class _GhidraMemoryOperandView:
         clone._segment = copy.deepcopy(self._segment, memo)
         clone._scale = self._scale
         clone._disp = self._disp
+        clone._writeback = self._writeback
+        clone._pre_indexed = self._pre_indexed
+        clone._post_indexed = self._post_indexed
         return clone
 
 

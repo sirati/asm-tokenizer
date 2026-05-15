@@ -151,13 +151,23 @@ class TokenType(IntEnum):
 
 
 class MemoryOperandSymbol(Enum):
-    """Enum for memory operand symbols"""
+    """Enum for memory operand symbols.
+
+    ``OPEN_BRACKET``/``CLOSE_BRACKET`` frame the addressing expression;
+    ``PLUS``/``MINUS``/``MULTIPLY`` are the inline arithmetic separators.
+    ``POST_INDEX_SEPARATOR`` is the ARM-specific separator between the
+    close-bracket and the post-index displacement scalar in
+    ``[base], #imm`` post-indexed addressing; the asm renders this as
+    ``,`` so the value mirrors that, while ``token_str()`` returns the
+    vocab-stable ISA-neutral name.
+    """
 
     OPEN_BRACKET = "mem["
     CLOSE_BRACKET = "]mem"
     PLUS = "+"
     MINUS = "-"
     MULTIPLY = "*"
+    POST_INDEX_SEPARATOR = ","
 
     def token_str(self) -> str:
         """Get the string representation of the memory operand symbol"""
@@ -171,6 +181,8 @@ class MemoryOperandSymbol(Enum):
             return "MEM_MINUS"
         elif self == MemoryOperandSymbol.MULTIPLY:
             return "MEM_MULTIPLY"
+        elif self == MemoryOperandSymbol.POST_INDEX_SEPARATOR:
+            return "asm_post_index_separator"
         else:
             raise ValueError(f"Unknown memory operand symbol: {self}")
 

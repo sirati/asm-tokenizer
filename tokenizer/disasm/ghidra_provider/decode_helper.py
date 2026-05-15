@@ -137,25 +137,19 @@ class _GhidraDecodeHelper:
             compute = _compute_base_disp_memory_components
 
         def _populate(mem_view) -> None:
-            (
-                base_name,
-                base_id,
-                index_name,
-                index_id,
-                scale,
-                disp,
-                segment_name,
-                segment_id,
-            ) = compute(ghidra_insn, op_idx, reg_map)
+            decomp = compute(ghidra_insn, op_idx, reg_map)
             mem_view._populate(
-                base_name=base_name,
-                base_id=base_id,
-                index_name=index_name,
-                index_id=index_id,
-                segment_name=segment_name,
-                segment_id=segment_id,
-                scale=scale,
-                disp=disp,
+                base_name=decomp.base_name,
+                base_id=decomp.base_id,
+                index_name=decomp.index_name,
+                index_id=decomp.index_id,
+                segment_name=decomp.segment_name,
+                segment_id=decomp.segment_id,
+                scale=decomp.scale,
+                disp=decomp.disp,
+                writeback=decomp.writeback,
+                pre_indexed=decomp.pre_indexed,
+                post_indexed=decomp.post_indexed,
             )
 
         return _populate
@@ -340,6 +334,15 @@ class _GhidraDecodeHelper:
         # (e.g. RISC-V c.addi's immediate, or c.sdsp's disp scalar that
         # SLEIGH split off from its base register) is misleading and
         # produces a degenerate base-less mem-bracket rendering.
+        #
+        # ARM pre-indexed-with-writeback (``stp x29, x30, [sp, #-48]!``):
+        # Ghidra reports ``op_type = REGISTER|ADDRESS`` (no DYNAMIC) and
+        # surfaces the displacement as a ``Scalar`` inside ``getOpObjects``.
+        # The disambiguator vs a bare register operand is the presence of
+        # at least one Scalar (a plain REG operand carries no Scalar).
+        # Without this arm the Scalar + bracket framing + writeback marker
+        # are silently dropped.
+        scalar_in_objects = any(isinstance(o, Scalar) for o in objects or ())
         is_memory = bool(register_objs) and (
             bool(op_type & OperandType.DYNAMIC)
             or bool(op_type & OperandType.INDIRECT)
@@ -347,6 +350,12 @@ class _GhidraDecodeHelper:
                 bool(op_type & OperandType.ADDRESS)
                 and bool(op_type & OperandType.SCALAR)
                 and not (op_type & (OperandType.REGISTER | OperandType.CODE))
+            )
+            or (
+                bool(op_type & OperandType.REGISTER)
+                and bool(op_type & OperandType.ADDRESS)
+                and not (op_type & OperandType.CODE)
+                and scalar_in_objects
             )
         )
 

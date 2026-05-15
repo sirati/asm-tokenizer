@@ -132,6 +132,26 @@ class RegisterView(Protocol):
 # ---- SUB-VIEWS (bound to parent OperandView) ----
 @runtime_checkable
 class MemoryOperandView(Protocol):
+    """Decomposed memory-operand view.
+
+    Carries the (base, index, scale, disp, segment) classical addressing
+    fields plus the ARM-specific addressing-mode flags
+    (``writeback``/``pre_indexed``/``post_indexed``) surfaced from the
+    provider's representation list.
+
+    Writeback semantics (ARM/AArch64 only):
+      ``writeback`` is True iff the base register is auto-updated by the
+      displacement as part of the memory access; the asm marker is the
+      trailing ``!`` in ``[base, #imm]!``.
+      ``pre_indexed`` is True iff the base is updated BEFORE the memory
+      access (this implies ``writeback`` is also True).
+      ``post_indexed`` is True iff the base is updated AFTER the memory
+      access (writeback is implicit; the asm form is ``[base], #imm``).
+      Plain offset-only addressing (``[base, #imm]``) leaves all three
+      flags False; the three flags are mutually exclusive otherwise.
+      Non-ARM ISAs always report all three as False.
+    """
+
     @property
     def base(self) -> RegisterView: ...
 
@@ -146,6 +166,15 @@ class MemoryOperandView(Protocol):
 
     @property
     def segment(self) -> RegisterView: ...  # x86 segment override; is_absent on others
+
+    @property
+    def writeback(self) -> bool: ...        # ARM `!`; base auto-updated by disp
+
+    @property
+    def pre_indexed(self) -> bool: ...      # ARM [base, #imm]! (base updated BEFORE access)
+
+    @property
+    def post_indexed(self) -> bool: ...     # ARM [base], #imm (base updated AFTER access)
 
     def __deepcopy__(self, memo) -> "MemoryOperandView": ...
 
