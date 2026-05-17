@@ -176,6 +176,13 @@
               export bin_python=$(which python)
               export bin_python3=$(which python3)
               export GHIDRA_INSTALL_DIR="${pkgs.ghidra}/lib/ghidra"
+              # Point dynamic_runner's PodmanPackaging at the upstream
+              # nix-docker-layered-image extractor. The framework's
+              # legacy fallback path `<root>/nix/extract-layer-assignment.py`
+              # has been stale since the 2026-04-29 extractor split;
+              # this env-var lookup wins over that fallback. Fixed
+              # framework-side at dynamic-runner 0d1b6b7.
+              export DYNRUNNER_LAYER_EXTRACTOR_SCRIPT=${nix-docker-layered-image.packages.${system}.extract-layer-assignment}/bin/extract-layer-assignment
             '';
           };
         }
