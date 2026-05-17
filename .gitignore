@@ -73,6 +73,9 @@ pyvex_ffi_parser_cache*
 # Zed editor agent rules (auto-generated)
 .rules-zed-provided
 
+# Claude Code session artifacts
+.claude/
+
 # Per-developer cache for incremental nix-docker layer assignment
 # (consumed via NIX_DOCKER_LAYER_CACHE in flake.nix; refreshed
 # automatically by PodmanPackaging after each successful build).
