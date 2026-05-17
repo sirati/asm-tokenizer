@@ -1,26 +1,22 @@
 """CLI dispatcher for dynrunner specializations.
 
-    python -m dynrunner --task tokenize   [...task args]
-    python -m dynrunner --task unify-vocab [...task args]
-    python -m dynrunner --task build-memmap [...task args]
-    python -m dynrunner --task all         [...shared args]
+    python -m dynrunner --task tokenize       [...task args]
+    python -m dynrunner --task unify-vocab    [...task args]
+    python -m dynrunner --task build-memmap   [...task args]
+    python -m dynrunner --task full-pipeline  [...task args]
+    python -m dynrunner --task all            (alias for full-pipeline)
 
-`--task all` runs the three tasks sequentially in the order
-tokenize → unify-vocab → build-memmap, **chaining outputs** so phase
-2 and phase 3 read from phase 1's output rather than the user's
-original source tree:
+``--task full-pipeline`` hands the framework a composite
+:class:`~dynrunner.full_pipeline.FullPipelineTask` that declares all
+three phases with dep edges; the framework drives the chain on one
+persistent secondary mesh (one sbatch wave on SLURM, one mesh
+formation round). The historical ``--task all`` form — three
+independent framework dispatches with per-phase rewrites of
+``--source``/``--output`` — has been removed.
 
-* tokenize:     ``--source <user-source> --output <user-output>``
-* unify-vocab:  ``--source <user-output> --output <user-output>``
-                (mapping files land alongside the CSVs they describe)
-* build-memmap: ``--source <user-output> --output <user-output>/memmap``
-                (memmap files are flat-named per binary group; the
-                ``memmap/`` subdir keeps them separate from the
-                per-binary CSVs/mappings in the tokenize tree)
-
-The user only specifies ``--source`` and ``--output`` once. Other
-flags every subtask accepts (file-discovery filters, ``--platform``,
-``--max-memory``, etc.) are forwarded verbatim to each phase.
+``--task all`` is kept as a verbatim alias for ``full-pipeline`` so
+ops scripts that already pin the older name keep working without a
+behaviour change.
 """
 
 from __future__ import annotations
@@ -37,9 +33,16 @@ _TASK_TO_MODULE: dict[str, str] = {
     "tokenize": "dynrunner.tokenize",
     "unify-vocab": "dynrunner.unify_vocab",
     "build-memmap": "dynrunner.build_memmap",
+    "full-pipeline": "dynrunner.full_pipeline",
 }
 
-_PIPELINE_ORDER: tuple[str, ...] = ("tokenize", "unify-vocab", "build-memmap")
+# `--task all` is a verbatim alias kept for ops-compat with the
+# pre-composite shell scripts. The alias is resolved upfront so the
+# dispatch path is the same one-shot ``_dispatch`` invocation as every
+# other task.
+_TASK_ALIASES: dict[str, str] = {
+    "all": "full-pipeline",
+}
 
 
 # Framework's `--platform` default is `["x86", "x64"]` (see
@@ -79,83 +82,6 @@ def _ensure_full_platform_default(rest: list[str]) -> list[str]:
     return [*rest, "--platform", *_ALL_PLATFORMS]
 
 
-def _extract_flag(rest: list[str], flag: str) -> str | None:
-    """Read the value of ``--<flag>`` from ``rest`` without removing it.
-
-    Accepts both ``--flag value`` and ``--flag=value`` forms. Returns
-    the first occurrence (argparse semantics) or ``None`` if absent.
-    """
-    long = f"--{flag}"
-    eq_prefix = f"--{flag}="
-    for i, arg in enumerate(rest):
-        if arg == long and i + 1 < len(rest):
-            return rest[i + 1]
-        if arg.startswith(eq_prefix):
-            return arg[len(eq_prefix):]
-    return None
-
-
-def _replace_flag(rest: list[str], flag: str, new_value: str) -> list[str]:
-    """Return ``rest`` with the value of ``--<flag>`` replaced by
-    ``new_value``. If the flag is absent, append ``--<flag> <new_value>``.
-    Leaves other args (their order) untouched.
-    """
-    long = f"--{flag}"
-    eq_prefix = f"--{flag}="
-    out: list[str] = []
-    i = 0
-    replaced = False
-    while i < len(rest):
-        arg = rest[i]
-        if arg == long and i + 1 < len(rest):
-            out.append(long)
-            out.append(new_value)
-            i += 2
-            replaced = True
-            continue
-        if arg.startswith(eq_prefix):
-            out.append(f"{eq_prefix}{new_value}")
-            i += 1
-            replaced = True
-            continue
-        out.append(arg)
-        i += 1
-    if not replaced:
-        out.extend([long, new_value])
-    return out
-
-
-def _chain_for_phase(rest: list[str], phase: str) -> list[str]:
-    """Rewrite ``--source`` / ``--output`` for phase 2 and phase 3 of
-    ``--task all`` so each phase reads from the previous phase's output.
-
-    Phase 1 (``tokenize``) keeps the user's ``--source`` and ``--output``
-    verbatim. Phase 2 (``unify-vocab``) reads the tokenize outputs by
-    pointing ``--source`` at the user's ``--output``; its own
-    ``--output`` stays the same dir so mapping files land alongside the
-    CSVs they describe. Phase 3 (``build-memmap``) reads from the
-    same dir but writes its flat-named memmap artefacts into a sibling
-    ``memmap/`` subdir, preserving the tokenize tree's structure.
-
-    See module docstring for the full layout. Aborts cleanly if the
-    user didn't provide ``--output`` (we can't synthesise a chain
-    target without it).
-    """
-    if phase == "tokenize":
-        return rest
-    user_output = _extract_flag(rest, "output")
-    if user_output is None:
-        raise SystemExit(
-            "dynrunner --task all: --output is required to chain "
-            f"phase '{phase}' onto the previous phase's output. "
-            "Pass --output <dir> alongside --source."
-        )
-    rest = _replace_flag(rest, "source", user_output)
-    if phase == "build-memmap":
-        rest = _replace_flag(rest, "output", f"{user_output}/memmap")
-    return rest
-
-
 def _dispatch(task: str, rest: list[str]) -> None:
     module_name = _TASK_TO_MODULE[task]
     module = importlib.import_module(module_name + ".__main__")
@@ -171,10 +97,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--task",
-        choices=[*_TASK_TO_MODULE.keys(), "all"],
+        choices=[*_TASK_TO_MODULE.keys(), *_TASK_ALIASES.keys()],
         help=(
-            "Which specialization to run. `all` runs the full "
-            "tokenize -> unify-vocab -> build-memmap pipeline."
+            "Which specialization to run. `full-pipeline` (alias: `all`) "
+            "runs the composite tokenize → unify-vocab → build-memmap "
+            "task as a single framework dispatch."
         ),
     )
     parser.add_argument(
@@ -195,11 +122,8 @@ def main() -> None:
 
     rest = _ensure_full_platform_default(rest)
 
-    if args.task == "all":
-        for sub in _PIPELINE_ORDER:
-            _dispatch(sub, _chain_for_phase(rest, sub))
-    else:
-        _dispatch(args.task, rest)
+    resolved_task = _TASK_ALIASES.get(args.task, args.task)
+    _dispatch(resolved_task, rest)
 
 
 if __name__ == "__main__":

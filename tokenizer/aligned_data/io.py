@@ -11,7 +11,7 @@ from .binary_format import (
     extract_arrays_from_data,
     parse_binary_header,
 )
-from .csv_format import format_compiler_sets, format_inlining_dict
+from .csv_format import format_inlining_dict, format_variant_refs
 
 
 def decode_and_translate_tokens(row, mapping=None):
@@ -75,21 +75,25 @@ def write_index_entry(file3, start, length, avg_len):
 
 def write_function_section_csv(
     writer,
-    arch,
-    compiler,
-    compilerversion,
-    opt,
+    variant_ref,
     inlining_list,
     data_offset,
     data_len,
 ):
+    """Write one matched-section row.
+
+    ``variant_ref`` is the ``0x<hex>`` row index into the per-group
+    ``<binary>_variants.csv`` sidecar (see
+    ``tokenizer.memmap_builder.variants.VariantRegistry``). The
+    4-axis canonical tuple (arch, compiler, version, opt) and any
+    sidecar ``extra_metadata`` are recoverable via that ref;
+    keeping them out of the section CSV avoids the per-row repetition
+    that conflated variants sharing the canonical-4 axes.
+    """
     inlining_str = format_inlining_dict(inlining_list)
     writer.writerow(
         [
-            arch,
-            compiler,
-            compilerversion,
-            opt,
+            variant_ref,
             inlining_str,
             f"{data_offset:x}",
             f"{data_len:x}",
@@ -100,21 +104,25 @@ def write_function_section_csv(
 def write_unmatched_section_csv(
     writer,
     func_name,
-    platform_tuples,
+    variant_refs,
     called_functions_str,
     inlining_data_str,
     data_offset,
     data_len,
 ):
+    """Write one unmatched-section row.
+
+    ``variant_refs`` is the ordered list of ``0x<hex>`` row indices
+    (one per version present for this unmatched function). Encoded
+    semicolon-joined into a single cell, mirroring the structure of
+    the legacy ``compiler_sets`` cell so the column count stays
+    constant across the section CSV.
     """
-    Write unmatched section row with format:
-    function_name,"compiler_sets","called_functions","inlining_data",data_offset,data_len
-    """
-    platform_str = format_compiler_sets(platform_tuples)
+    variants_str = format_variant_refs(variant_refs)
     writer.writerow(
         [
             func_name,
-            platform_str,
+            variants_str,
             called_functions_str,
             inlining_data_str,
             f"{data_offset:x}",

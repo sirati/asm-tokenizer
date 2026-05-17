@@ -10,6 +10,7 @@ from ..aligned_data.io import (
     decode_runlengths,
     write_function_binary_data,
 )
+from .variants import VariantRegistry, write_warn_log_entry
 
 
 @dataclass
@@ -157,8 +158,10 @@ def build_inlining_data(
     function_lookup: dict,
     warn_log,
     func_name: str,
+    variants: VariantRegistry,
 ) -> List[InliningEntry]:
     """Build inlining data list with lookups, logging warnings for missing entries."""
+    variant_ref = variants.ref(vkey)
     inlining_data = {}
     for called_func in called_functions:
         called_idx = unique_called.index(called_func)
@@ -167,7 +170,7 @@ def build_inlining_data(
             func_offset, func_len, is_matched = function_lookup[lookup_key]
             inlining_data[called_idx] = (func_offset, func_len, is_matched)
         else:
-            warn_log.write(f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n")
+            write_warn_log_entry(warn_log, func_name, variant_ref, called_func)
 
     inlining_list = [
         InliningEntry(idx=idx, offset=start, length=length, is_matched=is_matched)

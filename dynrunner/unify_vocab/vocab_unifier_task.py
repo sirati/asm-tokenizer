@@ -127,18 +127,18 @@ class _OutputFilenameCollector:
 
 
 def _walk_with_filters(
-    root: str, gateway_url: str | None, filters: SelectionFilters
+    root: str, filters: SelectionFilters
 ) -> list:
     visitor = _CsvVisitor(filters)
-    return _native.find_items(visitor, root, gateway_url=gateway_url)
+    return _native.find_items(visitor, root)
 
 
 def _collect_existing_output_filenames(
-    output_root: str, gateway_url: str | None
+    output_root: str,
 ) -> set[str]:
     collector = _OutputFilenameCollector()
     try:
-        _native.find_items(collector, output_root, gateway_url=gateway_url)
+        _native.find_items(collector, output_root)
     except OSError:
         return set()
     return collector.filenames
@@ -190,17 +190,17 @@ class VocabUnifierTask:
         its own source_dir at run time.
         """
         config = process_selection_arguments(args)
-        if getattr(args, "source_already_staged", None):
-            root = args.source_already_staged
-            gateway_url = getattr(args, "gateway", None)
-        else:
-            root = str(config.source_dir)
-            gateway_url = None
+        # Always operates on a real local filesystem from the discoverer's
+        # POV. Under --multi-computer slurm with --source-already-staged,
+        # the framework runs discover_items on a promoted setup-secondary
+        # against its bind-mounted local path (passed here as source_dir);
+        # no SSH walk involved. Mirrors TokenizerTask.discover_items.
+        root = str(source_dir)
 
         csv_filters = compile_selection_filters(
             _replace_format(config, _csv_format(config.file_format))
         )
-        csv_items = _walk_with_filters(root, gateway_url, csv_filters)
+        csv_items = _walk_with_filters(root, csv_filters)
 
         if not csv_items:
             _logger.warning(
@@ -224,9 +224,7 @@ class VocabUnifierTask:
         if getattr(args, "skip_existing", False):
             output_root = getattr(args, "resolved_output_root", None)
             if output_root:
-                completed = _collect_existing_output_filenames(
-                    output_root, gateway_url
-                )
+                completed = _collect_existing_output_filenames(output_root)
                 unified_name = self.get_output_filename_pattern(_TYPE_ID, None)
                 if unified_name in completed:
                     _logger.info(
@@ -275,6 +273,16 @@ class VocabUnifierTask:
         # Vendored asm-binary corpus selection flags (--platform etc.) —
         # see TokenizerTask.add_task_arguments for rationale.
         add_asm_selection_arguments(parser)
+        self.add_private_task_arguments(parser)
+
+    def add_private_task_arguments(self, parser: ArgumentParser) -> None:
+        """Task-private argparse registrations (no asm-selection flags).
+
+        Split out of ``add_task_arguments`` so the composite
+        ``FullPipelineTask`` can register asm-selection flags exactly
+        once across all three child tasks while still binding each
+        child's own argparse surface.
+        """
         parser.add_argument(
             "--out-unified-vocab",
             type=str,

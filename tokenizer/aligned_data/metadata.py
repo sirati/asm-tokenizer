@@ -21,16 +21,17 @@ def parse_inlining_data(inlining_str: str) -> List[List[int]]:
 
 
 def extract_metadata_from_section_row(row: List[str], header: List[str]) -> Dict[str, Any]:
-    """
-    Given a row from the section CSV and its header, extract metadata fields as a dict.
-    Returns: dict with keys: arch, compiler, compilerversion, opt, inlining_data, data_offset, data_len
+    """Given a row from the section CSV and its header, extract metadata as a dict.
+
+    Returns: dict with keys ``variant_ref``, ``inlining_data``,
+    ``data_offset``, ``data_len``. The variant ref is the
+    ``0x<hex>`` row index into the per-group ``<binary>_variants.csv``
+    sidecar — resolution to the canonical-4 axes / extra-metadata is
+    a separate consumer-side concern and not performed here.
     """
     idx = {k: i for i, k in enumerate(header)}
     return {
-        "arch": row[idx["arch"]],
-        "compiler": row[idx["compiler"]],
-        "compilerversion": row[idx["compilerversion"]],
-        "opt": row[idx["opt"]],
+        "variant_ref": row[idx["variant_ref"]],
         "inlining_data": parse_inlining_data(row[idx["inlining_data"]]),
         "data_offset": int(row[idx["data_offset"]], 16),
         "data_len": int(row[idx["data_len"]], 16),

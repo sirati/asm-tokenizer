@@ -46,6 +46,12 @@ class SelectionFilters:
     compiler_versions: list[str] | None
     normalized_opt_levels: list[str] | None
     exclude_pattern: re.Pattern | None
+    # Compiled `--name-regex` for post-parse binary-name filtering on the
+    # legacy local pathway (`walk_dataset` + `VariantInfo.from_legacy_filename`),
+    # which doesn't go through `match_filename`'s `binary_format` and would
+    # otherwise admit every parseable name regardless of `--name-regex`.
+    # None when no name-regex was supplied.
+    name_pattern: re.Pattern | None
 
 
 def _normalize_opt_levels_for_filter(
@@ -118,6 +124,7 @@ def compile_selection_filters(config: SelectionConfig) -> SelectionFilters:
             config.opt_levels, config.opt_regex
         ),
         exclude_pattern=_build_exclude_pattern(config.exclude_subfolders),
+        name_pattern=re.compile(config.name_regex) if config.name_regex else None,
     )
 
 

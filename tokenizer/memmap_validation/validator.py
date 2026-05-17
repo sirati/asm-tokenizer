@@ -428,24 +428,25 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
     if dataset.unmatched_func_names and dataset.unmatched_sections.exists():
         import csv
 
+        # The unmatched-section row's variant_refs cell is a
+        # semicolon-joined list of ``0x<hex>`` row indices into the
+        # per-group ``<binary>_variants.csv`` sidecar. Each ref's
+        # numeric value is the registration position, which coincides
+        # with this validator's own ``version_keys`` ordering (both
+        # derive from the same ordered ``config.versions`` list).
+        # Resolve each ref to the corresponding vkey directly.
+        from ..aligned_data.csv_format import parse_variant_refs
+
         index_entry_idx = 0
         with open(dataset.unmatched_sections, "r", newline="", encoding="ascii") as f:
             reader = csv.reader(f)
             for row in reader:
                 if row and len(row) == 6:
                     func_name = row[0]
-                    platform_tuples_str = row[1]
-                    if platform_tuples_str:
-                        from ..aligned_data.csv_format import parse_compiler_sets
-
-                        platform_tuples = parse_compiler_sets(platform_tuples_str)
-                        for arch, compiler, compilerversion, opt in platform_tuples:
-                            vkey = VersionKey(
-                                arch=arch,
-                                compiler=compiler,
-                                compilerversion=compilerversion,
-                                opt=opt,
-                            )
+                    variant_refs_str = row[1]
+                    if variant_refs_str:
+                        for ref in parse_variant_refs(variant_refs_str):
+                            vkey = version_keys[int(ref, 16)]
                             unmatched_data_by_name_and_vkey[(func_name, vkey)] = index_entry_idx
                             index_entry_idx += 1
 

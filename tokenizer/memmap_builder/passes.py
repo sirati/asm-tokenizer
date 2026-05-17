@@ -9,6 +9,7 @@ from .helpers import (
     should_skip_function_for_matched,
     should_skip_function_for_unmatched,
 )
+from .variants import VariantRegistry, write_warn_log_entry
 from .writers import (
     build_inlining_data_for_unmatched,
     finalize_index_file,
@@ -95,13 +96,6 @@ def process_unmatched_function_pass1(
         try:
             binary_data = process_function_binary_data(row, mapping, data_file, dedup_cache)
 
-            platform_tuple = (
-                vkey.arch,
-                vkey.compiler,
-                vkey.compilerversion,
-                vkey.opt,
-            )
-
             unmatched_entries.append(
                 {
                     "func_name": func_name,
@@ -109,7 +103,6 @@ def process_unmatched_function_pass1(
                     "data_offset": binary_data.data_offset,
                     "data_len": binary_data.data_len,
                     "token_len": binary_data.token_len,
-                    "platform_tuple": platform_tuple,
                     "called": set(called),
                 }
             )
@@ -152,6 +145,7 @@ def write_matched_sections_pass2(
     sections_file,
     index_file,
     warn_log,
+    variants: VariantRegistry,
 ):
     """Pass 2: Write matched sections CSV with resolved inlining data."""
     writer = csv.writer(sections_file)
@@ -174,6 +168,7 @@ def write_matched_sections_pass2(
             data_len = vdata["data_len"]
             token_len = vdata["token_len"]
 
+            variant_ref = variants.ref(vkey)
             inlining_data = {}
             for called_func in called:
                 called_idx = unique_called.index(called_func)
@@ -182,9 +177,7 @@ def write_matched_sections_pass2(
                     func_offset, func_len, is_matched = function_lookup[lookup_key]
                     inlining_data[called_idx] = (func_offset, func_len, is_matched)
                 else:
-                    warn_log.write(
-                        f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-                    )
+                    write_warn_log_entry(warn_log, func_name, variant_ref, called_func)
 
             inlining_list = [
                 [idx, start, length, is_matched] for idx, (start, length, is_matched) in sorted(inlining_data.items())
@@ -192,10 +185,7 @@ def write_matched_sections_pass2(
 
             write_function_section_csv(
                 writer,
-                vkey.arch,
-                vkey.compiler,
-                vkey.compilerversion,
-                vkey.opt,
+                variant_ref,
                 inlining_list,
                 data_offset,
                 data_len,
@@ -212,7 +202,15 @@ def write_matched_sections_pass2(
 def group_unmatched_entries_by_function(
     unmatched_data_entries: List[dict],
 ) -> Dict[str, dict]:
-    """Group unmatched entries by function name."""
+    """Group unmatched entries by function name.
+
+    Per-function aggregator: collects the vkeys in encounter order
+    (their list position is the ``comp_set_id`` referenced from
+    ``called_by_version`` and the inlining-data merge). The pass-2
+    writer resolves vkeys to ``0x<hex>`` variant refs via the
+    ``VariantRegistry``; this stage stays unaware of the on-disk
+    encoding.
+    """
     unmatched_by_func = {}
     for entry in unmatched_data_entries:
         func_name = entry["func_name"]
@@ -220,14 +218,12 @@ def group_unmatched_entries_by_function(
 
         if func_name not in unmatched_by_func:
             unmatched_by_func[func_name] = {
-                "platform_tuples": [],
                 "all_called": set(),
                 "version_data_list": [],
                 "called_by_version": [],
                 "vkeys": [],
             }
 
-        unmatched_by_func[func_name]["platform_tuples"].append(entry["platform_tuple"])
         unmatched_by_func[func_name]["all_called"].update(entry["called"])
         unmatched_by_func[func_name]["version_data_list"].append(
             (entry["data_offset"], entry["data_len"], entry["token_len"])
@@ -245,13 +241,13 @@ def write_unmatched_sections_pass2(
     sections_file,
     index_file,
     warn_log,
+    variants: VariantRegistry,
 ):
     """Pass 2: Write unmatched sections CSV with resolved inlining data."""
     writer = csv.writer(sections_file)
     unmatched_by_func = group_unmatched_entries_by_function(unmatched_data_entries)
 
     for func_name, data in unmatched_by_func.items():
-        platform_tuples = data["platform_tuples"]
         all_called = data["all_called"]
         version_data_list = data["version_data_list"]
         called_by_version = data["called_by_version"]
@@ -270,12 +266,15 @@ def write_unmatched_sections_pass2(
             function_lookup,
             warn_log,
             func_name,
+            variants,
         )
+
+        variant_refs = [variants.ref(vkey) for vkey in vkeys]
 
         write_unmatched_function_section(
             writer,
             func_name,
-            platform_tuples,
+            variant_refs,
             unique_called_list,
             inlining_data_list,
             first_offset,

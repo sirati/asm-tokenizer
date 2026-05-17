@@ -14,6 +14,7 @@ from tokenizer.memmap_builder.helpers import (
     get_called_functions_from_row,
     process_function_binary_data,
 )
+from tokenizer.memmap_builder.variants import VariantRegistry
 from tokenizer.memmap_builder.writers import finalize_index_file
 from tokenizer.vocab_unifier import load_vocab_manager
 
@@ -198,6 +199,7 @@ def write_function_sections(
     binary_name,
     function_lookup,
     warn_log,
+    variants,
     unmatched=False,
 ):
     """Write the function sections and binary data files as specified."""
@@ -236,14 +238,13 @@ def write_function_sections(
             mapping = mapping_dict.get(vkey)
             binary_data = process_function_binary_data(row, mapping, file2, dedup_cache)
 
-            inlining_list = build_inlining_data(called, unique_called, vkey, function_lookup, warn_log, func_name)
+            inlining_list = build_inlining_data(
+                called, unique_called, vkey, function_lookup, warn_log, func_name, variants
+            )
 
             write_function_section_csv(
                 writer,
-                vkey.arch,
-                vkey.compiler,
-                vkey.compilerversion,
-                vkey.opt,
+                variants.ref(vkey),
                 format_inlining_list(inlining_list),
                 binary_data.data_offset,
                 binary_data.data_len,
@@ -271,6 +272,7 @@ def write_unmatched_files(
     binary_name,
     function_lookup,
     warn_log,
+    variants,
 ):
     from tokenizer.memmap_builder.writers import (
         build_inlining_data_for_unmatched,
@@ -285,7 +287,7 @@ def write_unmatched_files(
 
     for func_name in function_names:
         dedup_cache = {}
-        platform_tuples = []
+        per_func_vkeys = []
         all_called = set()
         version_data_list = []
         called_by_version = []
@@ -302,7 +304,7 @@ def write_unmatched_files(
             mapping = mapping_dict.get(vkey)
             binary_data = process_function_binary_data(row, mapping, data_file, dedup_cache)
 
-            platform_tuples.append((vkey.arch, vkey.compiler, vkey.compilerversion, vkey.opt))
+            per_func_vkeys.append(vkey)
             version_data_list.append((binary_data.data_offset, binary_data.data_len, binary_data.token_len))
             called_by_version.append((compiler_set_id, called))
             compiler_set_id += 1
@@ -318,12 +320,15 @@ def write_unmatched_files(
                 function_lookup,
                 warn_log,
                 func_name,
+                variants,
             )
+
+            variant_refs = [variants.ref(vkey) for vkey in per_func_vkeys]
 
             write_unmatched_function_section(
                 sections_writer,
                 func_name,
-                platform_tuples,
+                variant_refs,
                 unique_called_list,
                 inlining_data_list,
                 first_offset,
@@ -452,6 +457,14 @@ def export_matched_and_unmatched_sets(binaries, output_path):
 
         function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
 
+        # Legacy entry-point: no per-variant metadata, so the registry
+        # captures only the canonical-4 axes; ``filename``/``pkg``
+        # default to the binary name and ``flags`` is empty. The
+        # ``_variants.csv`` sidecar is still emitted so the section
+        # CSVs are self-describing through their 0x<hex> refs.
+        variants = VariantRegistry.from_vkeys(version_keys, filename=binary, pkg=binary)
+        variants.write_sidecar(Path(out_path), binary)
+
         matched_sections_file = open(f"{out_path}/{prefix}_sections.csv", "w", newline="", encoding="ascii")
         matched_index_file = open(f"{out_path}/{prefix}_index.bin", "wb")
         warn_log = open(f"{out_path}/{binary}.warn.log", "w", encoding="ascii")
@@ -462,6 +475,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             matched_sections_file,
             matched_index_file,
             warn_log,
+            variants,
         )
 
         matched_sections_file.close()
@@ -481,6 +495,7 @@ def export_matched_and_unmatched_sets(binaries, output_path):
             unmatched_sections_file,
             unmatched_index_file,
             warn_log,
+            variants,
         )
 
         unmatched_sections_file.close()

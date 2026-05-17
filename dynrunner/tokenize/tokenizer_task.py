@@ -28,7 +28,6 @@ from dynrunner.binary_selection import (
     add_asm_selection_arguments,
     compile_selection_filters,
     is_excluded_subfolder,
-    match_filename,
     process_selection_arguments,
 )
 from tokenizer.arch_translation import arch_to_platform
@@ -41,6 +40,28 @@ _PHASE_ID = "tokenize"
 _TYPE_ID = "tokenizer"
 
 _logger = logging.getLogger(__name__)
+
+# Ghidra workspace artifacts that pyghidra writes adjacent to each
+# binary it touches (a sibling ``<binary-stem>_ghidra/`` directory
+# populated with project metadata). When TokenizerTask runs on a corpus
+# that retained those sidecars from a prior run, discovery would walk
+# them and try to tokenize the metadata as if it were ELF — angr then
+# fails with CLECompatibilityError on the Ghidra archive format.
+_GHIDRA_WORKSPACE_DIR_SUFFIX = "_ghidra"
+_GHIDRA_SIDECAR_EXTENSIONS: frozenset[str] = frozenset(
+    {".gpr", ".rep", ".lock", ".lock~", ".bak~", ".prp"}
+)
+
+
+def _is_ghidra_workspace_artifact(path: Path) -> bool:
+    """True if `path` is inside a ``*_ghidra/`` workspace directory or
+    has a Ghidra sidecar extension. Used to filter discovery so prior
+    Ghidra runs do not pollute the input set.
+    """
+    if any(seg.endswith(_GHIDRA_WORKSPACE_DIR_SUFFIX) for seg in path.parts[:-1]):
+        return True
+    name = path.name
+    return any(name.endswith(ext) for ext in _GHIDRA_SIDECAR_EXTENSIONS)
 
 
 class TokenizerPhase(str, Enum):
@@ -87,38 +108,28 @@ class TokenizerTask:
     ) -> Iterable[TaskInfo]:
         """Walk the source corpus, build TaskInfos with VariantInfo payload, sort.
 
-        Two transport pathways converge on the same
-        ``(BinaryHandle, VariantInfo)`` pair stream:
+        ``walk_dataset`` from ``tokenizer.binary_discovery`` does the
+        walk; it handles both legacy 4-axis filenames and the
+        sidecar-JSON folder format with per-directory dispatch,
+        returning ``(handle, variant)`` pairs where ``handle.path`` is
+        the binary file (and ``handle.variant_dir`` carries the
+        folder in sidecar mode).
 
-        * Local (default): ``walk_dataset`` from
-          ``tokenizer.binary_discovery`` handles both legacy 4-axis
-          filenames and the new sidecar-JSON format with per-directory
-          dispatch, returning ``(handle, variant)`` pairs with
-          ``handle.tarball`` set in sidecar mode.
-        * Gateway / SSH (``args.source_already_staged`` set, SLURM
-          mode): the Rust ``_native.find_items`` walker still drives
-          remote discovery via the existing ``--gateway`` connection;
-          its ``BinaryIdentifier`` outputs are adapted to
-          ``VariantInfo`` via ``VariantInfo.from_legacy_filename`` for
-          symmetry with the local pathway. Sidecar over SSH is not yet
-          supported (TODO: extend ``walk_dataset`` to take a path-walk
-          backend so the gateway transport can carry both formats).
+        Always operates on a real local filesystem from the discoverer's
+        POV. Under ``--multi-computer slurm`` with
+        ``--source-already-staged``, the framework runs discover_items
+        on a promoted setup-secondary against its bind-mounted
+        ``/app/src-network`` (a local path from that secondary's POV);
+        no SSH walk involved.
 
         Selection filters (``--platform``, ``--compiler``,
-        ``--compiler-versions``, ``--opt``, ``--exclude-subfolder``) are
-        applied uniformly on the converged pair stream so both formats
-        respect the same allowlists.
+        ``--compiler-versions``, ``--opt``, ``--name-regex``,
+        ``--exclude-subfolder``) are applied uniformly post-walk.
         """
         config = process_selection_arguments(args)
         filters: SelectionFilters = compile_selection_filters(config)
 
-        gateway_url = (
-            getattr(args, "gateway", None)
-            if getattr(args, "source_already_staged", None)
-            else None
-        )
-
-        pairs = self._iter_filtered_pairs(args, config, filters)
+        pairs = self._iter_local_pairs(source_dir, filters)
         # `source_root` is the absolute prefix the discovery walks
         # produced their `BinaryHandle.path` / `.tarball` against. The
         # framework treats `TaskInfo.path` as the wire identifier and
@@ -126,19 +137,12 @@ class TokenizerTask:
         # absolute paths here makes the wire identifier non-portable
         # across primary/secondary FS-views, so we strip the prefix
         # at the TaskInfo boundary.
-        source_root = (
-            Path(args.source_already_staged)
-            if getattr(args, "source_already_staged", None)
-            else config.source_dir
-        )
-        sorted_items = list(self._sort_and_tag_pairs(pairs, source_root))
+        sorted_items = list(self._sort_and_tag_pairs(pairs, source_dir))
 
         if getattr(args, "skip_existing", False):
             output_root = getattr(args, "resolved_output_root", None)
             if output_root:
-                completed = _collect_existing_output_filenames(
-                    output_root, gateway_url
-                )
+                completed = _collect_existing_output_filenames(output_root)
                 before = len(sorted_items)
                 sorted_items = [
                     it
@@ -159,24 +163,6 @@ class TokenizerTask:
 
         return sorted_items
 
-    def _iter_filtered_pairs(
-        self,
-        args: Namespace,
-        config,
-        filters: SelectionFilters,
-    ) -> Iterable[tuple[BinaryHandle, VariantInfo, int]]:
-        """Yield ``(handle, variant, size)`` triples respecting selection filters.
-
-        Dispatches between the local ``walk_dataset`` pathway and the
-        gateway ``_native.find_items`` pathway based on whether
-        ``--source-already-staged`` is set; both converge on the same
-        triple shape so downstream sort + emit logic stays uniform.
-        """
-        if getattr(args, "source_already_staged", None):
-            yield from self._iter_gateway_pairs(args, filters)
-        else:
-            yield from self._iter_local_pairs(config.source_dir, filters)
-
     def _iter_local_pairs(
         self,
         source_dir: Path,
@@ -184,6 +170,8 @@ class TokenizerTask:
     ) -> Iterable[tuple[BinaryHandle, VariantInfo, int]]:
         """Walk ``source_dir`` locally via ``walk_dataset`` and apply filters."""
         for handle, variant in walk_dataset(source_dir):
+            if _is_ghidra_workspace_artifact(handle.path):
+                continue
             if not _variant_passes_filters(variant, filters):
                 continue
             if not _path_passes_subfolder_filter(handle.path, source_dir, filters):
@@ -198,70 +186,6 @@ class TokenizerTask:
             except OSError:
                 continue
             yield handle, variant, size
-
-    def _iter_gateway_pairs(
-        self,
-        args: Namespace,
-        filters: SelectionFilters,
-    ) -> Iterable[tuple[BinaryHandle, VariantInfo, int]]:
-        """Walk a gateway-side path via ``_native.find_items`` over SSH.
-
-        Only legacy 4-axis filenames are handled here — the Rust walker
-        + ``visit()`` only mark files matching that format. Sidecar-over-
-        SSH is a known gap (see ``discover_items`` docstring).
-        """
-        root = args.source_already_staged
-        gateway_url = getattr(args, "gateway", None)
-        self._filters: SelectionFilters | None = filters
-        try:
-            items = _native.find_items(self, root, gateway_url=gateway_url)
-        finally:
-            self._filters = None
-
-        root_path = Path(root)
-        for item in items:
-            absolute_path = root_path / str(item.path)
-            try:
-                variant = VariantInfo.from_legacy_filename(absolute_path)
-            except ValueError:
-                continue
-            handle = BinaryHandle(path=absolute_path, tarball=None)
-            yield handle, variant, item.size
-
-    def visit(
-        self,
-        parent_payload: str | None,
-        subfolders: list,
-        files: list,
-    ) -> None:
-        """Per-directory policy callback driven by `_native.find_items`.
-
-        Used only on the gateway-SSH pathway (``_iter_gateway_pairs``);
-        the local pathway uses ``walk_dataset`` directly. Per-file
-        matching + per-subfolder exclude both delegate to the framework's
-        ``match_filename`` / ``is_excluded_subfolder`` helpers so this
-        stays in lockstep with the standard
-        ``platform-compiler-version-opt-binary`` filename format.
-        """
-        filters = self._filters
-        if filters is None:
-            return
-
-        current_rel = parent_payload or ""
-
-        for folder in subfolders:
-            child_rel = (
-                f"{current_rel}/{folder.name}" if current_rel else folder.name
-            )
-            if is_excluded_subfolder(child_rel, filters):
-                folder.enter(False)
-            else:
-                folder.enter(True, payload=child_rel)
-
-        for f in files:
-            identifier = match_filename(f.name, filters)
-            if identifier is not None:
-                f.mark(True, payload=identifier)
 
     @staticmethod
     def _sort_and_tag_pairs(
@@ -301,13 +225,13 @@ class TokenizerTask:
 
         for _, _, group in group_averages:
             for handle, variant, size in group:
-                # `TaskInfo.path` is the file the framework uploads /
-                # stages / hashes for this task. For sidecar tasks
-                # that's the .tar.zst (the archive carries the binaries
-                # to tokenize); the JSON sidecar is metadata-only and
+                # `TaskInfo.path` is the binary file the framework
+                # uploads / stages / hashes for this task. Sidecar
+                # mode points at `<variant_dir>/<pkg>`; legacy mode
+                # points at the canonical-format binary on disk. The
+                # JSON sidecar (in sidecar mode) is metadata-only and
                 # already fully decoded into `variant` at discovery
                 # time, so it doesn't need to travel across the wire.
-                # Legacy tasks emit the binary file directly.
                 #
                 # Emit RELATIVE-to-source-root paths so the wire
                 # identifier is portable across primary/secondary
@@ -317,11 +241,10 @@ class TokenizerTask:
                 # Absolute primary-side paths break that semantics
                 # in SLURM dispatch (the secondary's source mount is
                 # at a different absolute location).
-                abs_path = handle.tarball if handle.tarball is not None else handle.path
                 try:
-                    wire_path = abs_path.relative_to(source_root)
+                    wire_path = handle.path.relative_to(source_root)
                 except ValueError:
-                    wire_path = abs_path
+                    wire_path = handle.path
                 yield TaskInfo(
                     path=wire_path,
                     size=size,
@@ -363,6 +286,16 @@ class TokenizerTask:
         # here so the `discover_items` body can consume them via
         # `process_selection_arguments(args)`.
         add_asm_selection_arguments(parser)
+        self.add_private_task_arguments(parser)
+
+    def add_private_task_arguments(self, parser: ArgumentParser) -> None:
+        """Task-private argparse registrations (no asm-selection flags).
+
+        The composite ``FullPipelineTask`` calls this directly so it can
+        register the asm-selection flag block exactly once across all
+        three child tasks; the standalone entry point still funnels
+        through ``add_task_arguments`` (which composes both).
+        """
 
     def build_worker_command_args(
         self,
@@ -538,6 +471,16 @@ def _variant_passes_filters(
         and variant.opt not in filters.normalized_opt_levels
     ):
         return False
+    # Name-regex post-parse check. The local pathway (`walk_dataset` +
+    # `VariantInfo.from_legacy_filename`) doesn't run filenames through
+    # `match_filename`, so `binary_format`'s embedded name-regex never
+    # gets applied there. `filters.name_pattern` is the same regex
+    # exposed as a standalone `re.Pattern`; checking it against
+    # `variant.pkg` (the parsed binary-name field) closes the gap.
+    # Without this, `--name-regex minigzipsh` on the local pathway
+    # admits ~13× more items than the SLURM-pathway sibling (BUGS.md #3).
+    if filters.name_pattern is not None and not filters.name_pattern.search(variant.pkg):
+        return False
     return True
 
 
@@ -594,9 +537,7 @@ class _OutputFilenameCollector:
             self.filenames.add(f.name)
 
 
-def _collect_existing_output_filenames(
-    output_root: str, gateway_url: str | None
-) -> set[str]:
+def _collect_existing_output_filenames(output_root: str) -> set[str]:
     """Walk `output_root` via `_native.find_items` and return the set of
     file basenames present.
 
@@ -604,10 +545,15 @@ def _collect_existing_output_filenames(
     directory yet) yields an empty set rather than an error — the
     skip-existing filter degrades to no-op on a fresh deployment instead
     of failing the whole dispatch.
+
+    Post the 2026-05-13 native-task-discovery refactor (`6f583fc`),
+    `_native.find_items` accepts only `(task_definition, root)` and
+    always operates on a local filesystem; the gateway-SSH walk path
+    is gone framework-side.
     """
     collector = _OutputFilenameCollector()
     try:
-        _native.find_items(collector, output_root, gateway_url=gateway_url)
+        _native.find_items(collector, output_root)
     except OSError:
         # Path doesn't exist or unreadable — first-run case; treat as
         # "no completions yet".

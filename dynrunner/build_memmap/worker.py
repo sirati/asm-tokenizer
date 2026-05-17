@@ -140,6 +140,12 @@ def _process_payload(
                 pkg=pkg,
                 variant_id=int(entry.get("variant_id", 0)),
                 extra_metadata=extra_metadata,
+                # ``filename`` flows from the planner verbatim (the
+                # CSV's parent folder name). The worker forwards it
+                # so the builder's per-group ``_variants.csv``
+                # sidecar can record each variant's stable on-disk
+                # identity.
+                filename=entry.get("filename", "") or "",
             )
         )
 

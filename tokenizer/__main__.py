@@ -1,11 +1,9 @@
 import argparse
-import contextlib
 import json
 import logging
 import os
 import random
 import sys
-import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +23,6 @@ from tokenizer.arch import Platform
 from tokenizer.arch_translation import arch_to_platform
 from tokenizer.output_filename import format_output_basename
 from tokenizer.run_tokenizer import NonRecoverableTokenizerError, run_tokenizer
-from tokenizer.tarball_extractor import extract_all_binaries
 from tokenizer.variant_info import VariantInfo
 
 # Payload-key constants mirror the task-side encoder
@@ -34,15 +31,6 @@ from tokenizer.variant_info import VariantInfo
 # than a silent default. The variant sub-dict exactly matches
 # ``VariantInfo``'s field names — see ``_decode_variant``.
 _PAYLOAD_VARIANT_KEY = "variant"
-
-# Per-task tarball extraction lives under this root so it's isolated
-# from the durable output directory and from concurrent tasks. Each
-# task gets a unique TemporaryDirectory under here scoped by
-# ``relative_path`` so collisions across worker reuse can't happen.
-# The directory is removed on handler exit (success or failure)
-# regardless of which path through the worker fired.
-_EXTRACT_ROOT = Path(tempfile.gettempdir()) / "tokenizer-extract"
-
 
 def _decode_variant(variant_dict: dict) -> VariantInfo:
     """Reconstruct ``VariantInfo`` from the JSON-decoded payload.
@@ -82,15 +70,18 @@ class _TokenizeJob:
     output_basename: str
 
 
-def _legacy_job(source_path: Path, variant: VariantInfo) -> _TokenizeJob:
-    """Build the single ``_TokenizeJob`` for a legacy (non-sidecar)
-    task.
+def _job_for_task(source_path: Path, variant: VariantInfo) -> _TokenizeJob:
+    """Build the single ``_TokenizeJob`` the worker runs for one task.
 
-    The basename is composed from the variant's canonical-4 + pkg +
-    variant_id — for legacy tasks ``variant_id == 0`` and
+    The on-disk file at ``source_path`` is always a binary (no
+    extraction step) — discovery (``walk_dataset``) emits the binary
+    path directly for both legacy 4-axis files and sidecar-folder
+    variants. The basename is composed from the variant's canonical-4
+    + pkg + variant_id: for legacy tasks (``variant_id == 0``)
     ``variant.pkg`` equals the binary basename, so this round-trips
     the source filename byte-for-byte (preserving legacy output
-    paths).
+    paths); for sidecar-folder tasks (``variant_id != 0``) ``pkg`` is
+    the binary's name within its variant folder.
     """
     return _TokenizeJob(
         binary_path=source_path,
@@ -103,75 +94,6 @@ def _legacy_job(source_path: Path, variant: VariantInfo) -> _TokenizeJob:
             variant.variant_id,
         ),
     )
-
-
-def _sidecar_jobs(
-    tarball: Path, scratch_dir: Path, variant: VariantInfo
-) -> list[_TokenizeJob]:
-    """Extract every regular-file member of ``tarball`` into
-    ``scratch_dir``; return one ``_TokenizeJob`` per member.
-
-    Each job's output basename is composed by replacing the binary-
-    name slot (``pkg`` parameter on
-    ``tokenizer.output_filename.format_output_basename``) with the
-    archive member's basename. ``Path(member_name).name`` strips any
-    archive-internal subdir layout (e.g. ``./hello`` → ``hello``,
-    ``usr/bin/cat`` → ``cat``) so the emitted filename is the bare
-    binary name regardless of how the archive structures its members.
-
-    All N jobs share the same ``VariantInfo`` (per-package metadata
-    applies identically to every binary in the package); only the
-    output basename differs per binary.
-    """
-    return [
-        _TokenizeJob(
-            binary_path=binary_path,
-            output_basename=format_output_basename(
-                variant.arch,
-                variant.compiler,
-                variant.compiler_version,
-                variant.opt,
-                Path(member_name).name,
-                variant.variant_id,
-            ),
-        )
-        for binary_path, member_name in extract_all_binaries(tarball, scratch_dir)
-    ]
-
-
-@contextlib.contextmanager
-def _resolve_jobs_for_task(
-    source_path: Path,
-    variant: VariantInfo,
-    tarball: Path | None,
-):
-    """Yield the list of ``_TokenizeJob`` instances the handler runs
-    for this task.
-
-    Two pathways converge:
-
-    * Legacy (``tarball is None``): ``source_path`` is the binary file
-      itself; yields a one-element list with the canonical-format
-      basename derived from ``variant``. No scratch dir.
-    * Sidecar (``tarball`` is set): the archive is extracted into a
-      per-task scratch dir under ``/tmp/tokenizer-extract/`` (scoped
-      by variant pkg + id so concurrent tasks don't collide); yields
-      one job per regular-file member of the archive, each with its
-      own per-binary basename. Scratch cleanup runs unconditionally
-      on context exit so all jobs must finish before the with-block
-      exits (the handler's loop is fully inside this scope).
-    """
-    if tarball is None:
-        yield [_legacy_job(source_path, variant)]
-        return
-
-    _EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=f"{variant.pkg}-{variant.variant_id:08x}-",
-        dir=_EXTRACT_ROOT,
-    ) as scratch_str:
-        scratch_dir = Path(scratch_str)
-        yield _sidecar_jobs(tarball, scratch_dir, variant)
 
 
 @dataclass(frozen=True)
@@ -317,9 +239,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         type=str,
-        default="angr",
+        default="ghidra",
         choices=["angr", "ghidra"],
-        help="Disassembly backend to use (default: angr)",
+        help="Disassembly backend to use (default: ghidra)",
     )
     parser.add_argument(
         "--simulate-errors",
@@ -422,13 +344,12 @@ def handle(task: Task) -> WorkerOutput | None:
         raise NonRecoverableError(f"Simulated error ({_SIMULATE_ERRORS}% chance)")
 
     # Decode the task payload (encoded by tokenizer_task._build_payload)
-    # into a VariantInfo. Tarball location is no longer carried in
-    # the payload — for sidecar tasks the on-disk file at source_path
-    # IS the tarball, and the worker treats source_path as the
-    # archive when ``variant.variant_id != 0``.
+    # into a VariantInfo. The wire identifier (``source_path``) always
+    # points at the binary file itself for both transport flavors
+    # ``walk_dataset`` emits (legacy 4-axis files and sidecar-folder
+    # ``<variant_dir>/<pkg>`` binaries) — no extraction step exists.
     payload = json.loads(task.payload_str) if task.payload_str else {}
     variant = _decode_variant(payload[_PAYLOAD_VARIANT_KEY])
-    tarball_path = source_path if variant.variant_id != 0 else None
 
     # Source-tree-relative path used for output layout + staged_publish
     # scope. ``task.relative_path`` is wire-supplied relative to the
@@ -449,40 +370,26 @@ def handle(task: Task) -> WorkerOutput | None:
         platform = cast(Platform | str, _PLATFORM)
 
     try:
-        # ``_resolve_jobs_for_task`` yields one job per binary the
-        # handler must tokenize: legacy → exactly one (the source
-        # file); sidecar → one per regular-file member of the
-        # tarball. Each job carries its own ``output_basename`` so
-        # multi-binary tarballs land at distinct filenames while
-        # sharing one VariantInfo's per-package metadata. Aggregated
-        # warnings + filtered counts surface to the framework as a
-        # single ``WorkerOutput``; the framework's protocol has no
-        # per-emit reporting so summing is the right model
-        # (skip-existing emits return ``(-1, -1)``; clamping to 0
-        # below preserves the existing semantic that
-        # ``warnings_total == 0 and filtered_total == 0`` after a
-        # full skip is indistinguishable from a successful zero-
-        # warning run, matching the legacy single-binary contract).
-        warnings_total = 0
-        filtered_total = 0
-        with _resolve_jobs_for_task(source_path, variant, tarball_path) as jobs:
-            for job in jobs:
-                warnings, filtered = run_tokenizer(
-                    job.binary_path,
-                    platform=platform,
-                    skip_existing_csv=_SKIP_EXISTING,
-                    source_dir=_SOURCE_DIR,
-                    output_dir=_OUTPUT_DIR,
-                    task=task,
-                    backend=_BACKEND,
-                    variant_info=variant,
-                    source_relative_path=source_relative_path,
-                    output_basename=job.output_basename,
-                )
-                if warnings >= 0:
-                    warnings_total += warnings
-                if filtered >= 0:
-                    filtered_total += filtered
+        # ``_job_for_task`` builds the single ``_TokenizeJob`` the
+        # worker runs. ``run_tokenizer`` returns warnings + filtered
+        # counts; skip-existing emits return ``(-1, -1)`` which clamp
+        # to 0 below — preserves the original semantic that ``0/0``
+        # after a full skip is indistinguishable from a clean run.
+        job = _job_for_task(source_path, variant)
+        warnings, filtered = run_tokenizer(
+            job.binary_path,
+            platform=platform,
+            skip_existing_csv=_SKIP_EXISTING,
+            source_dir=_SOURCE_DIR,
+            output_dir=_OUTPUT_DIR,
+            task=task,
+            backend=_BACKEND,
+            variant_info=variant,
+            source_relative_path=source_relative_path,
+            output_basename=job.output_basename,
+        )
+        warnings_total = max(0, warnings)
+        filtered_total = max(0, filtered)
     except NonRecoverableTokenizerError as e:
         # Binary-deterministic tokenizer failures (e.g.
         # angr arm_elf_fast.py:89 IndexError on certain

@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List
 
 
 def format_inlining_dict(inlining_list: List) -> str:
@@ -13,14 +13,17 @@ def format_inlining_dict(inlining_list: List) -> str:
     return ";".join(parts)
 
 
-def format_compiler_sets(compiler_sets: List[Tuple[str, str, str, str]]) -> str:
-    """Format list of compiler set tuples using semicolon separation: arch,compiler,version,opt;..."""
-    if not compiler_sets:
+def format_variant_refs(variant_refs: List[str]) -> str:
+    """Encode an ordered list of ``0x<hex>`` variant refs into a single
+    section-CSV cell.
+
+    Each entry is already the ``0x<hex>`` form produced by
+    ``VariantRegistry.ref`` — this function only chooses the
+    separator (``;``). Empty list yields an empty cell.
+    """
+    if not variant_refs:
         return ""
-    parts = []
-    for arch, compiler, compilerversion, opt in compiler_sets:
-        parts.append(f"{arch},{compiler},{compilerversion},{opt}")
-    return ";".join(parts)
+    return ";".join(variant_refs)
 
 
 def format_unique_called(unique_called: List[str]) -> str:
@@ -70,15 +73,14 @@ def parse_inlining_data(inlining_str: str) -> List[Tuple]:
     return entries
 
 
-def parse_compiler_sets(compiler_sets_str: str) -> List[Tuple[str, str, str, str]]:
-    """Parse semicolon-separated compiler sets: arch,compiler,version,opt;..."""
-    if not compiler_sets_str:
+def parse_variant_refs(variant_refs_str: str) -> List[str]:
+    """Inverse of ``format_variant_refs``: split a section-CSV variant-ref
+    cell back into the ordered list of ``0x<hex>`` refs.
+
+    Returns the raw string entries (no integer conversion) so consumers
+    can decide whether to keep the hex form or resolve into the
+    sidecar variants CSV. Empty cell yields ``[]``.
+    """
+    if not variant_refs_str:
         return []
-    sets = []
-    for part in compiler_sets_str.split(";"):
-        if not part:
-            continue
-        fields = part.split(",")
-        if len(fields) >= 4:
-            sets.append((fields[0], fields[1], fields[2], fields[3]))
-    return sets
+    return [part for part in variant_refs_str.split(";") if part]

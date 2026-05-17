@@ -1,13 +1,12 @@
-"""Per-directory dispatch between legacy 4-axis filenames and the new
+"""Per-directory dispatch between legacy 4-axis filenames and the
 sidecar-JSON dataset layout.
 
 Single concern: turn a dataset directory tree into a flat stream of
 ``(BinaryHandle, VariantInfo)`` pairs. Format detection is per-subdir
 and lazy: each directory is classified once at descent time as
-"sidecar" (contains at least one ``*.json`` paired with a same-stem
-``*.tar.zst``) or "legacy" (everything else). Mixed-format trees work
-naturally because dispatch happens per directory, not for the tree as
-a whole.
+"sidecar" (``*.json`` paired with same-stem directory containing the
+binary) or "legacy" (4-axis filenames). Both flavors can coexist in
+one directory — pairs are emitted per stem.
 
 This module owns *only* the walk + dispatch concern. Filename / sidecar
 parsing is delegated to ``VariantInfo.from_legacy_filename`` and
@@ -18,22 +17,23 @@ that is the caller's concern, applied to the emitted pairs.
 The opaque ``BinaryHandle`` exists because the two formats reach the
 binary content via different paths:
 
-* Legacy: ``path`` is the binary file itself; ``tarball`` is ``None``.
-* Sidecar: ``path`` is the JSON sidecar; ``tarball`` is the sibling
-  ``*.tar.zst`` archive (worker extracts at task time per the
-  per-task-extraction decision in the plan).
+* Legacy: ``path`` is the binary file itself; ``variant_dir`` is
+  ``None``.
+* Sidecar: ``path`` is the binary file inside the variant's folder
+  (``<variant_dir>/<pkg>``); ``variant_dir`` is that folder. The
+  worker reads ``path`` directly — discovery already located the
+  binary. Worker-side platform-derive routing keys on
+  ``VariantInfo.variant_id != 0`` (sidecar) vs ``== 0`` (legacy).
 
 Downstream consumers (tokenize / vocab / memmap discover_items) only
-need ``handle.path`` (used as ``TaskInfo.path`` — legacy convention
-preserved) and, in sidecar mode, ``handle.tarball`` (forwarded to the
-worker via payload for extraction).
+need ``handle.path`` (used as ``TaskInfo.path``); the worker reads it
+directly in both flavors.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -44,103 +44,96 @@ __all__ = ["BinaryHandle", "walk_dataset"]
 
 _logger = logging.getLogger(__name__)
 
-# Sidecar filename pair: the JSON carries metadata; the same-stem
-# .tar.zst carries the binary. Detection looks for at least one
-# matched pair in the directory; orphans on either side are reported
-# (warning) and skipped.
+# Sidecar pairing: a ``*.json`` carrying the variant's metadata next
+# to a same-stem subdirectory carrying the binary content. Detection
+# looks for at least one matched pair in the directory; orphans on
+# either side are reported (warning) and skipped.
 _SIDECAR_JSON_SUFFIX = ".json"
-_SIDECAR_TARBALL_SUFFIX = ".tar.zst"
 
 
 @dataclass(frozen=True)
 class BinaryHandle:
     """Opaque locator for the binary content of one variant.
 
-    Two flavors, distinguished by whether ``tarball`` is set:
+    Two flavors, distinguished by whether ``variant_dir`` is set:
 
-    * Legacy (``tarball is None``): ``path`` is the binary file on
-      disk. The caller can pass it straight to a tokenizer worker.
-    * Sidecar (``tarball`` is a Path): ``path`` is the JSON sidecar;
-      ``tarball`` is the matching ``*.tar.zst`` archive. The worker
-      extracts the archive at task time and finds the binary inside.
+    * Legacy (``variant_dir is None``): ``path`` is the binary file on
+      disk (its filename encodes the 4-axis variant info).
+    * Sidecar (``variant_dir`` is a Path): ``path`` is the binary file
+      inside the variant's folder (``<variant_dir>/<pkg>``); the JSON
+      sidecar metadata is already decoded into ``VariantInfo``.
     """
 
     path: Path
-    tarball: Path | None = None
+    variant_dir: Path | None = None
 
     def binary_size(self) -> int:
         """Uncompressed size of the binary content this handle locates.
 
         Single source of truth for "how big is the thing tokenization
-        will operate on", regardless of transport. Legacy: the
-        filesystem size of the binary file. Sidecar: the sum of regular-
-        file member sizes from the tarball's tar header (read without
-        decompressing the data payload — header-only walk via
-        ``tarfile.getmembers()``). Both flavors return *uncompressed*
-        bytes, so downstream RAM estimators see a consistent number
-        across the dataset's two layouts.
+        will operate on". Both flavors return ``path.stat().st_size``
+        — ``path`` is always a regular file on disk.
         """
-        if self.tarball is None:
-            return self.path.stat().st_size
-        return _tarball_uncompressed_size(self.tarball)
+        return self.path.stat().st_size
 
 
-def _tarball_uncompressed_size(tarball_path: Path) -> int:
-    """Sum of regular-file member sizes from the tarball's tar header.
-
-    Opens the archive in ``r:zst`` mode and walks ``getmembers()``;
-    member sizes come from the tar header so the data payload is never
-    decompressed. The "regular file" filter mirrors the convention the
-    extractor uses (``tarball_extractor.extract_all_binaries`` skips
-    every non-``isfile()`` member): directory and symlink entries
-    don't contribute to the binary content.
-    """
-    with tarfile.open(tarball_path, "r:zst") as tf:
-        return sum(m.size for m in tf.getmembers() if m.isfile())
-
-
-def _classify_dir_files(filenames: list[str]) -> set[str]:
-    """Return the set of stems for which BOTH a ``.json`` sidecar and a
-    matching ``.tar.zst`` archive exist in this directory. An empty set
-    means the directory is not in sidecar mode (legacy fallback)."""
+def _classify_dir_files(
+    filenames: list[str], dirnames: list[str]
+) -> set[str]:
+    """Return stems where a ``.json`` sidecar pairs with a same-stem
+    subdirectory in this dir. An empty set means the directory is in
+    legacy fallback."""
     json_stems = {
         name[: -len(_SIDECAR_JSON_SUFFIX)]
         for name in filenames
         if name.endswith(_SIDECAR_JSON_SUFFIX)
     }
-    tarball_stems = {
-        name[: -len(_SIDECAR_TARBALL_SUFFIX)]
-        for name in filenames
-        if name.endswith(_SIDECAR_TARBALL_SUFFIX)
-    }
-    return json_stems & tarball_stems
+    return json_stems & set(dirnames)
 
 
 def _emit_sidecar_dir(
     dir_path: Path,
-    filenames: list[str],
-    paired_stems: set[str],
+    folder_stems: set[str],
 ) -> Iterator[tuple[BinaryHandle, VariantInfo]]:
-    """Yield ``(handle, variant)`` for every paired sidecar in this
-    directory, sorted by stem for deterministic order. Orphan JSONs
-    (no matching tarball) are warned-and-skipped per the plan."""
-    json_names = sorted(
-        name for name in filenames if name.endswith(_SIDECAR_JSON_SUFFIX)
-    )
-    for json_name in json_names:
-        stem = json_name[: -len(_SIDECAR_JSON_SUFFIX)]
-        if stem not in paired_stems:
+    """Yield ``(handle, variant)`` for every sidecar-paired variant in
+    this directory, sorted by stem. ``path`` is the binary file inside
+    the variant's folder (``<stem>/<variant.pkg>``); the worker reads
+    it directly with no extraction. Folders that don't contain the
+    expected ``<pkg>`` file are warned-and-skipped (malformed
+    sidecar)."""
+    for stem in sorted(folder_stems):
+        json_path = dir_path / f"{stem}{_SIDECAR_JSON_SUFFIX}"
+        variant = VariantInfo.from_sidecar(json_path)
+        variant_dir = dir_path / stem
+        binary_path = variant_dir / variant.pkg
+        if not binary_path.is_file():
             _logger.warning(
-                "sidecar JSON %s has no matching %s%s — skipping",
-                dir_path / json_name,
-                stem,
-                _SIDECAR_TARBALL_SUFFIX,
+                "sidecar folder %s missing expected binary %r — skipping",
+                variant_dir,
+                variant.pkg,
             )
             continue
-        json_path = dir_path / json_name
-        tarball_path = dir_path / f"{stem}{_SIDECAR_TARBALL_SUFFIX}"
-        variant = VariantInfo.from_sidecar(json_path)
-        yield BinaryHandle(path=json_path, tarball=tarball_path), variant
+        yield BinaryHandle(path=binary_path, variant_dir=variant_dir), variant
+
+
+def _emit_orphan_json_warnings(
+    dir_path: Path,
+    filenames: list[str],
+    paired_stems: set[str],
+) -> None:
+    """Warn about ``*.json`` sidecars that aren't paired with a
+    same-stem directory."""
+    for name in sorted(filenames):
+        if not name.endswith(_SIDECAR_JSON_SUFFIX):
+            continue
+        stem = name[: -len(_SIDECAR_JSON_SUFFIX)]
+        if stem in paired_stems:
+            continue
+        _logger.warning(
+            "sidecar JSON %s has no matching %s/ — skipping",
+            dir_path / name,
+            stem,
+        )
 
 
 def _emit_legacy_dir(
@@ -162,7 +155,7 @@ def _emit_legacy_dir(
             variant = VariantInfo.from_legacy_filename(candidate)
         except ValueError:
             continue
-        yield BinaryHandle(path=candidate, tarball=None), variant
+        yield BinaryHandle(path=candidate, variant_dir=None), variant
 
 
 def walk_dataset(
@@ -171,21 +164,25 @@ def walk_dataset(
     """Walk ``source_dir`` recursively, classify each directory as
     sidecar or legacy, and yield ``(handle, variant)`` pairs.
 
-    Detection is lazy and per-directory: a directory is in sidecar mode
-    iff it contains at least one ``*.json`` paired with a same-stem
-    ``*.tar.zst``. Otherwise the directory is treated as legacy. The
-    walk descends into all subdirectories of either flavor, so a
-    sidecar directory under a legacy parent (or vice versa) works.
+    Detection is lazy and per-directory: a directory is in sidecar
+    mode iff it contains at least one ``*.json`` paired with a
+    same-stem subdirectory. Sidecar-paired folders are NOT descended
+    into for further walking (they only contain the variant's binary
+    — descending would re-emit it through the legacy fallback). Other
+    subdirectories are walked normally, so a sidecar directory under
+    a legacy parent (or vice versa) works.
 
-    Order: directories are visited in sorted top-down order, files
-    within a directory are emitted in sorted order. Caller can rely on
-    the iteration order being a deterministic function of the tree.
+    Order: directories visited in sorted top-down order; within a
+    directory, sidecar pairs emit first (alphabetical) then legacy
+    files. Iteration order is a deterministic function of the tree.
     """
     for root, dirs, files in os.walk(source_dir):
         dirs.sort()
         dir_path = Path(root)
-        paired_stems = _classify_dir_files(files)
+        paired_stems = _classify_dir_files(files, dirs)
         if paired_stems:
-            yield from _emit_sidecar_dir(dir_path, files, paired_stems)
+            yield from _emit_sidecar_dir(dir_path, paired_stems)
+            _emit_orphan_json_warnings(dir_path, files, paired_stems)
+            dirs[:] = [d for d in dirs if d not in paired_stems]
         else:
             yield from _emit_legacy_dir(dir_path, files)

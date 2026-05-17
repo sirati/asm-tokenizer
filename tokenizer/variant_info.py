@@ -14,10 +14,11 @@ Two construction paths exist:
   positions to the canonical field names. `variant_id=0`,
   `extra_metadata={}`.
 
-* `from_sidecar(json_path)`: JSON sidecar paired with a `*.tar.zst`
-  archive (filename: `<compiler>_<arch>_<opt>_<8hex>.json`). The
-  8-hex-digit filename suffix becomes `variant_id`. Storage-only keys
-  (`tarball_name`, `drv`, `label`) are dropped at this boundary.
+* `from_sidecar(json_path)`: JSON sidecar paired with a same-stem
+  directory containing the binary (filename:
+  `<compiler>_<arch>_<opt>_<8hex>.json`). The 8-hex-digit filename
+  suffix becomes `variant_id`. Storage-only keys (`tarball_name`,
+  `variant_dir`, `drv`, `label`) are dropped at this boundary.
   Canonical fields are pulled out of the JSON; everything else (e.g.
   `flag_set`, `hardening`, `sanitizer`, `march`, ...) flows through as
   `extra_metadata` without enumeration, so new sidecar fields require
@@ -54,7 +55,9 @@ from shared.binary_info import (
 # Storage-only keys that exist in the sidecar JSON but never enter the
 # pipeline-visible metadata. Listed here once so the boundary is
 # auditable in one place.
-_SIDECAR_STORAGE_ONLY_KEYS: frozenset[str] = frozenset({"tarball_name", "drv", "label"})
+_SIDECAR_STORAGE_ONLY_KEYS: frozenset[str] = frozenset(
+    {"tarball_name", "variant_dir", "drv", "label"}
+)
 
 # Canonical-axis keys consumed directly from the sidecar (mapped onto
 # fields of this dataclass). Kept as a constant so the

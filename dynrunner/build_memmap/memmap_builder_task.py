@@ -32,6 +32,8 @@ from pathlib import Path
 from dynamic_runner import _native
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
+from tokenizer.arch_translation import arch_to_platform
+
 from dynrunner.binary_selection import (
     BinaryIdentifier,
     SelectionFilters,
@@ -156,7 +158,7 @@ class _OutputFilenameCollector:
 
 
 def _walk_with_filters(
-    root: str, gateway_url: str | None, filters: SelectionFilters
+    root: str, filters: SelectionFilters
 ) -> list:
     """Run `_native.find_items` against `root` with a `_FormatVisitor`
     parameterised by `filters`. Returns the list of marked PyTaskInfo
@@ -164,11 +166,11 @@ def _walk_with_filters(
     `.identifier`).
     """
     visitor = _FormatVisitor(filters)
-    return _native.find_items(visitor, root, gateway_url=gateway_url)
+    return _native.find_items(visitor, root)
 
 
 def _collect_existing_output_filenames(
-    output_root: str, gateway_url: str | None
+    output_root: str,
 ) -> set[str]:
     """Walk `output_root` via `_native.find_items` and return the set of
     file basenames present. A non-existent or unreadable `output_root`
@@ -177,7 +179,7 @@ def _collect_existing_output_filenames(
     """
     collector = _OutputFilenameCollector()
     try:
-        _native.find_items(collector, output_root, gateway_url=gateway_url)
+        _native.find_items(collector, output_root)
     except OSError:
         return set()
     return collector.filenames
@@ -232,38 +234,28 @@ class MemmapBuilderTask:
         """Discover CSV outputs + mapping files via two `find_items`
         passes, pair by `BinaryIdentifier`, group by `binary_name`,
         emit one TaskInfo per group with the per-version pairing data
-        inline in `TaskInfo.payload`.
-
-        SLURM pre-staged mode (`args.source_already_staged` set):
-        both walks happen against the gateway via SSH, paths in the
-        emitted payload are gateway-absolute (the secondary's
-        bind-mount makes them resolve inside the container).
-
-        Local mode: walks resolve locally; payload paths are absolute
-        primary-side filesystem paths.
+        inline in `TaskInfo.payload`. Walks resolve locally against
+        the discoverer-side `source_dir` (either submitter-side for
+        local mode, or the promoted setup-secondary's bind-mount under
+        `--multi-computer slurm`). Payload paths are relative to the
+        walk roots; the worker resolves them against its own
+        source_dir at run time.
         """
         config = process_selection_arguments(args)
 
-        # Decide source / vocab roots and the gateway URL once. The
-        # `--vocab-source` flag (if set) overrides the mapping-pass
-        # root; otherwise it tracks the source root in both deployment
-        # modes.
-        if getattr(args, "source_already_staged", None):
-            source_root = args.source_already_staged
-            vocab_root = (
-                args.vocab_source
-                if args.vocab_source
-                else args.source_already_staged
-            )
-            gateway_url = getattr(args, "gateway", None)
-        else:
-            source_root = str(config.source_dir)
-            vocab_root = (
-                str(Path(args.vocab_source).resolve())
-                if args.vocab_source
-                else str(config.source_dir)
-            )
-            gateway_url = None
+        # Always operates on a real local filesystem from the discoverer's
+        # POV. Under --multi-computer slurm with --source-already-staged,
+        # the framework runs discover_items on a promoted setup-secondary
+        # against its bind-mounted local path (passed here as source_dir);
+        # no SSH walk involved. Mirrors TokenizerTask.discover_items.
+        # `--vocab-source` (if set) overrides the mapping-pass root;
+        # otherwise it tracks the source root.
+        source_root = str(source_dir)
+        vocab_root = (
+            str(Path(args.vocab_source).resolve())
+            if getattr(args, "vocab_source", None)
+            else str(source_dir)
+        )
 
         csv_filters = compile_selection_filters(
             _config_with_format(config, _csv_format(config.file_format))
@@ -275,14 +267,14 @@ class MemmapBuilderTask:
             _config_with_format(config, _meta_format(config.file_format))
         )
 
-        csv_items = _walk_with_filters(source_root, gateway_url, csv_filters)
-        mapping_items = _walk_with_filters(vocab_root, gateway_url, mapping_filters)
+        csv_items = _walk_with_filters(source_root, csv_filters)
+        mapping_items = _walk_with_filters(vocab_root, mapping_filters)
         # Meta sidecars live next to the CSVs (tokenize phase emits both
         # together), so the meta walk shares the CSV walk root. A meta
         # file's absence is benign: legacy build_memmap output predates
         # the sidecar writer, so each entry's `meta_path` defaults to
         # `None` when no sibling `_meta.json` is found.
-        meta_items = _walk_with_filters(source_root, gateway_url, meta_filters)
+        meta_items = _walk_with_filters(source_root, meta_filters)
 
         # Pair CSV ↔ mapping ↔ meta by explicit tuple key.
         # `_native.find_items` returns `PyTaskInfo` objects whose
@@ -304,7 +296,7 @@ class MemmapBuilderTask:
             stripped_name, variant_id = _split_variant_suffix(ident.binary_name)
             return (
                 stripped_name,
-                ident.platform,
+                arch_to_platform(ident.platform),
                 ident.compiler,
                 ident.version,
                 ident.opt_level,
@@ -346,6 +338,49 @@ class MemmapBuilderTask:
                 map_item = mapping_by_key[key]
                 meta_item = meta_by_key.get(key)
                 total_size += csv_item.size
+                # ``filename`` is the variant's stable on-disk identity.
+                # Two sidecar layouts coexist on LMU NFS:
+                #
+                #   * **legacy tarball-derived**:
+                #     ``<bin>/<variant_dir>/<csv>`` — parent is the
+                #     variant folder (e.g. ``clang10_aarch64_O0_90c970e8``,
+                #     or pre-folder-migration ``clang10…tar.zst``).
+                #   * **asm-dataset-nix folder-native**:
+                #     ``<bin>/<variant_dir>/<bin>/<csv>`` — parent is
+                #     the *binary subfolder* (e.g. ``hello``),
+                #     grandparent is the variant folder.
+                #
+                # Pre-2026-05-17 the code unconditionally used
+                # ``parent.name`` and collided every folder-native
+                # variant of the same binary onto ``filename=<bin>``,
+                # losing the variant identity in the emitted
+                # ``_variants.csv``. The variant_id hex (8 chars,
+                # parsed from the canonical-4 ``__<8hex>`` filename
+                # suffix) is part of every variant folder name by
+                # asm-dataset-nix convention, so the layout check is:
+                # if the parent's name contains the variant-id hex
+                # suffix, parent IS the variant folder; otherwise the
+                # variant folder is the grandparent.
+                #
+                # Legacy 4-axis Dataset-1 variants (``variant_id == 0``,
+                # no per-variant folder) keep the original
+                # ``<binary_basename>`` shape.
+                csv_path_obj = Path(csv_item.path)
+                variant_id = key[5]
+                if variant_id != 0:
+                    variant_id_hex = f"{variant_id:08x}"
+                    parent_name = csv_path_obj.parent.name
+                    if variant_id_hex in parent_name:
+                        variant_filename = parent_name
+                    else:
+                        variant_filename = csv_path_obj.parent.parent.name
+                else:
+                    name = csv_path_obj.name
+                    variant_filename = (
+                        name[: -len("_output.csv")]
+                        if name.endswith("_output.csv")
+                        else csv_path_obj.stem
+                    )
                 entries.append(
                     {
                         # Per-version paths are kept *relative* to the
@@ -361,6 +396,7 @@ class MemmapBuilderTask:
                         # resolve through its bind-mount.
                         "csv_path": str(csv_item.path),
                         "mapping_path": str(map_item.path),
+                        "filename": variant_filename,
                         # `meta_path` is forward-compat scaffolding for
                         # the per-variant metadata sidecar that the
                         # tokenize worker emits (`_meta.json`). Null
@@ -371,7 +407,7 @@ class MemmapBuilderTask:
                         "meta_path": (
                             str(meta_item.path) if meta_item is not None else None
                         ),
-                        "arch": csv_item.identifier.platform,
+                        "arch": arch_to_platform(csv_item.identifier.platform),
                         "compiler": csv_item.identifier.compiler,
                         "compilerversion": csv_item.identifier.version,
                         "opt": csv_item.identifier.opt_level,
@@ -396,7 +432,7 @@ class MemmapBuilderTask:
                     size=total_size,
                     identifier=BinaryIdentifier(
                         binary_name=binary_name,
-                        platform=representative.identifier.platform,
+                        platform=arch_to_platform(representative.identifier.platform),
                         compiler=representative.identifier.compiler,
                         version=representative.identifier.version,
                         opt_level=representative.identifier.opt_level,
@@ -420,9 +456,7 @@ class MemmapBuilderTask:
         if getattr(args, "skip_existing", False):
             output_root = getattr(args, "resolved_output_root", None)
             if output_root:
-                completed = _collect_existing_output_filenames(
-                    output_root, gateway_url
-                )
+                completed = _collect_existing_output_filenames(output_root)
                 before = len(group_items)
                 group_items = [
                     ti
@@ -457,6 +491,14 @@ class MemmapBuilderTask:
         # Vendored asm-binary corpus selection flags (--platform etc.) —
         # see TokenizerTask.add_task_arguments for rationale.
         add_asm_selection_arguments(parser)
+        self.add_private_task_arguments(parser)
+
+    def add_private_task_arguments(self, parser: ArgumentParser) -> None:
+        """Task-private argparse registrations (no asm-selection flags).
+
+        See ``TokenizerTask.add_private_task_arguments`` for the
+        composite-pipeline rationale.
+        """
         parser.add_argument(
             "--vocab-source",
             type=str,

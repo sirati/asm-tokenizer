@@ -6,6 +6,7 @@ from ..aligned_data.io import (
     write_index_entry,
     write_unmatched_section_csv,
 )
+from .variants import VariantRegistry, write_warn_log_entry
 
 
 def write_matched_function_section(
@@ -15,6 +16,7 @@ def write_matched_function_section(
     version_data_list: List[dict],
     function_lookup: dict,
     warn_log,
+    variants: VariantRegistry,
 ) -> Tuple[int, int]:
     """
     Write a complete matched function section (header + version rows).
@@ -31,6 +33,7 @@ def write_matched_function_section(
         data_len = vdata["data_len"]
         token_len = vdata["token_len"]
 
+        variant_ref = variants.ref(vkey)
         inlining_data = {}
         for called_func in called:
             called_idx = unique_called.index(called_func)
@@ -39,9 +42,7 @@ def write_matched_function_section(
                 func_offset, func_len, is_matched = function_lookup[lookup_key]
                 inlining_data[called_idx] = (func_offset, func_len, is_matched)
             else:
-                warn_log.write(
-                    f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
-                )
+                write_warn_log_entry(warn_log, func_name, variant_ref, called_func)
 
         inlining_list = [
             [idx, start, length, is_matched] for idx, (start, length, is_matched) in sorted(inlining_data.items())
@@ -49,10 +50,7 @@ def write_matched_function_section(
 
         write_function_section_csv(
             writer,
-            vkey.arch,
-            vkey.compiler,
-            vkey.compilerversion,
-            vkey.opt,
+            variant_ref,
             inlining_list,
             data_offset,
             data_len,
@@ -66,13 +64,18 @@ def write_matched_function_section(
 def write_unmatched_function_section(
     writer,
     func_name: str,
-    platform_tuples: List[Tuple[str, str, str, str]],
+    variant_refs: List[str],
     unique_called_list: List[str],
     inlining_data_list: List,
     first_offset: int,
     first_len: int,
 ):
-    """Write a single-line unmatched function section."""
+    """Write a single-line unmatched function section.
+
+    ``variant_refs`` is the ordered list of ``0x<hex>`` refs (one per
+    version present for this unmatched function), in the same order
+    as the inlining data's ``comp_set_id`` references it.
+    """
     called_str = format_unique_called(unique_called_list)
 
     from collections import defaultdict
@@ -92,7 +95,7 @@ def write_unmatched_function_section(
     write_unmatched_section_csv(
         writer,
         func_name,
-        platform_tuples,
+        variant_refs,
         called_str,
         inlining_data_str,
         first_offset,
@@ -114,6 +117,7 @@ def build_inlining_data_for_unmatched(
     function_lookup: dict,
     warn_log,
     func_name: str,
+    variants: VariantRegistry,
 ) -> List:
     """Build inlining data list for unmatched functions with compiler_set_id-called_func_id format."""
     inlining_data_list = []
@@ -133,8 +137,7 @@ def build_inlining_data_for_unmatched(
                     ]
                 )
             else:
-                vkey = vkeys[comp_set_id]
-                warn_log.write(
-                    f"{func_name},{vkey.arch},{vkey.compiler},{vkey.compilerversion},{vkey.opt},{called_func}\n"
+                write_warn_log_entry(
+                    warn_log, func_name, variants.ref(vkeys[comp_set_id]), called_func
                 )
     return inlining_data_list

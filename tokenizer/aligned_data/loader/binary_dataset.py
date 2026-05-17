@@ -9,7 +9,7 @@ edge indices.
 import csv
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -45,9 +45,17 @@ class BinaryDataset:
         self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
 
         self.versions_sidecar = self.base_path / f"{binary_name}_versions.json"
+        self.variants_sidecar = self.base_path / f"{binary_name}_variants.csv"
 
         # Load per-version variant metadata sidecar (legacy fallback: empty list).
         self._versions: List[VariantInfo] = self._load_versions_sidecar()
+
+        # Load the per-group ``_variants.csv`` sidecar that the section
+        # CSVs reference by ``0x<hex>`` row index. Positional list of
+        # dicts (one per variant); empty when the sidecar is absent
+        # (legacy datasets written before the variant-ref schema). The
+        # row index is the canonical reference.
+        self._variants: List[Dict[str, str]] = self._load_variants_sidecar()
 
         # Load metadata (NO memmap caching)
         self._load_metadata()
@@ -92,6 +100,40 @@ class BinaryDataset:
         if version_idx < 0 or version_idx >= len(self._versions):
             return None
         return self._versions[version_idx]
+
+    def _load_variants_sidecar(self) -> List[Dict[str, str]]:
+        """Read ``<binary>_variants.csv`` and return one dict per row.
+
+        Columns are read from the CSV header; row index in the returned
+        list is the canonical ``variant_ref`` line number (parsed from
+        ``0x<hex>`` cells in section CSVs). Missing sidecar yields an
+        empty list — legacy datasets predate this schema and have no
+        variant-ref resolution.
+        """
+        if not self.variants_sidecar.exists():
+            return []
+        with open(self.variants_sidecar, "r", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def get_variant_by_ref(
+        self, variant_ref: str
+    ) -> Optional[Dict[str, str]]:
+        """Resolve a section-CSV ``variant_ref`` (``0x<hex>``) to the
+        variant's full metadata dict from ``_variants.csv``.
+
+        Returns ``None`` if the sidecar is absent or the parsed line
+        index is out of range. Caller is responsible for handling the
+        legacy-dataset fallback.
+        """
+        if not self._variants:
+            return None
+        try:
+            idx = int(variant_ref, 16)
+        except (TypeError, ValueError):
+            return None
+        if idx < 0 or idx >= len(self._variants):
+            return None
+        return self._variants[idx]
 
     def _open_sections_csv(self, path: Path) -> Tuple[object, int]:
         """Open a ``_sections.csv`` file, transparently consuming a
@@ -490,14 +532,14 @@ class BinaryDataset:
         first_line = list(csv.reader([lines[0]]))[0]
         func_name = first_line[0]
 
-        # Parse versions (remaining lines except empty line at end)
+        # Parse versions (remaining lines except empty line at end).
+        # New per-row schema collapses the 4-axis canonical tuple
+        # into a single ``variant_ref`` ``0x<hex>`` index that points
+        # into the per-group ``<binary>_variants.csv`` sidecar.
         versions = []
         reader = csv.reader(lines[1:])
         header = [
-            "arch",
-            "compiler",
-            "compilerversion",
-            "opt",
+            "variant_ref",
             "inlining_data",
             "data_offset",
             "data_len",
@@ -508,6 +550,18 @@ class BinaryDataset:
                 continue
 
             metadata = extract_metadata_from_section_row(row, header)
+
+            # Resolve the 0x<hex> ``variant_ref`` against the per-group
+            # ``_variants.csv`` sidecar so callers see the variant's
+            # canonical-4 axes / filename / flags directly on the
+            # metadata dict (instead of having to round-trip the ref).
+            # The raw ``variant_ref`` stays present for consumers that
+            # need the index identity. Sidecar-absent (legacy datasets)
+            # is a benign no-op.
+            variant_row = self.get_variant_by_ref(metadata["variant_ref"])
+            if variant_row is not None:
+                for k, v in variant_row.items():
+                    metadata.setdefault(k, v)
 
             # Load binary data (memmap opened and closed inside read_function_data_memmap)
             data_offset = metadata["data_offset"]
@@ -564,12 +618,26 @@ class BinaryDataset:
             finally:
                 f.close()
 
+        # Unmatched section rows carry ``;``-joined variant refs in
+        # column 1 (one function present in multiple variants but
+        # without a matched canonical form). Resolve every ref against
+        # the per-group ``_variants.csv`` sidecar so callers get the
+        # list of variants this unmatched function appears in. The
+        # raw ``platform_info`` string is kept for consumers that need
+        # the unresolved form.
+        variant_refs = [r for r in platform_info.split(";") if r] if platform_info else []
+        variants = [
+            v for v in (self.get_variant_by_ref(r) for r in variant_refs) if v is not None
+        ]
+
         metadata = {
             "arch": "unknown",
             "compiler": "unknown",
             "compilerversion": "unknown",
             "opt": "unknown",
             "platform_info": platform_info,
+            "variant_refs": variant_refs,
+            "variants": variants,
             "called": called,
             "inlining_data": inlining_data,
             "data_offset": data_offset_from_csv,

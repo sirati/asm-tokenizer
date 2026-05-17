@@ -32,10 +32,6 @@ REPO_ROOT = Path("/home/sirati/devel/python/asm-tokenizer")
 sys.path.insert(0, str(REPO_ROOT))
 
 import dynamic_runner as _rs  # noqa: E402
-from dynamic_runner._shared import (  # noqa: E402
-    find_matching_binaries,
-    process_selection_arguments,
-)
 from dynrunner.tokenize.tokenizer_task import TokenizerTask  # noqa: E402
 
 
@@ -182,8 +178,12 @@ def main() -> int:
     logging.info("outer cgroup: %s", cgroup)
 
     # Build the binaries list at the orchestrator (= "starting instance"
-    # in the new task_protocol vocabulary). The compat shim on
-    # TokenizerTask handles ordering.
+    # in the new task_protocol vocabulary). `TokenizerTask.discover_items`
+    # is the canonical entry point: it composes selection-args parsing,
+    # walk_dataset, name/platform/compiler/opt filtering, Ghidra-artifact
+    # skipping (Bug #2), and pkg-group + size-desc sorting in one pass.
+    # The orchestrator just supplies the args Namespace shape TokenizerTask
+    # expects.
     selection_args = argparse.Namespace(
         source=str(args.input_dir),
         output=str(args.output_root),
@@ -191,22 +191,19 @@ def main() -> int:
         compiler=args.compiler,
         compiler_versions=None,
         opt=None,
-        opt_regex=None,
+        opt_regex="[oO]?([0123s]|fast|z)",
         version_regex=None,
         name_regex=args.name_regex,
         exclude_subfolder=None,
         list_files=False,
         file_format="platform-compiler-version-optimisationlevel_binaryname",
         debugs=False,
-    )
-    cfg = process_selection_arguments(selection_args)
-    binaries = find_matching_binaries(
-        cfg.source_dir, cfg.platforms, cfg.compiler, cfg.compiler_versions,
-        cfg.opt_levels, cfg.file_format, cfg.version_regex, cfg.opt_regex,
-        cfg.name_regex, cfg.exclude_subfolders,
+        source_already_staged=None,
+        gateway=None,
+        skip_existing=False,
     )
     task = TokenizerTask()
-    binaries = task.organize_and_sort_items(binaries)
+    binaries = list(task.discover_items(Path(args.input_dir), selection_args))
     logging.info("discovered %d input binaries", len(binaries))
     if not binaries:
         logging.error("no binaries matched; check --input-dir and filters")

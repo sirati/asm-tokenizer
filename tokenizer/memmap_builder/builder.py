@@ -15,6 +15,7 @@ from .passes import (
     write_matched_sections_pass2,
     write_unmatched_sections_pass2,
 )
+from .variants import VariantRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,14 @@ class BinaryVersionInfo:
     pkg: str = ""
     variant_id: int = 0
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
+    # ``filename`` is the variant's stable on-disk identifier — the
+    # parent folder name of its per-variant CSV (variant folder name
+    # for sidecar variants, binary basename for legacy 4-axis). Empty
+    # when the caller didn't populate it (e.g. legacy export.py
+    # entry-point that has no folder-name notion). Surfaces in the
+    # per-group ``_variants.csv`` so consumers can recover the original
+    # build's filesystem identity.
+    filename: str = ""
 
 
 def get_mapping(mapping_path: Path):
@@ -114,6 +123,15 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     """Build memory-mapped binary files from aligned CSV data."""
 
     logger.info(f"  Output directory: {output_dir}")
+
+    # Variant registry: single authority on the `vkey -> 0x<hex>` ref
+    # used by every section-CSV row and the warn-log. Built up front
+    # so the assignment is fixed before any matched/unmatched pass
+    # consults it, and the sidecar `<binary>_variants.csv` written at
+    # the start (alongside the data files) of this group's output.
+    variants = VariantRegistry.from_versions(versions)
+    variants_path = variants.write_sidecar(output_dir, binary_name)
+    logger.info(f"  Wrote: {variants_path}")
 
     mapping_dict = {}
     csv_paths = []
@@ -212,6 +230,7 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
         matched_sections_file,
         matched_index_file,
         warn_log,
+        variants,
     )
 
     matched_sections_file.close()
@@ -237,6 +256,7 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
         unmatched_sections_file,
         unmatched_index_file,
         warn_log,
+        variants,
     )
 
     unmatched_sections_file.close()

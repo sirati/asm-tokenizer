@@ -189,23 +189,27 @@ def process_selection_arguments(args: argparse.Namespace) -> SelectionConfig:
     source_dir = Path(args.source).resolve()
     output_dir = Path(args.output).resolve()
 
-    # --source-already-staged means the data lives on the cluster
-    # filesystem (gateway-side), not locally; the local --source path
-    # has no local meaning. Skip the local-exists check so the consumer
-    # doesn't have to pass a placeholder local dir just to clear
-    # validation. The path is still passed through to discover_items —
-    # consumers that want to drive find_items against the staged
-    # location should resolve the gateway path themselves (typically
-    # from args.source_already_staged + the SSH backend).
-    if not source_dir.exists() and not getattr(args, "source_already_staged", None):
-        print(f"Error: Source directory does not exist: {source_dir}")
-        print(
-            "Hint: if the source data lives on the gateway / cluster filesystem only, "
-            "pass --source-already-staged <path> and the local --source check is skipped."
-        )
-        sys.exit(1)
+    # No source-existence validation here. Post the 2026-05-13
+    # native-task-discovery refactor (dynamic-runner 54d665d), the
+    # framework passes the canonical `source_dir` directly to
+    # `task.discover_items` — either submitter-side for local mode
+    # (a real local path) or on a promoted setup-secondary with its
+    # bind-mounted `/app/src-network`. `args.source` may be a
+    # placeholder ('/app/src', '/tmp') on the secondary that has no
+    # local meaning. Validating it here used to `sys.exit(1)` the
+    # setup-secondary process before discovery could run. Drop the
+    # check; if `source_dir` is genuinely invalid, `walk_dataset`
+    # yields nothing and the dispatch terminates with `total=0`.
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Under --multi-computer slurm the --output path refers to a directory
+    # on the SLURM gateway, not the dispatcher's local host. The SLURM
+    # packaging layer creates it on the gateway via ssh-mkdir; the local
+    # mkdir is purely defensive and trips on PermissionError when the
+    # gateway-side path (e.g. /home/kruppb/...) has no local counterpart.
+    # Symmetric with the source-already-staged skip above. Mirrors the
+    # framework's `_shared/selection_args.py` fix at dynamic-runner 394be31.
+    if getattr(args, "multi_computer", None) != "slurm":
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     return SelectionConfig(
         source_dir=source_dir,
