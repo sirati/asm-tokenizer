@@ -79,19 +79,26 @@ def build_field_regexes(
     if platforms:
         platform_regex = "(?:" + "|".join(re.escape(p) for p in platforms) + ")"
     else:
-        # Allow dashes inside platform names so dash-segmented archs from
-        # the sidecar corpus (e.g. ``armv7l-hf``, ``aarch64-be``) parse
-        # under the default ``platform-compiler-version-opt_binary``
-        # format. The compiler / version / opt slots stay dash-free
-        # (``[^-_]+`` and the ``O…`` opt anchor below), so the regex
-        # backtracking still finds the unique split: greedy platform
-        # absorbs leading dashed chunks, then the last three dashed
-        # chunks before ``_`` consume compiler/version/opt. Pre-2026
-        # default ``[^-_]+`` silently dropped multi-segment archs (e.g.
-        # ``armv7l-hf``) from output-CSV pairing in build_memmap and
-        # vocab_unifier; relaxing here keeps the legacy single-segment
-        # corpus parse identical (only sidecar-derived names benefit).
-        platform_regex = r"[^_]+"
+        # Allow dashes AND underscores inside platform names so the
+        # full sidecar arch set parses under the default
+        # ``platform-compiler-version-opt_binary`` format:
+        #   * dash-segmented archs (``armv7l-hf``, ``aarch64-be``) —
+        #     the original 2026 relaxation;
+        #   * underscore-containing archs (``x86_64``) — the
+        #     2026-05-17 follow-on. Pre-fix the platform regex was
+        #     ``[^_]+`` which rejected every ``x86_64-*`` CSV /
+        #     mapping / meta file at vocab-unifier and build-memmap
+        #     discovery; 80 of LMU's 596 dataset/ variants silently
+        #     never made it through Phase 2/3.
+        # The pattern shape is ``letter+alnum`` followed by 0+ chunks
+        # of ``[-_]alnum+``. Each chunk must contain at least one
+        # alphanumeric so the trailing ``-compiler`` cannot be greedy-
+        # absorbed (compiler / version / opt rejects ``.`` so regex
+        # backtracking forces the right split):
+        #   ``x86_64`` ✓, ``armv7l-hf`` ✓, ``aarch64`` ✓, ``ppc32`` ✓,
+        #   ``mips64el`` ✓, ``i686`` ✓, plus the legacy 4-axis
+        #   ``x86``/``x64``/``arm32``/``arm64`` family.
+        platform_regex = r"[a-zA-Z][a-zA-Z0-9]*(?:[-_][a-zA-Z0-9]+)*"
 
     if compilers:
         compiler_regex = "(?:" + "|".join(re.escape(c) for c in compilers) + ")"
