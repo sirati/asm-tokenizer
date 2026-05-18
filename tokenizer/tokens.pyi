@@ -277,6 +277,14 @@ class CodePtrTableToken(ModifierToken, ABC):
     @abstractmethod
     def __init__(self) -> None: ...
 
+class VariantAxisToken(Tokens, ABC):
+    token: str
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self, token: str) -> None: ...
+
 class MemoryOperandToken(Tokens, ABC):
     symbol: MemoryOperandSymbol
 

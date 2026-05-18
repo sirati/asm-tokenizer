@@ -12,16 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-# Match the conftest bootstrap pattern: the asm-tokenizer codebase is a
-# flat package tree at the repo root; tests under tokenizer/tests/ need
-# the repo root on sys.path so `from tokenizer.*` imports resolve.
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
 import numpy as np
 import pytest
 
