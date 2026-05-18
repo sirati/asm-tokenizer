@@ -80,7 +80,8 @@ _OUTPUT_CSV_SUFFIX = "_output.csv"
 _META_SIDECAR_SUFFIX = "_meta.json"
 
 # Variant-id suffix on the binary_name slot: ``<binary>__<8hex>``.
-# Mirrors ``dynrunner.build_memmap.memmap_builder_task._VARIANT_SUFFIX_RE``.
+# Single source of truth (build_memmap imports `split_variant_id_suffix`
+# below rather than parallel-implementing this regex).
 _VARIANT_SUFFIX_RE: re.Pattern = re.compile(
     r"^(?P<binary>.*)__(?P<hex>[0-9a-fA-F]{8})$"
 )
