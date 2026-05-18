@@ -16,7 +16,11 @@ def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) ->
     # positions"). Slice them off the serialized vocab + accompanying
     # per-ID arrays; the loader reconstitutes them from the protocol
     # convention when `format_version=2` is detected in the trailer.
-    if vocab_manager.format_version == 2:
+    # v3 reuses the v2 reserved-digit layout verbatim (variant-axis tokens
+    # are additive at IDs >= 256, so the wire format is byte-identical to
+    # v2 except for the trailer integer). See plan
+    # memoized-booping-wren.md § "Format-version policy".
+    if vocab_manager.format_version in (2, 3):
         start = VocabularyManager._V2_RESERVED_DIGIT_COUNT
     else:
         start = 0
@@ -45,10 +49,12 @@ def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) ->
         ]
         row += extra
 
-    if vocab_manager.format_version == 2:
-        # Append the v2 trailer pair after the v1-shaped row so v1 readers
+    if vocab_manager.format_version in (2, 3):
+        # Append the trailer pair after the v1-shaped row so v1 readers
         # (which assert the legacy column count) reject the file cleanly
-        # rather than silently mis-decoding.
+        # rather than silently mis-decoding. v3's wire layout matches v2
+        # byte-for-byte aside from this integer; the loader picks which
+        # decode branch to take by reading it back.
         row += ["format_version", str(vocab_manager.format_version)]
 
     csv_writer.writerow(row)

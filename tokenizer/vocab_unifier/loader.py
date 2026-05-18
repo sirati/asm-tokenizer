@@ -15,15 +15,18 @@ from .types import Platform
 
 def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
     # v1 layout: 10 cells (per-platform) or 13 cells (unified).
-    # v2 layout: appends `("format_version", "<int>")` at the tail —
+    # v2 / v3 layout: appends `("format_version", "<int>")` at the tail —
     # 12 cells (per-platform) or 15 cells (unified). Wire-format is
     # otherwise byte-identical to v1; the trailing pair is the *only*
     # delta on the vocab tail row (the per-binary entries for IDs 0..255
     # are stripped by the saver because they are protocol-reserved
-    # digit slots — see plan vivid-tinkering-wilkes.md).
+    # digit slots — see plan vivid-tinkering-wilkes.md). v3 is the
+    # unified-vocab-only additive superset that registers variant-axis
+    # tokens at IDs >= 256 (plan memoized-booping-wren.md) — same wire
+    # column count as v2, only the trailer integer differs.
     base_cols = 13 if platform == "unified" else 10
     assert len(row) == base_cols or len(row) == base_cols + 2, (
-        f"Expected {base_cols} (v1) or {base_cols + 2} (v2) columns, got {len(row)}"
+        f"Expected {base_cols} (v1) or {base_cols + 2} (v2/v3) columns, got {len(row)}"
     )
     assert row[0] == "vocabulary"
     assert row[2].startswith("_id_to_token_type")
@@ -100,17 +103,20 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
     platform_list = row[11].strip('"').split(",") if platform == "unified" else None
     token_to_platform = base64_to_ndarray(row[12]).astype(np.int8) + platform_offset if platform == "unified" else None
 
-    # v2 trailer: ("format_version", "<int>") appended after the v1 tail.
-    # Saver strips the protocol-reserved digit slots (IDs 0..255) from the
-    # serialized vocab; the loader reconstitutes them here so downstream
-    # absolute-ID lookups (lit caches, register_on_vocab_manager, etc.) all
-    # stay valid.
+    # v2 / v3 trailer: ("format_version", "<int>") appended after the v1
+    # tail. Saver strips the protocol-reserved digit slots (IDs 0..255)
+    # from the serialized vocab; the loader reconstitutes them here so
+    # downstream absolute-ID lookups (lit caches,
+    # register_on_vocab_manager, etc.) all stay valid. v3 is the additive
+    # unified-vocab superset (variant-axis tokens at IDs >= 256; wire
+    # layout identical to v2) per plan memoized-booping-wren.md, so both
+    # versions take this branch.
     base_cols = 13 if platform == "unified" else 10
     format_version = 1
     if len(row) == base_cols + 2:
         format_version = int(row[base_cols + 1])
 
-    if format_version == 2:
+    if format_version in (2, 3):
         reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
         digit_names = [f"digit_{i:02X}" for i in range(reserved)]
         vocabulary = digit_names + vocabulary
@@ -197,6 +203,17 @@ def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> Voca
 def load_unified_vocab_manager(csv_path: Path) -> VocabularyManager | None:
     """Load vocabulary manager from unified_vocab.csv file.
 
+    The unified-vocab file is exactly one CSV row (the vocab definition
+    line, written by ``unifier.unify_vocab`` via a single
+    ``csv.writer.writerow`` call). Earlier revisions of this loader
+    assumed a leading header line and used ``readline`` to skip it,
+    which always returned ``None`` against the real writer output
+    (called out in ``assert_valid_vocab_def``'s comment as the
+    "unrelated readline bug"). Reading the whole file as the row
+    avoids that mismatch and naturally tolerates an optional trailing
+    newline — ``is_vocab_def`` already pipes the bytes through
+    ``csv.reader`` which strips it.
+
     Args:
         csv_path: Path to unified_vocab.csv file
 
@@ -204,13 +221,8 @@ def load_unified_vocab_manager(csv_path: Path) -> VocabularyManager | None:
         VocabularyManager instance or None if loading fails
     """
     try:
-        # Read the second line (skip header) from the CSV file
         with open(csv_path, "rb") as f:
-            # Skip first line (header)
-            f.readline()
-            # Read second line (actual vocab data)
-            vocab_line = f.readline()
-
+            vocab_line = f.read()
         return load_vocab_manager_csv_row_bytes(vocab_line, "unified")
     except Exception as e:
         logger = logging.getLogger(__name__)
