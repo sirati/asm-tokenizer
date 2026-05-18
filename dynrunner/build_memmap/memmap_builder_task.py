@@ -390,7 +390,8 @@ class MemmapBuilderTask:
                         # when absent (legacy outputs predating the
                         # sidecar). Worker consumption is downstream:
                         # `meta_path` reconstructs `VariantInfo` so the
-                        # builder library can persist `_versions.json`.
+                        # builder library can encode variant-axis tokens
+                        # into `_variants.bin` via the unified vocab.
                         "meta_path": (
                             str(meta_item.path) if meta_item is not None else None
                         ),
