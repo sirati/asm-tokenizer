@@ -8,23 +8,6 @@ This module provides utilities for:
 - Index management for fast function lookup by length
 """
 
-from .export import (
-    VersionKey,
-    collect_binaries,
-    compute_avg_function_length,
-    export_matched_and_unmatched_sets,
-    get_all_function_names,
-    get_called_functions,
-    get_function_names_across_versions,
-    get_vocab_and_mapping,
-    load_all_function_data,
-    load_function_data,
-    parse_filename,
-    process_unmatched_too_long,
-    run_alignment_export,
-    write_function_sections,
-    write_unmatched_files,
-)
 from .index import (
     create_length_lookup_map,
     extract_avg_lengths,
@@ -88,22 +71,6 @@ __all__ = [
     "read_data_file",
     "read_function_data_memmap",
     "parse_function_data_header",
-    # export
-    "parse_filename",
-    "collect_binaries",
-    "load_function_data",
-    "get_vocab_and_mapping",
-    "get_function_names_across_versions",
-    "load_all_function_data",
-    "get_called_functions",
-    "compute_avg_function_length",
-    "write_function_sections",
-    "write_unmatched_files",
-    "get_all_function_names",
-    "process_unmatched_too_long",
-    "export_matched_and_unmatched_sets",
-    "run_alignment_export",
-    "VersionKey",
     # match
     "is_vocab_row",
     "open_csv_skip_vocab",
