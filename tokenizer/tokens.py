@@ -147,6 +147,13 @@ class TokenType(IntEnum):
     # writeback symbols, paired open/close framing around the register-token
     # members.
     REGISTER_LIST = 28
+    # Variant-axis identity token (one vocab entry per distinct prefixed
+    # axis string -- `arch:x64`, `comp:gcc`, `cver:gcc:13.2.0`, `opt:O2`,
+    # `<metakey>:<metaval>`). Opaque-string family: each registered string
+    # IS the token; no compositional structure, no inline payload. Used by
+    # the unified vocab (format_version=3) to make per-binary build
+    # provenance vocab-resolvable for ML consumers.
+    VARIANT_AXIS = 29
     UNRESOLVED = -1
 
 
@@ -779,6 +786,36 @@ class RegisterListToken(Tokens, ABC):
 
     def _register_on(self, cls_other):
         return cls_other(self.symbol)
+
+
+class VariantAxisToken(Tokens, ABC):
+    """Protocol for variant-axis identity tokens.
+
+    Each instance holds a single opaque prefixed string (e.g. ``arch:x64``,
+    ``comp:gcc``, ``cver:gcc:13.2.0``, ``opt:O2``, ``<metakey>:<metaval>``)
+    that registers as exactly one vocab entry. Distinct from
+    ``PlatformToken``: no platform/ISA association, no family-prefix
+    mangling, no insn-type tagging -- the string IS the token. The wire
+    form is exactly one vocab id and no inline payload.
+
+    Used by the unified vocab (format_version=3) to expose per-binary
+    build provenance (compiler invocation axes + extra-metadata k:v pairs)
+    as first-class vocab tokens; the prefix grammar that produces these
+    strings lives in ``tokenizer.variant_tokens.prefixes``.
+    """
+
+    token: str
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        """Return the type of this token representation"""
+        return TokenType.VARIANT_AXIS
+
+    @abstractmethod
+    def __init__(self, token: str) -> None: ...
+
+    def _register_on(self, cls_other):
+        return cls_other(self.token)
 
 
 class TokenRaw(Tokens, ABC):
