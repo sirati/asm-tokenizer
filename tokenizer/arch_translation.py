@@ -1,32 +1,46 @@
 """Translate sidecar ``arch`` strings to the tokenizer's ``Platform``.
 
-Single concern: map the verbose, distro-style architecture names that
-appear in JSON sidecars (``x86_64``, ``aarch64``, ``armv7l-hf``,
-``mips64el``, ``mipsel``, ``i686``, ``ppc32``, ``ppc64``, ``riscv64``,
-...) onto the tokenizer's compact ``Platform`` literal type
-(``x86``, ``x64``, ``arm32``, ``arm64``, ``mips32``, ``mips64``,
-``ppc32``, ``ppc64``, ``riscv32``, ``riscv64``).
+This module hosts **two** translation functions with distinct concerns
+that must not be conflated by callers:
+
+- :func:`arch_to_platform` — **ISA / disassembler dispatch.**
+  Bitness-only collapse. Maps verbose distro-style arch names
+  (``x86_64``, ``aarch64``, ``armv7l-hf``, ``mips64el`` ...) onto the
+  tokenizer's compact ``Platform`` literal type
+  (``x86``, ``x64``, ``arm32``, ``arm64``, ``mips32``, ``mips64``,
+  ``ppc32``, ``ppc64``, ``riscv32``, ``riscv64``).
+  ABI/float/endianness sub-variants intentionally collapse: the enum
+  is bitness-only and the backend (Ghidra / angr) recovers
+  endianness/float-mode from the ELF header. Unknown input is a hard
+  error (``ValueError``) so a never-before-seen arch fails loudly at
+  the worker boundary instead of silently picking a wrong Platform.
+
+- :func:`arch_to_variant_arch` — **variant-vocab identity.**
+  ABI/sub-arch preserving. Only the family-equivalent aliases collapse
+  (``x86_64``/``amd64``/``x64`` → ``x64``; ``aarch64``/``arm64`` →
+  ``arm64``); everything else is identity (``armv7l``, ``armv7l-hf``,
+  ``armv6l``, ``mipsel``, ``mips64el``, ``ppc64le``, ``riscv64``, …).
+  Unknown input passes through unchanged — the variant vocab is
+  corpus-driven and must never block a run on an unfamiliar arch.
 
 Sidecar callers cannot rely on the tokenizer's filename auto-detect
 (the binary inside the tarball is named ``hello`` or ``busybox``,
 carrying no platform prefix), so the worker handler must compute the
 ``Platform`` value from the variant's ``arch`` field and pass it in
-explicitly. This module is the single source of truth for that
-translation; every arch string the dataset emits MUST resolve to a
-member of ``Platform`` here, and unknown arches surface as
-``ValueError`` at the boundary instead of silently falling through to
-a wrong platform.
+explicitly. :func:`arch_to_platform` is the single source of truth
+for that translation; every arch string the dataset emits MUST
+resolve to a member of ``Platform`` there.
 
 Endianness suffixes (``el`` for little-endian, ``eb`` / bare for
-big-endian) intentionally collapse onto the same ``Platform`` value:
-the tokenizer's ``Platform`` enum is bitness-only, and endianness is
-recovered downstream by the disassembly backend (Ghidra / angr) from
-the ELF header. So ``mipsel`` and ``mips`` both → ``mips32``;
-``mips64el`` and ``mips64`` both → ``mips64``; same for ``ppc*``.
+big-endian) intentionally collapse onto the same ``Platform`` value
+for :func:`arch_to_platform`. So ``mipsel`` and ``mips`` both →
+``mips32``; ``mips64el`` and ``mips64`` both → ``mips64``; same for
+``ppc*``.
 
 ARM variants (``armv7l``, ``armv7l-hf``, ``armv6l``, ``armhf`` ...)
-all map to ``arm32`` for the same reason: ABI/float-mode hints belong
-to the binary, not the ISA-token namespace.
+all map to ``arm32`` under :func:`arch_to_platform` for the same
+reason. Under :func:`arch_to_variant_arch` these stay **distinct**
+because the variant vocab models ABI/float-mode identity.
 """
 
 from __future__ import annotations
@@ -92,6 +106,59 @@ def arch_to_platform(arch: str) -> Platform:
         raise ValueError(
             f"unknown sidecar arch {arch!r}; accepted: {accepted}"
         ) from None
+
+
+# Variant-vocab arch aliases: ONLY the family-equivalent renames
+# collapse here (x86_64/amd64/x64 -> x64; aarch64/arm64 -> arm64).
+# Every other arch passes through identity so the variant vocab
+# preserves ABI/sub-arch identity (armv7l vs armv7l-hf vs armv6l
+# remain distinct tokens; ppc64le keeps its endianness suffix; etc.).
+#
+# Unlike ``_ARCH_TO_PLATFORM`` this map is intentionally NOT
+# exhaustive: it is a sparse alias table consulted by
+# ``arch_to_variant_arch``, which falls back to identity for any
+# unknown input. The variant vocab is corpus-driven and must never
+# block a run on an arch we haven't catalogued yet.
+_VARIANT_ARCH_ALIASES: dict[str, str] = {
+    "x86_64": "x64",
+    "amd64": "x64",
+    "x64": "x64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
+
+
+def arch_to_variant_arch(arch: str) -> str:
+    """Canonicalise an ``arch`` string for the **variant vocab**.
+
+    This is the ABI/sub-arch-preserving sibling of
+    :func:`arch_to_platform`. Use this when constructing variant-axis
+    tokens (``arch:<canonical>``), NOT when dispatching the
+    disassembler.
+
+    Behaviour:
+
+    - ``x86_64`` / ``amd64`` / ``x64`` → ``x64``
+    - ``aarch64`` / ``arm64`` → ``arm64``
+    - Everything else (``armv7l``, ``armv7l-hf``, ``armv6l``,
+      ``mipsel``, ``mips64el``, ``ppc64le``, ``riscv32``,
+      ``riscv64``, …) passes through identity.
+    - Unknown input passes through identity. There is **no**
+      ``ValueError``: the variant vocab is corpus-driven and must
+      never block a run on an arch the alias table hasn't catalogued.
+
+    Contract contrast with :func:`arch_to_platform`:
+
+    >>> arch_to_platform("armv7l-hf")
+    'arm32'
+    >>> arch_to_variant_arch("armv7l-hf")
+    'armv7l-hf'
+
+    The first collapses ABI/float-mode hints because the disassembler
+    only needs bitness; the second preserves them because the variant
+    vocab models per-binary identity.
+    """
+    return _VARIANT_ARCH_ALIASES.get(arch, arch)
 
 
 def all_known_arch_strings() -> tuple[str, ...]:
