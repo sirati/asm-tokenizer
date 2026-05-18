@@ -39,6 +39,7 @@ class TokenType(IntEnum):
     THREAD_LOCAL: "TokenType"
     VTABLE: "TokenType"
     CODE_PTR_TABLE: "TokenType"
+    VARIANT_AXIS: "TokenType"
     UNRESOLVED: "TokenType"
 
 class MemoryOperandSymbol(Enum):
