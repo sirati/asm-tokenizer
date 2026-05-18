@@ -1,4 +1,3 @@
-import json
 import logging
 import sys
 from dataclasses import dataclass, field
@@ -6,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
+from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
 from ..aligned_data.match import lockstep_function_match
 from .passes import (
@@ -50,9 +50,9 @@ class BinaryVersionInfo:
     `extra_metadata` is the opaque pass-through dict reconstructed from
     the per-variant sidecar (`<basename>_meta.json`) during worker
     decoding. Legacy versions without a sidecar carry an empty dict —
-    the metadata is forwarded verbatim to the per-binary
-    `<binary>_versions.json` writer and is never inspected by the
-    builder itself.
+    the metadata is forwarded to the per-binary `_variants.bin` record
+    encoder (via the unified vocab's variant-axis tokens) and is never
+    inspected by the builder itself.
     """
 
     path: Path
@@ -82,54 +82,53 @@ def get_mapping(mapping_path: Path):
     return None
 
 
-def _write_versions_sidecar(
+def build_memmap_files(
     versions: List[BinaryVersionInfo],
     output_dir: Path,
     binary_name: str,
+    unified_vocab_path: Path,
 ) -> None:
-    """Emit ``<binary>_versions.json`` with one entry per version in
-    the same iteration order as ``build_memmap_files`` consumes
-    ``versions``. The reader matches a section row to its version
-    record by the canonical-4 axes plus ``variant_id``; the
-    ``version_idx`` field is a positional convenience and equals the
-    list position.
+    """Build memory-mapped binary files from aligned CSV data.
 
-    `_sections.csv` deliberately stays flat (no `variant_id` column,
-    no embedded metadata) — the sidecar is purely additive lookup.
+    `unified_vocab_path` points at the corpus-wide ``unified_vocab.csv``
+    produced by ``tokenizer.vocab_unifier``. It is loaded once here
+    (format_version=3 required) and threaded into ``VariantRegistry``
+    so the per-variant token records emitted into ``<binary>_variants.bin``
+    can resolve each axis string (``arch:*``, ``comp:*``, ``cver:*``,
+    ``opt:*``, plus per-metadata-pair tokens) to its assigned uint16 ID.
+    A v2 (or missing) unified vocab is rejected loudly here rather than
+    silently corrupting the bin via stub IDs.
     """
-    payload = []
-    for idx, version in enumerate(versions):
-        payload.append(
-            {
-                "version_idx": idx,
-                "variant_id": version.variant_id,
-                "arch": version.arch,
-                "compiler": version.compiler,
-                "compiler_version": version.compilerversion,
-                "opt": version.opt,
-                "pkg": version.pkg,
-                "extra_metadata": version.extra_metadata,
-            }
-        )
-
-    versions_path = output_dir / f"{binary_name}_versions.json"
-    logger.info(f"  Creating: {versions_path}")
-    with open(versions_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=False)
-    logger.info(f"  Closed: {versions_path}")
-
-
-def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, binary_name: str) -> None:
-    """Build memory-mapped binary files from aligned CSV data."""
 
     logger.info(f"  Output directory: {output_dir}")
+
+    # Unified vocab is a hard dependency of the variant-token encoder
+    # (every axis string must already have an assigned uint16 ID before
+    # the registry walks its records). Load before constructing the
+    # registry so a vocab-shape mismatch fails this group up front
+    # instead of mid-record-write.
+    unified_vocab = load_unified_vocab_manager(unified_vocab_path)
+    if unified_vocab is None:
+        raise ValueError(
+            f"build_memmap_files: failed to load unified vocab from "
+            f"{unified_vocab_path}; cannot encode variant-axis tokens."
+        )
+    if unified_vocab.format_version != 3:
+        raise ValueError(
+            f"build_memmap_files: unified vocab at {unified_vocab_path} "
+            f"reports format_version={unified_vocab.format_version}; v3 "
+            f"required (v3 is the variant-token-aware superset). Re-run "
+            f"tokenizer.vocab_unifier against the per-binary CSV inputs."
+        )
 
     # Variant registry: single authority on the `vkey -> 0x<hex>` ref
     # used by every section-CSV row and the warn-log. Built up front
     # so the assignment is fixed before any matched/unmatched pass
-    # consults it, and the sidecar `<binary>_variants.csv` written at
-    # the start (alongside the data files) of this group's output.
-    variants = VariantRegistry.from_versions(versions)
+    # consults it. ``write_sidecar`` MUST run before the section passes
+    # since `ref(vkey)` only returns a usable byte offset once the bin
+    # has been written; today's ordering (sidecar -> section passes)
+    # already satisfies that invariant.
+    variants = VariantRegistry.from_versions(versions, unified_vocab=unified_vocab)
     variants_path = variants.write_sidecar(output_dir, binary_name)
     logger.info(f"  Wrote: {variants_path}")
 
@@ -265,9 +264,3 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
     logger.info(f"  Closed: {unmatched_index_path}")
     warn_log.close()
     logger.info(f"  Closed: {warn_log_path}")
-
-    # Per-binary metadata sidecar: one record per version in the same
-    # iteration order as the matched/unmatched CSV writers consumed
-    # `versions`. Empty `extra_metadata` for legacy versions; populated
-    # from the per-variant `_meta.json` for sidecar-format inputs.
-    _write_versions_sidecar(versions, output_dir, binary_name)
