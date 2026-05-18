@@ -55,10 +55,10 @@ def format_output_basename(
     walk) matches both legacy and sidecar outputs uniformly.
 
     For sidecar variants (``variant_id != 0``) the binary-name slot
-    grows a ``__<variant_id:08x>`` suffix; the pairing walk peels that
-    off via ``_VARIANT_SUFFIX_RE`` to reduce the tuple key to the
-    canonical-5 + ``variant_id`` shape expected by
-    ``_split_variant_suffix``.
+    grows a ``__<variant_id:08x>`` suffix; the pairing walk peels
+    that off via ``tokenizer.variant_info.split_variant_id_suffix``
+    to reduce the tuple key to the canonical-5 + ``variant_id``
+    shape.
 
     For legacy variants (``variant_id == 0``) the suffix is omitted so
     the emitted filename equals the input binary's filename byte-for-
