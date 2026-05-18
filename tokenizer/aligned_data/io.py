@@ -178,13 +178,39 @@ def read_data_file(data_path, offset, length):
         return extract_arrays_from_data(data, header)
 
 
+def parse_function_data_memmap(memmap_handle, offset, length):
+    """Slice one function record from an already-open ``_data.bin`` view.
+
+    ``memmap_handle`` is the caller's already-open ``np.memmap`` (or any
+    1-D uint8 ndarray view) of the WHOLE ``_data.bin`` file; ``offset``
+    and ``length`` are the byte range of one function record within it
+    (the same values stored as ``data_offset`` / ``data_len`` in the
+    section CSV).
+
+    Pure parsing: no file I/O, no handle lifecycle. Mirrors the
+    ``variant_tokens.record.read_record`` pattern so a future session
+    owns one open handle per bin file and slices many records out of
+    it without re-opening per call.
+
+    Returns ``(insn_runlength, block_runlength, tokens)``.
+    """
+    data = memmap_handle[offset:offset + length]
+    return parse_function_data_header(data)
+
+
 def read_function_data_memmap(data_path, offset, length):
     """
     Read the binary data for a function from the data file using numpy.memmap for random access.
     Returns: insn_runlength, block_runlength, tokens
+
+    Thin wrapper that opens the full ``_data.bin`` as a uint8 memmap,
+    delegates to :func:`parse_function_data_memmap`, and lets the
+    memmap close when the local reference drops. Use the open-handle
+    form directly inside a session that needs many records out of the
+    same bin file (avoids per-call mmap overhead).
     """
-    data = np.memmap(data_path, dtype=np.uint8, mode="r", offset=offset, shape=(length,))
-    return parse_function_data_header(data)
+    data = np.memmap(data_path, dtype=np.uint8, mode="r")
+    return parse_function_data_memmap(data, offset, length)
 
 
 def parse_function_data_header(data_bytes):

@@ -21,6 +21,7 @@ from .io import (
     format_inlining_dict,
     format_variant_refs,
     parse_function_data_header,
+    parse_function_data_memmap,
     read_data_file,
     read_function_data_memmap,
     read_index_file,
@@ -70,6 +71,7 @@ __all__ = [
     "read_sections_file",
     "read_data_file",
     "read_function_data_memmap",
+    "parse_function_data_memmap",
     "parse_function_data_header",
     # match
     "is_vocab_row",
