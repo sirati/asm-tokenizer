@@ -39,9 +39,16 @@ logger = logging.getLogger(__name__)
 # mirrors the runtime's contract that the handler closes over the
 # parsed CLI args via the on_args hook rather than passing them
 # through the Task object (which carries only per-task data).
+#
+# `_UNIFIED_VOCAB_PATH` is a per-run constant (the same corpus-wide
+# vocab is read by every task in this dispatch) so it lands as a CLI
+# arg here, mirroring `--vocab-source` and the unify_vocab worker's
+# `--out-unified-vocab`. Per-variant data still travels through
+# `TaskInfo.payload`; per-run config travels through CLI argv.
 _SOURCE_DIR: Path
 _VOCAB_DIR: Path
 _OUTPUT_DIR: Path
+_UNIFIED_VOCAB_PATH: Path
 
 
 def _process_payload(
@@ -51,6 +58,7 @@ def _process_payload(
     source_dir: Path,
     vocab_dir: Path,
     output_dir: Path,
+    unified_vocab_path: Path,
 ) -> None:
     """Parse the inline payload, reconstruct BinaryVersionInfo, build memmap.
 
@@ -162,7 +170,7 @@ def _process_payload(
     # and atomic-publish to `output_dir` only on clean exit. A worker
     # killed mid-write leaves nothing partial on `/app/out-network`.
     with staged_publish(task, output_dir, scope=f"build_memmap/{binary_name}") as stage_dir:
-        build_memmap_files(versions, stage_dir, binary_name)
+        build_memmap_files(versions, stage_dir, binary_name, unified_vocab_path)
 
 
 @task_function
@@ -198,7 +206,15 @@ def handle(task: Task) -> WorkerOutput | None:
     task.set_phase("build_memmap")
 
     try:
-        _process_payload(task, binary_name, payload_str, _SOURCE_DIR, _VOCAB_DIR, _OUTPUT_DIR)
+        _process_payload(
+            task,
+            binary_name,
+            payload_str,
+            _SOURCE_DIR,
+            _VOCAB_DIR,
+            _OUTPUT_DIR,
+            _UNIFIED_VOCAB_PATH,
+        )
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         # Filesystem-shape errors are permanent for this input set —
         # re-running won't make a missing path appear. Surface as
@@ -254,6 +270,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--unified-vocab",
+        type=str,
+        required=True,
+        help=(
+            "Path to the corpus-wide unified_vocab.csv (format_version=3) "
+            "produced by the unify_vocab phase. Loaded once per worker "
+            "and threaded into build_memmap_files so variant-axis tokens "
+            "resolve to their assigned uint16 IDs. Required: v3 cutover "
+            "removed the vocab-less mode."
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         help="Log file instead of stdout/err",
@@ -274,7 +302,7 @@ def _on_args(args: argparse.Namespace) -> None:
     """Hook invoked by `run()` before the loop starts. Sets up
     logging and the module-level config the handler closes over.
     """
-    global _SOURCE_DIR, _VOCAB_DIR, _OUTPUT_DIR
+    global _SOURCE_DIR, _VOCAB_DIR, _OUTPUT_DIR, _UNIFIED_VOCAB_PATH
 
     increase_csv_field_size_limit()
 
@@ -308,9 +336,21 @@ def _on_args(args: argparse.Namespace) -> None:
         Path(args.vocab_source).resolve() if args.vocab_source else _SOURCE_DIR
     )
     _OUTPUT_DIR = Path(args.output).resolve()
+    _UNIFIED_VOCAB_PATH = Path(args.unified_vocab).resolve()
+
+    # Fail fast at worker startup if the unified vocab isn't reachable —
+    # every task in this dispatch will hit the same miss inside
+    # `build_memmap_files`, so surfacing here turns a per-task storm of
+    # identical errors into a single readable startup failure.
+    if not _UNIFIED_VOCAB_PATH.is_file():
+        raise FileNotFoundError(
+            f"build_memmap worker: --unified-vocab path does not exist "
+            f"or is not a regular file: {_UNIFIED_VOCAB_PATH}"
+        )
 
     logger.info(f"[*] Source directory: {_SOURCE_DIR}")
     logger.info(f"[*] Output directory: {_OUTPUT_DIR}")
+    logger.info(f"[*] Unified vocab: {_UNIFIED_VOCAB_PATH}")
 
 
 if __name__ == "__main__":

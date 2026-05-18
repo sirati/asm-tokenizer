@@ -496,6 +496,24 @@ class MemmapBuilderTask:
                 "--source-already-staged."
             ),
         )
+        # Per-run constant: the corpus-wide unified vocab (v3) the
+        # variant-token encoder needs to resolve axis strings to uint16
+        # IDs. Required since the v3 cutover removed the vocab-less
+        # mode of `build_memmap_files`. Flows planner -> worker via
+        # `build_worker_command_args` as a CLI flag (NOT via
+        # `TaskInfo.payload` — the same constant for every task in the
+        # dispatch belongs in argv, not duplicated into N payloads;
+        # mirrors the existing `--vocab-source` precedent in this file).
+        parser.add_argument(
+            "--unified-vocab",
+            type=str,
+            required=True,
+            help=(
+                "Path to the corpus-wide unified_vocab.csv "
+                "(format_version=3) produced by the unify_vocab phase. "
+                "Required — the v3 cutover removed the vocab-less mode."
+            ),
+        )
 
     def build_worker_command_args(
         self,
@@ -519,6 +537,16 @@ class MemmapBuilderTask:
             args, "source_already_staged", None
         ):
             cmd.extend(["--vocab-source", str(args.vocab_source)])
+        # `--unified-vocab` is required at argparse time, so it is
+        # always present on `args`. Forward verbatim — the worker
+        # validates existence at startup. Under SLURM
+        # `--source-already-staged`, the user-supplied path must be
+        # resolvable inside the container (typically a path under the
+        # bind-mounted source root; the unify_vocab phase writes the
+        # file under `output_dir`, which becomes build_memmap's
+        # `source_dir` per the routing rule, so a relative-to-source
+        # convention naturally satisfies this).
+        cmd.extend(["--unified-vocab", str(args.unified_vocab)])
         return cmd
 
     def get_output_filename_pattern(
