@@ -586,7 +586,7 @@ class VocabularyManager:
     # Returns `None` for non-v2 token types so the caller falls back to the
     # legacy `_reconstruct_token_from_ids` path (PLATFORM, BLOCK_DEF,
     # MEMORY_OPERAND, etc. all still work as singletons under v2 too).
-    # VARIANT_AXIS (v3-only opaque-string family) also takes the singleton
+    # VARIANT_AXIS (v1-unified-vocab-only opaque-string family) also takes the singleton
     # fallback: each vocab id is a real registered string and `Variant_Axis
     # ._from_token_ids([id])` simply looks up the string from the vocab.
     # No representative-shape collapse is meaningful because each id IS its
@@ -1699,7 +1699,7 @@ class VocabularyManager:
         self.Thread_Local = ThreadLocalInner
         self.Vtable = VtableInner
         self.Code_Ptr_Table = CodePtrTableInner
-        # Variant-axis opaque-string token (v3 unified vocab only).
+        # Variant-axis opaque-string token (v1 unified vocab only).
         # Registered on every VM so the dispatch table is complete; the
         # unifier is the only intended caller.
         self.Variant_Axis = VariantAxisInner
