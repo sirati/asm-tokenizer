@@ -1,28 +1,43 @@
 """Pass-2 section + index emitters (matched + unmatched).
 
-Pass 1 (in :mod:`tokenizer.memmap_builder.passes`) walks the per-binary
-CSVs, writes ``_data.bin`` records, and collects metadata into per-
-function dicts. Pass 2 reads those dicts back, emits section CSV rows
-and ``_index.bin`` entries, and threads the ``<binary>.error.log``
-handle to ``write_index_entry`` so cap-overflows skip the entry rather
-than aborting the build.
+Pass 1 (``tokenizer.memmap_builder.passes``) writes ``_data.bin``
+records and collects per-function metadata; pass 2 emits the section
+CSVs and per-arm index files.
 
-Split from ``passes.py`` to keep both files under the 300 LOC cap.
+Layout responsibilities (post matched-arm restructuring):
+
+* Matched header rows + unmatched first cell carry the base64 of the
+  function's line number in ``<binary>_function_names.txt``; called-
+  funcs cells are comma-joined base64 line numbers. Raw function names
+  no longer appear in either section CSV.
+* Matched variant rows carry a single ``indexer_hex`` cell (16 hex
+  chars encoding the 8-byte v1 entry for that variant's
+  ``matched_data.bin`` record). No per-variant entry in any index file.
+* ``matched_index.bin`` is the function-to-CSV-section locator in
+  pre-v1 layout (``write_csv_section_index_entry``). CSV text-file
+  byte offsets are NOT 4-aligned -- they must never go through the v1
+  ``write_index_entry`` writer (which asserts data-bin alignment).
+* ``unmatched_index.bin`` stays v1 (one entry per version's data-bin
+  record, 4-aligned) and continues using ``write_index_entry``.
+* Inlining-data cells keep LOCAL ``called_func_id`` indices.
 """
 
 from __future__ import annotations
 
 import csv
+from collections import defaultdict
 from typing import Dict, List
 
-from ..aligned_data.csv_format import format_unique_called
-from ..aligned_data.io import write_function_section_csv, write_index_entry
-from .variants import VariantRegistry, write_warn_log_entry
-from .writers import (
-    build_inlining_data_for_unmatched,
-    finalize_index_file,
-    write_unmatched_function_section,
+from ..aligned_data.csv_section_index import write_csv_section_index_entry
+from ..aligned_data.inline_indexer import encode_inline_indexer
+from ..aligned_data.io import (
+    write_function_section_csv,
+    write_index_entry,
+    write_unmatched_section_csv,
 )
+from ..aligned_data.line_no_codec import encode_line_no, encode_line_nos_csv
+from .function_names import FunctionNamesRegistry
+from .variants import VariantRegistry, write_warn_log_entry
 
 
 def write_matched_sections_pass2(
@@ -32,24 +47,31 @@ def write_matched_sections_pass2(
     index_file,
     warn_log,
     variants: VariantRegistry,
+    registry: FunctionNamesRegistry,
     *,
     error_log=None,
 ):
-    """Pass 2: Write matched sections CSV with resolved inlining data.
+    """Pass 2: matched sections CSV + pre-v1 ``matched_index.bin``.
 
-    ``error_log`` is forwarded to the index-entry writer so a per-entry
-    cap overflow gets logged and the entry is skipped from
-    ``_index.bin``.
+    ``registry`` is the FINALISED ``FunctionNamesRegistry``; the caller
+    (builder.py) must finalise + write the sidecar BEFORE pass 2.
+    ``index_file`` is the pre-v1 layout matched-index handle (no v1
+    16-byte prelude, no alignment shift). ``error_log`` is forwarded
+    to the section-index writer so per-entry cap overflows are logged
+    and the entry skipped.
 
-    The CSV-prelude bytes already written by the caller (builder.py)
-    are excluded from every stored ``section_start`` by snapshotting
-    the current file position once at entry — the reader compensates
-    by adding its ``content_offset`` back at load time, so the index
-    stays prelude-agnostic.
+    The CSV-prelude bytes already written by the caller are excluded
+    from every stored ``section_start`` by snapshotting the current
+    file position once at entry -- the reader compensates by adding
+    its ``content_offset`` back at load time.
     """
     content_offset = sections_file.tell()
     writer = csv.writer(sections_file)
-    index_entries = []
+    # Collect (func_name, section_start, section_len, avg_len) per
+    # function so we can sort by avg_len before writing the index --
+    # matches the pre-existing matched-arm length-bucket ordering
+    # consumed by length-conditioned function selection.
+    pending_index_entries: List = []
 
     for entry in matched_data_entries:
         func_name = entry["func_name"]
@@ -57,8 +79,11 @@ def write_matched_sections_pass2(
         version_data = entry["version_data"]
 
         section_start = sections_file.tell() - content_offset
-        unique_called_str = format_unique_called(unique_called)
-        writer.writerow([func_name, unique_called_str])
+        line_no_b64 = encode_line_no(registry.line_no(func_name))
+        called_line_nos_b64 = encode_line_nos_csv(
+            [registry.line_no(name) for name in unique_called]
+        )
+        writer.writerow([line_no_b64, called_line_nos_b64])
 
         total_len = 0
         for vdata in version_data:
@@ -84,25 +109,31 @@ def write_matched_sections_pass2(
                 for idx, (start, length, is_matched) in sorted(inlining_data.items())
             ]
 
-            write_function_section_csv(
-                writer,
-                variant_ref,
-                inlining_list,
-                data_offset,
-                data_len,
-            )
+            indexer_hex = encode_inline_indexer(data_offset, data_len)
+            write_function_section_csv(writer, variant_ref, inlining_list, indexer_hex)
             total_len += token_len
 
         avg_len = total_len // len(version_data) if version_data else 0
         section_end = sections_file.tell() - content_offset
-        index_entries.append(
+        pending_index_entries.append(
             (func_name, section_start, section_end - section_start, avg_len)
         )
         writer.writerow([])
 
-    finalize_index_file(
-        index_file, index_entries, sort_by_avg_len=True, error_log=error_log
-    )
+    # Length-bucket sort preserved from the previous matched-arm
+    # ordering. Pre-v1 layout doesn't change the sort contract -- the
+    # index is just a function locator; readers don't depend on entry
+    # order matching CSV row order.
+    pending_index_entries.sort(key=lambda x: x[3])
+    for func_name, section_start, section_len, avg_len in pending_index_entries:
+        write_csv_section_index_entry(
+            index_file,
+            csv_offset=section_start,
+            csv_len=section_len,
+            avg_len=avg_len,
+            func_name=func_name,
+            error_log=error_log,
+        )
 
 
 def group_unmatched_entries_by_function(
@@ -141,6 +172,55 @@ def group_unmatched_entries_by_function(
     return unmatched_by_func
 
 
+def _build_unmatched_inlining_data_list(
+    called_by_version,
+    unique_called_list: List[str],
+    vkeys: List,
+    function_lookup: dict,
+    warn_log,
+    func_name: str,
+    variants: VariantRegistry,
+) -> List:
+    """Resolve each unmatched call site into the on-disk inlining tuple."""
+    inlining_data_list = []
+    for comp_set_id, called_funcs in called_by_version:
+        for called_func in called_funcs:
+            called_func_id = unique_called_list.index(called_func)
+            lookup_key = (called_func, vkeys[comp_set_id])
+            if lookup_key in function_lookup:
+                func_offset, func_len, is_matched = function_lookup[lookup_key]
+                inlining_data_list.append(
+                    [called_func_id, comp_set_id, func_offset, func_len, is_matched]
+                )
+            else:
+                write_warn_log_entry(
+                    warn_log, func_name, variants.ref(vkeys[comp_set_id]), called_func
+                )
+    return inlining_data_list
+
+
+def _format_unmatched_inlining_str(inlining_data_list: List) -> str:
+    """Merge per-version tuples + format the on-disk inlining-data cell.
+
+    ``called_func_id`` is a LOCAL index into the section's
+    ``unique_called`` list (NOT a function name). Duplicate
+    ``(called_func_id, offset, length, is_matched)`` tuples appearing
+    across multiple versions collapse into one entry whose
+    ``comp_set_id`` field underscore-joins the contributing version IDs.
+    """
+    grouped = defaultdict(list)
+    for called_func_id, comp_set_id, offset, length, is_matched in inlining_data_list:
+        grouped[(called_func_id, offset, length, is_matched)].append(comp_set_id)
+
+    merged_entries = []
+    for (called_func_id, offset, length, is_matched), comp_set_ids in sorted(grouped.items()):
+        comp_set_str = "_".join(map(str, sorted(comp_set_ids)))
+        merged_entries.append(
+            f"{called_func_id}-{comp_set_str},{offset:x},{length:x},{is_matched}"
+        )
+    return ";".join(merged_entries)
+
+
 def write_unmatched_sections_pass2(
     unmatched_data_entries: List[dict],
     function_lookup: dict,
@@ -148,15 +228,21 @@ def write_unmatched_sections_pass2(
     index_file,
     warn_log,
     variants: VariantRegistry,
+    registry: FunctionNamesRegistry,
     *,
     error_log=None,
 ):
-    """Pass 2: Write unmatched sections CSV with resolved inlining data.
+    """Pass 2: unmatched sections CSV + v1 ``unmatched_index.bin``.
 
-    ``error_log`` is forwarded to ``write_index_entry`` so per-version
-    cap overflows get logged + skipped (no index entry written) rather
-    than raising. ``func_name`` is forwarded so the skipped entry is
-    traceable in the log.
+    ``registry`` provides line numbers for the first-cell + called-funcs
+    cell base64 indirection. Inlining-data cells keep LOCAL
+    ``called_func_id`` indices unchanged.
+
+    ``index_file`` is the v1 unmatched-index handle; one entry per
+    version's data-bin record (4-aligned, sentinel/overlong machinery
+    applies). The matched-arm restructuring does NOT touch this path.
+    ``error_log`` is forwarded so per-version cap overflows are logged
+    and the entry skipped (no abort).
     """
     writer = csv.writer(sections_file)
     unmatched_by_func = group_unmatched_entries_by_function(unmatched_data_entries)
@@ -173,7 +259,7 @@ def write_unmatched_sections_pass2(
         unique_called_list = sorted(all_called)
         first_offset, first_len = version_data_list[0][0], version_data_list[0][1]
 
-        inlining_data_list = build_inlining_data_for_unmatched(
+        inlining_data_list = _build_unmatched_inlining_data_list(
             called_by_version,
             unique_called_list,
             vkeys,
@@ -184,15 +270,20 @@ def write_unmatched_sections_pass2(
         )
 
         variant_refs = [variants.ref(vkey) for vkey in vkeys]
+        line_no_b64 = encode_line_no(registry.line_no(func_name))
+        called_line_nos_b64 = encode_line_nos_csv(
+            [registry.line_no(name) for name in unique_called_list]
+        )
+        inlining_data_str = _format_unmatched_inlining_str(inlining_data_list)
+        indexer_hex = encode_inline_indexer(first_offset, first_len)
 
-        write_unmatched_function_section(
+        write_unmatched_section_csv(
             writer,
-            func_name,
+            line_no_b64,
             variant_refs,
-            unique_called_list,
-            inlining_data_list,
-            first_offset,
-            first_len,
+            called_line_nos_b64,
+            inlining_data_str,
+            indexer_hex,
         )
 
         for data_offset, data_len, token_len in version_data_list:
