@@ -28,12 +28,16 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import BinaryIO
+from pathlib import Path
+from typing import BinaryIO, Optional, Tuple
+
+import numpy as np
 
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
 INDEX_MAGIC: bytes = b"IDX1"
 INDEX_HEADER_SIZE: int = 16
+INDEX_ENTRY_SIZE: int = 8
 ALIGNMENT_SHIFT: int = 2
 SENTINEL_LENGTH: int = 0x0000
 
@@ -82,3 +86,104 @@ def read_index_prelude(file_handle: BinaryIO) -> IndexPrelude:
             f"_index.bin format_version must be {MEMMAP_FORMAT_VERSION}; got {format_version}; re-run memmap_builder on the per-binary CSVs to regenerate"
         )
     return IndexPrelude(format_version=format_version, alignment_shift=alignment_shift)
+
+
+def decode_index_entry(
+    entry_bytes, shift: int
+) -> Tuple[int, int, int, bool]:
+    """Decode one 8-byte index entry, applying the alignment ``shift``.
+
+    Returns ``(start, length, avg_len, is_overlong)``. ``start`` is the
+    real byte offset in ``_data.bin`` (``offset_shifted << shift``).
+    ``length`` is the real record byte length (``length_shifted <<
+    shift``) for normal entries; for the sentinel entry it is ``0`` and
+    ``is_overlong`` is ``True`` (the caller resolves the real length
+    from the data record's overlong field).
+    """
+    offset_shifted = int.from_bytes(bytes(entry_bytes[0:5]), "little")
+    length_shifted = int.from_bytes(bytes(entry_bytes[5:7]), "little")
+    avg_len = int(entry_bytes[7])
+    start = offset_shifted << shift
+    if length_shifted == SENTINEL_LENGTH:
+        return start, 0, avg_len, True
+    return start, length_shifted << shift, avg_len, False
+
+
+def read_index_arrays(
+    index_path: Path,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Load a v1 ``_index.bin`` into three column ndarrays.
+
+    Returns ``(starts, lengths, avg_lengths)`` with dtypes
+    ``int64``/``uint32``/``uint8``. ``starts`` are real byte offsets;
+    ``lengths`` carry the real record length for normal entries and ``0``
+    for sentinel (overlong) entries -- callers detect the marker and
+    resolve the real length from the data record's overlong field.
+    Returns ``None`` when the file does not exist. Raises
+    :class:`ValueError` on missing prelude / wrong version / malformed
+    entry region.
+    """
+    if not index_path.exists():
+        return None
+    filesize = index_path.stat().st_size
+    if filesize < INDEX_HEADER_SIZE:
+        raise ValueError(
+            f"{index_path}: file size {filesize} smaller than the 16-byte "
+            f"prelude; re-run memmap_builder on the per-binary CSVs to regenerate"
+        )
+    entries_size = filesize - INDEX_HEADER_SIZE
+    if entries_size % INDEX_ENTRY_SIZE != 0:
+        raise ValueError(
+            f"{index_path}: entry region size {entries_size} is not a multiple "
+            f"of {INDEX_ENTRY_SIZE}"
+        )
+    n_entries = entries_size // INDEX_ENTRY_SIZE
+    with open(index_path, "rb") as fh:
+        prelude = read_index_prelude(fh)
+    shift = prelude.alignment_shift
+    if n_entries == 0:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.uint32),
+            np.zeros(0, dtype=np.uint8),
+        )
+    # ``offset=`` skips the prelude bytes natively.
+    index_memmap = np.memmap(
+        index_path,
+        dtype=np.uint8,
+        mode="r",
+        offset=INDEX_HEADER_SIZE,
+        shape=(n_entries, INDEX_ENTRY_SIZE),
+    )
+    starts = np.zeros(n_entries, dtype=np.int64)
+    lengths = np.zeros(n_entries, dtype=np.uint32)
+    avg_lengths = np.zeros(n_entries, dtype=np.uint8)
+    for i in range(n_entries):
+        start, length, avg_len, _ = decode_index_entry(index_memmap[i], shift)
+        starts[i] = start
+        lengths[i] = length
+        avg_lengths[i] = avg_len
+    del index_memmap
+    return starts, lengths, avg_lengths
+
+
+def iter_index_entries(index_path: Path):
+    """Yield ``(start, length, avg_len)`` per entry of a v1 ``_index.bin``.
+
+    Convenience for streaming readers (the iterator does not materialise
+    the column arrays). ``length`` is ``0`` for sentinel entries.
+    """
+    with open(index_path, "rb") as fh:
+        prelude = read_index_prelude(fh)
+        shift = prelude.alignment_shift
+        while True:
+            raw = fh.read(INDEX_ENTRY_SIZE)
+            if not raw:
+                return
+            if len(raw) != INDEX_ENTRY_SIZE:
+                raise ValueError(
+                    f"{index_path}: truncated entry of {len(raw)} bytes; "
+                    f"expected {INDEX_ENTRY_SIZE}"
+                )
+            start, length, avg_len, _ = decode_index_entry(raw, shift)
+            yield start, length, avg_len

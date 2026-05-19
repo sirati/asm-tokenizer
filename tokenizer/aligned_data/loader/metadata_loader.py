@@ -16,7 +16,14 @@ from typing import Callable, List, Optional, TextIO, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.binary_format import HEADER_BYTES, parse_binary_header
+from tokenizer.aligned_data.index_format import read_index_arrays
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+
+from ._index_decoding import record_token_count
+
+# First line of every v1 sections / variants CSV. Comment-line marker so
+# third-party CSV viewers ignore it; this reader requires it verbatim.
+_SECTIONS_PRELUDE_LINE = f"# format={MEMMAP_FORMAT_VERSION}\n"
 
 
 class SectionKind(Enum):
@@ -79,50 +86,42 @@ class _ArmSpec:
 
 
 def open_sections_csv(path: Path) -> Tuple[TextIO, int]:
-    """Open ``_sections.csv``, consume any ``version=N`` prelude row.
+    """Open a v1 sections CSV; require the ``# format=N`` prelude line.
 
-    Returns ``(handle, content_offset_bytes)``. ``content_offset`` is the
-    prelude row's byte width (0 when absent) -- seek-based callers add
-    it to stored offsets; iterating callers just read from the handle.
+    Returns ``(handle, content_offset_bytes)``: seek-based callers add
+    ``content_offset`` to stored offsets, iterating callers just read.
+    Raises :class:`ValueError` with a migration-pointing message on any
+    other first line. CRLF in the prelude is tolerated; the writer
+    always emits LF.
     """
     f = open(path, "r", newline="", encoding="ascii")
-    start_pos = f.tell()
     first_line = f.readline()
-    if first_line.startswith("version="):
-        return f, f.tell() - start_pos
-    f.seek(start_pos)
-    return f, 0
+    expected = _SECTIONS_PRELUDE_LINE.rstrip("\n")
+    if first_line.rstrip("\r\n") != expected:
+        f.close()
+        raise ValueError(
+            f"{path}: missing or unsupported prelude; expected first line "
+            f"{expected!r}, got {first_line!r}; re-run memmap_builder on the "
+            f"per-binary CSVs to regenerate"
+        )
+    return f, f.tell()
 
 
 def load_index_once(
     index_path: Path,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-    """Load ``*_index.bin`` and materialise the three columns. Missing
-    file -> ``(None, None, None)``; zero-entry file -> empty arrays.
-    Memmap is dropped before return (ML-leak hygiene)."""
-    if not index_path.exists():
+    """Load a v1 ``*_index.bin`` into ``(starts, lengths, avg_lengths)``.
+
+    Missing file -> ``(None, None, None)``. Delegates to
+    :func:`read_index_arrays` which owns the wire format (16-byte
+    prelude, alignment shift, sentinel marker). ``starts`` are real
+    byte offsets (``int64``); ``lengths`` are real record byte lengths
+    (``uint32``) with ``0`` flagging an overlong record.
+    """
+    arrays = read_index_arrays(index_path)
+    if arrays is None:
         return None, None, None
-    filesize = index_path.stat().st_size
-    if filesize % 8 != 0:
-        raise ValueError(f"Index file size {filesize} is not a multiple of 8")
-    n_entries = filesize // 8
-    if n_entries == 0:
-        return (
-            np.zeros(0, dtype=np.uint32),
-            np.zeros(0, dtype=np.uint32),
-            np.zeros(0, dtype=np.uint8),
-        )
-    index_memmap = np.memmap(index_path, dtype=np.uint8, mode="r", shape=(n_entries, 8))
-    starts = np.zeros(n_entries, dtype=np.uint32)
-    lengths = np.zeros(n_entries, dtype=np.uint32)
-    avg_lengths = np.zeros(n_entries, dtype=np.uint8)
-    for i in range(n_entries):
-        entry = index_memmap[i]
-        starts[i] = int.from_bytes(entry[0:4].tobytes(), "little")
-        lengths[i] = int.from_bytes(entry[4:7].tobytes(), "little")
-        avg_lengths[i] = entry[7]
-    del index_memmap
-    return starts, lengths, avg_lengths
+    return arrays
 
 
 def build_length_lookup_tables(
@@ -149,20 +148,21 @@ def build_length_lookup_tables(
 def load_unmatched_lengths(
     paths: BinaryArmPaths, starts: np.ndarray, lengths: np.ndarray
 ) -> np.ndarray:
-    """Real token count per unmatched function. Header parsing is
-    delegated to ``parse_binary_header`` so the field layout lives in
-    one place; pad + overlong accounting is added by the v1 reader.
+    """Real token count per unmatched function.
+
+    Delegates per-record decoding to :func:`record_token_count`, which
+    owns the pad + overlong-field accounting in one place. ``lengths``
+    carries the index reader's sentinel-marker convention (``0`` flags
+    an overlong record).
     """
     if not paths.data_bin.exists() or len(starts) == 0:
         return np.array([], dtype=np.int32)
 
     data_memmap = np.memmap(str(paths.data_bin), dtype=np.uint8, mode="r")
-    token_counts: List[int] = []
-    for i in range(len(starts)):
-        start, length = int(starts[i]), int(lengths[i])
-        header = parse_binary_header(data_memmap[start : start + HEADER_BYTES])
-        body_bytes = length - HEADER_BYTES - header.insn_len - header.block_len
-        token_counts.append(body_bytes // 2)
+    token_counts = [
+        record_token_count(data_memmap, int(starts[i]), int(lengths[i]))
+        for i in range(len(starts))
+    ]
     del data_memmap
     return np.array(token_counts, dtype=np.int32)
 
@@ -247,9 +247,9 @@ _ARM_SPECS: dict[SectionKind, _ArmSpec] = {
 
 
 def _empty_arm() -> SectionArm:
-    """Canonical empty arm; preserves dtypes for legacy zero-state parity."""
+    """Canonical empty arm; dtypes match ``load_index_once`` output."""
     return SectionArm(
-        starts=np.array([], dtype=np.uint32),
+        starts=np.array([], dtype=np.int64),
         lengths=np.array([], dtype=np.uint32),
         edge_indices=np.zeros(1, dtype=np.int32),
         count_per_length=np.zeros(1, dtype=np.int32),

@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ..io import parse_function_data_memmap as _parse_function_data_memmap
+from ._index_decoding import resolve_record_length
 from ._session_parsers import (
     arm_arrays,
     build_unmatched_function_data,
@@ -36,6 +37,7 @@ from ._session_parsers import (
 )
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
+from .metadata_loader import open_sections_csv
 from .variant_resolver import get_variant_by_ref as _resolve_variant_by_ref
 
 
@@ -130,7 +132,7 @@ class BinarySession:
         data_mmap = self._open_data("matched")
         return parse_matched_section(
             section_data,
-            data_slice=lambda o, l: _parse_function_data_memmap(data_mmap, o, l),
+            data_slice=lambda o, l: self._slice_data_record(data_mmap, o, l),
             resolve_ref=self.get_variant_by_ref,
         )
 
@@ -140,15 +142,34 @@ class BinarySession:
         if idx >= len(starts):
             raise IndexError(f"Index {idx} out of bounds for unmatched functions")
         start = int(starts[idx])
-        length = int(lengths[idx])
+        stored_length = int(lengths[idx])
         data_mmap = self._open_data("unmatched")
+        real_length, is_overlong = resolve_record_length(
+            data_mmap, start, stored_length
+        )
         insn_rl, block_rl, tokens = _parse_function_data_memmap(
-            data_mmap, start, length
+            data_mmap, start, real_length, is_overlong=is_overlong,
         )
         row = self._read_unmatched_row(arm, idx)
         return build_unmatched_function_data(
-            row, idx, start, length, tokens, insn_rl, block_rl,
+            row, idx, start, real_length, tokens, insn_rl, block_rl,
             resolve_ref=self.get_variant_by_ref,
+        )
+
+    def _slice_data_record(self, data_mmap, offset: int, length: int):
+        """Resolve overlong sentinel then slice via the shared parser.
+
+        The matched-section CSV stores the real ``data_len`` directly,
+        but the writer picks the overlong layout when that length
+        exceeds the normal-record cap; ``resolve_record_length`` owns
+        the single rule that maps stored length → ``(real_length,
+        is_overlong)`` for both arms.
+        """
+        real_length, is_overlong = resolve_record_length(
+            data_mmap, offset, length
+        )
+        return _parse_function_data_memmap(
+            data_mmap, offset, real_length, is_overlong=is_overlong,
         )
 
     def get_variant_by_ref(self, ref: str) -> Optional[Dict[str, Any]]:
@@ -185,20 +206,14 @@ class BinarySession:
             return self._sections_handle
         suffix = "_sections.csv" if kind == "matched" else "_unmatched_sections.csv"
         path = self._base_path / f"{self._binary_name}{suffix}"
-        f = open(path, "r", newline="", encoding="ascii")
+        # Delegate prelude validation + content-offset accounting to
+        # ``open_sections_csv`` so the v1 ``# format=N`` requirement
+        # lives in one place across the reader chain.
+        f, content_offset = open_sections_csv(path)
         self._stack.callback(f.close)
-        # Transparent v2 prelude consumption — mirrors the legacy
-        # ``_open_sections_csv``; prelude width is a property of the
-        # open handle, not of cached metadata.
-        start_pos = f.tell()
-        first_line = f.readline()
-        if first_line.startswith("version="):
-            self._sections_content_offset = f.tell() - start_pos
-        else:
-            f.seek(start_pos)
-            self._sections_content_offset = 0
         self._sections_handle = f
         self._sections_kind = kind
+        self._sections_content_offset = content_offset
         return f
 
     def _open_data(self, kind: str) -> np.ndarray:
@@ -243,7 +258,9 @@ class BinarySession:
             return None
         sections = self._open_sections("unmatched")
         try:
-            sections.seek(int(section_starts[idx]))
+            sections.seek(
+                int(section_starts[idx]) + self._sections_content_offset
+            )
         except (IndexError, ValueError):
             return None
         line = sections.readline()

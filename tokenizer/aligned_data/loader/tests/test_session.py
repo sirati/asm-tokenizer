@@ -30,6 +30,9 @@ import pytest
 
 from tokenizer.aligned_data.binary_format import encode_binary_header
 from tokenizer.aligned_data.loader.session import BinarySession
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+
+_SECTIONS_PRELUDE = f"# format={MEMMAP_FORMAT_VERSION}\n"
 
 
 class _FakeArm:
@@ -119,17 +122,21 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
         d_off, d_len = _write_data_record(f, np.array([10, 11, 12], dtype=np.uint16))
 
     # --- _sections.csv (matched: one section with one version) -----
+    # The v1 prelude is stripped by ``open_sections_csv``; row offsets
+    # in the matched arm are content-relative (post-prelude).
     sections_path = base / f"{binary_name}_sections.csv"
     with open(sections_path, "w", newline="", encoding="ascii") as f:
+        f.write(_SECTIONS_PRELUDE)
+        prelude_size = f.tell()
         writer = csv.writer(f)
-        section_start = f.tell()
+        section_start = f.tell() - prelude_size
         writer.writerow(["my_func"])
         writer.writerow([f"{variant_offset:x}", "", f"{d_off:x}", f"{d_len:x}"])
-        section_end = f.tell()
+        section_end = f.tell() - prelude_size
     section_length = section_end - section_start
 
     matched_arm = _FakeArm(
-        starts=np.array([section_start], dtype=np.uint32),
+        starts=np.array([section_start], dtype=np.int64),
         lengths=np.array([section_length], dtype=np.uint32),
     )
 
@@ -140,7 +147,9 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
 
     unmatched_sections_path = base / f"{binary_name}_unmatched_sections.csv"
     with open(unmatched_sections_path, "w", newline="", encoding="ascii") as f:
-        u_sec_start = f.tell()
+        f.write(_SECTIONS_PRELUDE)
+        u_prelude_size = f.tell()
+        u_sec_start = f.tell() - u_prelude_size
         writer = csv.writer(f)
         writer.writerow([
             "lonely_func",
@@ -152,10 +161,10 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
         ])
 
     unmatched_arm = _FakeArm(
-        starts=np.array([u_off], dtype=np.uint32),
+        starts=np.array([u_off], dtype=np.int64),
         lengths=np.array([u_len], dtype=np.uint32),
         func_names=["lonely_func"],
-        section_starts=np.array([u_sec_start], dtype=np.uint64),
+        section_starts=np.array([u_sec_start], dtype=np.int64),
     )
 
     metadata = {

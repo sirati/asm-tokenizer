@@ -21,6 +21,7 @@ from typing import List
 import numpy as np
 
 from tokenizer.aligned_data.binary_format import compute_pad, encode_binary_header
+from tokenizer.aligned_data.index_format import write_index_prelude
 from tokenizer.aligned_data.io import write_index_entry
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.metadata_loader import (
@@ -30,6 +31,9 @@ from tokenizer.aligned_data.loader.metadata_loader import (
     load_section_arm,
     open_sections_csv,
 )
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+
+_SECTIONS_PRELUDE = f"# format={MEMMAP_FORMAT_VERSION}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,7 @@ def _write_matched_data(path: Path, n_records: int) -> List[tuple]:
 
 def _write_index(path: Path, triples: List[tuple]) -> None:
     with open(path, "wb") as f:
+        write_index_prelude(f)
         for start, length, avg_len in triples:
             write_index_entry(f, start, length, avg_len)
 
@@ -92,13 +97,16 @@ def _write_matched_sections(
 
     For test parity with the production layout, each function gets a
     single-cell header row followed by one variant row, and the index
-    file's ``start`` value is the byte offset of the header row.
+    file's ``start`` value is the byte offset of the header row
+    *relative to the v1 prelude* (the reader's ``content_offset``).
     """
     with open(path, "wb") as f:
+        f.write(_SECTIONS_PRELUDE.encode("ascii"))
+        prelude_size = f.tell()
         for name, start, length in names_with_offsets:
-            assert f.tell() == start, (
+            assert f.tell() - prelude_size == start, (
                 f"Section CSV builder out of sync at {name}: "
-                f"want {start} got {f.tell()}"
+                f"want {start} got {f.tell() - prelude_size}"
             )
             block = name.encode("ascii") + b"\n0,,0,0\n"
             assert len(block) == length, (
@@ -172,11 +180,12 @@ def _build_unmatched_arm(tmp_path: Path) -> List[str]:
 
     _write_index(tmp_path / "bin_unmatched_index.bin", triples)
 
-    # Unmatched sections CSV: 6-col rows (func_name, variant_refs,
-    # called_funcs, inlining, data_offset, data_len). Plain ASCII,
-    # no embedded newlines per row.
+    # Unmatched sections CSV: v1 ``# format=N`` prelude, then 6-col rows
+    # (func_name, variant_refs, called_funcs, inlining, data_offset,
+    # data_len). Plain ASCII, no embedded newlines per row.
     with open(tmp_path / "bin_unmatched_sections.csv", "w",
               newline="", encoding="ascii") as f:
+        f.write(_SECTIONS_PRELUDE)
         writer = csv.writer(f)
         for i, name in enumerate(names):
             start, length, _ = triples[i]
@@ -270,9 +279,10 @@ def test_matched_arm_has_empty_section_starts(tmp_path):
     # Sanity: the legacy starts ARE the CSV offsets, so seeking to
     # arm.starts[i] in the sections CSV reads the i-th function's
     # header row.
+    prelude_len = len(_SECTIONS_PRELUDE.encode("ascii"))
     with open(_matched_paths(tmp_path).sections_csv, "rb") as f:
         for i, start in enumerate(arm.starts):
-            f.seek(int(start))
+            f.seek(int(start) + prelude_len)
             line = f.readline().rstrip(b"\n").decode("ascii")
             assert line == arm.func_names[i]
 
@@ -321,7 +331,7 @@ def test_empty_arm_when_index_missing(tmp_path):
     )
     arm = load_section_arm(SectionKind.MATCHED, paths)
     assert arm.count == 0
-    assert arm.starts.dtype == np.uint32
+    assert arm.starts.dtype == np.int64
     assert arm.lengths.dtype == np.uint32
     assert arm.edge_indices.dtype == np.int32
     assert arm.count_per_length.dtype == np.int32
@@ -331,10 +341,10 @@ def test_empty_arm_when_index_missing(tmp_path):
 
 
 def test_zero_entry_index_yields_empty_arm(tmp_path):
-    """An index file that exists but is empty (zero entries) yields
-    the empty arm, NOT a None/exception — matches the legacy
-    zero-entry handling in ``load_index_once``."""
-    (tmp_path / "empty_index.bin").write_bytes(b"")
+    """A v1 index with only the 16-byte prelude (zero entries) yields
+    the empty arm, not None/exception."""
+    with open(tmp_path / "empty_index.bin", "wb") as f:
+        write_index_prelude(f)
     paths = BinaryArmPaths(
         sections_csv=tmp_path / "empty_sections.csv",
         index_bin=tmp_path / "empty_index.bin",

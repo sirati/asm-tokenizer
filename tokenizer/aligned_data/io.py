@@ -9,6 +9,7 @@ from .binary_format import (
     parse_binary_header,
 )
 from .csv_format import format_inlining_dict, format_variant_refs
+from .index_format import iter_index_entries
 from ._writers import write_function_binary_data, write_index_entry  # re-export
 
 __all__ = (
@@ -107,22 +108,16 @@ def write_unmatched_section_csv(
 
 
 def read_index_file(index_path):
-    """Read the index file and yield (start, length, avg_len) for each function."""
-    with open(index_path, "rb") as f:
-        while True:
-            start_bytes = f.read(4)
-            if not start_bytes or len(start_bytes) < 4:
-                break
-            start = int.from_bytes(start_bytes, "little")
-            length_bytes = f.read(3)
-            if not length_bytes or len(length_bytes) < 3:
-                break
-            length = int.from_bytes(length_bytes, "little")
-            avg_len_byte = f.read(1)
-            if not avg_len_byte or len(avg_len_byte) < 1:
-                break
-            avg_len = int.from_bytes(avg_len_byte, "little")
-            yield (start, length, avg_len)
+    """Yield ``(start, length, avg_len)`` for each entry in a v1 ``_index.bin``.
+
+    Thin wrapper over :func:`tokenizer.aligned_data.index_format.iter_index_entries`
+    so external callers keep the existing import path. ``start`` is the
+    real byte offset, ``length`` is the real record byte length for
+    normal entries and ``0`` for the sentinel marker (overlong record;
+    the real length lives in the data record's u24 overlong field).
+    Raises :class:`ValueError` on missing prelude / wrong format version.
+    """
+    yield from iter_index_entries(index_path)
 
 
 def read_sections_file(sections_path):
