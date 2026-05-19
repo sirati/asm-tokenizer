@@ -14,10 +14,11 @@ instruction tokens — those are pass 2's concern.
 
 Order discipline: ``VariantInventory.iter_tokens`` yields strings in
 alphabetical order. The unifier registers them on a freshly
-constructed v3 ``VocabularyManager`` whose first registerable ID is
-``_V2_RESERVED_DIGIT_COUNT`` (256). Variant tokens therefore land at
-contiguous IDs ``[256, 256 + n_variants)``. Two runs over the same
-corpus produce byte-identical unified vocabs.
+constructed unified ``VocabularyManager`` (``MEMMAP_FORMAT_VERSION``)
+whose first registerable ID is ``_V2_RESERVED_DIGIT_COUNT`` (256).
+Variant tokens therefore land at contiguous IDs
+``[256, 256 + n_variants)``. Two runs over the same corpus produce
+byte-identical unified vocabs.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.variant_info import VariantInfo
 from tokenizer.variant_tokens import VariantInventory
@@ -66,16 +68,18 @@ def discover_and_register_variants(
     the hood and is idempotent on duplicate strings, so the per-token
     registration cost is one dict lookup after the first occurrence.
 
-    ``unified_vm.format_version`` MUST be 3 — variant tokens are
-    meaningful only in the additive v3 unified vocab. The assert
-    is here (not inside the Inner class) because the Inner class is
-    layout-agnostic and a future format may legitimately reuse it.
+    ``unified_vm.format_version`` MUST equal ``MEMMAP_FORMAT_VERSION``
+    — variant tokens are meaningful only in the unified vocab. The
+    assert is here (not inside the Inner class) because the Inner
+    class is layout-agnostic and a future format may legitimately
+    reuse it.
 
     Returns the count of distinct variant tokens registered — the
     unifier logs this and tests assert it.
     """
-    assert unified_vm.format_version == 3, (
-        f"discover_and_register_variants requires a v3 unified VM; "
+    assert unified_vm.format_version == MEMMAP_FORMAT_VERSION, (
+        f"discover_and_register_variants requires a unified VM at "
+        f"format_version={MEMMAP_FORMAT_VERSION}; "
         f"got format_version={unified_vm.format_version}"
     )
 
@@ -85,7 +89,7 @@ def discover_and_register_variants(
     # `iter_tokens` yields alphabetically — deterministic across runs
     # on the same corpus. Each call to `unified_vm.Variant_Axis(s)`
     # registers `s` at the next free vocab id (starting at 256 on a
-    # fresh v3 VM); duplicates are no-ops.
+    # fresh unified VM); duplicates are no-ops.
     n_registered = 0
     for token_str in inventory.iter_tokens():
         unified_vm.Variant_Axis(token_str)

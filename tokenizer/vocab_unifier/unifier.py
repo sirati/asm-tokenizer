@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.compact_base64_utils import ndarray_to_base64
 from tokenizer.token_manager import VocabularyManager
 
@@ -58,13 +59,14 @@ def unify_vocab(
     if mapping_output_dir is not None:
         mapping_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # v3 unified vocab: variant-axis tokens occupy a low contiguous
+    # Unified vocab: variant-axis tokens occupy a low contiguous
     # block starting at id 256 (the v2 reserved-digit boundary);
     # instruction representatives from the per-binary v2 CSVs land
-    # above that block via pass 2. The unified VM is v3 from the
-    # start so `_private_add_token` recognises the reserved-digit
-    # layout for both variant and instruction registrations.
-    unified_vm = VocabularyManager(platform=None, format_version=3)
+    # above that block via pass 2. The unified VM is built at
+    # ``MEMMAP_FORMAT_VERSION`` from the start so ``_private_add_token``
+    # recognises the reserved-digit layout for both variant and
+    # instruction registrations.
+    unified_vm = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
 
     # Pass 1 — sidecar-only walk to register every distinct variant-
     # axis token. No CSV body is read in this pass; the input CSVs'
@@ -74,8 +76,9 @@ def unify_vocab(
 
     # Pass 2 — instruction-representative walk against each per-binary
     # vocab CSV. The mapping array translates the per-binary id space
-    # into the unified id space; v3 reuses v2's reserved-digit semantics
-    # so the identity remap for IDs 0..255 stays valid.
+    # into the unified id space; the unified vocab reuses v2's
+    # reserved-digit semantics so the identity remap for IDs 0..255
+    # stays valid.
     loaded_count = 0
     for csv_file in csv_files:
         print(f"Loading vocabulary from {csv_file}")
@@ -87,10 +90,11 @@ def unify_vocab(
 
         current_format_version = current_vocab_manager.format_version
         # Per-binary CSVs are always v2 under the plan (variant tokens
-        # live ONLY in the unified vocab). A v1 or v3 input here would
-        # mean someone fed the unifier a stale or mis-built CSV; refuse
-        # explicitly rather than silently mis-decoding the reserved-id
-        # band.
+        # live ONLY in the unified vocab). Anything else here would
+        # mean someone fed the unifier a stale or mis-built CSV — most
+        # commonly a unified vocab file mistaken for a per-binary one;
+        # refuse explicitly rather than silently mis-decoding the
+        # reserved-id band.
         if current_format_version != 2:
             raise ValueError(
                 f"unify_vocab: per-binary CSV must be format_version=2; "
