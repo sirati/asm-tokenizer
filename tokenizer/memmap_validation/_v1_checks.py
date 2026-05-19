@@ -33,6 +33,7 @@ import numpy as np
 from tokenizer.aligned_data.binary_format import (
     HEADER_BYTES,
     OVERLONG_FIELD_BYTES,
+    compute_pad,
     parse_binary_header,
 )
 from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH, read_index_prelude
@@ -171,6 +172,79 @@ def check_sentinel_overlong_coupling(
     return errors
 
 
+def check_pad_consistency(
+    data_path: Path,
+    starts: np.ndarray,
+    lengths: np.ndarray,
+    label: str,
+) -> List[str]:
+    """Every record's ``header.pad_size`` must equal ``compute_pad(...)``.
+
+    Recovers token_count from body geometry then re-derives pad via the
+    shared :func:`tokenizer.aligned_data.binary_format.compute_pad` --
+    a mismatch means writer + header invariant disagree (or tampering).
+    """
+    if not data_path.exists() or len(starts) == 0 or data_path.stat().st_size == 0:
+        return []
+    errors: List[str] = []
+    data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
+    try:
+        for i in range(len(starts)):
+            start = int(starts[i])
+            real_length, is_overlong = resolve_record_length(data, start, int(lengths[i]))
+            header = parse_binary_header(data[start : start + HEADER_BYTES])
+            body_prefix = HEADER_BYTES + (OVERLONG_FIELD_BYTES if is_overlong else 0)
+            token_count = (
+                real_length - body_prefix - header.insn_len - header.pad_size - header.block_len
+            ) // 2
+            expected_pad = compute_pad(
+                header.insn_len, header.block_len, token_count, is_overlong
+            )
+            if header.pad_size != expected_pad:
+                errors.append(
+                    f"{label}: record {i} (start={start}) pad_size={header.pad_size} "
+                    f"disagrees with compute_pad={expected_pad} "
+                    f"(insn_len={header.insn_len}, block_len={header.block_len}, "
+                    f"token_count={token_count}, is_overlong={is_overlong})"
+                )
+    finally:
+        del data
+    return errors
+
+
+def check_record_bounds(
+    data_path: Path,
+    starts: np.ndarray,
+    lengths: np.ndarray,
+    label: str,
+) -> List[str]:
+    """Every record must fit inside ``_data.bin`` (``start + real_length <= size``).
+
+    A truncated ``_data.bin`` or a corrupted index entry pointing past
+    the file would otherwise surface as a silent ``IndexError`` later.
+    """
+    if not data_path.exists() or len(starts) == 0:
+        return []
+    file_size = data_path.stat().st_size
+    if file_size == 0:
+        return []
+    errors: List[str] = []
+    data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
+    try:
+        for i in range(len(starts)):
+            start = int(starts[i])
+            real_length, _ = resolve_record_length(data, start, int(lengths[i]))
+            end = start + real_length
+            if end > file_size:
+                errors.append(
+                    f"{label}: record {i} (start={start}, real_length={real_length}) "
+                    f"extends to {end} but file_size={file_size}"
+                )
+    finally:
+        del data
+    return errors
+
+
 def run_v1_prelude_checks(
     matched_sections: Path,
     unmatched_sections: Path,
@@ -213,20 +287,14 @@ def run_v1_post_checks(
     errors: List[str] = []
     errors.extend(check_starts_alignment(matched_starts, f"{matched_index} (matched)"))
     errors.extend(check_starts_alignment(unmatched_starts, f"{unmatched_index} (unmatched)"))
-    errors.extend(
-        check_pad_bytes_zero(matched_data, matched_starts, matched_lengths, str(matched_data))
-    )
-    errors.extend(
-        check_pad_bytes_zero(unmatched_data, unmatched_starts, unmatched_lengths, str(unmatched_data))
-    )
-    errors.extend(
-        check_sentinel_overlong_coupling(
-            matched_data, matched_starts, matched_lengths, str(matched_index)
+    for data_path, index_path, starts, lengths in (
+        (matched_data, matched_index, matched_starts, matched_lengths),
+        (unmatched_data, unmatched_index, unmatched_starts, unmatched_lengths),
+    ):
+        errors.extend(check_pad_bytes_zero(data_path, starts, lengths, str(data_path)))
+        errors.extend(
+            check_sentinel_overlong_coupling(data_path, starts, lengths, str(index_path))
         )
-    )
-    errors.extend(
-        check_sentinel_overlong_coupling(
-            unmatched_data, unmatched_starts, unmatched_lengths, str(unmatched_index)
-        )
-    )
+        errors.extend(check_pad_consistency(data_path, starts, lengths, str(data_path)))
+        errors.extend(check_record_bounds(data_path, starts, lengths, str(data_path)))
     return errors
