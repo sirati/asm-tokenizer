@@ -1,29 +1,47 @@
 import csv
 
-import numpy as np
-
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.compact_base64_utils import ndarray_to_base64
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
+# Unified-vocab artifacts always carry the single in-tree memmap-chain
+# version (memmap_format.MEMMAP_FORMAT_VERSION). The per-binary CSV
+# (out-of-scope tokenize-output, see plan memoized-booping-wren.md
+# §"Out of scope") keeps its own version=2 trailer; this writer stamps
+# whichever value the manager declares. The constant is duplicated here
+# rather than imported from tokenizer.aligned_data.memmap_format because
+# that package eagerly imports vocab_unifier.loader (via the unified-vocab
+# gate), forming an import cycle. Bumps stay coupled because the gate
+# also raises on any version other than its imported constant.
+_UNIFIED_FORMAT_VERSION = 1
+_PER_BINARY_FORMAT_VERSION = 2
+
+_SUPPORTED_FORMAT_VERSIONS = (_UNIFIED_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
+
 
 def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) -> None:
+    # Two callers exist: the vocab_unifier produces unified-vocab
+    # format_version=1 (see plan memoized-booping-wren.md §"Format-version
+    # coupling"), and the per-binary tokenize worker produces per-binary
+    # CSV format_version=2. Both share the wire layout: the first
+    # `_V2_RESERVED_DIGIT_COUNT` IDs are protocol-reserved digit slots,
+    # not written on the wire (the loader reconstitutes them from the
+    # protocol convention based on the trailer integer). Any other value
+    # is a programmer error — the legacy v1-no-trailer and v3 paths were
+    # removed in the memoized-booping-wren.md cleanup.
+    if vocab_manager.format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"save_vocabulary supports unified vocab format_version="
+            f"{_UNIFIED_FORMAT_VERSION} or per-binary CSV format_version="
+            f"{_PER_BINARY_FORMAT_VERSION}; got "
+            f"{vocab_manager.format_version}"
+        )
+
     token_count = len(vocab_manager.id_to_token)
-    # Under format_version=2 the first `_V2_RESERVED_DIGIT_COUNT` IDs are
-    # protocol-reserved digit slots — never emitted on the wire (see plan
-    # vivid-tinkering-wilkes.md: "no entries are written for these
-    # positions"). Slice them off the serialized vocab + accompanying
-    # per-ID arrays; the loader reconstitutes them from the protocol
-    # convention when `format_version=2` is detected in the trailer.
-    # v3 reuses the v2 reserved-digit layout verbatim (variant-axis tokens
-    # are additive at IDs >= 256, so the wire format is byte-identical to
-    # v2 except for the trailer integer). See plan
-    # memoized-booping-wren.md § "Format-version policy".
-    if vocab_manager.format_version in (2, 3):
-        start = VocabularyManager._V2_RESERVED_DIGIT_COUNT
-    else:
-        start = 0
+    # Strip the protocol-reserved digit slots; no entries are written for
+    # these positions. Both supported versions share this encoding.
+    start = VocabularyManager._V2_RESERVED_DIGIT_COUNT
 
     row = [
         "vocabulary",
@@ -49,12 +67,9 @@ def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) ->
         ]
         row += extra
 
-    if vocab_manager.format_version in (2, 3):
-        # Append the trailer pair after the v1-shaped row so v1 readers
-        # (which assert the legacy column count) reject the file cleanly
-        # rather than silently mis-decoding. v3's wire layout matches v2
-        # byte-for-byte aside from this integer; the loader picks which
-        # decode branch to take by reading it back.
-        row += ["format_version", str(vocab_manager.format_version)]
+    # Trailer pair always written. The loader keys decode behavior on the
+    # integer — it does not branch on per-version layouts because both
+    # supported versions share the wire format byte-for-byte.
+    row += ["format_version", str(vocab_manager.format_version)]
 
     csv_writer.writerow(row)
