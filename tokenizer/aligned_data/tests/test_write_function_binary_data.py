@@ -23,11 +23,11 @@ from tokenizer.aligned_data.binary_format import (
     determine_block_encoding,
     parse_binary_header,
 )
+from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH
 from tokenizer.aligned_data.io import write_function_binary_data
 
-# Mirror the writer's local constants so the test can drive the boundaries
-# without importing private names.
-_MAX_NORMAL_REAL_LENGTH = 0xFFFF << 2
+# Overlong cap is a writer-private constant; mirror it here for boundary
+# tests. (Hoisting it to ``index_format`` is out of scope for this dedup.)
 _MAX_OVERLONG_REAL_LENGTH = 0xFFFFFF << 2
 
 
@@ -51,7 +51,7 @@ def _parse_written_record(buf: bytes):
     header = parse_binary_header(buf)
     offset = HEADER_BYTES
     overlong_length = None
-    if len(buf) > _MAX_NORMAL_REAL_LENGTH:
+    if len(buf) > MAX_NORMAL_REAL_LENGTH:
         # Total exceeds normal cap; writer must have stamped the u24 overlong
         # field. The test seeds enough headroom for this branch.
         overlong_length = int.from_bytes(buf[offset : offset + OVERLONG_FIELD_BYTES], "little") << 2
@@ -117,7 +117,7 @@ def test_round_trip_200_random_shapes():
         # Block byte-count, not element count.
         assert rec["header"].block_len == block.nbytes
         # Pad value must be the one the pure function picks.
-        is_overlong = length > _MAX_NORMAL_REAL_LENGTH
+        is_overlong = length > MAX_NORMAL_REAL_LENGTH
         expected_pad = compute_pad(insn_len, block.nbytes, token_count, is_overlong)
         assert rec["header"].pad_size == expected_pad
         assert rec["pad_bytes"] == b"\x00" * expected_pad

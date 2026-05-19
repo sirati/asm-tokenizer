@@ -21,15 +21,10 @@ from tokenizer.aligned_data.binary_format import (
     BinaryHeader,
     parse_binary_header,
 )
+from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH
 
 # Cached per-arithmetic sum so the hot resolve path stays branch-free.
 _OVERLONG_PREFIX = HEADER_BYTES + OVERLONG_FIELD_BYTES
-
-# Real-length threshold above which the writer always picks the overlong
-# layout. Mirrors ``tokenizer.aligned_data._writers._MAX_NORMAL_REAL_LENGTH``;
-# kept private here so the wire-format detail is not duplicated across
-# the reader chain.
-_MAX_NORMAL_REAL_LENGTH = 0xFFFF << 2
 
 
 def resolve_record_length(
@@ -45,7 +40,7 @@ def resolve_record_length(
     so layout knowledge stays in one place.
 
     * ``stored_length == 0``  -> sentinel; read the overlong field.
-    * ``stored_length > _MAX_NORMAL_REAL_LENGTH`` -> the writer chose
+    * ``stored_length > MAX_NORMAL_REAL_LENGTH`` -> the writer chose
       the overlong layout because the record could not fit the index's
       u16 cap; return ``(stored_length, True)``.
     * else -> normal record; ``(stored_length, False)``.
@@ -53,7 +48,7 @@ def resolve_record_length(
     if stored_length == 0:
         field = data_memmap[start + HEADER_BYTES : start + _OVERLONG_PREFIX]
         return int.from_bytes(bytes(field), "little") << 2, True
-    if stored_length > _MAX_NORMAL_REAL_LENGTH:
+    if stored_length > MAX_NORMAL_REAL_LENGTH:
         return stored_length, True
     return stored_length, False
 

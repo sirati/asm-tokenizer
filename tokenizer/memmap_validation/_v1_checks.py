@@ -35,7 +35,7 @@ from tokenizer.aligned_data.binary_format import (
     OVERLONG_FIELD_BYTES,
     parse_binary_header,
 )
-from tokenizer.aligned_data.index_format import read_index_prelude
+from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH, read_index_prelude
 from tokenizer.aligned_data.loader._index_decoding import resolve_record_length
 from tokenizer.aligned_data.loader.metadata_loader import open_sections_csv
 
@@ -149,7 +149,6 @@ def check_sentinel_overlong_coupling(
         return []
     errors: List[str] = []
     data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
-    normal_cap = 0xFFFF << 2  # mirrors _writers._MAX_NORMAL_REAL_LENGTH
     try:
         for i in range(len(starts)):
             if int(lengths[i]) != 0:
@@ -161,11 +160,11 @@ def check_sentinel_overlong_coupling(
                     f"{label}: index entry {i} flagged sentinel but record at "
                     f"start={start} did not resolve as overlong"
                 )
-            elif real_length <= normal_cap:
+            elif real_length <= MAX_NORMAL_REAL_LENGTH:
                 errors.append(
                     f"{label}: index entry {i} sentinel/overlong-field mismatch: "
                     f"resolved real_length={real_length} fits the normal u16 cap "
-                    f"({normal_cap}); the writer should not have used the sentinel"
+                    f"({MAX_NORMAL_REAL_LENGTH}); the writer should not have used the sentinel"
                 )
     finally:
         del data

@@ -41,6 +41,15 @@ INDEX_ENTRY_SIZE: int = 8
 ALIGNMENT_SHIFT: int = 2
 SENTINEL_LENGTH: int = 0x0000
 
+# Largest real record length the u16 length_shifted field can carry without
+# tripping the overlong sentinel. ``length_shifted`` max is 0xFFFF; the
+# alignment shift (<<2) lifts that to 0xFFFF << 2 = 262140 bytes (~256 KiB).
+# Records strictly above this switch to the overlong layout where the real
+# length lives in the u24 overlong field of the data record. Single source
+# of truth — writer (`_writers`), index-decoding helper (`_index_decoding`),
+# and validator (`_v1_checks`) all import this constant.
+MAX_NORMAL_REAL_LENGTH: int = 0xFFFF << ALIGNMENT_SHIFT
+
 _PRELUDE_STRUCT = struct.Struct("<4sIII")
 assert _PRELUDE_STRUCT.size == INDEX_HEADER_SIZE
 

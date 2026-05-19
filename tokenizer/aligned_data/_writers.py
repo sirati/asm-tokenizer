@@ -17,7 +17,7 @@ from .binary_format import (
     determine_block_encoding,
     encode_binary_header,
 )
-from .index_format import SENTINEL_LENGTH
+from .index_format import MAX_NORMAL_REAL_LENGTH, SENTINEL_LENGTH
 
 # Caps derived from the on-wire entry layout (see ``index_format.py``).
 # offset is stored as the low 5 bytes of a u64 (u40); length is u16 of
@@ -27,12 +27,6 @@ _MAX_OFFSET_SHIFTED = (1 << 40) - 1
 _MAX_NORMAL_LENGTH_SHIFTED = 0xFFFF
 _MAX_OVERLONG_REAL_LENGTH = 0xFFFFFF << 2  # 67,108,860 bytes (~64 MiB)
 _INDEX_ENTRY_SIZE = 8
-
-# Largest real record length the index entry can carry without the sentinel.
-# `length_shifted` is u16; multiplied by the alignment shift (<<2) gives the
-# cap. Records strictly above this switch to the overlong layout with a u24
-# length field stored inside the data record (cap _MAX_OVERLONG_REAL_LENGTH).
-_MAX_NORMAL_REAL_LENGTH = 0xFFFF << 2
 
 
 def write_function_binary_data(
@@ -76,7 +70,7 @@ def write_function_binary_data(
         # Pick normal vs overlong layout from the would-be total length.
         pad_normal = compute_pad(insn_len, block_len, token_count, is_overlong=False)
         total_normal = 6 + insn_len + pad_normal + block_len + 2 * token_count
-        if total_normal <= _MAX_NORMAL_REAL_LENGTH:
+        if total_normal <= MAX_NORMAL_REAL_LENGTH:
             is_overlong = False
             pad_size = pad_normal
             total = total_normal
@@ -128,7 +122,7 @@ def write_index_entry(
 
     ``start`` and ``length`` are shifted right by 2 (4-byte record
     alignment is a writer invariant). A real length above
-    ``_MAX_NORMAL_REAL_LENGTH`` (~256 KiB) is encoded with sentinel
+    ``MAX_NORMAL_REAL_LENGTH`` (~256 KiB) is encoded with sentinel
     ``length_shifted == SENTINEL_LENGTH``; the real length then lives
     in the u24-shifted overlong field of the matching ``_data.bin``
     record (cap ~64 MiB). On cap violation :class:`IndexEntrySkip` is
