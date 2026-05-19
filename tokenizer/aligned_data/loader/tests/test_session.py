@@ -218,12 +218,15 @@ def test_session_opens_and_closes_cleanly(synthetic_binary):
 
 def test_session_load_unmatched(synthetic_binary):
     fb = synthetic_binary
+    # The reader returns memmap-backed views; ndarray consumers must read
+    # them inside the session's ``with`` so the underlying mapping is
+    # still live. Metadata (plain Python objects) is safe to use after.
     with BinarySession(
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
         f = sess.load_unmatched(0)
-    assert f.func_name == "lonely_func"
-    assert f.tokens.tolist() == [20, 21]
+        assert f.func_name == "lonely_func"
+        assert f.tokens.tolist() == [20, 21]
     variants = f.metadata.get("variants", [])
     assert len(variants) == 1
     assert variants[0].get("arch") == "x64"

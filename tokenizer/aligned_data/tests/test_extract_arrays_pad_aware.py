@@ -212,6 +212,110 @@ def test_parse_function_data_memmap_normal_and_overlong(tmp_path):
     _expect_arrays_equal(arrays_b, insn_b, block_b, tokens_b)
 
 
+# ---------------------------------------------------------------------------
+# Zero-copy guarantee: parsing a memmap must not allocate the whole record.
+# Returned arrays must be views into the memmap (np.shares_memory), and the
+# three reader entry points (bytes / ndarray / memmap) must agree byte-for-byte.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_memmap_returns_views_into_the_memmap(tmp_path):
+    """Slicing memmap input must yield memmap-backed views, not copies.
+
+    The audit flagged the previous ``.tobytes()`` path as defeating the
+    alignment-driven perf win. The reader must now slice the memmap
+    directly so the returned arrays share memory with the underlying
+    mapping — independent of pad value and overlong layout.
+    """
+    insn_a, block_a, tokens_a = _sample_arrays(block_enc=2)
+    record_a = _pack_record(
+        insn_a, block_a, tokens_a, pad_size=2, is_overlong=False
+    )
+    insn_b, block_b, tokens_b = _sample_arrays(block_enc=1)
+    record_b = _pack_record(
+        insn_b, block_b, tokens_b, pad_size=3, is_overlong=True,
+        overlong_length_value=400 * 1024,
+    )
+
+    bin_path = tmp_path / "synthetic_data.bin"
+    with open(bin_path, "wb") as fh:
+        fh.write(record_a)
+        offset_b = fh.tell()
+        fh.write(record_b)
+
+    mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
+
+    insn_p, block_p, tok_p = parse_function_data_memmap(
+        mmap, 0, len(record_a), is_overlong=False
+    )
+    insn_q, block_q, tok_q = parse_function_data_memmap(
+        mmap, offset_b, len(record_b), is_overlong=True
+    )
+
+    for arr in (insn_p, block_p, tok_p, insn_q, block_q, tok_q):
+        assert np.shares_memory(arr, mmap), (
+            f"array {arr.dtype}/{arr.shape} does not share memory with memmap "
+            f"— a record-sized copy was allocated"
+        )
+
+
+def test_parse_three_input_paths_agree_byte_for_byte(tmp_path):
+    """bytes / np.ndarray / np.memmap inputs must produce identical output.
+
+    Same record packed once; fed through the parser as three distinct
+    buffer kinds. Byte-for-byte agreement pins down that the
+    type-dispatch in ``_as_uint8_view`` is behaviour-preserving.
+    """
+    insn, block, tokens = _sample_arrays(block_enc=2)
+    record = _pack_record(
+        insn, block, tokens, pad_size=2, is_overlong=False
+    )
+
+    bin_path = tmp_path / "synthetic_data.bin"
+    bin_path.write_bytes(record)
+
+    bytes_form = parse_function_data_header(record, is_overlong=False)
+    ndarray_form = parse_function_data_header(
+        np.frombuffer(record, dtype=np.uint8), is_overlong=False
+    )
+    mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
+    memmap_form = parse_function_data_header(mmap, is_overlong=False)
+
+    for got in (bytes_form, ndarray_form, memmap_form):
+        _expect_arrays_equal(got, insn, block, tokens)
+
+    # Cross-check: dtype + bytes agree across all three input paths.
+    for i in range(3):
+        assert bytes_form[i].dtype == ndarray_form[i].dtype == memmap_form[i].dtype
+        assert bytes_form[i].tobytes() == ndarray_form[i].tobytes() == memmap_form[i].tobytes()
+
+
+def test_parse_binary_header_does_not_copy_full_record(tmp_path):
+    """``parse_binary_header`` reads only the first 6 bytes.
+
+    Build a comparatively large record, hand the parser a memmap slice
+    pointing at it, and confirm the parsed fields are correct without
+    relying on any allocation behaviour — the function's only contract
+    is that it never materialises the body. We assert the documented
+    fields round-trip correctly; the no-copy guarantee for the body is
+    pinned by the dedicated body-slice tests above.
+    """
+    insn = np.arange(2048, dtype=np.uint8)
+    block = np.arange(1024, dtype=np.uint16)
+    tokens = np.arange(4096, dtype=np.uint16)
+    record = _pack_record(insn, block, tokens, pad_size=1, is_overlong=False)
+
+    bin_path = tmp_path / "big_data.bin"
+    bin_path.write_bytes(record)
+    mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
+
+    header = parse_binary_header(mmap[: HEADER_BYTES])
+    assert header.insn_len == len(insn)
+    assert header.block_enc == 1
+    assert header.block_len == block.nbytes
+    assert header.pad_size == 1
+
+
 def test_overlong_field_bytes_are_not_consumed_as_insn(tmp_path):
     """The 3-byte overlong field must NOT bleed into the insn slice.
 
