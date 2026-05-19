@@ -109,6 +109,50 @@ def write_function_binary_data(
     return result
 
 
+def pack_v1_entry(offset: int, length: int, avg_len: int) -> bytes:
+    """Pack one 8-byte v1 index entry: u40 offset_shifted, u16 length_shifted, u8 avg_len.
+
+    Pure function. Single source of truth for the on-wire 8-byte v1
+    entry layout. Both ``write_index_entry`` (writes to ``_index.bin``)
+    and ``inline_indexer.encode_inline_indexer`` (hex-embeds the entry
+    inline in ``matched_sections.csv``) call into this packer so the
+    layout exists in exactly one place.
+
+    ``offset`` and ``length`` are shifted right by 2 (4-byte record
+    alignment is a writer invariant). A real length above
+    ``MAX_NORMAL_REAL_LENGTH`` (~256 KiB) is encoded with sentinel
+    ``length_shifted == SENTINEL_LENGTH``; the real length then lives
+    in the u24-shifted overlong field of the matching ``_data.bin``
+    record (cap ~64 MiB). On cap violation :class:`IndexEntrySkip` is
+    raised so callers can decide between logging-and-skipping vs
+    propagating. Alignment violations are programmer errors and raise
+    :class:`AssertionError`.
+    """
+    assert offset % 4 == 0, f"index entry offset must be 4-byte aligned; got {offset}"
+    assert length % 4 == 0, f"index entry length must be 4-byte aligned; got {length}"
+    assert length > 0, "index entry length must be > 0 (minimum padded record is 8 bytes)"
+
+    offset_shifted = offset >> 2
+    if offset_shifted > _MAX_OFFSET_SHIFTED:
+        raise IndexEntrySkip("offset_overflow", offset)
+
+    length_shifted = length >> 2
+    if length_shifted <= _MAX_NORMAL_LENGTH_SHIFTED:
+        length_field = length_shifted
+    else:
+        if length > _MAX_OVERLONG_REAL_LENGTH:
+            raise IndexEntrySkip("overlong_length_overflow", length)
+        length_field = SENTINEL_LENGTH
+
+    avg_len_clamped = min(avg_len >> 4, 255)
+    # Low 5 bytes of a u64 LE = u40 LE on the wire.
+    return (
+        struct.pack("<Q", offset_shifted)[:5]
+        + struct.pack("<H", length_field)
+        + struct.pack("B", avg_len_clamped)
+    )
+
+
 def write_index_entry(
     file3,
     start: int,
@@ -118,36 +162,16 @@ def write_index_entry(
     func_name: str = "",
     error_log=None,
 ) -> None:
-    """Pack one 8-byte index entry: u40 offset_shifted, u16 length_shifted, u8 avg_len.
+    """Write one 8-byte index entry; thin wrapper over :func:`pack_v1_entry`.
 
-    ``start`` and ``length`` are shifted right by 2 (4-byte record
-    alignment is a writer invariant). A real length above
-    ``MAX_NORMAL_REAL_LENGTH`` (~256 KiB) is encoded with sentinel
-    ``length_shifted == SENTINEL_LENGTH``; the real length then lives
-    in the u24-shifted overlong field of the matching ``_data.bin``
-    record (cap ~64 MiB). On cap violation :class:`IndexEntrySkip` is
-    raised; when ``error_log`` is supplied the exception is logged and
-    the function returns ``None`` (no entry written), otherwise it
-    propagates. ``func_name`` is logged so the offending function is
-    recoverable. Alignment violations are programmer errors and raise
-    :class:`AssertionError` (never logged).
+    On cap violation :class:`IndexEntrySkip` propagates; when
+    ``error_log`` is supplied the exception is logged and the function
+    returns ``None`` (no entry written). ``func_name`` is logged so the
+    offending function is recoverable. Alignment violations are
+    programmer errors and raise :class:`AssertionError` (never logged).
     """
-    assert start % 4 == 0, f"index entry start must be 4-byte aligned; got {start}"
-    assert length % 4 == 0, f"index entry length must be 4-byte aligned; got {length}"
-    assert length > 0, "index entry length must be > 0 (minimum padded record is 8 bytes)"
-
     try:
-        offset_shifted = start >> 2
-        if offset_shifted > _MAX_OFFSET_SHIFTED:
-            raise IndexEntrySkip("offset_overflow", start)
-
-        length_shifted = length >> 2
-        if length_shifted <= _MAX_NORMAL_LENGTH_SHIFTED:
-            length_field = length_shifted
-        else:
-            if length > _MAX_OVERLONG_REAL_LENGTH:
-                raise IndexEntrySkip("overlong_length_overflow", length)
-            length_field = SENTINEL_LENGTH
+        entry_bytes = pack_v1_entry(start, length, avg_len)
     except IndexEntrySkip as exc:
         if error_log is None:
             raise
@@ -158,13 +182,6 @@ def write_index_entry(
         write_error_log_entry(error_log, exc.reason, func_name, exc.value)
         return
 
-    avg_len_clamped = min(avg_len >> 4, 255)
-    # Low 5 bytes of a u64 LE = u40 LE on the wire.
-    entry_bytes = (
-        struct.pack("<Q", offset_shifted)[:5]
-        + struct.pack("<H", length_field)
-        + struct.pack("B", avg_len_clamped)
-    )
     before = file3.tell()
     file3.write(entry_bytes)
     assert file3.tell() - before == _INDEX_ENTRY_SIZE, (
