@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.vocab_unifier.variant_registration import (
     discover_and_register_variants,
@@ -75,7 +76,7 @@ def test_register_simple_corpus(tmp_path: Path) -> None:
         _write_legacy_csv(tmp_path, "armv7l-clang-15.0.0-O3_hello"),
         _write_legacy_csv(tmp_path, "arm64-gcc-13.2.0-O2_hello"),
     ]
-    vm = VocabularyManager(platform=None, format_version=3)
+    vm = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
     n = discover_and_register_variants(csvs, vm)
 
     # 3 archs (already alias-collapsed in filename; identity through
@@ -121,7 +122,7 @@ def test_register_with_sidecar_extra_metadata(tmp_path: Path) -> None:
             "sanitizer": "address",
         },
     )
-    vm = VocabularyManager(platform=None, format_version=3)
+    vm = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
     n = discover_and_register_variants([csv], vm)
 
     # 4 positional + 3 metadata (hardening:full, hardening:fortify,
@@ -145,7 +146,7 @@ def test_register_deduplicates_across_corpus(tmp_path: Path) -> None:
         _write_legacy_csv(tmp_path, f"x64-gcc-13.2.0-O2_pkg{i}")
         for i in range(5)
     ]
-    vm = VocabularyManager(platform=None, format_version=3)
+    vm = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
     n = discover_and_register_variants(csvs, vm)
     # 4 positional axes, all identical across the 5 CSVs
     assert n == 4
@@ -157,8 +158,8 @@ def test_register_order_is_deterministic(tmp_path: Path) -> None:
         _write_legacy_csv(tmp_path, "armv7l-clang-15.0.0-O3_foo"),
         _write_legacy_csv(tmp_path, "x64-gcc-13.2.0-O2_bar"),
     ]
-    vm_a = VocabularyManager(platform=None, format_version=3)
-    vm_b = VocabularyManager(platform=None, format_version=3)
+    vm_a = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
+    vm_b = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
     n_a = discover_and_register_variants(csvs, vm_a)
     n_b = discover_and_register_variants(list(reversed(csvs)), vm_b)
     assert n_a == n_b
@@ -174,11 +175,12 @@ def test_register_order_is_deterministic(tmp_path: Path) -> None:
         )
 
 
-def test_register_rejects_non_v3_vm(tmp_path: Path) -> None:
-    """Calling against a v1 or v2 VM is a programmer error."""
+def test_register_rejects_wrong_format_version_vm(tmp_path: Path) -> None:
+    """Calling against any VM whose format_version != MEMMAP_FORMAT_VERSION
+    is a programmer error."""
     csv = _write_legacy_csv(tmp_path, "x64-gcc-13.2.0-O2_hello")
     vm_v2 = VocabularyManager(platform=None, format_version=2)
-    with pytest.raises(AssertionError, match="v3 unified VM"):
+    with pytest.raises(AssertionError, match="format_version"):
         discover_and_register_variants([csv], vm_v2)
 
 
@@ -190,7 +192,7 @@ def test_register_warns_and_skips_unparseable_csv(tmp_path: Path) -> None:
     bogus.write_text("")
     good = _write_legacy_csv(tmp_path, "x64-gcc-13.2.0-O2_hello")
 
-    vm = VocabularyManager(platform=None, format_version=3)
+    vm = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
     n = discover_and_register_variants([bogus, good], vm)
     # Good CSV's 4 positional axes still registered
     assert n == 4

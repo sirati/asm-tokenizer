@@ -5,7 +5,7 @@ filename-derived variant identity), runs ``unify_vocab``, then reads
 the produced ``unified_vocab.csv`` back through
 ``load_unified_vocab_manager`` and asserts:
 
-* ``format_version == 3``
+* ``format_version == MEMMAP_FORMAT_VERSION``
 * variant-axis tokens populate ids ``[256, 256+n_variants)``
 * instruction-representative tokens populate ids above the variant
   block
@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.compact_base64_utils import base64_to_ndarray
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
@@ -62,9 +63,9 @@ def _write_per_binary_csv(
         save_vocabulary(vm, writer)
 
 
-def test_unify_vocab_emits_v3_with_variant_block(tmp_path: Path) -> None:
-    """Two per-binary v2 CSVs -> one unified v3 CSV with variant +
-    instruction id bands."""
+def test_unify_vocab_emits_unified_with_variant_block(tmp_path: Path) -> None:
+    """Two per-binary v2 CSVs -> one unified CSV (at
+    ``MEMMAP_FORMAT_VERSION``) with variant + instruction id bands."""
     csv_files = []
     # Filename schema: <platform>-<compiler>-<version>-<opt>_<pkg>_output.csv
     # (default format string: platform-compiler-version-optimisationlevel_binaryname).
@@ -84,7 +85,7 @@ def test_unify_vocab_emits_v3_with_variant_block(tmp_path: Path) -> None:
 
     loaded = load_unified_vocab_manager(out_csv)
     assert loaded is not None
-    assert loaded.format_version == 3
+    assert loaded.format_version == MEMMAP_FORMAT_VERSION
 
     # Variant tokens: 2 archs + 2 compilers + 2 cver + 2 opts = 8
     expected_variants = {
