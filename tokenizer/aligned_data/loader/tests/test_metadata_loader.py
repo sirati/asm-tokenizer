@@ -54,6 +54,7 @@ def _write_matched_data(path: Path, n_records: int) -> List[tuple]:
                 insn_len=len(insn_rl),
                 block_enc=0,  # uint8
                 block_len=len(block_rl),
+                pad_size=0,
             )
             f.write(header)
             f.write(insn_rl.tobytes())
@@ -138,6 +139,7 @@ def _build_unmatched_arm(tmp_path: Path) -> List[str]:
                     insn_len=len(insn_rl),
                     block_enc=0,
                     block_len=len(block_rl),
+                    pad_size=0,
                 )
             )
             f.write(insn_rl.tobytes())

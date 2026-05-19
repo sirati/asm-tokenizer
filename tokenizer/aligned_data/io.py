@@ -52,7 +52,7 @@ def write_function_binary_data(file2, tokens, block_runlength, insn_runlength, d
     block_bytes = block_runlength.astype([np.uint8, np.uint16, np.uint32][block_enc]).tobytes()
     insn_len = len(insn_bytes)
 
-    header = encode_binary_header(insn_len, block_enc, len(block_bytes))
+    header = encode_binary_header(insn_len, block_enc, len(block_bytes), pad_size=0)
     file2.write(header)
     file2.write(insn_bytes)
     file2.write(block_bytes)

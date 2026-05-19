@@ -16,6 +16,8 @@ from typing import Callable, List, Optional, TextIO, Tuple
 
 import numpy as np
 
+from tokenizer.aligned_data.binary_format import HEADER_BYTES, parse_binary_header
+
 
 class SectionKind(Enum):
     """Matched (multi-version) vs unmatched (6-col single-row) arm."""
@@ -147,10 +149,9 @@ def build_length_lookup_tables(
 def load_unmatched_lengths(
     paths: BinaryArmPaths, starts: np.ndarray, lengths: np.ndarray
 ) -> np.ndarray:
-    """Real token count per unmatched function. Data-bin header is
-    ``[u24 insn_len, u8 _, u16 block_len, ...tokens...]`` (6 bytes);
-    token count = ``(length - 6 - insn_len - block_len) / 2``. Callers
-    pass pre-loaded index columns to avoid a second index-file pass.
+    """Real token count per unmatched function. Header parsing is
+    delegated to ``parse_binary_header`` so the field layout lives in
+    one place; pad + overlong accounting is added by the v1 reader.
     """
     if not paths.data_bin.exists() or len(starts) == 0:
         return np.array([], dtype=np.int32)
@@ -158,11 +159,10 @@ def load_unmatched_lengths(
     data_memmap = np.memmap(str(paths.data_bin), dtype=np.uint8, mode="r")
     token_counts: List[int] = []
     for i in range(len(starts)):
-        start = int(starts[i])
-        length = int(lengths[i])
-        insn_len = int.from_bytes(data_memmap[start : start + 3].tobytes(), "little")
-        block_len = int.from_bytes(data_memmap[start + 4 : start + 6].tobytes(), "little")
-        token_counts.append((length - 6 - insn_len - block_len) // 2)
+        start, length = int(starts[i]), int(lengths[i])
+        header = parse_binary_header(data_memmap[start : start + HEADER_BYTES])
+        body_bytes = length - HEADER_BYTES - header.insn_len - header.block_len
+        token_counts.append(body_bytes // 2)
     del data_memmap
     return np.array(token_counts, dtype=np.int32)
 

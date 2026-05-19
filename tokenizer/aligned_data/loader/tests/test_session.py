@@ -68,7 +68,7 @@ def _write_data_record(handle, tokens: np.ndarray) -> tuple[int, int]:
     block_runlength = np.array([1], dtype=np.uint8)
     insn_bytes = insn_runlength.tobytes()
     block_bytes = block_runlength.tobytes()
-    header = encode_binary_header(len(insn_bytes), 0, len(block_bytes))
+    header = encode_binary_header(len(insn_bytes), 0, len(block_bytes), pad_size=0)
     offset = handle.tell()
     handle.write(header)
     handle.write(insn_bytes)
