@@ -245,29 +245,6 @@ def check_record_bounds(
     return errors
 
 
-def run_v1_prelude_checks(
-    matched_sections: Path,
-    unmatched_sections: Path,
-    variants_csv: Path,
-    matched_index: Path,
-    unmatched_index: Path,
-) -> List[str]:
-    """Prelude / magic probes that must pass before ``BinaryDataset`` opens.
-
-    The dataloader treats a bad prelude as an unrecoverable
-    :class:`ValueError`, so the validator runs these first and surfaces
-    the errors as plain list entries; only after they all clear is it
-    safe to construct a ``BinaryDataset`` and load the section arms.
-    """
-    errors: List[str] = []
-    errors.extend(check_csv_prelude(matched_sections, str(matched_sections)))
-    errors.extend(check_csv_prelude(unmatched_sections, str(unmatched_sections)))
-    errors.extend(check_csv_prelude(variants_csv, str(variants_csv)))
-    errors.extend(check_index_prelude(matched_index, str(matched_index)))
-    errors.extend(check_index_prelude(unmatched_index, str(unmatched_index)))
-    return errors
-
-
 def run_v1_post_checks(
     matched_index: Path,
     unmatched_index: Path,

@@ -67,7 +67,15 @@ def build_unmatched_index_lookup(
     try:
         reader = csv.reader(handle)
         for row in reader:
-            if not row or len(row) != 5:
+            if not row:
+                continue
+            if len(row) == 6:
+                raise ValueError(
+                    f"{unmatched_sections}: legacy 6-cell row encountered "
+                    "(expected 5-cell post matched-arm restructuring); "
+                    "re-run memmap_builder on the per-binary CSVs to regenerate"
+                )
+            if len(row) != 5:
                 continue
             line_no = parse_function_line_no(row[0])
             func_name = line_to_name.get(line_no)
