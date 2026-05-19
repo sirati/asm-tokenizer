@@ -49,6 +49,7 @@ from typing import Any, Dict
 import numpy as np
 import numpy.typing as npt
 
+from tokenizer.aligned_data.loader.metadata_loader import open_sections_csv
 from tokenizer.variant_tokens.encoder import decode_record
 from tokenizer.variant_tokens.record import read_record
 
@@ -70,9 +71,16 @@ def load_variants_offset_to_filename(slim_csv_path: Path) -> Dict[int, str]:
     if not slim_csv_path.exists():
         return {}
     out: Dict[int, str] = {}
-    with open(slim_csv_path, "r", encoding="utf-8", newline="") as f:
+    # ``open_sections_csv`` consumes the mandatory ``# format=N\n`` prelude
+    # the builder stamps on every memmap-chain CSV (the slim variants file
+    # follows the same convention as sections CSVs). The DictReader then
+    # sees ``filename,offset`` as its real header row.
+    f, _content_offset = open_sections_csv(slim_csv_path)
+    try:
         for row in csv.DictReader(f):
             out[int(row["offset"], 16)] = row["filename"]
+    finally:
+        f.close()
     return out
 
 

@@ -243,9 +243,9 @@ def test_cross_check_flags_missing_filename_in_slim_csv(tmp_path: Path) -> None:
     slim_csv_path = output_dir / "demo_variants.csv"
     with open(slim_csv_path, encoding="ascii") as f:
         rows = list(csv.reader(f))
-    # Replace every filename cell with a string the VariantInfo.from_csv
-    # parse for the input CSVs cannot match.
-    for row in rows[1:]:
+    # rows[0] is the ``["# format=1"]`` prelude marker; rows[1] is the
+    # ``filename,offset`` header; data rows start at rows[2:].
+    for row in rows[2:]:
         row[0] = "wrong-filename-" + row[0]
     with open(slim_csv_path, "w", newline="", encoding="ascii") as f:
         writer = csv.writer(f)
