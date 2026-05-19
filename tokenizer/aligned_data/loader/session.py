@@ -16,8 +16,7 @@ This module does NOT load metadata (``metadata_loader``), parse
 data-bin records (``aligned_data.io.parse_function_data_memmap``), or
 own the variant-ref decoder body
 (``variant_resolver.get_variant_by_ref``). Row→FunctionData glue lives
-in ``_session_parsers``. The 5A/5D imports live in ``_compat`` so
-missing-batch fallbacks stay out of this file.
+in ``_session_parsers``.
 """
 
 from __future__ import annotations
@@ -29,8 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from ._compat import get_variant_by_ref as _resolve_variant_by_ref
-from ._compat import parse_function_data_memmap as _parse_function_data_memmap
+from ..io import parse_function_data_memmap as _parse_function_data_memmap
 from ._session_parsers import (
     arm_arrays,
     build_unmatched_function_data,
@@ -38,6 +36,7 @@ from ._session_parsers import (
 )
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
+from .variant_resolver import get_variant_by_ref as _resolve_variant_by_ref
 
 
 def _close_memmap(mmap_obj) -> None:
@@ -153,15 +152,24 @@ class BinarySession:
         )
 
     def get_variant_by_ref(self, ref: str) -> Optional[Dict[str, Any]]:
+        # Pure resolver raises on bad input (malformed hex, missing filename,
+        # vocab miss). Session swallows them all to ``None`` because the
+        # parser callers want a "no variant available" sentinel, not an
+        # exception that aborts a whole batch over one bad section row.
         if not ref:
+            return None
+        if self._vocab_manager is None:
             return None
         variants_mmap = self._open_variants()
         if variants_mmap is None:
             return None
         offset_to_filename = self._meta_get("offset_to_filename") or {}
-        return _resolve_variant_by_ref(
-            ref, self._vocab_manager, variants_mmap, offset_to_filename
-        )
+        try:
+            return _resolve_variant_by_ref(
+                ref, self._vocab_manager, variants_mmap, offset_to_filename
+            )
+        except (TypeError, ValueError, KeyError, IndexError, AssertionError):
+            return None
 
     # --- lazy openers ----------------------------------------------
 

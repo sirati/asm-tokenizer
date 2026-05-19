@@ -10,11 +10,35 @@ without standing up a full session.
 from __future__ import annotations
 
 import csv
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
 
 from ..metadata import extract_metadata_from_section_row, parse_inlining_data
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
+
+
+# Empty uint16 buffer reused when a variant ref cannot be resolved. Sharing one
+# instance avoids per-call allocation; consumers MUST treat it as read-only
+# (matches the rest of the loader's lazy-view discipline).
+_EMPTY_VARIANT_TOKENS: np.ndarray = np.zeros(0, dtype=np.uint16)
+
+
+def _variant_tokens_from_row(variant_row: Optional[Dict[str, Any]]) -> np.ndarray:
+    """Pull the resolver's ``variant_tokens`` ndarray off a variant dict.
+
+    Empty / missing variant row -> the shared empty uint16 buffer so
+    ``FunctionData.variant_tokens`` is always a valid uint16 ndarray
+    (zero-length signals "no variant resolved", matching the plan's
+    "zero-length only on a corrupt dataset" contract).
+    """
+    if not variant_row:
+        return _EMPTY_VARIANT_TOKENS
+    tokens = variant_row.get("variant_tokens")
+    if tokens is None:
+        return _EMPTY_VARIANT_TOKENS
+    return tokens
 
 
 def arm_arrays(arm: Any, kind: str, binary_name: str):
@@ -61,7 +85,10 @@ def parse_matched_section(
             metadata["data_offset"], metadata["data_len"]
         )
         versions.append(
-            FunctionData(func_name, metadata, tokens, insn_rl, block_rl)
+            FunctionData(
+                func_name, metadata, tokens, insn_rl, block_rl,
+                variant_tokens=_variant_tokens_from_row(variant_row),
+            )
         )
     return MatchedFunction(func_name, versions)
 
@@ -119,4 +146,12 @@ def build_unmatched_function_data(
         "data_offset": data_offset_csv,
         "data_len": data_len_csv,
     }
-    return FunctionData(func_name, metadata, tokens, insn_rl, block_rl)
+    # Unmatched functions span multiple variants; ``FunctionData.variant_tokens``
+    # carries the first resolved variant's prefix (deterministic by section-row
+    # order). Consumers wanting the full per-variant axis token streams find
+    # them on ``metadata["variants"][i]["variant_tokens"]``.
+    primary_variant = variants[0] if variants else None
+    return FunctionData(
+        func_name, metadata, tokens, insn_rl, block_rl,
+        variant_tokens=_variant_tokens_from_row(primary_variant),
+    )
