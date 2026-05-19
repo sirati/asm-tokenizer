@@ -12,21 +12,33 @@ from tokenizer.tokens import TokenType
 
 from .types import Platform
 
+# Unified vocab is the in-tree memmap-chain version
+# (memmap_format.MEMMAP_FORMAT_VERSION); per-binary CSV is the
+# out-of-scope tokenize-output version (kept at 2 by the producer).
+# Both share the wire layout — only the trailer integer differs.
+# The constant is duplicated here rather than imported from
+# tokenizer.aligned_data.memmap_format because that package eagerly
+# imports this module via the unified-vocab gate, forming an import
+# cycle. The gate's own constant import keeps the cascade aligned.
+_UNIFIED_FORMAT_VERSION = 1
+_PER_BINARY_FORMAT_VERSION = 2
+
+_SUPPORTED_FORMAT_VERSIONS = (_UNIFIED_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
+
 
 def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
-    # v1 layout: 10 cells (per-platform) or 13 cells (unified).
-    # v2 / v3 layout: appends `("format_version", "<int>")` at the tail —
-    # 12 cells (per-platform) or 15 cells (unified). Wire-format is
-    # otherwise byte-identical to v1; the trailing pair is the *only*
-    # delta on the vocab tail row (the per-binary entries for IDs 0..255
-    # are stripped by the saver because they are protocol-reserved
-    # digit slots — see plan vivid-tinkering-wilkes.md). v3 is the
-    # unified-vocab-only additive superset that registers variant-axis
-    # tokens at IDs >= 256 (plan memoized-booping-wren.md) — same wire
-    # column count as v2, only the trailer integer differs.
+    # Layout: 10 base cells (per-binary) or 13 base cells (unified),
+    # plus a mandatory 2-cell trailer ("format_version", "<int>"). The
+    # trailing pair is the only delta on the vocab tail row; per-binary
+    # entries for IDs 0..255 are stripped by the saver because they are
+    # protocol-reserved digit slots. Legacy v1-no-trailer vocabs are no
+    # longer supported (see plan memoized-booping-wren.md §"Legacy code
+    # purge"); re-run vocab_unifier on the per-binary CSVs to regenerate.
     base_cols = 13 if platform == "unified" else 10
-    assert len(row) == base_cols or len(row) == base_cols + 2, (
-        f"Expected {base_cols} (v1) or {base_cols + 2} (v2/v3) columns, got {len(row)}"
+    assert len(row) == base_cols + 2, (
+        f"Expected {base_cols + 2} columns (10/13 base + 2-cell trailer); "
+        f"got {len(row)}. Legacy v1-no-trailer vocabs are not supported — "
+        f"re-run vocab_unifier on the per-binary CSVs to regenerate."
     )
     assert row[0] == "vocabulary"
     assert row[2].startswith("_id_to_token_type")
@@ -37,18 +49,15 @@ def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
     # position 10 (row[9] is the lit_end base64 payload). The pre-existing
     # assertion checked row[9] which never matched any real layout;
     # `is_vocab_def` swallowed the AssertionError via its bare-except so
-    # the typo was silently dead code (the only caller of this validator
-    # via the read-back path, `load_unified_vocab_manager`, was already
-    # returning None for an unrelated readline bug). Fixed here because
-    # the v2 path now exercises this validation more rigorously.
+    # the typo was silently dead code.
     if platform == "unified":
         assert row[10].startswith("platforms"), (
             f"Expected 'platforms ...' header cell at position 10, got {row[10]!r}"
         )
-    if len(row) == base_cols + 2:
-        assert row[base_cols] == "format_version", (
-            f"Expected v2 trailer cell 'format_version' at position {base_cols}, got {row[base_cols]!r}"
-        )
+    assert row[base_cols] == "format_version", (
+        f"Expected trailer cell 'format_version' at position {base_cols}, "
+        f"got {row[base_cols]!r}"
+    )
 
 
 def is_vocab_def(csv_row: bytes, platform: Platform) -> tuple[bool, list[str]]:
@@ -103,49 +112,53 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
     platform_list = row[11].strip('"').split(",") if platform == "unified" else None
     token_to_platform = base64_to_ndarray(row[12]).astype(np.int8) + platform_offset if platform == "unified" else None
 
-    # v2 / v3 trailer: ("format_version", "<int>") appended after the v1
-    # tail. Saver strips the protocol-reserved digit slots (IDs 0..255)
-    # from the serialized vocab; the loader reconstitutes them here so
-    # downstream absolute-ID lookups (lit caches,
-    # register_on_vocab_manager, etc.) all stay valid. v3 is the additive
-    # unified-vocab superset (variant-axis tokens at IDs >= 256; wire
-    # layout identical to v2) per plan memoized-booping-wren.md, so both
-    # versions take this branch.
+    # Trailer is mandatory (asserted upstream in assert_valid_vocab_def).
+    # The integer keys the digit-slot reconstruction below — both supported
+    # versions share that encoding, so the reconstruction is unconditional
+    # on the trailer presence and gated only on supported-version membership.
     base_cols = 13 if platform == "unified" else 10
-    format_version = 1
-    if len(row) == base_cols + 2:
-        format_version = int(row[base_cols + 1])
+    format_version = int(row[base_cols + 1])
 
-    if format_version in (2, 3):
-        reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
-        digit_names = [f"digit_{i:02X}" for i in range(reserved)]
-        vocabulary = digit_names + vocabulary
-        id_to_token_type = np.concatenate(
+    if format_version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"vocab format_version must be {_UNIFIED_FORMAT_VERSION} "
+            f"(unified) or {_PER_BINARY_FORMAT_VERSION} (per-binary CSV); "
+            f"got {format_version}. Re-run vocab_unifier or memmap_builder "
+            f"on the per-binary CSVs to regenerate."
+        )
+
+    # Protocol-reserved digit slots (IDs 0..255) are stripped by the saver;
+    # reconstitute them so downstream absolute-ID lookups (lit caches,
+    # register_on_vocab_manager, etc.) stay valid.
+    reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+    digit_names = [f"digit_{i:02X}" for i in range(reserved)]
+    vocabulary = digit_names + vocabulary
+    id_to_token_type = np.concatenate(
+        [
+            np.full(reserved, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
+            id_to_token_type,
+        ]
+    )
+    platform_instruction_type_cache = np.concatenate(
+        [
+            np.full(
+                reserved,
+                PlatformInstructionTypes.AGNOSTIC,
+                dtype=platform_instruction_type_cache.dtype,
+            ),
+            platform_instruction_type_cache,
+        ]
+    )
+    if token_to_platform is not None:
+        token_to_platform = np.concatenate(
             [
-                np.full(reserved, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
-                id_to_token_type,
+                np.full(reserved, -1, dtype=token_to_platform.dtype),
+                token_to_platform,
             ]
         )
-        platform_instruction_type_cache = np.concatenate(
-            [
-                np.full(
-                    reserved,
-                    PlatformInstructionTypes.AGNOSTIC,
-                    dtype=platform_instruction_type_cache.dtype,
-                ),
-                platform_instruction_type_cache,
-            ]
-        )
-        if token_to_platform is not None:
-            token_to_platform = np.concatenate(
-                [
-                    np.full(reserved, -1, dtype=token_to_platform.dtype),
-                    token_to_platform,
-                ]
-            )
-        # Lit caches reference absolute IDs >= 256 (legacy stubs registered
-        # for class-stability under a v2 VM, if any); the saver writes them
-        # unshifted, so no adjustment is needed here.
+    # Lit caches reference absolute IDs >= 256 (legacy stubs registered
+    # for class-stability, if any); the saver writes them unshifted, so
+    # no adjustment is needed here.
 
     platform = platform if platform != "unified" else None
 
