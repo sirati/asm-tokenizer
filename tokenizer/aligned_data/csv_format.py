@@ -1,5 +1,11 @@
-from typing import List
+from typing import List, Sequence
 
+from .line_no_codec import (
+    decode_line_no,
+    decode_line_nos_csv,
+    encode_line_no,
+    encode_line_nos_csv,
+)
 from .memmap_format import MEMMAP_FORMAT_VERSION
 
 
@@ -70,22 +76,37 @@ def parse_escaped_function_names(called_str: str) -> List[str]:
     return parts
 
 
-def parse_inlining_data(inlining_str: str) -> List[Tuple]:
-    """Parse semicolon-separated inlining data: idx,hex_offset,hex_length,is_matched;..."""
-    if not inlining_str:
-        return []
-    entries = []
-    for part in inlining_str.split(";"):
-        if not part:
-            continue
-        fields = part.split(",")
-        if len(fields) >= 4:
-            idx = fields[0]
-            offset = int(fields[1], 16)
-            length = int(fields[2], 16)
-            is_matched = int(fields[3])
-            entries.append((idx, offset, length, is_matched))
-    return entries
+def format_function_line_no(line_no: int) -> str:
+    """Encode a function's sidecar line no for a section-CSV name cell.
+
+    Thin wrapper over :func:`tokenizer.aligned_data.line_no_codec.encode_line_no`
+    that exists so builder + loader call sites read as the domain
+    operation ("format the line no for this function name") instead
+    of the lower-level codec call. Single source of truth for the
+    base64 byte representation still lives in ``line_no_codec``.
+    """
+    return encode_line_no(line_no)
+
+
+def parse_function_line_no(s: str) -> int:
+    """Inverse of :func:`format_function_line_no`."""
+    return decode_line_no(s)
+
+
+def format_function_line_nos_csv(line_nos: Sequence[int]) -> str:
+    """Comma-joined :func:`format_function_line_no` for a sequence
+    of sidecar line numbers.
+
+    Used for the called-funcs cell in both section CSVs: every function
+    name there is replaced by its sidecar line no. Empty sequence ->
+    empty string.
+    """
+    return encode_line_nos_csv(line_nos)
+
+
+def parse_function_line_nos_csv(s: str) -> List[int]:
+    """Inverse of :func:`format_function_line_nos_csv`."""
+    return decode_line_nos_csv(s)
 
 
 def parse_variant_refs(variant_refs_str: str) -> List[str]:

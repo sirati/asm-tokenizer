@@ -124,12 +124,21 @@ def test_normal_record_round_trip(block_enc, pad_size):
     _expect_arrays_equal(arrays, insn, block, tokens)
 
 
-def test_normal_record_default_is_overlong_false():
-    """Default ``is_overlong=False`` preserves current caller behavior."""
+def test_normal_record_is_overlong_required_kwarg():
+    """``is_overlong`` is REQUIRED keyword-only -- no silent default.
+
+    The previous ``is_overlong=False`` default silently corrupted
+    overlong reads when a caller forgot to thread the sentinel
+    through; the audit (blocker #4) removed the default to make
+    forgetting impossible. This test pins that down: omitting the
+    kwarg raises ``TypeError``, and passing it explicitly behaves
+    exactly as the old positive case did.
+    """
     insn, block, tokens = _sample_arrays(block_enc=1)
     record = _pack_record(insn, block, tokens, pad_size=0, is_overlong=False)
-    # No is_overlong kwarg supplied — must behave as if False.
-    arrays = parse_function_data_header(record)
+    with pytest.raises(TypeError):
+        parse_function_data_header(record)
+    arrays = parse_function_data_header(record, is_overlong=False)
     _expect_arrays_equal(arrays, insn, block, tokens)
 
 
