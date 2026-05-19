@@ -8,13 +8,6 @@ This module provides utilities for:
 - Index management for fast function lookup by length
 """
 
-from .index import (
-    create_length_lookup_map,
-    extract_avg_lengths,
-    load_index_memmap,
-    read_index_entry,
-    select_random_function_by_length,
-)
 from .io import (
     decode_and_translate_tokens,
     decode_runlengths,
@@ -82,10 +75,4 @@ __all__ = [
     "extract_all_metadata_from_section_rows",
     # sections
     "read_function_section",
-    # index
-    "load_index_memmap",
-    "extract_avg_lengths",
-    "create_length_lookup_map",
-    "select_random_function_by_length",
-    "read_index_entry",
 ]

@@ -61,20 +61,45 @@ class BinaryHeader:
     pad_size: int
 
 
-def parse_binary_header(data_bytes) -> BinaryHeader:
-    """Parse the 6-byte record header from ``data_bytes``."""
-    if isinstance(data_bytes, (np.memmap, np.ndarray)):
-        data_bytes = data_bytes.tobytes()
+def _byte_at(data, idx: int) -> int:
+    """Return one byte of ``data`` as a plain ``int``.
 
-    packed = data_bytes[0]
+    Works uniformly for ``bytes``/``bytearray``/``memoryview`` (indexing
+    returns ``int``) and ``np.ndarray``/``np.memmap`` of dtype ``uint8``
+    (indexing returns a 0-d array convertible to ``int``). Touching one
+    byte of a memmap pages in only that byte's page, not a copy of the
+    record.
+    """
+    return int(data[idx])
+
+
+def _slice_to_int(data, start: int, end: int) -> int:
+    """Read bytes ``[start:end]`` as a little-endian unsigned int.
+
+    Copies only the ``end - start`` slice (at most 3 bytes for the
+    header sub-fields) to a ``bytes`` so ``int.from_bytes`` can consume
+    it uniformly across input types. Never touches the full record.
+    """
+    return int.from_bytes(bytes(data[start:end]), "little")
+
+
+def parse_binary_header(data) -> BinaryHeader:
+    """Parse the 6-byte record header from ``data``.
+
+    ``data`` may be ``bytes``, ``bytearray``, ``memoryview``,
+    ``np.ndarray`` (uint8), or ``np.memmap`` (uint8). Only the first 6
+    bytes are touched — the full record is never copied, so passing a
+    ``np.memmap`` slice does not allocate a record-sized buffer.
+    """
+    packed = _byte_at(data, 0)
     if packed & _RESERVED_MASK:
         raise ValueError(
             f"binary header reserved bits set: packed=0x{packed:02x}"
         )
     block_enc = packed & _BLOCK_ENC_MASK
     pad_size = (packed >> _PAD_SIZE_SHIFT) & _PAD_SIZE_MASK
-    insn_len = int.from_bytes(data_bytes[1:4], "little")
-    block_len = int.from_bytes(data_bytes[4:6], "little")
+    insn_len = _slice_to_int(data, 1, 4)
+    block_len = _slice_to_int(data, 4, 6)
 
     return BinaryHeader(
         insn_len=insn_len,
@@ -84,8 +109,28 @@ def parse_binary_header(data_bytes) -> BinaryHeader:
     )
 
 
+_BLOCK_DTYPES: Tuple[type, type, type] = (np.uint8, np.uint16, np.uint32)
+
+
+def _as_uint8_view(data) -> np.ndarray:
+    """Return a 1-D ``uint8`` view over ``data`` without copying contents.
+
+    For ``np.ndarray``/``np.memmap`` of dtype ``uint8`` the original is
+    returned as-is (a slice of a memmap stays a memmap-backed view).
+    For ``np.ndarray`` of another dtype the bytes are reinterpreted
+    with ``.view(np.uint8)`` (zero copy). For ``bytes``/``bytearray``
+    /``memoryview`` ``np.frombuffer`` creates a read-only view that
+    shares memory with the input buffer — no record-sized allocation.
+    """
+    if isinstance(data, np.ndarray):
+        if data.dtype != np.uint8:
+            return data.view(np.uint8)
+        return data
+    return np.frombuffer(data, dtype=np.uint8)
+
+
 def extract_arrays_from_data(
-    data_bytes,
+    data,
     header: BinaryHeader,
     is_overlong: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -105,24 +150,30 @@ def extract_arrays_from_data(
     overlong-length field; that field's value is resolved independently
     by the caller (the session layer that decoded the index sentinel),
     so this function never reads it.
+
+    Zero-copy on memmap input: ``data`` is wrapped in a ``uint8`` view
+    (``np.memmap`` slices stay memmap-backed; ``bytes`` are exposed via
+    ``np.frombuffer`` without copying contents), then the per-array
+    slices are produced by ``arr[i:j].view(target_dtype)``. The returned
+    arrays may therefore be views into the original memmap — no
+    record-sized buffer is ever allocated.
     """
-    if isinstance(data_bytes, (np.memmap, np.ndarray)):
-        data_bytes = data_bytes.tobytes()
+    raw = _as_uint8_view(data)
 
     prefix = HEADER_BYTES + (OVERLONG_FIELD_BYTES if is_overlong else 0)
     insn_end = prefix + header.insn_len
     block_start = insn_end + header.pad_size
     block_end = block_start + header.block_len
 
-    insn_runlength = np.frombuffer(data_bytes[prefix:insn_end], dtype=np.uint8)
+    insn_runlength = raw[prefix:insn_end]
 
-    block_dtype = [np.uint8, np.uint16, np.uint32][header.block_enc]
-    block_runlength = np.frombuffer(
-        data_bytes[block_start:block_end],
-        dtype=block_dtype,
+    block_dtype = _BLOCK_DTYPES[header.block_enc]
+    block_slice = raw[block_start:block_end]
+    block_runlength = (
+        block_slice if block_dtype is np.uint8 else block_slice.view(block_dtype)
     )
 
-    tokens = np.frombuffer(data_bytes[block_end:], dtype=np.uint16)
+    tokens = raw[block_end:].view(np.uint16)
 
     return insn_runlength, block_runlength, tokens
 
