@@ -38,6 +38,18 @@ _PAD_SIZE_MASK = 0b00000011
 _RESERVED_MASK = 0b11110000  # bits 4-7 must be 0
 
 
+def pack_avg_len_bucket(avg_len: int) -> int:
+    """Cross-codec 16-byte avg-length bucket used by both index formats.
+
+    The v1 ``_index.bin`` entry and the pre-v1 ``matched_index.bin``
+    entry both carry a one-byte length bucket so length-conditioned
+    function selection works the same across both arms. Single source
+    of truth -- both packers import this helper rather than re-deriving
+    the formula.
+    """
+    return min(avg_len >> 4, 255)
+
+
 class IndexEntrySkip(Exception):
     """Raised by encoders when a per-section field overflows its cap.
 

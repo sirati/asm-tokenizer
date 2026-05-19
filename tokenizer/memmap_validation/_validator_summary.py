@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("tokenizer.memmap_validation.validator")
+logger = logging.getLogger(__name__)
 
 
 def log_validation_summary(stats) -> None:

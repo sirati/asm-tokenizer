@@ -12,12 +12,20 @@ import struct
 import numpy as np
 
 from .binary_format import (
+    HEADER_BYTES,
+    OVERLONG_FIELD_BYTES,
     IndexEntrySkip,
     compute_pad,
     determine_block_encoding,
     encode_binary_header,
+    pack_avg_len_bucket,
 )
 from .index_format import MAX_NORMAL_REAL_LENGTH, SENTINEL_LENGTH
+
+# Per-record body prefix sizes for the writer's total-length arithmetic
+# (single-source-of-truth shared with binary_format's reader path).
+_NORMAL_PREFIX_BYTES = HEADER_BYTES
+_OVERLONG_PREFIX_BYTES = HEADER_BYTES + OVERLONG_FIELD_BYTES
 
 # Caps derived from the on-wire entry layout (see ``index_format.py``).
 # offset is stored as the low 5 bytes of a u64 (u40); length is u16 of
@@ -69,14 +77,14 @@ def write_function_binary_data(
     try:
         # Pick normal vs overlong layout from the would-be total length.
         pad_normal = compute_pad(insn_len, block_len, token_count, is_overlong=False)
-        total_normal = 6 + insn_len + pad_normal + block_len + 2 * token_count
+        total_normal = _NORMAL_PREFIX_BYTES + insn_len + pad_normal + block_len + 2 * token_count
         if total_normal <= MAX_NORMAL_REAL_LENGTH:
             is_overlong = False
             pad_size = pad_normal
             total = total_normal
         else:
             pad_long = compute_pad(insn_len, block_len, token_count, is_overlong=True)
-            total_long = 9 + insn_len + pad_long + block_len + 2 * token_count
+            total_long = _OVERLONG_PREFIX_BYTES + insn_len + pad_long + block_len + 2 * token_count
             if total_long > _MAX_OVERLONG_REAL_LENGTH:
                 raise IndexEntrySkip("overlong_length_overflow", total_long)
             is_overlong = True
@@ -99,6 +107,8 @@ def write_function_binary_data(
         file2.seek(data_offset)
         file2.truncate()
         if error_log is not None:
+            # Lazy import: ``tokenizer.memmap_builder`` package init pulls
+            # back into ``aligned_data``; a top-level import would cycle.
             from tokenizer.memmap_builder.error_log import write_error_log_entry
             write_error_log_entry(error_log, exc.reason, func_name, exc.value)
         return None
@@ -144,7 +154,7 @@ def pack_v1_entry(offset: int, length: int, avg_len: int) -> bytes:
             raise IndexEntrySkip("overlong_length_overflow", length)
         length_field = SENTINEL_LENGTH
 
-    avg_len_clamped = min(avg_len >> 4, 255)
+    avg_len_clamped = pack_avg_len_bucket(avg_len)
     # Low 5 bytes of a u64 LE = u40 LE on the wire.
     return (
         struct.pack("<Q", offset_shifted)[:5]

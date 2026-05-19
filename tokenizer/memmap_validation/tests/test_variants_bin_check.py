@@ -26,10 +26,6 @@ from typing import List
 
 import pytest
 
-from tokenizer.memmap_builder.builder import (
-    BinaryVersionInfo,
-    build_memmap_files,
-)
 from tokenizer.memmap_validation.validator import (
     ValidatorConfig,
     VersionInfo,
@@ -41,101 +37,12 @@ from tokenizer.memmap_validation.variants_bin_check import (
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 from tokenizer.vocab_unifier.saver import save_vocabulary
-from tokenizer.vocab_unifier.unifier import unify_vocab
 
-
-# Padding line so the file body exceeds the 64-byte tail that
-# ``read_last_line_of_file`` excludes (matches the memmap_builder smoke
-# test's padding convention).
-_PADDING_LINE = "function_name,binary_addr," + ("x" * 64) + "\n"
-
-
-def _write_per_binary_csv(csv_path: Path, platform: str) -> None:
-    """Write a synthetic v2 per-binary CSV at ``csv_path``."""
-    vm = VocabularyManager(platform=platform, format_version=2)
-    for bid in (0, 1, 2):
-        vm.Block_V2(bid)
-
-    with open(csv_path, "w", newline="", encoding="ascii") as fh:
-        fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
-        save_vocabulary(vm, writer)
-
-
-def _build_synthetic_corpus(tmp_path: Path) -> tuple[List[Path], Path]:
-    """Lay down two per-binary v2 CSVs + a v3 unified vocab.
-
-    Filenames follow the production default
-    (``<arch>-<compiler>-<ver>-<opt>_<pkg>_output.csv``) so
-    ``VariantInfo.from_csv`` parses them the same way the dynrunner
-    worker would.
-    """
-    csv_files: List[Path] = []
-    for basename, arch in [
-        ("x64-gcc-13.2.0-O2_pkga", "x64"),
-        ("arm64-clang-15.0.0-O3_pkgb", "arm64"),
-    ]:
-        path = tmp_path / f"{basename}_output.csv"
-        _write_per_binary_csv(path, platform=arch)
-        csv_files.append(path)
-
-    unified_vocab_path = tmp_path / "unified_vocab.csv"
-    unify_vocab(csv_files, unified_vocab_path)
-    return csv_files, unified_vocab_path
-
-
-def _builder_versions_for(csv_files: List[Path]) -> List[BinaryVersionInfo]:
-    """Build the ``BinaryVersionInfo`` list (memmap_builder shape)."""
-    return [
-        BinaryVersionInfo(
-            path=csv_files[0],
-            mapping_path=csv_files[0].with_suffix(".mapping.b64c"),
-            arch="x64",
-            compiler="gcc",
-            compilerversion="13.2.0",
-            opt="O2",
-            pkg="pkga",
-            filename="x64-gcc-13.2.0-O2_pkga",
-        ),
-        BinaryVersionInfo(
-            path=csv_files[1],
-            mapping_path=csv_files[1].with_suffix(".mapping.b64c"),
-            arch="arm64",
-            compiler="clang",
-            compilerversion="15.0.0",
-            opt="O3",
-            pkg="pkgb",
-            filename="arm64-clang-15.0.0-O3_pkgb",
-        ),
-    ]
-
-
-def _validator_versions_for(csv_files: List[Path]) -> List[VersionInfo]:
-    """Build the ``VersionInfo`` list (validator shape).
-
-    The validator's ``VersionInfo`` dataclass intentionally omits
-    ``extra_metadata`` and ``filename`` — the cross-check recovers
-    those by re-parsing ``VariantInfo.from_csv(csv_path)`` so the
-    validator and the builder see a single canonical identity.
-    """
-    return [
-        VersionInfo(
-            csv_path=csv_files[0],
-            mapping_path=csv_files[0].with_suffix(".mapping.b64c"),
-            arch="x64",
-            compiler="gcc",
-            compilerversion="13.2.0",
-            opt="O2",
-        ),
-        VersionInfo(
-            csv_path=csv_files[1],
-            mapping_path=csv_files[1].with_suffix(".mapping.b64c"),
-            arch="arm64",
-            compiler="clang",
-            compilerversion="15.0.0",
-            opt="O3",
-        ),
-    ]
+from ._pipeline import (
+    build_pipeline,
+    build_synthetic_corpus as _build_synthetic_corpus,
+    validator_versions_for as _validator_versions_for,
+)
 
 
 def _pipeline(tmp_path: Path) -> tuple[List[Path], Path, Path]:
@@ -143,12 +50,7 @@ def _pipeline(tmp_path: Path) -> tuple[List[Path], Path, Path]:
 
     Returns ``(csv_files, unified_vocab_path, output_dir)``.
     """
-    csv_files, unified_vocab_path = _build_synthetic_corpus(tmp_path)
-    output_dir = tmp_path / "out"
-    output_dir.mkdir()
-    versions = _builder_versions_for(csv_files)
-    build_memmap_files(versions, output_dir, "demo", unified_vocab_path)
-    return csv_files, unified_vocab_path, output_dir
+    return build_pipeline(tmp_path, copy_vocab_into_output=False)
 
 
 # ---------------------------------------------------------------------------

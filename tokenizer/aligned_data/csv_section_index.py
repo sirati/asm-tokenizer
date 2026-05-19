@@ -36,7 +36,7 @@ from typing import Iterator, Optional, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.binary_format import IndexEntrySkip
+from tokenizer.aligned_data.binary_format import IndexEntrySkip, pack_avg_len_bucket
 
 ENTRY_SIZE: int = 8
 MAX_CSV_OFFSET: int = (1 << 32) - 1
@@ -56,7 +56,7 @@ def pack_csv_section_index_entry(csv_offset: int, csv_len: int, avg_len: int) ->
         raise IndexEntrySkip("csv_offset_overflow", csv_offset)
     if csv_len > MAX_CSV_LENGTH:
         raise IndexEntrySkip("csv_length_overflow", csv_len)
-    avg_len_clamped = min(avg_len >> 4, 255)
+    avg_len_clamped = pack_avg_len_bucket(avg_len)
     return (
         struct.pack("<I", csv_offset)
         + struct.pack("<I", csv_len)[:3]

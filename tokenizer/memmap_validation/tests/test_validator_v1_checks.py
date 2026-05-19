@@ -8,7 +8,6 @@ build stays error-free.
 
 from __future__ import annotations
 
-import csv
 import struct
 from pathlib import Path
 from typing import List
@@ -23,7 +22,6 @@ from tokenizer.aligned_data.index_format import (
     read_index_arrays,
 )
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
-from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
 from tokenizer.memmap_validation._v1_checks import (
     check_csv_prelude,
     check_index_prelude,
@@ -37,93 +35,23 @@ from tokenizer.memmap_validation.validator import (
     VersionInfo,
     validate_memmap_output,
 )
-from tokenizer.token_manager import VocabularyManager
-from tokenizer.vocab_unifier.saver import save_vocabulary
-from tokenizer.vocab_unifier.unifier import unify_vocab
 
-
-# Same padding-line convention as test_variants_bin_check: ensures the
-# per-binary CSV body exceeds the 64-byte tail ``read_last_line_of_file``
-# excludes, so the builder accepts the file.
-_PADDING_LINE = "function_name,binary_addr," + ("x" * 64) + "\n"
-
-
-def _write_per_binary_csv(csv_path: Path, platform: str) -> None:
-    vm = VocabularyManager(platform=platform, format_version=2)
-    for bid in (0, 1, 2):
-        vm.Block_V2(bid)
-    with open(csv_path, "w", newline="", encoding="ascii") as fh:
-        fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
-        save_vocabulary(vm, writer)
+from ._pipeline import build_pipeline, validator_versions_for
 
 
 def _pipeline(tmp_path: Path) -> tuple[Path, Path]:
-    """Lay down a clean v1 corpus and return ``(output_dir, vocab_path)``.
-
-    The vocab is copied into ``output_dir`` so the validator's default
-    path resolution (mirroring ``AlignedDataLoader``) picks it up.
-    """
-    csv_files: List[Path] = []
-    for basename, arch in [
-        ("x64-gcc-13.2.0-O2_pkga", "x64"),
-        ("arm64-clang-15.0.0-O3_pkgb", "arm64"),
-    ]:
-        path = tmp_path / f"{basename}_output.csv"
-        _write_per_binary_csv(path, platform=arch)
-        csv_files.append(path)
-
-    unified_vocab_path = tmp_path / "unified_vocab.csv"
-    unify_vocab(csv_files, unified_vocab_path)
-
-    output_dir = tmp_path / "out"
-    output_dir.mkdir()
-    versions = [
-        BinaryVersionInfo(
-            path=csv_files[0],
-            mapping_path=csv_files[0].with_suffix(".mapping.b64c"),
-            arch="x64",
-            compiler="gcc",
-            compilerversion="13.2.0",
-            opt="O2",
-            pkg="pkga",
-            filename="x64-gcc-13.2.0-O2_pkga",
-        ),
-        BinaryVersionInfo(
-            path=csv_files[1],
-            mapping_path=csv_files[1].with_suffix(".mapping.b64c"),
-            arch="arm64",
-            compiler="clang",
-            compilerversion="15.0.0",
-            opt="O3",
-            pkg="pkgb",
-            filename="arm64-clang-15.0.0-O3_pkgb",
-        ),
-    ]
-    build_memmap_files(versions, output_dir, "demo", unified_vocab_path)
-    (output_dir / "unified_vocab.csv").write_bytes(unified_vocab_path.read_bytes())
+    """Lay down a clean v1 corpus and return ``(output_dir, vocab_path)``."""
+    _, unified_vocab_path, output_dir = build_pipeline(tmp_path)
     return output_dir, unified_vocab_path
 
 
 def _validator_versions(tmp_path: Path) -> List[VersionInfo]:
-    return [
-        VersionInfo(
-            csv_path=tmp_path / "x64-gcc-13.2.0-O2_pkga_output.csv",
-            mapping_path=tmp_path / "x64-gcc-13.2.0-O2_pkga_output.mapping.b64c",
-            arch="x64",
-            compiler="gcc",
-            compilerversion="13.2.0",
-            opt="O2",
-        ),
-        VersionInfo(
-            csv_path=tmp_path / "arm64-clang-15.0.0-O3_pkgb_output.csv",
-            mapping_path=tmp_path / "arm64-clang-15.0.0-O3_pkgb_output.mapping.b64c",
-            arch="arm64",
-            compiler="clang",
-            compilerversion="15.0.0",
-            opt="O3",
-        ),
-    ]
+    return validator_versions_for(
+        [
+            tmp_path / "x64-gcc-13.2.0-O2_pkga_output.csv",
+            tmp_path / "arm64-clang-15.0.0-O3_pkgb_output.csv",
+        ]
+    )
 
 
 def _run(tmp_path: Path):

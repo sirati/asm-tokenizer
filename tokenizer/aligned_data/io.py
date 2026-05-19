@@ -90,7 +90,7 @@ def write_unmatched_section_csv(
     inlining_data_str,
     indexer_hex,
 ):
-    """Write one unmatched-section row (6 cells).
+    """Write one unmatched-section row (5 cells).
 
     ``line_no_b64`` is the compact urlsafe-base64 of this function's
     1-indexed line number in the ``<binary>_function_names.txt``

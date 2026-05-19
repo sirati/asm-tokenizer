@@ -16,97 +16,27 @@ when the synthetic builder produces no functions.
 
 from __future__ import annotations
 
-import csv
 import struct
 from pathlib import Path
-from typing import List
 
 import numpy as np
 
 from tokenizer.aligned_data.binary_format import HEADER_BYTES
-from tokenizer.aligned_data.index_format import (
-    INDEX_MAGIC,
-    read_index_arrays,
-)
+from tokenizer.aligned_data.index_format import INDEX_MAGIC
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
-from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
 from tokenizer.memmap_validation._v1_checks import (
     check_pad_consistency,
     check_record_bounds,
 )
-from tokenizer.token_manager import VocabularyManager
-from tokenizer.vocab_unifier.saver import save_vocabulary
-from tokenizer.vocab_unifier.unifier import unify_vocab
 
-
-_PADDING_LINE = "function_name,binary_addr," + ("x" * 64) + "\n"
-
-
-def _write_per_binary_csv(csv_path: Path, platform: str) -> None:
-    vm = VocabularyManager(platform=platform, format_version=2)
-    for bid in (0, 1, 2):
-        vm.Block_V2(bid)
-    with open(csv_path, "w", newline="", encoding="ascii") as fh:
-        fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
-        save_vocabulary(vm, writer)
+from ._pipeline import arrays_or_empty as _arrays_or_empty
+from ._pipeline import build_pipeline as _build_pipeline
 
 
 def _pipeline(tmp_path: Path) -> Path:
     """Lay down a clean v1 corpus and return ``output_dir``."""
-    csv_files: List[Path] = []
-    for basename, arch in [
-        ("x64-gcc-13.2.0-O2_pkga", "x64"),
-        ("arm64-clang-15.0.0-O3_pkgb", "arm64"),
-    ]:
-        path = tmp_path / f"{basename}_output.csv"
-        _write_per_binary_csv(path, platform=arch)
-        csv_files.append(path)
-
-    unified_vocab_path = tmp_path / "unified_vocab.csv"
-    unify_vocab(csv_files, unified_vocab_path)
-
-    output_dir = tmp_path / "out"
-    output_dir.mkdir()
-    versions = [
-        BinaryVersionInfo(
-            path=csv_files[0],
-            mapping_path=csv_files[0].with_suffix(".mapping.b64c"),
-            arch="x64",
-            compiler="gcc",
-            compilerversion="13.2.0",
-            opt="O2",
-            pkg="pkga",
-            filename="x64-gcc-13.2.0-O2_pkga",
-        ),
-        BinaryVersionInfo(
-            path=csv_files[1],
-            mapping_path=csv_files[1].with_suffix(".mapping.b64c"),
-            arch="arm64",
-            compiler="clang",
-            compilerversion="15.0.0",
-            opt="O3",
-            pkg="pkgb",
-            filename="arm64-clang-15.0.0-O3_pkgb",
-        ),
-    ]
-    build_memmap_files(versions, output_dir, "demo", unified_vocab_path)
-    (output_dir / "unified_vocab.csv").write_bytes(unified_vocab_path.read_bytes())
+    _, _, output_dir = _build_pipeline(tmp_path)
     return output_dir
-
-
-def _arrays_or_empty(path: Path):
-    """Return ``(starts, lengths)`` for an index, or empty arrays.
-
-    Pre-v1 layout matched_index.bin or a missing file collapses to empty
-    arrays so the per-record checks short-circuit harmlessly.
-    """
-    if not path.exists() or path.stat().st_size == 0:
-        return (np.array([], dtype=np.int64), np.array([], dtype=np.uint32))
-    arr = read_index_arrays(path)
-    if arr is None:
-        return (np.array([], dtype=np.int64), np.array([], dtype=np.uint32))
-    return arr[0], arr[1]
 
 
 def _write_one_record_corpus(data_path: Path, index_path: Path) -> tuple[int, int]:

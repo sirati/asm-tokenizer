@@ -1,19 +1,22 @@
-"""Per-version (tokenizer-output) CSV decoders + skip predicates.
+"""Per-version (tokenizer-output) CSV row decoders, skip predicates,
+format probe, and dedup-key heuristic.
 
-Single concern: turn one ``lockstep_function_match`` row into the
-``(tokens, block_runlength, insn_runlength)`` triple the per-arm
-comparators expect, plus the small predicate set the orchestrator
-uses to gate which rows are worth validating.
+Single concern (one wire format, the per-version tokenizer-output
+CSV): everything the validator needs to read one row of that file
+without leaking the layout into ``validator.py`` or the comparators.
+Contents:
 
-Lives in its own module so the orchestrator (``validator.py``) stays
-focused on flow control and the comparators do not have to know
-where the decode helpers come from.
-
-The per-version CSV format detection (v1 vs. v2 prelude) lives here
-too -- it consumes the same wire format. Prelude *consumption*
-during data iteration stays with
-``aligned_data.match.open_csv_skip_vocab``; this module only
-*peeks* the first row to surface a format mismatch before iteration.
+* Row decoder: turn one ``lockstep_function_match`` row into the
+  ``(tokens, block_runlength, insn_runlength)`` triple the per-arm
+  comparators expect.
+* Skip predicates the orchestrator uses to gate which rows are
+  worth validating.
+* Format detection (v1 vs. v2 prelude) — peeks the first row to
+  surface a format mismatch before iteration. Prelude *consumption*
+  during data iteration stays with
+  ``aligned_data.match.open_csv_skip_vocab``.
+* Dedup-key heuristic for unique-offset detection across versions of
+  the same function.
 """
 
 from __future__ import annotations
