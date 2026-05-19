@@ -1,0 +1,211 @@
+"""Shared synthetic-binary fixture for the BinarySession test suite.
+
+Single concern: lay down a one-matched + one-unmatched corpus with a
+real ``_variants.bin`` record at byte 0, and assemble the metadata bag
+``BinarySession`` consumes. Split out so the two session test files
+(``test_session`` lifecycle + ``test_session_exception_safety``) can
+share one ``synthetic_binary`` fixture without duplicating the wiring.
+
+The fixture pairs the corpus builder (``_corpus.build_corpus_with_registry``)
+with a caller-supplied variant registry so every section-row
+``variant_ref`` cell points at the single hand-laid bin record. The
+variants bin is hand-laid because the resolver needs a real
+``encode_record``-produced byte sequence at the offset the rows
+reference; the stub builder's default registry emits placeholders that
+wouldn't decode.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+import pytest
+
+from tokenizer.aligned_data.csv_section_index import (
+    read_csv_section_index_arrays,
+)
+from tokenizer.aligned_data.index_format import read_index_arrays
+
+from ._corpus import (
+    MatchedFunctionSpec,
+    UnmatchedFunctionSpec,
+    build_corpus_with_registry,
+    make_simple_variant,
+)
+
+
+class _FakeArm:
+    """Minimal SectionArm stand-in -- session reads attributes only.
+
+    Tests build arms directly from on-disk byte positions rather than
+    going through ``load_section_arm`` so the lifecycle coverage stays
+    independent of the parallel matched-arm reader rewrite (which
+    lands in batch 2A).
+    """
+
+    def __init__(
+        self,
+        starts: np.ndarray,
+        lengths: np.ndarray,
+        func_names: List[str] | None = None,
+        section_starts: np.ndarray | None = None,
+    ) -> None:
+        self.starts = starts
+        self.lengths = lengths
+        self.func_names = func_names or []
+        self.section_starts = section_starts
+
+
+class _FakeVocab:
+    """Vocab stub: just enough for the variant decoder + axis builder."""
+
+    def __init__(self, items: List[str]) -> None:
+        self._s2i = {s: i + 256 for i, s in enumerate(items)}
+        self._i2s = {v: k for k, v in self._s2i.items()}
+
+    def get_token_id(self, token: str) -> int:
+        return self._s2i.get(token, -1)
+
+    def get_token_str(self, token_id: int) -> str:
+        return self._i2s.get(token_id, "")
+
+
+def _write_variants_bin(base: Path, binary_name: str, vocab: _FakeVocab) -> int:
+    """Lay down ``_variants.bin`` with one record at byte 0; return the offset.
+
+    Hand-laid (not via the fixture builder) because the variant
+    resolver needs a real axis record produced by ``encode_record``
+    to round-trip back through the decoder.
+    """
+    from tokenizer.variant_tokens.encoder import encode_record
+
+    class _V:
+        arch = "x86_64"
+        compiler = "gcc"
+        compilerversion = "13.2.0"
+        opt = "-O2"
+        extra_metadata: Dict[str, Any] = {}
+
+    record = encode_record(_V(), vocab)
+    variants_path = base / f"{binary_name}_variants.bin"
+    with open(variants_path, "wb") as f:
+        offset = f.tell()
+        f.write(record.tobytes())
+    return offset
+
+
+class _VariantStubRegistry:
+    """Registry whose ``.ref(vkey)`` returns the supplied ``offset_hex``."""
+
+    def __init__(self, hex_for_vkey: dict) -> None:
+        self._hex = hex_for_vkey
+
+    def ref(self, vkey) -> str:
+        return self._hex[vkey]
+
+
+def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
+    """Lay down a tiny binary: one matched section + one unmatched.
+
+    Matched arm: ``my_func`` with two variants (pass-1 dedupe heuristic
+    requires distinct data offsets). Unmatched arm: ``lonely_func``
+    with one version. All variant_refs point at the single
+    ``_variants.bin`` record so the resolver round-trip exercises the
+    axis decoder.
+    """
+    base = tmp_path
+    binary_name = "tinybin"
+
+    vocab_strings = [
+        "arch:x64",
+        "comp:gcc",
+        "cver:gcc:13.2.0",
+        "opt:O2",
+    ]
+    vocab = _FakeVocab(vocab_strings)
+    variant_offset = _write_variants_bin(base, binary_name, vocab)
+    variant_ref_hex = f"{variant_offset:x}"
+
+    m_vkey_a = ("matched", 0)
+    m_vkey_b = ("matched", 1)
+    u_vkey = ("unmatched", 0)
+    matched_specs = (
+        MatchedFunctionSpec(
+            func_name="my_func",
+            variants=(
+                make_simple_variant(m_vkey_a, token_seed=1, n_tokens=8),
+                make_simple_variant(m_vkey_b, token_seed=2, n_tokens=6),
+            ),
+            called=(),
+        ),
+    )
+    unmatched_specs = (
+        UnmatchedFunctionSpec(
+            func_name="lonely_func",
+            versions=(make_simple_variant(u_vkey, token_seed=3, n_tokens=4),),
+            called=(),
+        ),
+    )
+
+    variants_registry = _VariantStubRegistry(
+        {m_vkey_a: variant_ref_hex,
+         m_vkey_b: variant_ref_hex,
+         u_vkey: variant_ref_hex}
+    )
+    corpus = build_corpus_with_registry(
+        base, binary_name,
+        matched=matched_specs, unmatched=unmatched_specs,
+        variants=variants_registry,
+    )
+
+    matched_arm = _matched_arm_from_corpus(corpus)
+    unmatched_arm = _unmatched_arm_from_corpus(corpus)
+
+    metadata = {
+        "matched_arm": matched_arm,
+        "unmatched_arm": unmatched_arm,
+        "offset_to_filename": {variant_offset: "tinybin-x64-gcc-13.2.0-O2"},
+    }
+    return {
+        "base_path": base,
+        "binary_name": binary_name,
+        "vocab": vocab,
+        "metadata": metadata,
+        "variant_offset": variant_offset,
+    }
+
+
+def _matched_arm_from_corpus(corpus) -> _FakeArm:
+    triple = read_csv_section_index_arrays(corpus.matched_index_bin)
+    assert triple is not None and triple[0].shape == (1,)
+    starts, lengths, _ = triple
+    return _FakeArm(starts=starts, lengths=lengths, func_names=["my_func"])
+
+
+def _unmatched_arm_from_corpus(corpus) -> _FakeArm:
+    arrays = read_index_arrays(corpus.unmatched_index_bin)
+    assert arrays is not None
+    starts, lengths, _ = arrays
+    return _FakeArm(
+        starts=starts,
+        lengths=lengths,
+        func_names=["lonely_func"],
+        section_starts=np.array([0], dtype=np.int64),
+    )
+
+
+def count_open_fds() -> int:
+    """Count open file descriptors for the current process (Linux only)."""
+    try:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    except FileNotFoundError:  # pragma: no cover -- non-Linux fallback
+        return -1
+
+
+@pytest.fixture
+def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
+    """Pytest wrapper around :func:`build_synthetic_binary`."""
+    return build_synthetic_binary(tmp_path)
