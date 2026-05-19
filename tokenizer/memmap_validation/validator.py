@@ -3,29 +3,33 @@
 This module validates that the memmap files produced by memmap_builder contain
 the same data as the original CSV files.
 
-`_versions.json` cross-check
-----------------------------
+`_variants.bin` cross-check
+---------------------------
 
-When `build_memmap_files` runs against sidecar-format inputs it emits a
-`<binary>_versions.json` file alongside the per-binary memmap. The schema
-is one entry per version (positional index), each carrying the canonical
-4 axes (`arch`, `compiler`, `compiler_version`, `opt`), the integer
-`variant_id`, and the opaque `extra_metadata` dict. `_sections.csv`
-remains flat (no `variant_id` column); `_versions.json` is purely
-additive lookup keyed by row position.
+`build_memmap_files` (v3) emits two per-binary variant artefacts:
 
-The validator already reconstructs `VersionKey` from per-section data
-without supplying `variant_id`; this is now safe because `VersionKey`'s
-fifth field defaults to `0` (legacy invariant preserved). When the
-sidecar is present the validator additionally verifies that the
-canonical-4 axes of each `_versions.json` entry match the
-positionally-corresponding `VersionKey` reconstructed from `VersionInfo`,
-flagging any mismatch as a validation error. Memmaps without the sidecar
-(legacy builds) skip the cross-check unconditionally.
+  * ``<binary>_variants.bin`` — packed uint16 records, one per variant,
+    holding the axis-token IDs the unified vocab assigned to the
+    variant's ``arch:*``, ``comp:*``, ``cver:*``, ``opt:*``, and per-
+    metadata-pair strings.
+  * ``<binary>_variants.csv`` — slim two-column back-reference
+    (``filename,offset``) mapping each variant's CSV-derived filename to
+    its byte offset in the bin.
+
+The cross-check rebuilds each variant's expected axis-string list from
+the per-variant CSV (via ``VariantInfo.from_csv``), looks up the matching
+hex offset in the slim CSV by filename, decodes the bin slice at that
+offset through the unified vocab, and asserts the decoded strings equal
+the expected list in positional order. A missing bin / slim CSV / vocab
+miss / hex-offset gap surfaces as a single validation error so the
+existing reporter prints it in the summary block.
+
+The unified vocab is loaded ONCE at validator entry (via the shared v3
+gate in ``aligned_data.loader.unified_vocab_gate``) so the cross-check
+and the dataloader-side error formatter both share the same instance.
 """
 
 import csv
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,11 +40,12 @@ import numpy as np
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 from ..aligned_data.loader import BinaryDataset
+from ..aligned_data.loader.unified_vocab_gate import load_and_validate_unified_vocab
 from ..aligned_data.match import lockstep_function_match
 from ..function_token_list import FunctionTokenList
 from ..memmap_builder import VersionKey
 from ..token_manager import VocabularyManager
-from ..vocab_unifier.loader import load_unified_vocab_manager
+from .variants_bin_check import cross_check_variants_bin
 
 logger = logging.getLogger(__name__)
 
@@ -94,63 +99,6 @@ def _detect_csv_format_version(csv_path: Path) -> int:
     return 1
 
 
-def _load_versions_sidecar(output_dir: Path, binary_name: str) -> Optional[List[dict]]:
-    """Return the parsed ``<binary>_versions.json`` list or ``None`` when
-    the sidecar is absent (legacy memmap)."""
-    sidecar_path = output_dir / f"{binary_name}_versions.json"
-    if not sidecar_path.exists():
-        return None
-    with open(sidecar_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _cross_check_versions_sidecar(
-    version_keys: List[VersionKey],
-    sidecar_entries: List[dict],
-) -> List[str]:
-    """Verify that each ``_versions.json`` entry's canonical-4 axes match
-    the positionally-corresponding reconstructed ``VersionKey``.
-
-    Returns a list of human-readable error strings (empty when
-    consistent). The mapping is positional: ``sidecar_entries[i]`` must
-    describe the same build as ``version_keys[i]`` — this is the
-    contract `build_memmap_files` establishes when emitting the sidecar
-    in iteration order over the version list.
-
-    Note the schema asymmetry: `_versions.json` uses ``compiler_version``
-    (snake_case, sidecar convention) whereas `VersionKey` uses
-    ``compilerversion`` (legacy convention). The cross-check normalises
-    by name at the boundary so neither side leaks its naming choice.
-    """
-    errors: List[str] = []
-    if len(version_keys) != len(sidecar_entries):
-        errors.append(
-            f"_versions.json entry count ({len(sidecar_entries)}) does not "
-            f"match reconstructed version count ({len(version_keys)})"
-        )
-        return errors
-
-    for idx, (vkey, entry) in enumerate(zip(version_keys, sidecar_entries)):
-        sidecar_canonical = (
-            entry.get("arch"),
-            entry.get("compiler"),
-            entry.get("compiler_version"),
-            entry.get("opt"),
-        )
-        reconstructed_canonical = (
-            vkey.arch,
-            vkey.compiler,
-            vkey.compilerversion,
-            vkey.opt,
-        )
-        if sidecar_canonical != reconstructed_canonical:
-            errors.append(
-                f"_versions.json entry {idx} canonical-4 mismatch: "
-                f"sidecar={sidecar_canonical} reconstructed={reconstructed_canonical}"
-            )
-    return errors
-
-
 @dataclass
 class VersionInfo:
     """Information about a binary version for validation."""
@@ -165,11 +113,18 @@ class VersionInfo:
 
 @dataclass
 class ValidatorConfig:
-    """Configuration for memmap validation."""
+    """Configuration for memmap validation.
+
+    ``unified_vocab_path`` defaults to ``<output_dir>/unified_vocab.csv``
+    (mirrors ``AlignedDataLoader``'s convention) so the CLI does not need
+    to thread an extra arg; an explicit override is supported for tests
+    and out-of-tree vocab layouts.
+    """
 
     versions: List[VersionInfo]
     output_dir: Path
     binary_name: str
+    unified_vocab_path: Optional[Path] = None
 
 
 @dataclass
@@ -360,18 +315,25 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
     logger.info(f"  Output directory: {config.output_dir}")
     logger.info(f"  Versions to validate: {len(config.versions)}")
 
-    dataset = BinaryDataset(config.output_dir, config.binary_name)
+    # Unified vocab is a hard dependency of the variant-bin cross-check
+    # AND of the dataloader-side variant resolver. Loading + gating once
+    # here gives the BinaryDataset and the cross-check the same instance,
+    # and surfaces a v2 / missing dataset as a single clear ValueError
+    # before any per-binary state materialises.
+    vocab_path = (
+        config.unified_vocab_path
+        if config.unified_vocab_path is not None
+        else config.output_dir / "unified_vocab.csv"
+    )
+    vocab_manager = load_and_validate_unified_vocab(vocab_path)
+    logger.info(
+        f"  Loaded vocabulary v{vocab_manager.format_version} with "
+        f"{len(vocab_manager.id_to_token)} tokens from {vocab_path}"
+    )
 
-    # Try to load vocabulary for better error messages
-    vocab_manager = None
-    vocab_path = config.output_dir / "unified_vocab.csv"
-    if vocab_path.exists():
-        try:
-            vocab_manager = load_unified_vocab_manager(vocab_path)
-            if vocab_manager:
-                logger.info(f"  Loaded vocabulary with {len(vocab_manager.id_to_token)} tokens")
-        except Exception as e:
-            logger.warning(f"  Could not load vocabulary: {e}")
+    dataset = BinaryDataset(
+        config.output_dir, config.binary_name, vocab_manager=vocab_manager
+    )
 
     mapping_dict = {}
     csv_paths = []
@@ -407,17 +369,21 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
     csv_format_version = detected_formats[0] if detected_formats else 1
     logger.info(f"  Per-version CSV format: v{csv_format_version}")
 
-    # Cross-check `<binary>_versions.json` if present. Legacy memmaps
-    # without the sidecar skip this step (returns None). Mismatches are
-    # surfaced through the same `stats.errors` channel as data mismatches
-    # so the existing reporter prints them in the summary block.
-    sidecar_entries = _load_versions_sidecar(config.output_dir, config.binary_name)
-    sidecar_errors: List[str] = []
-    if sidecar_entries is not None:
-        sidecar_errors = _cross_check_versions_sidecar(version_keys, sidecar_entries)
-        if sidecar_errors:
-            for err in sidecar_errors:
-                logger.error(f"  {err}")
+    # Cross-check ``<binary>_variants.bin`` against the per-variant CSVs.
+    # The cross-check rebuilds each variant's expected axis-string list
+    # from the CSV (via VariantInfo.from_csv) and asserts the bin record
+    # at the slim CSV's offset decodes (through the unified vocab) to the
+    # same list. Errors flow through ``stats.errors`` so the existing
+    # reporter prints them in the summary block.
+    variants_bin_errors = cross_check_variants_bin(
+        config.versions,
+        config.output_dir,
+        config.binary_name,
+        vocab_manager,
+    )
+    if variants_bin_errors:
+        for err in variants_bin_errors:
+            logger.error(f"  {err}")
 
     matched_func_name_to_idx: Dict[str, int] = {}
     if dataset.matched_func_names:
@@ -457,7 +423,7 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         unmatched_skipped=0,
         csv_only_matched=0,
         csv_only_unmatched=0,
-        errors=list(sidecar_errors),
+        errors=list(variants_bin_errors),
     )
 
     for match_data in lockstep_function_match(csv_paths):
