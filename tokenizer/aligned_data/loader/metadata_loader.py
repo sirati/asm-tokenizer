@@ -1,18 +1,28 @@
 """Per-binary matched / unmatched metadata loading.
 
-The two arms share schema; the only deltas -- length source feeding the
-lookup tables and sections-CSV walker -- are isolated to ``_ArmSpec``
-callables dispatched by the closed ``SectionKind`` enum. A third arm
-adds an ``_ArmSpec`` entry, never an ``elif`` cascade.
+Matched-arm specifics (pre-v1 CSV-section locator + inline-indexer-
+bearing section rows) live in :mod:`_matched_arm_loader`; unmatched-
+arm specifics (v1 data-bin locator + 5-cell per-row CSV + sidecar
+line-no resolution) live in :mod:`_unmatched_arm_loader`. Both plug
+into a closed ``SectionKind`` enum dispatch -- a third arm adds an
+``_ArmSpec`` entry, never an ``elif`` cascade.
+
+Matched arm WAS / IS: ``starts`` / ``lengths`` once held per-function
+CSV byte offsets decoded via the v1 reader. Post-restructuring they
+hold per-VARIANT data-bin record positions decoded from the section-
+CSV variant rows' ``indexer_hex`` cell; per-function CSV positions
+move to ``csv_starts`` / ``csv_lengths``, loaded via the pre-v1
+:func:`csv_section_index.read_csv_section_index_arrays`. Header-row
+base64 line numbers resolve to names through the
+``<binary>_function_names.txt`` sidecar (loaded by ``BinaryDataset``).
 """
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Optional, TextIO, Tuple
+from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 
@@ -20,6 +30,7 @@ from tokenizer.aligned_data.index_format import read_index_arrays
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
 from ._index_decoding import record_token_count
+from ._matched_arm_loader import load_matched_arm
 
 # First line of every v1 sections / variants CSV. Comment-line marker so
 # third-party CSV viewers ignore it; this reader requires it verbatim.
@@ -37,10 +48,28 @@ class SectionKind(Enum):
 class SectionArm:
     """Per-arm metadata mirroring legacy ``self.{matched,unmatched}_*``.
 
-    ``section_starts``: per-row CSV byte offsets (content-offset-relative,
-    for ``f.seek()`` of a handle from ``open_sections_csv``). Empty for
-    matched (matched ``starts`` ARE CSV offsets); populated for unmatched
-    to let callers O(1)-seek instead of linear-iterating.
+    Cardinality (post matched-arm restructuring):
+
+    * Per-RECORD (one entry per ``_data.bin`` record):
+      ``starts``, ``lengths``, ``is_overlong``. Matched: one entry per
+      VARIANT (flattened across functions). Unmatched: one per function.
+    * Per-FUNCTION: ``func_names``, ``csv_starts``, ``csv_lengths``,
+      ``avg_lengths``, ``edge_indices``, ``count_per_length``,
+      ``section_starts``, ``count``.
+
+    ``csv_starts`` / ``csv_lengths``: per-function CSV-section locator
+    in BYTES, content-offset-relative. Matched: from the pre-v1
+    ``<binary>_index.bin`` (``csv_section_index``); unmatched: from the
+    per-row walker (``csv_lengths`` empty -- unmatched rows are single-
+    line so length is implicit). ``section_starts`` aliases ``csv_starts``.
+
+    ``avg_lengths``: per-function avg-len bucket. Matched: from pre-v1
+    index; unmatched: from v1 index (real token counts drive the
+    length-band tables, not these buckets).
+
+    ``is_overlong``: per-RECORD overlong flag derived from the v1
+    sentinel (``stored_length == SENTINEL_LENGTH``); consumers never
+    re-encode the sentinel rule.
     """
 
     starts: np.ndarray
@@ -51,9 +80,30 @@ class SectionArm:
     section_starts: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int64)
     )
+    csv_starts: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int64)
+    )
+    csv_lengths: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.uint32)
+    )
+    avg_lengths: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.uint8)
+    )
+    is_overlong: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.bool_)
+    )
 
     @property
     def count(self) -> int:
+        """Per-function count (driver for length-band sampling +
+        session indexing).
+        """
+        return int(len(self.func_names))
+
+    @property
+    def record_count(self) -> int:
+        """Per-record count (driver for validator pad/bounds checks
+        + per-variant iteration)."""
         return int(len(self.starts))
 
 
@@ -68,16 +118,12 @@ class BinaryArmPaths:
 
 @dataclass(frozen=True)
 class _ArmSpec:
-    """Per-arm dispatch table: scale, length source, sections walker."""
+    """Per-arm dispatch: one ``loader`` callable from per-arm paths +
+    sidecar ``line_to_name`` to a fully populated ``SectionArm``.
+    """
 
     kind: SectionKind
-    scale_factor: int
-    length_source: Callable[
-        [BinaryArmPaths, np.ndarray, np.ndarray, np.ndarray], np.ndarray
-    ]
-    walk_sections: Callable[
-        [BinaryArmPaths, np.ndarray], Tuple[List[str], np.ndarray]
-    ]
+    loader: Callable[[BinaryArmPaths, Dict[int, str]], "SectionArm"]
 
 
 # --- Module-level helpers (formerly ``BinaryDataset._*`` methods) ----------
@@ -167,87 +213,30 @@ def load_unmatched_lengths(
     return np.array(token_counts, dtype=np.int32)
 
 
-# --- Per-arm walkers + length sources --------------------------------------
-# Only the matched-vs-unmatched behavioural delta lives here; each pair
-# plugs into ``_ArmSpec``.
+# --- Per-arm loader dispatch ----------------------------------------------
+# Each arm is fully owned by its own module. The dispatch is one entry
+# per arm; a third arm is one entry, not an ``elif`` cascade.
 
 
-def _matched_length_source(paths, starts, lengths, avg_lengths):
-    """Matched: index's ``avg_lengths`` is authoritative (scale 16)."""
-    return avg_lengths
-
-def _unmatched_length_source(paths, starts, lengths, avg_lengths):
-    """Unmatched: real token counts need per-record data-bin header reads."""
-    return load_unmatched_lengths(paths, starts, lengths)
+def _load_matched(paths: BinaryArmPaths, line_to_name: Dict[int, str]) -> SectionArm:
+    return load_matched_arm(paths.sections_csv, paths.index_bin, line_to_name)
 
 
-def _matched_walk_sections(
-    paths: BinaryArmPaths, starts: np.ndarray
-) -> Tuple[List[str], np.ndarray]:
-    """Seek to each stored CSV offset, read first line as the function
-    name. ``section_starts`` empty -- matched ``starts`` ARE CSV offsets.
-    """
-    func_names: List[str] = []
-    if not paths.sections_csv.exists() or len(starts) == 0:
-        return func_names, np.zeros(0, dtype=np.int64)
-    f, content_offset = open_sections_csv(paths.sections_csv)
-    try:
-        for i in range(len(starts)):
-            f.seek(int(starts[i]) + content_offset)
-            row = list(csv.reader([f.readline()]))[0]
-            if row and len(row) >= 1:
-                func_names.append(row[0])
-    finally:
-        f.close()
-    return func_names, np.zeros(0, dtype=np.int64)
-
-
-def _unmatched_walk_sections(
-    paths: BinaryArmPaths, starts: np.ndarray
-) -> Tuple[List[str], np.ndarray]:
-    """Walk line-by-line; record per-row CSV byte offsets (content-relative)
-    so callers can O(1)-seek instead of linear-iterating. Uses manual
-    ``readline()`` (not ``csv.reader``) for accurate ``tell()`` -- the
-    reader buffers ahead. Each unmatched row is single-line by format.
-    """
-    func_names: List[str] = []
-    section_offsets: List[int] = []
-    if not paths.sections_csv.exists():
-        return func_names, np.zeros(0, dtype=np.int64)
-    f, content_offset = open_sections_csv(paths.sections_csv)
-    try:
-        while True:
-            row_start = f.tell() - content_offset
-            line = f.readline()
-            if not line:
-                break
-            row = list(csv.reader([line]))[0]
-            if row and len(row) == 6:
-                func_names.append(row[0])
-                section_offsets.append(row_start)
-    finally:
-        f.close()
-    return func_names, np.array(section_offsets, dtype=np.int64)
+def _load_unmatched(paths: BinaryArmPaths, line_to_name: Dict[int, str]) -> SectionArm:
+    from ._unmatched_arm_loader import load_unmatched_arm
+    return load_unmatched_arm(paths, line_to_name)
 
 
 _ARM_SPECS: dict[SectionKind, _ArmSpec] = {
-    SectionKind.MATCHED: _ArmSpec(
-        kind=SectionKind.MATCHED,
-        scale_factor=16,
-        length_source=_matched_length_source,
-        walk_sections=_matched_walk_sections,
-    ),
-    SectionKind.UNMATCHED: _ArmSpec(
-        kind=SectionKind.UNMATCHED,
-        scale_factor=1,
-        length_source=_unmatched_length_source,
-        walk_sections=_unmatched_walk_sections,
-    ),
+    SectionKind.MATCHED: _ArmSpec(SectionKind.MATCHED, _load_matched),
+    SectionKind.UNMATCHED: _ArmSpec(SectionKind.UNMATCHED, _load_unmatched),
 }
 
 
 def _empty_arm() -> SectionArm:
-    """Canonical empty arm; dtypes match ``load_index_once`` output."""
+    """Canonical empty arm; every array dtype is preserved so downstream
+    length / indexing arithmetic does not degrade.
+    """
     return SectionArm(
         starts=np.array([], dtype=np.int64),
         lengths=np.array([], dtype=np.uint32),
@@ -255,46 +244,37 @@ def _empty_arm() -> SectionArm:
         count_per_length=np.zeros(1, dtype=np.int32),
         func_names=[],
         section_starts=np.zeros(0, dtype=np.int64),
+        csv_starts=np.zeros(0, dtype=np.int64),
+        csv_lengths=np.zeros(0, dtype=np.uint32),
+        avg_lengths=np.zeros(0, dtype=np.uint8),
+        is_overlong=np.zeros(0, dtype=np.bool_),
     )
 
 
-def load_section_arm(kind: SectionKind, paths: BinaryArmPaths) -> SectionArm:
-    """Build one ``SectionArm`` for the requested kind. Single
-    implementation: the kind picks an ``_ArmSpec`` (length-source +
-    walker); the scaffold around it is common across both arms.
+def load_section_arm(
+    kind: SectionKind,
+    paths: BinaryArmPaths,
+    line_to_name: Optional[Dict[int, str]] = None,
+) -> SectionArm:
+    """Build one ``SectionArm`` for the requested kind via the per-arm
+    loader. ``line_to_name`` resolves base64 line numbers in the
+    section CSVs back to function names; required whenever the arm
+    actually reads a section CSV (i.e. both matched and unmatched
+    when their index file exists). Pass an empty dict only for the
+    "no functions at all" path.
     """
     spec = _ARM_SPECS[kind]
-    if not paths.index_bin.exists():
-        return _empty_arm()
-    starts, lengths, avg_lengths = load_index_once(paths.index_bin)
-    if starts is None or avg_lengths is None or lengths is None:
-        return _empty_arm()
-
-    length_array = spec.length_source(paths, starts, lengths, avg_lengths)
-    if len(length_array) > 0:
-        edge_indices, count_per_length = build_length_lookup_tables(
-            length_array, scale_factor=spec.scale_factor
-        )
-    else:
-        edge_indices = np.zeros(1, dtype=np.int32)
-        count_per_length = np.zeros(1, dtype=np.int32)
-
-    func_names, section_starts = spec.walk_sections(paths, starts)
-    return SectionArm(
-        starts=starts,
-        lengths=lengths,
-        edge_indices=edge_indices,
-        count_per_length=count_per_length,
-        func_names=func_names,
-        section_starts=section_starts,
-    )
+    return spec.loader(paths, line_to_name or {})
 
 
 def load_metadata(
-    matched_paths: BinaryArmPaths, unmatched_paths: BinaryArmPaths
+    matched_paths: BinaryArmPaths,
+    unmatched_paths: BinaryArmPaths,
+    line_to_name: Optional[Dict[int, str]] = None,
 ) -> Tuple[SectionArm, SectionArm]:
-    """Compose both arms for one binary; pure function on paths."""
+    """Compose both arms for one binary; pure function on paths +
+    sidecar lookup."""
     return (
-        load_section_arm(SectionKind.MATCHED, matched_paths),
-        load_section_arm(SectionKind.UNMATCHED, unmatched_paths),
+        load_section_arm(SectionKind.MATCHED, matched_paths, line_to_name),
+        load_section_arm(SectionKind.UNMATCHED, unmatched_paths, line_to_name),
     )
