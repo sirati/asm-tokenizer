@@ -20,7 +20,7 @@ from typing import List
 
 import numpy as np
 
-from tokenizer.aligned_data.binary_format import encode_binary_header
+from tokenizer.aligned_data.binary_format import compute_pad, encode_binary_header
 from tokenizer.aligned_data.io import write_index_entry
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.metadata_loader import (
@@ -41,7 +41,13 @@ from tokenizer.aligned_data.loader.metadata_loader import (
 
 def _write_matched_data(path: Path, n_records: int) -> List[tuple]:
     """Write ``n_records`` matched function records, return per-record
-    ``(start, length, avg_len)`` triples for the index file."""
+    ``(start, length, avg_len)`` triples for the index file.
+
+    Records are padded to a 4-byte total (the writer invariant the new
+    ``_index.bin`` layout depends on) by computing ``pad_size`` from
+    the header / insn / block / tokens sizes and inserting the matching
+    number of ``\\x00`` bytes between insn and block.
+    """
     triples: List[tuple] = []
     with open(path, "wb") as f:
         for i in range(n_records):
@@ -50,14 +56,21 @@ def _write_matched_data(path: Path, n_records: int) -> List[tuple]:
             tokens = np.arange(i + 1, dtype=np.uint16)
             insn_rl = np.array([1, 2], dtype=np.uint8)
             block_rl = np.array([3], dtype=np.uint8)
+            pad_size = compute_pad(
+                insn_len=len(insn_rl),
+                block_len=len(block_rl),
+                token_count=len(tokens),
+                is_overlong=False,
+            )
             header = encode_binary_header(
                 insn_len=len(insn_rl),
                 block_enc=0,  # uint8
                 block_len=len(block_rl),
-                pad_size=0,
+                pad_size=pad_size,
             )
             f.write(header)
             f.write(insn_rl.tobytes())
+            f.write(b"\x00" * pad_size)
             f.write(block_rl.tobytes())
             f.write(tokens.tobytes())
             length = f.tell() - start
@@ -134,15 +147,22 @@ def _build_unmatched_arm(tmp_path: Path) -> List[str]:
             tokens = np.arange((i + 1) * 2, dtype=np.uint16)
             insn_rl = np.array([1], dtype=np.uint8)
             block_rl = np.array([2, 3], dtype=np.uint8)
+            pad_size = compute_pad(
+                insn_len=len(insn_rl),
+                block_len=len(block_rl),
+                token_count=len(tokens),
+                is_overlong=False,
+            )
             f.write(
                 encode_binary_header(
                     insn_len=len(insn_rl),
                     block_enc=0,
                     block_len=len(block_rl),
-                    pad_size=0,
+                    pad_size=pad_size,
                 )
             )
             f.write(insn_rl.tobytes())
+            f.write(b"\x00" * pad_size)
             f.write(block_rl.tobytes())
             f.write(tokens.tobytes())
             length = f.tell() - start
