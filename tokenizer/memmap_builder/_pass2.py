@@ -35,7 +35,10 @@ from ..aligned_data.io import (
     write_index_entry,
     write_unmatched_section_csv,
 )
-from ..aligned_data.line_no_codec import encode_line_no, encode_line_nos_csv
+from ..aligned_data.csv_format import (
+    format_function_line_no,
+    format_function_line_nos_csv,
+)
 from .function_names import FunctionNamesRegistry
 from .variants import VariantRegistry, write_warn_log_entry
 
@@ -79,8 +82,8 @@ def write_matched_sections_pass2(
         version_data = entry["version_data"]
 
         section_start = sections_file.tell() - content_offset
-        line_no_b64 = encode_line_no(registry.line_no(func_name))
-        called_line_nos_b64 = encode_line_nos_csv(
+        line_no_b64 = format_function_line_no(registry.line_no(func_name))
+        called_line_nos_b64 = format_function_line_nos_csv(
             [registry.line_no(name) for name in unique_called]
         )
         writer.writerow([line_no_b64, called_line_nos_b64])
@@ -270,8 +273,8 @@ def write_unmatched_sections_pass2(
         )
 
         variant_refs = [variants.ref(vkey) for vkey in vkeys]
-        line_no_b64 = encode_line_no(registry.line_no(func_name))
-        called_line_nos_b64 = encode_line_nos_csv(
+        line_no_b64 = format_function_line_no(registry.line_no(func_name))
+        called_line_nos_b64 = format_function_line_nos_csv(
             [registry.line_no(name) for name in unique_called_list]
         )
         inlining_data_str = _format_unmatched_inlining_str(inlining_data_list)
