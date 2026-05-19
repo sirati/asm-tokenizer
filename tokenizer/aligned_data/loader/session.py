@@ -172,14 +172,19 @@ class BinarySession:
     ):
         """Slice + parse + egress-copy one record (memmap-view detach).
 
-        ``is_overlong`` is the caller-decoded record flag (matched: from
-        the variant row's ``indexer_hex``; unmatched: from
-        ``resolve_record_length``); this helper never resolves sentinels.
-        Arrays are copied so they outlive the session's ``_data.bin``
-        memmap (see class docstring lifetime contract).
+        ``length`` may be the index sentinel (``0``) for an overlong
+        record; sentinel resolution happens here via
+        ``resolve_record_length`` so both arms route through one rule
+        (matched callers decode ``indexer_hex`` → sentinel-or-real;
+        unmatched callers pre-resolve from the v1 index — calling again
+        is idempotent). Arrays are copied so they outlive the session's
+        ``_data.bin`` memmap (see class docstring lifetime contract).
         """
+        real_length, _resolved_overlong = resolve_record_length(
+            data_mmap, offset, length
+        )
         insn_rl, block_rl, tokens = _parse_function_data_memmap(
-            data_mmap, offset, length, is_overlong=is_overlong,
+            data_mmap, offset, real_length, is_overlong=is_overlong,
         )
         return (
             np.array(insn_rl, copy=True),

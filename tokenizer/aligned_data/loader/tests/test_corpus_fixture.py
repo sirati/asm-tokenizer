@@ -29,10 +29,12 @@ from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
 from tokenizer.aligned_data.index_format import (
+    MAX_NORMAL_REAL_LENGTH,
     SENTINEL_LENGTH,
     read_index_arrays,
 )
 from tokenizer.aligned_data.inline_indexer import decode_inline_indexer
+from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.metadata_loader import open_sections_csv
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
@@ -101,6 +103,49 @@ def test_matched_variant_overlong_indexer_round_trips(tmp_path):
     # surfaces ``length == 0`` (the sentinel marker) so the consumer
     # routes through the data record's overlong field.
     assert len1 == 0
+
+
+def test_session_load_matched_overlong_returns_real_tokens(tmp_path):
+    """End-to-end: ``BinaryDataset.load_matched_function`` resolves the
+    inline-indexer sentinel for an overlong matched variant and returns
+    the full token sequence (not an empty slice).
+
+    Pins the matched-arm sentinel-resolution path through the session
+    slice: ``_slice_data_record`` must call ``resolve_record_length``
+    internally so the matched arm (which decodes ``indexer_hex`` →
+    sentinel) and the unmatched arm (which pre-resolves) both produce
+    real lengths. A regression here would surface as
+    ``IndexError: index 0 is out of bounds`` at ``binary_format.py``'s
+    header parse when the parser receives ``length == 0``.
+    """
+    spec = matched_spec("fn_with_overlong", n_variants=2, overlong_variant_idx=1)
+    corpus = build_corpus(tmp_path, "bin", matched=[spec])
+
+    dataset = BinaryDataset(corpus.base_path, corpus.binary_name)
+    matched = dataset.load_matched_function(0)
+    assert matched.func_name == "fn_with_overlong"
+    assert len(matched.versions) == 2
+    overlong_variant = matched.versions[1]
+    # The overlong variant must decode to a real (non-empty) token
+    # sequence — a length-0 slice would silently produce an empty
+    # array and the test would notice via the token count assertion.
+    assert overlong_variant.tokens.size > 0, (
+        "overlong matched variant produced empty tokens; "
+        "sentinel resolution failed in the slice path"
+    )
+    # Cross-check: the record's total bytes exceed the v1 normal cap
+    # (>~256 KiB), which is what makes it overlong in the first place.
+    # tokens are uint16 → 2 bytes each; insn + block + tokens roughly
+    # tracks the record body.
+    record_bytes = (
+        overlong_variant.tokens.nbytes
+        + overlong_variant.insn_runlength.nbytes
+        + overlong_variant.block_runlength.nbytes
+    )
+    assert record_bytes > MAX_NORMAL_REAL_LENGTH // 2, (
+        f"overlong variant body {record_bytes} bytes is below the "
+        f"normal cap — fixture isn't actually exercising the sentinel path"
+    )
 
 
 def test_unmatched_overlong_index_entry_surfaces_sentinel(tmp_path):
