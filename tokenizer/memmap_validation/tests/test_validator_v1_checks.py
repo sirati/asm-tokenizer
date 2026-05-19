@@ -25,11 +25,12 @@ from tokenizer.aligned_data.index_format import (
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
 from tokenizer.memmap_validation._v1_checks import (
+    check_csv_prelude,
+    check_index_prelude,
     check_pad_bytes_zero,
     check_sentinel_overlong_coupling,
     check_starts_alignment,
     run_v1_post_checks,
-    run_v1_prelude_checks,
 )
 from tokenizer.memmap_validation.validator import (
     ValidatorConfig,
@@ -153,9 +154,17 @@ def test_clean_v1_corpus_passes(tmp_path: Path) -> None:
 
 
 def test_missing_index_prelude_raises(tmp_path: Path) -> None:
-    """Zeroing the 16-byte prelude removes the magic; validator reports it."""
+    """Zeroing the 16-byte prelude removes the magic; validator reports it.
+
+    Targets ``_unmatched_index.bin`` -- the only index file still carrying
+    the v1 ``IDX1`` prelude. ``_index.bin`` (matched arm) is pre-v1
+    layout (no prelude, function->CSV-section locator); its structural
+    integrity is enforced by ``read_csv_section_index_arrays`` at
+    ``BinaryDataset`` construction time, not by the validator's prelude
+    probe.
+    """
     output_dir, _ = _pipeline(tmp_path)
-    idx_path = output_dir / "demo_index.bin"
+    idx_path = output_dir / "demo_unmatched_index.bin"
     raw = bytearray(idx_path.read_bytes())
     raw[0:INDEX_HEADER_SIZE] = b"\x00" * INDEX_HEADER_SIZE
     idx_path.write_bytes(bytes(raw))
@@ -172,9 +181,13 @@ def test_missing_index_prelude_raises(tmp_path: Path) -> None:
 
 
 def test_wrong_index_format_version_raises(tmp_path: Path) -> None:
-    """Rewrite the prelude with format_version=99; validator reports it."""
+    """Rewrite the prelude with format_version=99; validator reports it.
+
+    Targets ``_unmatched_index.bin`` for the same reason as
+    :func:`test_missing_index_prelude_raises`.
+    """
     output_dir, _ = _pipeline(tmp_path)
-    idx_path = output_dir / "demo_index.bin"
+    idx_path = output_dir / "demo_unmatched_index.bin"
     raw = bytearray(idx_path.read_bytes())
     # Preserve magic; rewrite version+shift+reserved with version=99.
     raw[0:INDEX_HEADER_SIZE] = struct.pack("<4sIII", INDEX_MAGIC, 99, 2, 0)
@@ -391,16 +404,25 @@ def test_sentinel_overlong_mismatch_detected(tmp_path: Path) -> None:
 
 
 def test_helpers_clean_on_fresh_corpus(tmp_path: Path) -> None:
-    """``run_v1_prelude_checks`` + ``run_v1_post_checks`` return [] on v1."""
+    """Per-helper prelude probes + ``run_v1_post_checks`` clean on a v1 build.
+
+    Composes the prelude checks the same way the validator does --
+    individual ``check_csv_prelude`` + ``check_index_prelude`` calls,
+    skipping the matched ``_index.bin`` because that file is pre-v1
+    layout (no IDX1 magic; structurally validated at ``BinaryDataset``
+    construction via ``read_csv_section_index_arrays``).
+    """
     output_dir, _ = _pipeline(tmp_path)
 
-    prelude_errors = run_v1_prelude_checks(
-        matched_sections=output_dir / "demo_sections.csv",
-        unmatched_sections=output_dir / "demo_unmatched_sections.csv",
-        variants_csv=output_dir / "demo_variants.csv",
-        matched_index=output_dir / "demo_index.bin",
-        unmatched_index=output_dir / "demo_unmatched_index.bin",
-    )
+    prelude_errors: list[str] = []
+    for path in [
+        output_dir / "demo_sections.csv",
+        output_dir / "demo_unmatched_sections.csv",
+        output_dir / "demo_variants.csv",
+    ]:
+        prelude_errors.extend(check_csv_prelude(path, str(path)))
+    unmatched_idx = output_dir / "demo_unmatched_index.bin"
+    prelude_errors.extend(check_index_prelude(unmatched_idx, str(unmatched_idx)))
     assert prelude_errors == [], f"prelude checks dirty on fresh build: {prelude_errors!r}"
 
     def _arrays_or_empty(path: Path):
@@ -412,7 +434,19 @@ def test_helpers_clean_on_fresh_corpus(tmp_path: Path) -> None:
             )
         return arr[0], arr[1]
 
-    matched_starts, matched_lengths = _arrays_or_empty(output_dir / "demo_index.bin")
+    # Matched arm: source per-record starts/lengths from the loaded
+    # ``BinaryDataset`` (decoded inline_indexer hex per variant), NOT
+    # from the pre-v1 ``demo_index.bin`` (which now holds CSV byte
+    # positions, not data-bin positions). Unmatched arm still reads
+    # the v1 index file.
+    from tokenizer.aligned_data.loader import BinaryDataset
+    from tokenizer.aligned_data.loader.unified_vocab_gate import (
+        load_and_validate_unified_vocab,
+    )
+
+    vocab = load_and_validate_unified_vocab(output_dir / "unified_vocab.csv")
+    dataset = BinaryDataset(output_dir, "demo", vocab_manager=vocab)
+
     unmatched_starts, unmatched_lengths = _arrays_or_empty(
         output_dir / "demo_unmatched_index.bin"
     )
@@ -421,8 +455,8 @@ def test_helpers_clean_on_fresh_corpus(tmp_path: Path) -> None:
         unmatched_index=output_dir / "demo_unmatched_index.bin",
         matched_data=output_dir / "demo_data.bin",
         unmatched_data=output_dir / "demo_unmatched_data.bin",
-        matched_starts=matched_starts,
-        matched_lengths=matched_lengths,
+        matched_starts=dataset.matched_starts,
+        matched_lengths=dataset.matched_lengths,
         unmatched_starts=unmatched_starts,
         unmatched_lengths=unmatched_lengths,
     )
