@@ -1,5 +1,7 @@
 from typing import Any, Dict, List
 
+from .inline_indexer import decode_inline_indexer
+
 
 def parse_inlining_data(inlining_str: str) -> List[List[int]]:
     """
@@ -21,20 +23,35 @@ def parse_inlining_data(inlining_str: str) -> List[List[int]]:
 
 
 def extract_metadata_from_section_row(row: List[str], header: List[str]) -> Dict[str, Any]:
-    """Given a row from the section CSV and its header, extract metadata as a dict.
+    """Given a matched-section variant row + its header, extract metadata.
+
+    Post matched-arm restructuring the variant row is 3 cells
+    ``[variant_ref, inlining_data, indexer_hex]`` (the previous
+    ``data_offset, data_len`` pair was replaced by the single
+    ``indexer_hex`` cell -- the 16-hex-char inline encoding of the v1
+    index entry). This helper decodes ``indexer_hex`` through
+    :func:`tokenizer.aligned_data.inline_indexer.decode_inline_indexer`
+    so the layout knowledge lives in one place and the returned dict
+    keeps the same downstream keys (``data_offset``, ``data_len``,
+    ``is_overlong``).
 
     Returns: dict with keys ``variant_ref``, ``inlining_data``,
-    ``data_offset``, ``data_len``. The variant ref is the
-    ``0x<hex>`` row index into the per-group ``<binary>_variants.csv``
-    sidecar — resolution to the canonical-4 axes / extra-metadata is
-    a separate consumer-side concern and not performed here.
+    ``data_offset``, ``data_len``, ``is_overlong``. The variant ref is
+    the ``0x<hex>`` row index into the per-group
+    ``<binary>_variants.csv`` sidecar -- resolution to the canonical-4
+    axes / extra-metadata is a separate consumer-side concern and not
+    performed here.
     """
     idx = {k: i for i, k in enumerate(header)}
+    data_offset, data_len, is_overlong = decode_inline_indexer(
+        row[idx["indexer_hex"]]
+    )
     return {
         "variant_ref": row[idx["variant_ref"]],
         "inlining_data": parse_inlining_data(row[idx["inlining_data"]]),
-        "data_offset": int(row[idx["data_offset"]], 16),
-        "data_len": int(row[idx["data_len"]], 16),
+        "data_offset": data_offset,
+        "data_len": data_len,
+        "is_overlong": is_overlong,
     }
 
 

@@ -3,20 +3,27 @@
 Single concern: own the three file handles a ``BinaryDataset`` uses
 while serving a batch of slicing operations on ONE binary
 (``_sections.csv``/``_unmatched_sections.csv``, ``_data.bin``,
-``_variants.bin``), and guarantee deterministic close of every
-opened handle on exit.
+``_variants.bin``), and guarantee deterministic close on exit.
 
-Lazy opens + a single ``contextlib.ExitStack`` give the two required
-properties at once: handles nobody touches stay closed; handles that
-DO open are unwound (in reverse order) by the stack on ``__exit__``,
-even when a mid-batch slice raises. ``__exit__`` is idempotent per
-the plan's "BinarySession exception safety is mandatory" requirement.
+Lazy opens + a single ``contextlib.ExitStack``: handles nobody touches
+stay closed; handles that DO open are unwound (in reverse order) by
+the stack on ``__exit__``, even when a mid-batch slice raises.
+``__exit__`` is idempotent.
 
 This module does NOT load metadata (``metadata_loader``), parse
 data-bin records (``aligned_data.io.parse_function_data_memmap``), or
-own the variant-ref decoder body
-(``variant_resolver.get_variant_by_ref``). Row→FunctionData glue lives
-in ``_session_parsers``.
+own the variant-ref decoder (``variant_resolver``). Row→FunctionData
+glue lives in ``_session_parsers``.
+
+**Lifetime contract (egress copy)**: every ``FunctionData`` /
+``MatchedFunction`` returned by a slice method is independent of the
+session's open memmap handles -- :py:meth:`BinarySession._slice_data_record`
+copies ``tokens`` / ``insn_runlength`` / ``block_runlength`` off the
+zero-copy ``extract_arrays_from_data`` views before they reach the
+caller. Callers may consume returned arrays freely after the ``with``
+exits; per-record copy cost is negligible vs the memmap-paging the
+reader already paid, and mirrors ``variant_resolver.get_variant_by_ref``
+which already copies ``variant_tokens`` for the same reason.
 """
 
 from __future__ import annotations
@@ -42,8 +49,7 @@ from .variant_resolver import get_variant_by_ref as _resolve_variant_by_ref
 
 
 def _close_memmap(mmap_obj) -> None:
-    # Pin mmap release to the ExitStack instead of GC; long-lived
-    # dataloader workers otherwise accumulate file descriptors.
+    # Pin mmap release to ExitStack vs GC -- long-lived workers leak fds.
     inner = getattr(mmap_obj, "_mmap", None)
     if inner is not None:
         try:
@@ -55,15 +61,13 @@ def _close_memmap(mmap_obj) -> None:
 class BinarySession:
     """Context manager bundling the three per-binary handles.
 
-    ``metadata`` is a pre-loaded bag (built by ``metadata_loader``
-    in 5B and the variant-CSV reader in 5D). Accessed attribute-first,
-    dict-fallback so 5B's final shape choice is transparent. Expected
-    keys/attrs:
+    ``metadata`` is a pre-loaded bag (built by ``metadata_loader``).
+    Accessed attribute-first, dict-fallback. Expected keys/attrs:
 
-      * ``matched_arm``        — SectionArm: ``.starts``, ``.lengths``
-      * ``unmatched_arm``      — SectionArm: ``.starts``, ``.lengths``,
-                                 ``.func_names``, ``.section_starts``
-      * ``offset_to_filename`` — ``dict[int, str]``
+      * ``matched_arm``        -- SectionArm: ``.starts``, ``.lengths``
+      * ``unmatched_arm``      -- SectionArm: ``.starts``, ``.lengths``,
+                                  ``.func_names``, ``.section_starts``
+      * ``offset_to_filename`` -- ``dict[int, str]``
     """
 
     def __init__(
@@ -101,9 +105,8 @@ class BinarySession:
         self._closed = True
         stack = self._stack
         self._stack = None
-        # Drop handle refs BEFORE the stack unwinds so a stray
-        # mid-unwind slice call sees a torn-down session, not a
-        # half-closed handle.
+        # Drop refs BEFORE stack unwinds so stray mid-unwind slice calls
+        # see a torn-down session, not a half-closed handle.
         self._sections_handle = None
         self._sections_content_offset = 0
         self._sections_kind = None
@@ -132,7 +135,9 @@ class BinarySession:
         data_mmap = self._open_data("matched")
         return parse_matched_section(
             section_data,
-            data_slice=lambda o, l: self._slice_data_record(data_mmap, o, l),
+            data_slice=lambda o, l, ov: self._slice_data_record(
+                data_mmap, o, l, ov
+            ),
             resolve_ref=self.get_variant_by_ref,
         )
 
@@ -142,44 +147,48 @@ class BinarySession:
         if idx >= len(starts):
             raise IndexError(f"Index {idx} out of bounds for unmatched functions")
         start = int(starts[idx])
-        stored_length = int(lengths[idx])
         data_mmap = self._open_data("unmatched")
+        # ``resolve_record_length`` bridges sentinel ↔ real length.
         real_length, is_overlong = resolve_record_length(
-            data_mmap, start, stored_length
+            data_mmap, start, int(lengths[idx])
         )
-        insn_rl, block_rl, tokens = _parse_function_data_memmap(
-            data_mmap, start, real_length, is_overlong=is_overlong,
+        insn_rl, block_rl, tokens = self._slice_data_record(
+            data_mmap, start, real_length, is_overlong
         )
-        row = self._read_unmatched_row(arm, idx)
         return build_unmatched_function_data(
-            row, idx, start, real_length, tokens, insn_rl, block_rl,
+            self._read_unmatched_row(arm, idx),
+            idx,
+            self._unmatched_func_name(arm, idx),
+            start, real_length, is_overlong,
+            tokens, insn_rl, block_rl,
             resolve_ref=self.get_variant_by_ref,
         )
 
-    def _slice_data_record(self, data_mmap, offset: int, length: int):
-        """Resolve overlong sentinel then slice via the shared parser.
+    def _slice_data_record(
+        self, data_mmap, offset: int, length: int, is_overlong: bool
+    ):
+        """Slice + parse + egress-copy one record (memmap-view detach).
 
-        The matched-section CSV stores the real ``data_len`` directly,
-        but the writer picks the overlong layout when that length
-        exceeds the normal-record cap; ``resolve_record_length`` owns
-        the single rule that maps stored length → ``(real_length,
-        is_overlong)`` for both arms.
+        ``is_overlong`` is the caller-decoded record flag (matched: from
+        the variant row's ``indexer_hex``; unmatched: from
+        ``resolve_record_length``); this helper never resolves sentinels.
+        Arrays are copied so they outlive the session's ``_data.bin``
+        memmap (see class docstring lifetime contract).
         """
-        real_length, is_overlong = resolve_record_length(
-            data_mmap, offset, length
+        insn_rl, block_rl, tokens = _parse_function_data_memmap(
+            data_mmap, offset, length, is_overlong=is_overlong,
         )
-        return _parse_function_data_memmap(
-            data_mmap, offset, real_length, is_overlong=is_overlong,
+        return (
+            np.array(insn_rl, copy=True),
+            np.array(block_rl, copy=True),
+            np.array(tokens, copy=True),
         )
 
     def get_variant_by_ref(self, ref: str) -> Optional[Dict[str, Any]]:
-        # Pure resolver raises on bad input (malformed hex, missing filename,
-        # vocab miss). Session swallows them all to ``None`` because the
-        # parser callers want a "no variant available" sentinel, not an
-        # exception that aborts a whole batch over one bad section row.
-        if not ref:
-            return None
-        if self._vocab_manager is None:
+        # Swallow resolver errors to ``None`` -- parsers want a sentinel
+        # for "no variant available", not an exception aborting a batch
+        # over one bad section row.
+        if not ref or self._vocab_manager is None:
             return None
         variants_mmap = self._open_variants()
         if variants_mmap is None:
@@ -206,9 +215,8 @@ class BinarySession:
             return self._sections_handle
         suffix = "_sections.csv" if kind == "matched" else "_unmatched_sections.csv"
         path = self._base_path / f"{self._binary_name}{suffix}"
-        # Delegate prelude validation + content-offset accounting to
-        # ``open_sections_csv`` so the v1 ``# format=N`` requirement
-        # lives in one place across the reader chain.
+        # Prelude validation + content-offset accounting belong to
+        # ``open_sections_csv`` (single v1 ``# format=N`` consumer).
         f, content_offset = open_sections_csv(path)
         self._stack.callback(f.close)
         self._sections_handle = f
@@ -250,6 +258,8 @@ class BinarySession:
     # --- internal helpers ------------------------------------------
 
     def _read_unmatched_row(self, arm: Any, idx: int) -> Optional[List[str]]:
+        # Row layout (5 cells): line_no_b64, variant_refs, called_b64,
+        # inlining, indexer_hex (post matched-arm restructuring).
         section_starts = getattr(arm, "section_starts", None)
         sections_path = (
             self._base_path / f"{self._binary_name}_unmatched_sections.csv"
@@ -267,7 +277,14 @@ class BinarySession:
         if not line:
             return None
         row = next(csv.reader([line]), None)
-        return row if row and len(row) == 6 else None
+        return row if row and len(row) == 5 else None
+
+    def _unmatched_func_name(self, arm: Any, idx: int) -> str:
+        # Row first cell is base64-of-line-number; ``metadata_loader``
+        # resolves via the function-names sidecar and surfaces names on
+        # ``arm.func_names`` in row order. Placeholder fallback on miss.
+        names = getattr(arm, "func_names", None) or []
+        return names[idx] if 0 <= idx < len(names) else f"unmatched_{idx}"
 
     def _meta_get(self, key: str) -> Any:
         if self._metadata is None:
