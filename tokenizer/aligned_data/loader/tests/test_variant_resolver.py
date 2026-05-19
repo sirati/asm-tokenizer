@@ -203,3 +203,30 @@ def test_get_variant_by_ref_missing_filename_raises(tmp_path):
     # Deliberately empty filename table.
     with pytest.raises(KeyError):
         get_variant_by_ref("0", vocab, mmap, {})
+
+
+def test_variant_tokens_survives_memmap_close(tmp_path):
+    """Returned ``variant_tokens`` must own its buffer.
+
+    ``read_record`` slices a memmap view; if we returned that view
+    directly, the array would dangle once the enclosing
+    ``BinarySession`` closes the memmap and any post-batch
+    dereference (e.g. ``FunctionData.full_token_stream()`` in a
+    training loop) would segfault on freed pages. The resolver
+    therefore copies into an owning buffer at the session-boundary
+    handoff; this test pins that contract."""
+    vi = FakeVersionInfo(extra_metadata={})
+    bin_path, slim_csv_path, vocab, _offsets = _write_corpus(
+        tmp_path, [(vi, "lonely")]
+    )
+    offset_to_filename = load_variants_offset_to_filename(slim_csv_path)
+
+    mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
+    result = get_variant_by_ref("0", vocab, mmap, offset_to_filename)
+    tokens = result["variant_tokens"]
+    # Releasing the memmap MUST not invalidate tokens.
+    mmap._mmap.close()
+    del mmap
+    # If tokens were a view, the next line would touch freed memory.
+    assert int(tokens.sum()) >= 0
+    assert tokens.flags.owndata

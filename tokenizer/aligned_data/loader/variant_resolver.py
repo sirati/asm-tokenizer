@@ -94,10 +94,14 @@ def get_variant_by_ref(
         5. ``variant_tokens`` is the vocab-ID slice ``tokens[1:]`` —
            the leading size header is dropped so the array can be
            concatenated directly into the instruction token stream.
+           Copied via ``np.array(..., copy=True)`` so the returned
+           array owns its buffer; ``read_record`` returns a memmap
+           view that would dangle once the enclosing ``BinarySession``
+           closes its handle.
     """
     offset = int(ref, 16)
     tokens = read_record(variants_mmap, offset)
     out: Dict[str, Any] = decode_record(tokens, vocab_manager)
     out["filename"] = offset_to_filename[offset]
-    out["variant_tokens"] = tokens[1:]
+    out["variant_tokens"] = np.array(tokens[1:], copy=True)
     return out
