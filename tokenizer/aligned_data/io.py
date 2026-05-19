@@ -6,12 +6,21 @@ import numpy as np
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 from .binary_format import (
+    IndexEntrySkip,
+    compute_pad,
     determine_block_encoding,
     encode_binary_header,
     extract_arrays_from_data,
     parse_binary_header,
 )
 from .csv_format import format_inlining_dict, format_variant_refs
+
+# Largest real record length the index entry can carry without the sentinel.
+# `length_shifted` is u16; multiplied by the alignment shift (<<2) gives the
+# cap. Records strictly above this switch to the overlong layout with a u24
+# length field stored inside the data record (cap 0xFFFFFF << 2 bytes).
+_MAX_NORMAL_REAL_LENGTH = 0xFFFF << 2
+_MAX_OVERLONG_REAL_LENGTH = 0xFFFFFF << 2
 
 
 def decode_and_translate_tokens(row, mapping=None):
@@ -35,7 +44,23 @@ def decode_runlengths(row):
     return block_runlength, insn_runlength
 
 
-def write_function_binary_data(file2, tokens, block_runlength, insn_runlength, dedup_cache=None):
+def write_function_binary_data(
+    file2,
+    tokens,
+    block_runlength,
+    insn_runlength,
+    dedup_cache=None,
+    *,
+    func_name: str = "",
+    error_log=None,
+):
+    """Write one function record (pad-aligned, overlong-aware).
+
+    Returns ``(data_offset, data_len)`` on success. On
+    :class:`IndexEntrySkip` from the encode path the partial write is
+    truncated and ``None`` is returned so the caller skips the index
+    entry; if ``error_log`` is provided the skip reason is logged.
+    """
     cache_key = None
     if dedup_cache is not None:
         cache_key = (
@@ -49,20 +74,53 @@ def write_function_binary_data(file2, tokens, block_runlength, insn_runlength, d
     data_offset = file2.tell()
     insn_bytes = insn_runlength.astype(np.uint8).tobytes()
     block_enc = determine_block_encoding(block_runlength)
-    block_bytes = block_runlength.astype([np.uint8, np.uint16, np.uint32][block_enc]).tobytes()
+    block_bytes = block_runlength.astype(
+        [np.uint8, np.uint16, np.uint32][block_enc]
+    ).tobytes()
     insn_len = len(insn_bytes)
+    block_len = len(block_bytes)
+    token_count = len(tokens)
 
-    header = encode_binary_header(insn_len, block_enc, len(block_bytes), pad_size=0)
-    file2.write(header)
-    file2.write(insn_bytes)
-    file2.write(block_bytes)
-    file2.write(tokens.tobytes())
-    data_len = file2.tell() - data_offset
+    try:
+        # Pick normal vs overlong layout from the would-be total length.
+        pad_normal = compute_pad(insn_len, block_len, token_count, is_overlong=False)
+        total_normal = 6 + insn_len + pad_normal + block_len + 2 * token_count
+        if total_normal <= _MAX_NORMAL_REAL_LENGTH:
+            is_overlong = False
+            pad_size = pad_normal
+            total = total_normal
+        else:
+            pad_long = compute_pad(insn_len, block_len, token_count, is_overlong=True)
+            total_long = 9 + insn_len + pad_long + block_len + 2 * token_count
+            if total_long > _MAX_OVERLONG_REAL_LENGTH:
+                raise IndexEntrySkip("overlong_length_overflow", total_long)
+            is_overlong = True
+            pad_size = pad_long
+            total = total_long
+
+        header = encode_binary_header(insn_len, block_enc, block_len, pad_size=pad_size)
+        file2.write(header)
+        if is_overlong:
+            file2.write(struct.pack("<I", total >> 2)[0:3])
+        file2.write(insn_bytes)
+        file2.write(b"\x00" * pad_size)
+        file2.write(block_bytes)
+        file2.write(tokens.tobytes())
+
+        data_len = file2.tell() - data_offset
+        assert data_len == total, (data_len, total)
+        assert data_len % 4 == 0, data_len
+    except IndexEntrySkip as exc:
+        file2.seek(data_offset)
+        file2.truncate()
+        if error_log is not None:
+            from tokenizer.memmap_builder.error_log import write_error_log_entry
+            write_error_log_entry(error_log, exc.reason, func_name, exc.value)
+        return None
+
     result = (data_offset, data_len)
-
     if dedup_cache is not None:
         dedup_cache[cache_key] = result
-
     return result
 
 
