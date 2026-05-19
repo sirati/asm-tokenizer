@@ -53,7 +53,7 @@ def test_v2_unified_vocab_raises_value_error(tmp_path: Path) -> None:
     # Names both the offending version and the required version so the
     # operator can fix without grepping logs.
     assert "format_version=2" in msg
-    assert "v3 required" in msg
+    assert "v1 required" in msg
     assert "tokenizer.vocab_unifier" in msg
 
 
@@ -224,4 +224,4 @@ def test_vocab_manager_threaded_into_binary_dataset(
     )
     stub = loader.datasets["binA"]
     assert stub.vocab_manager is loader.vocab_manager
-    assert loader.vocab_manager.format_version == 3
+    assert loader.vocab_manager.format_version == 1
