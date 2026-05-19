@@ -395,13 +395,24 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         import csv
 
         # The unmatched-section row's variant_refs cell is a
-        # semicolon-joined list of ``0x<hex>`` row indices into the
-        # per-group ``<binary>_variants.csv`` sidecar. Each ref's
-        # numeric value is the registration position, which coincides
-        # with this validator's own ``version_keys`` ordering (both
-        # derive from the same ordered ``config.versions`` list).
-        # Resolve each ref to the corresponding vkey directly.
+        # semicolon-joined list of ``0x<hex>`` byte offsets into the
+        # per-group ``<binary>_variants.bin`` (post-4A semantic flip).
+        # Slim ``<binary>_variants.csv`` lists one (filename, offset)
+        # row per variant in the same registration order as
+        # ``version_keys`` (both derive from ``config.versions``), so
+        # the i-th entry by ascending offset matches version_keys[i].
         from ..aligned_data.csv_format import parse_variant_refs
+        from ..aligned_data.loader.variant_resolver import (
+            load_variants_offset_to_filename,
+        )
+
+        offset_to_filename = load_variants_offset_to_filename(
+            dataset.variants_sidecar
+        )
+        offset_to_vkey = {
+            offset: version_keys[i]
+            for i, offset in enumerate(sorted(offset_to_filename.keys()))
+        }
 
         index_entry_idx = 0
         with open(dataset.unmatched_sections, "r", newline="", encoding="ascii") as f:
@@ -412,7 +423,7 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
                     variant_refs_str = row[1]
                     if variant_refs_str:
                         for ref in parse_variant_refs(variant_refs_str):
-                            vkey = version_keys[int(ref, 16)]
+                            vkey = offset_to_vkey[int(ref, 16)]
                             unmatched_data_by_name_and_vkey[(func_name, vkey)] = index_entry_idx
                             index_entry_idx += 1
 
