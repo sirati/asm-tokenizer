@@ -72,11 +72,34 @@ def process_function_binary_data(
     mapping: Optional[np.ndarray],
     data_file,
     dedup_cache: dict,
-) -> FunctionBinaryData:
-    """Decode, translate, and write binary data for a function. Returns offset, length, token count."""
+    *,
+    func_name: str = "",
+    error_log=None,
+) -> Optional[FunctionBinaryData]:
+    """Decode, translate, and write binary data for a function.
+
+    Returns ``FunctionBinaryData`` on success, or ``None`` when the
+    encoder raised :class:`IndexEntrySkip` (a cap was breached, the
+    partial data write was truncated, and an entry was logged into
+    ``<binary>.error.log`` if a handle was supplied). The ``None``
+    return is the sole "skip this function's version" signal that
+    propagates through pass 1 into pass 2 — callers MUST gate any
+    section-row + index-entry emission on it.
+    """
     tokens = decode_and_translate_tokens(row, mapping)
     block_runlength, insn_runlength = decode_runlengths(row)
-    data_offset, data_len = write_function_binary_data(data_file, tokens, block_runlength, insn_runlength, dedup_cache)
+    write_result = write_function_binary_data(
+        data_file,
+        tokens,
+        block_runlength,
+        insn_runlength,
+        dedup_cache,
+        func_name=func_name,
+        error_log=error_log,
+    )
+    if write_result is None:
+        return None
+    data_offset, data_len = write_result
     return FunctionBinaryData(data_offset=data_offset, data_len=data_len, token_len=len(tokens))
 
 

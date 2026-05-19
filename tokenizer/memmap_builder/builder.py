@@ -9,6 +9,7 @@ from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
 from ..aligned_data.match import lockstep_function_match
+from ._output_files import open_section_outputs
 from .passes import (
     build_function_lookup_table,
     process_matched_function_pass1,
@@ -162,10 +163,13 @@ def build_memmap_files(
 
     matched_data_path = output_dir / f"{prefix}_data.bin"
     unmatched_data_path = output_dir / f"{unmatched_prefix}_data.bin"
+    error_log_path = output_dir / f"{binary_name}.error.log"
     logger.info(f"  Creating: {matched_data_path}")
     logger.info(f"  Creating: {unmatched_data_path}")
+    logger.info(f"  Creating: {error_log_path}")
     matched_data_file = open(matched_data_path, "wb")
     unmatched_data_file = open(unmatched_data_path, "wb")
+    error_log = open(error_log_path, "w", encoding="ascii")
 
     progress_callback = None
     pbar = None
@@ -193,17 +197,36 @@ def build_memmap_files(
         count = match_data["count"]
 
         if count >= 2:
-            entry = process_matched_function_pass1(func_name, rows, version_keys, mapping_dict, matched_data_file)
+            entry = process_matched_function_pass1(
+                func_name,
+                rows,
+                version_keys,
+                mapping_dict,
+                matched_data_file,
+                error_log=error_log,
+            )
             if entry is not None:
                 matched_data_entries.append(entry)
             else:
                 entries = process_unmatched_function_pass1(
-                    func_name, rows, version_keys, mapping_dict, unmatched_data_file
+                    func_name,
+                    rows,
+                    version_keys,
+                    mapping_dict,
+                    unmatched_data_file,
+                    error_log=error_log,
                 )
                 unmatched_data_entries.extend(entries)
 
         elif count == 1:
-            entries = process_unmatched_function_pass1(func_name, rows, version_keys, mapping_dict, unmatched_data_file)
+            entries = process_unmatched_function_pass1(
+                func_name,
+                rows,
+                version_keys,
+                mapping_dict,
+                unmatched_data_file,
+                error_log=error_log,
+            )
             unmatched_data_entries.extend(entries)
 
     if pbar is not None:
@@ -216,54 +239,35 @@ def build_memmap_files(
 
     function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
 
-    matched_sections_path = output_dir / f"{prefix}_sections.csv"
-    matched_index_path = output_dir / f"{prefix}_index.bin"
     warn_log_path = output_dir / f"{binary_name}.warn.log"
-    logger.info(f"  Creating: {matched_sections_path}")
-    logger.info(f"  Creating: {matched_index_path}")
     logger.info(f"  Creating: {warn_log_path}")
-    matched_sections_file = open(matched_sections_path, "w", newline="", encoding="ascii")
-    matched_index_file = open(matched_index_path, "wb")
     warn_log = open(warn_log_path, "w", encoding="ascii")
 
+    matched_outputs = open_section_outputs(output_dir, prefix)
     write_matched_sections_pass2(
         matched_data_entries,
         function_lookup,
-        matched_sections_file,
-        matched_index_file,
+        matched_outputs.sections_file,
+        matched_outputs.index_file,
         warn_log,
         variants,
+        error_log=error_log,
     )
+    matched_outputs.close()
 
-    matched_sections_file.close()
-    logger.info(f"  Closed: {matched_sections_path}")
-    matched_index_file.close()
-    logger.info(f"  Closed: {matched_index_path}")
-
-    unmatched_sections_path = output_dir / f"{unmatched_prefix}_sections.csv"
-    unmatched_index_path = output_dir / f"{unmatched_prefix}_index.bin"
-    logger.info(f"  Creating: {unmatched_sections_path}")
-    logger.info(f"  Creating: {unmatched_index_path}")
-    unmatched_sections_file = open(
-        unmatched_sections_path,
-        "w",
-        newline="",
-        encoding="ascii",
-    )
-    unmatched_index_file = open(unmatched_index_path, "wb")
-
+    unmatched_outputs = open_section_outputs(output_dir, unmatched_prefix)
     write_unmatched_sections_pass2(
         unmatched_data_entries,
         function_lookup,
-        unmatched_sections_file,
-        unmatched_index_file,
+        unmatched_outputs.sections_file,
+        unmatched_outputs.index_file,
         warn_log,
         variants,
+        error_log=error_log,
     )
+    unmatched_outputs.close()
 
-    unmatched_sections_file.close()
-    logger.info(f"  Closed: {unmatched_sections_path}")
-    unmatched_index_file.close()
-    logger.info(f"  Closed: {unmatched_index_path}")
     warn_log.close()
     logger.info(f"  Closed: {warn_log_path}")
+    error_log.close()
+    logger.info(f"  Closed: {error_log_path}")

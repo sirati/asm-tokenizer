@@ -64,6 +64,19 @@ def _make_version(
     )
 
 
+def _read_slim_csv_rows(csv_path: Path) -> List[List[str]]:
+    """Open a slim ``_variants.csv``, skip the ``# format=N`` prelude
+    line, and return the remaining rows parsed via ``csv.reader``.
+
+    The prelude is consumed line-wise (not via ``csv.reader``) because
+    ``csv.reader`` would surface it as a single-cell row and the
+    surrounding tests assert on ``rows[0]`` being the standard header.
+    """
+    with open(csv_path, encoding="ascii") as fh:
+        fh.readline()  # skip "# format=N" prelude
+        return list(csv.reader(fh))
+
+
 def _make_vocab_for(versions: List[BinaryVersionInfo]) -> FakeVocab:
     """Register every axis string for ``versions`` into a fresh fake vocab.
 
@@ -95,8 +108,7 @@ def test_dedup_collapses_identical_vkey_versions(tmp_path):
     registry.write_sidecar(tmp_path, "hello")
 
     csv_path = tmp_path / "hello_variants.csv"
-    with open(csv_path, encoding="ascii") as f:
-        rows = list(csv.reader(f))
+    rows = _read_slim_csv_rows(csv_path)
     # header + 1 data row (dedup collapsed the duplicate)
     assert len(rows) == 2
     assert rows[0] == ["filename", "offset"]
@@ -121,8 +133,7 @@ def test_distinct_variant_ids_stay_distinct(tmp_path):
     registry.write_sidecar(tmp_path, "hello")
 
     csv_path = tmp_path / "hello_variants.csv"
-    with open(csv_path, encoding="ascii") as f:
-        rows = list(csv.reader(f))
+    rows = _read_slim_csv_rows(csv_path)
     assert len(rows) == 3  # header + 2 data rows
     filenames = [r[0] for r in rows[1:]]
     assert filenames == ["hello-O2-noflag", "hello-O2-fortify"]
@@ -272,8 +283,7 @@ def test_slim_csv_has_only_filename_and_offset(tmp_path):
     registry.write_sidecar(tmp_path, "hello")
 
     csv_path = tmp_path / "hello_variants.csv"
-    with open(csv_path, encoding="ascii") as f:
-        rows = list(csv.reader(f))
+    rows = _read_slim_csv_rows(csv_path)
 
     assert rows[0] == ["filename", "offset"]
     assert len(rows) == 3
@@ -298,8 +308,7 @@ def test_slim_csv_offsets_match_ref(tmp_path):
     registry.write_sidecar(tmp_path, "trio")
 
     csv_path = tmp_path / "trio_variants.csv"
-    with open(csv_path, encoding="ascii") as f:
-        rows = list(csv.reader(f))
+    rows = _read_slim_csv_rows(csv_path)
 
     # filename -> offset from CSV.
     csv_filename_to_offset = {row[0]: row[1] for row in rows[1:]}

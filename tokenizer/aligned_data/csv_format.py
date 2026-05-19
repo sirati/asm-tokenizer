@@ -1,5 +1,20 @@
 from typing import List
 
+from .memmap_format import MEMMAP_FORMAT_VERSION
+
+
+def write_csv_prelude(handle) -> None:
+    """Emit the comment-line CSV prelude shared by sections + slim variants CSVs.
+
+    Layout is exactly ``# format=<MEMMAP_FORMAT_VERSION>\\n`` written as the
+    file's first line, before any other content (including the
+    ``csv.writer`` header row). The leading ``#`` makes third-party CSV
+    viewers ignore the line while our readers parse the integer back out
+    via the same constant. Centralising the format string here keeps the
+    on-wire prelude one definition.
+    """
+    handle.write(f"# format={MEMMAP_FORMAT_VERSION}\n")
+
 
 def format_inlining_dict(inlining_list: List) -> str:
     """Format inlining data as semicolon-separated: idx,hex_offset,hex_length,is_matched;..."""

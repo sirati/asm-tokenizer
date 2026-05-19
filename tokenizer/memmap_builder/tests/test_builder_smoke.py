@@ -145,9 +145,12 @@ def test_build_memmap_files_emits_slim_csv_bin_no_versions_json(tmp_path: Path) 
     assert (output_dir / "demo_variants.csv").exists()
     assert not (output_dir / "demo_versions.json").exists()
 
-    # Slim CSV header is exactly the new two-column shape.
+    # Slim CSV: first physical line is the format prelude; remainder is
+    # the standard CSV header + data rows.
     with open(output_dir / "demo_variants.csv", encoding="ascii") as fh:
+        first_line = fh.readline()
         rows = list(csv.reader(fh))
+    assert first_line == "# format=1\n"
     assert rows[0] == ["filename", "offset"]
     assert len(rows) == 3  # header + 2 data rows
     for row in rows[1:]:
@@ -193,6 +196,7 @@ def test_variant_ref_offsets_decode_to_input_axes(tmp_path: Path) -> None:
         output_dir / "demo_variants.bin", dtype=np.uint8, mode="r"
     )
     with open(output_dir / "demo_variants.csv", encoding="ascii") as fh:
+        fh.readline()  # skip "# format=N" prelude
         csv_rows = list(csv.reader(fh))
     filename_to_offset = {row[0]: int(row[1], 16) for row in csv_rows[1:]}
 
