@@ -6,7 +6,8 @@ the same data as the original CSV files.
 `_variants.bin` cross-check
 ---------------------------
 
-`build_memmap_files` (v3) emits two per-binary variant artefacts:
+`build_memmap_files` (v1, the current memmap-output format) emits two
+per-binary variant artefacts:
 
   * ``<binary>_variants.bin`` — packed uint16 records, one per variant,
     holding the axis-token IDs the unified vocab assigned to the
@@ -24,7 +25,7 @@ the expected list in positional order. A missing bin / slim CSV / vocab
 miss / hex-offset gap surfaces as a single validation error so the
 existing reporter prints it in the summary block.
 
-The unified vocab is loaded ONCE at validator entry (via the shared v3
+The unified vocab is loaded ONCE at validator entry (via the shared v1
 gate in ``aligned_data.loader.unified_vocab_gate``) so the cross-check
 and the dataloader-side error formatter both share the same instance.
 """

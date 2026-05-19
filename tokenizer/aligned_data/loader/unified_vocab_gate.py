@@ -1,12 +1,12 @@
 """Single-concern helper: load + validate the corpus-wide unified vocab.
 
 Hard cutover: the variant-aware dataloader REQUIRES
-``unified_vocab.format_version == 3``. v2 unified vocabs predate variant-axis
-tokens, and a v2-shaped dataset's section CSVs cite ``variant_ref`` cells
-that the v3-aware loader would otherwise misinterpret as row indices. The
-gate refuses the dataset up-front, before any per-binary state materialises,
-so the caller sees a single clean ``ValueError`` rather than a downstream
-decode mismatch.
+``unified_vocab.format_version == MEMMAP_FORMAT_VERSION`` (currently v1).
+Any other on-disk vocab is rejected up-front, before any per-binary state
+materialises, so the caller sees a single clean ``ValueError`` rather than
+a downstream decode mismatch. The reader has NO knowledge of specific
+legacy version numbers — it simply requires v1 and treats every other
+value identically as "not v1, regenerate".
 
 Kept out of ``aligned_data_loader.py`` so the loader file stays under the
 300 LOC project cap and so the gate is independently testable.
@@ -16,18 +16,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
 
-# Required on-disk layout version for ``unified_vocab.csv``. Bumped to 3 when
-# the unifier began registering variant-axis tokens (see plan
-# memoized-booping-wren.md §"Format-version policy").
-REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION = 3
+# Required on-disk layout version for ``unified_vocab.csv``. Sourced from
+# the single ``MEMMAP_FORMAT_VERSION`` constant so future bumps cascade
+# through every consumer without a touch here.
+REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION = MEMMAP_FORMAT_VERSION
 
 
 def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
-    """Load ``unified_vocab.csv`` and enforce ``format_version == 3``.
+    """Load ``unified_vocab.csv`` and enforce the memmap-chain version.
 
     Args:
         vocab_path: Path to the corpus-wide unified vocab CSV.
@@ -37,9 +38,9 @@ def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
 
     Raises:
         ValueError: missing file, unparseable contents, or
-            ``format_version != 3``. The exception message names the path
-            and the version mismatch loudly so an operator can resolve it
-            without grepping logs.
+            ``format_version != REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION``.
+            The exception message names the path and the version mismatch
+            loudly so an operator can resolve it without grepping logs.
     """
     if not vocab_path.exists():
         raise ValueError(
@@ -60,9 +61,10 @@ def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
     if vocab_manager.format_version != REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION:
         raise ValueError(
             f"unified_vocab.format_version={vocab_manager.format_version}; "
-            f"v{REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION} required for "
-            "variant-aware dataloader. Re-run tokenizer.vocab_unifier to "
-            f"produce a v{REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION} vocab."
+            f"v{REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION} required for the "
+            "memmap-output chain. Re-run `python -m tokenizer.vocab_unifier` "
+            "followed by `python -m tokenizer.memmap_builder` on the "
+            "per-binary CSVs to regenerate."
         )
 
     return vocab_manager

@@ -80,19 +80,29 @@ def _v2_bytes_to_int(byte_ids: typing.Iterable[int]) -> int:
 class VocabularyManager:
     """Manages vocabulary for token-to-ID mapping"""
 
-    # IDs 0..255 are protocol-reserved digit slots under format_version=2.
-    # `_V2_RESERVED_DIGIT_COUNT` is the literal boundary — the first vocab
-    # entry registered on a v2 VM lands at id _V2_RESERVED_DIGIT_COUNT.
+    # IDs 0..255 are protocol-reserved digit slots under format_version
+    # in (1, 2) (v1 unified vocab + v2 per-binary CSV; both share the
+    # inline-digit wire encoding). `_V2_RESERVED_DIGIT_COUNT` is the
+    # literal boundary — the first vocab entry registered on such a VM
+    # lands at id _V2_RESERVED_DIGIT_COUNT.
     _V2_RESERVED_DIGIT_COUNT = 256
 
     def __init__(self, platform: typing.Optional[str], _init=True, format_version: int = 1):
         self.platform = platform
-        # Wire-format version: 1 = legacy (Block_<HEX>, Lit_Start framing);
-        # 2 = inline-digit category-token stream (see plan
-        # vivid-tinkering-wilkes.md). Under v2, `_private_add_token` skips
-        # IDs 0..255 so they remain free for digit continuations in the
-        # token stream. Saver (Phase 4.1) reads this attribute to emit the
-        # `format_version=2` prelude in vocab.csv.
+        # Wire-format version: 1 = unified vocab (inline-digit stream;
+        # see plan memoized-booping-wren.md — the new unified-vocab
+        # format that supersedes the deleted legacy unified numbering);
+        # 2 = per-binary CSV inline-digit category-token stream (see
+        # plan vivid-tinkering-wilkes.md). Both v1 and v2 use the
+        # inline-digit wire encoding, so `_private_add_token` skips IDs
+        # 0..255 under either to keep them free for digit continuations
+        # in the token stream. Per-binary CSV saver emits a
+        # `format_version=2` prelude in vocab.csv. Any other
+        # format_version value (e.g. the historical "1 = legacy
+        # Block_<HEX> / Lit_Start framing" pathway) bypasses both the
+        # reserved-digit pre-population and the V2 Inner-class
+        # dispatch — used today only by ad-hoc callers that supply
+        # `vocab_list` explicitly through `from_vocab`.
         self.format_version = format_version
         if platform is None:
             self.platform_list: list[str] = []
@@ -118,17 +128,20 @@ class VocabularyManager:
                 256, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8
             )
 
-            # Under v2 (and v3, which is "v2 + variant tokens"; see
-            # plan memoized-booping-wren.md), pre-populate ids 0..255
-            # with debug-friendly `digit_<HH>` placeholders and mark
-            # their token_type as UNRESOLVED so the array stays
+            # Under v2 (per-binary CSV) and v1 (the new unified vocab;
+            # see plan memoized-booping-wren.md — v1 is the renumbered
+            # unified vocab that takes over from the deleted legacy
+            # unified format), pre-populate ids 0..255 with
+            # debug-friendly `digit_<HH>` placeholders and mark their
+            # token_type as UNRESOLVED so the array stays
             # self-consistent. The `token_to_id` dict deliberately
             # stays empty for these positions — they are addressed by
             # their literal numeric value in the token stream, not by
-            # name. v3 reuses the same reserved-digit layout: variant
-            # tokens land at IDs `_V2_RESERVED_DIGIT_COUNT` (256) and
-            # up, identical to how v2 places its first real entry.
-            if format_version in (2, 3):
+            # name. v1 unified reuses the same reserved-digit layout:
+            # variant tokens land at IDs `_V2_RESERVED_DIGIT_COUNT`
+            # (256) and up, identical to how v2 places its first real
+            # entry.
+            if format_version in (1, 2):
                 self.id_to_token.extend(
                     f"digit_{i:02X}" for i in range(self._V2_RESERVED_DIGIT_COUNT)
                 )
@@ -151,10 +164,12 @@ class VocabularyManager:
     ) -> "VocabularyManager":
         """Creates vocab from tokenizer output.
 
-        `format_version=2` callers are responsible for passing a `vocab_list`
-        and `id_to_token_type` whose first 256 entries are the reserved
-        digit slots (the loader in Phase 4.1 reconstitutes those from the
-        protocol convention since vocab.csv writes no entries for them).
+        Callers passing `format_version` in (1, 2) (the inline-digit
+        wire encoding — v1 unified vocab + v2 per-binary CSV) are
+        responsible for supplying a `vocab_list` and `id_to_token_type`
+        whose first 256 entries are the reserved digit slots (loaders
+        reconstitute those from the protocol convention since vocab.csv
+        writes no entries for them).
         """
         v_man = VocabularyManager(platform, format_version=format_version)
         # Reassigning id_to_token wholesale replaces the constructor's
@@ -246,16 +261,17 @@ class VocabularyManager:
             token[-2] == "_" or "Lit" in token or token == "Block_Def"
         ), f"Warning: two digit token thats shouldnt: {token}"
 
-        # Under v2/v3 the constructor pre-populates `id_to_token[0..255]`
-        # with `digit_<HH>` placeholders so `self.size` is already >= 256
+        # Under v2 (per-binary CSV) and v1 (unified vocab) the
+        # constructor pre-populates `id_to_token[0..255]` with
+        # `digit_<HH>` placeholders so `self.size` is already >= 256
         # here — the ID-skip is automatic, no manual bump needed. Guard
         # against callers accidentally registering a token literally named
-        # `digit_XX` which would shadow a digit slot. v3 carries the same
-        # reserved-digit layout as v2 (see plan memoized-booping-wren.md:
-        # "v3 = v2 + variant tokens"), so the collision check applies
+        # `digit_XX` which would shadow a digit slot. v1 unified carries
+        # the same reserved-digit layout as v2 (see plan
+        # memoized-booping-wren.md), so the collision check applies
         # unchanged.
         assert not (
-            self.format_version in (2, 3)
+            self.format_version in (1, 2)
             and len(token) == 8
             and token.startswith("digit_")
             and all(c in "0123456789ABCDEFabcdef" for c in token[6:])
@@ -481,14 +497,15 @@ class VocabularyManager:
     # Format-aware factory dispatchers. Consumer code that needs to emit a
     # valued constant or block identifier in the active wire format should
     # call these instead of branching on `format_version` at the call site
-    # (single-source-of-truth for v1/v2/v3 dispatch). v3 uses the v2 wire
-    # form for instruction-stream tokens (variant axes are additive,
-    # registered separately via the Variant_Axis Inner class).
+    # (single-source-of-truth for v1-unified / v2-per-binary-CSV dispatch;
+    # the inline-digit encoding is shared between the two). Variant axes
+    # are additive in v1, registered separately via the Variant_Axis Inner
+    # class.
     def ValuedConst(self, value):
-        return self.Valued_Const_V2(value) if self.format_version in (2, 3) else self.Valued_Const(value)
+        return self.Valued_Const_V2(value) if self.format_version in (1, 2) else self.Valued_Const(value)
 
     def BlockId(self, block_id):
-        return self.Block_V2(block_id) if self.format_version in (2, 3) else self.Block(block_id)
+        return self.Block_V2(block_id) if self.format_version in (1, 2) else self.Block(block_id)
 
     def iter_representative_tokens(self):
         identifier_token_ids = []
@@ -497,15 +514,16 @@ class VocabularyManager:
         lit_ends = set(self.lit_ends.tolist())
         lits = lit_starts.union(lit_ends)
         self.Valued_Const._token_ids = np.array([], dtype=np.int_)
-        # Under format_version=2 and =3 the first `_V2_RESERVED_DIGIT_COUNT`
-        # IDs are protocol-reserved digit slots (carrying
-        # TokenType.UNRESOLVED). They are not real vocab entries — no
-        # registration, no string, no representative token. Skip them so
-        # the dispatch table never sees the placeholder UNRESOLVED type.
-        # v3 reuses the v2 reserved-digit layout (variant tokens are
-        # additive at IDs 256+); the inline-digit representative path
-        # below also applies unchanged.
-        v2 = self.format_version in (2, 3)
+        # Under format_version=1 (unified vocab) and =2 (per-binary CSV)
+        # the first `_V2_RESERVED_DIGIT_COUNT` IDs are protocol-reserved
+        # digit slots (carrying TokenType.UNRESOLVED). They are not real
+        # vocab entries — no registration, no string, no representative
+        # token. Skip them so the dispatch table never sees the
+        # placeholder UNRESOLVED type. v1 unified reuses the v2
+        # reserved-digit layout (variant tokens are additive at IDs
+        # 256+); the inline-digit representative path below also applies
+        # unchanged.
+        v2 = self.format_version in (1, 2)
         start_id = self._V2_RESERVED_DIGIT_COUNT if v2 else 0
         for i in range(start_id, self.size):
             if i in lits:
@@ -997,12 +1015,13 @@ class VocabularyManager:
         # `_from_token_ids` strips the type-id and reassembles the payload.
         #
         # All v2 Inner classes assert `vocab_manager.format_version in
-        # (2, 3)` on instantiation to enforce the reserved-id-protocol
-        # invariant — a v1 VM has no reserved digit slots, so a v2 token
-        # would silently collide with low-id legacy entries. v3 reuses
-        # the v2 layout (see plan memoized-booping-wren.md: "v3 = v2 +
-        # variant tokens", strict superset), so the same Inner classes
-        # are valid on a v3 VM and produce identical wire streams.
+        # (1, 2)` on instantiation to enforce the reserved-id-protocol
+        # invariant — a VM without reserved digit slots would silently
+        # collide with low-id legacy entries. v1 (the unified vocab; see
+        # plan memoized-booping-wren.md) reuses the v2 reserved-digit
+        # layout, so the same Inner classes are valid on a v1 VM and
+        # produce identical wire streams. Variant tokens are additive at
+        # IDs 256+ on v1.
         # ------------------------------------------------------------------
 
         class _V2IdentityInner(TokensInner, IdentifierToken, ABC):
@@ -1022,8 +1041,8 @@ class VocabularyManager:
                 # IdentifierToken's __init__ stores `id`; replicate that
                 # contract without delegating to legacy `IdentifierInner`'s
                 # encode_tokens path.
-                assert vocab_manager.format_version in (2, 3), (
-                    "v2 Inner classes require format_version=2 or =3 VocabularyManager; "
+                assert vocab_manager.format_version in (1, 2), (
+                    "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
                 assert identifier_id >= 0, f"v2 identity must be non-negative, got {identifier_id}"
@@ -1199,8 +1218,8 @@ class VocabularyManager:
             __slots__ = ("value", "_token_ids", "_type_token_id")
 
             def __init__(self, value: int):
-                assert vocab_manager.format_version in (2, 3), (
-                    "v2 Inner classes require format_version=2 or =3 VocabularyManager; "
+                assert vocab_manager.format_version in (1, 2), (
+                    "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
                 # Plan reserves negative-value semantics; current impl
@@ -1253,8 +1272,8 @@ class VocabularyManager:
             __slots__ = ("bits", "_token_ids", "_type_token_id")
 
             def __init__(self, bits: Optional[int] = None):
-                assert vocab_manager.format_version in (2, 3), (
-                    "v2 Inner classes require format_version=2 or =3 VocabularyManager; "
+                assert vocab_manager.format_version in (1, 2), (
+                    "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
                 if bits is not None:
@@ -1396,8 +1415,8 @@ class VocabularyManager:
             __slots__ = ("_type_token_id",)
 
             def __init__(self):
-                assert vocab_manager.format_version in (2, 3), (
-                    "v2 Inner classes require format_version=2 or =3 VocabularyManager; "
+                assert vocab_manager.format_version in (1, 2), (
+                    "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
                 self._type_token_id = vocab_manager._private_add_token(self._get_basename(), self.__class__)
@@ -1477,11 +1496,11 @@ class VocabularyManager:
         # is only the registration + round-trip surface.
         #
         # No reserved-digit-protocol restriction: variant tokens make
-        # sense only in the unified vocab (format_version=3), but the
-        # Inner class itself does not assert format_version because the
-        # token's wire form (single id) is layout-independent. The
-        # unifier (plan memoized-booping-wren.md Batch 3) is the single
-        # caller that registers these on a v3 unified VM.
+        # sense only in the unified vocab (format_version=1; see plan
+        # memoized-booping-wren.md), but the Inner class itself does not
+        # assert format_version because the token's wire form (single
+        # id) is layout-independent. The unifier is the single caller
+        # that registers these on a v1 unified VM.
 
         class VariantAxisInner(TokensInner, VariantAxisToken):
             """Represents a variant-axis identity token (opaque string)."""
@@ -1656,12 +1675,12 @@ class VocabularyManager:
         self.MemoryOperand = MemoryOperandTokenInner
         self.RegisterList = RegisterListTokenInner
         self.TokenSet = TokenSetInner
-        # v2 category factories. Available on every VM (v1 / v2 / v3) but
-        # guarded at construction time — instantiating any of these on a
-        # v1 VM fails the `format_version in (2, 3)` assertion in
-        # `_V2IdentityInner.__init__` (and peers). v3 is the unified-vocab
-        # variant-token superset and accepts v2-shape category tokens
-        # unchanged.
+        # v2 category factories. Available on every VM but guarded at
+        # construction time — instantiating any of these on a VM whose
+        # format_version is outside `(1, 2)` fails the assertion in
+        # `_V2IdentityInner.__init__` (and peers). v1 is the unified
+        # vocab and accepts v2-shape category tokens unchanged; variant
+        # tokens are additive on v1.
         self.Local_Func = LocalFuncInner
         self.Plt_Func = PltFuncInner
         self.Ext_Func = ExtFuncInner

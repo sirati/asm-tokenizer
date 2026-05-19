@@ -186,7 +186,7 @@ def test_variant_ref_offsets_decode_to_input_axes(tmp_path: Path) -> None:
     # IDs back to their axis strings.
     unified_vocab = load_unified_vocab_manager(unified_vocab_path)
     assert unified_vocab is not None
-    assert unified_vocab.format_version == 3
+    assert unified_vocab.format_version == 1
 
     # Memmap the bin + parse the slim CSV's filename->offset table.
     bin_mmap = np.memmap(

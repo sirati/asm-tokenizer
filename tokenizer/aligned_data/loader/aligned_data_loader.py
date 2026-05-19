@@ -70,8 +70,10 @@ class AlignedDataLoader:
 
         Raises:
             ValueError: If the unified vocab is missing, unparseable, or its
-                ``format_version`` is not 3. Hard cutover — see
-                ``unified_vocab_gate`` for the rationale.
+                ``format_version`` does not equal the memmap-chain version
+                (see ``unified_vocab_gate.REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION``,
+                currently v1). Hard cutover — see ``unified_vocab_gate`` for
+                the rationale.
         """
         self.base_path = Path(base_path)
         self.binary_names = binary_names
