@@ -10,7 +10,10 @@ from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
 from ..aligned_data.match import lockstep_function_match
-from ._output_files import open_section_outputs
+from ._output_files import (
+    open_matched_section_outputs,
+    open_unmatched_section_outputs,
+)
 from .function_names import FunctionNamesRegistry
 from .passes import (
     build_function_lookup_table,
@@ -258,7 +261,7 @@ def build_memmap_files(
         logger.info(f"  Creating: {warn_log_path}")
         warn_log = stack.enter_context(open(warn_log_path, "w", encoding="ascii"))
 
-        matched_outputs = open_section_outputs(output_dir, prefix)
+        matched_outputs = open_matched_section_outputs(output_dir, prefix)
         stack.callback(matched_outputs.close)
         write_matched_sections_pass2(
             matched_data_entries,
@@ -271,7 +274,7 @@ def build_memmap_files(
             error_log=error_log,
         )
 
-        unmatched_outputs = open_section_outputs(output_dir, unmatched_prefix)
+        unmatched_outputs = open_unmatched_section_outputs(output_dir, unmatched_prefix)
         stack.callback(unmatched_outputs.close)
         write_unmatched_sections_pass2(
             unmatched_data_entries,
