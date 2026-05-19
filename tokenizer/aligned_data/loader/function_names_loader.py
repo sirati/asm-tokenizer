@@ -29,9 +29,16 @@ def load_function_names(
     Returns ``(name_to_line, line_to_name)`` with 1-indexed line
     numbers. The first line of the file must be exactly
     ``# format=<MEMMAP_FORMAT_VERSION>``; any deviation raises
-    :class:`ValueError`.
+    :class:`ValueError`. A missing file also raises
+    :class:`ValueError` (hard cutover -- callers are not allowed to
+    silently fall back to a sidecar-less path).
     """
     path = Path(path)
+    if not path.exists():
+        raise ValueError(
+            f"{path}: function-names sidecar missing; re-run memmap_builder "
+            f"to regenerate the sidecar at format_version={MEMMAP_FORMAT_VERSION}"
+        )
     with open(path, "r", encoding="utf-8", newline="") as f:
         first_line = f.readline()
         if first_line.rstrip("\r\n") != _EXPECTED_PRELUDE:

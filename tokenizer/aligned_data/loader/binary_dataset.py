@@ -7,6 +7,7 @@ a ``BinarySession`` that bundles the three handle-lifetime concerns
 Loading concerns live elsewhere:
     * SectionArm assembly ........ ``metadata_loader``
     * Slim-CSV decode ............ ``variant_resolver.load_variants_offset_to_filename``
+    * Function-names sidecar ..... ``function_names_loader.load_function_names``
     * Handle lifecycle + slicing . ``session.BinarySession``
     * Parser glue ................ ``_session_parsers``
 
@@ -23,6 +24,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from .function_data import FunctionData
+from .function_names_loader import load_function_names
 from .matched_function import MatchedFunction
 from .metadata_loader import (
     BinaryArmPaths,
@@ -62,14 +64,34 @@ class BinaryDataset:
         self.unmatched_data = self.base_path / f"{binary_name}_unmatched_data.bin"
         self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
         self.variants_sidecar = self.base_path / f"{binary_name}_variants.csv"
+        self.function_names_sidecar = (
+            self.base_path / f"{binary_name}_function_names.txt"
+        )
+
+        # Function-names sidecar: hard cutover. Required whenever either
+        # arm exists; both arms' section CSVs reference names through
+        # base64 line numbers into this file. A missing or bad-prelude
+        # sidecar raises ValueError with a migration-pointing message
+        # via ``load_function_names``. The all-arms-empty path skips it
+        # to keep the loader usable on a brand-new (empty) output dir.
+        if self.matched_index.exists() or self.unmatched_index.exists():
+            self.name_to_line, self.line_to_name = load_function_names(
+                self.function_names_sidecar
+            )
+        else:
+            self.name_to_line, self.line_to_name = {}, {}
 
         # Build both section arms via the shared dispatch (single
         # implementation in ``metadata_loader``).
         self._matched_arm: SectionArm = load_section_arm(
-            SectionKind.MATCHED, self._arm_paths(SectionKind.MATCHED)
+            SectionKind.MATCHED,
+            self._arm_paths(SectionKind.MATCHED),
+            self.line_to_name,
         )
         self._unmatched_arm: SectionArm = load_section_arm(
-            SectionKind.UNMATCHED, self._arm_paths(SectionKind.UNMATCHED)
+            SectionKind.UNMATCHED,
+            self._arm_paths(SectionKind.UNMATCHED),
+            self.line_to_name,
         )
         self._publish_arm("matched", self._matched_arm)
         self._publish_arm("unmatched", self._unmatched_arm)
@@ -105,6 +127,12 @@ class BinaryDataset:
         attributes that the validator + utils + tests read directly. New
         consumers should read from ``self._matched_arm`` / ``_unmatched_arm``
         instead.
+
+        Post matched-arm restructuring, ``<prefix>_starts`` / ``_lengths``
+        are per-RECORD (data-bin positions; matched = per-variant flat,
+        unmatched = per-function), and the new ``<prefix>_csv_starts``
+        / ``_csv_lengths`` / ``_avg_lengths`` / ``_is_overlong`` mirror
+        the matching SectionArm fields.
         """
         setattr(self, f"{attr_prefix}_starts", arm.starts)
         setattr(self, f"{attr_prefix}_lengths", arm.lengths)
@@ -113,6 +141,10 @@ class BinaryDataset:
         setattr(self, f"{attr_prefix}_func_names", arm.func_names)
         setattr(self, f"{attr_prefix}_count", arm.count)
         setattr(self, f"{attr_prefix}_section_starts", arm.section_starts)
+        setattr(self, f"{attr_prefix}_csv_starts", arm.csv_starts)
+        setattr(self, f"{attr_prefix}_csv_lengths", arm.csv_lengths)
+        setattr(self, f"{attr_prefix}_avg_lengths", arm.avg_lengths)
+        setattr(self, f"{attr_prefix}_is_overlong", arm.is_overlong)
 
     # ------------------------------------------------------------------
     # Session API
@@ -134,6 +166,8 @@ class BinaryDataset:
                 "matched_arm": self._matched_arm,
                 "unmatched_arm": self._unmatched_arm,
                 "offset_to_filename": self._offset_to_filename,
+                "line_to_name": self.line_to_name,
+                "name_to_line": self.name_to_line,
             },
         )
 
