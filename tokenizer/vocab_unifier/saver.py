@@ -1,23 +1,19 @@
 import csv
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.compact_base64_utils import ndarray_to_base64
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
 # Unified-vocab artifacts always carry the single in-tree memmap-chain
-# version (memmap_format.MEMMAP_FORMAT_VERSION). The per-binary CSV
-# (out-of-scope tokenize-output, see plan memoized-booping-wren.md
-# §"Out of scope") keeps its own version=2 trailer; this writer stamps
-# whichever value the manager declares. The constant is duplicated here
-# rather than imported from tokenizer.aligned_data.memmap_format because
-# that package eagerly imports vocab_unifier.loader (via the unified-vocab
-# gate), forming an import cycle. Bumps stay coupled because the gate
-# also raises on any version other than its imported constant.
-_UNIFIED_FORMAT_VERSION = 1
+# version (``MEMMAP_FORMAT_VERSION``). The per-binary CSV (out-of-scope
+# tokenize-output, see plan memoized-booping-wren.md §"Out of scope")
+# keeps its own version=2 trailer; this writer stamps whichever value
+# the manager declares.
 _PER_BINARY_FORMAT_VERSION = 2
 
-_SUPPORTED_FORMAT_VERSIONS = (_UNIFIED_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
+_SUPPORTED_FORMAT_VERSIONS = (MEMMAP_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
 
 
 def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) -> None:
@@ -33,7 +29,7 @@ def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) ->
     if vocab_manager.format_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
             f"save_vocabulary supports unified vocab format_version="
-            f"{_UNIFIED_FORMAT_VERSION} or per-binary CSV format_version="
+            f"{MEMMAP_FORMAT_VERSION} or per-binary CSV format_version="
             f"{_PER_BINARY_FORMAT_VERSION}; got "
             f"{vocab_manager.format_version}"
         )

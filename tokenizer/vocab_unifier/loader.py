@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.compact_base64_utils import base64_to_ndarray
 from tokenizer.token_manager import VocabularyManager
@@ -13,17 +14,12 @@ from tokenizer.tokens import TokenType
 from .types import Platform
 
 # Unified vocab is the in-tree memmap-chain version
-# (memmap_format.MEMMAP_FORMAT_VERSION); per-binary CSV is the
-# out-of-scope tokenize-output version (kept at 2 by the producer).
-# Both share the wire layout — only the trailer integer differs.
-# The constant is duplicated here rather than imported from
-# tokenizer.aligned_data.memmap_format because that package eagerly
-# imports this module via the unified-vocab gate, forming an import
-# cycle. The gate's own constant import keeps the cascade aligned.
-_UNIFIED_FORMAT_VERSION = 1
+# (``MEMMAP_FORMAT_VERSION``); per-binary CSV is the out-of-scope
+# tokenize-output version (kept at 2 by the producer). Both share the
+# wire layout — only the trailer integer differs.
 _PER_BINARY_FORMAT_VERSION = 2
 
-_SUPPORTED_FORMAT_VERSIONS = (_UNIFIED_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
+_SUPPORTED_FORMAT_VERSIONS = (MEMMAP_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
 
 
 def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
@@ -121,7 +117,7 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
 
     if format_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
-            f"vocab format_version must be {_UNIFIED_FORMAT_VERSION} "
+            f"vocab format_version must be {MEMMAP_FORMAT_VERSION} "
             f"(unified) or {_PER_BINARY_FORMAT_VERSION} (per-binary CSV); "
             f"got {format_version}. Re-run vocab_unifier or memmap_builder "
             f"on the per-binary CSVs to regenerate."
