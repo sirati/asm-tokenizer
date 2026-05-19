@@ -26,6 +26,9 @@ import numpy as np
 
 from tokenizer.aligned_data.index_format import write_index_prelude
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
+from tokenizer.aligned_data.loader.function_names_loader import (
+    load_function_names,
+)
 from tokenizer.aligned_data.loader.metadata_loader import (
     BinaryArmPaths,
     SectionKind,
@@ -56,6 +59,15 @@ def _unmatched_paths(corpus) -> BinaryArmPaths:
         index_bin=corpus.unmatched_index_bin,
         data_bin=corpus.unmatched_data_bin,
     )
+
+
+def _line_to_name(corpus):
+    """Read the function-names sidecar produced by the corpus builder
+    and return the ``line_no -> name`` dict; ``load_section_arm`` needs
+    it to resolve the base64 line-no cells back to function names.
+    """
+    _, line_to_name = load_function_names(corpus.function_names_sidecar)
+    return line_to_name
 
 
 def _matched_corpus(tmp_path: Path):
@@ -115,8 +127,9 @@ def test_section_arm_equality_same_inputs(tmp_path):
     """``SectionArm`` is a frozen dataclass: identical inputs produce
     arms whose fields are element-equal."""
     corpus = _matched_corpus(tmp_path)
-    arm_a = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus))
-    arm_b = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus))
+    line_to_name = _line_to_name(corpus)
+    arm_a = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus), line_to_name)
+    arm_b = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus), line_to_name)
 
     assert np.array_equal(arm_a.starts, arm_b.starts)
     assert np.array_equal(arm_a.lengths, arm_b.lengths)
@@ -166,17 +179,18 @@ def test_unmatched_arm_matches_legacy_attributes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_matched_arm_has_empty_section_starts(tmp_path):
-    """Matched callers drive seeks from ``starts``;
-    ``section_starts`` stays empty (matched ``starts`` ARE CSV offsets).
-
-    Post-restructure the ``starts`` array still represents per-section
-    CSV offsets, sourced from ``matched_index.bin`` in the pre-v1
-    layout (no alignment shift).
+def test_matched_arm_csv_starts_index_section_csv_bytes(tmp_path):
+    """Matched ``load(idx)`` seeks the section CSV via
+    ``csv_starts``/``csv_lengths`` (per-function); ``starts``/``lengths``
+    carry per-variant data-bin positions for the validator. Function
+    names recovered from the sidecar match ``arm.func_names``.
     """
     corpus = _matched_corpus(tmp_path)
-    arm = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus))
-    assert len(arm.section_starts) == 0
+    arm = load_section_arm(
+        SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus)
+    )
+    assert arm.csv_starts is not None and len(arm.csv_starts) == len(arm.func_names)
+    assert arm.csv_lengths is not None and len(arm.csv_lengths) == len(arm.func_names)
     sidecar_names = (
         corpus.function_names_sidecar.read_text("utf-8").splitlines()[1:]
     )
@@ -200,7 +214,9 @@ def test_unmatched_section_starts_point_to_rows(tmp_path):
         "bin",
         unmatched=[unmatched_spec(n) for n in ("unfn_a", "unfn_bb", "unfn_ccc")],
     )
-    arm = load_section_arm(SectionKind.UNMATCHED, _unmatched_paths(corpus))
+    arm = load_section_arm(
+        SectionKind.UNMATCHED, _unmatched_paths(corpus), _line_to_name(corpus)
+    )
 
     assert arm.func_names == ["unfn_a", "unfn_bb", "unfn_ccc"]
     assert len(arm.section_starts) == 3

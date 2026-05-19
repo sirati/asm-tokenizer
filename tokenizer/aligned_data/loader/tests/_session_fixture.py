@@ -52,11 +52,19 @@ class _FakeArm:
         lengths: np.ndarray,
         func_names: List[str] | None = None,
         section_starts: np.ndarray | None = None,
+        csv_starts: np.ndarray | None = None,
+        csv_lengths: np.ndarray | None = None,
     ) -> None:
         self.starts = starts
         self.lengths = lengths
         self.func_names = func_names or []
         self.section_starts = section_starts
+        # Matched arm: session.load_matched(idx) slices the section CSV
+        # via these per-function fields (per F2-A's SectionArm shape);
+        # ``starts``/``lengths`` are reserved for per-variant data-bin.
+        # Unmatched arm leaves these as None and reuses starts/lengths.
+        self.csv_starts = csv_starts
+        self.csv_lengths = csv_lengths
 
 
 class _FakeVocab:
@@ -181,8 +189,18 @@ def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
 def _matched_arm_from_corpus(corpus) -> _FakeArm:
     triple = read_csv_section_index_arrays(corpus.matched_index_bin)
     assert triple is not None and triple[0].shape == (1,)
-    starts, lengths, _ = triple
-    return _FakeArm(starts=starts, lengths=lengths, func_names=["my_func"])
+    csv_starts, csv_lengths, _ = triple
+    # The per-variant data-bin arrays (arm.starts/lengths) aren't read
+    # by load_matched after the F2-A contract change; populate empty
+    # placeholders so any inadvertent access surfaces clearly.
+    empty = np.zeros(0, dtype=np.int64)
+    return _FakeArm(
+        starts=empty,
+        lengths=empty,
+        func_names=["my_func"],
+        csv_starts=csv_starts,
+        csv_lengths=csv_lengths,
+    )
 
 
 def _unmatched_arm_from_corpus(corpus) -> _FakeArm:

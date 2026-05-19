@@ -42,13 +42,26 @@ def _variant_tokens_from_row(variant_row: Optional[Dict[str, Any]]) -> np.ndarra
 
 
 def arm_arrays(arm: Any, kind: str, binary_name: str):
+    """Per-function arrays the session uses to slice for ``kind``.
+
+    Matched ``load(idx)`` slices the section CSV (per-function), so it
+    needs the CSV bounds from ``csv_starts``/``csv_lengths``. Unmatched
+    ``load(idx)`` slices ``_data.bin`` directly (the unmatched index is
+    per-function 1:1), so it needs ``starts``/``lengths``.
+    """
     if arm is None:
         raise IndexError(f"{kind} arm not loaded for binary {binary_name}")
-    starts = getattr(arm, "starts", None)
-    lengths = getattr(arm, "lengths", None)
+    if kind == "matched":
+        starts = getattr(arm, "csv_starts", None)
+        lengths = getattr(arm, "csv_lengths", None)
+        attr_pair = "csv_starts/csv_lengths"
+    else:
+        starts = getattr(arm, "starts", None)
+        lengths = getattr(arm, "lengths", None)
+        attr_pair = "starts/lengths"
     if starts is None or lengths is None:
         raise IndexError(
-            f"{kind} arm has no starts/lengths for binary {binary_name}"
+            f"{kind} arm has no {attr_pair} for binary {binary_name}"
         )
     return starts, lengths
 

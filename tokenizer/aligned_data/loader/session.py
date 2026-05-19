@@ -133,8 +133,11 @@ class BinarySession:
         sections.seek(start + self._sections_content_offset)
         section_data = sections.read(length)
         data_mmap = self._open_data("matched")
+        func_names = getattr(arm, "func_names", None) or []
+        func_name_override = func_names[idx] if idx < len(func_names) else None
         return parse_matched_section(
             section_data,
+            func_name_override=func_name_override,
             data_slice=lambda o, l, ov: self._slice_data_record(
                 data_mmap, o, l, ov
             ),
