@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import sys
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
 from ..aligned_data.match import lockstep_function_match
 from ._output_files import open_section_outputs
+from .function_names import FunctionNamesRegistry
 from .passes import (
     build_function_lookup_table,
     process_matched_function_pass1,
@@ -164,110 +166,120 @@ def build_memmap_files(
     matched_data_path = output_dir / f"{prefix}_data.bin"
     unmatched_data_path = output_dir / f"{unmatched_prefix}_data.bin"
     error_log_path = output_dir / f"{binary_name}.error.log"
-    logger.info(f"  Creating: {matched_data_path}")
-    logger.info(f"  Creating: {unmatched_data_path}")
-    logger.info(f"  Creating: {error_log_path}")
-    matched_data_file = open(matched_data_path, "wb")
-    unmatched_data_file = open(unmatched_data_path, "wb")
-    error_log = open(error_log_path, "w", encoding="ascii")
+    warn_log_path = output_dir / f"{binary_name}.warn.log"
 
-    progress_callback = None
-    pbar = None
-    if sys.stdout.isatty():
-        try:
-            from tqdm import tqdm
+    # ExitStack owns every file handle the build opens so an exception
+    # in any phase (pass 1, sidecar emission, pass 2) reliably closes
+    # them in reverse open order. Partial output is intentionally left
+    # on disk — clean-up on retry is the caller's responsibility, as
+    # it has been pre-refactor; only the close-on-exception behaviour
+    # changes here.
+    function_names_registry = FunctionNamesRegistry()
 
-            total_size = sum(Path(csv_path).stat().st_size for csv_path in csv_paths)
-            pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Processing {binary_name}", leave=False)
-            progress_callback = pbar.update
-            last_bytes = [0]
+    with contextlib.ExitStack() as stack:
+        logger.info(f"  Creating: {matched_data_path}")
+        logger.info(f"  Creating: {unmatched_data_path}")
+        logger.info(f"  Creating: {error_log_path}")
+        matched_data_file = stack.enter_context(open(matched_data_path, "wb"))
+        unmatched_data_file = stack.enter_context(open(unmatched_data_path, "wb"))
+        error_log = stack.enter_context(open(error_log_path, "w", encoding="ascii"))
 
-            def progress_wrapper(current_bytes):
-                delta = current_bytes - last_bytes[0]
-                last_bytes[0] = current_bytes
-                pbar.update(delta)
+        progress_callback = None
+        pbar = None
+        if sys.stdout.isatty():
+            try:
+                from tqdm import tqdm
 
-            progress_callback = progress_wrapper
-        except ImportError:
-            pass
+                total_size = sum(Path(csv_path).stat().st_size for csv_path in csv_paths)
+                pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Processing {binary_name}", leave=False)
+                # Ensure the bar is closed even if pass 1 throws.
+                stack.callback(pbar.close)
+                last_bytes = [0]
 
-    for match_data in lockstep_function_match(csv_paths, progress_callback):
-        func_name = match_data["function_name"]
-        rows = match_data["rows"]
-        count = match_data["count"]
+                def progress_wrapper(current_bytes):
+                    delta = current_bytes - last_bytes[0]
+                    last_bytes[0] = current_bytes
+                    pbar.update(delta)
 
-        if count >= 2:
-            entry = process_matched_function_pass1(
-                func_name,
-                rows,
-                version_keys,
-                mapping_dict,
-                matched_data_file,
-                error_log=error_log,
-            )
-            if entry is not None:
-                matched_data_entries.append(entry)
-            else:
+                progress_callback = progress_wrapper
+            except ImportError:
+                pass
+
+        for match_data in lockstep_function_match(csv_paths, progress_callback):
+            func_name = match_data["function_name"]
+            rows = match_data["rows"]
+            count = match_data["count"]
+
+            if count >= 2:
+                entry = process_matched_function_pass1(
+                    func_name,
+                    rows,
+                    version_keys,
+                    mapping_dict,
+                    matched_data_file,
+                    function_names_registry,
+                    error_log=error_log,
+                )
+                if entry is not None:
+                    matched_data_entries.append(entry)
+                else:
+                    entries = process_unmatched_function_pass1(
+                        func_name,
+                        rows,
+                        version_keys,
+                        mapping_dict,
+                        unmatched_data_file,
+                        function_names_registry,
+                        error_log=error_log,
+                    )
+                    unmatched_data_entries.extend(entries)
+
+            elif count == 1:
                 entries = process_unmatched_function_pass1(
                     func_name,
                     rows,
                     version_keys,
                     mapping_dict,
                     unmatched_data_file,
+                    function_names_registry,
                     error_log=error_log,
                 )
                 unmatched_data_entries.extend(entries)
 
-        elif count == 1:
-            entries = process_unmatched_function_pass1(
-                func_name,
-                rows,
-                version_keys,
-                mapping_dict,
-                unmatched_data_file,
-                error_log=error_log,
-            )
-            unmatched_data_entries.extend(entries)
+        # Pass 1 done — finalize + emit the sidecar BEFORE pass 2 so
+        # pass 2 can resolve every section-CSV function-name cell to
+        # its 1-indexed line number.
+        function_names_registry.finalize()
+        sidecar_path = function_names_registry.write_sidecar(output_dir, binary_name)
+        logger.info(f"  Wrote: {sidecar_path}")
 
-    if pbar is not None:
-        pbar.close()
+        function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
 
-    matched_data_file.close()
-    logger.info(f"  Closed: {matched_data_path}")
-    unmatched_data_file.close()
-    logger.info(f"  Closed: {unmatched_data_path}")
+        logger.info(f"  Creating: {warn_log_path}")
+        warn_log = stack.enter_context(open(warn_log_path, "w", encoding="ascii"))
 
-    function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
+        matched_outputs = open_section_outputs(output_dir, prefix)
+        stack.callback(matched_outputs.close)
+        write_matched_sections_pass2(
+            matched_data_entries,
+            function_lookup,
+            matched_outputs.sections_file,
+            matched_outputs.index_file,
+            warn_log,
+            variants,
+            function_names_registry,
+            error_log=error_log,
+        )
 
-    warn_log_path = output_dir / f"{binary_name}.warn.log"
-    logger.info(f"  Creating: {warn_log_path}")
-    warn_log = open(warn_log_path, "w", encoding="ascii")
-
-    matched_outputs = open_section_outputs(output_dir, prefix)
-    write_matched_sections_pass2(
-        matched_data_entries,
-        function_lookup,
-        matched_outputs.sections_file,
-        matched_outputs.index_file,
-        warn_log,
-        variants,
-        error_log=error_log,
-    )
-    matched_outputs.close()
-
-    unmatched_outputs = open_section_outputs(output_dir, unmatched_prefix)
-    write_unmatched_sections_pass2(
-        unmatched_data_entries,
-        function_lookup,
-        unmatched_outputs.sections_file,
-        unmatched_outputs.index_file,
-        warn_log,
-        variants,
-        error_log=error_log,
-    )
-    unmatched_outputs.close()
-
-    warn_log.close()
-    logger.info(f"  Closed: {warn_log_path}")
-    error_log.close()
-    logger.info(f"  Closed: {error_log_path}")
+        unmatched_outputs = open_section_outputs(output_dir, unmatched_prefix)
+        stack.callback(unmatched_outputs.close)
+        write_unmatched_sections_pass2(
+            unmatched_data_entries,
+            function_lookup,
+            unmatched_outputs.sections_file,
+            unmatched_outputs.index_file,
+            warn_log,
+            variants,
+            function_names_registry,
+            error_log=error_log,
+        )
