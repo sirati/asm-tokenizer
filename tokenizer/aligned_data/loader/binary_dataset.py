@@ -9,7 +9,7 @@ edge indices.
 import csv
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -19,6 +19,16 @@ from ..io import read_function_data_memmap
 from ..metadata import extract_metadata_from_section_row
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
+from .metadata_loader import (
+    BinaryArmPaths,
+    SectionArm,
+    SectionKind,
+    build_length_lookup_tables,
+    load_index_once,
+    load_section_arm,
+    load_unmatched_lengths,
+    open_sections_csv,
+)
 
 
 class BinaryDataset:
@@ -135,7 +145,7 @@ class BinaryDataset:
             return None
         return self._variants[idx]
 
-    def _open_sections_csv(self, path: Path) -> Tuple[object, int]:
+    def _open_sections_csv(self, path: Path):
         """Open a ``_sections.csv`` file, transparently consuming a
         ``version=N`` wire-format prelude if one is present.
 
@@ -171,221 +181,104 @@ class BinaryDataset:
             is ``0`` for v1 (no prelude) and the prelude row's byte
             width for v2.
         """
-        f = open(path, "r", newline="", encoding="ascii")
-        start_pos = f.tell()
-        first_line = f.readline()
-        if first_line.startswith("version="):
-            # Prelude consumed; file pointer now at the header line.
-            # Byte width = current tell() since start_pos was 0.
-            return f, f.tell() - start_pos
-        # No prelude: rewind so callers see a virgin file.
-        f.seek(start_pos)
-        return f, 0
+        return open_sections_csv(path)
 
     def _load_index_once(
         self, index_path: Path
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        """Load index file, extract data, close memmap immediately."""
-        if not index_path.exists():
-            return None, None, None
-
-        # Open memmap temporarily
-        filesize = index_path.stat().st_size
-        if filesize % 8 != 0:
-            raise ValueError(f"Index file size {filesize} is not a multiple of 8")
-
-        n_entries = filesize // 8
-        # numpy refuses to mmap a zero-byte file (mmap() returns
-        # EINVAL for length=0). Skip the memmap and return empty
-        # arrays in lockstep with the index-absent branch so a
-        # binary that has only unmatched (or only matched) functions
-        # — e.g. a single-version validation run — loads cleanly.
-        if n_entries == 0:
-            return (
-                np.zeros(0, dtype=np.uint32),
-                np.zeros(0, dtype=np.uint32),
-                np.zeros(0, dtype=np.uint8),
-            )
-
-        index_memmap = np.memmap(index_path, dtype=np.uint8, mode="r", shape=(n_entries, 8))
-
-        # Extract all needed data before closing
-        starts = np.zeros(n_entries, dtype=np.uint32)
-        lengths = np.zeros(n_entries, dtype=np.uint32)
-        avg_lengths = np.zeros(n_entries, dtype=np.uint8)
-
-        for i in range(n_entries):
-            entry = index_memmap[i]
-            starts[i] = int.from_bytes(entry[0:4].tobytes(), "little")
-            lengths[i] = int.from_bytes(entry[4:7].tobytes(), "little")
-            avg_lengths[i] = entry[7]
-
-        # Close memmap by deleting reference
-        del index_memmap
-
-        return starts, lengths, avg_lengths
+    ):
+        """Shim → ``metadata_loader.load_index_once``; retained so
+        external callers / tests that still use the dataset method
+        name continue to work. The implementation lives next to the
+        other index-bin helpers in ``metadata_loader``.
+        """
+        return load_index_once(index_path)
 
     def _build_length_lookup_tables(
         self, avg_lengths: np.ndarray, scale_factor: int = 16
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Build edge indices and count arrays for efficient length-based lookup.
-
-        Args:
-            avg_lengths: Array of average lengths (sorted)
-            scale_factor: Scale factor for lengths (avg_lengths are scaled down)
-
-        Returns:
-            edge_indices: edge_indices[L] = first index where length >= L
-            count_per_length: count_per_length[L] = number of functions with length L
-        """
-        if len(avg_lengths) == 0:
-            return np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)
-
-        # Scale back to actual lengths
-        actual_lengths = avg_lengths.astype(np.int32) * scale_factor
-
-        max_length = int(actual_lengths.max())
-
-        # Allocate arrays (up to max_length + 1)
-        edge_indices = np.zeros(max_length + 2, dtype=np.int32)
-        count_per_length = np.zeros(max_length + 1, dtype=np.int32)
-
-        # Count occurrences
-        for length in actual_lengths:
-            count_per_length[length] += 1
-
-        # Build edge indices (first index where length >= L)
-        # Since sorted, we can build this efficiently
-        current_idx = 0
-        for length in range(max_length + 2):
-            # Find first index with actual_lengths[i] >= length
-            while current_idx < len(actual_lengths) and actual_lengths[current_idx] < length:
-                current_idx += 1
-            edge_indices[length] = current_idx
-
-        return edge_indices, count_per_length
+    ):
+        """Shim → ``metadata_loader.build_length_lookup_tables``."""
+        return build_length_lookup_tables(avg_lengths, scale_factor=scale_factor)
 
     def _load_unmatched_lengths(self) -> np.ndarray:
-        """Load actual token counts for unmatched functions (no memmap caching)."""
-        if not self.unmatched_index.exists() or not self.unmatched_data.exists():
+        """Shim → ``metadata_loader.load_unmatched_lengths``.
+
+        Re-loads the unmatched index inside the helper for the legacy
+        signature; the arm-driven ``_load_metadata`` path calls
+        ``load_unmatched_lengths`` directly with already-loaded
+        ``starts`` / ``lengths`` to avoid a second index pass.
+        """
+        if not self.unmatched_index.exists():
             return np.array([], dtype=np.int32)
-
-        # Read index
-        starts, lengths, _ = self._load_index_once(self.unmatched_index)
-        if starts is None:
-            return np.array([], dtype=np.int32)
-
-        # Open data memmap temporarily to read headers
-        data_memmap = np.memmap(str(self.unmatched_data), dtype=np.uint8, mode="r")
-
-        token_counts = []
+        starts, lengths, _ = load_index_once(self.unmatched_index)
         if starts is None or lengths is None:
             return np.array([], dtype=np.int32)
+        paths = BinaryArmPaths(
+            sections_csv=self.unmatched_sections,
+            index_bin=self.unmatched_index,
+            data_bin=self.unmatched_data,
+        )
+        return load_unmatched_lengths(paths, starts, lengths)
 
-        for i in range(len(starts)):
-            start = int(starts[i])
-            length = int(lengths[i])
-            # Read just the header
-            insn_len = int.from_bytes(data_memmap[start : start + 3].tobytes(), "little")
-            block_len = int.from_bytes(data_memmap[start + 4 : start + 6].tobytes(), "little")
-            token_bytes = length - 6 - insn_len - block_len
-            token_count = token_bytes // 2  # uint16 tokens
-            token_counts.append(token_count)
+    def _arm_paths(self, kind: SectionKind) -> BinaryArmPaths:
+        """Bundle the three on-disk file paths for the requested arm.
 
-        # Close memmap
-        del data_memmap
+        Single switch-point between matched and unmatched path triples;
+        the rest of ``_load_metadata`` reads ``kind`` only through this
+        helper so no per-arm ``if`` cascade leaks into the loader body.
+        """
+        if kind is SectionKind.MATCHED:
+            return BinaryArmPaths(
+                sections_csv=self.matched_sections,
+                index_bin=self.matched_index,
+                data_bin=self.matched_data,
+            )
+        return BinaryArmPaths(
+            sections_csv=self.unmatched_sections,
+            index_bin=self.unmatched_index,
+            data_bin=self.unmatched_data,
+        )
 
-        return np.array(token_counts, dtype=np.int32)
+    def _publish_arm(self, attr_prefix: str, arm: SectionArm) -> None:
+        """Mirror a ``SectionArm`` onto the legacy ``self.<prefix>_*``
+        public attributes that downstream consumers read directly
+        (``AlignedDataLoader``, ``validator.py``,
+        ``utils.load_single_matched_function``). Naming uses
+        ``attr_prefix`` ("matched" / "unmatched") so the six fields
+        land at their established names with no per-arm branch.
+        """
+        setattr(self, f"{attr_prefix}_starts", arm.starts)
+        setattr(self, f"{attr_prefix}_lengths", arm.lengths)
+        setattr(self, f"{attr_prefix}_edge_indices", arm.edge_indices)
+        setattr(self, f"{attr_prefix}_count_per_length", arm.count_per_length)
+        setattr(self, f"{attr_prefix}_func_names", arm.func_names)
+        setattr(self, f"{attr_prefix}_count", arm.count)
+        # ``section_starts`` is a new field; only the unmatched arm
+        # populates it (matched seeks from ``starts`` directly).
+        # Batch 5G consumes it to drop the linear-scan in
+        # ``load_unmatched_function``.
+        setattr(self, f"{attr_prefix}_section_starts", arm.section_starts)
 
     def _load_metadata(self):
-        """Load index files and build metadata structures (NO memmap caching)."""
-        # Matched functions
-        if self.matched_index.exists():
-            self.matched_starts, self.matched_lengths, matched_avg_lengths = self._load_index_once(self.matched_index)
+        """Build matched + unmatched ``SectionArm``s and publish them.
 
-            if self.matched_starts is not None and matched_avg_lengths is not None:
-                self.matched_count = len(self.matched_starts)
-                if len(matched_avg_lengths) > 0:
-                    self.matched_edge_indices, self.matched_count_per_length = self._build_length_lookup_tables(
-                        matched_avg_lengths, scale_factor=16
-                    )
-                else:
-                    self.matched_edge_indices = np.zeros(1, dtype=np.int32)
-                    self.matched_count_per_length = np.zeros(1, dtype=np.int32)
-
-                # Build function name index from sections file, following index file order
-                self.matched_func_names = []
-                f, content_offset = self._open_sections_csv(self.matched_sections)
-                try:
-                    for i in range(len(self.matched_starts)):
-                        f.seek(int(self.matched_starts[i]) + content_offset)
-                        first_line = f.readline()
-                        row = list(csv.reader([first_line]))[0]
-                        if row and len(row) >= 1:
-                            self.matched_func_names.append(row[0])
-                finally:
-                    f.close()
-            else:
-                self.matched_count = 0
-                self.matched_starts = np.array([], dtype=np.uint32)
-                self.matched_lengths = np.array([], dtype=np.uint32)
-                self.matched_edge_indices = np.zeros(1, dtype=np.int32)
-                self.matched_count_per_length = np.zeros(1, dtype=np.int32)
-                self.matched_func_names = []
-        else:
-            self.matched_count = 0
-            self.matched_starts = np.array([], dtype=np.uint32)
-            self.matched_lengths = np.array([], dtype=np.uint32)
-            self.matched_edge_indices = np.zeros(1, dtype=np.int32)
-            self.matched_count_per_length = np.zeros(1, dtype=np.int32)
-            self.matched_func_names = []
-
-        # Unmatched functions
-        if self.unmatched_index.exists():
-            self.unmatched_starts, self.unmatched_lengths, _ = self._load_index_once(self.unmatched_index)
-
-            if self.unmatched_starts is not None:
-                self.unmatched_count = len(self.unmatched_starts)
-                # Load actual token counts (not cached as memmap)
-                unmatched_token_counts = self._load_unmatched_lengths()
-                if len(unmatched_token_counts) > 0:
-                    self.unmatched_edge_indices, self.unmatched_count_per_length = self._build_length_lookup_tables(
-                        unmatched_token_counts, scale_factor=1
-                    )
-                else:
-                    self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
-                    self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
-
-                # Build function names from unmatched sections file
-                self.unmatched_func_names = []
-                if self.unmatched_sections.exists():
-                    f, _content_offset = self._open_sections_csv(self.unmatched_sections)
-                    try:
-                        reader = csv.reader(f)
-                        for row in reader:
-                            if (
-                                row and len(row) == 6
-                            ):  # Unmatched format: func_name, compiler_sets, called_funcs, inlining_data, offset, len
-                                self.unmatched_func_names.append(row[0])
-                    finally:
-                        f.close()
-                else:
-                    self.unmatched_func_names = []
-            else:
-                self.unmatched_count = 0
-                self.unmatched_starts = np.array([], dtype=np.uint32)
-                self.unmatched_lengths = np.array([], dtype=np.uint32)
-                self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
-                self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
-                self.unmatched_func_names = []
-        else:
-            self.unmatched_count = 0
-            self.unmatched_starts = np.array([], dtype=np.uint32)
-            self.unmatched_lengths = np.array([], dtype=np.uint32)
-            self.unmatched_edge_indices = np.zeros(1, dtype=np.int32)
-            self.unmatched_count_per_length = np.zeros(1, dtype=np.int32)
-            self.unmatched_func_names = []
+        Delegates per-arm computation to
+        ``metadata_loader.load_section_arm`` (single implementation
+        shared by both kinds). This method's only remaining concern
+        is binding the arms onto the legacy public attribute names.
+        """
+        matched_arm = load_section_arm(
+            SectionKind.MATCHED, self._arm_paths(SectionKind.MATCHED)
+        )
+        unmatched_arm = load_section_arm(
+            SectionKind.UNMATCHED, self._arm_paths(SectionKind.UNMATCHED)
+        )
+        self._publish_arm("matched", matched_arm)
+        self._publish_arm("unmatched", unmatched_arm)
+        # Stash the arms so future session code (Batch 5G) can pass
+        # them through without re-loading; harmless attribute for
+        # current callers.
+        self._matched_arm = matched_arm
+        self._unmatched_arm = unmatched_arm
 
     def get_matched_indices_by_length(self, target_length: int, min_count: int = 1) -> np.ndarray:
         """
