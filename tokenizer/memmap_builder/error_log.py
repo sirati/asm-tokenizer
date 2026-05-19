@@ -17,6 +17,8 @@ ALLOWED_REASONS: frozenset[str] = frozenset(
         "block_len_overflow",
         "overlong_length_overflow",
         "offset_overflow",
+        "csv_offset_overflow",
+        "csv_length_overflow",
     }
 )
 

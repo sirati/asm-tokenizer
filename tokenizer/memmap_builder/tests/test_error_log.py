@@ -72,8 +72,10 @@ def test_invalid_reason_rejected() -> None:
 def test_allowed_reasons_set_is_exhaustive() -> None:
     """Guard against silent reason-set drift relative to the design.
 
-    The plan enumerates exactly these four overflow reasons; if more
-    are added the writer's surface MUST be revisited at the same time.
+    The v1 record codec contributes four overflow reasons (insn / block
+    / overlong / offset); the pre-v1 ``matched_index.bin`` codec adds
+    two more (csv_offset / csv_length). Adding further reasons MUST be
+    accompanied by a writer-surface review at the same time.
     """
     assert ALLOWED_REASONS == frozenset(
         {
@@ -81,5 +83,7 @@ def test_allowed_reasons_set_is_exhaustive() -> None:
             "block_len_overflow",
             "overlong_length_overflow",
             "offset_overflow",
+            "csv_offset_overflow",
+            "csv_length_overflow",
         }
     )
