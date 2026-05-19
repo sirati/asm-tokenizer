@@ -6,12 +6,23 @@ import numpy as np
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 from .binary_format import (
+    IndexEntrySkip,
     determine_block_encoding,
     encode_binary_header,
     extract_arrays_from_data,
     parse_binary_header,
 )
 from .csv_format import format_inlining_dict, format_variant_refs
+from .index_format import SENTINEL_LENGTH
+
+# Caps derived from the on-wire entry layout (see ``index_format.py``).
+# offset is stored as the low 5 bytes of a u64 (u40); length is u16 of
+# the shifted real length, with the value 0x0000 reserved as the sentinel
+# that flags an overlong record (real length carried in ``_data.bin``).
+_MAX_OFFSET_SHIFTED = (1 << 40) - 1
+_MAX_NORMAL_LENGTH_SHIFTED = 0xFFFF
+_MAX_OVERLONG_REAL_LENGTH = 0xFFFFFF << 2  # 67,108,860 bytes (~64 MiB)
+_INDEX_ENTRY_SIZE = 8
 
 
 def decode_and_translate_tokens(row, mapping=None):
@@ -66,11 +77,67 @@ def write_function_binary_data(file2, tokens, block_runlength, insn_runlength, d
     return result
 
 
-def write_index_entry(file3, start, length, avg_len):
-    file3.write(struct.pack("<I", start))
-    file3.write(struct.pack("<I", length)[0:3])
+def write_index_entry(
+    file3,
+    start: int,
+    length: int,
+    avg_len: int,
+    *,
+    func_name: str = "",
+    error_log=None,
+) -> None:
+    """Pack one 8-byte index entry: u40 offset_shifted, u16 length_shifted, u8 avg_len.
+
+    ``start`` and ``length`` are shifted right by 2 (4-byte record
+    alignment is a writer invariant). A real length above
+    ``0xFFFF << 2`` (~256 KiB) is encoded with sentinel
+    ``length_shifted == SENTINEL_LENGTH``; the real length then lives
+    in the u24-shifted overlong field of the matching ``_data.bin``
+    record (cap ~64 MiB). On cap violation :class:`IndexEntrySkip` is
+    raised; when ``error_log`` is supplied the exception is logged and
+    the function returns ``None`` (no entry written), otherwise it
+    propagates. ``func_name`` is logged so the offending function is
+    recoverable. Alignment violations are programmer errors and raise
+    :class:`AssertionError` (never logged).
+    """
+    assert start % 4 == 0, f"index entry start must be 4-byte aligned; got {start}"
+    assert length % 4 == 0, f"index entry length must be 4-byte aligned; got {length}"
+    assert length > 0, "index entry length must be > 0 (minimum padded record is 8 bytes)"
+
+    try:
+        offset_shifted = start >> 2
+        if offset_shifted > _MAX_OFFSET_SHIFTED:
+            raise IndexEntrySkip("offset_overflow", start)
+
+        length_shifted = length >> 2
+        if length_shifted <= _MAX_NORMAL_LENGTH_SHIFTED:
+            length_field = length_shifted
+        else:
+            if length > _MAX_OVERLONG_REAL_LENGTH:
+                raise IndexEntrySkip("overlong_length_overflow", length)
+            length_field = SENTINEL_LENGTH
+    except IndexEntrySkip as exc:
+        if error_log is None:
+            raise
+        # Lazy import: ``tokenizer.memmap_builder`` package init pulls
+        # back into ``aligned_data``; a top-level import would cycle.
+        from tokenizer.memmap_builder.error_log import write_error_log_entry
+
+        write_error_log_entry(error_log, exc.reason, func_name, exc.value)
+        return
+
     avg_len_clamped = min(avg_len >> 4, 255)
-    file3.write(struct.pack("B", avg_len_clamped))
+    # Low 5 bytes of a u64 LE = u40 LE on the wire.
+    entry_bytes = (
+        struct.pack("<Q", offset_shifted)[:5]
+        + struct.pack("<H", length_field)
+        + struct.pack("B", avg_len_clamped)
+    )
+    before = file3.tell()
+    file3.write(entry_bytes)
+    assert file3.tell() - before == _INDEX_ENTRY_SIZE, (
+        f"index entry wrote {file3.tell() - before} bytes; expected {_INDEX_ENTRY_SIZE}"
+    )
 
 
 def write_function_section_csv(
