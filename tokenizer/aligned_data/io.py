@@ -169,16 +169,21 @@ def read_sections_file(sections_path):
             yield (func_name, rows)
 
 
-def read_data_file(data_path, offset, length):
-    """Read the binary data for a function from the data file given offset and length."""
+def read_data_file(data_path, offset, length, is_overlong: bool = False):
+    """Read the binary data for a function from the data file given offset and length.
+
+    ``is_overlong`` is forwarded to the parser so the body offset shifts
+    past the 3-byte overlong-length field when the caller already
+    resolved the real length via the index sentinel.
+    """
     with open(data_path, "rb") as f:
         f.seek(offset)
         data = f.read(length)
         header = parse_binary_header(data)
-        return extract_arrays_from_data(data, header)
+        return extract_arrays_from_data(data, header, is_overlong=is_overlong)
 
 
-def parse_function_data_memmap(memmap_handle, offset, length):
+def parse_function_data_memmap(memmap_handle, offset, length, is_overlong: bool = False):
     """Slice one function record from an already-open ``_data.bin`` view.
 
     ``memmap_handle`` is the caller's already-open ``np.memmap`` (or any
@@ -192,13 +197,16 @@ def parse_function_data_memmap(memmap_handle, offset, length):
     owns one open handle per bin file and slices many records out of
     it without re-opening per call.
 
+    ``is_overlong`` is forwarded to the parser; the session layer sets
+    it after observing the index-entry sentinel.
+
     Returns ``(insn_runlength, block_runlength, tokens)``.
     """
     data = memmap_handle[offset:offset + length]
-    return parse_function_data_header(data)
+    return parse_function_data_header(data, is_overlong=is_overlong)
 
 
-def read_function_data_memmap(data_path, offset, length):
+def read_function_data_memmap(data_path, offset, length, is_overlong: bool = False):
     """
     Read the binary data for a function from the data file using numpy.memmap for random access.
     Returns: insn_runlength, block_runlength, tokens
@@ -210,13 +218,17 @@ def read_function_data_memmap(data_path, offset, length):
     same bin file (avoids per-call mmap overhead).
     """
     data = np.memmap(data_path, dtype=np.uint8, mode="r")
-    return parse_function_data_memmap(data, offset, length)
+    return parse_function_data_memmap(data, offset, length, is_overlong=is_overlong)
 
 
-def parse_function_data_header(data_bytes):
+def parse_function_data_header(data_bytes, is_overlong: bool = False):
     """
     Parse the header and return (insn_runlength, block_runlength, tokens) ndarrays.
     data_bytes: bytes or 1D uint8 array
+
+    ``is_overlong`` is forwarded to :func:`extract_arrays_from_data`
+    so the body offset accounts for the optional 3-byte overlong-length
+    field that precedes the body in overlong records.
     """
     header = parse_binary_header(data_bytes)
-    return extract_arrays_from_data(data_bytes, header)
+    return extract_arrays_from_data(data_bytes, header, is_overlong=is_overlong)

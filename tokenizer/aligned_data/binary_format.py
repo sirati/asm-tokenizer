@@ -84,20 +84,45 @@ def parse_binary_header(data_bytes) -> BinaryHeader:
     )
 
 
-def extract_arrays_from_data(data_bytes, header: BinaryHeader) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract insn_runlength, block_runlength, tokens arrays from data given header."""
+def extract_arrays_from_data(
+    data_bytes,
+    header: BinaryHeader,
+    is_overlong: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract insn_runlength, block_runlength, tokens arrays from data given header.
+
+    Body layout, starting at ``prefix = HEADER_BYTES + (OVERLONG_FIELD_BYTES
+    if is_overlong else 0)``::
+
+        [insn_bytes (header.insn_len)]
+        [pad        (header.pad_size, all \\x00)]
+        [block_bytes(header.block_len)]
+        [tokens     (rest, uint16 LE)]
+
+    The pad is skipped purely by arithmetic — the reader never recomputes
+    its size and never inspects its bytes (the validator owns that
+    invariant). ``is_overlong`` shifts the body start past the 3-byte
+    overlong-length field; that field's value is resolved independently
+    by the caller (the session layer that decoded the index sentinel),
+    so this function never reads it.
+    """
     if isinstance(data_bytes, (np.memmap, np.ndarray)):
         data_bytes = data_bytes.tobytes()
 
-    insn_runlength = np.frombuffer(data_bytes[6 : 6 + header.insn_len], dtype=np.uint8)
+    prefix = HEADER_BYTES + (OVERLONG_FIELD_BYTES if is_overlong else 0)
+    insn_end = prefix + header.insn_len
+    block_start = insn_end + header.pad_size
+    block_end = block_start + header.block_len
+
+    insn_runlength = np.frombuffer(data_bytes[prefix:insn_end], dtype=np.uint8)
 
     block_dtype = [np.uint8, np.uint16, np.uint32][header.block_enc]
     block_runlength = np.frombuffer(
-        data_bytes[6 + header.insn_len : 6 + header.insn_len + header.block_len],
+        data_bytes[block_start:block_end],
         dtype=block_dtype,
     )
 
-    tokens = np.frombuffer(data_bytes[6 + header.insn_len + header.block_len :], dtype=np.uint16)
+    tokens = np.frombuffer(data_bytes[block_end:], dtype=np.uint16)
 
     return insn_runlength, block_runlength, tokens
 
