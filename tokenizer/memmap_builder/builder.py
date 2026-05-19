@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
@@ -92,12 +93,13 @@ def build_memmap_files(
 
     `unified_vocab_path` points at the corpus-wide ``unified_vocab.csv``
     produced by ``tokenizer.vocab_unifier``. It is loaded once here
-    (format_version=3 required) and threaded into ``VariantRegistry``
-    so the per-variant token records emitted into ``<binary>_variants.bin``
-    can resolve each axis string (``arch:*``, ``comp:*``, ``cver:*``,
-    ``opt:*``, plus per-metadata-pair tokens) to its assigned uint16 ID.
-    A v2 (or missing) unified vocab is rejected loudly here rather than
-    silently corrupting the bin via stub IDs.
+    (``MEMMAP_FORMAT_VERSION`` required) and threaded into
+    ``VariantRegistry`` so the per-variant token records emitted into
+    ``<binary>_variants.bin`` can resolve each axis string (``arch:*``,
+    ``comp:*``, ``cver:*``, ``opt:*``, plus per-metadata-pair tokens) to
+    its assigned uint16 ID. Any non-current-version (or missing) unified
+    vocab is rejected loudly here rather than silently corrupting the bin
+    via stub IDs.
     """
 
     logger.info(f"  Output directory: {output_dir}")
@@ -113,12 +115,13 @@ def build_memmap_files(
             f"build_memmap_files: failed to load unified vocab from "
             f"{unified_vocab_path}; cannot encode variant-axis tokens."
         )
-    if unified_vocab.format_version != 3:
+    if unified_vocab.format_version != MEMMAP_FORMAT_VERSION:
         raise ValueError(
             f"build_memmap_files: unified vocab at {unified_vocab_path} "
-            f"reports format_version={unified_vocab.format_version}; v3 "
-            f"required (v3 is the variant-token-aware superset). Re-run "
-            f"tokenizer.vocab_unifier against the per-binary CSV inputs."
+            f"reports format_version={unified_vocab.format_version}; "
+            f"v{MEMMAP_FORMAT_VERSION} required for the memmap-output "
+            f"chain. Re-run tokenizer.vocab_unifier against the per-binary "
+            f"CSV inputs to regenerate."
         )
 
     # Variant registry: single authority on the `vkey -> 0x<hex>` ref
