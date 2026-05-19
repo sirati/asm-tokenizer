@@ -30,7 +30,7 @@ from tokenizer.aligned_data.loader.aligned_data_loader import AlignedDataLoader
 from ._loader_test_support import (
     patch_binary_dataset_factory,
     stage_v2_unified_vocab,
-    stage_v3_unified_vocab,
+    stage_v1_unified_vocab,
 )
 
 
@@ -96,7 +96,7 @@ def test_load_matched_groups_by_binary_one_session_each(
     """Across a batch of 10 matched functions split over 2 binaries, the
     loader must open exactly 2 sessions (one per touched binary), not 10.
     """
-    stage_v3_unified_vocab(tmp_path)
+    stage_v1_unified_vocab(tmp_path)
 
     ledger: List[str] = []
     patch_binary_dataset_factory(
@@ -130,7 +130,7 @@ def test_load_unmatched_groups_by_binary_one_session_each(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Same one-session-per-binary discipline on the unmatched path."""
-    stage_v3_unified_vocab(tmp_path)
+    stage_v1_unified_vocab(tmp_path)
 
     ledger: List[str] = []
     patch_binary_dataset_factory(
@@ -171,7 +171,7 @@ def test_session_count_bounded_by_touched_binaries_not_function_count(
     count must equal the number of distinct touched binaries (<= 3) and
     must be strictly less than the per-function count.
     """
-    stage_v3_unified_vocab(tmp_path)
+    stage_v1_unified_vocab(tmp_path)
 
     ledger: List[str] = []
     patch_binary_dataset_factory(
@@ -207,7 +207,7 @@ def test_vocab_manager_threaded_into_binary_dataset(
     ``BinaryDataset`` via the ``vocab_manager`` kwarg (receiver contract
     for the shell-integrator subtask).
     """
-    stage_v3_unified_vocab(tmp_path)
+    stage_v1_unified_vocab(tmp_path)
 
     ledger: List[str] = []
     patch_binary_dataset_factory(

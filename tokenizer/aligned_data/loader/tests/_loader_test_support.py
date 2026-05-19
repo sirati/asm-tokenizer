@@ -2,7 +2,8 @@
 
 Two concerns:
 
-1. **Unified-vocab staging.** Build a v2 or v3 ``unified_vocab.csv`` in
+1. **Unified-vocab staging.** Build a v1 (valid) or v2 (rejected — per-binary
+   format) ``unified_vocab.csv`` in
    a tmpdir using the real ``save_vocabulary`` writer — same path the
    production unifier uses, so the gate test exercises the real on-disk
    shape.
@@ -55,9 +56,9 @@ def stage_v2_unified_vocab(tmp_path: Path) -> Path:
     return csv_path
 
 
-def stage_v3_unified_vocab(tmp_path: Path) -> Path:
-    """Write a v3-shaped ``unified_vocab.csv`` into ``tmp_path``."""
-    vm = VocabularyManager(platform=None, format_version=3)
+def stage_v1_unified_vocab(tmp_path: Path) -> Path:
+    """Write a v1-shaped ``unified_vocab.csv`` into ``tmp_path``."""
+    vm = VocabularyManager(platform=None, format_version=1)
     vm.Variant_Axis("arch:x64")
     vm.Variant_Axis("opt:O2")
     vm.Block_V2(0)
