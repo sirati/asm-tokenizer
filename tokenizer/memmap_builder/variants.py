@@ -42,6 +42,7 @@ import csv
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from tokenizer.aligned_data.csv_format import write_csv_prelude
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.variant_tokens.record import write_record
 
@@ -151,6 +152,7 @@ class VariantRegistry:
                 self._offsets[vkey] = offset
 
         with open(csv_path, "w", newline="", encoding="ascii") as csv_handle:
+            write_csv_prelude(csv_handle)
             writer = csv.writer(csv_handle)
             writer.writerow(["filename", "offset"])
             for version in self._ordered_versions:

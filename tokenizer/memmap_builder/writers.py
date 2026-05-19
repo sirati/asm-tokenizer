@@ -103,11 +103,33 @@ def write_unmatched_function_section(
     )
 
 
-def finalize_index_file(index_file, index_entries: List[Tuple[int, int, int]], sort_by_avg_len: bool = True):
-    """Write sorted index entries to index file."""
-    sorted_entries = sorted(index_entries, key=lambda x: x[2]) if sort_by_avg_len else index_entries
-    for start, length, avg_len in sorted_entries:
-        write_index_entry(index_file, start, length, avg_len)
+def finalize_index_file(
+    index_file,
+    index_entries: List[Tuple[str, int, int, int]],
+    sort_by_avg_len: bool = True,
+    *,
+    error_log=None,
+):
+    """Write sorted index entries to index file.
+
+    Each entry is ``(func_name, start, length, avg_len)``; ``func_name``
+    is forwarded to ``write_index_entry`` so a cap-overflow logged into
+    ``error_log`` carries the offending function name. ``avg_len`` (the
+    sort key) is the third tuple slot — kept unchanged so the existing
+    "shortest first" ordering still applies.
+    """
+    sorted_entries = (
+        sorted(index_entries, key=lambda x: x[3]) if sort_by_avg_len else index_entries
+    )
+    for func_name, start, length, avg_len in sorted_entries:
+        write_index_entry(
+            index_file,
+            start,
+            length,
+            avg_len,
+            func_name=func_name,
+            error_log=error_log,
+        )
 
 
 def build_inlining_data_for_unmatched(
