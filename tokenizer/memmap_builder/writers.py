@@ -2,63 +2,10 @@ from typing import List, Tuple
 
 from ..aligned_data.csv_format import format_unique_called
 from ..aligned_data.io import (
-    write_function_section_csv,
     write_index_entry,
     write_unmatched_section_csv,
 )
 from .variants import VariantRegistry, write_warn_log_entry
-
-
-def write_matched_function_section(
-    writer,
-    func_name: str,
-    unique_called: List[str],
-    version_data_list: List[dict],
-    function_lookup: dict,
-    warn_log,
-    variants: VariantRegistry,
-) -> Tuple[int, int]:
-    """
-    Write a complete matched function section (header + version rows).
-    Returns (section_start, section_length) for index.
-    """
-    unique_called_str = format_unique_called(unique_called)
-    writer.writerow([func_name, unique_called_str])
-
-    total_len = 0
-    for vdata in version_data_list:
-        vkey = vdata["vkey"]
-        called = vdata["called"]
-        data_offset = vdata["data_offset"]
-        data_len = vdata["data_len"]
-        token_len = vdata["token_len"]
-
-        variant_ref = variants.ref(vkey)
-        inlining_data = {}
-        for called_func in called:
-            called_idx = unique_called.index(called_func)
-            lookup_key = (called_func, vkey)
-            if lookup_key in function_lookup:
-                func_offset, func_len, is_matched = function_lookup[lookup_key]
-                inlining_data[called_idx] = (func_offset, func_len, is_matched)
-            else:
-                write_warn_log_entry(warn_log, func_name, variant_ref, called_func)
-
-        inlining_list = [
-            [idx, start, length, is_matched] for idx, (start, length, is_matched) in sorted(inlining_data.items())
-        ]
-
-        write_function_section_csv(
-            writer,
-            variant_ref,
-            inlining_list,
-            data_offset,
-            data_len,
-        )
-        total_len += token_len
-
-    writer.writerow([])
-    return total_len
 
 
 def write_unmatched_function_section(

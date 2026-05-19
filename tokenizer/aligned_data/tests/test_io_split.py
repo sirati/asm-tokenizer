@@ -67,8 +67,16 @@ def test_parse_matches_read_byte_for_byte(tmp_path):
     whole_mmap = np.memmap(data_bin, dtype=np.uint8, mode="r")
 
     for offset, length, tokens_in, block_in, insn_in in records:
-        path_form = read_function_data_memmap(str(data_bin), offset, length)
-        handle_form = parse_function_data_memmap(whole_mmap, offset, length)
+        # The synthetic bin in this test only writes normal-length records
+        # (no overlong sentinel exercised), so ``is_overlong=False`` is
+        # the correct explicit value for every call here. The audit
+        # removed the silent default; callers thread the flag explicitly.
+        path_form = read_function_data_memmap(
+            str(data_bin), offset, length, is_overlong=False
+        )
+        handle_form = parse_function_data_memmap(
+            whole_mmap, offset, length, is_overlong=False
+        )
 
         insn_p, block_p, tok_p = path_form
         insn_h, block_h, tok_h = handle_form
@@ -106,8 +114,12 @@ def test_parse_with_ndarray_view(tmp_path):
 
     for offset, length, _, _, _ in records:
         whole_mmap = np.memmap(data_bin, dtype=np.uint8, mode="r")
-        insn_m, block_m, tok_m = parse_function_data_memmap(whole_mmap, offset, length)
-        insn_n, block_n, tok_n = parse_function_data_memmap(in_memory, offset, length)
+        insn_m, block_m, tok_m = parse_function_data_memmap(
+            whole_mmap, offset, length, is_overlong=False
+        )
+        insn_n, block_n, tok_n = parse_function_data_memmap(
+            in_memory, offset, length, is_overlong=False
+        )
 
         assert insn_m.tobytes() == insn_n.tobytes()
         assert block_m.tobytes() == block_n.tobytes()

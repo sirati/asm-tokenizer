@@ -53,10 +53,9 @@ def write_function_section_csv(
     writer,
     variant_ref,
     inlining_list,
-    data_offset,
-    data_len,
+    indexer_hex,
 ):
-    """Write one matched-section row.
+    """Write one matched-section variant row (3 cells).
 
     ``variant_ref`` is the ``0x<hex>`` row index into the per-group
     ``<binary>_variants.csv`` sidecar (see
@@ -65,44 +64,61 @@ def write_function_section_csv(
     sidecar ``extra_metadata`` are recoverable via that ref;
     keeping them out of the section CSV avoids the per-row repetition
     that conflated variants sharing the canonical-4 axes.
+
+    ``indexer_hex`` is the 16-hex-char inline encoding of the v1
+    8-byte index entry for this variant's ``_data.bin`` record
+    (offset + length + sentinel/overlong marker). Callers compute
+    it via :func:`tokenizer.aligned_data.inline_indexer.encode_inline_indexer`;
+    this writer treats it as an opaque string and emits it verbatim,
+    so the writer stays unaware of the entry layout.
     """
     inlining_str = format_inlining_dict(inlining_list)
     writer.writerow(
         [
             variant_ref,
             inlining_str,
-            f"{data_offset:x}",
-            f"{data_len:x}",
+            indexer_hex,
         ]
     )
 
 
 def write_unmatched_section_csv(
     writer,
-    func_name,
+    line_no_b64,
     variant_refs,
     called_functions_str,
     inlining_data_str,
-    data_offset,
-    data_len,
+    indexer_hex,
 ):
-    """Write one unmatched-section row.
+    """Write one unmatched-section row (6 cells).
+
+    ``line_no_b64`` is the compact urlsafe-base64 of this function's
+    1-indexed line number in the ``<binary>_function_names.txt``
+    sidecar; callers compute it via the registry. ``called_functions_str``
+    likewise carries comma-joined base64 line nos (NOT raw function
+    names) produced by the caller -- the writer is unaware of either
+    indirection.
 
     ``variant_refs`` is the ordered list of ``0x<hex>`` row indices
     (one per version present for this unmatched function). Encoded
     semicolon-joined into a single cell, mirroring the structure of
     the legacy ``compiler_sets`` cell so the column count stays
     constant across the section CSV.
+
+    ``indexer_hex`` is the 16-hex-char inline encoding of the v1
+    8-byte index entry for this function's first variant ``_data.bin``
+    record (offset + length + sentinel/overlong marker). Callers compute
+    it via :func:`tokenizer.aligned_data.inline_indexer.encode_inline_indexer`;
+    this writer treats it as an opaque string and emits it verbatim.
     """
     variants_str = format_variant_refs(variant_refs)
     writer.writerow(
         [
-            func_name,
+            line_no_b64,
             variants_str,
             called_functions_str,
             inlining_data_str,
-            f"{data_offset:x}",
-            f"{data_len:x}",
+            indexer_hex,
         ]
     )
 
@@ -121,30 +137,62 @@ def read_index_file(index_path):
 
 
 def read_sections_file(sections_path):
-    """Read the sections CSV file and yield (func_name, [rows]) for each function section."""
-    with open(sections_path, newline="", encoding="ascii") as f:
-        reader = csv.reader(f)
+    """Yield ``(func_name, [variant_rows])`` for each function section.
+
+    Routes through :func:`tokenizer.aligned_data.loader.metadata_loader.open_sections_csv`
+    so the ``# format=N`` prelude is consumed (and validated) before
+    the ``csv.reader`` sees the stream. Without this routing, the
+    prelude line would appear as a phantom section row and silently
+    corrupt the iteration. The import is local to avoid a circular
+    dependency between ``io`` and ``loader``.
+
+    Section layout (matched arm; what pass-2 writes):
+    ``header_row`` (``[func_name, unique_called_str]`` -- 2 cells)
+    followed by zero or more variant rows (3 cells each), terminated
+    by a blank row. The first row of the file (after the prelude) is
+    a header; every blank row marks the boundary before the next
+    header. ``variant_rows`` is the list of variant rows between the
+    header and its trailing blank; ``func_name`` is the header's
+    first cell.
+    """
+    from .loader.metadata_loader import open_sections_csv
+
+    handle, _ = open_sections_csv(sections_path)
+    try:
+        reader = csv.reader(handle)
         func_name = None
         rows = []
+        expecting_header = True
         for row in reader:
-            if not row or (len(row) == 1 and row[0]):
-                # New section or blank line
-                if func_name is not None and rows:
+            if not row:
+                # Blank row = end of current section. Emit and reset.
+                if func_name is not None:
                     yield (func_name, rows)
-                func_name = row[0] if row and row[0] else None
+                func_name = None
                 rows = []
-            elif func_name:
+                expecting_header = True
+                continue
+            if expecting_header:
+                func_name = row[0]
+                rows = []
+                expecting_header = False
+            else:
                 rows.append(row)
-        if func_name and rows:
+        if func_name is not None:
             yield (func_name, rows)
+    finally:
+        handle.close()
 
 
-def read_data_file(data_path, offset, length, is_overlong: bool = False):
+def read_data_file(data_path, offset, length, *, is_overlong: bool):
     """Read the binary data for a function from the data file given offset and length.
 
-    ``is_overlong`` is forwarded to the parser so the body offset shifts
-    past the 3-byte overlong-length field when the caller already
-    resolved the real length via the index sentinel.
+    ``is_overlong`` is REQUIRED (keyword-only): callers must derive it
+    from the index-entry sentinel via
+    :func:`tokenizer.aligned_data.loader._index_decoding.resolve_record_length`
+    (or the inline-indexer decode for matched-arm variants). A silent
+    default would corrupt overlong reads by skipping the 3-byte
+    overlong-length field shift, so the API forces an explicit value.
     """
     with open(data_path, "rb") as f:
         f.seek(offset)
@@ -153,7 +201,7 @@ def read_data_file(data_path, offset, length, is_overlong: bool = False):
         return extract_arrays_from_data(data, header, is_overlong=is_overlong)
 
 
-def parse_function_data_memmap(memmap_handle, offset, length, is_overlong: bool = False):
+def parse_function_data_memmap(memmap_handle, offset, length, *, is_overlong: bool):
     """Slice one function record from an already-open ``_data.bin`` view.
 
     ``memmap_handle`` is the caller's already-open ``np.memmap`` (or any
@@ -167,8 +215,10 @@ def parse_function_data_memmap(memmap_handle, offset, length, is_overlong: bool 
     owns one open handle per bin file and slices many records out of
     it without re-opening per call.
 
-    ``is_overlong`` is forwarded to the parser; the session layer sets
-    it after observing the index-entry sentinel.
+    ``is_overlong`` is REQUIRED (keyword-only) -- see
+    :func:`read_data_file` for the rationale; the session layer sets
+    it after observing the index-entry sentinel or after decoding the
+    inline indexer on the matched arm.
 
     Returns ``(insn_runlength, block_runlength, tokens)``.
     """
@@ -176,7 +226,7 @@ def parse_function_data_memmap(memmap_handle, offset, length, is_overlong: bool 
     return parse_function_data_header(data, is_overlong=is_overlong)
 
 
-def read_function_data_memmap(data_path, offset, length, is_overlong: bool = False):
+def read_function_data_memmap(data_path, offset, length, *, is_overlong: bool):
     """
     Read the binary data for a function from the data file using numpy.memmap for random access.
     Returns: insn_runlength, block_runlength, tokens
@@ -185,20 +235,22 @@ def read_function_data_memmap(data_path, offset, length, is_overlong: bool = Fal
     delegates to :func:`parse_function_data_memmap`, and lets the
     memmap close when the local reference drops. Use the open-handle
     form directly inside a session that needs many records out of the
-    same bin file (avoids per-call mmap overhead).
+    same bin file (avoids per-call mmap overhead). ``is_overlong`` is
+    REQUIRED (keyword-only); see :func:`read_data_file`.
     """
     data = np.memmap(data_path, dtype=np.uint8, mode="r")
     return parse_function_data_memmap(data, offset, length, is_overlong=is_overlong)
 
 
-def parse_function_data_header(data_bytes, is_overlong: bool = False):
+def parse_function_data_header(data_bytes, *, is_overlong: bool):
     """
     Parse the header and return (insn_runlength, block_runlength, tokens) ndarrays.
     data_bytes: bytes or 1D uint8 array
 
-    ``is_overlong`` is forwarded to :func:`extract_arrays_from_data`
-    so the body offset accounts for the optional 3-byte overlong-length
-    field that precedes the body in overlong records.
+    ``is_overlong`` is REQUIRED (keyword-only): forwarded to
+    :func:`extract_arrays_from_data` so the body offset accounts for
+    the optional 3-byte overlong-length field that precedes the body
+    in overlong records.
     """
     header = parse_binary_header(data_bytes)
     return extract_arrays_from_data(data_bytes, header, is_overlong=is_overlong)

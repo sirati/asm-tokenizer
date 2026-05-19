@@ -29,7 +29,6 @@ from .passes import (
 from .writers import (
     build_inlining_data_for_unmatched,
     finalize_index_file,
-    write_matched_function_section,
     write_unmatched_function_section,
 )
 
@@ -55,6 +54,5 @@ __all__ = [
     "write_unmatched_sections_pass2",
     "build_inlining_data_for_unmatched",
     "finalize_index_file",
-    "write_matched_function_section",
     "write_unmatched_function_section",
 ]
