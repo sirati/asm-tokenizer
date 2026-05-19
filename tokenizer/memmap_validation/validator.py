@@ -46,6 +46,7 @@ from ..aligned_data.match import lockstep_function_match
 from ..function_token_list import FunctionTokenList
 from ..memmap_builder import VersionKey
 from ..token_manager import VocabularyManager
+from ._v1_checks import run_v1_post_checks, run_v1_prelude_checks
 from .variants_bin_check import cross_check_variants_bin
 
 logger = logging.getLogger(__name__)
@@ -332,6 +333,36 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         f"{len(vocab_manager.id_to_token)} tokens from {vocab_path}"
     )
 
+    # Prelude / magic / version checks run BEFORE ``BinaryDataset``
+    # construction: the dataset's metadata loader treats a missing or
+    # wrong prelude as an unrecoverable ``ValueError`` (per the v1
+    # hard-cutover contract on the dataloader side), so a corrupted
+    # prelude would otherwise crash the validator instead of landing in
+    # the error list the caller iterates over. We probe first; if any
+    # prelude is unhealthy we short-circuit with a stats object that
+    # carries only those errors.
+    base = config.output_dir
+    bn = config.binary_name
+    prelude_errors = run_v1_prelude_checks(
+        matched_sections=base / f"{bn}_sections.csv",
+        unmatched_sections=base / f"{bn}_unmatched_sections.csv",
+        variants_csv=base / f"{bn}_variants.csv",
+        matched_index=base / f"{bn}_index.bin",
+        unmatched_index=base / f"{bn}_unmatched_index.bin",
+    )
+    if prelude_errors:
+        for err in prelude_errors:
+            logger.error(f"  {err}")
+        return ValidationStats(
+            matched_validated=0,
+            matched_skipped=0,
+            unmatched_validated=0,
+            unmatched_skipped=0,
+            csv_only_matched=0,
+            csv_only_unmatched=0,
+            errors=list(prelude_errors),
+        )
+
     dataset = BinaryDataset(
         config.output_dir, config.binary_name, vocab_manager=vocab_manager
     )
@@ -386,6 +417,24 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         for err in variants_bin_errors:
             logger.error(f"  {err}")
 
+    # Per-record v1 invariant checks (4-byte alignment + zero-pad +
+    # sentinel/overlong coupling). Run after ``BinaryDataset`` loaded
+    # the section arms so the checks reuse the already-decoded starts/
+    # lengths arrays instead of re-opening ``_index.bin``.
+    v1_check_errors = run_v1_post_checks(
+        matched_index=dataset.matched_index,
+        unmatched_index=dataset.unmatched_index,
+        matched_data=dataset.matched_data,
+        unmatched_data=dataset.unmatched_data,
+        matched_starts=dataset.matched_starts,
+        matched_lengths=dataset.matched_lengths,
+        unmatched_starts=dataset.unmatched_starts,
+        unmatched_lengths=dataset.unmatched_lengths,
+    )
+    if v1_check_errors:
+        for err in v1_check_errors:
+            logger.error(f"  {err}")
+
     matched_func_name_to_idx: Dict[str, int] = {}
     if dataset.matched_func_names:
         for idx, name in enumerate(dataset.matched_func_names):
@@ -435,7 +484,7 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         unmatched_skipped=0,
         csv_only_matched=0,
         csv_only_unmatched=0,
-        errors=list(variants_bin_errors),
+        errors=list(variants_bin_errors) + list(v1_check_errors),
     )
 
     for match_data in lockstep_function_match(csv_paths):
