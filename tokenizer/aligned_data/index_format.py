@@ -164,15 +164,46 @@ def read_index_arrays(
         offset=INDEX_HEADER_SIZE,
         shape=(n_entries, INDEX_ENTRY_SIZE),
     )
-    starts = np.zeros(n_entries, dtype=np.int64)
-    lengths = np.zeros(n_entries, dtype=np.uint32)
-    avg_lengths = np.zeros(n_entries, dtype=np.uint8)
-    for i in range(n_entries):
-        start, length, avg_len, _ = decode_index_entry(index_memmap[i], shift)
-        starts[i] = start
-        lengths[i] = length
-        avg_lengths[i] = avg_len
-    del index_memmap
+    try:
+        # Vectorised entry decode -- bit-for-bit equivalent to the
+        # per-entry ``decode_index_entry`` loop, but built from column
+        # slices over the ``(n_entries, INDEX_ENTRY_SIZE)`` matrix so the
+        # work happens in numpy rather than Python. The pad-and-view
+        # trick avoids per-row ``int.from_bytes`` calls.
+        #
+        # u40 offset_shifted (bytes 0-4): pad the row with 3 zero bytes
+        # to land on 8 and view as little-endian u64.
+        zero_pad_3 = np.zeros((n_entries, 3), dtype=np.uint8)
+        offset_padded = np.concatenate(
+            [index_memmap[:, 0:5], zero_pad_3], axis=1
+        )
+        offset_shifted = np.ascontiguousarray(offset_padded).view(
+            np.uint64
+        ).reshape(n_entries)
+        starts = (offset_shifted.astype(np.int64) << shift)
+        # u16 length_shifted (bytes 5-6): assemble little-endian by hand
+        # from the two byte columns. Keeps the work in uint16 so the
+        # sentinel comparison stays bit-exact.
+        length_shifted = (
+            index_memmap[:, 5].astype(np.uint16)
+            | (index_memmap[:, 6].astype(np.uint16) << 8)
+        )
+        sentinel_mask = length_shifted == SENTINEL_LENGTH
+        lengths = np.where(
+            sentinel_mask,
+            np.uint32(0),
+            length_shifted.astype(np.uint32) << shift,
+        ).astype(np.uint32)
+        # u8 avg_len (byte 7): direct copy so the returned array owns
+        # its buffer once the memmap is dropped on exit.
+        avg_lengths = np.array(index_memmap[:, 7], dtype=np.uint8)
+    finally:
+        # Drop the memmap deterministically: ``read_index_arrays`` is a
+        # leaf reader, so the file mapping should not outlive this call
+        # even if the consumer raises mid-iteration on the returned
+        # arrays (avg_lengths already owns its bytes; starts/lengths
+        # were built from arithmetic on derived arrays).
+        del index_memmap
     return starts, lengths, avg_lengths
 
 
