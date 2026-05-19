@@ -28,7 +28,8 @@ from typing import Any, Dict, List
 import numpy as np
 import pytest
 
-from tokenizer.aligned_data.binary_format import encode_binary_header
+from tokenizer.aligned_data.binary_format import compute_pad, encode_binary_header
+from tokenizer.aligned_data.inline_indexer import encode_inline_indexer
 from tokenizer.aligned_data.loader.session import BinarySession
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
@@ -66,15 +67,29 @@ class _FakeVocab:
 
 
 def _write_data_record(handle, tokens: np.ndarray) -> tuple[int, int]:
-    """Append one ``_data.bin`` record, return ``(offset, length)``."""
+    """Append one 4-byte-aligned ``_data.bin`` record, return ``(offset, length)``.
+
+    Pad is computed via ``compute_pad`` so the record total stays a
+    multiple of 4 -- the writer invariant the inline indexer encoder
+    asserts on.
+    """
     insn_runlength = np.array([len(tokens)], dtype=np.uint8)
     block_runlength = np.array([1], dtype=np.uint8)
     insn_bytes = insn_runlength.tobytes()
     block_bytes = block_runlength.tobytes()
-    header = encode_binary_header(len(insn_bytes), 0, len(block_bytes), pad_size=0)
+    pad_size = compute_pad(
+        insn_len=len(insn_bytes),
+        block_len=len(block_bytes),
+        token_count=len(tokens),
+        is_overlong=False,
+    )
+    header = encode_binary_header(
+        len(insn_bytes), 0, len(block_bytes), pad_size=pad_size,
+    )
     offset = handle.tell()
     handle.write(header)
     handle.write(insn_bytes)
+    handle.write(b"\x00" * pad_size)
     handle.write(block_bytes)
     handle.write(tokens.astype(np.uint16).tobytes())
     return offset, handle.tell() - offset
@@ -123,7 +138,9 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
 
     # --- _sections.csv (matched: one section with one version) -----
     # The v1 prelude is stripped by ``open_sections_csv``; row offsets
-    # in the matched arm are content-relative (post-prelude).
+    # in the matched arm are content-relative (post-prelude). Matched
+    # variant row is 3 cells post-restructuring: [variant_ref,
+    # inlining_str, indexer_hex].
     sections_path = base / f"{binary_name}_sections.csv"
     with open(sections_path, "w", newline="", encoding="ascii") as f:
         f.write(_SECTIONS_PRELUDE)
@@ -131,7 +148,8 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
         writer = csv.writer(f)
         section_start = f.tell() - prelude_size
         writer.writerow(["my_func"])
-        writer.writerow([f"{variant_offset:x}", "", f"{d_off:x}", f"{d_len:x}"])
+        indexer_hex = encode_inline_indexer(d_off, d_len)
+        writer.writerow([f"{variant_offset:x}", "", indexer_hex])
         section_end = f.tell() - prelude_size
     section_length = section_end - section_start
 
@@ -145,6 +163,11 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
     with open(unmatched_data_path, "wb") as f:
         u_off, u_len = _write_data_record(f, np.array([20, 21], dtype=np.uint16))
 
+    # Post-restructuring unmatched row is 5 cells: [line_no_b64,
+    # variant_refs, called_b64, inlining, indexer_hex]. The line_no_b64
+    # cell is opaque to the session reader (resolution lives in
+    # ``arm.func_names``); the indexer_hex cell is informational on the
+    # unmatched arm (data position comes from the index file).
     unmatched_sections_path = base / f"{binary_name}_unmatched_sections.csv"
     with open(unmatched_sections_path, "w", newline="", encoding="ascii") as f:
         f.write(_SECTIONS_PRELUDE)
@@ -152,12 +175,11 @@ def synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
         u_sec_start = f.tell() - u_prelude_size
         writer = csv.writer(f)
         writer.writerow([
-            "lonely_func",
+            "Aw",  # line_no_b64 placeholder
             f"{variant_offset:x}",
             "",
             "",
-            f"{u_off:x}",
-            f"{u_len:x}",
+            encode_inline_indexer(u_off, u_len),
         ])
 
     unmatched_arm = _FakeArm(
@@ -218,18 +240,54 @@ def test_session_opens_and_closes_cleanly(synthetic_binary):
 
 def test_session_load_unmatched(synthetic_binary):
     fb = synthetic_binary
-    # The reader returns memmap-backed views; ndarray consumers must read
-    # them inside the session's ``with`` so the underlying mapping is
-    # still live. Metadata (plain Python objects) is safe to use after.
+    # Egress-copy lifetime contract: every array on the returned
+    # ``FunctionData`` is independent of the session's memmap handles,
+    # so consumers may read tokens / metadata freely after the ``with``.
     with BinarySession(
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
         f = sess.load_unmatched(0)
         assert f.func_name == "lonely_func"
-        assert f.tokens.tolist() == [20, 21]
+    assert f.tokens.tolist() == [20, 21]  # post-exit read must work
     variants = f.metadata.get("variants", [])
     assert len(variants) == 1
     assert variants[0].get("arch") == "x64"
+
+
+def test_session_returns_independent_arrays_after_exit(synthetic_binary):
+    """Egress-copy contract: arrays returned by Session.load_* survive
+    past ``__exit__`` and are independent buffers (mutating them does
+    not touch the underlying ``_data.bin``).
+
+    A session is arm-locked (matched OR unmatched per ``with``), so the
+    two arms are exercised in separate ``with`` blocks; the post-exit
+    reads happen after both are closed to prove the copy contract holds
+    in the worst case (no live memmap backing the returned arrays).
+    """
+    fb = synthetic_binary
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        matched = sess.load_matched(0)
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        unmatched = sess.load_unmatched(0)
+
+    # After both sessions exit, every array stays readable.
+    for fd in (matched.versions[0], unmatched):
+        assert fd.tokens.tolist() == fd.tokens.tolist()
+        assert fd.insn_runlength.tolist() == fd.insn_runlength.tolist()
+        assert fd.block_runlength.tolist() == fd.block_runlength.tolist()
+
+    # And: mutating the returned tokens must not propagate to the file.
+    matched_tokens_before = matched.versions[0].tokens.copy()
+    matched.versions[0].tokens[0] = 0xFFFF
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        reread = sess.load_matched(0)
+    assert reread.versions[0].tokens.tolist() == matched_tokens_before.tolist()
 
 
 def test_session_fd_no_leak(synthetic_binary):

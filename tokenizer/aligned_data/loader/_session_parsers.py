@@ -10,7 +10,7 @@ without standing up a full session.
 from __future__ import annotations
 
 import csv
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -53,6 +53,12 @@ def arm_arrays(arm: Any, kind: str, binary_name: str):
     return starts, lengths
 
 
+# Matched-section variant-row schema after the matched-arm restructuring.
+# Pinned here so the row decoder + the helper that walks the row both see
+# the same column order (a future schema bump touches this one definition).
+_MATCHED_VARIANT_HEADER: List[str] = ["variant_ref", "inlining_data", "indexer_hex"]
+
+
 def parse_matched_section(
     section_data,
     *,
@@ -62,27 +68,35 @@ def parse_matched_section(
 ) -> MatchedFunction:
     """Parse a matched-section blob into a ``MatchedFunction``.
 
-    ``data_slice(offset, length)`` returns ``(insn_rl, block_rl, tokens)``;
-    ``resolve_ref(ref_str)`` returns the variant dict (or ``None``).
-    Both injected so this helper does not import the session's lazy
-    openers.
+    ``data_slice(offset, length, is_overlong)`` returns
+    ``(insn_rl, block_rl, tokens)``; ``resolve_ref(ref_str)`` returns
+    the variant dict (or ``None``). Both injected so this helper does
+    not import the session's lazy openers.
+
+    Per the post-restructuring layout each variant row is 3 cells
+    ``[variant_ref, inlining_data, indexer_hex]``; the inline indexer
+    decode populates ``data_offset`` / ``data_len`` / ``is_overlong`` on
+    the metadata dict (and is the only authoritative source for the
+    record's overlong flag on the matched arm, since no separate index
+    file tracks per-variant data positions).
     """
     text = section_data.strip() if isinstance(section_data, str) else section_data
     lines = text.split("\n")
     func_name = func_name_override or list(csv.reader([lines[0]]))[0][0]
 
     versions: List[FunctionData] = []
-    header = ["variant_ref", "inlining_data", "data_offset", "data_len"]
     for row in csv.reader(lines[1:]):
         if not row:
             continue
-        metadata = extract_metadata_from_section_row(row, header)
+        metadata = extract_metadata_from_section_row(row, _MATCHED_VARIANT_HEADER)
         variant_row = resolve_ref(metadata["variant_ref"])
         if variant_row is not None:
             for k, v in variant_row.items():
                 metadata.setdefault(k, v)
         insn_rl, block_rl, tokens = data_slice(
-            metadata["data_offset"], metadata["data_len"]
+            metadata["data_offset"],
+            metadata["data_len"],
+            metadata["is_overlong"],
         )
         versions.append(
             FunctionData(
@@ -93,11 +107,44 @@ def parse_matched_section(
     return MatchedFunction(func_name, versions)
 
 
+def parse_unmatched_row(row: List[str]) -> Tuple[List[str], List[str], List[List[int]]]:
+    """Parse a 5-cell unmatched section row into its semantic fields.
+
+    Post matched-arm restructuring the unmatched row layout is
+    ``[line_no_b64, variant_refs, called_b64, inlining, indexer_hex]``:
+
+    * ``line_no_b64`` -- caller resolves to the function name via the
+      function-names sidecar; not consumed here (the session passes the
+      resolved name in separately).
+    * ``variant_refs`` -- semicolon-joined ``0x<hex>`` byte offsets into
+      ``_variants.bin``.
+    * ``called_b64`` -- comma-joined base64 line numbers; this helper
+      surfaces them as the raw base64 strings so the session layer can
+      resolve them through the sidecar (this module stays
+      indirection-agnostic).
+    * ``inlining`` -- comma-joined per-version inlining tuples (parsed
+      via :func:`parse_inlining_data`).
+    * ``indexer_hex`` -- ignored on the unmatched arm because the
+      index file (``unmatched_index.bin``) is the authoritative source
+      for per-version data positions; the cell is kept inline for
+      validator cross-checks and round-trip parity with the matched arm.
+    """
+    variant_refs = [r for r in row[1].split(";") if r] if row[1] else []
+    called_b64s = (
+        [name.replace("\\,", ",") for name in row[2].split(",") if name]
+        if row[2] else []
+    )
+    inlining_data = parse_inlining_data(row[3])
+    return variant_refs, called_b64s, inlining_data
+
+
 def build_unmatched_function_data(
     row: Optional[List[str]],
     idx: int,
+    func_name: str,
     start: int,
     length: int,
+    is_overlong: bool,
     tokens,
     insn_rl,
     block_rl,
@@ -106,31 +153,17 @@ def build_unmatched_function_data(
 ) -> FunctionData:
     """Assemble an unmatched ``FunctionData`` from its CSV row + bytes.
 
-    ``row`` may be ``None`` (CSV row not recoverable) — caller passes
-    the bytes-derived ``start``/``length`` as fallback offset/length.
+    ``row`` may be ``None`` (CSV row not recoverable) -- callers supply
+    the index-derived ``start`` / ``length`` / ``is_overlong`` directly
+    and the metadata dict falls back to "unknown" placeholders. The
+    function name is resolved by the caller (session layer) via the
+    function-names sidecar; this helper never decodes ``line_no_b64``.
     """
-    func_name_default = f"unmatched_{idx}"
     if row is None:
-        func_name = func_name_default
-        platform_info, called, inlining_data = "unknown", [], []
-        data_offset_csv, data_len_csv = start, length
+        variant_refs, called_b64s, inlining_data = [], [], []
     else:
-        func_name = row[0] or func_name_default
-        platform_info = row[1]
-        called = (
-            [name.replace("\\,", ",") for name in row[2].split(",") if name]
-            if row[2] else []
-        )
-        inlining_data = parse_inlining_data(row[3])
-        try:
-            data_offset_csv = int(row[4], 16)
-            data_len_csv = int(row[5], 16)
-        except ValueError:
-            data_offset_csv, data_len_csv = start, length
+        variant_refs, called_b64s, inlining_data = parse_unmatched_row(row)
 
-    variant_refs = (
-        [r for r in platform_info.split(";") if r] if platform_info else []
-    )
     variants = [v for v in (resolve_ref(r) for r in variant_refs) if v is not None]
 
     metadata = {
@@ -138,13 +171,17 @@ def build_unmatched_function_data(
         "compiler": "unknown",
         "compilerversion": "unknown",
         "opt": "unknown",
-        "platform_info": platform_info,
         "variant_refs": variant_refs,
         "variants": variants,
-        "called": called,
+        # ``called`` is exposed as the raw base64 line numbers because
+        # this module does not own the function-names sidecar; the
+        # AlignedDataLoader layer resolves them when callers ask for
+        # human-readable names.
+        "called": called_b64s,
         "inlining_data": inlining_data,
-        "data_offset": data_offset_csv,
-        "data_len": data_len_csv,
+        "data_offset": start,
+        "data_len": length,
+        "is_overlong": is_overlong,
     }
     # Unmatched functions span multiple variants; ``FunctionData.variant_tokens``
     # carries the first resolved variant's prefix (deterministic by section-row

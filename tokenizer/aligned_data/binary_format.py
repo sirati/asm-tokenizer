@@ -132,7 +132,8 @@ def _as_uint8_view(data) -> np.ndarray:
 def extract_arrays_from_data(
     data,
     header: BinaryHeader,
-    is_overlong: bool = False,
+    *,
+    is_overlong: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract insn_runlength, block_runlength, tokens arrays from data given header.
 
@@ -146,17 +147,21 @@ def extract_arrays_from_data(
 
     The pad is skipped purely by arithmetic — the reader never recomputes
     its size and never inspects its bytes (the validator owns that
-    invariant). ``is_overlong`` shifts the body start past the 3-byte
-    overlong-length field; that field's value is resolved independently
-    by the caller (the session layer that decoded the index sentinel),
-    so this function never reads it.
+    invariant). ``is_overlong`` is REQUIRED (keyword-only): callers must
+    derive it from the index-entry sentinel (unmatched arm) or the inline
+    indexer decode (matched arm) -- a silent default would corrupt
+    overlong reads by skipping the 3-byte overlong-length field shift,
+    so the API forces an explicit value. The field itself is resolved
+    independently by the caller (the session layer that decoded the
+    index sentinel), so this function never reads it.
 
     Zero-copy on memmap input: ``data`` is wrapped in a ``uint8`` view
     (``np.memmap`` slices stay memmap-backed; ``bytes`` are exposed via
     ``np.frombuffer`` without copying contents), then the per-array
     slices are produced by ``arr[i:j].view(target_dtype)``. The returned
-    arrays may therefore be views into the original memmap — no
-    record-sized buffer is ever allocated.
+    arrays may therefore be views into the original memmap -- the
+    enclosing ``BinarySession`` copies them on egress so callers receive
+    independent buffers (see ``BinarySession`` class docstring).
     """
     raw = _as_uint8_view(data)
 
