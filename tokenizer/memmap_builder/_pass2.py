@@ -114,11 +114,11 @@ def write_matched_sections_pass2(
             total_len += token_len
 
         avg_len = total_len // len(version_data) if version_data else 0
+        writer.writerow([])
         section_end = sections_file.tell() - content_offset
         pending_index_entries.append(
             (func_name, section_start, section_end - section_start, avg_len)
         )
-        writer.writerow([])
 
     # Length-bucket sort preserved from the previous matched-arm
     # ordering. Pre-v1 layout doesn't change the sort contract -- the
