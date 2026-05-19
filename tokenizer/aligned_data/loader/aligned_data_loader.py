@@ -1,19 +1,34 @@
 """
 AlignedDataLoader class for loading function data across multiple binaries.
 
-This module provides the main interface for loading and sampling function data
-from aligned data files, supporting multiple binaries with flexible filtering
-and sampling strategies.
+Receiver contracts (satisfied by sibling sub-tasks of this batch):
+
+* ``BinaryDataset(base_path, binary_name, vocab_manager=...)`` — accepts the
+  unified ``VocabularyManager`` so variant-axis token IDs resolve against
+  the corpus-wide ID space (5G shell-integrator wires receipt).
+* ``BinaryDataset.open_session() -> BinarySession`` — context manager that
+  lazily opens (and on ``__exit__`` closes) the three per-binary file
+  handles (sections CSV, ``_data.bin`` memmap, ``_variants.bin`` memmap),
+  exposing ``load_matched(idx)`` and ``load_unmatched(idx)`` methods (5C
+  ``session.py`` wires receipt).
+
+Per-binary batching rationale: today's public ``load_matched_function(idx)``
+opens-and-closes all three handles per call. Grouping batch candidates by
+``binary_name`` before entering any session, then doing every load for that
+group inside one ``with binary.open_session()`` block, collapses that to
+one open-and-close set per touched binary. ML-leak discipline is preserved
+because each top-level batch call still drops the handles on exit.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from .binary_dataset import BinaryDataset
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
+from .unified_vocab_gate import load_and_validate_unified_vocab
 
 
 class AlignedDataLoader:
@@ -25,7 +40,8 @@ class AlignedDataLoader:
     - Loading unmatched functions (single version functions)
     - Filtering by token length
     - Random sampling with various strategies
-    - No memmap caching (safe for ML training)
+    - No memmap caching across batches (safe for ML training); within a single
+      batch call, file handles are reused per-binary via ``open_session``.
     """
 
     def __init__(
@@ -35,6 +51,7 @@ class AlignedDataLoader:
         min_length: Optional[int] = None,
         max_length: Optional[int] = None,
         seed: Optional[int] = None,
+        unified_vocab_path: Optional[Path] = None,
     ):
         """
         Initialize data loader.
@@ -45,6 +62,16 @@ class AlignedDataLoader:
             min_length: Minimum token length (inclusive), None for no limit
             max_length: Maximum token length (inclusive), None for no limit
             seed: Random seed for reproducibility
+            unified_vocab_path: Path to the corpus-wide ``unified_vocab.csv``.
+                Defaults to ``base_path / "unified_vocab.csv"``. Loaded once
+                here and threaded into every ``BinaryDataset`` so variant-axis
+                tokens decode through the same ID space the memmap_builder
+                wrote.
+
+        Raises:
+            ValueError: If the unified vocab is missing, unparseable, or its
+                ``format_version`` is not 3. Hard cutover — see
+                ``unified_vocab_gate`` for the rationale.
         """
         self.base_path = Path(base_path)
         self.binary_names = binary_names
@@ -52,8 +79,29 @@ class AlignedDataLoader:
         self.max_length = max_length if max_length is not None else 1_000_000
         self.rng = np.random.default_rng(seed)
 
-        # Load datasets
-        self.datasets = {name: BinaryDataset(self.base_path, name) for name in binary_names}
+        # Resolve unified vocab path with a base-path-relative default; keep
+        # it on the instance for diagnostics.
+        self.unified_vocab_path = (
+            Path(unified_vocab_path)
+            if unified_vocab_path is not None
+            else self.base_path / "unified_vocab.csv"
+        )
+
+        # Load + gate the unified vocab BEFORE constructing any BinaryDataset.
+        # Failing here means no per-binary state ever materialises, so the
+        # caller sees a clean ValueError without partially-initialised state.
+        self.vocab_manager = load_and_validate_unified_vocab(
+            self.unified_vocab_path
+        )
+
+        # Pass the validated vocab into each BinaryDataset (receiver contract
+        # wired by the shell-integrator subtask).
+        self.datasets = {
+            name: BinaryDataset(
+                self.base_path, name, vocab_manager=self.vocab_manager
+            )
+            for name in binary_names
+        }
 
         # Build global indices
         self._build_indices()
@@ -74,18 +122,34 @@ class AlignedDataLoader:
             for idx in indices:
                 self.unmatched_indices.append((binary_name, int(idx)))
 
+    # ------------------------------------------------------------------
+    # Per-binary batching helper
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _group_by_binary(
+        candidates: Sequence[Tuple[str, int]],
+    ) -> Dict[str, List[int]]:
+        """Group ``(binary_name, func_idx)`` pairs by ``binary_name``.
+
+        Insertion-ordered dict (Python 3.7+ guarantee) preserves the random
+        sampling order across binaries; per-binary index lists keep the
+        order they were sampled in, so deterministic seeds stay
+        deterministic.
+        """
+        grouped: Dict[str, List[int]] = {}
+        for binary_name, func_idx in candidates:
+            grouped.setdefault(binary_name, []).append(int(func_idx))
+        return grouped
+
     def load_matched_functions(self, n: int, target_length: Optional[int] = None) -> List[MatchedFunction]:
         """
         Load N random matched functions of the same or similar length.
 
         Uses pre-computed edge indices for O(1) lookup without searching.
-
-        Args:
-            n: Number of functions to load
-            target_length: Target token length, or None to pick random length
-
-        Returns:
-            List of MatchedFunction objects
+        Groups selected candidates by ``binary_name`` before entering any
+        session; iterates groups serially with one ``binary.open_session()``
+        per group, so per-binary file handles are reused across every load
+        in the group.
         """
         if len(self.matched_indices) == 0:
             return []
@@ -110,7 +174,7 @@ class AlignedDataLoader:
             target_length = self.rng.choice(all_lengths, p=probs)
 
         # Collect candidates from all datasets
-        candidates = []
+        candidates: List[Tuple[str, int]] = []
         # Ensure target_length is set
         if target_length is None:
             target_length = self.min_length
@@ -130,24 +194,24 @@ class AlignedDataLoader:
             return []
 
         selected_idx = self.rng.choice(len(candidates), size=n, replace=False)
+        selected: List[Tuple[str, int]] = [candidates[i] for i in selected_idx]
 
-        functions = []
-        for idx in selected_idx:
-            binary_name, func_idx = candidates[idx]
-            func = self.datasets[binary_name].load_matched_function(func_idx)
-            functions.append(func)
+        # Group BEFORE entering any session so we open at most one session
+        # per touched binary; each group's loads share three file handles.
+        grouped = self._group_by_binary(selected)
+        functions: List[MatchedFunction] = []
+        for binary_name, func_indices in grouped.items():
+            binary = self.datasets[binary_name]
+            with binary.open_session() as sess:
+                for func_idx in func_indices:
+                    functions.append(sess.load_matched(func_idx))
 
         return functions
 
     def load_unmatched_functions(self, n: int) -> List[FunctionData]:
-        """
-        Load N random unmatched functions.
+        """Load N random unmatched functions.
 
-        Args:
-            n: Number of functions to load
-
-        Returns:
-            List of FunctionData objects
+        Same per-binary batching as ``load_matched_functions``.
         """
         if len(self.unmatched_indices) == 0:
             return []
@@ -157,27 +221,25 @@ class AlignedDataLoader:
             return []
 
         selected_idx = self.rng.choice(len(self.unmatched_indices), size=n, replace=False)
+        selected: List[Tuple[str, int]] = [self.unmatched_indices[i] for i in selected_idx]
 
-        functions = []
-        for idx in selected_idx:
-            binary_name, func_idx = self.unmatched_indices[idx]
-            func = self.datasets[binary_name].load_unmatched_function(func_idx)
-            functions.append(func)
+        grouped = self._group_by_binary(selected)
+        functions: List[FunctionData] = []
+        for binary_name, func_indices in grouped.items():
+            binary = self.datasets[binary_name]
+            with binary.open_session() as sess:
+                for func_idx in func_indices:
+                    functions.append(sess.load_unmatched(func_idx))
 
         return functions
 
     def load_random_sections(self, n: int) -> List[Union[FunctionData, MatchedFunction]]:
-        """
-        Load N random function sections (mixed matched and unmatched).
+        """Load N random function sections (mixed matched and unmatched).
 
-        Each matched function is treated as a single unit. The split between matched
-        and unmatched is chosen randomly to avoid bias.
-
-        Args:
-            n: Number of sections to load
-
-        Returns:
-            List containing FunctionData (for unmatched) and MatchedFunction (for matched) objects
+        Each matched function is treated as a single unit. The matched and
+        unmatched batch helpers each do their own per-binary grouping, so
+        the open-session count is bounded by the number of distinct
+        binaries touched across both halves (not by ``n``).
         """
         total_available = len(self.matched_indices) + len(self.unmatched_indices)
         if total_available == 0:
