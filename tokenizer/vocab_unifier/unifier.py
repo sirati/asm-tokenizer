@@ -171,5 +171,5 @@ def unify_vocab(
           f"({loaded_count}/{len(csv_files)} CSVs loaded; "
           f"{n_variants} variant-axis tokens registered)")
     with open(unified_vocab_file, "w", newline="", encoding="ascii") as csvfile:
-        writer = csv.writer(csvfile)
+        writer = csv.writer(csvfile, lineterminator='\n')
         save_vocabulary(unified_vm, writer)

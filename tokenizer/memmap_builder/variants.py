@@ -153,7 +153,7 @@ class VariantRegistry:
 
         with open(csv_path, "w", newline="", encoding="ascii") as csv_handle:
             write_csv_prelude(csv_handle)
-            writer = csv.writer(csv_handle)
+            writer = csv.writer(csv_handle, lineterminator='\n')
             writer.writerow(["filename", "offset"])
             for version in self._ordered_versions:
                 vkey = _vkey_for_version(version)

@@ -52,7 +52,7 @@ def _write_per_binary_csv(csv_path: Path, platform: str) -> None:
         vm.Block_V2(bid)
     with open(csv_path, "w", newline="", encoding="ascii") as fh:
         fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm, writer)
 
 

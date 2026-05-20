@@ -39,7 +39,7 @@ from tokenizer.aligned_data.io import (
 def test_write_function_section_csv_emits_three_cells():
     """Matched-section variant row has exactly 3 cells: ref, inlining, indexer."""
     buf = StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, lineterminator='\n')
     indexer_hex = encode_inline_indexer(0x40, 0x80)
     write_function_section_csv(
         writer,
@@ -63,7 +63,7 @@ def test_write_unmatched_section_csv_emits_six_cells():
     an opaque string.
     """
     buf = StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, lineterminator='\n')
     indexer_hex = encode_inline_indexer(0x100, 0x40)
     write_unmatched_section_csv(
         writer,
@@ -85,7 +85,7 @@ def test_writers_do_not_accept_legacy_offset_length_pair():
     pre-restructuring code.
     """
     buf = StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, lineterminator='\n')
     with pytest.raises(TypeError):
         write_function_section_csv(writer, "0x0", [], 0, 4)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
@@ -103,7 +103,7 @@ def _write_sections_csv_with_prelude(path, sections):
     """
     with open(path, "w", newline="", encoding="ascii") as fh:
         write_csv_prelude(fh)
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         for header_cells, body_rows in sections:
             writer.writerow(header_cells)
             for row in body_rows:
@@ -143,7 +143,7 @@ def test_read_sections_file_missing_prelude_raises(tmp_path):
     """Files written without the prelude must be rejected (hard cutover)."""
     path = tmp_path / "matched_sections.csv"
     with open(path, "w", newline="", encoding="ascii") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         writer.writerow(["foo", "x"])
         writer.writerow(["0x0", "", encode_inline_indexer(0, 4)])
     with pytest.raises(ValueError):

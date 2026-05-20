@@ -90,7 +90,7 @@ def _make_vm(
 
 def _save_to_bytes(vm: VocabularyManager) -> bytes:
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, lineterminator='\n')
     save_vocabulary(vm, writer)
     return buf.getvalue().encode("ascii")
 
@@ -142,7 +142,7 @@ def _craft_unsupported_row(
         row += ["format_version", declared_version]
 
     buf = io.StringIO()
-    csv.writer(buf).writerow(row)
+    csv.writer(buf, lineterminator='\n').writerow(row)
     return buf.getvalue().encode("ascii")
 
 
@@ -285,6 +285,6 @@ def test_saver_rejects_unsupported_format_version() -> None:
     vm.format_version = 99
 
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, lineterminator='\n')
     with pytest.raises(ValueError, match="got 99"):
         save_vocabulary(vm, writer)

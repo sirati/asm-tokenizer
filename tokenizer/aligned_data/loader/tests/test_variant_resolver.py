@@ -56,7 +56,7 @@ def _write_corpus(
     slim_csv_path = tmp_path / "synthetic_variants.csv"
     with open(slim_csv_path, "w", encoding="utf-8", newline="") as f:
         f.write("# format=1\n")
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator='\n')
         writer.writerow(["filename", "offset"])
         for (vi, fname), off in zip(versions, offsets):
             writer.writerow([fname, f"{off:x}"])
@@ -182,7 +182,7 @@ def test_load_variants_offset_to_filename_hex_offset_parse(tmp_path):
     slim_csv_path = tmp_path / "wide.csv"
     with open(slim_csv_path, "w", encoding="utf-8", newline="") as f:
         f.write("# format=1\n")
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator='\n')
         writer.writerow(["filename", "offset"])
         writer.writerow(["a", "0"])
         writer.writerow(["b", "a"])         # 10

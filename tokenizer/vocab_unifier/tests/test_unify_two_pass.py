@@ -59,7 +59,7 @@ def _write_per_binary_csv(
 
     with open(csv_path, "w", newline="", encoding="ascii") as fh:
         fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm, writer)
 
 
@@ -128,7 +128,7 @@ def test_unify_vocab_rejects_v1_per_binary_csv(tmp_path: Path) -> None:
     vm_v1.Block(0)  # legacy v1 block token
     with open(csv_path, "w", newline="", encoding="ascii") as fh:
         fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm_v1, writer)
 
     out_csv = tmp_path / "unified_vocab.csv"

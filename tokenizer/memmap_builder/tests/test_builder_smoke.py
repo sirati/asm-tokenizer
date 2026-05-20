@@ -70,7 +70,7 @@ def _write_per_binary_csv(csv_path: Path, platform: str) -> None:
 
     with open(csv_path, "w", newline="", encoding="ascii") as fh:
         fh.write(_PADDING_LINE)
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm, writer)
 
 
@@ -227,7 +227,7 @@ def test_build_memmap_files_rejects_v2_unified_vocab(tmp_path: Path) -> None:
     # Hand-roll a v2 unified vocab in place of the v3 one.
     vm_v2 = VocabularyManager(platform=None, format_version=2)
     with open(unified_vocab_path, "w", newline="", encoding="ascii") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm_v2, writer)
 
     output_dir = tmp_path / "out"

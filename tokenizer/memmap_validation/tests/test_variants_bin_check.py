@@ -150,7 +150,7 @@ def test_cross_check_flags_missing_filename_in_slim_csv(tmp_path: Path) -> None:
     for row in rows[2:]:
         row[0] = "wrong-filename-" + row[0]
     with open(slim_csv_path, "w", newline="", encoding="ascii") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator='\n')
         writer.writerows(rows)
 
     errors = cross_check_variants_bin(
@@ -225,7 +225,7 @@ def test_validate_memmap_output_rejects_v2_unified_vocab(tmp_path: Path) -> None
     # vocab-load is what we want to fail.
     vm_v2 = VocabularyManager(platform=None, format_version=2)
     with open(output_dir / "unified_vocab.csv", "w", newline="", encoding="ascii") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm_v2, writer)
 
     config = ValidatorConfig(
