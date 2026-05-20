@@ -6,9 +6,10 @@ entry per function -- unmatched functions have a single record) and
 the post-restructuring 5-cell unmatched sections CSV whose first cell
 is a base64 line number into the function-names sidecar.
 
-Per-record ``is_overlong`` is derived from the v1 sentinel marker
-(``stored_length == SENTINEL_LENGTH``) at load time; downstream
-consumers never re-encode the sentinel rule.
+Records are self-describing in ``_data.bin`` (the record header
+carries ``token_count``), so the index entry is a bare offset and
+there is no length / sentinel / overlong shadow to carry on the
+loader side.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from tokenizer.aligned_data.csv_format import parse_function_line_no
-from tokenizer.aligned_data.index_format import SENTINEL_LENGTH
 
 
 def _walk_unmatched_rows(
@@ -94,32 +94,22 @@ def load_unmatched_arm(
 
     if not paths.index_bin.exists():
         return _empty_arm()
-    starts, lengths, avg_lengths = load_index_once(paths.index_bin)
-    if starts is None or avg_lengths is None or lengths is None:
+    starts = load_index_once(paths.index_bin)
+    if starts is None:
         return _empty_arm()
 
-    is_overlong = (lengths == SENTINEL_LENGTH)
-    real_lengths = load_unmatched_lengths(paths, starts, lengths)
-    if len(real_lengths) > 0:
-        edge_indices, count_per_length = build_length_lookup_tables(
-            real_lengths, scale_factor=1
-        )
-    else:
-        edge_indices = np.zeros(1, dtype=np.int32)
-        count_per_length = np.zeros(1, dtype=np.int32)
+    token_counts = load_unmatched_lengths(paths, starts)
+    edge_indices, count_per_length = build_length_lookup_tables(
+        token_counts, scale_factor=1
+    )
 
     func_names, section_starts = _walk_unmatched_rows(
         paths, line_to_name, open_sections_csv
     )
     return SectionArm(
         starts=starts,
-        lengths=lengths,
         edge_indices=edge_indices,
         count_per_length=count_per_length,
         func_names=func_names,
         section_starts=section_starts,
-        csv_starts=section_starts,
-        csv_lengths=np.zeros(0, dtype=np.uint32),
-        avg_lengths=avg_lengths,
-        is_overlong=is_overlong,
     )

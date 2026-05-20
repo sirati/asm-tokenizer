@@ -148,21 +148,17 @@ def open_sections_csv(path: Path) -> Tuple[TextIO, int]:
     return f, f.tell()
 
 
-def load_index_once(
-    index_path: Path,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-    """Load a v1 ``*_index.bin`` into ``(starts, lengths, avg_lengths)``.
+def load_index_once(index_path: Path) -> Optional[np.ndarray]:
+    """Load a v1 ``*_index.bin`` into a single int64 ndarray of offsets.
 
-    Missing file -> ``(None, None, None)``. Delegates to
+    Missing file (or zero-entry file) -> ``None``. Delegates to
     :func:`read_index_arrays` which owns the wire format (16-byte
-    prelude, alignment shift, sentinel marker). ``starts`` are real
-    byte offsets (``int64``); ``lengths`` are real record byte lengths
-    (``uint32``) with ``0`` flagging an overlong record.
+    prelude, alignment shift). The returned array contains the real
+    ``_data.bin`` byte offsets (``stored << alignment_shift``); records
+    are self-describing in ``_data.bin`` so the index entry no longer
+    carries a length or sentinel field.
     """
-    arrays = read_index_arrays(index_path)
-    if arrays is None:
-        return None, None, None
-    return arrays
+    return read_index_arrays(index_path)
 
 
 def build_length_lookup_tables(
