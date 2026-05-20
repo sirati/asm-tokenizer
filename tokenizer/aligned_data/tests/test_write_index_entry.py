@@ -1,12 +1,16 @@
-"""Tests for ``tokenizer.aligned_data.io.write_index_entry``.
+"""Tests for ``tokenizer.aligned_data._writers.write_index_entry``.
 
-Covers the v1 index-entry packing — u40 ``offset_shifted`` plus u16
-``length_shifted`` plus u8 ``avg_len`` — and the sentinel transition at
-the 256 KiB / 64 MiB boundaries. Cap violations raise
-:class:`IndexEntrySkip`; when an ``error_log`` is supplied the
-exception is logged and the entry is skipped. Alignment / zero-length
+Each entry is one ``u32 = offset >> ALIGNMENT_SHIFT`` (4 bytes total).
+Records are self-describing in ``_data.bin`` so no length, no avg_len,
+no overlong sentinel. The writer is a thin wrapper over
+:func:`tokenizer.aligned_data.index_format.pack_index_entry` and shares
+its cap (~64 GiB per binary at the current 16-byte record alignment)
+and its alignment invariant (offsets must be 16-byte aligned).
+
+Cap violations raise :class:`IndexEntrySkip`; when an ``error_log`` is
+supplied the exception is logged and the entry is skipped. Alignment
 violations are programmer errors and raise :class:`AssertionError`
-without logging.
+without logging (same policy as the data-record writer).
 """
 
 from __future__ import annotations
@@ -16,29 +20,25 @@ import struct
 
 import pytest
 
-from tokenizer.aligned_data.binary_format import IndexEntrySkip
-from tokenizer.aligned_data.index_format import SENTINEL_LENGTH
-from tokenizer.aligned_data.io import write_index_entry
+from tokenizer.aligned_data.binary_format import IndexEntrySkip, RECORD_ALIGNMENT
+from tokenizer.aligned_data.index_format import (
+    ALIGNMENT_SHIFT,
+    INDEX_ENTRY_SIZE,
+)
+from tokenizer.aligned_data._writers import write_index_entry
 
-# Convenience caps mirroring the writer's private constants. Kept here
-# so test failures point at intent ("at the 256 KiB boundary") not at
-# raw hex.
-MAX_NORMAL_LENGTH = 0xFFFF << 2  # 262_140 bytes ≈ 256 KiB
-OVERLONG_CAP = 0xFFFFFF << 2     # 67_108_860 bytes ≈ 64 MiB
-MAX_OFFSET = ((1 << 40) - 1) << 2  # ~4 TiB
+# Convenience cap mirroring the codec's private constant. Kept here so
+# test failures point at intent ("at the 64 GiB boundary") not at raw
+# hex; pinning to the same arithmetic also makes the test independent
+# of how the codec spells its private constant.
+MAX_OFFSET = ((1 << 32) - 1) << ALIGNMENT_SHIFT  # ~64 GiB
 
 
-def _unpack_entry(raw: bytes) -> tuple[int, int, int]:
-    """Decode the 8-byte entry into ``(offset_shifted, length_field, avg_len)``.
-
-    The u40 is read by re-padding the low-5-byte slice to a full u64.
-    """
-    assert len(raw) == 8
-    offset_padded = raw[:5] + b"\x00\x00\x00"
-    offset_shifted = struct.unpack("<Q", offset_padded)[0]
-    length_field = struct.unpack("<H", raw[5:7])[0]
-    avg_len = raw[7]
-    return offset_shifted, length_field, avg_len
+def _unpack_entry(raw: bytes) -> int:
+    """Decode the 4-byte entry to its stored ``offset_shifted`` field."""
+    assert len(raw) == INDEX_ENTRY_SIZE
+    (offset_shifted,) = struct.unpack("<I", raw)
+    return offset_shifted
 
 
 # ---------------------------------------------------------------------------
@@ -46,74 +46,26 @@ def _unpack_entry(raw: bytes) -> tuple[int, int, int]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("start", [0, 4, 8, 1024])
-@pytest.mark.parametrize("length", [8, 64, 100_000, MAX_NORMAL_LENGTH])
-@pytest.mark.parametrize("avg_len", [0, 16, 4096])
-def test_normal_round_trip(start: int, length: int, avg_len: int):
-    """Every combination in the normal regime packs back to its inputs."""
+@pytest.mark.parametrize(
+    "offset",
+    [0, RECORD_ALIGNMENT, RECORD_ALIGNMENT * 2, 1024, MAX_OFFSET],
+)
+def test_round_trip(offset: int):
+    """Every aligned offset packs back to its ``offset >> ALIGNMENT_SHIFT``."""
     buf = io.BytesIO()
-    write_index_entry(buf, start, length, avg_len)
-
-    offset_shifted, length_field, avg_byte = _unpack_entry(buf.getvalue())
-
-    assert offset_shifted == start >> 2
-    assert length_field == length >> 2
-    assert length_field != SENTINEL_LENGTH  # all picked values stay in normal regime
-    assert avg_byte == min(avg_len >> 4, 255)
+    write_index_entry(buf, offset)
+    offset_shifted = _unpack_entry(buf.getvalue())
+    assert offset_shifted == offset >> ALIGNMENT_SHIFT
 
 
-def test_writer_advances_exactly_eight_bytes():
-    """The entry width is fixed at 8 bytes; the writer must not over- or
-    under-write. The internal post-write assertion guards this in
-    production; the test pins the externally-observable consequence so
-    a future "optimisation" doesn't regress the on-wire size."""
+def test_writer_advances_exactly_four_bytes():
+    """Pin the on-wire entry width so a future "optimisation" can't
+    silently regress it."""
     buf = io.BytesIO()
     before = buf.tell()
-    write_index_entry(buf, 4, 8, 16)
-    assert buf.tell() - before == 8
-
-
-# ---------------------------------------------------------------------------
-# Sentinel transitions
-# ---------------------------------------------------------------------------
-
-
-def test_max_normal_length_is_not_sentinel():
-    """``length == 0xFFFF << 2`` is the LAST normal value: it packs into
-    ``length_field = 0xFFFF`` which is distinct from the
-    ``SENTINEL_LENGTH == 0x0000`` flag."""
-    buf = io.BytesIO()
-    write_index_entry(buf, 0, MAX_NORMAL_LENGTH, 0)
-    _, length_field, _ = _unpack_entry(buf.getvalue())
-    assert length_field == 0xFFFF
-    assert length_field != SENTINEL_LENGTH
-
-
-def test_first_overlong_length_triggers_sentinel():
-    """The next 4-aligned step above ``0xFFFF << 2`` crosses into the
-    overlong regime, stamping the sentinel in ``length_field``."""
-    overlong_length = MAX_NORMAL_LENGTH + 4
-    buf = io.BytesIO()
-    write_index_entry(buf, 0, overlong_length, 0)
-    _, length_field, _ = _unpack_entry(buf.getvalue())
-    assert length_field == SENTINEL_LENGTH
-
-
-def test_one_mib_length_is_overlong_sentinel():
-    """A real length of 1 MiB sits well inside the overlong regime."""
-    buf = io.BytesIO()
-    write_index_entry(buf, 0, 1 << 20, 0)
-    _, length_field, _ = _unpack_entry(buf.getvalue())
-    assert length_field == SENTINEL_LENGTH
-
-
-def test_overlong_at_cap_is_sentinel():
-    """The exact 64 MiB-shifted cap is the LAST acceptable overlong
-    length; it must encode as the sentinel without raising."""
-    buf = io.BytesIO()
-    write_index_entry(buf, 0, OVERLONG_CAP, 0)
-    _, length_field, _ = _unpack_entry(buf.getvalue())
-    assert length_field == SENTINEL_LENGTH
+    write_index_entry(buf, RECORD_ALIGNMENT)
+    assert buf.tell() - before == INDEX_ENTRY_SIZE
+    assert INDEX_ENTRY_SIZE == 4
 
 
 # ---------------------------------------------------------------------------
@@ -121,68 +73,37 @@ def test_overlong_at_cap_is_sentinel():
 # ---------------------------------------------------------------------------
 
 
-def test_overlong_cap_raise_without_error_log():
-    """One 4-byte step past the overlong cap raises
-    :class:`IndexEntrySkip` when no log handle is supplied."""
-    over_cap = OVERLONG_CAP + 4
-    buf = io.BytesIO()
-    with pytest.raises(IndexEntrySkip) as info:
-        write_index_entry(buf, 0, over_cap, 0)
-    assert info.value.reason == "overlong_length_overflow"
-    assert info.value.value == over_cap
-    # No partial write: the entry-encoding raises BEFORE writing.
-    assert buf.tell() == 0
-
-
-def test_overlong_cap_logs_when_error_log_supplied():
-    """With an ``error_log`` handle, the exception is logged and the
-    writer returns ``None`` without advancing the index file."""
-    over_cap = OVERLONG_CAP + 4
-    buf = io.BytesIO()
-    log = io.StringIO()
-    result = write_index_entry(
-        buf, 0, over_cap, 0, func_name="myfunc", error_log=log,
-    )
-    assert result is None
-    assert buf.tell() == 0  # no bytes appended
-
-    log_text = log.getvalue()
-    assert log_text.count("\n") == 1
-    fields = log_text.rstrip("\n").split("\t")
-    assert fields[0] == "overlong_length_overflow"
-    assert fields[1] == "myfunc"
-    assert int(fields[2]) == over_cap
-
-
 def test_offset_cap_raise_without_error_log():
-    """A start above ``(2**40 - 1) << 2`` overflows the u40 offset and
-    raises :class:`IndexEntrySkip`."""
-    over_offset = 1 << 44  # > MAX_OFFSET (~4 TiB), still 4-aligned
-    assert over_offset > MAX_OFFSET
+    """One ``RECORD_ALIGNMENT`` step past the cap raises
+    :class:`IndexEntrySkip` when no log handle is supplied."""
+    over_cap = MAX_OFFSET + RECORD_ALIGNMENT
     buf = io.BytesIO()
     with pytest.raises(IndexEntrySkip) as info:
-        write_index_entry(buf, over_offset, 8, 0)
+        write_index_entry(buf, over_cap)
     assert info.value.reason == "offset_overflow"
-    assert info.value.value == over_offset
+    assert info.value.value == over_cap
+    # No partial write: the packer raises BEFORE writing.
     assert buf.tell() == 0
 
 
 def test_offset_cap_logs_when_error_log_supplied():
-    """With ``error_log`` supplied, the offset-cap path logs and skips
-    without writing."""
-    over_offset = 1 << 44
+    """With an ``error_log`` handle, the exception is logged and the
+    writer returns ``None`` without advancing the index file."""
+    over_cap = MAX_OFFSET + RECORD_ALIGNMENT
     buf = io.BytesIO()
     log = io.StringIO()
     result = write_index_entry(
-        buf, over_offset, 8, 0, func_name="bigfn", error_log=log,
+        buf, over_cap, func_name="bigfn", error_log=log,
     )
     assert result is None
     assert buf.tell() == 0
 
-    fields = log.getvalue().rstrip("\n").split("\t")
+    log_text = log.getvalue()
+    assert log_text.count("\n") == 1
+    fields = log_text.rstrip("\n").split("\t")
     assert fields[0] == "offset_overflow"
     assert fields[1] == "bigfn"
-    assert int(fields[2]) == over_offset
+    assert int(fields[2]) == over_cap
 
 
 # ---------------------------------------------------------------------------
@@ -190,35 +111,21 @@ def test_offset_cap_logs_when_error_log_supplied():
 # ---------------------------------------------------------------------------
 
 
-def test_unaligned_start_asserts():
+@pytest.mark.parametrize("bad_offset", [1, 3, 5, 7, 15])
+def test_unaligned_offset_asserts(bad_offset: int):
     """Misaligned offsets reveal a writer bug; raise unconditionally."""
     buf = io.BytesIO()
     with pytest.raises(AssertionError):
-        write_index_entry(buf, 5, 8, 0)
-
-
-def test_unaligned_length_asserts():
-    """Misaligned lengths reveal a writer bug; raise unconditionally."""
-    buf = io.BytesIO()
-    with pytest.raises(AssertionError):
-        write_index_entry(buf, 0, 7, 0)
-
-
-def test_zero_length_asserts():
-    """A real length of 0 is impossible: the smallest padded record is
-    8 bytes. Treat as a programmer error."""
-    buf = io.BytesIO()
-    with pytest.raises(AssertionError):
-        write_index_entry(buf, 0, 0, 0)
+        write_index_entry(buf, bad_offset)
 
 
 def test_alignment_error_not_logged_even_with_error_log():
     """Programmer errors must bubble up even when an ``error_log`` is
-    available — they're never appropriate to log + skip silently."""
+    available -- they're never appropriate to log + skip silently."""
     buf = io.BytesIO()
     log = io.StringIO()
     with pytest.raises(AssertionError):
-        write_index_entry(buf, 5, 8, 0, func_name="bug", error_log=log)
+        write_index_entry(buf, 5, func_name="bug", error_log=log)
     assert log.getvalue() == ""
 
 
@@ -228,13 +135,11 @@ def test_alignment_error_not_logged_even_with_error_log():
 
 
 def test_bit_exact_byte_layout():
-    """Pin a known triple to its on-wire bytes so a structural mistake
-    (endianness, field order, slice off-by-one) is caught immediately.
+    """Pin a known offset to its on-wire bytes so a structural mistake
+    (endianness, slice off-by-one) is caught immediately.
 
-    ``start=4``  → ``offset_shifted=1``  → ``\\x01\\x00\\x00\\x00\\x00``
-    ``length=8`` → ``length_field=2``    → ``\\x02\\x00``
-    ``avg=32``   → ``avg_clamped=2``     → ``\\x02``
+    ``offset=16`` → ``offset_shifted=1`` → ``\\x01\\x00\\x00\\x00``
     """
     buf = io.BytesIO()
-    write_index_entry(buf, 4, 8, 32)
-    assert buf.getvalue() == b"\x01\x00\x00\x00\x00\x02\x00\x02"
+    write_index_entry(buf, RECORD_ALIGNMENT)
+    assert buf.getvalue() == b"\x01\x00\x00\x00"

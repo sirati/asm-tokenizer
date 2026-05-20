@@ -1,40 +1,33 @@
-"""Binary-format writers split out of ``io.py`` to keep that module
-under the 300 LOC cap.
+"""Binary-format writers split out of ``io.py`` to keep that module focused.
 
-Single concern: encode one function record into ``_data.bin`` and one
-8-byte index entry into ``_index.bin``, including the pad-and-overlong
-layout decisions and the cap-overflow / error-log handling. Re-exported
-from ``tokenizer.aligned_data.io`` so external callers keep the existing
-import path.
+Single concern: encode ONE function record into ``_data.bin`` and ONE
+4-byte index entry into ``_index.bin``. Each record is self-describing
+via :class:`~tokenizer.aligned_data.binary_format.BinaryHeader` so the
+index entry shrinks to a 16-byte-aligned offset only; length and the
+former overlong escape are gone. Cap-overflow handling mirrors the
+project's "log + skip + continue build" policy (see
+:func:`tokenizer.memmap_builder.error_log.write_error_log_entry`).
+
+Re-exported from :mod:`tokenizer.aligned_data.io` so external callers
+keep the existing import path.
 """
-import struct
+
+from __future__ import annotations
 
 import numpy as np
 
 from .binary_format import (
-    HEADER_BYTES,
-    OVERLONG_FIELD_BYTES,
+    BinaryHeader,
+    BinaryHeaderFormat,
     IndexEntrySkip,
-    compute_pad,
+    RECORD_ALIGNMENT,
+    derive_pad_placement,
     determine_block_encoding,
     encode_binary_header,
-    pack_avg_len_bucket,
+    parse_binary_header,
+    record_total_size,
 )
-from .index_format import MAX_NORMAL_REAL_LENGTH, SENTINEL_LENGTH
-
-# Per-record body prefix sizes for the writer's total-length arithmetic
-# (single-source-of-truth shared with binary_format's reader path).
-_NORMAL_PREFIX_BYTES = HEADER_BYTES
-_OVERLONG_PREFIX_BYTES = HEADER_BYTES + OVERLONG_FIELD_BYTES
-
-# Caps derived from the on-wire entry layout (see ``index_format.py``).
-# offset is stored as the low 5 bytes of a u64 (u40); length is u16 of
-# the shifted real length, with the value 0x0000 reserved as the sentinel
-# that flags an overlong record (real length carried in ``_data.bin``).
-_MAX_OFFSET_SHIFTED = (1 << 40) - 1
-_MAX_NORMAL_LENGTH_SHIFTED = 0xFFFF
-_MAX_OVERLONG_REAL_LENGTH = 0xFFFFFF << 2  # 67,108,860 bytes (~64 MiB)
-_INDEX_ENTRY_SIZE = 8
+from .index_format import INDEX_ENTRY_SIZE, pack_index_entry
 
 
 def write_function_binary_data(
@@ -47,141 +40,121 @@ def write_function_binary_data(
     func_name: str = "",
     error_log=None,
 ):
-    """Write one function record (pad-aligned, overlong-aware).
+    """Write one function record at the current file position.
 
-    Returns ``(data_offset, data_len)`` on success. On
-    :class:`IndexEntrySkip` from the encode path the partial write is
-    truncated and ``None`` is returned so the caller skips the index
-    entry; if ``error_log`` is provided the skip reason is logged.
+    The record body is laid out exactly as
+    :func:`~tokenizer.aligned_data.binary_format.derive_pad_placement`
+    prescribes (self-describing header, optional pre-pad, block words,
+    optional post-pad, tokens) so the total is always a multiple of
+    :data:`RECORD_ALIGNMENT` (= 16). The writer never asks the caller to
+    pre-compute the geometry -- it builds a :class:`BinaryHeader`,
+    encodes it, derives pad placement, and writes the body in one shot.
+
+    Returns the data-bin byte offset of the new record on success.
+    On :class:`IndexEntrySkip` (insn_len / block_word_count /
+    token_count cap overflow from
+    :func:`~tokenizer.aligned_data.binary_format.encode_binary_header`)
+    the partial write is truncated back to the pre-call position and
+    ``None`` is returned; ``error_log`` (when supplied) receives one
+    TSV row naming the offending field, the function name, and the
+    offending value. With ``error_log=None`` the exception re-raises so
+    the caller can decide a different policy.
+
+    ``dedup_cache`` (optional ``dict``) is keyed by ``(insn_bytes,
+    block_bytes, tokens_bytes)`` and short-circuits to the cached
+    offset on hit; skipped writes are never cached.
     """
-    cache_key = None
-    if dedup_cache is not None:
-        cache_key = (
-            tokens.tobytes(),
-            block_runlength.tobytes(),
-            insn_runlength.tobytes(),
-        )
-        if cache_key in dedup_cache:
-            return dedup_cache[cache_key]
-
-    data_offset = file2.tell()
     insn_bytes = insn_runlength.astype(np.uint8).tobytes()
     block_enc = determine_block_encoding(block_runlength)
-    block_bytes = block_runlength.astype(
-        [np.uint8, np.uint16, np.uint32][block_enc]
-    ).tobytes()
+    block_dtype = (np.uint8, np.uint16, np.uint32)[block_enc]
+    block_bytes = block_runlength.astype(block_dtype).tobytes()
+    tokens_bytes = tokens.tobytes()
+
+    cache_key = None
+    if dedup_cache is not None:
+        cache_key = (insn_bytes, block_bytes, tokens_bytes)
+        cached = dedup_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    data_offset = file2.tell()
     insn_len = len(insn_bytes)
-    block_len = len(block_bytes)
+    block_word_count = len(block_runlength)
     token_count = len(tokens)
 
+    # Header.format is informational; encode_binary_header re-derives the
+    # canonical (shortest) form via the strict ultrashort predicate so
+    # handing it ``Normal`` unconditionally still emits ultrashort when
+    # eligible. Keeping that dispatch in ONE place (the encoder) means
+    # this writer never reimplements the predicate.
+    header = BinaryHeader(
+        format=BinaryHeaderFormat.Normal,
+        block_enc=block_enc,
+        insn_len=insn_len,
+        block_word_count=block_word_count,
+        token_count=token_count,
+    )
+
     try:
-        # Pick normal vs overlong layout from the would-be total length.
-        pad_normal = compute_pad(insn_len, block_len, token_count, is_overlong=False)
-        total_normal = _NORMAL_PREFIX_BYTES + insn_len + pad_normal + block_len + 2 * token_count
-        if total_normal <= MAX_NORMAL_REAL_LENGTH:
-            is_overlong = False
-            pad_size = pad_normal
-            total = total_normal
-        else:
-            pad_long = compute_pad(insn_len, block_len, token_count, is_overlong=True)
-            total_long = _OVERLONG_PREFIX_BYTES + insn_len + pad_long + block_len + 2 * token_count
-            if total_long > _MAX_OVERLONG_REAL_LENGTH:
-                raise IndexEntrySkip("overlong_length_overflow", total_long)
-            is_overlong = True
-            pad_size = pad_long
-            total = total_long
+        header_bytes = encode_binary_header(header)
+        # ``encode_binary_header`` canonicalises the form (a Normal-tagged
+        # header that fits ultrashort is emitted in ultrashort form), so the
+        # parsed-back header is the one whose ``format`` field matches the
+        # bytes on disk. Geometry helpers (``derive_pad_placement`` /
+        # ``record_total_size``) key on ``header.format``; using the parsed
+        # version keeps writer and reader on the same dataclass instance --
+        # one source of truth for the on-disk geometry.
+        canonical_header, _prefix_bytes = parse_binary_header(header_bytes)
+        pre_pad, post_pad = derive_pad_placement(canonical_header)
+        total = record_total_size(canonical_header)
 
-        header = encode_binary_header(insn_len, block_enc, block_len, pad_size=pad_size)
-        file2.write(header)
-        if is_overlong:
-            file2.write(struct.pack("<I", total >> 2)[0:3])
+        file2.write(header_bytes)
         file2.write(insn_bytes)
-        file2.write(b"\x00" * pad_size)
+        if pre_pad:
+            file2.write(b"\x00" * pre_pad)
         file2.write(block_bytes)
-        file2.write(tokens.tobytes())
+        if post_pad:
+            file2.write(b"\x00" * post_pad)
+        file2.write(tokens_bytes)
 
-        data_len = file2.tell() - data_offset
-        assert data_len == total, (data_len, total)
-        assert data_len % 4 == 0, data_len
+        written = file2.tell() - data_offset
+        assert written == total, (written, total)
+        assert written % RECORD_ALIGNMENT == 0, written
     except IndexEntrySkip as exc:
         file2.seek(data_offset)
         file2.truncate()
-        if error_log is not None:
-            # Lazy import: ``tokenizer.memmap_builder`` package init pulls
-            # back into ``aligned_data``; a top-level import would cycle.
-            from tokenizer.memmap_builder.error_log import write_error_log_entry
-            write_error_log_entry(error_log, exc.reason, func_name, exc.value)
+        if error_log is None:
+            raise
+        # Lazy import: ``tokenizer.memmap_builder`` package init pulls
+        # back into ``aligned_data``; a top-level import would cycle.
+        from tokenizer.memmap_builder.error_log import write_error_log_entry
+
+        write_error_log_entry(error_log, exc.reason, func_name, exc.value)
         return None
 
-    result = (data_offset, data_len)
     if dedup_cache is not None:
-        dedup_cache[cache_key] = result
-    return result
-
-
-def pack_v1_entry(offset: int, length: int, avg_len: int) -> bytes:
-    """Pack one 8-byte v1 index entry: u40 offset_shifted, u16 length_shifted, u8 avg_len.
-
-    Pure function. Single source of truth for the on-wire 8-byte v1
-    entry layout. Both ``write_index_entry`` (writes to ``_index.bin``)
-    and ``inline_indexer.encode_inline_indexer`` (hex-embeds the entry
-    inline in ``matched_sections.csv``) call into this packer so the
-    layout exists in exactly one place.
-
-    ``offset`` and ``length`` are shifted right by 2 (4-byte record
-    alignment is a writer invariant). A real length above
-    ``MAX_NORMAL_REAL_LENGTH`` (~256 KiB) is encoded with sentinel
-    ``length_shifted == SENTINEL_LENGTH``; the real length then lives
-    in the u24-shifted overlong field of the matching ``_data.bin``
-    record (cap ~64 MiB). On cap violation :class:`IndexEntrySkip` is
-    raised so callers can decide between logging-and-skipping vs
-    propagating. Alignment violations are programmer errors and raise
-    :class:`AssertionError`.
-    """
-    assert offset % 4 == 0, f"index entry offset must be 4-byte aligned; got {offset}"
-    assert length % 4 == 0, f"index entry length must be 4-byte aligned; got {length}"
-    assert length > 0, "index entry length must be > 0 (minimum padded record is 8 bytes)"
-
-    offset_shifted = offset >> 2
-    if offset_shifted > _MAX_OFFSET_SHIFTED:
-        raise IndexEntrySkip("offset_overflow", offset)
-
-    length_shifted = length >> 2
-    if length_shifted <= _MAX_NORMAL_LENGTH_SHIFTED:
-        length_field = length_shifted
-    else:
-        if length > _MAX_OVERLONG_REAL_LENGTH:
-            raise IndexEntrySkip("overlong_length_overflow", length)
-        length_field = SENTINEL_LENGTH
-
-    avg_len_clamped = pack_avg_len_bucket(avg_len)
-    # Low 5 bytes of a u64 LE = u40 LE on the wire.
-    return (
-        struct.pack("<Q", offset_shifted)[:5]
-        + struct.pack("<H", length_field)
-        + struct.pack("B", avg_len_clamped)
-    )
+        dedup_cache[cache_key] = data_offset
+    return data_offset
 
 
 def write_index_entry(
     file3,
-    start: int,
-    length: int,
-    avg_len: int,
+    offset: int,
     *,
     func_name: str = "",
     error_log=None,
 ) -> None:
-    """Write one 8-byte index entry; thin wrapper over :func:`pack_v1_entry`.
+    """Write one 4-byte index entry; thin wrapper over :func:`pack_index_entry`.
 
-    On cap violation :class:`IndexEntrySkip` propagates; when
-    ``error_log`` is supplied the exception is logged and the function
-    returns ``None`` (no entry written). ``func_name`` is logged so the
-    offending function is recoverable. Alignment violations are
-    programmer errors and raise :class:`AssertionError` (never logged).
+    On :class:`IndexEntrySkip` (offset above the ~64 GiB cap): with
+    ``error_log`` supplied the exception is logged and the function
+    returns without writing; without ``error_log`` it propagates.
+    Alignment violations (``offset`` not a multiple of
+    :data:`RECORD_ALIGNMENT`) are programmer errors and raise
+    :class:`AssertionError` unconditionally -- never logged.
     """
     try:
-        entry_bytes = pack_v1_entry(start, length, avg_len)
+        entry_bytes = pack_index_entry(offset)
     except IndexEntrySkip as exc:
         if error_log is None:
             raise
@@ -194,6 +167,7 @@ def write_index_entry(
 
     before = file3.tell()
     file3.write(entry_bytes)
-    assert file3.tell() - before == _INDEX_ENTRY_SIZE, (
-        f"index entry wrote {file3.tell() - before} bytes; expected {_INDEX_ENTRY_SIZE}"
+    assert file3.tell() - before == INDEX_ENTRY_SIZE, (
+        f"index entry wrote {file3.tell() - before} bytes; "
+        f"expected {INDEX_ENTRY_SIZE}"
     )

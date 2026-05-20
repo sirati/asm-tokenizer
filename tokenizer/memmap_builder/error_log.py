@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 ALLOWED_REASONS: frozenset[str] = frozenset(
     {
         "insn_len_overflow",
-        "block_len_overflow",
-        "overlong_length_overflow",
+        "block_word_count_overflow",
+        "token_count_overflow",
         "offset_overflow",
         "csv_offset_overflow",
         "csv_length_overflow",

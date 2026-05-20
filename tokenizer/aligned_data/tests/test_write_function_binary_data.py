@@ -1,202 +1,309 @@
 """Round-trip + cap-overflow tests for ``write_function_binary_data``.
 
-The writer is the only producer of ``_data.bin`` records; correctness here
-is the foundation that the reader-side tests (2A) consume. These tests use
-byte-level inspection (small local layout helper) instead of routing
-through ``extract_arrays_from_data`` so pad-awareness on the read side is
-not a prerequisite for this suite to pass.
+The writer is the sole producer of ``_data.bin`` records; correctness
+here is the foundation that the reader-side tests consume. The new
+self-describing record header carries ``insn_len``,
+``block_word_count`` and ``token_count`` -- callers no longer hand the
+writer a precomputed length and the writer no longer surfaces one (the
+return value is just the data-bin offset). Records always align to 16
+bytes; pad placement is fully derivable from the header via
+:func:`derive_pad_placement`.
+
+We assert round-trip fidelity by reading back via
+:func:`extract_arrays_from_data` (the read-side helper covered by 0A's
+own tests, so this test is testing the writer-as-producer, not
+re-testing the reader). Both the ultrashort form (small records, block
+words implicit u8) and the normal form (all 4 token-width tags +
+``block_enc`` ∈ {0,1,2}) are exercised.
 """
 
 from __future__ import annotations
 
 import io as stdio
 import random
-import struct
 
 import numpy as np
 import pytest
 
 from tokenizer.aligned_data.binary_format import (
-    HEADER_BYTES,
-    OVERLONG_FIELD_BYTES,
-    compute_pad,
+    BLOCK_WORD_SIZE,
+    NORMAL_TOKEN_CAPS,
+    RECORD_ALIGNMENT,
+    ULTRASHORT_BLOCK_CAP,
+    ULTRASHORT_INSN_CAP,
+    ULTRASHORT_TOKENS_CAP,
+    BinaryHeaderFormat,
+    IndexEntrySkip,
+    derive_pad_placement,
     determine_block_encoding,
+    extract_arrays_from_data,
     parse_binary_header,
+    record_total_size,
 )
-from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH
-from tokenizer.aligned_data.io import write_function_binary_data
-
-# Overlong cap is a writer-private constant; mirror it here for boundary
-# tests. (Hoisting it to ``index_format`` is out of scope for this dedup.)
-_MAX_OVERLONG_REAL_LENGTH = 0xFFFFFF << 2
+from tokenizer.aligned_data._writers import write_function_binary_data
 
 
-def _make_inputs(insn_len: int, block_enc: int, block_count: int, token_count: int, rng):
+def _make_inputs(
+    insn_len: int,
+    block_enc: int,
+    block_count: int,
+    token_count: int,
+    rng: random.Random,
+):
     """Build the three ndarrays the writer expects."""
     insn = np.frombuffer(rng.randbytes(insn_len), dtype=np.uint8).copy()
-    block_dtype = [np.uint8, np.uint16, np.uint32][block_enc]
-    nbytes = block_count * np.dtype(block_dtype).itemsize
+    block_dtype = (np.uint8, np.uint16, np.uint32)[block_enc]
+    nbytes = block_count * BLOCK_WORD_SIZE[block_enc]
     block = np.frombuffer(rng.randbytes(nbytes), dtype=block_dtype).copy()
     tokens = np.frombuffer(rng.randbytes(token_count * 2), dtype=np.uint16).copy()
     return insn, block, tokens
 
 
-def _parse_written_record(buf: bytes):
-    """Minimal byte-level parser mirroring the writer's layout.
+def _round_trip(insn, block, tokens):
+    """Drive the writer once and slice the bytes back via the read path.
 
-    Returns a dict of the slice-views the writer is claimed to have laid
-    down. Pad bytes are returned verbatim so the test can assert they are
-    ``\\x00``.
+    Returns the parsed header plus the three ndarrays that fall out of
+    :func:`extract_arrays_from_data` so the test can compare element-wise.
     """
-    header = parse_binary_header(buf)
-    offset = HEADER_BYTES
-    overlong_length = None
-    if len(buf) > MAX_NORMAL_REAL_LENGTH:
-        # Total exceeds normal cap; writer must have stamped the u24 overlong
-        # field. The test seeds enough headroom for this branch.
-        overlong_length = int.from_bytes(buf[offset : offset + OVERLONG_FIELD_BYTES], "little") << 2
-        offset += OVERLONG_FIELD_BYTES
-    insn_bytes = buf[offset : offset + header.insn_len]
-    offset += header.insn_len
-    pad_bytes = buf[offset : offset + header.pad_size]
-    offset += header.pad_size
-    block_bytes = buf[offset : offset + header.block_len]
-    offset += header.block_len
-    tokens_bytes = buf[offset:]
-    return {
-        "header": header,
-        "overlong_length": overlong_length,
-        "insn_bytes": insn_bytes,
-        "pad_bytes": pad_bytes,
-        "block_bytes": block_bytes,
-        "tokens_bytes": tokens_bytes,
-    }
+    buf = stdio.BytesIO()
+    result = write_function_binary_data(buf, tokens, block, insn)
+    assert result == 0  # first write lands at offset 0
+    raw = buf.getvalue()
+    assert len(raw) % RECORD_ALIGNMENT == 0
+    header, prefix_bytes = parse_binary_header(raw)
+    insn_out, block_out, tokens_out = extract_arrays_from_data(
+        raw, header, prefix_bytes
+    )
+    return header, insn_out, block_out, tokens_out, raw
+
+
+# ---------------------------------------------------------------------------
+# Ultrashort form (block_enc=0, small fields)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("insn_len", [0, 1, 7, ULTRASHORT_INSN_CAP - 1])
+@pytest.mark.parametrize("block_count", [0, 1, 64, ULTRASHORT_BLOCK_CAP - 1])
+@pytest.mark.parametrize("token_count", [0, 1, 31, ULTRASHORT_TOKENS_CAP - 1])
+def test_ultrashort_round_trip(insn_len: int, block_count: int, token_count: int):
+    """Every combination in the ultrashort regime round-trips bit-exactly."""
+    rng = random.Random((insn_len, block_count, token_count).__hash__())
+    insn, block, tokens = _make_inputs(insn_len, 0, block_count, token_count, rng)
+    header, insn_out, block_out, tokens_out, _ = _round_trip(insn, block, tokens)
+
+    assert header.format is BinaryHeaderFormat.UltraShort
+    assert header.block_enc == 0
+    assert header.insn_len == insn_len
+    assert header.block_word_count == block_count
+    assert header.token_count == token_count
+    assert insn_out.tobytes() == insn.tobytes()
+    assert block_out.tobytes() == block.tobytes()
+    assert tokens_out.tobytes() == tokens.tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Normal form, every block_enc + token-width tag combination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("block_enc", [0, 1, 2])
+def test_normal_form_via_block_enc(block_enc: int):
+    """``block_enc`` ∈ {1, 2} forces the normal form because ultrashort
+    requires block_enc=0; ``block_enc=0`` here uses block_count past the
+    ultrashort cap so the encoder still picks normal."""
+    rng = random.Random(0xC0DE + block_enc)
+    insn_len = 10
+    block_count = ULTRASHORT_BLOCK_CAP if block_enc == 0 else 3
+    token_count = 5
+    insn, block, tokens = _make_inputs(
+        insn_len, block_enc, block_count, token_count, rng
+    )
+    header, insn_out, block_out, tokens_out, _ = _round_trip(insn, block, tokens)
+
+    assert header.format is BinaryHeaderFormat.Normal
+    assert header.block_enc == block_enc
+    assert header.insn_len == insn_len
+    assert header.block_word_count == block_count
+    assert header.token_count == token_count
+    assert insn_out.tobytes() == insn.tobytes()
+    assert block_out.tobytes() == block.tobytes()
+    assert tokens_out.tobytes() == tokens.tobytes()
+
+
+@pytest.mark.parametrize("width_tag", [0, 1, 2])
+def test_normal_form_every_token_width_tag(width_tag: int):
+    """Drive the writer at a token_count that selects each width tag's
+    cap regime. (Tag 3 reaches into u36 territory which would allocate
+    several GiB of token memory; covered by encoder unit tests in 0A.)
+    """
+    rng = random.Random(0xD00D + width_tag)
+    # Pick a token_count that exceeds the prior width's cap so the
+    # encoder must use width_tag (or larger) to encode it.
+    lower_cap = NORMAL_TOKEN_CAPS[width_tag - 1] if width_tag > 0 else 0
+    token_count = max(lower_cap, ULTRASHORT_TOKENS_CAP)  # past ultrashort too
+    insn_len = 3
+    block_count = 4  # past ultrashort_block cap via token_count? no, via tag
+    insn, block, tokens = _make_inputs(insn_len, 0, block_count, token_count, rng)
+    # block_enc=0 but token_count past ultrashort → normal form.
+    header, _, _, tokens_out, _ = _round_trip(insn, block, tokens)
+    assert header.format is BinaryHeaderFormat.Normal
+    assert header.token_count == token_count
+    assert tokens_out.size == token_count
+
+
+# ---------------------------------------------------------------------------
+# Pad placement + 16-byte alignment invariant on random shapes
+# ---------------------------------------------------------------------------
 
 
 def _shape_iter(rng, n):
     """Yield ``n`` random (insn_len, block_enc, block_count, token_count) shapes.
 
-    Distribution covers pad=0/1/2/3 incidents (small shapes hit all four
-    residues) and occasionally pushes total length over the normal cap so
-    the overlong branch gets exercised.
+    Distribution covers ultrashort + normal + several pad residues mod 16.
     """
     for _ in range(n):
-        roll = rng.random()
-        if roll < 0.85:
-            insn_len = rng.randint(0, 200)
-            block_enc = rng.randint(0, 2)
-            block_count = rng.randint(0, 80)
-            token_count = rng.randint(0, 80)
-        else:
-            # Force overlong territory. ~300 KiB of insn bytes is plenty
-            # above the 256 KiB normal cap and well under the 64 MiB
-            # overlong cap.
-            insn_len = rng.randint(300_000, 320_000)
-            block_enc = rng.randint(0, 2)
-            block_count = rng.randint(0, 40)
-            token_count = rng.randint(0, 40)
+        insn_len = rng.randint(0, 200)
+        block_enc = rng.randint(0, 2)
+        block_count = rng.randint(0, 80)
+        token_count = rng.randint(0, 80)
         yield insn_len, block_enc, block_count, token_count
 
 
 def test_round_trip_200_random_shapes():
     rng = random.Random(0xA5A5)
-    overlong_seen = 0
+    seen_ultrashort = 0
+    seen_normal = 0
     for insn_len, block_enc, block_count, token_count in _shape_iter(rng, 200):
-        insn, block, tokens = _make_inputs(insn_len, block_enc, block_count, token_count, rng)
-        buf = stdio.BytesIO()
-        result = write_function_binary_data(buf, tokens, block, insn)
-        assert result is not None
-        offset, length = result
-        assert offset == 0
-        assert length == buf.tell()
-        assert length % 4 == 0
-        # Byte-level inspection.
-        rec = _parse_written_record(buf.getvalue())
-        assert rec["header"].insn_len == insn_len
-        assert rec["header"].block_enc == determine_block_encoding(block)
-        # Block byte-count, not element count.
-        assert rec["header"].block_len == block.nbytes
-        # Pad value must be the one the pure function picks.
-        is_overlong = length > MAX_NORMAL_REAL_LENGTH
-        expected_pad = compute_pad(insn_len, block.nbytes, token_count, is_overlong)
-        assert rec["header"].pad_size == expected_pad
-        assert rec["pad_bytes"] == b"\x00" * expected_pad
-        assert rec["insn_bytes"] == insn.tobytes()
-        assert rec["block_bytes"] == block.tobytes()
-        assert rec["tokens_bytes"] == tokens.tobytes()
-        if is_overlong:
-            assert rec["overlong_length"] == length
-            overlong_seen += 1
-    assert overlong_seen >= 1, "shape distribution should hit the overlong branch"
+        insn, block, tokens = _make_inputs(
+            insn_len, block_enc, block_count, token_count, rng
+        )
+        header, insn_out, block_out, tokens_out, raw = _round_trip(
+            insn, block, tokens
+        )
+
+        assert header.insn_len == insn_len
+        assert header.block_word_count == block_count
+        assert header.token_count == token_count
+        assert header.block_enc == determine_block_encoding(block)
+        assert insn_out.tobytes() == insn.tobytes()
+        assert block_out.tobytes() == block.tobytes()
+        assert tokens_out.tobytes() == tokens.tobytes()
+
+        # Geometry-rule invariants.
+        assert len(raw) == record_total_size(header)
+        assert len(raw) % RECORD_ALIGNMENT == 0
+        pre_pad, post_pad = derive_pad_placement(header)
+        # Pad bytes must be zero where the writer claims it laid them.
+        # Reconstruct slice boundaries from the same rule the reader uses.
+        from tokenizer.aligned_data.binary_format import prefix_bytes_for_header
+
+        prefix = prefix_bytes_for_header(header)
+        insn_end = prefix + header.insn_len
+        block_start = insn_end + pre_pad
+        block_bytes = header.block_word_count * BLOCK_WORD_SIZE[header.block_enc]
+        block_end = block_start + block_bytes
+        tokens_start = block_end + post_pad
+        assert raw[insn_end:block_start] == b"\x00" * pre_pad
+        assert raw[block_end:tokens_start] == b"\x00" * post_pad
+
+        if header.format is BinaryHeaderFormat.UltraShort:
+            seen_ultrashort += 1
+        else:
+            seen_normal += 1
+    assert seen_ultrashort > 0, "shape distribution missed ultrashort form"
+    assert seen_normal > 0, "shape distribution missed normal form"
 
 
-def test_overlong_cap_logs_and_truncates():
-    # ~33.6M uint16 tokens = 67.2 MiB tokens stream, above the 64 MiB cap.
-    huge_tokens = np.zeros(33_600_000, dtype=np.uint16)
-    block = np.zeros(0, dtype=np.uint8)
-    insn = np.zeros(0, dtype=np.uint8)
+def test_writer_appends_one_record_per_call():
+    """Sequential writes append, each leaving the file 16-byte aligned."""
+    rng = random.Random(0xBEEF)
     buf = stdio.BytesIO()
-    # Pre-seed some content so we can assert truncate restored the prior
-    # file position.
-    buf.write(b"\x11" * 4)
-    pre_offset = buf.tell()
-    log = stdio.StringIO()
-    result = write_function_binary_data(
-        buf, huge_tokens, block, insn, func_name="huge_fn", error_log=log
-    )
-    assert result is None
-    assert buf.tell() == pre_offset
-    # File contents preserved up to pre_offset; nothing beyond.
-    assert len(buf.getvalue()) == pre_offset
-    log_text = log.getvalue()
-    assert "overlong_length_overflow" in log_text
-    assert "huge_fn" in log_text
+    offsets = []
+    for insn_len, block_enc, block_count, token_count in _shape_iter(rng, 25):
+        insn, block, tokens = _make_inputs(
+            insn_len, block_enc, block_count, token_count, rng
+        )
+        before = buf.tell()
+        offset = write_function_binary_data(buf, tokens, block, insn)
+        assert offset == before
+        assert buf.tell() % RECORD_ALIGNMENT == 0
+        offsets.append((offset, buf.tell()))
+    # Each record's span is positive and the records do not overlap.
+    for (off, end_pos), (next_off, _) in zip(offsets, offsets[1:]):
+        assert end_pos == next_off
+
+
+# ---------------------------------------------------------------------------
+# Cap-overflow propagation + error_log + truncate-on-skip
+# ---------------------------------------------------------------------------
 
 
 def test_insn_len_cap_logs_and_truncates():
-    insn = np.zeros(1 << 24, dtype=np.uint8)  # exactly at cap → guard fires
+    """``insn_len >= NORMAL_INSN_CAP`` (= 1<<24) is the smallest insn-len
+    overflow; encoder raises ``insn_len_overflow`` and the writer logs +
+    truncates back to the pre-call file position."""
+    insn = np.zeros(1 << 24, dtype=np.uint8)
     block = np.zeros(0, dtype=np.uint8)
     tokens = np.zeros(0, dtype=np.uint16)
     buf = stdio.BytesIO()
+    buf.write(b"\x11" * 4)  # pre-existing bytes; truncate must preserve
     pre_offset = buf.tell()
     log = stdio.StringIO()
+
     result = write_function_binary_data(
         buf, tokens, block, insn, func_name="big_insn", error_log=log
     )
     assert result is None
     assert buf.tell() == pre_offset
-    assert "insn_len_overflow" in log.getvalue()
+    assert len(buf.getvalue()) == pre_offset
+
+    log_text = log.getvalue()
+    assert "insn_len_overflow" in log_text
+    assert "big_insn" in log_text
 
 
-def test_block_len_cap_logs_and_truncates():
-    # 65536 uint8 entries → block_len == 1<<16 triggers the guard.
+def test_block_word_count_cap_logs_and_truncates():
+    """``block_word_count >= NORMAL_BLOCK_WORD_CAP`` (= 65536) is the
+    smallest block-word overflow."""
     insn = np.zeros(0, dtype=np.uint8)
     block = np.zeros(1 << 16, dtype=np.uint8)
     tokens = np.zeros(0, dtype=np.uint16)
     buf = stdio.BytesIO()
     pre_offset = buf.tell()
     log = stdio.StringIO()
+
     result = write_function_binary_data(
         buf, tokens, block, insn, func_name="big_block", error_log=log
     )
     assert result is None
     assert buf.tell() == pre_offset
-    assert "block_len_overflow" in log.getvalue()
+    assert "block_word_count_overflow" in log.getvalue()
 
 
-def test_no_error_log_silent_skip():
+def test_no_error_log_propagates_skip():
+    """Without ``error_log`` the cap-overflow exception bubbles up and
+    the file is truncated back to the pre-call position."""
     insn = np.zeros(1 << 24, dtype=np.uint8)
     block = np.zeros(0, dtype=np.uint8)
     tokens = np.zeros(0, dtype=np.uint16)
     buf = stdio.BytesIO()
+    buf.write(b"\xaa" * 8)
     pre_offset = buf.tell()
-    # error_log defaults to None — no exception propagates, file truncated.
-    result = write_function_binary_data(buf, tokens, block, insn)
-    assert result is None
+    with pytest.raises(IndexEntrySkip) as info:
+        write_function_binary_data(buf, tokens, block, insn)
+    assert info.value.reason == "insn_len_overflow"
     assert buf.tell() == pre_offset
+    assert len(buf.getvalue()) == pre_offset
+
+
+# ---------------------------------------------------------------------------
+# Dedup cache
+# ---------------------------------------------------------------------------
 
 
 def test_dedup_cache_hit_avoids_rewrite():
+    """A second call with identical arrays returns the cached offset and
+    leaves the file position unchanged."""
     insn = np.arange(10, dtype=np.uint8)
     block = np.arange(5, dtype=np.uint8)
     tokens = np.arange(7, dtype=np.uint16)
@@ -207,11 +314,11 @@ def test_dedup_cache_hit_avoids_rewrite():
     bytes_after_first = buf.tell()
     second = write_function_binary_data(buf, tokens, block, insn, dedup_cache=cache)
     assert second == first
-    # File position unchanged: cache hit returned without writing.
     assert buf.tell() == bytes_after_first
 
 
 def test_dedup_cache_not_polluted_on_skip():
+    """A cap-overflow skip must not leave a partial cache entry behind."""
     insn = np.zeros(1 << 24, dtype=np.uint8)
     block = np.zeros(0, dtype=np.uint8)
     tokens = np.zeros(0, dtype=np.uint16)
@@ -225,15 +332,31 @@ def test_dedup_cache_not_polluted_on_skip():
     assert cache == {}
 
 
-def test_post_write_alignment_invariant_sweep():
-    """Every successful write leaves the file at a 4-byte boundary."""
-    rng = random.Random(0xBEEF)
+# ---------------------------------------------------------------------------
+# Ultrashort vs normal dispatch happens in encode_binary_header, not in
+# the writer. Pin the canonical-form invariant: a tiny record always
+# uses ultrashort even though the writer hands the encoder ``Normal``.
+# ---------------------------------------------------------------------------
+
+
+def test_tiny_record_picks_ultrashort_form():
+    insn = np.zeros(2, dtype=np.uint8)
+    block = np.zeros(3, dtype=np.uint8)  # block_enc=0
+    tokens = np.zeros(4, dtype=np.uint16)
     buf = stdio.BytesIO()
-    successes = 0
-    for insn_len, block_enc, block_count, token_count in _shape_iter(rng, 50):
-        insn, block, tokens = _make_inputs(insn_len, block_enc, block_count, token_count, rng)
-        result = write_function_binary_data(buf, tokens, block, insn)
-        assert result is not None
-        assert buf.tell() % 4 == 0
-        successes += 1
-    assert successes == 50
+    write_function_binary_data(buf, tokens, block, insn)
+    header, _ = parse_binary_header(buf.getvalue())
+    assert header.format is BinaryHeaderFormat.UltraShort
+
+
+def test_block_enc_one_forces_normal_form():
+    """``block_enc=1`` (u16 block words) is ineligible for ultrashort
+    regardless of how small the other fields are."""
+    insn = np.zeros(2, dtype=np.uint8)
+    block = np.zeros(3, dtype=np.uint16)  # block_enc=1
+    tokens = np.zeros(4, dtype=np.uint16)
+    buf = stdio.BytesIO()
+    write_function_binary_data(buf, tokens, block, insn)
+    header, _ = parse_binary_header(buf.getvalue())
+    assert header.format is BinaryHeaderFormat.Normal
+    assert header.block_enc == 1
