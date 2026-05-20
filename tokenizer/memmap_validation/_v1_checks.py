@@ -7,12 +7,15 @@ inspects and returns a ``list[str]`` of human-readable error messages
 results into its existing error list -- no shared state, no I/O hidden
 behind class boundaries.
 
-Layout / version knowledge crosses three module boundaries only:
+Layout / version knowledge crosses module boundaries only via:
 
   * ``aligned_data.memmap_format.MEMMAP_FORMAT_VERSION``
-  * ``aligned_data.index_format.read_index_prelude``
-  * ``aligned_data.binary_format.{HEADER_BYTES, OVERLONG_FIELD_BYTES,
-    parse_binary_header}`` (record-header decoding)
+  * ``aligned_data.index_format.{RECORD_ALIGNMENT_does_not_live_here,
+    read_index_prelude}`` (record alignment is exported by
+    :mod:`aligned_data.binary_format`, not by ``index_format``)
+  * ``aligned_data.binary_format.{RECORD_ALIGNMENT, MAX_HEADER_BYTES,
+    parse_binary_header, derive_pad_placement, record_total_size}``
+    -- the sole source of truth for record geometry
   * ``aligned_data.loader.metadata_loader.open_sections_csv`` (prelude
     consumption on sections + slim variants CSVs -- the helper is
     content-agnostic so the slim CSV reuses it)
@@ -29,12 +32,14 @@ from typing import List
 import numpy as np
 
 from tokenizer.aligned_data.binary_format import (
-    HEADER_BYTES,
-    OVERLONG_FIELD_BYTES,
-    compute_pad,
+    BLOCK_WORD_SIZE,
+    MAX_HEADER_BYTES,
+    RECORD_ALIGNMENT,
+    derive_pad_placement,
     parse_binary_header,
+    record_total_size,
 )
-from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH, read_index_prelude
+from tokenizer.aligned_data.index_format import read_index_prelude
 from tokenizer.aligned_data.loader.metadata_loader import open_sections_csv
 
 
@@ -71,35 +76,50 @@ def check_index_prelude(path: Path, label: str) -> List[str]:
 
 
 def check_starts_alignment(starts: np.ndarray, label: str) -> List[str]:
-    """Every index entry's resolved ``start`` must be 4-byte aligned.
+    """Every index entry's resolved ``start`` must be ``RECORD_ALIGNMENT``-aligned.
 
-    The post-shift writer guarantees this by construction (offsets are
-    written as ``start >> 2`` and read back ``stored << 2``), but a
-    corrupted ``_index.bin`` or a stale prelude alignment_shift could
+    Records align to :data:`RECORD_ALIGNMENT` (= 16) bytes; the writer
+    guarantees this by construction (offsets written as
+    ``start >> ALIGNMENT_SHIFT`` and read back ``stored << shift``).
+    A corrupted ``_index.bin`` or a stale prelude alignment_shift could
     silently land on an unaligned offset; the validator catches it.
     """
     if len(starts) == 0:
         return []
-    bad = np.where(starts % 4 != 0)[0]
+    bad = np.where(starts % RECORD_ALIGNMENT != 0)[0]
     return [
-        f"{label}: index entry {int(i)} start {int(starts[int(i)])} is not 4-byte aligned"
+        f"{label}: index entry {int(i)} start {int(starts[int(i)])} "
+        f"is not {RECORD_ALIGNMENT}-byte aligned"
         for i in bad
     ]
+
+
+def _header_window(data: np.ndarray, start: int) -> np.ndarray:
+    """Return up to :data:`MAX_HEADER_BYTES` bytes starting at ``start``.
+
+    Real header may be shorter (ultrashort is 3 bytes, narrow normal
+    tags are 7-9 bytes); :func:`parse_binary_header` reads only the
+    bytes it needs from the slice.
+    """
+    end = min(start + MAX_HEADER_BYTES, len(data))
+    return data[start:end]
 
 
 def check_pad_bytes_zero(
     data_path: Path,
     starts: np.ndarray,
-    lengths: np.ndarray,
     label: str,
 ) -> List[str]:
-    """Every record's pad bytes between insn and block must be ``\\x00``.
+    """Every record's pad regions (pre AND post block) must be ``\\x00``.
 
-    The writer always emits zeroed pad bytes; non-zero pad is either
-    corruption or a writer regression. Iterates per record so this is
-    O(n_entries) over the corpus; the check uses a single memmap and
-    only touches the pad slice -- it does not materialise the whole
-    record.
+    The new record layout is::
+
+        [prefix][insn_bytes][pre_pad][block_bytes][post_pad][tokens]
+
+    ``derive_pad_placement(header)`` returns the split that the writer
+    used; both regions are independently asserted zero. Iterates per
+    record over a single ``np.memmap`` -- only the prefix + pad slices
+    are paged in, never the record body.
     """
     if not data_path.exists() or len(starts) == 0 or data_path.stat().st_size == 0:
         return []
@@ -108,78 +128,78 @@ def check_pad_bytes_zero(
     try:
         for i in range(len(starts)):
             start = int(starts[i])
-            stored = int(lengths[i])
-            _, is_overlong = resolve_record_length(data, start, stored)
-            body_prefix = HEADER_BYTES + (OVERLONG_FIELD_BYTES if is_overlong else 0)
-            header = parse_binary_header(data[start : start + HEADER_BYTES])
-            if header.pad_size == 0:
+            header, prefix_bytes = parse_binary_header(_header_window(data, start))
+            pre_pad, post_pad = derive_pad_placement(header)
+            block_bytes = header.block_word_count * BLOCK_WORD_SIZE[header.block_enc]
+
+            pre_pad_start = start + prefix_bytes + header.insn_len
+            pre_pad_end = pre_pad_start + pre_pad
+            post_pad_start = pre_pad_end + block_bytes
+            post_pad_end = post_pad_start + post_pad
+
+            err = _first_nonzero_in_region(
+                data, pre_pad_start, pre_pad_end, "pre-pad", i, start, label
+            )
+            if err is not None:
+                errors.append(err)
                 continue
-            pad_start = start + body_prefix + header.insn_len
-            pad_end = pad_start + header.pad_size
-            pad = data[pad_start:pad_end]
-            if not bool(np.all(pad == 0)):
-                errors.append(
-                    f"{label}: record {i} (start={start}) has non-zero pad bytes "
-                    f"{bytes(pad)!r} at [{pad_start}:{pad_end}]"
-                )
+            err = _first_nonzero_in_region(
+                data, post_pad_start, post_pad_end, "post-pad", i, start, label
+            )
+            if err is not None:
+                errors.append(err)
     finally:
         del data
     return errors
 
 
-def check_sentinel_overlong_coupling(
-    data_path: Path,
-    starts: np.ndarray,
-    lengths: np.ndarray,
+def _first_nonzero_in_region(
+    data: np.ndarray,
+    region_start: int,
+    region_end: int,
+    region_name: str,
+    record_idx: int,
+    record_start: int,
     label: str,
-) -> List[str]:
-    """Index sentinel (length==0) <-> data record's overlong u24 field.
+) -> str | None:
+    """Return a single error string if any byte in the region is non-zero.
 
-    For every entry the index marks as sentinel (the loader collapses
-    ``length_shifted == 0x0000`` into ``lengths[i] == 0``), the record
-    at ``start`` must carry a u24-shifted real length immediately after
-    the 6-byte header. The check resolves the length via the shared
-    decoder and asserts the result is in the overlong band (above the
-    u16-shifted cap); a sentinel entry that decodes back to a normal
-    length means writer + index disagree on the layout.
+    Empty regions (``region_start == region_end``) short-circuit cleanly
+    -- a zero-pad split is the common case for records whose body
+    geometry already lands on a 16-byte boundary.
     """
-    if not data_path.exists() or len(starts) == 0 or data_path.stat().st_size == 0:
-        return []
-    errors: List[str] = []
-    data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
-    try:
-        for i in range(len(starts)):
-            if int(lengths[i]) != 0:
-                continue
-            start = int(starts[i])
-            real_length, is_overlong = resolve_record_length(data, start, 0)
-            if not is_overlong:
-                errors.append(
-                    f"{label}: index entry {i} flagged sentinel but record at "
-                    f"start={start} did not resolve as overlong"
-                )
-            elif real_length <= MAX_NORMAL_REAL_LENGTH:
-                errors.append(
-                    f"{label}: index entry {i} sentinel/overlong-field mismatch: "
-                    f"resolved real_length={real_length} fits the normal u16 cap "
-                    f"({MAX_NORMAL_REAL_LENGTH}); the writer should not have used the sentinel"
-                )
-    finally:
-        del data
-    return errors
+    if region_end <= region_start:
+        return None
+    region = data[region_start:region_end]
+    if bool(np.all(region == 0)):
+        return None
+    return (
+        f"{label}: record {record_idx} (start={record_start}) has non-zero "
+        f"{region_name} bytes {bytes(region)!r} at [{region_start}:{region_end}]"
+    )
 
 
 def check_pad_consistency(
     data_path: Path,
     starts: np.ndarray,
-    lengths: np.ndarray,
     label: str,
 ) -> List[str]:
-    """Every record's ``header.pad_size`` must equal ``compute_pad(...)``.
+    """Each record's writer layout must match ``derive_pad_placement``.
 
-    Recovers token_count from body geometry then re-derives pad via the
-    shared :func:`tokenizer.aligned_data.binary_format.compute_pad` --
-    a mismatch means writer + header invariant disagree (or tampering).
+    Re-derives the rule from the parsed header alone (the rule lives in
+    :mod:`aligned_data.binary_format._pad` and is the single source of
+    truth) and asserts that:
+
+    * total record size from ``record_total_size(header)`` is a
+      multiple of :data:`RECORD_ALIGNMENT`;
+    * the ``(pre_pad, post_pad)`` split is the one that the rule
+      prescribes given ``P`` (``(-U) % 16``) and ``B``
+      (``(-(prefix + insn_len)) % block_align``).
+
+    The rule is a single-line conditional inside ``derive_pad_placement``
+    so this check effectively pins that ``derive_pad_placement(header)``
+    is the same value the writer used when laying down the record; a
+    mismatch means the writer + header geometry disagree (or tampering).
     """
     if not data_path.exists() or len(starts) == 0 or data_path.stat().st_size == 0:
         return []
@@ -188,21 +208,34 @@ def check_pad_consistency(
     try:
         for i in range(len(starts)):
             start = int(starts[i])
-            real_length, is_overlong = resolve_record_length(data, start, int(lengths[i]))
-            header = parse_binary_header(data[start : start + HEADER_BYTES])
-            body_prefix = HEADER_BYTES + (OVERLONG_FIELD_BYTES if is_overlong else 0)
-            token_count = (
-                real_length - body_prefix - header.insn_len - header.pad_size - header.block_len
-            ) // 2
-            expected_pad = compute_pad(
-                header.insn_len, header.block_len, token_count, is_overlong
+            header, prefix_bytes = parse_binary_header(_header_window(data, start))
+            pre_pad, post_pad = derive_pad_placement(header)
+
+            block_bytes = header.block_word_count * BLOCK_WORD_SIZE[header.block_enc]
+            unpadded_total = prefix_bytes + header.insn_len + block_bytes + 2 * header.token_count
+            total_pad = (-unpadded_total) % RECORD_ALIGNMENT
+            block_align = BLOCK_WORD_SIZE[header.block_enc]
+            block_pad = (-(prefix_bytes + header.insn_len)) % block_align
+
+            expected_pre, expected_post = (
+                (block_pad, total_pad - block_pad)
+                if block_pad <= total_pad
+                else (total_pad, 0)
             )
-            if header.pad_size != expected_pad:
+            if (pre_pad, post_pad) != (expected_pre, expected_post):
                 errors.append(
-                    f"{label}: record {i} (start={start}) pad_size={header.pad_size} "
-                    f"disagrees with compute_pad={expected_pad} "
-                    f"(insn_len={header.insn_len}, block_len={header.block_len}, "
-                    f"token_count={token_count}, is_overlong={is_overlong})"
+                    f"{label}: record {i} (start={start}) pad split "
+                    f"({pre_pad}, {post_pad}) disagrees with rule "
+                    f"({expected_pre}, {expected_post}) "
+                    f"(insn_len={header.insn_len}, block_word_count={header.block_word_count}, "
+                    f"block_enc={header.block_enc}, token_count={header.token_count})"
+                )
+                continue
+            total = record_total_size(header)
+            if total % RECORD_ALIGNMENT != 0:
+                errors.append(
+                    f"{label}: record {i} (start={start}) total size {total} "
+                    f"is not a multiple of {RECORD_ALIGNMENT}"
                 )
     finally:
         del data
@@ -212,13 +245,14 @@ def check_pad_consistency(
 def check_record_bounds(
     data_path: Path,
     starts: np.ndarray,
-    lengths: np.ndarray,
     label: str,
 ) -> List[str]:
-    """Every record must fit inside ``_data.bin`` (``start + real_length <= size``).
+    """Every record must fit inside ``_data.bin`` (``start + total <= size``).
 
     A truncated ``_data.bin`` or a corrupted index entry pointing past
     the file would otherwise surface as a silent ``IndexError`` later.
+    Total size is derived from the parsed header via
+    :func:`record_total_size`.
     """
     if not data_path.exists() or len(starts) == 0:
         return []
@@ -230,11 +264,12 @@ def check_record_bounds(
     try:
         for i in range(len(starts)):
             start = int(starts[i])
-            real_length, _ = resolve_record_length(data, start, int(lengths[i]))
-            end = start + real_length
+            header, _ = parse_binary_header(_header_window(data, start))
+            total = record_total_size(header)
+            end = start + total
             if end > file_size:
                 errors.append(
-                    f"{label}: record {i} (start={start}, real_length={real_length}) "
+                    f"{label}: record {i} (start={start}, total_size={total}) "
                     f"extends to {end} but file_size={file_size}"
                 )
     finally:
@@ -248,27 +283,23 @@ def run_v1_post_checks(
     matched_data: Path,
     unmatched_data: Path,
     matched_starts: np.ndarray,
-    matched_lengths: np.ndarray,
     unmatched_starts: np.ndarray,
-    unmatched_lengths: np.ndarray,
 ) -> List[str]:
     """Per-record invariants that run only after preludes have validated.
 
     The starts arrays come from the already-loaded ``SectionArm`` so the
-    validator never re-opens an index file for this step. Pad + sentinel
-    probes touch ``_data.bin`` once via ``np.memmap``.
+    validator never re-opens an index file for this step. Each per-arm
+    probe touches its ``_data.bin`` once via ``np.memmap``; records are
+    self-describing so no companion ``_lengths`` array is required.
     """
     errors: List[str] = []
     errors.extend(check_starts_alignment(matched_starts, f"{matched_index} (matched)"))
     errors.extend(check_starts_alignment(unmatched_starts, f"{unmatched_index} (unmatched)"))
-    for data_path, index_path, starts, lengths in (
-        (matched_data, matched_index, matched_starts, matched_lengths),
-        (unmatched_data, unmatched_index, unmatched_starts, unmatched_lengths),
+    for data_path, starts in (
+        (matched_data, matched_starts),
+        (unmatched_data, unmatched_starts),
     ):
-        errors.extend(check_pad_bytes_zero(data_path, starts, lengths, str(data_path)))
-        errors.extend(
-            check_sentinel_overlong_coupling(data_path, starts, lengths, str(index_path))
-        )
-        errors.extend(check_pad_consistency(data_path, starts, lengths, str(data_path)))
-        errors.extend(check_record_bounds(data_path, starts, lengths, str(data_path)))
+        errors.extend(check_pad_bytes_zero(data_path, starts, str(data_path)))
+        errors.extend(check_pad_consistency(data_path, starts, str(data_path)))
+        errors.extend(check_record_bounds(data_path, starts, str(data_path)))
     return errors
