@@ -9,8 +9,7 @@ This module provides utilities for:
 """
 
 from .io import (
-    decode_and_translate_tokens,
-    decode_runlengths,
+    assemble_function_record,
     format_inlining_dict,
     format_variant_refs,
     parse_function_data_header,
@@ -33,12 +32,18 @@ from .loader import (
 )
 from .match import (
     is_vocab_row,
-    lockstep_function_match,
     open_csv_skip_vocab,
 )
 from .metadata import (
     extract_all_metadata_from_section_rows,
     extract_metadata_from_section_row,
+)
+from .parsed_record_iter import (
+    Matched,
+    ParsedRecord,
+    Unmatched,
+    lockstep_records,
+    open_parsed_record_iter,
 )
 from .sections import (
     read_function_section,
@@ -52,8 +57,7 @@ __all__ = [
     "MatchedFunction",
     "load_single_matched_function",
     # io
-    "decode_and_translate_tokens",
-    "decode_runlengths",
+    "assemble_function_record",
     "format_inlining_dict",
     "format_variant_refs",
     "write_function_binary_data",
@@ -69,7 +73,12 @@ __all__ = [
     # match
     "is_vocab_row",
     "open_csv_skip_vocab",
-    "lockstep_function_match",
+    # parsed_record_iter
+    "ParsedRecord",
+    "Matched",
+    "Unmatched",
+    "open_parsed_record_iter",
+    "lockstep_records",
     # metadata
     "extract_metadata_from_section_row",
     "extract_all_metadata_from_section_rows",

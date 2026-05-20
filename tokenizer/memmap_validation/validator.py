@@ -27,9 +27,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import contextlib
+
 from ..aligned_data.loader import BinaryDataset
 from ..aligned_data.loader.unified_vocab_gate import load_and_validate_unified_vocab
-from ..aligned_data.match import lockstep_function_match
+from ..aligned_data.parsed_record_iter import (
+    Matched,
+    Unmatched,
+    lockstep_records,
+    open_parsed_record_iter,
+)
 from ..memmap_builder import VersionKey
 from ._v1_checks import (
     check_csv_prelude,
@@ -39,7 +46,6 @@ from ._v1_checks import (
 from ._unmatched_lookup import build_unmatched_index_lookup
 from ._validator_arms import compare_matched_arm, compare_unmatched_arm
 from ._validator_csv import (
-    decode_csv_row_data,
     detect_csv_format_version,
     has_unique_offsets,
     load_mapping,
@@ -160,14 +166,12 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         config.output_dir, config.binary_name, vocab_manager=vocab_manager
     )
 
-    mapping_dict = {}
     csv_paths = []
     version_keys = []
+    mappings = []
     detected_formats: List[int] = []
 
     for version in config.versions:
-        mapping = load_mapping(version.mapping_path)
-
         vkey = VersionKey(
             arch=version.arch,
             compiler=version.compiler,
@@ -175,9 +179,9 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
             opt=version.opt,
         )
 
-        mapping_dict[vkey] = mapping
         csv_paths.append(str(version.csv_path))
         version_keys.append(vkey)
+        mappings.append(load_mapping(version.mapping_path))
         detected_formats.append(detect_csv_format_version(version.csv_path))
 
     # Refuse mixed v1/v2 inputs: lockstep validation joins per-function
@@ -258,41 +262,40 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         + list(sidecar_resolution_errors),
     )
 
-    for match_data in lockstep_function_match(csv_paths):
-        func_name = match_data["function_name"]
-        rows = match_data["rows"]
-        count = match_data["count"]
+    with contextlib.ExitStack() as stack:
+        wrappers = []
+        per_csv_iters = []
+        for csv_path, mapping in zip(csv_paths, mappings):
+            wrapper, it, _header = open_parsed_record_iter(csv_path, mapping)
+            wrappers.append(wrapper)
+            per_csv_iters.append(it)
+            stack.callback(wrapper.close)
 
-        if func_name.startswith(".L"):
-            continue
+        for item in lockstep_records(per_csv_iters, wrappers):
+            if item.func_name.startswith(".L"):
+                continue
 
-        if count >= 2:
-            compare_matched_arm(
-                func_name,
-                rows,
-                version_keys=version_keys,
-                mapping_dict=mapping_dict,
-                decode_csv_row_data=decode_csv_row_data,
-                has_unique_offsets=has_unique_offsets,
-                should_skip_matched_function=should_skip_matched_function,
-                matched_func_name_to_idx=matched_func_name_to_idx,
-                dataset=dataset,
-                vocab_manager=vocab_manager,
-                stats=stats,
-            )
-        elif count == 1:
-            compare_unmatched_arm(
-                func_name,
-                rows,
-                version_keys=version_keys,
-                mapping_dict=mapping_dict,
-                decode_csv_row_data=decode_csv_row_data,
-                should_skip_unmatched_function=should_skip_unmatched_function,
-                unmatched_data_by_name_and_vkey=unmatched_data_by_name_and_vkey,
-                dataset=dataset,
-                vocab_manager=vocab_manager,
-                stats=stats,
-            )
+            if isinstance(item, Matched):
+                compare_matched_arm(
+                    item,
+                    version_keys=version_keys,
+                    has_unique_offsets=has_unique_offsets,
+                    should_skip_matched_function=should_skip_matched_function,
+                    matched_func_name_to_idx=matched_func_name_to_idx,
+                    dataset=dataset,
+                    vocab_manager=vocab_manager,
+                    stats=stats,
+                )
+            elif isinstance(item, Unmatched):
+                compare_unmatched_arm(
+                    item,
+                    version_keys=version_keys,
+                    should_skip_unmatched_function=should_skip_unmatched_function,
+                    unmatched_data_by_name_and_vkey=unmatched_data_by_name_and_vkey,
+                    dataset=dataset,
+                    vocab_manager=vocab_manager,
+                    stats=stats,
+                )
 
     log_validation_summary(stats)
     return stats

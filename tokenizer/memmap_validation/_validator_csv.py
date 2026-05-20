@@ -1,32 +1,28 @@
-"""Per-version (tokenizer-output) CSV row decoders, skip predicates,
-format probe, and dedup-key heuristic.
+"""Validator helpers that survived the parsed-record refactor.
 
-Single concern (one wire format, the per-version tokenizer-output
-CSV): everything the validator needs to read one row of that file
-without leaking the layout into ``validator.py`` or the comparators.
-Contents:
+Row decoding now lives on the per-CSV iterator
+(:mod:`tokenizer.aligned_data.parsed_record_iter`); the validator
+consumes :class:`ParsedRecord` objects directly. What's left here:
 
-* Row decoder: turn one ``lockstep_function_match`` row into the
-  ``(tokens, block_runlength, insn_runlength)`` triple the per-arm
-  comparators expect.
-* Skip predicates the orchestrator uses to gate which rows are
-  worth validating.
 * Format detection (v1 vs. v2 prelude) — peeks the first row to
   surface a format mismatch before iteration. Prelude *consumption*
   during data iteration stays with
   ``aligned_data.match.open_csv_skip_vocab``.
-* Dedup-key heuristic for unique-offset detection across versions of
-  the same function.
+* Per-variant mapping loader (used by the validator's setup step).
+* Skip predicates mirroring the pass-1 walkers' gating.
+* Dedup-key heuristic for unique-offset detection across variants of
+  the same function (matched arm's drop gate).
 """
 
 from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
+from tokenizer.aligned_data.parsed_record_iter import ParsedRecord
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 
@@ -68,52 +64,41 @@ def load_mapping(mapping_path: Path) -> Optional[np.ndarray]:
     return None
 
 
-def decode_csv_row_data(
-    row: dict, mapping: Optional[np.ndarray]
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Decode tokens and runlengths from CSV row."""
-    tokens = base64_to_ndarray_vec(row["tokens_base64"])
-    if mapping is not None:
-        tokens = mapping[tokens]
-    tokens = tokens.astype(np.uint16)
+def should_skip_matched_function(records: Dict[int, ParsedRecord]) -> bool:
+    """``True`` when any variant's block runlength reaches the cap.
 
-    block_runlength = base64_to_ndarray_vec(row["block_runlength_base64"])
-    insn_runlength = base64_to_ndarray_vec(row["instruction_runlength_base64"])
-
-    return tokens, block_runlength, insn_runlength
-
-
-def should_skip_matched_function(rows: List[Optional[dict]]) -> bool:
-    """Check if matched function should be skipped based on builder logic."""
-    for row in rows:
-        if row is not None and "block_runlength_base64" in row:
-            try:
-                block_runlength = base64_to_ndarray_vec(row["block_runlength_base64"])
-                if block_runlength.sum() >= 4096:
-                    return True
-            except Exception:
-                return True
+    Mirrors the pass-1 matched walker's gate
+    (:func:`tokenizer.memmap_builder.helpers.should_skip_for_matched`)
+    applied across every variant; one over-cap variant drops the
+    whole function from the matched arm.
+    """
+    for rec in records.values():
+        if int(rec.block_runlength.sum()) >= 4096:
+            return True
     return False
 
 
-def should_skip_unmatched_function(row: dict) -> bool:
-    """Check if unmatched function should be skipped based on builder logic.
-
-    Note: The builder checks for 'block_runlength' (not 'block_runlength_base64'),
-    which doesn't exist in the CSV, so it never actually skips unmatched functions.
-    This matches that behavior.
-    """
+def should_skip_unmatched_function(_block_runlength: np.ndarray) -> bool:
+    """No-op preserved from the pre-refactor walker (see helpers.py)."""
     return False
 
 
 def has_unique_offsets(version_data_list: List[dict]) -> bool:
-    """Check if versions have unique binary offsets (would not be deduplicated)."""
-    unique_offsets = set()
+    """Check if variants have unique encoded bodies (would not be deduplicated).
+
+    The matched arm drops a function when every variant encodes to the
+    same byte sequence (``len(unique_offsets) == 1`` at
+    ``passes.process_matched_function``). This predicate predicts that
+    outcome from the per-variant ndarrays alone so the validator can
+    skip the matched comparison when the builder would have rerouted
+    the data to the unmatched arm.
+    """
+    unique_keys = set()
     for vdata in version_data_list:
         cache_key = (
             vdata["tokens"].tobytes(),
             vdata["block_rl"].tobytes(),
             vdata["insn_rl"].tobytes(),
         )
-        unique_offsets.add(cache_key)
-    return len(unique_offsets) > 1
+        unique_keys.add(cache_key)
+    return len(unique_keys) > 1

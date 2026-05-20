@@ -1,297 +1,183 @@
 """Pass-1 walker integration with the FunctionNamesRegistry.
 
-The walkers take the registry as a required positional argument and
-add every function name they emit (header function + called-function
-references) so pass 2 can resolve the section-CSV cells to 1-indexed
-sidecar line numbers.
+The walkers add every function name they emit (header function + called-
+function references) to the shared registry so pass 2 can resolve the
+section-CSV cells to 1-indexed sidecar line numbers.
 
-These tests stub :func:`process_function_binary_data` so they can
-focus on the registry-wiring concern without re-creating valid
-binary-encoded fixtures — the encoder's correctness is owned by
-``test_builder_error_log.py`` and the ``_writers`` test suite.
+These tests drive the walkers with synthetic :class:`ParsedRecord`
+instances + a real :class:`ArmDedupState` writing to a tmp_path bin.
+The bin is fresh per test (the writer's grow-on-demand mapping handles
+the small fixtures with no truncation).
 """
 
 from __future__ import annotations
 
-import io
+from dataclasses import dataclass
+from typing import Tuple
 
+import numpy as np
 import pytest
 
-from tokenizer.memmap_builder import passes as passes_mod
+from tokenizer.aligned_data.parsed_record_iter import Matched, ParsedRecord
+from tokenizer.memmap_builder._dedup import open_arm_dedup_state
 from tokenizer.memmap_builder.function_names import FunctionNamesRegistry
-from tokenizer.memmap_builder.helpers import FunctionBinaryData
 from tokenizer.memmap_builder.passes import (
-    process_matched_function_pass1,
-    process_unmatched_function_pass1,
+    process_matched_function,
+    process_unmatched_function,
 )
 
 
+@dataclass(frozen=True)
 class _FakeVKey:
     """Minimal hashable vkey stand-in; identity is enough for the tests."""
 
-    def __init__(self, label: str) -> None:
-        self.label = label
-
-    def __hash__(self) -> int:
-        return hash(self.label)
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _FakeVKey) and self.label == other.label
-
-    def __repr__(self) -> str:
-        return f"_FakeVKey({self.label!r})"
+    label: str
 
 
-def _make_row_with_metadata(callees: list[str]) -> dict:
-    """Build a v2-style row dict with the minimum fields the walkers read.
-
-    The walkers consult:
-      * ``row["block_runlength_base64"]`` via
-        ``should_skip_function_for_matched`` — empty string is rejected
-        by ``base64_to_ndarray_vec`` and the helper treats that as a
-        skip; supply an empty array's base64 instead (``""``-decoded
-        gives a zero-length array, sum < 4096 -> not skipped).
-      * ``row["block_runlength"]`` via
-        ``should_skip_function_for_unmatched`` — when absent the helper
-        falls through cleanly.
-      * ``row["metadata"]`` via ``get_called_functions_from_row`` (v2
-        schema: JSON with a ``local_funcs`` array of ``{"name": ...}``).
-
-    The actual binary encoding is stubbed out so the row need not carry
-    valid ``tokens_base64`` / runlength payloads.
-    """
-    metadata_json = (
-        '{"local_funcs": ['
-        + ",".join(f'{{"name": "{name}"}}' for name in callees)
-        + '], "plt_funcs": [], "ext_funcs": []}'
+def _make_record(
+    func_name: str,
+    called: list[str],
+    *,
+    n_tokens: int = 4,
+    token_fill: int = 0,
+) -> ParsedRecord:
+    """One synthetic ParsedRecord that will round-trip through the encoder."""
+    tokens = np.full(n_tokens, token_fill, dtype=np.uint16)
+    block_runlength = np.array([1, 2], dtype=np.uint8)
+    insn_runlength = np.array([3, 4], dtype=np.uint8)
+    # Content hash is not used by the registry-wiring path; any
+    # deterministic value works as long as identical bytes produce the
+    # same hash (so the dedup gate fires when expected).
+    content_hash = int(tokens.tobytes().__hash__() & 0xFFFFFFFFFFFFFFFF)
+    return ParsedRecord(
+        func_name=func_name,
+        insn_runlength=insn_runlength,
+        block_runlength=block_runlength,
+        tokens=tokens,
+        called_funcs=sorted(called),
+        content_hash=content_hash,
     )
-    # `AAAA` is base64 for `\0\0\0` -> ndarray([0,0,0]); sum=0 < 4096.
-    return {
-        "block_runlength_base64": "AAAA",
-        "metadata": metadata_json,
-    }
 
 
-def _stub_binary_data(offset: int, length: int = 16) -> FunctionBinaryData:
-    return FunctionBinaryData(data_offset=offset, data_len=length, token_len=length // 2)
+def _make_arm_state(tmp_path, name: str):
+    state = open_arm_dedup_state(tmp_path / f"{name}_data.bin")
+    return state
 
 
-def test_matched_walker_requires_registry_argument():
-    """The walker signature now treats ``registry`` as a required
-    positional argument; calls that omit it raise ``TypeError``."""
-    with pytest.raises(TypeError, match="registry"):
-        # Intentionally drop the registry to confirm the signature.
-        process_matched_function_pass1(  # type: ignore[call-arg]
-            "fn",
-            [None],
-            [_FakeVKey("a")],
-            {},
-            io.BytesIO(),
-        )
-
-
-def test_unmatched_walker_requires_registry_argument():
-    with pytest.raises(TypeError, match="registry"):
-        process_unmatched_function_pass1(  # type: ignore[call-arg]
-            "fn",
-            [None],
-            [_FakeVKey("a")],
-            {},
-            io.BytesIO(),
-        )
-
-
-def test_matched_walker_records_header_and_callees_on_emit(monkeypatch):
-    """A function that survives encoding records its name + every
-    called-function name it references into the registry."""
+def test_matched_walker_records_header_and_callees_on_emit(tmp_path):
+    """Function survives encoding (distinct bytes per variant) → its
+    name + every referenced callee land in the registry."""
     vkey_a = _FakeVKey("a")
     vkey_b = _FakeVKey("b")
-    rows = [
-        _make_row_with_metadata(["alpha_callee", "beta_callee"]),
-        _make_row_with_metadata(["alpha_callee", "gamma_callee"]),
-    ]
-
-    # Stub the encoder so each version "writes" to a unique offset (the
-    # walker drops the function when all versions share an offset — the
-    # dedup-result heuristic).
-    offsets = iter([0, 16])
-    monkeypatch.setattr(
-        passes_mod,
-        "process_function_binary_data",
-        lambda *a, **kw: _stub_binary_data(next(offsets)),
+    matched = Matched(
+        func_name="header_fn",
+        records={
+            0: _make_record("header_fn", ["alpha_callee", "beta_callee"], token_fill=1),
+            1: _make_record("header_fn", ["alpha_callee", "gamma_callee"], token_fill=2),
+        },
     )
 
     registry = FunctionNamesRegistry()
-    entry = process_matched_function_pass1(
-        "header_fn",
-        rows,
-        [vkey_a, vkey_b],
-        {},
-        io.BytesIO(),
-        registry,
-    )
+    state = _make_arm_state(tmp_path, "matched")
+    try:
+        entry = process_matched_function(matched, [vkey_a, vkey_b], state, registry)
+        assert entry is not None
+    finally:
+        state.writer.finalize()
 
-    assert entry is not None
     registry.finalize()
     expected = {"header_fn", "alpha_callee", "beta_callee", "gamma_callee"}
-    # All emitted names landed in the registry; nothing else slipped in.
     assert set(registry._sorted) == expected  # noqa: SLF001 — test-side white-box
 
 
-def test_matched_walker_skips_registry_when_function_dropped(monkeypatch):
-    """All versions reported the same data offset -> the function is
-    dropped (the dedup-result heuristic) and no name is recorded.
-
-    Tests the contract that the registry only holds names pass 2 will
-    actually write into a section CSV.
-    """
+def test_matched_walker_skips_registry_when_function_dropped(tmp_path):
+    """All variants encode to the same bytes → dedup collapses to one
+    offset → the matched arm drops the function and no name is recorded."""
     vkey_a = _FakeVKey("a")
     vkey_b = _FakeVKey("b")
-    rows = [
-        _make_row_with_metadata(["only_callee"]),
-        _make_row_with_metadata(["only_callee"]),
-    ]
-    monkeypatch.setattr(
-        passes_mod,
-        "process_function_binary_data",
-        lambda *a, **kw: _stub_binary_data(0),  # both versions hit offset 0
-    )
+    rec = _make_record("deduped_fn", ["only_callee"], token_fill=42)
+    matched = Matched(func_name="deduped_fn", records={0: rec, 1: rec})
 
     registry = FunctionNamesRegistry()
-    entry = process_matched_function_pass1(
-        "deduped_fn",
-        rows,
-        [vkey_a, vkey_b],
-        {},
-        io.BytesIO(),
-        registry,
-    )
+    state = _make_arm_state(tmp_path, "matched_drop")
+    try:
+        entry = process_matched_function(matched, [vkey_a, vkey_b], state, registry)
+    finally:
+        state.writer.finalize()
 
     assert entry is None
     registry.finalize()
     assert registry._sorted == ()  # noqa: SLF001
 
 
-def test_matched_walker_skips_registry_when_all_versions_cap_overflow(monkeypatch):
-    """All ``process_function_binary_data`` calls returned ``None``
-    (cap overflow + error_log) -> walker drops the function and the
-    registry stays empty for that name."""
+def test_unmatched_walker_records_header_and_callees(tmp_path):
+    """Single-variant function → header + its callees land in the registry."""
     vkey_a = _FakeVKey("a")
-    vkey_b = _FakeVKey("b")
-    rows = [
-        _make_row_with_metadata(["cap_overflow_callee"]),
-        _make_row_with_metadata(["cap_overflow_callee"]),
-    ]
-    monkeypatch.setattr(
-        passes_mod,
-        "process_function_binary_data",
-        lambda *a, **kw: None,
-    )
+    rec = _make_record("unmatched_fn", ["x_callee", "y_callee"])
+    records = {0: rec}
 
     registry = FunctionNamesRegistry()
-    entry = process_matched_function_pass1(
-        "overflow_fn",
-        rows,
-        [vkey_a, vkey_b],
-        {},
-        io.BytesIO(),
-        registry,
-    )
-
-    assert entry is None
-    registry.finalize()
-    assert registry._sorted == ()  # noqa: SLF001
-
-
-def test_unmatched_walker_records_header_and_per_version_callees(monkeypatch):
-    """Each surviving version contributes ``func_name`` + that version's
-    callees to the registry. The registry's set semantics dedupe; the
-    walker need not preempt that."""
-    vkey_a = _FakeVKey("a")
-    vkey_b = _FakeVKey("b")
-    rows = [
-        _make_row_with_metadata(["x_callee"]),
-        _make_row_with_metadata(["y_callee", "z_callee"]),
-    ]
-
-    offsets = iter([0, 32])
-    monkeypatch.setattr(
-        passes_mod,
-        "process_function_binary_data",
-        lambda *a, **kw: _stub_binary_data(next(offsets)),
-    )
-
-    registry = FunctionNamesRegistry()
-    entries = process_unmatched_function_pass1(
-        "unmatched_fn",
-        rows,
-        [vkey_a, vkey_b],
-        {},
-        io.BytesIO(),
-        registry,
-    )
-
-    assert len(entries) == 2
-    registry.finalize()
-    expected = {"unmatched_fn", "x_callee", "y_callee", "z_callee"}
-    assert set(registry._sorted) == expected  # noqa: SLF001
-
-
-def test_unmatched_walker_skips_registry_for_cap_overflow_version(monkeypatch):
-    """The version whose encoder returned ``None`` is dropped; its
-    callees do NOT enter the registry. Surviving versions still record."""
-    vkey_a = _FakeVKey("a")
-    vkey_b = _FakeVKey("b")
-    rows = [
-        _make_row_with_metadata(["surviving_callee"]),
-        _make_row_with_metadata(["overflow_only_callee"]),
-    ]
-
-    # First call (vkey_a) succeeds; second (vkey_b) overflows.
-    results = iter([_stub_binary_data(0), None])
-    monkeypatch.setattr(
-        passes_mod,
-        "process_function_binary_data",
-        lambda *a, **kw: next(results),
-    )
-
-    registry = FunctionNamesRegistry()
-    entries = process_unmatched_function_pass1(
-        "partial_fn",
-        rows,
-        [vkey_a, vkey_b],
-        {},
-        io.BytesIO(),
-        registry,
-    )
+    state = _make_arm_state(tmp_path, "unmatched")
+    try:
+        entries = process_unmatched_function(
+            "unmatched_fn", records, [vkey_a], state, registry
+        )
+    finally:
+        state.writer.finalize()
 
     assert len(entries) == 1
     registry.finalize()
-    assert set(registry._sorted) == {"partial_fn", "surviving_callee"}  # noqa: SLF001
+    assert set(registry._sorted) == {"unmatched_fn", "x_callee", "y_callee"}  # noqa: SLF001
 
 
-def test_unmatched_walker_propagates_unexpected_exception(monkeypatch):
-    """The bare ``except Exception: pass`` is removed. Programmer-error
-    or IO failures from the encoder are no longer silently swallowed —
-    they surface immediately so an operator sees the actual cause."""
+def test_unmatched_walker_handles_multi_variant_records(tmp_path):
+    """Matched fallback path: every variant from the original Matched
+    flows through here as the records dict; each adds its callees."""
     vkey_a = _FakeVKey("a")
-    rows = [_make_row_with_metadata(["any_callee"])]
-
-    class _SyntheticEncoderBug(RuntimeError):
-        pass
-
-    def _boom(*_a, **_kw):
-        raise _SyntheticEncoderBug("encoder invariant violated")
-
-    monkeypatch.setattr(passes_mod, "process_function_binary_data", _boom)
+    vkey_b = _FakeVKey("b")
+    records = {
+        0: _make_record("partial_fn", ["alpha_callee"], token_fill=10),
+        1: _make_record("partial_fn", ["beta_callee", "gamma_callee"], token_fill=20),
+    }
 
     registry = FunctionNamesRegistry()
-    with pytest.raises(_SyntheticEncoderBug):
-        process_unmatched_function_pass1(
-            "leaky_fn",
-            rows,
-            [vkey_a],
-            {},
-            io.BytesIO(),
-            registry,
+    state = _make_arm_state(tmp_path, "unmatched_multi")
+    try:
+        entries = process_unmatched_function(
+            "partial_fn", records, [vkey_a, vkey_b], state, registry
         )
+    finally:
+        state.writer.finalize()
+
+    assert len(entries) == 2
+    registry.finalize()
+    assert set(registry._sorted) == {  # noqa: SLF001
+        "partial_fn",
+        "alpha_callee",
+        "beta_callee",
+        "gamma_callee",
+    }
+
+
+def test_matched_walker_skips_dotL_prefix(tmp_path):
+    """``.L``-prefixed local-label functions are never recorded."""
+    vkey_a = _FakeVKey("a")
+    vkey_b = _FakeVKey("b")
+    matched = Matched(
+        func_name=".Llocal",
+        records={
+            0: _make_record(".Llocal", ["any_callee"], token_fill=1),
+            1: _make_record(".Llocal", ["any_callee"], token_fill=2),
+        },
+    )
+
+    registry = FunctionNamesRegistry()
+    state = _make_arm_state(tmp_path, "matched_dotL")
+    try:
+        entry = process_matched_function(matched, [vkey_a, vkey_b], state, registry)
+    finally:
+        state.writer.finalize()
+
+    assert entry is None
+    registry.finalize()
+    assert registry._sorted == ()  # noqa: SLF001

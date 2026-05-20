@@ -251,6 +251,14 @@ class BinarySession:
         suffix = "_unmatched_data.bin" if kind == "unmatched" else "_data.bin"
         path = self._base_path / f"{self._binary_name}{suffix}"
         mmap = np.memmap(str(path), dtype=np.uint8, mode="r")
+        # Validate the 16-byte file-level prelude up front so a stale /
+        # pre-prelude / wrong-format bin fails loud on open instead of
+        # returning garbage records on first slice.
+        from tokenizer.aligned_data.memmap_format import (
+            DATA_BIN_PRELUDE_SIZE,
+            assert_data_bin_prelude,
+        )
+        assert_data_bin_prelude(bytes(mmap[:DATA_BIN_PRELUDE_SIZE]), path=str(path))
         self._stack.callback(_close_memmap, mmap)
         self._data_mmap = mmap
         self._data_kind = kind

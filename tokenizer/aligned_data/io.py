@@ -2,8 +2,6 @@ import csv
 
 import numpy as np
 
-from tokenizer.compact_base64_utils import base64_to_ndarray_vec
-
 from .binary_format import (
     MAX_HEADER_BYTES,
     extract_arrays_from_data,
@@ -12,11 +10,14 @@ from .binary_format import (
 )
 from .csv_format import format_inlining_dict, format_variant_refs
 from .index_format import iter_index_entries
-from ._writers import write_function_binary_data, write_index_entry  # re-export
+from ._writers import (  # re-export
+    assemble_function_record,
+    write_function_binary_data,
+    write_index_entry,
+)
 
 __all__ = (
-    "decode_and_translate_tokens",
-    "decode_runlengths",
+    "assemble_function_record",
     "parse_function_data_header",
     "parse_function_data_memmap",
     "read_data_file",
@@ -30,25 +31,6 @@ __all__ = (
 )
 
 
-def decode_and_translate_tokens(row, mapping=None):
-    # `mapping` is the per-binary local-ID → unified-ID lookup written by
-    # `vocab_unifier`. Under format_version=2 the unifier identity-maps IDs
-    # 0..255 (the protocol-reserved digit slots), so inline-digit
-    # continuations survive `mapping[tokens]` byte-for-byte: digit 0x42
-    # in the per-binary stream stays digit 0x42 in the unified stream.
-    # No v2-specific branch needed here — the fancy-indexing semantics
-    # do the right thing as long as the unifier emits identity for that
-    # range (see `tokenizer/vocab_unifier/unifier.py`).
-    tokens = base64_to_ndarray_vec(row["tokens_base64"])
-    if mapping is not None:
-        tokens = mapping[tokens]
-    return tokens.astype(np.uint16)
-
-
-def decode_runlengths(row):
-    block_runlength = base64_to_ndarray_vec(row["block_runlength_base64"])
-    insn_runlength = base64_to_ndarray_vec(row["instruction_runlength_base64"])
-    return block_runlength, insn_runlength
 
 
 def write_function_section_csv(

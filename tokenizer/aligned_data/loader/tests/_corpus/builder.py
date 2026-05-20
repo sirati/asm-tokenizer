@@ -222,6 +222,11 @@ def _emit_matched_data(
     matched_data_entries: List[dict] = []
     lookup: dict = {}
     with open(data_path, "wb") as data_file:
+        # Match the production builder's file-level prelude so the
+        # loader's prelude-magic assertion fires successfully on test
+        # fixtures too.
+        from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
+        data_file.write(encode_data_bin_prelude())
         for spec in matched:
             version_data = []
             for variant in spec.variants:
@@ -260,6 +265,11 @@ def _emit_unmatched_data(
     unmatched_data_entries: List[dict] = []
     lookup: dict = {}
     with open(data_path, "wb") as data_file:
+        # Match the production builder's file-level prelude so the
+        # loader's prelude-magic assertion fires successfully on test
+        # fixtures too.
+        from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
+        data_file.write(encode_data_bin_prelude())
         for spec in unmatched:
             registry.add(spec.func_name)
             for callee in spec.called:

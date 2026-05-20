@@ -1,10 +1,9 @@
 """Per-arm token-equality compare loops.
 
-Single concern: given one match-data record from
-``lockstep_function_match`` plus the per-version CSV decoders + the
-``BinaryDataset`` + the per-arm name-to-index lookups, fold the
-matched (count >= 2) or unmatched (count == 1) arm's comparison into
-the running ``ValidationStats``.
+Single concern: given one :class:`Matched` / :class:`Unmatched` from the
+lockstep merge plus the ``BinaryDataset`` + the per-arm name-to-index
+lookups, fold the matched arm's or unmatched arm's comparison into the
+running ``ValidationStats``.
 
 Extracted from ``validator.py`` to keep the orchestrator focused on
 flow-control + setup; the per-arm comparison logic was originally an
@@ -20,50 +19,40 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from ..aligned_data.parsed_record_iter import Matched, ParsedRecord, Unmatched
 from ..memmap_builder import VersionKey
 from ._validator_mismatch_report import format_token_mismatch
 
 logger = logging.getLogger(__name__)
 
 
-def _decode_per_version_rows(
+def _pack_records(
     version_keys: List[VersionKey],
-    rows: List[Optional[dict]],
-    mapping_dict: Dict[VersionKey, Optional[np.ndarray]],
-    decode_csv_row_data,
+    records: Dict[int, ParsedRecord],
 ) -> List[dict]:
-    """Decode each non-None row into ``{vkey, tokens, block_rl, insn_rl}``.
+    """Pack per-variant :class:`ParsedRecord`s into validator-shaped dicts.
 
-    Skips rows that fail to decode (per-CSV corruption is tolerated --
-    one bad version does not poison the others' comparison).
+    Returns one dict per surviving variant index. Each dict carries the
+    vkey + the three ndarrays the comparators byte-compare against the
+    memmap-loaded counterparts.
     """
-    decoded: List[dict] = []
-    for vkey, row in zip(version_keys, rows):
-        if row is None:
-            continue
-        mapping = mapping_dict.get(vkey)
-        try:
-            tokens_csv, block_rl_csv, insn_rl_csv = decode_csv_row_data(row, mapping)
-        except Exception:
-            continue
-        decoded.append(
+    packed: List[dict] = []
+    for variant_index, rec in records.items():
+        packed.append(
             {
-                "vkey": vkey,
-                "tokens": tokens_csv,
-                "block_rl": block_rl_csv,
-                "insn_rl": insn_rl_csv,
+                "vkey": version_keys[variant_index],
+                "tokens": rec.tokens,
+                "block_rl": rec.block_runlength,
+                "insn_rl": rec.insn_runlength,
             }
         )
-    return decoded
+    return packed
 
 
 def compare_matched_arm(
-    func_name: str,
-    rows: List[Optional[dict]],
+    matched: Matched,
     *,
     version_keys: List[VersionKey],
-    mapping_dict: Dict[VersionKey, Optional[np.ndarray]],
-    decode_csv_row_data,
     has_unique_offsets,
     should_skip_matched_function,
     matched_func_name_to_idx: Dict[str, int],
@@ -71,20 +60,18 @@ def compare_matched_arm(
     vocab_manager,
     stats,
 ) -> None:
-    """Compare one matched-arm function's per-version tokens/runlengths
+    """Compare one matched-arm function's per-variant tokens/runlengths
     against the memmap-loaded counterpart; mutate ``stats`` in place.
 
-    Mirrors the previous inlined ``count >= 2`` block in
-    ``validate_memmap_output``; the bytes-on-the-wire path through
-    ``dataset.load_matched_function`` is unchanged.
+    Mirrors the previous inlined ``count >= 2`` block; the bytes-on-the-
+    wire path through ``dataset.load_matched_function`` is unchanged.
     """
-    if should_skip_matched_function(rows):
+    func_name = matched.func_name
+    if should_skip_matched_function(matched.records):
         stats.matched_skipped += 1
         return
 
-    version_data_csv = _decode_per_version_rows(
-        version_keys, rows, mapping_dict, decode_csv_row_data
-    )
+    version_data_csv = _pack_records(version_keys, matched.records)
 
     if not has_unique_offsets(version_data_csv):
         stats.matched_skipped += 1
@@ -150,73 +137,58 @@ def compare_matched_arm(
 
 
 def compare_unmatched_arm(
-    func_name: str,
-    rows: List[Optional[dict]],
+    unmatched: Unmatched,
     *,
     version_keys: List[VersionKey],
-    mapping_dict: Dict[VersionKey, Optional[np.ndarray]],
-    decode_csv_row_data,
     should_skip_unmatched_function,
     unmatched_data_by_name_and_vkey: Dict[tuple, int],
     dataset,
     vocab_manager,
     stats,
 ) -> None:
-    """Compare one unmatched-arm function's per-version tokens against
+    """Compare one unmatched-arm function's per-variant tokens against
     the memmap-loaded counterpart; mutate ``stats`` in place.
-
-    Mirrors the previous inlined ``count == 1`` block in
-    ``validate_memmap_output``; entries are consumed from
-    ``unmatched_data_by_name_and_vkey`` on success so the caller can
-    track leftovers if needed (current orchestrator does not).
     """
-    for vkey, row in zip(version_keys, rows):
-        if row is None:
-            continue
+    func_name = unmatched.func_name
+    rec = unmatched.record
+    vkey = version_keys[unmatched.variant_index]
 
-        if should_skip_unmatched_function(row):
-            stats.unmatched_skipped += 1
-            continue
+    if should_skip_unmatched_function(rec.block_runlength):
+        stats.unmatched_skipped += 1
+        return
 
-        mapping = mapping_dict.get(vkey)
+    lookup_key = (func_name, vkey)
+    if lookup_key not in unmatched_data_by_name_and_vkey:
+        logger.warning(f"Unmatched function {func_name} version {vkey} in CSV but not in memmap")
+        stats.csv_only_unmatched += 1
+        return
 
-        try:
-            tokens_csv, block_rl_csv, insn_rl_csv = decode_csv_row_data(row, mapping)
-        except Exception:
-            continue
+    unmatched_idx = unmatched_data_by_name_and_vkey[lookup_key]
+    unmatched_func = dataset.load_unmatched_function(unmatched_idx)
 
-        lookup_key = (func_name, vkey)
-        if lookup_key not in unmatched_data_by_name_and_vkey:
-            logger.warning(f"Unmatched function {func_name} version {vkey} in CSV but not in memmap")
-            stats.csv_only_unmatched += 1
-            continue
+    if not np.array_equal(unmatched_func.tokens, rec.tokens):
+        mismatch_details = format_token_mismatch(unmatched_func.tokens, rec.tokens, vocab_manager)
+        error_msg = f"Tokens mismatch for unmatched function {func_name} version {vkey}\n{mismatch_details}"
+        stats.errors.append(error_msg)
+        return
 
-        unmatched_idx = unmatched_data_by_name_and_vkey[lookup_key]
-        unmatched_func = dataset.load_unmatched_function(unmatched_idx)
+    if not np.array_equal(unmatched_func.block_runlength, rec.block_runlength):
+        error_msg = (
+            f"Block runlength mismatch for unmatched function {func_name} version {vkey}\n"
+            f"  Memmap: {unmatched_func.block_runlength}\n"
+            f"  CSV: {rec.block_runlength}"
+        )
+        stats.errors.append(error_msg)
+        return
 
-        if not np.array_equal(unmatched_func.tokens, tokens_csv):
-            mismatch_details = format_token_mismatch(unmatched_func.tokens, tokens_csv, vocab_manager)
-            error_msg = f"Tokens mismatch for unmatched function {func_name} version {vkey}\n{mismatch_details}"
-            stats.errors.append(error_msg)
-            continue
+    if not np.array_equal(unmatched_func.insn_runlength, rec.insn_runlength):
+        error_msg = (
+            f"Instruction runlength mismatch for unmatched function {func_name} version {vkey}\n"
+            f"  Memmap: {unmatched_func.insn_runlength}\n"
+            f"  CSV: {rec.insn_runlength}"
+        )
+        stats.errors.append(error_msg)
+        return
 
-        if not np.array_equal(unmatched_func.block_runlength, block_rl_csv):
-            error_msg = (
-                f"Block runlength mismatch for unmatched function {func_name} version {vkey}\n"
-                f"  Memmap: {unmatched_func.block_runlength}\n"
-                f"  CSV: {block_rl_csv}"
-            )
-            stats.errors.append(error_msg)
-            continue
-
-        if not np.array_equal(unmatched_func.insn_runlength, insn_rl_csv):
-            error_msg = (
-                f"Instruction runlength mismatch for unmatched function {func_name} version {vkey}\n"
-                f"  Memmap: {unmatched_func.insn_runlength}\n"
-                f"  CSV: {insn_rl_csv}"
-            )
-            stats.errors.append(error_msg)
-            continue
-
-        stats.unmatched_validated += 1
-        del unmatched_data_by_name_and_vkey[lookup_key]
+    stats.unmatched_validated += 1
+    del unmatched_data_by_name_and_vkey[lookup_key]

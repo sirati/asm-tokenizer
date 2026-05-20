@@ -6,10 +6,16 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+from tokenizer.aligned_data.parsed_record_iter import (
+    Matched,
+    Unmatched,
+    lockstep_records,
+    open_parsed_record_iter,
+)
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
-from ..aligned_data.match import lockstep_function_match
+from ._dedup import open_arm_dedup_state
 from ._output_files import (
     open_matched_section_outputs,
     open_unmatched_section_outputs,
@@ -17,8 +23,8 @@ from ._output_files import (
 from .function_names import FunctionNamesRegistry
 from .passes import (
     build_function_lookup_table,
-    process_matched_function_pass1,
-    process_unmatched_function_pass1,
+    process_matched_function,
+    process_unmatched_function,
     write_matched_sections_pass2,
     write_unmatched_sections_pass2,
 )
@@ -141,13 +147,11 @@ def build_memmap_files(
     variants_path = variants.write_sidecar(output_dir, binary_name)
     logger.info(f"  Wrote: {variants_path}")
 
-    mapping_dict = {}
     csv_paths = []
     version_keys = []
+    mappings = []
 
     for version in versions:
-        mapping = get_mapping(version.mapping_path)
-
         vkey = VersionKey(
             arch=version.arch,
             compiler=version.compiler,
@@ -155,10 +159,9 @@ def build_memmap_files(
             opt=version.opt,
             variant_id=version.variant_id,
         )
-
-        mapping_dict[vkey] = mapping
         csv_paths.append(str(version.path))
         version_keys.append(vkey)
+        mappings.append(get_mapping(version.mapping_path))
 
     prefix = binary_name
     unmatched_prefix = f"{binary_name}_unmatched"
@@ -174,18 +177,26 @@ def build_memmap_files(
     # ExitStack owns every file handle the build opens so an exception
     # in any phase (pass 1, sidecar emission, pass 2) reliably closes
     # them in reverse open order. Partial output is intentionally left
-    # on disk — clean-up on retry is the caller's responsibility, as
-    # it has been pre-refactor; only the close-on-exception behaviour
-    # changes here.
+    # on disk — clean-up on retry is the caller's responsibility.
     function_names_registry = FunctionNamesRegistry()
 
     with contextlib.ExitStack() as stack:
         logger.info(f"  Creating: {matched_data_path}")
         logger.info(f"  Creating: {unmatched_data_path}")
         logger.info(f"  Creating: {error_log_path}")
-        matched_data_file = stack.enter_context(open(matched_data_path, "wb"))
-        unmatched_data_file = stack.enter_context(open(unmatched_data_path, "wb"))
+        matched_state = open_arm_dedup_state(matched_data_path)
+        unmatched_state = open_arm_dedup_state(unmatched_data_path)
+        stack.callback(matched_state.writer.finalize)
+        stack.callback(unmatched_state.writer.finalize)
         error_log = stack.enter_context(open(error_log_path, "w", encoding="ascii"))
+
+        wrappers = []
+        per_csv_iters = []
+        for csv_path, mapping in zip(csv_paths, mappings):
+            wrapper, it, _header = open_parsed_record_iter(csv_path, mapping)
+            wrappers.append(wrapper)
+            per_csv_iters.append(it)
+            stack.callback(wrapper.close)
 
         progress_callback = None
         pbar = None
@@ -195,7 +206,6 @@ def build_memmap_files(
 
                 total_size = sum(Path(csv_path).stat().st_size for csv_path in csv_paths)
                 pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Processing {binary_name}", leave=False)
-                # Ensure the bar is closed even if pass 1 throws.
                 stack.callback(pbar.close)
                 last_bytes = [0]
 
@@ -208,46 +218,39 @@ def build_memmap_files(
             except ImportError:
                 pass
 
-        for match_data in lockstep_function_match(csv_paths, progress_callback):
-            func_name = match_data["function_name"]
-            rows = match_data["rows"]
-            count = match_data["count"]
-
-            if count >= 2:
-                entry = process_matched_function_pass1(
-                    func_name,
-                    rows,
+        for item in lockstep_records(per_csv_iters, wrappers, progress_callback):
+            if isinstance(item, Matched):
+                entry = process_matched_function(
+                    item,
                     version_keys,
-                    mapping_dict,
-                    matched_data_file,
+                    matched_state,
                     function_names_registry,
                     error_log=error_log,
                 )
                 if entry is not None:
                     matched_data_entries.append(entry)
                 else:
-                    entries = process_unmatched_function_pass1(
-                        func_name,
-                        rows,
+                    entries = process_unmatched_function(
+                        item.func_name,
+                        item.records,
                         version_keys,
-                        mapping_dict,
-                        unmatched_data_file,
+                        unmatched_state,
                         function_names_registry,
                         error_log=error_log,
                     )
                     unmatched_data_entries.extend(entries)
-
-            elif count == 1:
-                entries = process_unmatched_function_pass1(
-                    func_name,
-                    rows,
+            elif isinstance(item, Unmatched):
+                entries = process_unmatched_function(
+                    item.func_name,
+                    {item.variant_index: item.record},
                     version_keys,
-                    mapping_dict,
-                    unmatched_data_file,
+                    unmatched_state,
                     function_names_registry,
                     error_log=error_log,
                 )
                 unmatched_data_entries.extend(entries)
+            else:
+                raise TypeError(f"unexpected lockstep yield: {type(item).__name__}")
 
         # Pass 1 done — finalize + emit the sidecar BEFORE pass 2 so
         # pass 2 can resolve every section-CSV function-name cell to

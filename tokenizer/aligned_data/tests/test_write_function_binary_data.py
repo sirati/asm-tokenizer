@@ -299,42 +299,6 @@ def test_no_error_log_propagates_skip():
 
 
 # ---------------------------------------------------------------------------
-# Dedup cache
-# ---------------------------------------------------------------------------
-
-
-def test_dedup_cache_hit_avoids_rewrite():
-    """A second call with identical arrays returns the cached offset and
-    leaves the file position unchanged."""
-    insn = np.arange(10, dtype=np.uint8)
-    block = np.arange(5, dtype=np.uint8)
-    tokens = np.arange(7, dtype=np.uint16)
-    cache = {}
-    buf = stdio.BytesIO()
-    first = write_function_binary_data(buf, tokens, block, insn, dedup_cache=cache)
-    assert first is not None
-    bytes_after_first = buf.tell()
-    second = write_function_binary_data(buf, tokens, block, insn, dedup_cache=cache)
-    assert second == first
-    assert buf.tell() == bytes_after_first
-
-
-def test_dedup_cache_not_polluted_on_skip():
-    """A cap-overflow skip must not leave a partial cache entry behind."""
-    insn = np.zeros(1 << 24, dtype=np.uint8)
-    block = np.zeros(0, dtype=np.uint8)
-    tokens = np.zeros(0, dtype=np.uint16)
-    cache = {}
-    buf = stdio.BytesIO()
-    log = stdio.StringIO()
-    result = write_function_binary_data(
-        buf, tokens, block, insn, dedup_cache=cache, error_log=log
-    )
-    assert result is None
-    assert cache == {}
-
-
-# ---------------------------------------------------------------------------
 # Ultrashort vs normal dispatch happens in encode_binary_header, not in
 # the writer. Pin the canonical-form invariant: a tiny record always
 # uses ultrashort even though the writer hands the encoder ``Normal``.
