@@ -80,12 +80,13 @@ def _pad_section_to_alignment(sections_file, content_offset: int) -> int:
     relative to ``content_offset``.
     """
     end0 = sections_file.tell() - content_offset
-    # First: smallest 4-multiple that is strictly > end0. That single
-    # bump satisfies BOTH constraints (>= end0 + 1 AND multiple of
-    # _SECTION_ALIGN). Pad length is therefore always in
-    # 1..._SECTION_ALIGN inclusive; combined with the row terminator
-    # already emitted by ``writerow([])`` the inter-section separator
-    # spans 2..(_SECTION_ALIGN + 1) ``\n`` bytes.
+    # Smallest 4-multiple strictly > end0. That single bump satisfies
+    # BOTH constraints (>= end0 + 1 AND multiple of _SECTION_ALIGN), so
+    # pad always lands in 1..._SECTION_ALIGN inclusive. Combined with
+    # the two ``\n``s already on disk (last variant row's terminator +
+    # ``writerow([])``'s blank-row terminator), the run of ``\n`` bytes
+    # after the last non-``\n`` content byte spans
+    # ``2 + pad`` chars → 3..(_SECTION_ALIGN + 2) inclusive.
     next_start = ((end0 // _SECTION_ALIGN) + 1) * _SECTION_ALIGN
     pad = next_start - end0
     sections_file.write(_SECTION_LINE_TERMINATOR * pad)

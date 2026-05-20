@@ -2,14 +2,14 @@
 
 The matched-section writer (``write_matched_sections_pass2``) pads
 between sections with raw ``\\n`` bytes so every section start (and
-every section length) lands on a 4-byte boundary, AND so the previous
-section is followed by ≥ 1 empty line (≥ 2 ``\\n`` bytes total between
-the last content byte and the next section's first byte). The
-``matched_index.bin`` entry codec (u40 ``csv_offset >> 2`` + u24
-``csv_length >> 2``) asserts both alignments, so a layout regression
-trips loudly at write time -- but we also pin the invariants here so a
-future refactor can't silently drop the padding step and rely on
-coincidental alignment.
+every section length) lands on a 4-byte boundary, AND so the run of
+``\\n`` bytes between consecutive sections is at least 3 bytes long
+(last variant row's terminator + the blank-row terminator from
+``writerow([])`` + 1-4 pad bytes). The ``matched_index.bin`` entry
+codec (u40 ``csv_offset >> 2`` + u24 ``csv_length >> 2``) asserts both
+alignments, so a layout regression trips loudly at write time -- but
+we also pin the invariants here so a future refactor can't silently
+drop the padding step and rely on coincidental alignment.
 
 What we assert per fixture:
 
@@ -17,8 +17,8 @@ What we assert per fixture:
     it; double-checked at the array level).
   * Every ``csv_lengths[i] % 4 == 0`` (same).
   * Between consecutive sections the bytes are all ``\\n`` (no row
-    content leaks into the padding) and the count is ≥ 2 (one ``\\n``
-    from the row terminator + ≥ 1 from the pad).
+    content leaks into the padding) and the count is in [3, 6] (two
+    from the row + blank-row terminators + 1-4 from the pad helper).
   * Nowhere in the section CSV does ``\\r\\n`` survive -- the csv
     writer is pinned to ``lineterminator='\\n'`` so byte counting is
     deterministic.
@@ -239,20 +239,23 @@ def test_matched_arm_two_functions_every_section_is_4_aligned_and_padded(
     # No CRLF anywhere in the section CSV.
     assert b"\r\n" not in raw, "section CSV must use \\n line terminators only"
 
-    # The padding between sections 0 and 1 is all ``\n``. Section 0's
-    # textual content ends at the first ``\n`` of the inter-section
-    # separator (the row-terminator after writerow([])). The pad
-    # helper then writes (next_start - end_of_blank_row) more ``\n``s.
-    # The total separator must be >= 2 ``\n`` bytes (≥ 1 empty line).
+    # The padding between sections 0 and 1 is all ``\n``. Section 0
+    # ends (per the stored length) at the byte where section 1 begins;
+    # walking backwards from there we count the run of ``\n`` bytes
+    # since the last non-``\n`` content character. That run is:
+    #
+    #   * last variant row's terminator (1 ``\n``)
+    #   * ``writerow([])``'s blank-row terminator (1 ``\n``)
+    #   * 1..4 pad bytes from the helper
+    #
+    # So the run length must be in [3, 6] -- the legacy "blank-row only"
+    # layout would have produced exactly 2.
     section0_end_abs = prelude_end + pairs[0][0] + pairs[0][1]
     section1_start_abs = prelude_end + pairs[1][0]
     assert section0_end_abs == section1_start_abs, (
         "stored length must include the inter-section pad"
     )
 
-    # Walk backwards from section0_end_abs to find the last non-newline
-    # byte; everything between that byte (exclusive) and the next
-    # section's start (== section0_end_abs) must be all ``\n``.
     last_content_idx = section0_end_abs - 1
     while last_content_idx >= prelude_end and raw[last_content_idx:last_content_idx + 1] == b"\n":
         last_content_idx -= 1
@@ -260,9 +263,9 @@ def test_matched_arm_two_functions_every_section_is_4_aligned_and_padded(
     assert set(trailing) == {ord(b"\n")}, (
         f"inter-section bytes must be all '\\n'; got {trailing!r}"
     )
-    assert len(trailing) >= 2, (
-        f"inter-section separator must be >= 2 '\\n' bytes (>= 1 "
-        f"fully empty line); got {len(trailing)} ({trailing!r})"
+    assert 3 <= len(trailing) <= 6, (
+        f"inter-section ``\\n`` run length must be in [3, 6]; "
+        f"got {len(trailing)} ({trailing!r})"
     )
 
 
@@ -367,18 +370,14 @@ def test_matched_arm_padding_covers_all_residue_classes(tmp_path: Path) -> None:
         assert start % 4 == 0, f"csv_starts[{i}]={start} not 4-aligned"
         assert length % 4 == 0, f"csv_lengths[{i}]={length} not 4-aligned"
 
-    # Pre-pad end-of-content residues across all four classes.
-    # ``unpadded_end`` per section is the byte after the trailing-blank
-    # row's ``\n``, before any pad bytes. We can't observe it directly
-    # from the recorded length (the length includes the pad), but we
-    # CAN observe the inter-section gap (gap = pad bytes after the
-    # blank row's ``\n`` and before the next section's first content
-    # byte). gap counts: 1 = pad zero (only the row terminator),
-    # 2 = pad one ``\n``, ..., up to 4. With the ≥ 1 empty line rule
-    # the helper forces gap >= 2 -- if alignment alone would have made
-    # gap == 1, the helper bumps to the next 4-aligned offset so the
-    # actual gap becomes 5 (one to satisfy "≥ 1 empty line", four more
-    # to re-align). So observed gaps must always be in {2, 3, 4, 5}.
+    # Per-section gap = run of ``\n`` bytes from the last non-``\n``
+    # content character to the next section's first byte. The pad
+    # helper writes 1..4 ``\n``s on top of two terminator ``\n``s
+    # already on disk (last variant row + ``writerow([])``), so gap
+    # is always in [3, 6]. Observing multiple distinct gap lengths
+    # proves the pad helper is input-residue-sensitive (a constant gap
+    # would be coincidentally-correct -- the same trap the legacy
+    # 4-byte-by-coincidence alignment had).
     observed_gaps = set()
     for i in range(len(starts) - 1):
         section_end = prelude_end + starts[i] + lengths[i]
@@ -387,8 +386,6 @@ def test_matched_arm_padding_covers_all_residue_classes(tmp_path: Path) -> None:
             f"sections must abut: section[{i}] ends at {section_end}, "
             f"section[{i + 1}] starts at {next_section_start}"
         )
-        # Walk backwards from section_end to find the boundary between
-        # the last content byte and the run of pad ``\n`` bytes.
         idx = section_end - 1
         while idx >= prelude_end and raw[idx:idx + 1] == b"\n":
             idx -= 1
@@ -396,8 +393,9 @@ def test_matched_arm_padding_covers_all_residue_classes(tmp_path: Path) -> None:
         assert set(pad_run) == {ord(b"\n")}, (
             f"section[{i}]→[{i + 1}] pad must be all '\\n'; got {pad_run!r}"
         )
-        assert 2 <= len(pad_run) <= 5, (
-            f"section[{i}]→[{i + 1}] pad length out of range; got {len(pad_run)}"
+        assert 3 <= len(pad_run) <= 6, (
+            f"section[{i}]→[{i + 1}] pad length out of range; "
+            f"got {len(pad_run)}"
         )
         observed_gaps.add(len(pad_run))
 
