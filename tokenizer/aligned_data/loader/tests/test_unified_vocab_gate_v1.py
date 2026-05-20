@@ -53,8 +53,8 @@ def test_v1_vocab_passes(tmp_path: Path) -> None:
     _touch(vocab_path)
     stub = _stub_vocab_manager(format_version=MEMMAP_FORMAT_VERSION)
 
-    with patch.object(
-        unified_vocab_gate, "load_unified_vocab_manager", return_value=stub
+    with patch(
+        "tokenizer.vocab_unifier.loader.load_unified_vocab_manager", return_value=stub
     ) as mocked:
         result = load_and_validate_unified_vocab(vocab_path)
 
@@ -78,8 +78,8 @@ def test_non_v1_vocab_raises(tmp_path: Path, bad_version: int) -> None:
     _touch(vocab_path)
     stub = _stub_vocab_manager(format_version=bad_version)
 
-    with patch.object(
-        unified_vocab_gate, "load_unified_vocab_manager", return_value=stub
+    with patch(
+        "tokenizer.vocab_unifier.loader.load_unified_vocab_manager", return_value=stub
     ):
         with pytest.raises(ValueError) as excinfo:
             load_and_validate_unified_vocab(vocab_path)
@@ -93,8 +93,8 @@ def test_missing_file_raises(tmp_path: Path) -> None:
     """A non-existent vocab path raises before any loader call."""
     vocab_path = tmp_path / "does_not_exist.csv"
 
-    with patch.object(
-        unified_vocab_gate, "load_unified_vocab_manager"
+    with patch(
+        "tokenizer.vocab_unifier.loader.load_unified_vocab_manager"
     ) as mocked:
         with pytest.raises(ValueError) as excinfo:
             load_and_validate_unified_vocab(vocab_path)
@@ -109,8 +109,8 @@ def test_unparseable_vocab_raises(tmp_path: Path) -> None:
     vocab_path = tmp_path / "unified_vocab.csv"
     _touch(vocab_path)
 
-    with patch.object(
-        unified_vocab_gate, "load_unified_vocab_manager", return_value=None
+    with patch(
+        "tokenizer.vocab_unifier.loader.load_unified_vocab_manager", return_value=None
     ):
         with pytest.raises(ValueError) as excinfo:
             load_and_validate_unified_vocab(vocab_path)

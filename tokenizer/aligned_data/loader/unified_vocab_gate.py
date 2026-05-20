@@ -18,7 +18,15 @@ from pathlib import Path
 
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.token_manager import VocabularyManager
-from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
+
+# ``load_unified_vocab_manager`` is imported lazily inside the function
+# body to break the import cycle: ``tokenizer.vocab_unifier`` (its
+# package __init__ pulls .loader, which imports
+# ``tokenizer.aligned_data.memmap_format`` and so triggers the
+# ``aligned_data/__init__`` cascade that lands back here). A top-level
+# import here resolves into a partially-initialised vocab_unifier.loader
+# and raises ``ImportError`` on every ``python -m tokenizer.vocab_unifier``
+# entry point.
 
 
 # Required on-disk layout version for ``unified_vocab.csv``. Sourced from
@@ -49,6 +57,8 @@ def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
             "vocab. Run `python -m tokenizer.vocab_unifier --source "
             "<dir> --output <dir>` to produce one."
         )
+
+    from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
     vocab_manager = load_unified_vocab_manager(vocab_path)
     if vocab_manager is None:
