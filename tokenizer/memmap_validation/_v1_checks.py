@@ -16,8 +16,6 @@ Layout / version knowledge crosses three module boundaries only:
   * ``aligned_data.loader.metadata_loader.open_sections_csv`` (prelude
     consumption on sections + slim variants CSVs -- the helper is
     content-agnostic so the slim CSV reuses it)
-  * ``aligned_data.loader._index_decoding.resolve_record_length``
-    (sentinel <-> overlong-field coupling)
 
 If any of these constants/parsers change, the writer + reader + this
 validator all swap together; we never re-derive layout here.
@@ -37,7 +35,6 @@ from tokenizer.aligned_data.binary_format import (
     parse_binary_header,
 )
 from tokenizer.aligned_data.index_format import MAX_NORMAL_REAL_LENGTH, read_index_prelude
-from tokenizer.aligned_data.loader._index_decoding import resolve_record_length
 from tokenizer.aligned_data.loader.metadata_loader import open_sections_csv
 
 
