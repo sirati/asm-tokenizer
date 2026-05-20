@@ -66,9 +66,10 @@ def _round_trip(insn, block, tokens):
     :func:`extract_arrays_from_data` so the test can compare element-wise.
     """
     buf = stdio.BytesIO()
-    result = write_function_binary_data(buf, tokens, block, insn)
-    assert result == 0  # first write lands at offset 0
+    offset, total = write_function_binary_data(buf, tokens, block, insn)
+    assert offset == 0  # first write lands at offset 0
     raw = buf.getvalue()
+    assert total == len(raw)
     assert len(raw) % RECORD_ALIGNMENT == 0
     header, prefix_bytes = parse_binary_header(raw)
     insn_out, block_out, tokens_out = extract_arrays_from_data(
@@ -224,8 +225,9 @@ def test_writer_appends_one_record_per_call():
             insn_len, block_enc, block_count, token_count, rng
         )
         before = buf.tell()
-        offset = write_function_binary_data(buf, tokens, block, insn)
+        offset, total = write_function_binary_data(buf, tokens, block, insn)
         assert offset == before
+        assert buf.tell() == before + total
         assert buf.tell() % RECORD_ALIGNMENT == 0
         offsets.append((offset, buf.tell()))
     # Each record's span is positive and the records do not overlap.

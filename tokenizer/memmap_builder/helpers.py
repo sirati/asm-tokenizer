@@ -100,7 +100,9 @@ def process_function_binary_data(
     if write_result is None:
         return None
     data_offset, data_len = write_result
-    return FunctionBinaryData(data_offset=data_offset, data_len=data_len, token_len=len(tokens))
+    return FunctionBinaryData(
+        data_offset=data_offset, data_len=data_len, token_len=len(tokens),
+    )
 
 
 def get_called_functions_from_row(row: dict) -> List[str]:

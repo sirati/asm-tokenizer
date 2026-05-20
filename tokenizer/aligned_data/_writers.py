@@ -50,7 +50,14 @@ def write_function_binary_data(
     pre-compute the geometry -- it builds a :class:`BinaryHeader`,
     encodes it, derives pad placement, and writes the body in one shot.
 
-    Returns the data-bin byte offset of the new record on success.
+    Returns ``(data_offset, total_record_bytes)`` on success.
+    ``total_record_bytes`` is what the writer wrote -- the index
+    layer never needs it (records are self-describing), but the
+    matched-arm inlining-cell wire format embeds per-callee
+    ``[idx, start, length, is_matched]`` quads, so callers building
+    that cell need the length and would otherwise have to re-parse
+    the encoded header to recover it.
+
     On :class:`IndexEntrySkip` (insn_len / block_word_count /
     token_count cap overflow from
     :func:`~tokenizer.aligned_data.binary_format.encode_binary_header`)
@@ -62,7 +69,7 @@ def write_function_binary_data(
 
     ``dedup_cache`` (optional ``dict``) is keyed by ``(insn_bytes,
     block_bytes, tokens_bytes)`` and short-circuits to the cached
-    offset on hit; skipped writes are never cached.
+    ``(offset, total)`` on hit; skipped writes are never cached.
     """
     insn_bytes = insn_runlength.astype(np.uint8).tobytes()
     block_enc = determine_block_encoding(block_runlength)
@@ -132,9 +139,10 @@ def write_function_binary_data(
         write_error_log_entry(error_log, exc.reason, func_name, exc.value)
         return None
 
+    result = (data_offset, total)
     if dedup_cache is not None:
-        dedup_cache[cache_key] = data_offset
-    return data_offset
+        dedup_cache[cache_key] = result
+    return result
 
 
 def write_index_entry(
