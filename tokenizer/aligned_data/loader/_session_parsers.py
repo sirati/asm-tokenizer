@@ -45,25 +45,28 @@ def arm_arrays(arm: Any, kind: str, binary_name: str):
     """Per-function arrays the session uses to slice for ``kind``.
 
     Matched ``load(idx)`` slices the section CSV (per-function), so it
-    needs the CSV bounds from ``csv_starts``/``csv_lengths``. Unmatched
-    ``load(idx)`` slices ``_data.bin`` directly (the unmatched index is
-    per-function 1:1), so it needs ``starts``/``lengths``.
+    returns the 2-tuple ``(csv_starts, csv_lengths)`` from the
+    pre-v1 ``matched_index.bin`` locator. Unmatched ``load(idx)``
+    slices ``_data.bin`` directly (the unmatched index is per-function
+    1:1) and the record is self-describing, so it returns a SINGLE
+    ndarray of per-record offsets -- no companion ``lengths`` array.
     """
     if arm is None:
         raise IndexError(f"{kind} arm not loaded for binary {binary_name}")
     if kind == "matched":
-        starts = getattr(arm, "csv_starts", None)
-        lengths = getattr(arm, "csv_lengths", None)
-        attr_pair = "csv_starts/csv_lengths"
-    else:
-        starts = getattr(arm, "starts", None)
-        lengths = getattr(arm, "lengths", None)
-        attr_pair = "starts/lengths"
-    if starts is None or lengths is None:
+        csv_starts = getattr(arm, "csv_starts", None)
+        csv_lengths = getattr(arm, "csv_lengths", None)
+        if csv_starts is None or csv_lengths is None:
+            raise IndexError(
+                f"matched arm has no csv_starts/csv_lengths for binary {binary_name}"
+            )
+        return csv_starts, csv_lengths
+    starts = getattr(arm, "starts", None)
+    if starts is None:
         raise IndexError(
-            f"{kind} arm has no {attr_pair} for binary {binary_name}"
+            f"unmatched arm has no starts for binary {binary_name}"
         )
-    return starts, lengths
+    return starts
 
 
 # Matched-section variant-row schema after the matched-arm restructuring.
@@ -81,17 +84,17 @@ def parse_matched_section(
 ) -> MatchedFunction:
     """Parse a matched-section blob into a ``MatchedFunction``.
 
-    ``data_slice(offset, length, is_overlong)`` returns
-    ``(insn_rl, block_rl, tokens)``; ``resolve_ref(ref_str)`` returns
-    the variant dict (or ``None``). Both injected so this helper does
-    not import the session's lazy openers.
+    ``data_slice(offset)`` returns ``(insn_rl, block_rl, tokens)``;
+    ``resolve_ref(ref_str)`` returns the variant dict (or ``None``).
+    Both injected so this helper does not import the session's lazy
+    openers.
 
     Per the post-restructuring layout each variant row is 3 cells
     ``[variant_ref, inlining_data, indexer_hex]``; the inline indexer
-    decode populates ``data_offset`` / ``data_len`` / ``is_overlong`` on
-    the metadata dict (and is the only authoritative source for the
-    record's overlong flag on the matched arm, since no separate index
-    file tracks per-variant data positions).
+    decode populates ``data_offset`` on the metadata dict. The record
+    at ``data_offset`` is self-describing -- its header carries every
+    geometry field a reader needs -- so no companion length / overlong
+    flag rides alongside the offset.
     """
     text = section_data.strip() if isinstance(section_data, str) else section_data
     lines = text.split("\n")
@@ -106,11 +109,7 @@ def parse_matched_section(
         if variant_row is not None:
             for k, v in variant_row.items():
                 metadata.setdefault(k, v)
-        insn_rl, block_rl, tokens = data_slice(
-            metadata["data_offset"],
-            metadata["data_len"],
-            metadata["is_overlong"],
-        )
+        insn_rl, block_rl, tokens = data_slice(metadata["data_offset"])
         versions.append(
             FunctionData(
                 func_name, metadata, tokens, insn_rl, block_rl,
@@ -156,8 +155,6 @@ def build_unmatched_function_data(
     idx: int,
     func_name: str,
     start: int,
-    length: int,
-    is_overlong: bool,
     tokens,
     insn_rl,
     block_rl,
@@ -167,10 +164,12 @@ def build_unmatched_function_data(
     """Assemble an unmatched ``FunctionData`` from its CSV row + bytes.
 
     ``row`` may be ``None`` (CSV row not recoverable) -- callers supply
-    the index-derived ``start`` / ``length`` / ``is_overlong`` directly
-    and the metadata dict falls back to "unknown" placeholders. The
-    function name is resolved by the caller (session layer) via the
-    function-names sidecar; this helper never decodes ``line_no_b64``.
+    the index-derived ``start`` directly and the metadata dict falls
+    back to "unknown" placeholders. The record at ``start`` is
+    self-describing in ``_data.bin`` so no length / overlong flag
+    crosses this boundary. The function name is resolved by the caller
+    (session layer) via the function-names sidecar; this helper never
+    decodes ``line_no_b64``.
     """
     if row is None:
         variant_refs, called_b64s, inlining_data = [], [], []
@@ -193,8 +192,6 @@ def build_unmatched_function_data(
         "called": called_b64s,
         "inlining_data": inlining_data,
         "data_offset": start,
-        "data_len": length,
-        "is_overlong": is_overlong,
     }
     # Unmatched functions span multiple variants; ``FunctionData.variant_tokens``
     # carries the first resolved variant's prefix (deterministic by section-row

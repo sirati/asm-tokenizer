@@ -35,8 +35,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from ..io import parse_function_data_memmap as _parse_function_data_memmap
-from ._index_decoding import resolve_record_length
+from ..binary_format import (
+    MAX_HEADER_BYTES,
+    extract_arrays_from_data,
+    parse_binary_header,
+    record_total_size,
+)
 from ._worker_guard import assert_main_process
 from ._session_parsers import (
     arm_arrays,
@@ -65,10 +69,18 @@ class BinarySession:
     ``metadata`` is a pre-loaded bag (built by ``metadata_loader``).
     Accessed attribute-first, dict-fallback. Expected keys/attrs:
 
-      * ``matched_arm``        -- SectionArm: ``.starts``, ``.lengths``
-      * ``unmatched_arm``      -- SectionArm: ``.starts``, ``.lengths``,
-                                  ``.func_names``, ``.section_starts``
+      * ``matched_arm``        -- SectionArm: ``.starts`` (per-variant
+                                  data-bin offsets), ``.csv_starts`` /
+                                  ``.csv_lengths`` (per-function CSV
+                                  locator), ``.func_names``
+      * ``unmatched_arm``      -- SectionArm: ``.starts`` (per-function
+                                  data-bin offsets), ``.func_names``,
+                                  ``.section_starts``
       * ``offset_to_filename`` -- ``dict[int, str]``
+
+    ``_data.bin`` records are self-describing -- their headers carry
+    insn / block / token geometry -- so no companion ``lengths`` or
+    ``is_overlong`` array crosses any boundary here.
     """
 
     def __init__(
@@ -126,67 +138,59 @@ class BinarySession:
 
     def load_matched(self, idx: int) -> MatchedFunction:
         arm = self._meta_get("matched_arm")
-        starts, lengths = arm_arrays(arm, "matched", self._binary_name)
-        if idx >= len(starts):
+        csv_starts, csv_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if idx >= len(csv_starts):
             raise IndexError(f"Index {idx} out of bounds for matched functions")
-        start = int(starts[idx])
-        length = int(lengths[idx])
+        csv_start = int(csv_starts[idx])
+        csv_length = int(csv_lengths[idx])
         sections = self._open_sections("matched")
-        sections.seek(start + self._sections_content_offset)
-        section_data = sections.read(length)
+        sections.seek(csv_start + self._sections_content_offset)
+        section_data = sections.read(csv_length)
         data_mmap = self._open_data("matched")
         func_names = getattr(arm, "func_names", None) or []
         func_name_override = func_names[idx] if idx < len(func_names) else None
         return parse_matched_section(
             section_data,
             func_name_override=func_name_override,
-            data_slice=lambda o, l, ov: self._slice_data_record(
-                data_mmap, o, l, ov
-            ),
+            data_slice=lambda o: self._slice_data_record(data_mmap, o),
             resolve_ref=self.get_variant_by_ref,
         )
 
     def load_unmatched(self, idx: int) -> FunctionData:
         arm = self._meta_get("unmatched_arm")
-        starts, lengths = arm_arrays(arm, "unmatched", self._binary_name)
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
         if idx >= len(starts):
             raise IndexError(f"Index {idx} out of bounds for unmatched functions")
         start = int(starts[idx])
         data_mmap = self._open_data("unmatched")
-        # ``resolve_record_length`` bridges sentinel ↔ real length.
-        real_length, is_overlong = resolve_record_length(
-            data_mmap, start, int(lengths[idx])
-        )
-        insn_rl, block_rl, tokens = self._slice_data_record(
-            data_mmap, start, real_length, is_overlong
-        )
+        insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
         return build_unmatched_function_data(
             self._read_unmatched_row(arm, idx),
             idx,
             self._unmatched_func_name(arm, idx),
-            start, real_length, is_overlong,
+            start,
             tokens, insn_rl, block_rl,
             resolve_ref=self.get_variant_by_ref,
         )
 
-    def _slice_data_record(
-        self, data_mmap, offset: int, length: int, is_overlong: bool
-    ):
+    def _slice_data_record(self, data_mmap, offset: int):
         """Slice + parse + egress-copy one record (memmap-view detach).
 
-        ``length`` may be the index sentinel (``0``) for an overlong
-        record; sentinel resolution happens here via
-        ``resolve_record_length`` so both arms route through one rule
-        (matched callers decode ``indexer_hex`` → sentinel-or-real;
-        unmatched callers pre-resolve from the v1 index — calling again
-        is idempotent). Arrays are copied so they outlive the session's
-        ``_data.bin`` memmap (see class docstring lifetime contract).
+        The record at ``offset`` is self-describing: its header carries
+        every geometry field the body parser needs. Reads at most
+        :data:`MAX_HEADER_BYTES` for the header, derives the total via
+        :func:`record_total_size`, and slices the body via
+        :func:`extract_arrays_from_data`. Arrays are copied so they
+        outlive the session's ``_data.bin`` memmap (see class docstring
+        lifetime contract).
         """
-        real_length, _resolved_overlong = resolve_record_length(
-            data_mmap, offset, length
+        header, prefix_bytes = parse_binary_header(
+            bytes(data_mmap[offset : offset + MAX_HEADER_BYTES])
         )
-        insn_rl, block_rl, tokens = _parse_function_data_memmap(
-            data_mmap, offset, real_length, is_overlong=is_overlong,
+        total = record_total_size(header)
+        record_bytes = bytes(data_mmap[offset : offset + total])
+        insn_rl, block_rl, tokens = extract_arrays_from_data(
+            record_bytes, header, prefix_bytes
         )
         return (
             np.array(insn_rl, copy=True),

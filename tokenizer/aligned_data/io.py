@@ -5,8 +5,10 @@ import numpy as np
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 from .binary_format import (
+    MAX_HEADER_BYTES,
     extract_arrays_from_data,
     parse_binary_header,
+    record_total_size,
 )
 from .csv_format import format_inlining_dict, format_variant_refs
 from .index_format import iter_index_entries
@@ -65,10 +67,12 @@ def write_function_section_csv(
     keeping them out of the section CSV avoids the per-row repetition
     that conflated variants sharing the canonical-4 axes.
 
-    ``indexer_hex`` is the 16-hex-char inline encoding of the v1
-    8-byte index entry for this variant's ``_data.bin`` record
-    (offset + length + sentinel/overlong marker). Callers compute
-    it via :func:`tokenizer.aligned_data.inline_indexer.encode_inline_indexer`;
+    ``indexer_hex`` is the 8-hex-char inline encoding of the v1
+    4-byte index entry for this variant's ``_data.bin`` record
+    (one ``u32 = offset >> 4``; records are self-describing so no
+    length / overlong marker rides alongside the offset). Callers
+    compute it via
+    :func:`tokenizer.aligned_data.inline_indexer.encode_inline_indexer`;
     this writer treats it as an opaque string and emits it verbatim,
     so the writer stays unaware of the entry layout.
     """
@@ -105,10 +109,12 @@ def write_unmatched_section_csv(
     the legacy ``compiler_sets`` cell so the column count stays
     constant across the section CSV.
 
-    ``indexer_hex`` is the 16-hex-char inline encoding of the v1
-    8-byte index entry for this function's first variant ``_data.bin``
-    record (offset + length + sentinel/overlong marker). Callers compute
-    it via :func:`tokenizer.aligned_data.inline_indexer.encode_inline_indexer`;
+    ``indexer_hex`` is the 8-hex-char inline encoding of the v1
+    4-byte index entry for this function's first variant ``_data.bin``
+    record (one ``u32 = offset >> 4``; records are self-describing so
+    no length / overlong marker rides alongside the offset). Callers
+    compute it via
+    :func:`tokenizer.aligned_data.inline_indexer.encode_inline_indexer`;
     this writer treats it as an opaque string and emits it verbatim.
     """
     variants_str = format_variant_refs(variant_refs)
@@ -124,14 +130,13 @@ def write_unmatched_section_csv(
 
 
 def read_index_file(index_path):
-    """Yield ``(start, length, avg_len)`` for each entry in a v1 ``_index.bin``.
+    """Yield ``start`` (real byte offset) for each entry in a v1 ``_index.bin``.
 
     Thin wrapper over :func:`tokenizer.aligned_data.index_format.iter_index_entries`
-    so external callers keep the existing import path. ``start`` is the
-    real byte offset, ``length`` is the real record byte length for
-    normal entries and ``0`` for the sentinel marker (overlong record;
-    the real length lives in the data record's u24 overlong field).
-    Raises :class:`ValueError` on missing prelude / wrong format version.
+    so external callers keep the existing import path. Records are
+    self-describing in ``_data.bin`` (their headers carry the geometry)
+    so the index entry shrinks to an offset only. Raises
+    :class:`ValueError` on missing prelude / wrong format version.
     """
     yield from iter_index_entries(index_path)
 
@@ -184,73 +189,68 @@ def read_sections_file(sections_path):
         handle.close()
 
 
-def read_data_file(data_path, offset, length, *, is_overlong: bool):
-    """Read the binary data for a function from the data file given offset and length.
+def read_data_file(data_path, offset):
+    """Read one self-describing function record from ``_data.bin``.
 
-    ``is_overlong`` is REQUIRED (keyword-only): callers must derive it
-    from the index-entry sentinel via
-    :func:`tokenizer.aligned_data.loader._index_decoding.resolve_record_length`
-    (or the inline-indexer decode for matched-arm variants). A silent
-    default would corrupt overlong reads by skipping the 3-byte
-    overlong-length field shift, so the API forces an explicit value.
+    The record at ``offset`` carries its own geometry in the header --
+    :func:`parse_binary_header` returns the header dataclass + the
+    prefix-byte count the header occupied on disk, and
+    :func:`record_total_size` yields the total record byte count; no
+    companion length / overlong flag is needed at the boundary.
     """
     with open(data_path, "rb") as f:
         f.seek(offset)
-        data = f.read(length)
-        header = parse_binary_header(data)
-        return extract_arrays_from_data(data, header, is_overlong=is_overlong)
+        prefix_window = f.read(MAX_HEADER_BYTES)
+        header, prefix_bytes = parse_binary_header(prefix_window)
+        total = record_total_size(header)
+        f.seek(offset)
+        data = f.read(total)
+        return extract_arrays_from_data(data, header, prefix_bytes)
 
 
-def parse_function_data_memmap(memmap_handle, offset, length, *, is_overlong: bool):
+def parse_function_data_memmap(memmap_handle, offset):
     """Slice one function record from an already-open ``_data.bin`` view.
 
     ``memmap_handle`` is the caller's already-open ``np.memmap`` (or any
     1-D uint8 ndarray view) of the WHOLE ``_data.bin`` file; ``offset``
-    and ``length`` are the byte range of one function record within it
-    (the same values stored as ``data_offset`` / ``data_len`` in the
-    section CSV).
+    is the byte position of one self-describing record within it. The
+    record header carries every geometry field a reader needs, so no
+    companion length or overlong flag crosses this boundary.
 
     Pure parsing: no file I/O, no handle lifecycle. Mirrors the
-    ``variant_tokens.record.read_record`` pattern so a future session
-    owns one open handle per bin file and slices many records out of
-    it without re-opening per call.
-
-    ``is_overlong`` is REQUIRED (keyword-only) -- see
-    :func:`read_data_file` for the rationale; the session layer sets
-    it after observing the index-entry sentinel or after decoding the
-    inline indexer on the matched arm.
+    ``variant_tokens.record.read_record`` pattern so a session can own
+    one open handle per bin file and slice many records out of it
+    without re-opening per call.
 
     Returns ``(insn_runlength, block_runlength, tokens)``.
     """
-    data = memmap_handle[offset:offset + length]
-    return parse_function_data_header(data, is_overlong=is_overlong)
+    header, prefix_bytes = parse_binary_header(
+        memmap_handle[offset : offset + MAX_HEADER_BYTES]
+    )
+    total = record_total_size(header)
+    data = memmap_handle[offset : offset + total]
+    return extract_arrays_from_data(data, header, prefix_bytes)
 
 
-def read_function_data_memmap(data_path, offset, length, *, is_overlong: bool):
-    """
-    Read the binary data for a function from the data file using numpy.memmap for random access.
-    Returns: insn_runlength, block_runlength, tokens
+def read_function_data_memmap(data_path, offset):
+    """Read one self-describing record from ``_data.bin`` via ``np.memmap``.
 
-    Thin wrapper that opens the full ``_data.bin`` as a uint8 memmap,
-    delegates to :func:`parse_function_data_memmap`, and lets the
-    memmap close when the local reference drops. Use the open-handle
-    form directly inside a session that needs many records out of the
-    same bin file (avoids per-call mmap overhead). ``is_overlong`` is
-    REQUIRED (keyword-only); see :func:`read_data_file`.
+    Thin wrapper that opens the full ``_data.bin`` as a uint8 memmap
+    and delegates to :func:`parse_function_data_memmap`; the memmap
+    closes when the local reference drops. Use the open-handle form
+    directly inside a session that needs many records out of the same
+    bin file (avoids per-call mmap overhead).
     """
     data = np.memmap(data_path, dtype=np.uint8, mode="r")
-    return parse_function_data_memmap(data, offset, length, is_overlong=is_overlong)
+    return parse_function_data_memmap(data, offset)
 
 
-def parse_function_data_header(data_bytes, *, is_overlong: bool):
+def parse_function_data_header(data_bytes):
+    """Parse one self-describing record from in-memory bytes.
+
+    ``data_bytes`` must start at the record's header byte 0 and span
+    the full record (the header tells the parser how much to consume).
+    Returns ``(insn_runlength, block_runlength, tokens)``.
     """
-    Parse the header and return (insn_runlength, block_runlength, tokens) ndarrays.
-    data_bytes: bytes or 1D uint8 array
-
-    ``is_overlong`` is REQUIRED (keyword-only): forwarded to
-    :func:`extract_arrays_from_data` so the body offset accounts for
-    the optional 3-byte overlong-length field that precedes the body
-    in overlong records.
-    """
-    header = parse_binary_header(data_bytes)
-    return extract_arrays_from_data(data_bytes, header, is_overlong=is_overlong)
+    header, prefix_bytes = parse_binary_header(data_bytes)
+    return extract_arrays_from_data(data_bytes, header, prefix_bytes)

@@ -128,14 +128,15 @@ class BinaryDataset:
         consumers should read from ``self._matched_arm`` / ``_unmatched_arm``
         instead.
 
-        Post matched-arm restructuring, ``<prefix>_starts`` / ``_lengths``
-        are per-RECORD (data-bin positions; matched = per-variant flat,
-        unmatched = per-function), and the new ``<prefix>_csv_starts``
-        / ``_csv_lengths`` / ``_avg_lengths`` / ``_is_overlong`` mirror
-        the matching SectionArm fields.
+        Post self-describing record header, ``<prefix>_starts`` is the
+        per-RECORD ``_data.bin`` offset (matched = per-variant flat,
+        unmatched = per-function); records are self-describing so no
+        companion ``_lengths`` / ``_is_overlong`` / ``_avg_lengths``
+        array exists. The ``<prefix>_csv_starts`` / ``_csv_lengths``
+        mirror the per-function CSV-section locator for the matched
+        arm (empty on the unmatched arm where rows are single-line).
         """
         setattr(self, f"{attr_prefix}_starts", arm.starts)
-        setattr(self, f"{attr_prefix}_lengths", arm.lengths)
         setattr(self, f"{attr_prefix}_edge_indices", arm.edge_indices)
         setattr(self, f"{attr_prefix}_count_per_length", arm.count_per_length)
         setattr(self, f"{attr_prefix}_func_names", arm.func_names)
@@ -143,8 +144,6 @@ class BinaryDataset:
         setattr(self, f"{attr_prefix}_section_starts", arm.section_starts)
         setattr(self, f"{attr_prefix}_csv_starts", arm.csv_starts)
         setattr(self, f"{attr_prefix}_csv_lengths", arm.csv_lengths)
-        setattr(self, f"{attr_prefix}_avg_lengths", arm.avg_lengths)
-        setattr(self, f"{attr_prefix}_is_overlong", arm.is_overlong)
 
     # ------------------------------------------------------------------
     # Session API
