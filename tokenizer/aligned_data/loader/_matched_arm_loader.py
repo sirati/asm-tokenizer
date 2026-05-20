@@ -8,24 +8,32 @@ data-bin offsets).
 Layout split that makes this module possible:
 
 * ``<binary>_index.bin`` (matched arm) -- pre-v1 8-byte layout, no
-  prelude. Each entry locates ONE function's section in the text CSV:
-  ``(csv_offset, csv_len, avg_len_bucket)``. Decoded via
+  prelude. Each entry locates ONE function's section in the text CSV
+  as ``(csv_offset, csv_section_length)`` (u40 + u24, both
+  4-byte-aligned). Decoded via
   :func:`tokenizer.aligned_data.csv_section_index.read_csv_section_index_arrays`.
 * ``<binary>_sections.csv`` -- function sections separated by blank
   rows. Header row first cell is the base64 line number into
   ``<binary>_function_names.txt``; subsequent rows (until blank) are
   3-cell variant rows ``[variant_ref, inlining_str, indexer_hex]``
-  whose ``indexer_hex`` decodes to ``(data_start, stored_length,
-  is_overlong)`` for ONE record in ``<binary>_data.bin``.
+  whose ``indexer_hex`` (8 hex chars = one u32 ``offset >> 4``)
+  decodes to a single ``data_offset`` into ``<binary>_data.bin``. The
+  record at that offset is self-describing -- its header carries every
+  geometry field a reader needs -- so no length or overlong flag rides
+  alongside the offset.
 
 The previous matched-arm shape carried CSV byte positions in
 ``starts`` / ``lengths``. Post-restructuring those arrays hold
 **data-bin positions per VARIANT** (one entry per
 ``write_function_binary_data`` call pass 1 emitted); the per-function
 CSV-section locator moves to dedicated ``csv_starts`` / ``csv_lengths``
-fields. ``avg_lengths`` (per-function) drives length-band sampling
-exactly as before. ``func_names`` is per-function, resolved from the
-sidecar's ``line_to_name`` dict.
+fields. ``func_names`` is per-function, resolved from the sidecar's
+``line_to_name`` dict.
+
+``select_random_function_by_length`` is a NotImplementedError stub for
+the matched arm, so the length-band lookup tables collapse to empty
+placeholders -- there is no per-function avg-length signal to feed
+them.
 """
 
 from __future__ import annotations
@@ -48,23 +56,20 @@ def _slice_section_rows(
     csv_starts: np.ndarray,
     csv_lengths: np.ndarray,
     line_to_name: Dict[int, str],
-) -> Tuple[
-    List[str],
-    List[List[Tuple[int, int, bool]]],
-]:
+) -> Tuple[List[str], List[List[int]]]:
     """Per-function: slice the CSV section bytes, decode the header line
     number to a function name, decode each variant row's ``indexer_hex``.
 
-    Returns ``(func_names, per_function_variant_decodes)`` where the
-    inner list is ``[(data_start, stored_length, is_overlong)]`` for
-    every variant of that function. The CSV is opened ONCE via
-    :func:`metadata_loader.open_sections_csv` so the v1 prelude check
-    fires exactly once.
+    Returns ``(func_names, per_function_variant_offsets)`` where the
+    inner list is ``[data_offset]`` for every variant of that function
+    (one int per ``write_function_binary_data`` call pass 1 emitted).
+    The CSV is opened ONCE via :func:`metadata_loader.open_sections_csv`
+    so the v1 prelude check fires exactly once.
     """
     from .metadata_loader import open_sections_csv
 
     func_names: List[str] = []
-    per_function: List[List[Tuple[int, int, bool]]] = []
+    per_function: List[List[int]] = []
     if not sections_csv.exists() or len(csv_starts) == 0:
         return func_names, per_function
 
@@ -73,11 +78,11 @@ def _slice_section_rows(
         for i in range(len(csv_starts)):
             f.seek(int(csv_starts[i]) + content_offset)
             blob = f.read(int(csv_lengths[i]))
-            func_name, variant_decodes = _parse_section_blob(
+            func_name, variant_offsets = _parse_section_blob(
                 blob, line_to_name, sections_csv
             )
             func_names.append(func_name)
-            per_function.append(variant_decodes)
+            per_function.append(variant_offsets)
     finally:
         f.close()
     return func_names, per_function
@@ -87,16 +92,20 @@ def _parse_section_blob(
     blob: str,
     line_to_name: Dict[int, str],
     sections_csv: Path,
-) -> Tuple[str, List[Tuple[int, int, bool]]]:
+) -> Tuple[str, List[int]]:
     """Decode one CSV section blob.
 
     Header row: ``[base64_line_no, base64_called_funcs_csv]`` -> name
     via :func:`parse_function_line_no` + ``line_to_name``.
 
     Variant rows: ``[variant_ref, inlining_str, indexer_hex]``
-    (3 cells). Iteration stops at the first empty row (the trailing
-    blank separator that the writer emits) or at EOF. Any 4-cell
-    legacy row raises with a migration-pointing message -- hard cutover.
+    (3 cells). Each ``indexer_hex`` is 8 hex chars and decodes to one
+    ``data_offset`` (the record at that offset is self-describing).
+    Iteration stops at the first empty row (the trailing blank
+    separator that the writer emits) or at EOF. Any 4-cell legacy row
+    raises with a migration-pointing message; the legacy 16-hex-char
+    inline indexer is caught one layer down by
+    :func:`decode_inline_indexer` -- both are hard cutovers.
     """
     reader = csv.reader(blob.splitlines())
     rows = list(reader)
@@ -120,7 +129,7 @@ def _parse_section_blob(
         )
     func_name = line_to_name[line_no]
 
-    variant_decodes: List[Tuple[int, int, bool]] = []
+    variant_offsets: List[int] = []
     for row in rows[1:]:
         if not row:
             # Blank row = end-of-section separator.
@@ -138,8 +147,8 @@ def _parse_section_blob(
                 f"(expected 3); row={row!r}"
             )
         indexer_hex = row[2]
-        variant_decodes.append(decode_inline_indexer(indexer_hex))
-    return func_name, variant_decodes
+        variant_offsets.append(decode_inline_indexer(indexer_hex))
+    return func_name, variant_offsets
 
 
 def load_matched_arm(
@@ -152,18 +161,16 @@ def load_matched_arm(
 
     Empty (no matched functions) -> the orchestrator's canonical
     ``_empty_arm()``. The matched_index is the function-to-CSV-section
-    locator; the v1 alignment / sentinel / overlong machinery does NOT
-    apply to it (the entries point at TEXT-file byte positions). The
-    per-variant data-bin positions ARE shifted v1 entries (decoded
-    inline) and DO honour the alignment + sentinel rules.
+    locator; its entries point at TEXT-file byte positions and obey
+    the section CSV's 4-byte alignment rule -- they are not subject to
+    the ``_data.bin`` 16-byte alignment. The per-variant data-bin
+    positions ARE 16-byte-aligned (decoded from the 8-hex-char inline
+    indexer in each variant row) and produce the per-record
+    ``starts`` array.
     """
     # Local import to break the import cycle between this module and
     # the orchestrator (``metadata_loader`` imports ``load_matched_arm``).
-    from .metadata_loader import (
-        SectionArm,
-        _empty_arm,
-        build_length_lookup_tables,
-    )
+    from .metadata_loader import SectionArm, _empty_arm
 
     if not matched_index.exists():
         return _empty_arm()
@@ -171,46 +178,35 @@ def load_matched_arm(
     section_index = read_csv_section_index_arrays(matched_index)
     if section_index is None:
         return _empty_arm()
-    csv_starts, csv_lengths, avg_lengths = section_index
+    csv_starts, csv_lengths = section_index
 
     func_names, per_function = _slice_section_rows(
         sections_csv, csv_starts, csv_lengths, line_to_name
     )
 
-    # Flatten variants into per-record arrays. ``func_names`` stays
-    # per-function (one entry per matched section); ``starts`` /
-    # ``lengths`` / ``is_overlong`` are per-variant (one entry per
-    # ``write_function_binary_data`` call pass 1 made).
-    flat_starts: List[int] = []
-    flat_lengths: List[int] = []
-    flat_is_overlong: List[bool] = []
-    for decodes in per_function:
-        for data_start, stored_length, is_overlong in decodes:
-            flat_starts.append(data_start)
-            flat_lengths.append(stored_length)
-            flat_is_overlong.append(is_overlong)
-
+    # Flatten variants into per-record offsets. ``func_names`` stays
+    # per-function (one entry per matched section); ``starts`` is
+    # per-variant (one entry per ``write_function_binary_data`` call
+    # pass 1 made). No length or overlong flag -- the record at each
+    # offset is self-describing.
+    flat_starts: List[int] = [
+        offset for offsets in per_function for offset in offsets
+    ]
     starts = np.array(flat_starts, dtype=np.int64)
-    lengths = np.array(flat_lengths, dtype=np.uint32)
-    is_overlong = np.array(flat_is_overlong, dtype=np.bool_)
 
-    if len(avg_lengths) > 0:
-        edge_indices, count_per_length = build_length_lookup_tables(
-            avg_lengths, scale_factor=16
-        )
-    else:
-        edge_indices = np.zeros(1, dtype=np.int32)
-        count_per_length = np.zeros(1, dtype=np.int32)
+    # ``select_random_function_by_length`` is a NotImplementedError
+    # stub for the matched arm, so the length-band lookup tables have
+    # no consumer; ship the canonical empty placeholders the
+    # ``SectionArm`` dataclass expects.
+    edge_indices = np.zeros(1, dtype=np.int32)
+    count_per_length = np.zeros(1, dtype=np.int32)
 
     return SectionArm(
         starts=starts,
-        lengths=lengths,
         edge_indices=edge_indices,
         count_per_length=count_per_length,
         func_names=func_names,
         section_starts=csv_starts.astype(np.int64),
         csv_starts=csv_starts.astype(np.int64),
         csv_lengths=csv_lengths.astype(np.uint32),
-        avg_lengths=avg_lengths.astype(np.uint8),
-        is_overlong=is_overlong,
     )

@@ -91,10 +91,10 @@ class CorpusPaths:
         Returns an empty array when the index file is absent or empty
         (matches the loader's behaviour).
         """
-        triple = read_csv_section_index_arrays(self.matched_index_bin)
-        if triple is None:
+        pair = read_csv_section_index_arrays(self.matched_index_bin)
+        if pair is None:
             return np.zeros(0, dtype=np.int64)
-        starts, _lengths, _avg = triple
+        starts, _lengths = pair
         return starts
 
 
