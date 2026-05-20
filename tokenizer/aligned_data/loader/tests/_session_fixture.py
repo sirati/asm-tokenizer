@@ -42,27 +42,27 @@ class _FakeArm:
 
     Tests build arms directly from on-disk byte positions rather than
     going through ``load_section_arm`` so the lifecycle coverage stays
-    independent of the parallel matched-arm reader rewrite (which
-    lands in batch 2A).
+    independent of the parallel matched-arm reader rewrite. Records
+    are self-describing in ``_data.bin`` so the fake carries no
+    ``lengths`` companion.
     """
 
     def __init__(
         self,
         starts: np.ndarray,
-        lengths: np.ndarray,
         func_names: List[str] | None = None,
         section_starts: np.ndarray | None = None,
         csv_starts: np.ndarray | None = None,
         csv_lengths: np.ndarray | None = None,
     ) -> None:
         self.starts = starts
-        self.lengths = lengths
         self.func_names = func_names or []
         self.section_starts = section_starts
         # Matched arm: session.load_matched(idx) slices the section CSV
         # via these per-function fields (per F2-A's SectionArm shape);
-        # ``starts``/``lengths`` are reserved for per-variant data-bin.
-        # Unmatched arm leaves these as None and reuses starts/lengths.
+        # ``starts`` carries per-variant data-bin offsets for the
+        # validator. Unmatched arm leaves these as None and reuses
+        # ``starts`` directly.
         self.csv_starts = csv_starts
         self.csv_lengths = csv_lengths
 
@@ -187,16 +187,15 @@ def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
 
 
 def _matched_arm_from_corpus(corpus) -> _FakeArm:
-    triple = read_csv_section_index_arrays(corpus.matched_index_bin)
-    assert triple is not None and triple[0].shape == (1,)
-    csv_starts, csv_lengths, _ = triple
-    # The per-variant data-bin arrays (arm.starts/lengths) aren't read
-    # by load_matched after the F2-A contract change; populate empty
-    # placeholders so any inadvertent access surfaces clearly.
+    pair = read_csv_section_index_arrays(corpus.matched_index_bin)
+    assert pair is not None and pair[0].shape == (1,)
+    csv_starts, csv_lengths = pair
+    # arm.starts is only read by validators / iterators (not by
+    # load_matched after the F2-A contract change); populate an empty
+    # placeholder so any inadvertent slice surfaces clearly.
     empty = np.zeros(0, dtype=np.int64)
     return _FakeArm(
         starts=empty,
-        lengths=empty,
         func_names=["my_func"],
         csv_starts=csv_starts,
         csv_lengths=csv_lengths,
@@ -204,12 +203,10 @@ def _matched_arm_from_corpus(corpus) -> _FakeArm:
 
 
 def _unmatched_arm_from_corpus(corpus) -> _FakeArm:
-    arrays = read_index_arrays(corpus.unmatched_index_bin)
-    assert arrays is not None
-    starts, lengths, _ = arrays
+    starts = read_index_arrays(corpus.unmatched_index_bin)
+    assert starts is not None
     return _FakeArm(
         starts=starts,
-        lengths=lengths,
         func_names=["lonely_func"],
         section_starts=np.array([0], dtype=np.int64),
     )

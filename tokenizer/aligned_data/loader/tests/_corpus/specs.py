@@ -1,16 +1,19 @@
 """Per-function fixture descriptors + convenience constructors.
 
 Single concern: dataclass shapes that callers compose into a corpus
-build, plus tiny constructors that pre-seed common shapes (normal
-matched function, overlong-record matched variant, unmatched function).
-The builder layer (:mod:`.builder`) consumes these specs and drives
-the production pass-2 writers.
+build, plus tiny constructors that pre-seed common shapes (matched
+function with N variants, unmatched function with N versions). The
+builder layer (:mod:`.builder`) consumes these specs and drives the
+production pass-2 writers. Records are self-describing in
+``_data.bin`` so there is no "overlong" variant concept here -- the
+record-header encoder handles every record size up to its (much
+larger) cap.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -82,44 +85,17 @@ def make_simple_variant(
     return VariantSpec(vkey=vkey, tokens=tokens, block_rl=block_rl, insn_rl=insn_rl)
 
 
-def make_overlong_variant(vkey: Tuple, *, token_count: int = 16) -> VariantSpec:
-    """A variant whose data record lands in the overlong band
-    (real_length > 256 KiB).
-
-    The bulk lives in ``insn_runlength`` because the u16 ``block_len``
-    cap (64 KiB) cannot accommodate a >256 KiB record on its own.
-    Triggers the writer's sentinel + u24 overlong-field path; the
-    inline-indexer encoder emits ``length_field == SENTINEL_LENGTH``
-    so the consumer reads the real length from the data record.
-    """
-    insn_len = (1 << 18) + 5  # 256 KiB + tail -> definitely overlong
-    insn = np.zeros(insn_len, dtype=np.uint8)
-    block = np.array([1, 2], dtype=np.uint8)
-    tokens = np.arange(token_count, dtype=np.uint16)
-    return VariantSpec(vkey=vkey, tokens=tokens, block_rl=block, insn_rl=insn)
-
-
 def matched_spec(
     func_name: str,
     *,
     n_variants: int = 2,
     called: Sequence[str] = (),
-    overlong_variant_idx: Optional[int] = None,
 ) -> MatchedFunctionSpec:
-    """A 2+ variant matched function.
-
-    ``overlong_variant_idx`` -- when set, the variant at that position
-    uses :func:`make_overlong_variant` so the test exercises the
-    inline indexer's sentinel path under the matched arm
-    (cross-product of "matched" x "overlong-sentinel").
-    """
-    variants: List[VariantSpec] = []
-    for i in range(n_variants):
-        vkey = (func_name, i)
-        if overlong_variant_idx is not None and i == overlong_variant_idx:
-            variants.append(make_overlong_variant(vkey))
-        else:
-            variants.append(make_simple_variant(vkey, token_seed=i + 1))
+    """A 2+ variant matched function."""
+    variants: List[VariantSpec] = [
+        make_simple_variant((func_name, i), token_seed=i + 1)
+        for i in range(n_variants)
+    ]
     return MatchedFunctionSpec(
         func_name=func_name,
         variants=tuple(variants),
@@ -132,16 +108,12 @@ def unmatched_spec(
     *,
     n_versions: int = 1,
     called: Sequence[str] = (),
-    overlong_version_idx: Optional[int] = None,
 ) -> UnmatchedFunctionSpec:
     """A 1+ version unmatched function."""
-    versions: List[VariantSpec] = []
-    for i in range(n_versions):
-        vkey = (func_name, "u", i)
-        if overlong_version_idx is not None and i == overlong_version_idx:
-            versions.append(make_overlong_variant(vkey))
-        else:
-            versions.append(make_simple_variant(vkey, token_seed=i + 1))
+    versions: List[VariantSpec] = [
+        make_simple_variant((func_name, "u", i), token_seed=i + 1)
+        for i in range(n_versions)
+    ]
     return UnmatchedFunctionSpec(
         func_name=func_name,
         versions=tuple(versions),

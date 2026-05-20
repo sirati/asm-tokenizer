@@ -37,7 +37,7 @@ from tokenizer.aligned_data.loader.metadata_loader import (
 )
 
 from ._corpus import (
-    assert_mod4_residues_covered,
+    assert_starts_4_byte_aligned,
     build_corpus,
     make_variable_length_names,
     matched_spec,
@@ -99,23 +99,20 @@ def _full_corpus(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_matched_index_csv_starts_cover_every_mod4_residue(tmp_path):
-    """Fixture invariant: matched-index CSV starts span every mod-4 residue.
-
-    Documents the audit-driven intent: the original
-    ``matched_fn_{i}`` fixtures' 12-char names + 1-variant rows landed
-    on 4-byte boundaries coincidentally, hiding the matched-arm
-    alignment-assertion blocker. Asserting residue coverage here
-    catches any regression that re-introduces an alignment requirement
-    on this path.
+def test_matched_index_csv_starts_are_all_4_byte_aligned(tmp_path):
+    """Writer-enforced invariant: matched-index CSV starts are all
+    4-byte aligned (the writer pads each section with 1-4 trailing
+    ``\\n`` bytes so the next section header lands on a 4-aligned
+    offset). Variable-length fixture names ensure the padding code
+    runs against every input residue.
     """
     corpus = _matched_corpus(tmp_path)
     starts = corpus.read_matched_csv_starts()
     assert len(starts) >= 4, (
-        "fixture must produce at least 4 sections to demonstrate mod-4 "
-        f"residue coverage; got {len(starts)}"
+        "fixture must produce at least 4 sections to demonstrate "
+        f"alignment coverage; got {len(starts)}"
     )
-    assert_mod4_residues_covered(starts)
+    assert_starts_4_byte_aligned(starts)
 
 
 # ---------------------------------------------------------------------------

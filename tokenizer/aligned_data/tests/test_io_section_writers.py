@@ -6,8 +6,9 @@
 * ``read_sections_file`` routes through ``open_sections_csv`` so the
   ``# format=N`` prelude is consumed before ``csv.reader`` sees the
   stream.
-* All four reader entry points raise ``TypeError`` when ``is_overlong``
-  is omitted -- the silent default was audit blocker #4.
+* All four reader entry points refuse the legacy ``length`` argument --
+  records are self-describing in ``_data.bin`` and the reader derives
+  the total via :func:`record_total_size`.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from tokenizer.aligned_data.io import (
 
 
 # ---------------------------------------------------------------------------
-# Section writers emit the new 3- and 6-cell layouts.
+# Section writers emit the new 3- and 5-cell layouts.
 # ---------------------------------------------------------------------------
 
 
@@ -40,7 +41,7 @@ def test_write_function_section_csv_emits_three_cells():
     """Matched-section variant row has exactly 3 cells: ref, inlining, indexer."""
     buf = StringIO()
     writer = csv.writer(buf, lineterminator='\n')
-    indexer_hex = encode_inline_indexer(0x40, 0x80)
+    indexer_hex = encode_inline_indexer(0x40)
     write_function_section_csv(
         writer,
         variant_ref="0x2a",
@@ -50,12 +51,12 @@ def test_write_function_section_csv_emits_three_cells():
     rows = list(csv.reader(StringIO(buf.getvalue())))
     assert len(rows) == 1
     assert rows[0] == ["0x2a", "", indexer_hex]
-    # Indexer hex is exactly 16 chars (8-byte v1 entry hex-encoded).
-    assert len(rows[0][2]) == 16
+    # Indexer hex is exactly 8 chars (4-byte u32 entry hex-encoded).
+    assert len(rows[0][2]) == 8
 
 
-def test_write_unmatched_section_csv_emits_six_cells():
-    """Unmatched-section row has 6 cells: line_no_b64, refs, called,
+def test_write_unmatched_section_csv_emits_five_cells():
+    """Unmatched-section row has 5 cells: line_no_b64, refs, called,
     inlining, indexer.
 
     First cell is the caller-computed base64 of the function name's
@@ -64,7 +65,7 @@ def test_write_unmatched_section_csv_emits_six_cells():
     """
     buf = StringIO()
     writer = csv.writer(buf, lineterminator='\n')
-    indexer_hex = encode_inline_indexer(0x100, 0x40)
+    indexer_hex = encode_inline_indexer(0x100)
     write_unmatched_section_csv(
         writer,
         line_no_b64="Aw",  # caller-computed; opaque to writer
@@ -123,13 +124,13 @@ def test_read_sections_file_strips_prelude(tmp_path):
             (
                 ["foo", "x,y"],
                 [
-                    ["0x0", "", encode_inline_indexer(0, 4)],
-                    ["0x1", "", encode_inline_indexer(8, 4)],
+                    ["0x0", "", encode_inline_indexer(0)],
+                    ["0x1", "", encode_inline_indexer(0x10)],
                 ],
             ),
             (
                 ["bar", ""],
-                [["0x2", "", encode_inline_indexer(16, 4)]],
+                [["0x2", "", encode_inline_indexer(0x20)]],
             ),
         ],
     )
@@ -145,42 +146,45 @@ def test_read_sections_file_missing_prelude_raises(tmp_path):
     with open(path, "w", newline="", encoding="ascii") as fh:
         writer = csv.writer(fh, lineterminator='\n')
         writer.writerow(["foo", "x"])
-        writer.writerow(["0x0", "", encode_inline_indexer(0, 4)])
+        writer.writerow(["0x0", "", encode_inline_indexer(0)])
     with pytest.raises(ValueError):
         list(read_sections_file(path))
 
 
 # ---------------------------------------------------------------------------
-# Reader entry points require ``is_overlong`` (audit blocker #4).
+# Reader entry points refuse the legacy ``length`` argument.
 # ---------------------------------------------------------------------------
 
 
-def test_parse_function_data_header_requires_is_overlong():
-    """No silent ``is_overlong=False`` default on ``parse_function_data_header``."""
+def test_parse_function_data_header_refuses_legacy_kwargs():
+    """``parse_function_data_header(data)`` takes ONLY the bytes (record
+    is self-describing). A legacy ``is_overlong=`` kwarg must fail."""
     with pytest.raises(TypeError):
-        parse_function_data_header(b"\x00" * 8)  # type: ignore[call-arg]
+        parse_function_data_header(b"\x00" * 8, is_overlong=False)  # type: ignore[call-arg]
 
 
-def test_parse_function_data_memmap_requires_is_overlong(tmp_path):
-    """No silent ``is_overlong=False`` default on ``parse_function_data_memmap``."""
+def test_parse_function_data_memmap_refuses_legacy_length(tmp_path):
+    """``parse_function_data_memmap(memmap, offset)`` takes ONLY the
+    handle and the offset; a legacy length positional must fail."""
     data_path = tmp_path / "data.bin"
     data_path.write_bytes(b"\x00" * 16)
     mmap = np.memmap(data_path, dtype=np.uint8, mode="r")
     with pytest.raises(TypeError):
-        parse_function_data_memmap(mmap, 0, 8)  # type: ignore[call-arg]
+        parse_function_data_memmap(mmap, 0, 8, is_overlong=False)  # type: ignore[call-arg]
 
 
-def test_read_function_data_memmap_requires_is_overlong(tmp_path):
-    """No silent ``is_overlong=False`` default on ``read_function_data_memmap``."""
+def test_read_function_data_memmap_refuses_legacy_length(tmp_path):
+    """``read_function_data_memmap(path, offset)`` takes ONLY the path
+    and the offset."""
     data_path = tmp_path / "data.bin"
     data_path.write_bytes(b"\x00" * 16)
     with pytest.raises(TypeError):
-        read_function_data_memmap(str(data_path), 0, 8)  # type: ignore[call-arg]
+        read_function_data_memmap(str(data_path), 0, 8, is_overlong=False)  # type: ignore[call-arg]
 
 
-def test_read_data_file_requires_is_overlong(tmp_path):
-    """No silent ``is_overlong=False`` default on ``read_data_file``."""
+def test_read_data_file_refuses_legacy_length(tmp_path):
+    """``read_data_file(path, offset)`` takes ONLY the path and the offset."""
     data_path = tmp_path / "data.bin"
     data_path.write_bytes(b"\x00" * 16)
     with pytest.raises(TypeError):
-        read_data_file(str(data_path), 0, 8)  # type: ignore[call-arg]
+        read_data_file(str(data_path), 0, 8, is_overlong=False)  # type: ignore[call-arg]

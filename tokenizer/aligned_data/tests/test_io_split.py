@@ -23,10 +23,10 @@ from tokenizer.aligned_data.io import (
 def _make_record(rng: np.random.Generator, n_tokens: int, n_blocks: int, n_insns: int):
     """Build one synthetic function record's three arrays.
 
-    Sizes vary across records so the test exercises distinct
-    ``data_len`` values and distinct block-encoding widths (the
-    encoder picks uint8/uint16/uint32 based on the largest block
-    runlength).
+    Sizes vary across records so the test exercises distinct record
+    geometries (token counts spanning every header width tag) and
+    distinct block-encoding widths (the encoder picks uint8/uint16/uint32
+    based on the largest block runlength).
     """
     tokens = rng.integers(0, 2**16, size=n_tokens, dtype=np.uint16)
     block_runlength = rng.integers(1, 200, size=n_blocks, dtype=np.uint8)
@@ -36,8 +36,10 @@ def _make_record(rng: np.random.Generator, n_tokens: int, n_blocks: int, n_insns
 
 def _write_synthetic_data_bin(path: Path):
     """Append several records to a fresh ``_data.bin`` and return the
-    list of ``(offset, length, tokens, block_rl, insn_rl)`` tuples for
-    each record so the test can read them back and compare.
+    list of ``(offset, tokens, block_rl, insn_rl)`` tuples for each
+    record so the test can read them back and compare. Records are
+    self-describing on disk -- the reader derives the total byte
+    count from the parsed header, so callers do not track length.
     """
     rng = np.random.default_rng(seed=0xA51CED)
     record_specs = [
@@ -51,8 +53,8 @@ def _write_synthetic_data_bin(path: Path):
     with open(path, "wb") as f:
         for n_tok, n_blk, n_ins in record_specs:
             tokens, block_rl, insn_rl = _make_record(rng, n_tok, n_blk, n_ins)
-            off, length = write_function_binary_data(f, tokens, block_rl, insn_rl)
-            written.append((off, length, tokens, block_rl, insn_rl))
+            off, _total = write_function_binary_data(f, tokens, block_rl, insn_rl)
+            written.append((off, tokens, block_rl, insn_rl))
     return written
 
 
@@ -66,17 +68,9 @@ def test_parse_matches_read_byte_for_byte(tmp_path):
     # ``BinarySession`` will do once per session.
     whole_mmap = np.memmap(data_bin, dtype=np.uint8, mode="r")
 
-    for offset, length, tokens_in, block_in, insn_in in records:
-        # The synthetic bin in this test only writes normal-length records
-        # (no overlong sentinel exercised), so ``is_overlong=False`` is
-        # the correct explicit value for every call here. The audit
-        # removed the silent default; callers thread the flag explicitly.
-        path_form = read_function_data_memmap(
-            str(data_bin), offset, length, is_overlong=False
-        )
-        handle_form = parse_function_data_memmap(
-            whole_mmap, offset, length, is_overlong=False
-        )
+    for offset, tokens_in, block_in, insn_in in records:
+        path_form = read_function_data_memmap(str(data_bin), offset)
+        handle_form = parse_function_data_memmap(whole_mmap, offset)
 
         insn_p, block_p, tok_p = path_form
         insn_h, block_h, tok_h = handle_form
@@ -112,14 +106,10 @@ def test_parse_with_ndarray_view(tmp_path):
 
     in_memory = np.frombuffer(data_bin.read_bytes(), dtype=np.uint8)
 
-    for offset, length, _, _, _ in records:
+    for offset, _, _, _ in records:
         whole_mmap = np.memmap(data_bin, dtype=np.uint8, mode="r")
-        insn_m, block_m, tok_m = parse_function_data_memmap(
-            whole_mmap, offset, length, is_overlong=False
-        )
-        insn_n, block_n, tok_n = parse_function_data_memmap(
-            in_memory, offset, length, is_overlong=False
-        )
+        insn_m, block_m, tok_m = parse_function_data_memmap(whole_mmap, offset)
+        insn_n, block_n, tok_n = parse_function_data_memmap(in_memory, offset)
 
         assert insn_m.tobytes() == insn_n.tobytes()
         assert block_m.tobytes() == block_n.tobytes()

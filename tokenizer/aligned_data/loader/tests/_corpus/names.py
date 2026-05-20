@@ -1,22 +1,24 @@
-"""Variable-length function-name generator + mod-4 residue assertion.
+"""Variable-length function-name generator + 4-byte alignment assertion.
 
 Single concern: produce function-name lists whose lengths cycle across
-a span wide enough that the resulting section CSV byte offsets cover
-every ``mod 4`` residue ``{0, 1, 2, 3}``, NOT only the residue the
-legacy ``matched_fn_{i}`` (uniform 12-char) names accidentally hit.
+a span wide enough that the section CSV writer's padding policy is
+exercised across every input residue (the writer adds 1-4 trailing
+``\\n`` bytes after each section so the next section starts on a
+4-byte boundary). Without name-length variation the un-padded width
+already lands on a boundary every time and the padding code is never
+exercised.
 
-The audit blocker that motivated batch 2 of memoized-booping-wren
-(``_pass2.write_matched_sections_pass2`` feeding non-4-aligned CSV
-offsets into a 4-byte-asserting writer) was hidden by uniform-length
-fixtures whose accidentally-aligned offsets never tripped the
-assertion. The residue-coverage assertion below documents the intent
-so a future "let's reintroduce alignment on this path" regression
-cannot pass CI silently.
+After the writer's pad-policy landed, every per-section CSV start is
+4-byte aligned by construction; the assertion below pins that
+invariant so a future writer regression that drops the padding fails
+loudly. The prior "covers every mod-4 residue" assertion came from a
+pre-padding world where alignment was deliberately NOT enforced and
+the residue spread was the diagnostic.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence
+from typing import Iterable, List
 
 
 def make_variable_length_names(
@@ -56,24 +58,19 @@ def make_variable_length_names(
     return out
 
 
-def assert_mod4_residues_covered(
-    starts: Iterable[int],
-    *,
-    expected: Sequence[int] = (0, 1, 2, 3),
-) -> None:
-    """Intent assertion: ``starts`` must cover every residue in ``expected``.
+def assert_starts_4_byte_aligned(starts: Iterable[int]) -> None:
+    """Pin the post-padding invariant: every CSV-section start is 4-aligned.
 
-    Without this guard a future change to
-    :func:`make_variable_length_names` (or to the section CSV row
-    width) could accidentally regress to the matched_fn_00 pattern
-    (only one residue hit) and silently restore the
-    alignment-blind-spot the audit caught.
+    The writer adds 1-4 trailing ``\\n`` bytes after each section so
+    the next section header lands on a 4-byte boundary. A regression
+    that drops the padding step would land starts on misaligned
+    offsets; this assertion fires before the misaligned starts reach
+    ``pack_csv_section_index_entry`` (which would also raise but with
+    a less obvious message).
     """
-    residues = sorted({int(s) % 4 for s in starts})
-    missing = sorted(set(expected) - set(residues))
-    assert not missing, (
-        f"section starts cover residues {residues}, expected all of "
-        f"{sorted(expected)}; missing {missing}. Fixture lengths are no "
-        f"longer spanning every mod-4 residue -- adjust "
-        f"make_variable_length_names span/base_len."
+    misaligned = sorted({int(s) for s in starts if int(s) % 4 != 0})
+    assert not misaligned, (
+        f"matched-sections CSV starts must all be 4-byte aligned "
+        f"(writer pads with trailing newlines); got misaligned offsets "
+        f"{misaligned}"
     )

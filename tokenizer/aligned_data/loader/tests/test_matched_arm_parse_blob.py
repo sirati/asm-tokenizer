@@ -9,13 +9,13 @@ parallel batches).
 
 from __future__ import annotations
 
-import base64
 import csv
 import io
 from pathlib import Path
 
 import pytest
 
+from tokenizer.aligned_data.csv_format import format_function_line_no
 from tokenizer.aligned_data.inline_indexer import encode_inline_indexer
 from tokenizer.aligned_data.loader._matched_arm_loader import (
     _parse_section_blob,
@@ -25,10 +25,15 @@ from tokenizer.aligned_data.loader._matched_arm_loader import (
 def _blob_for(line_no: int, variant_offsets: list[int]) -> str:
     """Render a synthetic matched-section blob using the production
     CSV shape (``# format`` prelude lives one level up in
-    ``open_sections_csv`` so does not appear in the blob)."""
+    ``open_sections_csv`` so does not appear in the blob).
+
+    Routes through :func:`format_function_line_no` so the encoded
+    line-no cell matches what the production writer emits (the codec
+    encodes the integer as big-endian bytes, not its ASCII digits).
+    """
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
-    line_no_b64 = base64.b64encode(str(line_no).encode("ascii")).decode("ascii")
+    line_no_b64 = format_function_line_no(line_no)
     writer.writerow([line_no_b64, ""])  # header: line_no + (empty) called csv
     for offset in variant_offsets:
         writer.writerow(["0x10", "", encode_inline_indexer(offset)])
@@ -55,7 +60,7 @@ def test_parse_section_blob_two_variants_round_trip(tmp_path: Path) -> None:
 def test_parse_section_blob_legacy_4_cell_raises(tmp_path: Path) -> None:
     """4-cell legacy row -> ValueError with migration message."""
     line_no = 7
-    line_no_b64 = base64.b64encode(str(line_no).encode("ascii")).decode("ascii")
+    line_no_b64 = format_function_line_no(line_no)
     blob = (
         f"{line_no_b64},\n"
         "0x10,,deadbeef,00000004\n"  # legacy: 4 cells
@@ -70,7 +75,7 @@ def test_parse_section_blob_legacy_16_char_indexer_raises(tmp_path: Path) -> Non
     """3 cells but legacy 16-hex-char indexer -> ``decode_inline_indexer``
     raises with the migration message (delegated hard cutover)."""
     line_no = 9
-    line_no_b64 = base64.b64encode(str(line_no).encode("ascii")).decode("ascii")
+    line_no_b64 = format_function_line_no(line_no)
     blob = (
         f"{line_no_b64},\n"
         "0x10,,deadbeefcafebabe\n"  # 16-char legacy indexer

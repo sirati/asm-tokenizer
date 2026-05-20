@@ -11,7 +11,7 @@ Submodules:
                        ``assert_mod4_residues_covered``
 * :mod:`.specs`    -- ``MatchedFunctionSpec`` / ``UnmatchedFunctionSpec`` /
                        ``VariantSpec`` + ``matched_spec`` / ``unmatched_spec``
-                       / ``make_simple_variant`` / ``make_overlong_variant``
+                       / ``make_simple_variant``
 * :mod:`.builder`  -- ``build_corpus`` (stub registry) +
                        ``build_corpus_with_registry`` (test-supplied registry)
                        + ``CorpusPaths``
@@ -27,14 +27,13 @@ from .builder import (
     build_corpus_with_registry,
 )
 from .names import (
-    assert_mod4_residues_covered,
+    assert_starts_4_byte_aligned,
     make_variable_length_names,
 )
 from .specs import (
     MatchedFunctionSpec,
     UnmatchedFunctionSpec,
     VariantSpec,
-    make_overlong_variant,
     make_simple_variant,
     matched_spec,
     unmatched_spec,
@@ -45,10 +44,9 @@ __all__ = (
     "MatchedFunctionSpec",
     "UnmatchedFunctionSpec",
     "VariantSpec",
-    "assert_mod4_residues_covered",
+    "assert_starts_4_byte_aligned",
     "build_corpus",
     "build_corpus_with_registry",
-    "make_overlong_variant",
     "make_simple_variant",
     "make_variable_length_names",
     "matched_spec",
