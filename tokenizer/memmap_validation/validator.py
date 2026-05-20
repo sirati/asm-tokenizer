@@ -210,19 +210,19 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
         for err in variants_bin_errors:
             logger.error(f"  {err}")
 
-    # Per-record v1 invariant checks (4-byte alignment + zero-pad +
-    # sentinel/overlong coupling). Run after ``BinaryDataset`` loaded
-    # the section arms so the checks reuse the already-decoded starts/
-    # lengths arrays instead of re-opening ``_index.bin``.
+    # Per-record v1 invariant checks (16-byte alignment + zero-pad +
+    # pad-placement consistency + record bounds). Run after
+    # ``BinaryDataset`` loaded the section arms so the checks reuse the
+    # already-decoded starts arrays instead of re-opening ``_index.bin``;
+    # records are self-describing so no per-record length array is
+    # threaded through (the checks parse the header at each start).
     v1_check_errors = run_v1_post_checks(
         matched_index=dataset.matched_index,
         unmatched_index=dataset.unmatched_index,
         matched_data=dataset.matched_data,
         unmatched_data=dataset.unmatched_data,
         matched_starts=dataset.matched_starts,
-        matched_lengths=dataset.matched_lengths,
         unmatched_starts=dataset.unmatched_starts,
-        unmatched_lengths=dataset.unmatched_lengths,
     )
     if v1_check_errors:
         for err in v1_check_errors:
