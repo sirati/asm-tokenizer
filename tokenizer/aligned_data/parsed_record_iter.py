@@ -12,7 +12,7 @@ Two concerns are pushed down here from the legacy
 
 * base64 decode of tokens + runlengths (was in ``aligned_data/io.py``);
 * called-function extraction from the v1/v2 metadata column (was in
-  ``memmap_builder/helpers.py``).
+  the now-removed ``memmap_builder/helpers.py``).
 
 The lockstep merge :func:`lockstep_records` consumes N per-CSV
 iterators (one per build variant) and yields a tagged union per

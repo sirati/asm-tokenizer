@@ -49,8 +49,6 @@ from ._validator_csv import (
     detect_csv_format_version,
     has_unique_offsets,
     load_mapping,
-    should_skip_matched_function,
-    should_skip_unmatched_function,
 )
 from ._validator_summary import log_validation_summary
 from .variants_bin_check import cross_check_variants_bin
@@ -280,7 +278,6 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
                     item,
                     version_keys=version_keys,
                     has_unique_offsets=has_unique_offsets,
-                    should_skip_matched_function=should_skip_matched_function,
                     matched_func_name_to_idx=matched_func_name_to_idx,
                     dataset=dataset,
                     vocab_manager=vocab_manager,
@@ -290,7 +287,6 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
                 compare_unmatched_arm(
                     item,
                     version_keys=version_keys,
-                    should_skip_unmatched_function=should_skip_unmatched_function,
                     unmatched_data_by_name_and_vkey=unmatched_data_by_name_and_vkey,
                     dataset=dataset,
                     vocab_manager=vocab_manager,

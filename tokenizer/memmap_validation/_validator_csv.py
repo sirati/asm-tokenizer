@@ -9,7 +9,6 @@ consumes :class:`ParsedRecord` objects directly. What's left here:
   during data iteration stays with
   ``aligned_data.match.open_csv_skip_vocab``.
 * Per-variant mapping loader (used by the validator's setup step).
-* Skip predicates mirroring the pass-1 walkers' gating.
 * Dedup-key heuristic for unique-offset detection across variants of
   the same function (matched arm's drop gate).
 """
@@ -18,11 +17,10 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 
-from tokenizer.aligned_data.parsed_record_iter import ParsedRecord
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 
@@ -62,25 +60,6 @@ def load_mapping(mapping_path: Path) -> Optional[np.ndarray]:
         with open(mapping_path, "r", encoding="ascii") as f:
             return base64_to_ndarray_vec(f.read())
     return None
-
-
-def should_skip_matched_function(records: Dict[int, ParsedRecord]) -> bool:
-    """``True`` when any variant's block runlength reaches the cap.
-
-    Mirrors the pass-1 matched walker's gate
-    (:func:`tokenizer.memmap_builder.helpers.should_skip_for_matched`)
-    applied across every variant; one over-cap variant drops the
-    whole function from the matched arm.
-    """
-    for rec in records.values():
-        if int(rec.block_runlength.sum()) >= 4096:
-            return True
-    return False
-
-
-def should_skip_unmatched_function(_block_runlength: np.ndarray) -> bool:
-    """No-op preserved from the pre-refactor walker (see helpers.py)."""
-    return False
 
 
 def has_unique_offsets(version_data_list: List[dict]) -> bool:

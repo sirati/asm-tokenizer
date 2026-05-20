@@ -54,7 +54,6 @@ def compare_matched_arm(
     *,
     version_keys: List[VersionKey],
     has_unique_offsets,
-    should_skip_matched_function,
     matched_func_name_to_idx: Dict[str, int],
     dataset,
     vocab_manager,
@@ -67,10 +66,6 @@ def compare_matched_arm(
     wire path through ``dataset.load_matched_function`` is unchanged.
     """
     func_name = matched.func_name
-    if should_skip_matched_function(matched.records):
-        stats.matched_skipped += 1
-        return
-
     version_data_csv = _pack_records(version_keys, matched.records)
 
     if not has_unique_offsets(version_data_csv):
@@ -140,7 +135,6 @@ def compare_unmatched_arm(
     unmatched: Unmatched,
     *,
     version_keys: List[VersionKey],
-    should_skip_unmatched_function,
     unmatched_data_by_name_and_vkey: Dict[tuple, int],
     dataset,
     vocab_manager,
@@ -152,10 +146,6 @@ def compare_unmatched_arm(
     func_name = unmatched.func_name
     rec = unmatched.record
     vkey = version_keys[unmatched.variant_index]
-
-    if should_skip_unmatched_function(rec.block_runlength):
-        stats.unmatched_skipped += 1
-        return
 
     lookup_key = (func_name, vkey)
     if lookup_key not in unmatched_data_by_name_and_vkey:

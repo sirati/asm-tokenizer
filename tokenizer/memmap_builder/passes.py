@@ -32,7 +32,6 @@ from ._pass2 import (  # re-export so builder.py's import stays one module
     write_unmatched_sections_pass2,
 )
 from .function_names import FunctionNamesRegistry
-from .helpers import should_skip_for_matched, should_skip_for_unmatched
 
 __all__ = (
     "build_function_lookup_table",
@@ -57,7 +56,6 @@ def process_matched_function(
     Returns ``None`` on any of:
 
     * function name starts with ``.L`` (local label);
-    * any surviving variant's block-runlength sum reaches the cap;
     * every variant's encoder raised ``IndexEntrySkip``;
     * every variant deduplicated to the same offset (no inter-variant
       signal — the function is dropped from matched and the caller
@@ -71,9 +69,6 @@ def process_matched_function(
     """
     func_name = matched.func_name
     if func_name.startswith(".L"):
-        return None
-
-    if any(should_skip_for_matched(rec.block_runlength) for rec in matched.records.values()):
         return None
 
     unique_called = sorted(
@@ -142,9 +137,6 @@ def process_unmatched_function(
 
     entries = []
     for variant_index, rec in records.items():
-        if should_skip_for_unmatched(rec.block_runlength):
-            continue
-
         emit = _emit_record(rec, arm_state, func_name=func_name, error_log=error_log)
         if emit is None:
             continue

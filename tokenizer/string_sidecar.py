@@ -10,9 +10,9 @@ This module is the *single* place that knows the on-disk format. The
 tokenizer pipeline (``main_loop.py``, ``output_staging.py``,
 ``dynrunner.tokenize.tokenizer_task``) treats the sidecar opaquely —
 they open it, flow the path through their plumbing, and close it.
-Readers in downstream phases (``memmap_builder/helpers.py``,
-function-matching) call ``iter_sidecar_lines`` / ``read_sidecar_line``
-when they need to materialize a string's bytes.
+Readers in downstream phases (``memmap_builder``, function-matching)
+call ``iter_sidecar_lines`` / ``read_sidecar_line`` when they need to
+materialize a string's bytes.
 
 Wire format
 -----------
