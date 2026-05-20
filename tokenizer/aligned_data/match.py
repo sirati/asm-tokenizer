@@ -11,7 +11,16 @@ primitives.
 
 import csv
 import os
+import sys
 from typing import List
+
+# Real-corpus per-binary CSVs carry full-function ``tokens_base64`` cells
+# that routinely exceed the default 131072-byte field limit (large
+# functions in nmap / openssl / clamav). Raise to ``sys.maxsize`` so the
+# csv.reader doesn't reject those rows. Module-load is the right hook —
+# every csv.reader in this package is constructed lazily after this
+# point.
+csv.field_size_limit(sys.maxsize)
 
 
 class PositionTrackingWrapper:
