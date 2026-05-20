@@ -132,7 +132,6 @@ def test_section_arm_equality_same_inputs(tmp_path):
     arm_b = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus), line_to_name)
 
     assert np.array_equal(arm_a.starts, arm_b.starts)
-    assert np.array_equal(arm_a.lengths, arm_b.lengths)
     assert np.array_equal(arm_a.edge_indices, arm_b.edge_indices)
     assert np.array_equal(arm_a.count_per_length, arm_b.count_per_length)
     assert arm_a.func_names == arm_b.func_names
@@ -148,7 +147,6 @@ def test_matched_arm_matches_legacy_attributes(tmp_path):
     arm = dataset._matched_arm
 
     assert np.array_equal(dataset.matched_starts, arm.starts)
-    assert np.array_equal(dataset.matched_lengths, arm.lengths)
     assert np.array_equal(dataset.matched_edge_indices, arm.edge_indices)
     assert np.array_equal(
         dataset.matched_count_per_length, arm.count_per_length
@@ -165,7 +163,6 @@ def test_unmatched_arm_matches_legacy_attributes(tmp_path):
     arm = dataset._unmatched_arm
 
     assert np.array_equal(dataset.unmatched_starts, arm.starts)
-    assert np.array_equal(dataset.unmatched_lengths, arm.lengths)
     assert np.array_equal(dataset.unmatched_edge_indices, arm.edge_indices)
     assert np.array_equal(
         dataset.unmatched_count_per_length, arm.count_per_length
@@ -181,9 +178,9 @@ def test_unmatched_arm_matches_legacy_attributes(tmp_path):
 
 def test_matched_arm_csv_starts_index_section_csv_bytes(tmp_path):
     """Matched ``load(idx)`` seeks the section CSV via
-    ``csv_starts``/``csv_lengths`` (per-function); ``starts``/``lengths``
-    carry per-variant data-bin positions for the validator. Function
-    names recovered from the sidecar match ``arm.func_names``.
+    ``csv_starts``/``csv_lengths`` (per-function); ``starts`` carries
+    per-variant data-bin offsets for the validator. Function names
+    recovered from the sidecar match ``arm.func_names``.
     """
     corpus = _matched_corpus(tmp_path)
     arm = load_section_arm(
@@ -264,7 +261,6 @@ def test_empty_arm_when_index_missing(tmp_path):
     arm = load_section_arm(SectionKind.MATCHED, paths)
     assert arm.count == 0
     assert arm.starts.dtype == np.int64
-    assert arm.lengths.dtype == np.uint32
     assert arm.edge_indices.dtype == np.int32
     assert arm.count_per_length.dtype == np.int32
     assert arm.func_names == []
@@ -290,4 +286,3 @@ def test_zero_entry_index_yields_empty_arm(tmp_path):
     arm = load_section_arm(SectionKind.UNMATCHED, paths)
     assert arm.count == 0
     assert len(arm.starts) == 0
-    assert len(arm.lengths) == 0

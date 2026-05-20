@@ -7,13 +7,15 @@ line-no resolution) live in :mod:`_unmatched_arm_loader`. Both plug
 into a closed ``SectionKind`` enum dispatch -- a third arm adds an
 ``_ArmSpec`` entry, never an ``elif`` cascade.
 
-Matched arm WAS / IS: ``starts`` / ``lengths`` once held per-function
-CSV byte offsets decoded via the v1 reader. Post-restructuring they
-hold per-VARIANT data-bin record positions decoded from the section-
-CSV variant rows' ``indexer_hex`` cell; per-function CSV positions
-move to ``csv_starts`` / ``csv_lengths``, loaded via the pre-v1
-:func:`csv_section_index.read_csv_section_index_arrays`. Header-row
-base64 line numbers resolve to names through the
+Matched arm WAS / IS: ``starts`` once held per-function CSV byte
+offsets decoded via the v1 reader. Post-restructuring it holds
+per-VARIANT data-bin record positions decoded from the section-CSV
+variant rows' ``indexer_hex`` cell; per-function CSV positions move
+to ``csv_starts`` / ``csv_lengths``, loaded via the pre-v1
+:func:`csv_section_index.read_csv_section_index_arrays`. Records in
+``_data.bin`` are self-describing -- header carries the geometry --
+so the arm no longer shadows per-record lengths or overlong flags.
+Header-row base64 line numbers resolve to names through the
 ``<binary>_function_names.txt`` sidecar (loaded by ``BinaryDataset``).
 """
 
@@ -26,10 +28,10 @@ from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 
+from tokenizer.aligned_data.binary_format import record_token_count_from_memmap
 from tokenizer.aligned_data.index_format import read_index_arrays
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
-from ._index_decoding import record_token_count
 from ._matched_arm_loader import load_matched_arm
 
 # First line of every v1 sections / variants CSV. Comment-line marker so
@@ -48,14 +50,17 @@ class SectionKind(Enum):
 class SectionArm:
     """Per-arm metadata mirroring legacy ``self.{matched,unmatched}_*``.
 
-    Cardinality (post matched-arm restructuring):
+    Cardinality (post self-describing record header):
 
-    * Per-RECORD (one entry per ``_data.bin`` record):
-      ``starts``, ``lengths``, ``is_overlong``. Matched: one entry per
-      VARIANT (flattened across functions). Unmatched: one per function.
+    * Per-RECORD (one entry per ``_data.bin`` record): ``starts``.
+      Matched: one entry per VARIANT (flattened across functions).
+      Unmatched: one per function. Records are self-describing in
+      ``_data.bin`` -- the record header carries ``insn_len``,
+      ``block_word_count`` and ``token_count`` -- so the arm no longer
+      shadows per-record lengths or overlong flags.
     * Per-FUNCTION: ``func_names``, ``csv_starts``, ``csv_lengths``,
-      ``avg_lengths``, ``edge_indices``, ``count_per_length``,
-      ``section_starts``, ``count``.
+      ``edge_indices``, ``count_per_length``, ``section_starts``,
+      ``count``.
 
     ``csv_starts`` / ``csv_lengths``: per-function CSV-section locator
     in BYTES, content-offset-relative. Matched: from the pre-v1
@@ -63,17 +68,13 @@ class SectionArm:
     per-row walker (``csv_lengths`` empty -- unmatched rows are single-
     line so length is implicit). ``section_starts`` aliases ``csv_starts``.
 
-    ``avg_lengths``: per-function avg-len bucket. Matched: from pre-v1
-    index; unmatched: from v1 index (real token counts drive the
-    length-band tables, not these buckets).
-
-    ``is_overlong``: per-RECORD overlong flag derived from the v1
-    sentinel (``stored_length == SENTINEL_LENGTH``); consumers never
-    re-encode the sentinel rule.
+    ``edge_indices`` / ``count_per_length`` drive O(1) length-band
+    sampling; both arms compute them from real token counts
+    (unmatched: ``load_unmatched_lengths`` over the data records;
+    matched: per-function aggregation owned by the matched loader).
     """
 
     starts: np.ndarray
-    lengths: np.ndarray
     edge_indices: np.ndarray
     count_per_length: np.ndarray
     func_names: List[str] = field(default_factory=list)
@@ -85,12 +86,6 @@ class SectionArm:
     )
     csv_lengths: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.uint32)
-    )
-    avg_lengths: np.ndarray = field(
-        default_factory=lambda: np.zeros(0, dtype=np.uint8)
-    )
-    is_overlong: np.ndarray = field(
-        default_factory=lambda: np.zeros(0, dtype=np.bool_)
     )
 
     @property
@@ -192,21 +187,23 @@ def build_length_lookup_tables(
 
 
 def load_unmatched_lengths(
-    paths: BinaryArmPaths, starts: np.ndarray, lengths: np.ndarray
+    paths: BinaryArmPaths, starts: np.ndarray
 ) -> np.ndarray:
     """Real token count per unmatched function.
 
-    Delegates per-record decoding to :func:`record_token_count`, which
-    owns the pad + overlong-field accounting in one place. ``lengths``
-    carries the index reader's sentinel-marker convention (``0`` flags
-    an overlong record).
+    Records are self-describing in ``_data.bin``: the header at each
+    record start carries the token count directly, so no companion
+    ``lengths`` array is needed (the index entry is just an offset).
+    Delegates per-record decoding to
+    :func:`record_token_count_from_memmap`, which owns the header
+    parse + width-tag dispatch in one place.
     """
     if not paths.data_bin.exists() or len(starts) == 0:
         return np.array([], dtype=np.int32)
 
     data_memmap = np.memmap(str(paths.data_bin), dtype=np.uint8, mode="r")
     token_counts = [
-        record_token_count(data_memmap, int(starts[i]), int(lengths[i]))
+        record_token_count_from_memmap(data_memmap, int(starts[i]))
         for i in range(len(starts))
     ]
     del data_memmap
@@ -239,15 +236,12 @@ def _empty_arm() -> SectionArm:
     """
     return SectionArm(
         starts=np.array([], dtype=np.int64),
-        lengths=np.array([], dtype=np.uint32),
         edge_indices=np.zeros(1, dtype=np.int32),
         count_per_length=np.zeros(1, dtype=np.int32),
         func_names=[],
         section_starts=np.zeros(0, dtype=np.int64),
         csv_starts=np.zeros(0, dtype=np.int64),
         csv_lengths=np.zeros(0, dtype=np.uint32),
-        avg_lengths=np.zeros(0, dtype=np.uint8),
-        is_overlong=np.zeros(0, dtype=np.bool_),
     )
 
 
