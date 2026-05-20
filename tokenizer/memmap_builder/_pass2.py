@@ -4,22 +4,30 @@ Pass 1 (``tokenizer.memmap_builder.passes``) writes ``_data.bin``
 records and collects per-function metadata; pass 2 emits the section
 CSVs and per-arm index files.
 
-Layout responsibilities (post matched-arm restructuring):
+Layout responsibilities:
 
 * Matched header rows + unmatched first cell carry the base64 of the
   function's line number in ``<binary>_function_names.txt``; called-
   funcs cells are comma-joined base64 line numbers. Raw function names
   no longer appear in either section CSV.
-* Matched variant rows carry a single ``indexer_hex`` cell (16 hex
-  chars encoding the 8-byte v1 entry for that variant's
-  ``matched_data.bin`` record). No per-variant entry in any index file.
-* ``matched_index.bin`` is the function-to-CSV-section locator in
-  pre-v1 layout (``write_csv_section_index_entry``). CSV text-file
-  byte offsets are NOT 4-aligned -- they must never go through the v1
-  ``write_index_entry`` writer (which asserts data-bin alignment).
-* ``unmatched_index.bin`` stays v1 (one entry per version's data-bin
-  record, 4-aligned) and continues using ``write_index_entry``.
+* Matched variant rows carry a single ``indexer_hex`` cell (8 hex chars
+  encoding ``offset >> 4`` into the variant's ``matched_data.bin``
+  record). No per-variant entry in any index file. Record geometry is
+  recovered from the self-describing record header, so the inline
+  encoding no longer carries a length.
+* ``matched_index.bin`` is the function-to-CSV-section locator
+  (u40 ``csv_offset >> 2`` + u24 ``csv_section_length >> 2``, 8 bytes).
+  Both quantities are 4-byte aligned: after every section's blank-row
+  terminator the writer pads with raw ``\\n`` bytes until the next
+  section start lands on a 4-byte boundary AND ≥ 1 fully empty line of
+  separation is guaranteed.
+* ``unmatched_index.bin`` is one entry per version's data-bin record
+  (16-byte aligned offsets, 4-byte entries) and continues using
+  ``write_index_entry``.
 * Inlining-data cells keep LOCAL ``called_func_id`` indices.
+* All ``csv.writer`` callsites in this module pin
+  ``lineterminator='\\n'`` so byte counts (and therefore the
+  matched-arm pad arithmetic) are deterministic.
 """
 
 from __future__ import annotations
@@ -41,6 +49,47 @@ from ..aligned_data.csv_format import (
 )
 from .function_names import FunctionNamesRegistry
 from .variants import VariantRegistry, write_warn_log_entry
+
+# Matched-section CSV alignment:
+#
+# * Each section must start at a byte offset that is a multiple of
+#   ``_SECTION_ALIGN``.
+# * Each section must be separated from the previous one by ≥ 1 fully
+#   empty line, i.e. ≥ 2 ``\n`` bytes between the last content byte of
+#   section N and the first byte of section N+1. ``csv.writer.writerow([])``
+#   already emits one ``\n``; this module writes 1-``_SECTION_ALIGN``
+#   additional raw ``\n`` bytes after it.
+#
+# The csv writer is pinned to ``lineterminator='\n'`` so the byte
+# arithmetic below is platform-independent.
+_SECTION_ALIGN: int = 4
+_SECTION_LINE_TERMINATOR: str = "\n"
+
+
+def _pad_section_to_alignment(sections_file, content_offset: int) -> int:
+    """Pad a just-closed matched section to ``_SECTION_ALIGN`` + ≥ 1 empty line.
+
+    Caller invariant: ``writer.writerow([])`` has just emitted one
+    ``\n``, so the current file position is at ``end0`` relative to
+    ``content_offset``. This helper computes the smallest
+    ``next_start >= end0 + 1`` that is a multiple of
+    :data:`_SECTION_ALIGN` and writes ``next_start - end0`` raw ``\n``
+    characters straight through the underlying text stream (bypassing
+    the csv writer for these bytes -- they are inter-section structure,
+    not row content). Returns the new section_end (== ``next_start``)
+    relative to ``content_offset``.
+    """
+    end0 = sections_file.tell() - content_offset
+    # First: smallest 4-multiple that is strictly > end0. That single
+    # bump satisfies BOTH constraints (>= end0 + 1 AND multiple of
+    # _SECTION_ALIGN). Pad length is therefore always in
+    # 1..._SECTION_ALIGN inclusive; combined with the row terminator
+    # already emitted by ``writerow([])`` the inter-section separator
+    # spans 2..(_SECTION_ALIGN + 1) ``\n`` bytes.
+    next_start = ((end0 // _SECTION_ALIGN) + 1) * _SECTION_ALIGN
+    pad = next_start - end0
+    sections_file.write(_SECTION_LINE_TERMINATOR * pad)
+    return sections_file.tell() - content_offset
 
 
 def write_matched_sections_pass2(
@@ -69,11 +118,13 @@ def write_matched_sections_pass2(
     its ``content_offset`` back at load time.
     """
     content_offset = sections_file.tell()
-    writer = csv.writer(sections_file)
-    # Collect (func_name, section_start, section_len, avg_len) per
-    # function so we can sort by avg_len before writing the index --
-    # matches the pre-existing matched-arm length-bucket ordering
-    # consumed by length-conditioned function selection.
+    writer = csv.writer(sections_file, lineterminator=_SECTION_LINE_TERMINATOR)
+    # (func_name, section_start, section_len) per function in encounter
+    # order. The previous avg-len-bucket sort fed
+    # ``select_random_function_by_length`` (now a NotImplementedError
+    # stub), so the index no longer carries an avg_len column and the
+    # writer no longer reorders entries: readers do not depend on entry
+    # order matching CSV row order.
     pending_index_entries: List = []
 
     for entry in matched_data_entries:
@@ -88,13 +139,10 @@ def write_matched_sections_pass2(
         )
         writer.writerow([line_no_b64, called_line_nos_b64])
 
-        total_len = 0
         for vdata in version_data:
             vkey = vdata["vkey"]
             called = vdata["called"]
             data_offset = vdata["data_offset"]
-            data_len = vdata["data_len"]
-            token_len = vdata["token_len"]
 
             variant_ref = variants.ref(vkey)
             inlining_data = {}
@@ -112,28 +160,20 @@ def write_matched_sections_pass2(
                 for idx, (start, length, is_matched) in sorted(inlining_data.items())
             ]
 
-            indexer_hex = encode_inline_indexer(data_offset, data_len)
+            indexer_hex = encode_inline_indexer(data_offset)
             write_function_section_csv(writer, variant_ref, inlining_list, indexer_hex)
-            total_len += token_len
 
-        avg_len = total_len // len(version_data) if version_data else 0
         writer.writerow([])
-        section_end = sections_file.tell() - content_offset
+        section_end = _pad_section_to_alignment(sections_file, content_offset)
         pending_index_entries.append(
-            (func_name, section_start, section_end - section_start, avg_len)
+            (func_name, section_start, section_end - section_start)
         )
 
-    # Length-bucket sort preserved from the previous matched-arm
-    # ordering. Pre-v1 layout doesn't change the sort contract -- the
-    # index is just a function locator; readers don't depend on entry
-    # order matching CSV row order.
-    pending_index_entries.sort(key=lambda x: x[3])
-    for func_name, section_start, section_len, avg_len in pending_index_entries:
+    for func_name, section_start, section_len in pending_index_entries:
         write_csv_section_index_entry(
             index_file,
             csv_offset=section_start,
-            csv_len=section_len,
-            avg_len=avg_len,
+            csv_section_length=section_len,
             func_name=func_name,
             error_log=error_log,
         )
@@ -242,12 +282,19 @@ def write_unmatched_sections_pass2(
     ``called_func_id`` indices unchanged.
 
     ``index_file`` is the v1 unmatched-index handle; one entry per
-    version's data-bin record (4-aligned, sentinel/overlong machinery
-    applies). The matched-arm restructuring does NOT touch this path.
-    ``error_log`` is forwarded so per-version cap overflows are logged
-    and the entry skipped (no abort).
+    version's data-bin record (16-byte aligned, 4-byte u32 ``offset >> 4``
+    entries -- record geometry comes from the self-describing record
+    header, no length / sentinel / overlong machinery). The matched-arm
+    restructuring does NOT touch this path. ``error_log`` is forwarded
+    so per-version cap overflows are logged and the entry skipped (no
+    abort).
+
+    No CSV-byte alignment is required on this arm -- it has no
+    section-locator index that would benefit from a shifted offset --
+    so the section writer just emits rows back-to-back with the pinned
+    ``\\n`` line terminator.
     """
-    writer = csv.writer(sections_file)
+    writer = csv.writer(sections_file, lineterminator=_SECTION_LINE_TERMINATOR)
     unmatched_by_func = group_unmatched_entries_by_function(unmatched_data_entries)
 
     for func_name, data in unmatched_by_func.items():
@@ -260,7 +307,7 @@ def write_unmatched_sections_pass2(
             continue
 
         unique_called_list = sorted(all_called)
-        first_offset, first_len = version_data_list[0][0], version_data_list[0][1]
+        first_offset = version_data_list[0][0]
 
         inlining_data_list = _build_unmatched_inlining_data_list(
             called_by_version,
@@ -278,7 +325,7 @@ def write_unmatched_sections_pass2(
             [registry.line_no(name) for name in unique_called_list]
         )
         inlining_data_str = _format_unmatched_inlining_str(inlining_data_list)
-        indexer_hex = encode_inline_indexer(first_offset, first_len)
+        indexer_hex = encode_inline_indexer(first_offset)
 
         write_unmatched_section_csv(
             writer,
@@ -289,12 +336,10 @@ def write_unmatched_sections_pass2(
             indexer_hex,
         )
 
-        for data_offset, data_len, token_len in version_data_list:
+        for data_offset, _data_len, _token_len in version_data_list:
             write_index_entry(
                 index_file,
                 data_offset,
-                data_len,
-                token_len,
                 func_name=func_name,
                 error_log=error_log,
             )

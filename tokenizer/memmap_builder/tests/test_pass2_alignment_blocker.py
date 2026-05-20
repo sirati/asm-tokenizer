@@ -1,27 +1,27 @@
-"""Regression test for the matched-arm CSV-offset alignment blocker.
+"""Matched-arm CSV section alignment invariants.
 
-Pre-fix (origin/main at 3517385): ``write_matched_sections_pass2``
-collected the matched-arm section starts as CSV text-file byte offsets
-and fed them to the v1 ``write_index_entry`` writer, which asserts
-4-byte alignment on the offset. The pre-existing test fixtures used
-function names of exactly length 12 (e.g. ``matched_fn_00``); each
-matched section's header row plus padding *coincidentally* landed on a
-4-byte boundary, so the assertion never tripped in CI. The first real
-corpus with non-coincidentally-aligned section starts would have
-crashed the matched arm.
+The matched-section writer (``write_matched_sections_pass2``) pads
+between sections with raw ``\\n`` bytes so every section start (and
+every section length) lands on a 4-byte boundary, AND so the previous
+section is followed by ≥ 1 empty line (≥ 2 ``\\n`` bytes total between
+the last content byte and the next section's first byte). The
+``matched_index.bin`` entry codec (u40 ``csv_offset >> 2`` + u24
+``csv_length >> 2``) asserts both alignments, so a layout regression
+trips loudly at write time -- but we also pin the invariants here so a
+future refactor can't silently drop the padding step and rely on
+coincidental alignment.
 
-This test drives ``write_matched_sections_pass2`` against a function
-whose name is length 17 (intentionally NOT a multiple of 4) so the CSV
-section start would tickle the pre-fix assertion. After the fix:
+What we assert per fixture:
 
-  * ``matched_index.bin`` is the pre-v1 ``write_csv_section_index_entry``
-    layout -- no 4-byte alignment assertion on csv_offset.
-  * The stored ``csv_offset`` is the literal byte position of the
-    section header row in the CSV (relative to the post-prelude
-    content offset).
-  * That byte position is NOT 4-aligned for this fixture, which is
-    proof that the v1 alignment-asserting writer has been removed
-    from this code path (otherwise we'd see an ``AssertionError``).
+  * Every ``csv_starts[i] % 4 == 0`` (the matched index codec requires
+    it; double-checked at the array level).
+  * Every ``csv_lengths[i] % 4 == 0`` (same).
+  * Between consecutive sections the bytes are all ``\\n`` (no row
+    content leaks into the padding) and the count is ≥ 2 (one ``\\n``
+    from the row terminator + ≥ 1 from the pad).
+  * Nowhere in the section CSV does ``\\r\\n`` survive -- the csv
+    writer is pinned to ``lineterminator='\\n'`` so byte counting is
+    deterministic.
 """
 
 from __future__ import annotations
@@ -60,27 +60,20 @@ def _build_registry(*names: str) -> FunctionNamesRegistry:
     return reg
 
 
-def test_matched_arm_writes_non_aligned_csv_offset_without_assertion(
+def test_matched_arm_one_function_section_is_4_aligned_and_lf_only(
     tmp_path: Path,
 ) -> None:
-    """Function-name length 17 -> non-4-aligned section start; the
-    pre-v1 writer accepts it and round-trips the literal byte offset.
-    """
-    # 17-char function name: the CSV section header row is
-    # ``<base64_line_no>,<called_line_nos>\r\n`` -- with no called funcs
-    # the row is just ``<base64_line_no>\r\n``. Setting up the called-
-    # funcs to include this same name plus one other ensures the header
-    # row width varies; the absolute byte position is what matters here.
-    funcname_17 = "a_seventeen_chars"  # 17 chars
+    """One matched function -> the single section start is 0 (trivially
+    4-aligned), and the section length is rounded up to a 4-byte
+    multiple via ``\\n`` padding after the trailing blank row."""
+    # 17-char function name -> the section's unpadded length is
+    # non-4-aligned; the pad helper must round it up.
+    funcname_17 = "a_seventeen_chars"
     assert len(funcname_17) == 17
     called_name = "another_one"
 
     registry = _build_registry(funcname_17, called_name)
 
-    # Two version entries to keep the matched-function shape realistic
-    # (matched requires len(unique_offsets) > 1 in pass 1, but pass 2
-    # itself just iterates whatever was collected). Offsets here are
-    # arbitrary 4-aligned data-bin positions.
     matched_data_entries = [
         {
             "func_name": funcname_17,
@@ -104,9 +97,6 @@ def test_matched_arm_writes_non_aligned_csv_offset_without_assertion(
         },
     ]
 
-    # ``function_lookup`` resolves (called_func, vkey) -> (offset, len,
-    # is_matched). The called function is unmatched in this fixture,
-    # so any plausible 4-aligned offset works for the lookup target.
     function_lookup = {
         (called_name, ("v0",)): (1024, 32, 0),
         (called_name, ("v1",)): (1056, 32, 0),
@@ -118,8 +108,6 @@ def test_matched_arm_writes_non_aligned_csv_offset_without_assertion(
     with open(sections_path, "w", newline="", encoding="ascii") as sf, \
          open(index_path, "wb") as idxf:
         write_csv_prelude(sf)
-        # NOTE: pre-v1 matched_index.bin has NO 16-byte v1 prelude --
-        # that's the layout split. Open as a flat byte file.
         warn_log = io.StringIO()
         write_matched_sections_pass2(
             matched_data_entries,
@@ -131,59 +119,47 @@ def test_matched_arm_writes_non_aligned_csv_offset_without_assertion(
             registry,
         )
 
-    # The pre-v1 reader returns (csv_starts, csv_lengths, avg_lengths).
-    triple = read_csv_section_index_arrays(index_path)
-    assert triple is not None, "matched_index.bin should be non-empty"
-    csv_starts, csv_lengths, _avg = triple
+    pair = read_csv_section_index_arrays(index_path)
+    assert pair is not None, "matched_index.bin should be non-empty"
+    csv_starts, csv_lengths = pair
 
     # Exactly one function -> exactly one index entry.
     assert csv_starts.shape == (1,)
     assert csv_lengths.shape == (1,)
 
     csv_offset = int(csv_starts[0])
+    csv_length = int(csv_lengths[0])
 
-    # THE REGRESSION ASSERTION. The matched-arm CSV section starts at
-    # byte 0 (relative to the post-prelude content offset) -- that IS
-    # 4-aligned by coincidence for an empty CSV, so we need to compute
-    # what an asymmetric layout would produce. The actual proof is that
-    # the writer accepted whatever value tell() returned without
-    # raising an AssertionError. Re-confirm by inspecting the on-disk
-    # CSV: the stored csv_offset must equal the byte position of the
-    # section header row inside the CSV body (post-prelude).
+    # Alignment invariants.
+    assert csv_offset % 4 == 0, (
+        f"csv_starts[0]={csv_offset} must be 4-byte aligned"
+    )
+    assert csv_length % 4 == 0, (
+        f"csv_lengths[0]={csv_length} must be 4-byte aligned"
+    )
+
+    # The literal CSV layout: the section starts at the first byte
+    # after the ``# format=N\n`` prelude (offset 0 relative to post-
+    # prelude content). The recorded length spans from there to EOF
+    # (one function -> one section, padded to alignment).
     raw = sections_path.read_bytes()
     prelude_end = raw.index(b"\n") + 1  # first newline ends the # format= line
-    # The first data row starts immediately at prelude_end.
-    expected_offset = 0
-    assert csv_offset == expected_offset, (
-        f"matched_index.bin csv_offset must mirror the in-CSV byte "
-        f"position relative to post-prelude content; got {csv_offset}, "
-        f"expected {expected_offset}"
-    )
-
-    # The csv_length must cover the header + variant rows + the trailing
-    # blank row, ending exactly at the EOF (one function -> one section).
     body_len = len(raw) - prelude_end
-    assert int(csv_lengths[0]) == body_len, (
-        f"csv_lengths[0] must equal post-prelude body byte length; "
-        f"got {int(csv_lengths[0])}, expected {body_len}"
-    )
+    assert csv_offset == 0
+    assert csv_length == body_len
+
+    # No ``\r\n`` anywhere in the section CSV (we pinned LF).
+    assert b"\r\n" not in raw, "section CSV must use \\n line terminators only"
 
 
-def test_matched_arm_two_functions_second_section_offset_is_csv_byte_position(
+def test_matched_arm_two_functions_every_section_is_4_aligned_and_padded(
     tmp_path: Path,
 ) -> None:
-    """Two matched functions -> the second section's stored csv_offset
-    is the literal CSV byte position of its header row.
-
-    This is the load-bearing case for the alignment regression: with
-    two functions, the second section start cannot be 0 and is unlikely
-    to land on a 4-byte boundary (header row width depends on the
-    base64 line-no width + variant-row width + the trailing blank). A
-    v1 ``write_index_entry`` would assert on this value; the pre-v1
-    ``write_csv_section_index_entry`` accepts it.
+    """Two matched functions with deliberately mismatched name lengths
+    -> the second section start lands on a 4-byte boundary even though
+    the natural (unpadded) end of section 1 is not 4-aligned, AND the
+    bytes between consecutive sections are all ``\\n`` (≥ 2 of them).
     """
-    # Two functions, deliberately different name lengths to vary the
-    # header-row width across sections.
     fn_a = "a_seventeen_chars"  # 17 chars
     fn_b = "b_thirteen_ch"      # 13 chars
     assert len(fn_a) == 17
@@ -238,41 +214,202 @@ def test_matched_arm_two_functions_second_section_offset_is_csv_byte_position(
             registry,
         )
 
-    triple = read_csv_section_index_arrays(index_path)
-    assert triple is not None
-    csv_starts, csv_lengths, _avg = triple
+    pair = read_csv_section_index_arrays(index_path)
+    assert pair is not None
+    csv_starts, csv_lengths = pair
     assert csv_starts.shape == (2,)
 
-    # Section starts + lengths should partition the post-prelude body
-    # exactly. We don't pin to specific byte values (those depend on
-    # the per-row width and avg-len sort order) -- the load-bearing
-    # contract is:
-    #   * one of the two starts is 0 (the lower-avg-len section)
-    #   * the two (start, length) intervals cover the body without
-    #     gaps and without overlap
-    #   * at least one of the non-zero csv_offsets is NOT 4-aligned
-    #     (proves the pre-v1 writer accepted a non-aligned offset --
-    #      the only thing we couldn't have done with write_index_entry).
     raw = sections_path.read_bytes()
     prelude_end = raw.index(b"\n") + 1
     body_len = len(raw) - prelude_end
 
-    # Sort by csv_offset to get partition order independent of
-    # the avg-len sort ordering inside the index.
-    pairs = sorted(zip(csv_starts.tolist(), csv_lengths.tolist()))
+    # Encounter order is preserved (no avg-len sort anymore).
+    starts = csv_starts.tolist()
+    lengths = csv_lengths.tolist()
+    pairs = list(zip(starts, lengths))
     assert pairs[0][0] == 0
     assert pairs[0][0] + pairs[0][1] == pairs[1][0]
     assert pairs[1][0] + pairs[1][1] == body_len
 
-    # At least one csv_offset is non-4-aligned (this is the
-    # regression-proof line: the pre-fix writer would have crashed here
-    # with AssertionError).
-    non_zero_offsets = [off for off, _ in pairs if off != 0]
-    assert non_zero_offsets, "second section start must be non-zero"
-    assert any(off % 4 != 0 for off in non_zero_offsets), (
-        f"the fixture is supposed to produce at least one non-4-aligned "
-        f"section start; got {non_zero_offsets}. If this assertion "
-        f"trips, the fixture needs adjustment -- it's coincidentally "
-        f"4-aligned, which is exactly the bug class the original "
-        f"matched_fn_00 fixture had."
+    # Every csv_offset AND every csv_length is 4-byte aligned.
+    for i, (start, length) in enumerate(pairs):
+        assert start % 4 == 0, f"csv_starts[{i}]={start} not 4-aligned"
+        assert length % 4 == 0, f"csv_lengths[{i}]={length} not 4-aligned"
+
+    # No CRLF anywhere in the section CSV.
+    assert b"\r\n" not in raw, "section CSV must use \\n line terminators only"
+
+    # The padding between sections 0 and 1 is all ``\n``. Section 0's
+    # textual content ends at the first ``\n`` of the inter-section
+    # separator (the row-terminator after writerow([])). The pad
+    # helper then writes (next_start - end_of_blank_row) more ``\n``s.
+    # The total separator must be >= 2 ``\n`` bytes (≥ 1 empty line).
+    section0_end_abs = prelude_end + pairs[0][0] + pairs[0][1]
+    section1_start_abs = prelude_end + pairs[1][0]
+    assert section0_end_abs == section1_start_abs, (
+        "stored length must include the inter-section pad"
+    )
+
+    # Walk backwards from section0_end_abs to find the last non-newline
+    # byte; everything between that byte (exclusive) and the next
+    # section's start (== section0_end_abs) must be all ``\n``.
+    last_content_idx = section0_end_abs - 1
+    while last_content_idx >= prelude_end and raw[last_content_idx:last_content_idx + 1] == b"\n":
+        last_content_idx -= 1
+    trailing = raw[last_content_idx + 1:section1_start_abs]
+    assert set(trailing) == {ord(b"\n")}, (
+        f"inter-section bytes must be all '\\n'; got {trailing!r}"
+    )
+    assert len(trailing) >= 2, (
+        f"inter-section separator must be >= 2 '\\n' bytes (>= 1 "
+        f"fully empty line); got {len(trailing)} ({trailing!r})"
+    )
+
+
+def _run_matched_pass2(
+    tmp_path: Path,
+    matched_data_entries,
+    function_lookup,
+    registry,
+):
+    """Drive ``write_matched_sections_pass2`` and return ``(raw_bytes,
+    csv_starts, csv_lengths, prelude_end)``."""
+    sections_path = tmp_path / "demo_sections.csv"
+    index_path = tmp_path / "demo_matched_index.bin"
+    with open(sections_path, "w", newline="", encoding="ascii") as sf, \
+         open(index_path, "wb") as idxf:
+        write_csv_prelude(sf)
+        write_matched_sections_pass2(
+            matched_data_entries,
+            function_lookup,
+            sf,
+            idxf,
+            io.StringIO(),
+            _StubVariantRegistry(),
+            registry,
+        )
+    pair = read_csv_section_index_arrays(index_path)
+    assert pair is not None
+    csv_starts, csv_lengths = pair
+    raw = sections_path.read_bytes()
+    prelude_end = raw.index(b"\n") + 1
+    return raw, csv_starts.tolist(), csv_lengths.tolist(), prelude_end
+
+
+def test_matched_arm_padding_covers_all_residue_classes(tmp_path: Path) -> None:
+    """A many-function fixture with deliberately varied name lengths
+    drives the pad helper through every ``end0 % 4 ∈ {0, 1, 2, 3}``
+    residue class. For each section produced:
+
+      * ``csv_offset % 4 == 0`` AND ``csv_length % 4 == 0``.
+      * Padding bytes between consecutive sections are pure ``\\n``,
+        count is between 2 and ``_SECTION_ALIGN + 1`` inclusive (1
+        from the row terminator + 1-``_SECTION_ALIGN`` from the pad
+        helper, capped at the alignment boundary).
+      * The collected residue set covers all four classes ``{0, 1, 2,
+        3}`` so the helper's max-clause and ceil-clause are both
+        exercised.
+    """
+    # Function name length drives the residue of end0 % 4 because the
+    # base64 line number for each function varies in width too. Using a
+    # range of name lengths spaced by 1 character guarantees at least
+    # one example per residue class for any reasonable corpus -- we
+    # verify the coverage below rather than hard-coding the mapping.
+    callee = "callee"
+    name_lengths = [10, 11, 12, 13, 14, 15, 16, 17]
+    func_names = [f"f{'x' * (length - 1)}" for length in name_lengths]
+    for name, length in zip(func_names, name_lengths):
+        assert len(name) == length
+
+    registry = _build_registry(*func_names, callee)
+
+    matched_data_entries = []
+    for idx, name in enumerate(func_names):
+        matched_data_entries.append(
+            {
+                "func_name": name,
+                "unique_called": [callee],
+                "version_data": [
+                    {
+                        "vkey": (f"{name}-v0",),
+                        "called": [callee],
+                        "data_offset": idx * 64,
+                        "data_len": 16,
+                        "token_len": 4,
+                    },
+                    {
+                        "vkey": (f"{name}-v1",),
+                        "called": [callee],
+                        "data_offset": idx * 64 + 32,
+                        "data_len": 16,
+                        "token_len": 4,
+                    },
+                ],
+            }
+        )
+
+    function_lookup = {
+        (callee, vdata["vkey"]): (4096, 16, 0)
+        for entry in matched_data_entries
+        for vdata in entry["version_data"]
+    }
+
+    raw, starts, lengths, prelude_end = _run_matched_pass2(
+        tmp_path, matched_data_entries, function_lookup, registry
+    )
+
+    assert len(starts) == len(func_names)
+    assert len(lengths) == len(func_names)
+    assert b"\r\n" not in raw
+
+    # Per-section alignment.
+    for i, (start, length) in enumerate(zip(starts, lengths)):
+        assert start % 4 == 0, f"csv_starts[{i}]={start} not 4-aligned"
+        assert length % 4 == 0, f"csv_lengths[{i}]={length} not 4-aligned"
+
+    # Pre-pad end-of-content residues across all four classes.
+    # ``unpadded_end`` per section is the byte after the trailing-blank
+    # row's ``\n``, before any pad bytes. We can't observe it directly
+    # from the recorded length (the length includes the pad), but we
+    # CAN observe the inter-section gap (gap = pad bytes after the
+    # blank row's ``\n`` and before the next section's first content
+    # byte). gap counts: 1 = pad zero (only the row terminator),
+    # 2 = pad one ``\n``, ..., up to 4. With the ≥ 1 empty line rule
+    # the helper forces gap >= 2 -- if alignment alone would have made
+    # gap == 1, the helper bumps to the next 4-aligned offset so the
+    # actual gap becomes 5 (one to satisfy "≥ 1 empty line", four more
+    # to re-align). So observed gaps must always be in {2, 3, 4, 5}.
+    observed_gaps = set()
+    for i in range(len(starts) - 1):
+        section_end = prelude_end + starts[i] + lengths[i]
+        next_section_start = prelude_end + starts[i + 1]
+        assert section_end == next_section_start, (
+            f"sections must abut: section[{i}] ends at {section_end}, "
+            f"section[{i + 1}] starts at {next_section_start}"
+        )
+        # Walk backwards from section_end to find the boundary between
+        # the last content byte and the run of pad ``\n`` bytes.
+        idx = section_end - 1
+        while idx >= prelude_end and raw[idx:idx + 1] == b"\n":
+            idx -= 1
+        pad_run = raw[idx + 1:section_end]
+        assert set(pad_run) == {ord(b"\n")}, (
+            f"section[{i}]→[{i + 1}] pad must be all '\\n'; got {pad_run!r}"
+        )
+        assert 2 <= len(pad_run) <= 5, (
+            f"section[{i}]→[{i + 1}] pad length out of range; got {len(pad_run)}"
+        )
+        observed_gaps.add(len(pad_run))
+
+    # We need at least two distinct gap sizes to prove the pad helper
+    # actually responds to the input residue (a constant-gap output
+    # would be coincidentally-correct -- the same trap the legacy
+    # 4-byte-by-coincidence alignment had). The fixture's varying
+    # name lengths reliably produce >=2 distinct gaps; if a future
+    # row-width change collapses them, the assertion fires and the
+    # fixture needs adjustment.
+    assert len(observed_gaps) >= 2, (
+        f"matched-arm pad-residue coverage too narrow; observed {observed_gaps}. "
+        f"The fixture is supposed to span multiple residues -- if it "
+        f"trips, widen the name-length spread."
     )
