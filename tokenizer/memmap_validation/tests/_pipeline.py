@@ -147,17 +147,19 @@ def build_pipeline(
     return csv_files, unified_vocab_path, output_dir
 
 
-def arrays_or_empty(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Return ``(starts, lengths)`` for an index, or empty arrays.
+def starts_or_empty(path: Path) -> np.ndarray:
+    """Return per-record starts for a v1 ``_index.bin``, or an empty array.
 
-    Pre-v1 layout matched_index.bin or a missing file collapses to
-    empty arrays so per-record checks short-circuit harmlessly.
+    A missing / empty file or one whose entry count is zero collapses
+    to an empty int64 array so per-record checks short-circuit
+    harmlessly. ``read_index_arrays`` returns a single ndarray under
+    the self-describing record header (no companion lengths array).
     """
     from tokenizer.aligned_data.index_format import read_index_arrays
 
     if not path.exists() or path.stat().st_size == 0:
-        return (np.array([], dtype=np.int64), np.array([], dtype=np.uint32))
-    triple = read_index_arrays(path)
-    if triple is None:
-        return (np.array([], dtype=np.int64), np.array([], dtype=np.uint32))
-    return triple[0], triple[1]
+        return np.array([], dtype=np.int64)
+    arr = read_index_arrays(path)
+    if arr is None:
+        return np.array([], dtype=np.int64)
+    return arr
