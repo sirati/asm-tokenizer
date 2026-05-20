@@ -69,14 +69,24 @@ class VariantRegistry:
         versions: Iterable[Any],
         unified_vocab: VocabularyManager,
     ) -> None:
-        # Dedup vkeys in encounter order so two passes (registry build
-        # + bin write) walk the variants in the same sequence and the
-        # offsets land deterministically.
+        # Two complementary views over the input sequence:
+        #
+        # * ``_ordered_versions`` — vkey-deduped, in first-encounter
+        #   order. Drives the bin file (one record per unique vkey).
+        # * ``_all_versions`` — every ``BinaryVersionInfo`` the caller
+        #   handed in, in encounter order, no dedup. Drives the slim
+        #   CSV (one row per source artefact). Two BVIs that share a
+        #   vkey collapse to one bin record but produce TWO csv rows
+        #   sharing the same ``offset`` cell, so downstream tooling
+        #   can recover every source filename + build-config hash
+        #   without losing provenance.
         self._unified_vocab = unified_vocab
         self._ordered_versions: List[Any] = []
+        self._all_versions: List[Any] = []
         self._vkey_index: Dict[Any, int] = {}
         for version in versions:
             vkey = _vkey_for_version(version)
+            self._all_versions.append(version)
             if vkey in self._vkey_index:
                 continue
             self._vkey_index[vkey] = len(self._ordered_versions)
@@ -121,16 +131,21 @@ class VariantRegistry:
     def write_sidecar(self, output_dir: Path, binary_name: str) -> Path:
         """Emit ``<binary>_variants.bin`` and slim ``<binary>_variants.csv``.
 
-        The bin file holds one record per unique variant in
+        The bin file holds one record per UNIQUE variant in
         registration order (uint16 little-endian via
         ``variant_tokens.record.write_record``). Each record's
         starting byte offset is captured into ``self._offsets`` so
         ``ref(vkey)`` can return it.
 
-        The slim CSV is two columns — ``filename,offset`` — one row
-        per variant in the same order. ``offset`` is bare lowercase
-        hex, matching the section-CSV convention so a human can
-        cross-reference cells without mental base conversion. Length
+        The slim CSV has three columns — ``filename,variant_id,offset``
+        — and carries one row per ``BinaryVersionInfo`` the caller
+        handed in (NOT deduped by vkey on this side). Multiple rows
+        may therefore share the same ``offset`` cell when two source
+        binaries are the same variant; ``variant_id`` (the 8-hex
+        build-config hash, zero-padded to match the
+        ``__<8hex>`` filename suffix convention in
+        :func:`tokenizer.output_filename.format_output_basename`) is
+        the canonical discriminator readers should reach for. Length
         is intentionally omitted: the bin record's first u16
         (``n_tokens``) self-describes the slice length, so a back-
         reference table need not duplicate it.
@@ -142,23 +157,30 @@ class VariantRegistry:
         bin_path = output_dir / f"{binary_name}_variants.bin"
         csv_path = output_dir / f"{binary_name}_variants.csv"
 
-        # Single pass — for each unique variant in registration order,
-        # write its record to the bin and capture the offset back into
-        # the registry, then emit the matching slim CSV row.
+        # Bin: one record per unique variant; the offset becomes the
+        # canonical cross-reference used by section CSVs.
         with open(bin_path, "wb") as bin_handle:
             for version in self._ordered_versions:
                 vkey = _vkey_for_version(version)
                 offset = write_record(bin_handle, version, self._unified_vocab)
                 self._offsets[vkey] = offset
 
+        # Slim CSV: one row per BVI (no dedup); reuses the resolved
+        # offset for any BVI that shared a vkey with an earlier entry.
         with open(csv_path, "w", newline="", encoding="ascii") as csv_handle:
             write_csv_prelude(csv_handle)
             writer = csv.writer(csv_handle, lineterminator='\n')
-            writer.writerow(["filename", "offset"])
-            for version in self._ordered_versions:
+            writer.writerow(["filename", "variant_id", "offset"])
+            for version in self._all_versions:
                 vkey = _vkey_for_version(version)
                 filename = getattr(version, "filename", "") or ""
-                writer.writerow([filename, f"{self._offsets[vkey]:x}"])
+                writer.writerow(
+                    [
+                        filename,
+                        f"{version.variant_id:08x}",
+                        f"{self._offsets[vkey]:x}",
+                    ]
+                )
 
         return bin_path
 

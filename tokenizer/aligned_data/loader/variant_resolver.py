@@ -10,10 +10,14 @@ notebook / script caller that wants to resolve one ref without a
 session wrapper. Nothing here holds state.
 
 Round-trip ownership:
-    - The slim ``<bin>_variants.csv`` (header ``filename,offset``) is
-      read once per ``BinaryDataset`` via
-      ``load_variants_offset_to_filename`` and cached as a
-      ``dict[int, str]`` keyed by integer offset.
+    - The slim ``<bin>_variants.csv`` (header
+      ``filename,variant_id,offset``) is read once per ``BinaryDataset``
+      via ``load_variants_offset_to_filename`` and cached as a
+      ``dict[int, str]`` keyed by integer offset. Multiple CSV rows
+      may share the same ``offset`` cell when two source binaries are
+      the same variant; the cached dict stores the first encountered
+      filename per offset (the cross-reference is for human inspection,
+      and any filename for the variant works equally for that purpose).
     - The open ``_variants.bin`` memmap belongs to the session.
     - The unified ``VocabularyManager`` belongs to the
       ``AlignedDataLoader`` (loaded once, shared across all sessions).
@@ -57,11 +61,16 @@ from tokenizer.variant_tokens.record import read_record
 def load_variants_offset_to_filename(slim_csv_path: Path) -> Dict[int, str]:
     """Read the slim ``<bin>_variants.csv`` into ``{offset: filename}``.
 
-    Slim CSV header is ``filename,offset`` where ``offset`` is the hex
-    byte offset (no ``0x`` prefix, matching ``f"{offset:x}"``) into the
-    sibling ``_variants.bin``. Missing sidecar yields an empty dict —
-    legacy datasets predate this schema; callers see "no resolvable
-    refs" rather than a crash.
+    Slim CSV header is ``filename,variant_id,offset`` where ``offset``
+    is the hex byte offset (no ``0x`` prefix, matching
+    ``f"{offset:x}"``) into the sibling ``_variants.bin``. Missing
+    sidecar yields an empty dict — legacy datasets predate this schema;
+    callers see "no resolvable refs" rather than a crash.
+
+    Multiple rows may share the same ``offset`` cell when two source
+    binaries are the same variant (1:N CSV vs. 1:1 bin). The cached
+    dict keeps the FIRST encountered filename per offset; callers that
+    need the full per-row provenance can re-read the CSV directly.
 
     The dict is keyed by ``int`` (not the hex string) because callers
     already parse ``int(ref, 16)`` once for the memmap slice; reusing
@@ -74,11 +83,14 @@ def load_variants_offset_to_filename(slim_csv_path: Path) -> Dict[int, str]:
     # ``open_sections_csv`` consumes the mandatory ``# format=N\n`` prelude
     # the builder stamps on every memmap-chain CSV (the slim variants file
     # follows the same convention as sections CSVs). The DictReader then
-    # sees ``filename,offset`` as its real header row.
+    # sees ``filename,variant_id,offset`` as its real header row;
+    # ``variant_id`` is read by per-row callers but not by this cache.
     f, _content_offset = open_sections_csv(slim_csv_path)
     try:
         for row in csv.DictReader(f):
-            out[int(row["offset"], 16)] = row["filename"]
+            offset = int(row["offset"], 16)
+            if offset not in out:
+                out[offset] = row["filename"]
     finally:
         f.close()
     return out

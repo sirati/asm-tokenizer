@@ -131,7 +131,7 @@ def _versions_for(csv_files: List[Path]) -> List[BinaryVersionInfo]:
 def test_build_memmap_files_emits_slim_csv_bin_no_versions_json(tmp_path: Path) -> None:
     """End-to-end: build_memmap_files against a tiny synthetic corpus
     drops the legacy ``_versions.json`` sidecar and emits the slim
-    ``_variants.csv`` (header ``filename,offset``) + the new
+    ``_variants.csv`` (header ``filename,variant_id,offset``) + the new
     ``_variants.bin``."""
     csv_files, unified_vocab_path = _build_synthetic_corpus(tmp_path)
     output_dir = tmp_path / "out"
@@ -151,12 +151,12 @@ def test_build_memmap_files_emits_slim_csv_bin_no_versions_json(tmp_path: Path) 
         first_line = fh.readline()
         rows = list(csv.reader(fh))
     assert first_line == "# format=1\n"
-    assert rows[0] == ["filename", "offset"]
+    assert rows[0] == ["filename", "variant_id", "offset"]
     assert len(rows) == 3  # header + 2 data rows
     for row in rows[1:]:
-        assert len(row) == 2, (
-            f"slim CSV row must have exactly 2 columns (filename,offset), "
-            f"got {len(row)}: {row!r}"
+        assert len(row) == 3, (
+            f"slim CSV row must have exactly 3 columns "
+            f"(filename,variant_id,offset), got {len(row)}: {row!r}"
         )
 
     # Data rows carry the version filenames in registration order.
@@ -198,7 +198,8 @@ def test_variant_ref_offsets_decode_to_input_axes(tmp_path: Path) -> None:
     with open(output_dir / "demo_variants.csv", encoding="ascii") as fh:
         fh.readline()  # skip "# format=N" prelude
         csv_rows = list(csv.reader(fh))
-    filename_to_offset = {row[0]: int(row[1], 16) for row in csv_rows[1:]}
+    # row[0] = filename, row[1] = variant_id (8-hex), row[2] = offset (hex).
+    filename_to_offset = {row[0]: int(row[2], 16) for row in csv_rows[1:]}
 
     # For each version, decode the bin slice at its offset and confirm
     # the recovered axis-token strings equal those the encoder would

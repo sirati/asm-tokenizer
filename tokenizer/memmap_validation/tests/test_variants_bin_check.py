@@ -146,7 +146,7 @@ def test_cross_check_flags_missing_filename_in_slim_csv(tmp_path: Path) -> None:
     with open(slim_csv_path, encoding="ascii") as f:
         rows = list(csv.reader(f))
     # rows[0] is the ``["# format=1"]`` prelude marker; rows[1] is the
-    # ``filename,offset`` header; data rows start at rows[2:].
+    # ``filename,variant_id,offset`` header; data rows start at rows[2:].
     for row in rows[2:]:
         row[0] = "wrong-filename-" + row[0]
     with open(slim_csv_path, "w", newline="", encoding="ascii") as f:

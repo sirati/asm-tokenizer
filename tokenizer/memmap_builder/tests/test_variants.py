@@ -96,12 +96,17 @@ def _make_vocab_for(versions: List[BinaryVersionInfo]) -> FakeVocab:
 # ---------------------------------------------------------------------------
 
 
-def test_dedup_collapses_identical_vkey_versions(tmp_path):
-    """Two ``BinaryVersionInfo`` entries with the same vkey produce a
-    single bin record and a single CSV row — the registry is the
-    dedup boundary, not the section writers."""
-    v1 = _make_version(filename="hello-x64-gcc-13.2.0-O2")
-    v2 = _make_version(filename="hello-x64-gcc-13.2.0-O2")  # same vkey
+def test_dedup_collapses_bin_records_but_keeps_csv_provenance(tmp_path):
+    """Two ``BinaryVersionInfo`` entries with the same vkey collapse to
+    one bin record but keep BOTH rows in the slim CSV.
+
+    The bin file is content-addressed by vkey (one record per unique
+    variant), while the CSV records every source artefact the caller
+    handed in so downstream tooling does not lose provenance. The two
+    CSV rows therefore share the same ``offset`` cell.
+    """
+    v1 = _make_version(filename="hello-x64-gcc-13.2.0-O2_corpora")
+    v2 = _make_version(filename="hello-x64-gcc-13.2.0-O2_mirror")  # same vkey
     vocab = _make_vocab_for([v1])
 
     registry = VariantRegistry.from_versions([v1, v2], vocab)
@@ -109,9 +114,16 @@ def test_dedup_collapses_identical_vkey_versions(tmp_path):
 
     csv_path = tmp_path / "hello_variants.csv"
     rows = _read_slim_csv_rows(csv_path)
-    # header + 1 data row (dedup collapsed the duplicate)
-    assert len(rows) == 2
-    assert rows[0] == ["filename", "offset"]
+    # header + 2 data rows (one per BVI; bin still has one record).
+    assert len(rows) == 3
+    assert rows[0] == ["filename", "variant_id", "offset"]
+    # Both data rows share the same offset cell.
+    assert rows[1][2] == rows[2][2]
+    # Filenames are distinct; ordering matches encounter order.
+    assert [r[0] for r in rows[1:]] == [
+        "hello-x64-gcc-13.2.0-O2_corpora",
+        "hello-x64-gcc-13.2.0-O2_mirror",
+    ]
 
 
 def test_distinct_variant_ids_stay_distinct(tmp_path):
@@ -264,16 +276,19 @@ def test_bin_records_decode_back_to_input(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_slim_csv_has_only_filename_and_offset(tmp_path):
-    """The new CSV is two columns. No ``arch``, ``compiler``,
+def test_slim_csv_has_three_columns(tmp_path):
+    """The slim CSV is exactly three columns:
+    ``filename, variant_id, offset``. No ``arch``, ``compiler``,
     ``version``, ``opt``, ``pkg``, ``flags``, ``length`` — those were
     the verbose-CSV columns the bin replaces."""
     v1 = _make_version(
+        variant_id=0x12345678,
         filename="hello-x64-gcc-13.2.0-O2",
         extra_metadata={"hardening": "full"},
     )
     v2 = _make_version(
         opt="-Os",
+        variant_id=0xCAFEBABE,
         filename="hello-x64-gcc-13.2.0-Os",
         extra_metadata={},
     )
@@ -285,11 +300,14 @@ def test_slim_csv_has_only_filename_and_offset(tmp_path):
     csv_path = tmp_path / "hello_variants.csv"
     rows = _read_slim_csv_rows(csv_path)
 
-    assert rows[0] == ["filename", "offset"]
+    assert rows[0] == ["filename", "variant_id", "offset"]
     assert len(rows) == 3
-    # Data rows: exactly two columns each.
+    # Data rows: exactly three columns each.
     for row in rows[1:]:
-        assert len(row) == 2
+        assert len(row) == 3
+    # variant_id is zero-padded 8-hex.
+    assert rows[1][1] == "12345678"
+    assert rows[2][1] == "cafebabe"
 
 
 def test_slim_csv_offsets_match_ref(tmp_path):
@@ -310,8 +328,8 @@ def test_slim_csv_offsets_match_ref(tmp_path):
     csv_path = tmp_path / "trio_variants.csv"
     rows = _read_slim_csv_rows(csv_path)
 
-    # filename -> offset from CSV.
-    csv_filename_to_offset = {row[0]: row[1] for row in rows[1:]}
+    # filename -> offset from CSV (third column now).
+    csv_filename_to_offset = {row[0]: row[2] for row in rows[1:]}
 
     for version in (v1, v2, v3):
         vkey = VersionKey(

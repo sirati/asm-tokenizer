@@ -3,7 +3,8 @@
 End-to-end round-trip:
     1. Build a ``FakeVocab`` with known variant-axis tokens.
     2. ``write_record`` each variant into a synthetic ``_variants.bin``.
-    3. Emit a slim CSV (``filename,offset``) matching the writer order.
+    3. Emit a slim CSV (``filename,variant_id,offset``) matching the
+       writer order.
     4. ``load_variants_offset_to_filename`` reads the CSV back.
     5. ``get_variant_by_ref`` resolves a hex ref to the full identity
        dict and we assert every promised field.
@@ -57,9 +58,10 @@ def _write_corpus(
     with open(slim_csv_path, "w", encoding="utf-8", newline="") as f:
         f.write("# format=1\n")
         writer = csv.writer(f, lineterminator='\n')
-        writer.writerow(["filename", "offset"])
+        writer.writerow(["filename", "variant_id", "offset"])
         for (vi, fname), off in zip(versions, offsets):
-            writer.writerow([fname, f"{off:x}"])
+            variant_id = getattr(vi, "variant_id", 0)
+            writer.writerow([fname, f"{variant_id:08x}", f"{off:x}"])
 
     return bin_path, slim_csv_path, vocab, offsets
 
@@ -183,14 +185,29 @@ def test_load_variants_offset_to_filename_hex_offset_parse(tmp_path):
     with open(slim_csv_path, "w", encoding="utf-8", newline="") as f:
         f.write("# format=1\n")
         writer = csv.writer(f, lineterminator='\n')
-        writer.writerow(["filename", "offset"])
-        writer.writerow(["a", "0"])
-        writer.writerow(["b", "a"])         # 10
-        writer.writerow(["c", "100"])       # 256
-        writer.writerow(["d", "deadbeef"])  # large
+        writer.writerow(["filename", "variant_id", "offset"])
+        writer.writerow(["a", "00000000", "0"])
+        writer.writerow(["b", "00000001", "a"])         # 10
+        writer.writerow(["c", "00000002", "100"])       # 256
+        writer.writerow(["d", "00000003", "deadbeef"])  # large
 
     table = load_variants_offset_to_filename(slim_csv_path)
     assert table == {0: "a", 10: "b", 256: "c", 0xDEADBEEF: "d"}
+
+
+def test_load_variants_offset_to_filename_keeps_first_for_shared_offset(tmp_path):
+    """1:N CSV vs. 1:1 bin: two rows with the same offset → cached
+    dict keeps the FIRST filename it sees per offset."""
+    slim_csv_path = tmp_path / "shared.csv"
+    with open(slim_csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("# format=1\n")
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerow(["filename", "variant_id", "offset"])
+        writer.writerow(["primary_source", "deadbeef", "10"])
+        writer.writerow(["mirror_source", "deadbeef", "10"])
+
+    table = load_variants_offset_to_filename(slim_csv_path)
+    assert table == {0x10: "primary_source"}
 
 
 def test_get_variant_by_ref_missing_filename_raises(tmp_path):
