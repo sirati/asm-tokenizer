@@ -37,6 +37,7 @@ import numpy as np
 
 from ..io import parse_function_data_memmap as _parse_function_data_memmap
 from ._index_decoding import resolve_record_length
+from ._worker_guard import assert_main_process
 from ._session_parsers import (
     arm_arrays,
     build_unmatched_function_data,
@@ -95,6 +96,7 @@ class BinarySession:
     # --- lifecycle -------------------------------------------------
 
     def __enter__(self) -> "BinarySession":
+        assert_main_process()
         self._stack = ExitStack()
         self._closed = False
         return self
