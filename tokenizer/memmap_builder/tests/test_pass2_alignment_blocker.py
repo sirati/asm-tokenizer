@@ -47,9 +47,11 @@ class _StubVariantRegistry:
     """
 
     def ref(self, vkey) -> str:
-        # The hex shape is what production emits via ``f"{offset:x}"``;
-        # the exact value is irrelevant for the alignment check.
-        return f"0x{abs(hash(vkey)) & 0xFFFF:x}"
+        # crc32 is deterministic across interpreters and produces a
+        # variable-width hex; `hash()` is per-interpreter randomized,
+        # which makes residue-class coverage tests flaky.
+        import zlib
+        return f"0x{zlib.crc32(repr(vkey).encode()) & 0xFFFF:x}"
 
 
 def _build_registry(*names: str) -> FunctionNamesRegistry:
