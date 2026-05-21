@@ -19,6 +19,19 @@ Design Principles:
 
 from .aligned_data_loader import AlignedDataLoader
 from .binary_dataset import BinaryDataset
+from .decoded import (
+    Category,
+    DecodedFunction,
+    IDENTITY_SENTINEL,
+    INFNAN_EXPONENT_UNBIASED,
+    TARGET_EXPONENT_BIAS,
+    TARGET_EXPONENT_BITS,
+    TARGET_SIGNIFICAND_BITS,
+    decode_raw_tokens,
+    resolve_category_token_ids,
+    resolve_number_token_ids,
+    splice_with_callees,
+)
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
 from .utils import load_single_matched_function
@@ -26,7 +39,18 @@ from .utils import load_single_matched_function
 __all__ = [
     "AlignedDataLoader",
     "BinaryDataset",
+    "Category",
+    "DecodedFunction",
     "FunctionData",
+    "IDENTITY_SENTINEL",
+    "INFNAN_EXPONENT_UNBIASED",
     "MatchedFunction",
+    "TARGET_EXPONENT_BIAS",
+    "TARGET_EXPONENT_BITS",
+    "TARGET_SIGNIFICAND_BITS",
+    "decode_raw_tokens",
     "load_single_matched_function",
+    "resolve_category_token_ids",
+    "resolve_number_token_ids",
+    "splice_with_callees",
 ]
