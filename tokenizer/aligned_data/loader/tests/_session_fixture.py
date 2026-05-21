@@ -106,13 +106,22 @@ def _write_variants_bin(base: Path, binary_name: str, vocab: _FakeVocab) -> int:
 
 
 class _VariantStubRegistry:
-    """Registry whose ``.ref(vkey)`` returns the supplied ``offset_hex``."""
+    """Registry whose ``.ref(vkey)`` returns the supplied ``offset_hex``.
+
+    The integer companion ``.byte_offset(vkey)`` (consumed by the
+    matched-sections BIN walker) parses the same hex string so the
+    CSV's ``variant_ref`` cell and the BIN's ``variant_ref_offset``
+    u32 agree on the per-vkey value.
+    """
 
     def __init__(self, hex_for_vkey: dict) -> None:
         self._hex = hex_for_vkey
 
     def ref(self, vkey) -> str:
         return self._hex[vkey]
+
+    def byte_offset(self, vkey) -> int:
+        return int(self._hex[vkey], 16)
 
 
 def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:

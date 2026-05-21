@@ -24,11 +24,14 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 from tokenizer.aligned_data._writers import write_function_binary_data
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.csv_format import write_csv_prelude
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
+from tokenizer.aligned_data.extern_providers import ExternProviderRegistry
 from tokenizer.aligned_data.index_format import write_index_prelude
+from tokenizer.aligned_data.matched_sections_bin import SectionWriter
 from tokenizer.memmap_builder._pass2 import (
     write_matched_sections_pass2,
     write_unmatched_sections_pass2,
@@ -39,23 +42,31 @@ from .specs import MatchedFunctionSpec, UnmatchedFunctionSpec
 
 
 class _StubVariantRegistry:
-    """Bare ``.ref(vkey) -> str`` surface for the pass-2 writers.
+    """Bare ``.ref(vkey) -> str`` / ``.byte_offset`` surface for the
+    pass-2 writers.
 
     Each unique ``vkey`` gets a deterministic 4-byte-aligned hex
-    placeholder. Real ``VariantRegistry`` couples a unified vocab + a
-    bin write; neither is required to exercise the section CSV wire
-    formats this fixture targets.
+    placeholder (string for the CSV cell, the same integer for the
+    BIN's ``variant_ref_offset`` u32). Real ``VariantRegistry``
+    couples a unified vocab + a bin write; neither is required to
+    exercise the section CSV / BIN wire formats this fixture targets.
     """
 
     def __init__(self) -> None:
         self._counter = 0
         self._refs: dict = {}
 
-    def ref(self, vkey) -> str:
+    def _ensure(self, vkey) -> int:
         if vkey not in self._refs:
-            self._refs[vkey] = f"{self._counter * 0x10:x}"
+            self._refs[vkey] = self._counter * 0x10
             self._counter += 1
         return self._refs[vkey]
+
+    def ref(self, vkey) -> str:
+        return f"{self._ensure(vkey):x}"
+
+    def byte_offset(self, vkey) -> int:
+        return self._ensure(vkey)
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,8 @@ class CorpusPaths:
     unmatched_sections_csv: Path
     unmatched_index_bin: Path
     unmatched_data_bin: Path
+    sections_bin: Path
+    extern_providers_sidecar: Path
 
     @property
     def matched_function_names(self) -> Tuple[str, ...]:
@@ -152,25 +165,43 @@ def build_corpus_with_registry(
         unmatched_tuple, paths.unmatched_data_bin, registry
     )
     function_lookup = {**matched_lookup, **unmatched_lookup}
+    matched_func_names = {e["func_name"] for e in matched_data_entries}
+    sectioned_func_names = matched_func_names | {
+        e["func_name"] for e in unmatched_data_entries
+    }
     registry.finalize()
     function_names_sidecar = registry.write_sidecar(base_path, binary_name)
 
     warn_log = io.StringIO()  # discarded; warn paths not under test here
-    with open(paths.matched_sections_csv, "w", newline="", encoding="ascii") as sf, \
-         open(paths.matched_index_bin, "wb") as idxf:
-        write_csv_prelude(sf)
-        write_matched_sections_pass2(
-            matched_data_entries, function_lookup, sf, idxf, warn_log,
-            variants, registry,
-        )
-    with open(paths.unmatched_sections_csv, "w", newline="", encoding="ascii") as sf, \
-         open(paths.unmatched_index_bin, "wb") as idxf:
-        write_csv_prelude(sf)
-        write_index_prelude(idxf)  # unmatched keeps the v1 16-byte prelude
-        write_unmatched_sections_pass2(
-            unmatched_data_entries, function_lookup, sf, idxf, warn_log,
-            variants, registry,
-        )
+    extern_providers = ExternProviderRegistry()
+    section_writer = SectionWriter(paths.sections_bin)
+    try:
+        with open(paths.matched_sections_csv, "w", newline="", encoding="ascii") as sf, \
+             open(paths.matched_index_bin, "wb") as idxf:
+            write_csv_prelude(sf)
+            write_matched_sections_pass2(
+                matched_data_entries, function_lookup, sf, idxf, warn_log,
+                variants, registry,
+                section_writer, extern_providers,
+                matched_func_names, sectioned_func_names,
+            )
+        with open(paths.unmatched_sections_csv, "w", newline="", encoding="ascii") as sf, \
+             open(paths.unmatched_index_bin, "wb") as idxf:
+            write_csv_prelude(sf)
+            write_index_prelude(idxf)  # unmatched keeps the v1 16-byte prelude
+            write_unmatched_sections_pass2(
+                unmatched_data_entries, function_lookup, sf, idxf, warn_log,
+                variants, registry,
+                section_writer, extern_providers,
+                matched_func_names, sectioned_func_names,
+            )
+        section_writer.finalize()
+    except BaseException:
+        section_writer.close()
+        raise
+    extern_providers_sidecar = extern_providers.write_sidecar(
+        base_path, binary_name
+    )
 
     return CorpusPaths(
         base_path=base_path,
@@ -184,6 +215,8 @@ def build_corpus_with_registry(
         unmatched_sections_csv=paths.unmatched_sections_csv,
         unmatched_index_bin=paths.unmatched_index_bin,
         unmatched_data_bin=paths.unmatched_data_bin,
+        sections_bin=paths.sections_bin,
+        extern_providers_sidecar=extern_providers_sidecar,
     )
 
 
@@ -195,6 +228,7 @@ class _PathBundle:
     unmatched_sections_csv: Path
     unmatched_index_bin: Path
     unmatched_data_bin: Path
+    sections_bin: Path
 
 
 def _build_path_bundle(base_path: Path, binary_name: str) -> _PathBundle:
@@ -205,7 +239,22 @@ def _build_path_bundle(base_path: Path, binary_name: str) -> _PathBundle:
         unmatched_sections_csv=base_path / f"{binary_name}_unmatched_sections.csv",
         unmatched_index_bin=base_path / f"{binary_name}_unmatched_index.bin",
         unmatched_data_bin=base_path / f"{binary_name}_unmatched_data.bin",
+        sections_bin=base_path / f"{binary_name}_sections.bin",
     )
+
+
+def _project_called_typed(called: Sequence[str]) -> list:
+    """Project a name-only callee tuple from the spec into the typed
+    ``(name, CallTargetType.LOCAL)`` form pass-2 now consumes.
+
+    Specs don't carry call-type info — fixtures default every callee
+    to LOCAL since the loader-corpus tests don't exercise the BIN's
+    EXTERN/PLT branches. Phase-4 fixture refactors can widen
+    :mod:`.specs` to carry the typed form natively; this projection
+    keeps the existing spec API working without forcing a fixture
+    rewrite for Phase 3.
+    """
+    return [(name, CallTargetType.LOCAL) for name in called]
 
 
 def _emit_matched_data(
@@ -228,6 +277,7 @@ def _emit_matched_data(
         from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
         data_file.write(encode_data_bin_prelude())
         for spec in matched:
+            typed_called = _project_called_typed(spec.called)
             version_data = []
             for variant in spec.variants:
                 offset, length = write_function_binary_data(
@@ -236,7 +286,7 @@ def _emit_matched_data(
                 version_data.append(
                     {
                         "vkey": variant.vkey,
-                        "called": list(spec.called),
+                        "called": set(typed_called),
                         "data_offset": offset,
                         "data_len": length,
                         "token_len": len(variant.tokens),
@@ -246,7 +296,8 @@ def _emit_matched_data(
             matched_data_entries.append(
                 {
                     "func_name": spec.func_name,
-                    "unique_called": list(spec.called),
+                    "unique_called": list(typed_called),
+                    "extern_libraries": {},
                     "version_data": version_data,
                 }
             )
@@ -271,6 +322,7 @@ def _emit_unmatched_data(
         from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
         data_file.write(encode_data_bin_prelude())
         for spec in unmatched:
+            typed_called = _project_called_typed(spec.called)
             registry.add(spec.func_name)
             for callee in spec.called:
                 registry.add(callee)
@@ -285,7 +337,8 @@ def _emit_unmatched_data(
                         "data_offset": offset,
                         "data_len": length,
                         "token_len": len(version.tokens),
-                        "called": set(spec.called),
+                        "called": set(typed_called),
+                        "extern_libraries": {},
                     }
                 )
                 lookup[(spec.func_name, version.vkey)] = (offset, length, 0)

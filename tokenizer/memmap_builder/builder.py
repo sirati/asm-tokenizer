@@ -18,6 +18,7 @@ from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 from ._dedup import open_arm_dedup_state
 from ._output_files import (
     open_matched_section_outputs,
+    open_sections_bin_outputs,
     open_unmatched_section_outputs,
 )
 from .function_names import FunctionNamesRegistry
@@ -260,9 +261,34 @@ def build_memmap_files(
         logger.info(f"  Wrote: {sidecar_path}")
 
         function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
+        matched_func_names = {entry["func_name"] for entry in matched_data_entries}
+        # ``sectioned_func_names`` is the set of every function name
+        # whose section will land in ``<binary>_sections.bin`` — the
+        # union of matched and unmatched survivors. Threaded into
+        # pass-2 so the BIN walker can demote LOCAL/PLT call_targets to
+        # the EXTERN-unknown sentinel when the callee was dropped by
+        # pass-1 filters (otherwise the SectionWriter would leak a
+        # forever-unresolved header hole).
+        sectioned_func_names = matched_func_names | {
+            entry["func_name"] for entry in unmatched_data_entries
+        }
 
         logger.info(f"  Creating: {warn_log_path}")
         warn_log = stack.enter_context(open(warn_log_path, "w", encoding="ascii"))
+
+        # The BIN catalog (``<binary>_sections.bin``) holds matched +
+        # unmatched sections per Phase-3 layout decision; a single
+        # SectionWriter is therefore threaded into both arms. The
+        # ExternProviderRegistry collects unique library names across
+        # the binary's extern call_targets and is serialised to disk
+        # by ``sections_bin_outputs.finalize`` AFTER both arms run.
+        sections_bin_outputs = open_sections_bin_outputs(output_dir, binary_name)
+        # close() is the always-runs cleanup; finalize() runs the
+        # structural assertions + writes the sidecar. We register the
+        # cleanup with ExitStack so an exception mid-build still
+        # releases the mmap, and run finalize() explicitly at the
+        # bottom of the with-block once both arms have emitted.
+        stack.callback(sections_bin_outputs.close)
 
         matched_outputs = open_matched_section_outputs(output_dir, prefix)
         stack.callback(matched_outputs.close)
@@ -274,6 +300,10 @@ def build_memmap_files(
             warn_log,
             variants,
             function_names_registry,
+            sections_bin_outputs.section_writer,
+            sections_bin_outputs.extern_providers,
+            matched_func_names,
+            sectioned_func_names,
             error_log=error_log,
         )
 
@@ -287,5 +317,16 @@ def build_memmap_files(
             warn_log,
             variants,
             function_names_registry,
+            sections_bin_outputs.section_writer,
+            sections_bin_outputs.extern_providers,
+            matched_func_names,
+            sectioned_func_names,
             error_log=error_log,
         )
+
+        # Both arms done — finalize the BIN (runs the pending_holes +
+        # 0xFFFF sentinel sweep + writes the extern-provider sidecar).
+        # Failure here will surface BEFORE the ExitStack unwinds, so
+        # the registered ``close`` callback degrades to a no-op (the
+        # finalize path already called close internally).
+        sections_bin_outputs.finalize()

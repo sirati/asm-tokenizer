@@ -128,6 +128,22 @@ class VariantRegistry:
         """
         return f"{self._offsets[vkey]:x}"
 
+    def byte_offset(self, vkey: Any) -> int:
+        """Return ``vkey``'s byte offset into ``_variants.bin`` as an integer.
+
+        Wire-format companion to :meth:`ref`: the matched-sections BIN
+        codec stamps the offset as a little-endian ``u32`` rather than
+        the CSV's hex string, so it needs the raw integer. The hex
+        string and the integer are two encodings of the same authority
+        (``self._offsets[vkey]``), keeping the registry as the single
+        owner of the vkey -> bin-offset mapping for both consumers.
+
+        Same precondition / failure mode as :meth:`ref`: raises
+        ``KeyError`` if the registry is unfinalised or the vkey was
+        never registered.
+        """
+        return self._offsets[vkey]
+
     def write_sidecar(self, output_dir: Path, binary_name: str) -> Path:
         """Emit ``<binary>_variants.bin`` and slim ``<binary>_variants.csv``.
 

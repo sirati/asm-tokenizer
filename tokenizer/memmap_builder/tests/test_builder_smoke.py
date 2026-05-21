@@ -256,3 +256,66 @@ def test_build_memmap_files_rejects_missing_unified_vocab(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="failed to load unified vocab"):
         build_memmap_files(versions, output_dir, "demo", bogus_vocab)
+
+
+def test_build_memmap_files_emits_sections_bin_and_extern_providers(
+    tmp_path: Path,
+) -> None:
+    """Phase-3.2 BIN catalog smoke: ``<binary>_sections.bin`` exists
+    alongside the per-arm CSVs, starts with the ``MSEC`` prelude magic,
+    and ``<binary>_extern_providers.txt`` carries the ``# format=N``
+    prelude line (no real library lines on this empty-corpus fixture —
+    the per-binary CSVs have zero function rows, so no extern callees
+    are registered).
+
+    The synthetic corpus is empty by design (the broader v3 sidecar +
+    legacy ``_versions.json`` invariants in this file are
+    function-body-agnostic), so this test focuses on the *file
+    layout* contract: the BIN gets opened + finalised, the prelude
+    lands, and the sidecar is rewritten in the registry's encounter
+    order (empty in this case).
+    """
+    csv_files, unified_vocab_path = _build_synthetic_corpus(tmp_path)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    versions = _versions_for(csv_files)
+
+    build_memmap_files(versions, output_dir, "demo", unified_vocab_path)
+
+    sections_bin = output_dir / "demo_sections.bin"
+    extern_providers = output_dir / "demo_extern_providers.txt"
+
+    assert sections_bin.exists(), (
+        f"matched-sections BIN missing at {sections_bin}; "
+        f"Phase-3.2 wiring did not run end-to-end"
+    )
+    assert extern_providers.exists(), (
+        f"extern-providers sidecar missing at {extern_providers}"
+    )
+
+    # BIN starts with the 4-byte MSEC magic.
+    bin_head = sections_bin.read_bytes()[:4]
+    assert bin_head == b"MSEC", (
+        f"sections.bin must start with the MSEC magic; got {bin_head!r}"
+    )
+
+    # Sidecar starts with the format prelude; remaining lines (if any)
+    # would be library names. Empty fixture → just the prelude.
+    sidecar_lines = extern_providers.read_text(encoding="utf-8").splitlines()
+    assert sidecar_lines[0].startswith("# format="), (
+        f"extern_providers sidecar missing format prelude; got "
+        f"{sidecar_lines[0]!r}"
+    )
+    # The empty corpus has no extern callees, so only the prelude line
+    # is on disk. The assertion is on the *prelude shape* — not the
+    # exact library count — so adding function rows later doesn't
+    # rotate this test.
+    assert sidecar_lines == [sidecar_lines[0]], (
+        f"empty-corpus sidecar should carry only the prelude; got "
+        f"{sidecar_lines!r}"
+    )
+
+    # Both CSVs are still emitted alongside the BIN (Phase 4 trims
+    # cells but keeps both files until the loader cutover).
+    assert (output_dir / "demo_sections.csv").exists()
+    assert (output_dir / "demo_unmatched_sections.csv").exists()

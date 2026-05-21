@@ -29,29 +29,34 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.csv_format import write_csv_prelude
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
+from tokenizer.aligned_data.extern_providers import ExternProviderRegistry
+from tokenizer.aligned_data.matched_sections_bin import SectionWriter
 from tokenizer.memmap_builder._pass2 import write_matched_sections_pass2
 from tokenizer.memmap_builder.function_names import FunctionNamesRegistry
 
 
 class _StubVariantRegistry:
-    """Bare ``.ref(vkey) -> str`` surface -- pass 2 needs nothing else.
-
-    The real ``VariantRegistry`` couples a unified-vocab + a
-    ``_variants.bin`` write; neither matters for the alignment-
-    regression check, so a stub avoids dragging the whole vocab unifier
-    into a unit test that just exercises the CSV-offset write path.
+    """Bare ``.ref(vkey) -> str`` / ``.byte_offset`` surface — pass 2's
+    matched-arm CSV path needs the hex string for the variant_ref cell;
+    the BIN path needs the integer for the variant_ref_offset slot.
+    Both derive from the same per-vkey crc32 so the values are stable
+    across runs without dragging the unified vocab encoder in.
     """
 
-    def ref(self, vkey) -> str:
-        # crc32 is deterministic across interpreters and produces a
-        # variable-width hex; `hash()` is per-interpreter randomized,
-        # which makes residue-class coverage tests flaky.
+    def __init__(self) -> None:
         import zlib
-        return f"0x{zlib.crc32(repr(vkey).encode()) & 0xFFFF:x}"
+        self._zlib = zlib
+
+    def ref(self, vkey) -> str:
+        return f"0x{self._zlib.crc32(repr(vkey).encode()) & 0xFFFF:x}"
+
+    def byte_offset(self, vkey) -> int:
+        return self._zlib.crc32(repr(vkey).encode()) & 0xFFFFFFFF
 
 
 def _build_registry(*names: str) -> FunctionNamesRegistry:
@@ -76,21 +81,26 @@ def test_matched_arm_one_function_section_is_4_aligned_and_lf_only(
 
     registry = _build_registry(funcname_17, called_name)
 
+    # Use EXTERN so the BIN's call_target resolves without needing a
+    # callee section in the fixture (the alignment test exercises CSV
+    # padding, not cross-section BIN linking).
+    called_typed = (called_name, CallTargetType.EXTERN)
     matched_data_entries = [
         {
             "func_name": funcname_17,
-            "unique_called": [called_name],
+            "unique_called": [called_typed],
+            "extern_libraries": {},
             "version_data": [
                 {
                     "vkey": ("v0",),
-                    "called": [called_name],
+                    "called": {called_typed},
                     "data_offset": 0,
                     "data_len": 16,
                     "token_len": 8,
                 },
                 {
                     "vkey": ("v1",),
-                    "called": [called_name],
+                    "called": {called_typed},
                     "data_offset": 16,
                     "data_len": 32,
                     "token_len": 12,
@@ -106,20 +116,31 @@ def test_matched_arm_one_function_section_is_4_aligned_and_lf_only(
 
     sections_path = tmp_path / "demo_sections.csv"
     index_path = tmp_path / "demo_matched_index.bin"
+    bin_path = tmp_path / "demo_sections.bin"
 
     with open(sections_path, "w", newline="", encoding="ascii") as sf, \
          open(index_path, "wb") as idxf:
         write_csv_prelude(sf)
         warn_log = io.StringIO()
-        write_matched_sections_pass2(
-            matched_data_entries,
-            function_lookup,
-            sf,
-            idxf,
-            warn_log,
-            _StubVariantRegistry(),
-            registry,
-        )
+        section_writer = SectionWriter(bin_path)
+        try:
+            write_matched_sections_pass2(
+                matched_data_entries,
+                function_lookup,
+                sf,
+                idxf,
+                warn_log,
+                _StubVariantRegistry(),
+                registry,
+                section_writer,
+                ExternProviderRegistry(),
+                matched_func_names={funcname_17},
+                sectioned_func_names={funcname_17},
+            )
+            section_writer.finalize()
+        except BaseException:
+            section_writer.close()
+            raise
 
     pair = read_csv_section_index_arrays(index_path)
     assert pair is not None, "matched_index.bin should be non-empty"
@@ -170,23 +191,27 @@ def test_matched_arm_two_functions_every_section_is_4_aligned_and_padded(
 
     registry = _build_registry(fn_a, fn_b, called)
 
+    # Use EXTERN so the BIN's call_target resolves without a callee
+    # section emit (see test_matched_arm_one_function_section_*).
+    called_typed = (called, CallTargetType.EXTERN)
     matched_data_entries = []
     for func_name, base_offset in ((fn_a, 0), (fn_b, 64)):
         matched_data_entries.append(
             {
                 "func_name": func_name,
-                "unique_called": [called],
+                "unique_called": [called_typed],
+                "extern_libraries": {},
                 "version_data": [
                     {
                         "vkey": (f"{func_name}-v0",),
-                        "called": [called],
+                        "called": {called_typed},
                         "data_offset": base_offset,
                         "data_len": 32,
                         "token_len": 8,
                     },
                     {
                         "vkey": (f"{func_name}-v1",),
-                        "called": [called],
+                        "called": {called_typed},
                         "data_offset": base_offset + 32,
                         "data_len": 16,
                         "token_len": 4,
@@ -202,19 +227,30 @@ def test_matched_arm_two_functions_every_section_is_4_aligned_and_padded(
 
     sections_path = tmp_path / "demo_sections.csv"
     index_path = tmp_path / "demo_matched_index.bin"
+    bin_path = tmp_path / "demo_sections.bin"
 
     with open(sections_path, "w", newline="", encoding="ascii") as sf, \
          open(index_path, "wb") as idxf:
         write_csv_prelude(sf)
-        write_matched_sections_pass2(
-            matched_data_entries,
-            function_lookup,
-            sf,
-            idxf,
-            io.StringIO(),
-            _StubVariantRegistry(),
-            registry,
-        )
+        section_writer = SectionWriter(bin_path)
+        try:
+            write_matched_sections_pass2(
+                matched_data_entries,
+                function_lookup,
+                sf,
+                idxf,
+                io.StringIO(),
+                _StubVariantRegistry(),
+                registry,
+                section_writer,
+                ExternProviderRegistry(),
+                matched_func_names={fn_a, fn_b},
+                sectioned_func_names={fn_a, fn_b},
+            )
+            section_writer.finalize()
+        except BaseException:
+            section_writer.close()
+            raise
 
     pair = read_csv_section_index_arrays(index_path)
     assert pair is not None
@@ -281,18 +317,30 @@ def _run_matched_pass2(
     csv_starts, csv_lengths, prelude_end)``."""
     sections_path = tmp_path / "demo_sections.csv"
     index_path = tmp_path / "demo_matched_index.bin"
+    bin_path = tmp_path / "demo_sections.bin"
+    matched_func_names = {entry["func_name"] for entry in matched_data_entries}
     with open(sections_path, "w", newline="", encoding="ascii") as sf, \
          open(index_path, "wb") as idxf:
         write_csv_prelude(sf)
-        write_matched_sections_pass2(
-            matched_data_entries,
-            function_lookup,
-            sf,
-            idxf,
-            io.StringIO(),
-            _StubVariantRegistry(),
-            registry,
-        )
+        section_writer = SectionWriter(bin_path)
+        try:
+            write_matched_sections_pass2(
+                matched_data_entries,
+                function_lookup,
+                sf,
+                idxf,
+                io.StringIO(),
+                _StubVariantRegistry(),
+                registry,
+                section_writer,
+                ExternProviderRegistry(),
+                matched_func_names=matched_func_names,
+                sectioned_func_names=matched_func_names,
+            )
+            section_writer.finalize()
+        except BaseException:
+            section_writer.close()
+            raise
     pair = read_csv_section_index_arrays(index_path)
     assert pair is not None
     csv_starts, csv_lengths = pair
@@ -328,23 +376,25 @@ def test_matched_arm_padding_covers_all_residue_classes(tmp_path: Path) -> None:
 
     registry = _build_registry(*func_names, callee)
 
+    callee_typed = (callee, CallTargetType.EXTERN)
     matched_data_entries = []
     for idx, name in enumerate(func_names):
         matched_data_entries.append(
             {
                 "func_name": name,
-                "unique_called": [callee],
+                "unique_called": [callee_typed],
+                "extern_libraries": {},
                 "version_data": [
                     {
                         "vkey": (f"{name}-v0",),
-                        "called": [callee],
+                        "called": {callee_typed},
                         "data_offset": idx * 64,
                         "data_len": 16,
                         "token_len": 4,
                     },
                     {
                         "vkey": (f"{name}-v1",),
-                        "called": [callee],
+                        "called": {callee_typed},
                         "data_offset": idx * 64 + 32,
                         "data_len": 16,
                         "token_len": 4,
