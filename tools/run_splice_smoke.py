@@ -121,6 +121,32 @@ def _count_sentinels(identities: Dict[Category, np.ndarray]) -> int:
     return total
 
 
+def _max_non_sentinel_per_category(
+    identities: Dict[Category, np.ndarray],
+) -> Dict[str, int]:
+    """Largest non-sentinel compacted id per Category (``-1`` if empty
+    or all-sentinel).
+
+    Plan Decision 28 + the smoke baseline: after compaction the identity
+    space is bounded by the count of UNIQUE identities in the spliced
+    view, not by depth x per-function counter. This histogram lets the
+    smoke baseline assert the bound stays far short of the u16 ceiling
+    on real corpora.
+    """
+    per_category: Dict[str, int] = {}
+    for category in Category:
+        arr = identities.get(category)
+        if arr is None or arr.size == 0:
+            per_category[category.name] = -1
+            continue
+        non_sentinel = arr[arr != _IDENTITY_SENTINEL]
+        if non_sentinel.size == 0:
+            per_category[category.name] = -1
+        else:
+            per_category[category.name] = int(non_sentinel.max())
+    return per_category
+
+
 def _splice_one_binary(
     loader: AlignedDataLoader,
     binary_name: str,
@@ -148,6 +174,14 @@ def _splice_one_binary(
     per_depth_real_tokens: Dict[int, int] = {d: 0 for d in depths}
     per_depth_sentinels: Dict[int, int] = {d: 0 for d in depths}
     per_depth_ratios: Dict[int, List[float]] = {d: [] for d in depths}
+    # Per-depth per-Category maximum compacted id observed across every
+    # spliced function in this binary. ``-1`` baseline lets a function
+    # that never emitted a non-sentinel id for a given Category leave
+    # the running max untouched (the bound is the WORST case across
+    # the sampled functions).
+    per_depth_max_id: Dict[int, Dict[str, int]] = {
+        d: {category.name: -1 for category in Category} for d in depths
+    }
 
     with dataset.open_session() as sess:
         for func_idx in range(take):
@@ -167,6 +201,12 @@ def _splice_one_binary(
                 per_depth_sentinels[depth] += _count_sentinels(
                     spliced.identities
                 )
+                per_function_max = _max_non_sentinel_per_category(
+                    spliced.identities
+                )
+                for cat_name, max_id in per_function_max.items():
+                    if max_id > per_depth_max_id[depth][cat_name]:
+                        per_depth_max_id[depth][cat_name] = max_id
                 if depth == 0:
                     depth_0_len = n_real
                     per_depth_ratios[depth].append(1.0)
@@ -187,6 +227,7 @@ def _splice_one_binary(
             "total_real_tokens": per_depth_real_tokens[d],
             "mean_length_ratio_vs_depth_0": _safe_mean(per_depth_ratios[d]),
             "sentinel_count": per_depth_sentinels[d],
+            "max_compacted_id_per_category": per_depth_max_id[d],
         }
         for d in depths
     }
@@ -211,6 +252,9 @@ def _empty_block() -> Dict[str, float]:
         "total_real_tokens": 0,
         "mean_length_ratio_vs_depth_0": 0.0,
         "sentinel_count": 0,
+        "max_compacted_id_per_category": {
+            category.name: -1 for category in Category
+        },
     }
 
 
@@ -237,6 +281,12 @@ def _aggregate(
         real_tokens = 0
         sentinels = 0
         ratio_weighted_sum = 0.0
+        # Corpus-wide max-compacted-id per Category: take the max of
+        # the per-binary maxima (so the bound is the worst case across
+        # the full smoke set, not the average).
+        per_category_max: Dict[str, int] = {
+            category.name: -1 for category in Category
+        }
         for block in per_binary.values():
             entry = block[key]
             functions += entry["functions_spliced"]
@@ -246,6 +296,11 @@ def _aggregate(
                 entry["mean_length_ratio_vs_depth_0"]
                 * entry["functions_spliced"]
             )
+            for cat_name, max_id in entry.get(
+                "max_compacted_id_per_category", {}
+            ).items():
+                if max_id > per_category_max[cat_name]:
+                    per_category_max[cat_name] = max_id
         out[key] = {
             "functions_spliced": functions,
             "total_real_tokens": real_tokens,
@@ -253,6 +308,7 @@ def _aggregate(
                 ratio_weighted_sum / functions if functions else 0.0
             ),
             "sentinel_count": sentinels,
+            "max_compacted_id_per_category": per_category_max,
         }
     return out
 
