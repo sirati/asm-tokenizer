@@ -6,10 +6,10 @@ introspection, decoded-function dataclass, single-function extractor,
 recursive splicer); this ``__init__`` re-exports only the symbols
 external callers are expected to use.
 
-Re-exports are added by their owning phase. Phase 1.3 contributes the
-two ``category_tokens`` resolvers — single source of truth for
-TokenType-to-uint16-vocab-id mappings consumed everywhere else in
-``decoded/``.
+Re-exports are added by their owning phase. Phase 1.2 contributes the
+custom-float constants; Phase 1.3 contributes the two ``category_tokens``
+resolvers — single source of truth for TokenType-to-uint16-vocab-id
+mappings consumed everywhere else in ``decoded/``.
 """
 
 from __future__ import annotations
@@ -18,8 +18,18 @@ from .category_tokens import (
     resolve_category_token_ids,
     resolve_number_token_ids,
 )
+from .custom_float import (
+    INFNAN_EXPONENT_UNBIASED,
+    TARGET_EXPONENT_BIAS,
+    TARGET_EXPONENT_BITS,
+    TARGET_SIGNIFICAND_BITS,
+)
 
 __all__ = [
     "resolve_category_token_ids",
     "resolve_number_token_ids",
+    "INFNAN_EXPONENT_UNBIASED",
+    "TARGET_EXPONENT_BIAS",
+    "TARGET_EXPONENT_BITS",
+    "TARGET_SIGNIFICAND_BITS",
 ]
