@@ -1,9 +1,11 @@
 """Decoded-splicer bridge for :class:`BinarySession`.
 
 Single concern of this module: translate the session's per-arm
-``(idx, version) -> FunctionData`` API into the
-``(section_offset, arm) -> (DecodedFunction, Section)`` callbacks the
-:mod:`tokenizer.aligned_data.loader.decoded.splice` walker consumes.
+``(idx, variant_index) -> FunctionData`` API into the
+``(section_offset, arm, callee_variant_index) -> (DecodedFunction,
+Section)`` callbacks the :mod:`tokenizer.aligned_data.loader.decoded.splice`
+walker consumes, and assemble the N selected primary variants into
+the public ``list[DecodedFunction]`` return shape.
 
 The walker is pure on its inputs (per Phase 3 design); on-disk layout
 + vocab introspection are session-owned, so we keep that wiring here
@@ -25,16 +27,10 @@ Exposed as a mixin :class:`_BinarySessionSpliceMixin` so the public
 :py:meth:`splice_with_callees` method stays on :class:`BinarySession`
 itself -- callers do not need to know about the split. Mixin
 inheritance is purely additive: every attribute it reads
-(``_vocab_manager``, ``_meta_get``, ``_load_matched_section_and_versions``,
+(``_vocab_manager``, ``_meta_get``, ``_load_matched_section_and_variants``,
 ``_load_unmatched_record_and_section``, ``_unmatched_record_slot_base``,
 ``_category_token_ids``, ``_number_token_ids``) is owned by
 :class:`BinarySession` itself.
-
-Plan reference: ``## Wiring into the existing loader``, ``## Locked-in
-decisions`` items 7-13 (per-Category rebase, DAG-active-path cycle
-keys, section-call_target ordering, ``(arm, section_offset)`` cycle
-keys), and ``## Open questions`` item 1 (the inverse
-section-offset -> idx helper that previously did not exist).
 """
 
 from __future__ import annotations
@@ -201,7 +197,7 @@ class _BinarySessionSpliceMixin:
         a specific variant, so silent wrap-around would hide the bug.
         """
         section, section_offset, matched = (
-            self._load_matched_section_and_versions(idx)
+            self._load_matched_section_and_variants(idx)
         )
         if variant_index < 0 or variant_index >= len(matched.variants):
             raise IndexError(
@@ -234,58 +230,92 @@ class _BinarySessionSpliceMixin:
         *,
         arm: str,
         max_depth: int,
-        version: int = 0,
-    ) -> "DecodedFunction":
-        """Decode + splice the function at ``(arm, idx)`` with depth cap.
+        max_variants: int = 1,
+        inlined_equivalent_call_targets_only: bool = False,
+        rng: Optional[np.random.Generator] = None,
+    ) -> "list[DecodedFunction]":
+        """Decode + splice up to ``max_variants`` variant streams.
 
-        Per plan ``## Locked-in decisions`` items 7, 8, 9, 13: per-
-        ``Category`` identity rebase with sentinel handling; DAG-
-        active-path cycle detection on ``(arm, section_offset)``;
-        section-call_target ordering.
+        Returns ``list[DecodedFunction]`` of length ``min(max_variants,
+        len(section.variants))``. Each list element is one independent
+        splice stream rooted at one selected variant; callers asking
+        for one stream do ``result[0]``.
 
-        For ``arm="matched"`` ``version`` selects the index into the
-        :py:attr:`MatchedFunction.variants` list (default ``0`` -- the
-        first variant). For ``arm="unmatched"`` ``version`` is ignored
-        (one record per FunctionData by construction); callers must
-        pass the per-record idx the same way
-        :py:meth:`BinarySession.load_unmatched` does.
+        Args:
+            idx: Per-arm function index.
+            arm: ``"matched"`` or ``"unmatched"``.
+            max_depth: Recursion budget passed through to the walker.
+            max_variants: Upper bound on how many variant streams to
+                return. Must be ``>= 1`` -- ``0`` is rejected with
+                :class:`ValueError` as a programmer error. ``arm=
+                "unmatched"`` sections have exactly one variant by
+                construction (matched_sections_bin invariant), so the
+                same sampling logic yields a 1-element list there
+                regardless of ``max_variants``.
+            inlined_equivalent_call_targets_only: When ``True``, splice
+                a call_target ``K`` iff the current selection of
+                variants is split on whether they called ``K``. Variants
+                that did NOT call ``K`` presumably inlined it, so
+                splicing ``K``'s body gives the model the equivalent
+                view. When ``False`` (default), the walker uses
+                standard cycle + present checks only.
+            rng: Sampling source. ``None`` (default) constructs a
+                fresh :class:`numpy.random.Generator` per call --
+                non-deterministic by design. Tests + trainers thread
+                their own seeded generators when reproducibility is
+                required.
 
-        Callee recursion stays inside the same arm: the splicer's
-        ``decode_callee`` callback resolves the callee's
-        ``function_section_ptr`` via :py:meth:`_idx_for_section_offset`
-        on the caller's arm. Matched callees of a matched caller
-        always pick version ``0`` (the canonical first version --
-        callees inherit no version-selection context from the caller).
-        Cross-arm callees do not resolve and surface as
+        Per-stream variant sampling:
+          * ``selection_size = min(max_variants, len(section.variants))``.
+          * When ``selection_size == len(section.variants)`` all
+            variants are returned in their existing index order (no
+            shuffle).
+          * Otherwise ``rng.choice(n, size=selection_size,
+            replace=False)`` picks the variant indices and
+            :func:`numpy.sort` makes the order deterministic given the
+            rng's state.
+
+        Each selected variant ``V`` drives ONE walker invocation rooted
+        at variant ``V``'s body. The walker's ``decode_callee_to_staging``
+        callback receives the callee variant index from the per-call
+        entries lookup so callee bodies follow the primary variant's
+        choice. Cross-arm callees do not resolve and surface as
         ``is_callee_present=False``: their call-site tokens stay in
         the caller's stream but their bodies are not spliced.
         """
+        if max_variants < 1:
+            raise ValueError(
+                f"max_variants must be >= 1; got {max_variants}"
+            )
+
         from .decoded.extract import _decode_to_staging
         from .decoded.splice import splice_with_callees as _splice_walker
 
         cat_ids, num_ids = self._get_token_id_caches()
-        if arm == "matched":
-            root_fd, root_section, root_offset = self._load_matched_for_splice(
-                idx, version
-            )
-        elif arm == "unmatched":
-            root_fd, root_section, root_offset = (
-                self._load_unmatched_for_splice(idx)
-            )
-        else:
-            raise ValueError(f"unknown arm: {arm!r}")
 
-        root_fids = _build_fids_per_category(root_section)
-        root_staging = _decode_to_staging(
-            root_fd.full_token_stream(),
-            id_token_ids=cat_ids,
-            number_token_ids=num_ids,
-            fids_per_category=root_fids,
-            func_name=root_fd.func_name,
-            metadata=root_fd.metadata,
+        # Resolve the root section + each selected variant's FunctionData
+        # exactly once -- the per-stream loop body parses tokens but does
+        # NOT re-parse the section catalog. ``_load_root_variants`` is the
+        # only arm-dispatch site; the per-stream and callback bodies are
+        # arm-agnostic past the FunctionData handle.
+        section, section_offset, per_variant_fd = self._load_root_variants(
+            idx=idx,
+            arm=arm,
+            max_variants=max_variants,
+            rng=rng,
         )
 
-        def _decode_callee_to_staging(callee_offset: int, callee_arm: str):
+        selected_v_idxs = sorted(per_variant_fd.keys())
+        initial_selection_vkeys = frozenset(
+            int(section.variants[v].variant_ref_offset)
+            for v in selected_v_idxs
+        )
+
+        def _decode_callee_to_staging(
+            callee_offset: int,
+            callee_arm: str,
+            callee_variant_index: int,
+        ):
             callee_idx = self._idx_for_section_offset(
                 callee_offset, callee_arm
             )
@@ -299,8 +329,13 @@ class _BinarySessionSpliceMixin:
                     "is_callee_present must gate this"
                 )
             if callee_arm == "matched":
-                fd, sec, _off = self._load_matched_for_splice(callee_idx, 0)
+                fd, sec, _off = self._load_matched_for_splice(
+                    callee_idx, callee_variant_index
+                )
             else:
+                # Unmatched callees have exactly one variant by the
+                # matched_sections_bin invariant; ignore the
+                # walker-supplied variant index.
                 fd, sec, _off = self._load_unmatched_for_splice(callee_idx)
             callee_fids = _build_fids_per_category(sec)
             staging = _decode_to_staging(
@@ -319,15 +354,85 @@ class _BinarySessionSpliceMixin:
                 is not None
             )
 
-        return _splice_walker(
-            root_staging=root_staging,
-            root_arm=arm,
-            root_section=root_section,
-            root_section_offset=root_offset,
-            decode_callee_to_staging=_decode_callee_to_staging,
-            is_callee_present=_is_present,
-            max_depth=max_depth,
-        )
+        root_fids = _build_fids_per_category(section)
+        results: "list[DecodedFunction]" = []
+        for v_idx in selected_v_idxs:
+            root_fd = per_variant_fd[v_idx]
+            root_staging = _decode_to_staging(
+                root_fd.full_token_stream(),
+                id_token_ids=cat_ids,
+                number_token_ids=num_ids,
+                fids_per_category=root_fids,
+                func_name=root_fd.func_name,
+                metadata=root_fd.metadata,
+            )
+            spliced = _splice_walker(
+                root_staging=root_staging,
+                root_arm=arm,
+                root_section=section,
+                root_section_offset=section_offset,
+                decode_callee_to_staging=_decode_callee_to_staging,
+                is_callee_present=_is_present,
+                max_depth=max_depth,
+                primary_variant_idx=int(v_idx),
+                initial_selection_vkeys=initial_selection_vkeys,
+                inlined_equivalent_call_targets_only=(
+                    inlined_equivalent_call_targets_only
+                ),
+            )
+            results.append(spliced)
+
+        return results
+
+    # --- internal helpers ------------------------------------------
+
+    def _load_root_variants(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        idx: int,
+        arm: str,
+        max_variants: int,
+        rng: Optional[np.random.Generator],
+    ) -> Tuple[Section, int, Dict[int, FunctionData]]:
+        """Resolve the root section + each selected variant's FunctionData.
+
+        Single arm-dispatch site for ``splice_with_callees``. Matched
+        arm: parses the section once, then picks the variants chosen by
+        :func:`_select_variant_indices` from the pre-built
+        :class:`MatchedFunction`. Unmatched arm: the section has one
+        variant by construction so the selection logic yields exactly
+        ``{0: fd}`` regardless of ``max_variants``.
+
+        Returns ``(section, section_offset, {v_idx: FunctionData})``.
+        Raises :class:`ValueError` on an unknown ``arm`` name.
+        """
+        if arm == "matched":
+            section, section_offset, matched = (
+                self._load_matched_section_and_variants(idx)
+            )
+            selected = _select_variant_indices(
+                n_variants=len(section.variants),
+                max_variants=max_variants,
+                rng=rng,
+            )
+            per_variant_fd: Dict[int, FunctionData] = {
+                int(v): matched.variants[int(v)] for v in selected
+            }
+            return section, section_offset, per_variant_fd
+        if arm == "unmatched":
+            root_fd, section, section_offset = (
+                self._load_unmatched_for_splice(idx)
+            )
+            # An unmatched section has exactly one variant by the
+            # matched_sections_bin invariant; the sampling rule still
+            # validates ``max_variants`` (a 1-element list).
+            _select_variant_indices(
+                n_variants=len(section.variants),
+                max_variants=max_variants,
+                rng=rng,
+            )
+            return section, section_offset, {0: root_fd}
+        raise ValueError(f"unknown arm: {arm!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +453,34 @@ def _exact_section_matches(
     if starts is None or len(starts) == 0:
         return None
     return np.where(np.asarray(starts) == section_offset)[0]
+
+
+def _select_variant_indices(
+    *,
+    n_variants: int,
+    max_variants: int,
+    rng: Optional[np.random.Generator],
+) -> np.ndarray:
+    """Pick variant indices for the per-stream splice loop.
+
+    ``selection_size = min(max_variants, n_variants)``. If the
+    selection covers every variant the indices are returned in their
+    existing order (no shuffle); otherwise ``rng.choice`` samples
+    without replacement and the result is sorted for determinism.
+
+    ``rng=None`` constructs a fresh non-deterministic
+    :class:`numpy.random.Generator` per call -- callers that need
+    reproducibility (tests, seeded trainers) thread their own.
+    """
+    if n_variants <= 0:
+        raise ValueError(
+            f"section has zero variants; cannot sample (n_variants={n_variants})"
+        )
+    selection_size = min(max_variants, n_variants)
+    if selection_size == n_variants:
+        return np.arange(n_variants, dtype=np.int64)
+    generator = rng if rng is not None else np.random.default_rng()
+    chosen = generator.choice(
+        n_variants, size=selection_size, replace=False
+    )
+    return np.sort(chosen)

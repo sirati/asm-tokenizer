@@ -6,8 +6,8 @@ function data from aligned data files, with support for multiple binaries,
 length-based filtering, and ML-safe memory management.
 
 Key Classes:
-- FunctionData: Single function version
-- MatchedFunction: Function with multiple compilation versions
+- FunctionData: Single function variant
+- MatchedFunction: Function with multiple compilation variants
 - BinaryDataset: Manages data for a single binary
 - AlignedDataLoader: Main interface for loading from multiple binaries
 

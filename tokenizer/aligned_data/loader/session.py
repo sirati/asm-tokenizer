@@ -172,7 +172,7 @@ class BinarySession(_BinarySessionSpliceMixin):
     # --- public slice methods --------------------------------------
 
     def load_matched(self, idx: int) -> MatchedFunction:
-        _section, _offset, matched = self._load_matched_section_and_versions(idx)
+        _section, _offset, matched = self._load_matched_section_and_variants(idx)
         return matched
 
     def load_unmatched(self, idx: int) -> FunctionData:
@@ -190,10 +190,10 @@ class BinarySession(_BinarySessionSpliceMixin):
     # source of truth) while exposing the section + offset to
     # ``_load_*_for_splice`` without re-parsing.
 
-    def _load_matched_section_and_versions(
+    def _load_matched_section_and_variants(
         self, idx: int
     ) -> Tuple[Section, int, MatchedFunction]:
-        """Parse the matched section at ``idx`` + build all its versions.
+        """Parse the matched section at ``idx`` + build all its variants.
 
         Returns ``(section, section_offset, MatchedFunction)``. The
         ``Section`` is the parsed BIN catalog entry (call_targets +
