@@ -6,6 +6,14 @@ arbitrary earlier offsets without coherence issues — that's the property
 the content-addressed dedup helper relies on when it has to disambiguate
 a hash collision by byte-comparing against a previously-written record.
 
+In addition to append-at-cursor writes and random reads, the writer
+exposes a random-access ``patch(offset, data)`` primitive: it rewrites
+``len(data)`` bytes at ``offset`` in the existing mapping without moving
+``cursor``. The sections-bin codec uses this to back-patch placeholders
+left for forward-referenced callees (see
+``matched_sections_bin.SectionWriter``); patches are bounded by the
+already-written region, so they never silently extend the data range.
+
 The mapping grows on demand: when the next write would exceed the
 current mapping size, the underlying file is ``ftruncate``'d to the next
 size (geometric growth, capped at 1 GiB increments past 1 GiB) and the
@@ -88,6 +96,27 @@ class MemmapBinWriter:
     def read(self, offset: int, length: int) -> bytes:
         """Read ``length`` bytes starting at ``offset`` from the mapping."""
         return bytes(self._mm[offset : offset + length])
+
+    def patch(self, offset: int, data: bytes) -> None:
+        """Rewrite ``len(data)`` bytes at ``offset`` without moving the cursor.
+
+        The natural read/write counterpart to :meth:`read`: random-access
+        update of already-written bytes. Refuses to patch unwritten
+        regions — ``offset + len(data)`` must be ``<= cursor`` — so a
+        bug that would silently extend the data range past the writer's
+        own end raises instead. Used by callers that need to back-patch
+        forward-reference placeholders (see ``SectionWriter`` for the
+        sections-bin case).
+        """
+        if offset < 0:
+            raise ValueError(f"patch offset must be non-negative, got {offset}")
+        end = offset + len(data)
+        if end > self._cursor:
+            raise ValueError(
+                f"patch({offset}, {len(data)} bytes) extends to {end} but "
+                f"cursor is {self._cursor}; refusing to patch unwritten region"
+            )
+        self._mm[offset:end] = data
 
     def truncate_to(self, position: int) -> None:
         """Roll the cursor back to ``position`` (e.g. on encoder skip).
