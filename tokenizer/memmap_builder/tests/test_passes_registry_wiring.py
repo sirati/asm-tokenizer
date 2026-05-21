@@ -18,6 +18,7 @@ from typing import Tuple
 import numpy as np
 import pytest
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.parsed_record_iter import Matched, ParsedRecord
 from tokenizer.memmap_builder._dedup import open_arm_dedup_state
 from tokenizer.memmap_builder.function_names import FunctionNamesRegistry
@@ -49,12 +50,16 @@ def _make_record(
     # deterministic value works as long as identical bytes produce the
     # same hash (so the dedup gate fires when expected).
     content_hash = int(tokens.tobytes().__hash__() & 0xFFFFFFFFFFFFFFFF)
+    typed_called = sorted(
+        {(name, CallTargetType.LOCAL) for name in called},
+        key=lambda nt: (nt[0], nt[1].value),
+    )
     return ParsedRecord(
         func_name=func_name,
         insn_runlength=insn_runlength,
         block_runlength=block_runlength,
         tokens=tokens,
-        called_funcs=sorted(called),
+        called_funcs=typed_called,
         content_hash=content_hash,
     )
 

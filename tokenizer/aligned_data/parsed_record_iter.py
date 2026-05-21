@@ -40,6 +40,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Union
 import numpy as np
 import xxhash
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 
 from .match import (
@@ -56,7 +57,7 @@ class ParsedRecord:
     insn_runlength: np.ndarray
     block_runlength: np.ndarray
     tokens: np.ndarray
-    called_funcs: List[str]
+    called_funcs: list[tuple[str, CallTargetType]]
     content_hash: int
 
 
@@ -198,10 +199,17 @@ def _decode_tokens(
     return tokens.astype(np.uint16)
 
 
+_V2_CATEGORY_TYPES: "tuple[tuple[str, CallTargetType], ...]" = (
+    ("local_funcs", CallTargetType.LOCAL),
+    ("plt_funcs", CallTargetType.PLT),
+    ("ext_funcs", CallTargetType.EXTERN),
+)
+
+
 def _extract_called_funcs(
     row: List[str],
     column_index: "dict[str, int]",
-) -> List[str]:
+) -> list[tuple[str, CallTargetType]]:
     # Schema dispatch mirrors the pre-refactor
     # ``helpers.get_called_functions_from_row`` — v2 carries a
     # ``metadata`` JSON column; v1 carries the Python-repr
@@ -213,7 +221,7 @@ def _extract_called_funcs(
     return []
 
 
-def _called_from_v2_metadata(metadata_cell: str) -> List[str]:
+def _called_from_v2_metadata(metadata_cell: str) -> list[tuple[str, CallTargetType]]:
     if not metadata_cell:
         return []
     try:
@@ -222,27 +230,32 @@ def _called_from_v2_metadata(metadata_cell: str) -> List[str]:
         return []
     if not isinstance(meta, dict):
         return []
-    called = set()
-    for category_key in ("local_funcs", "plt_funcs", "ext_funcs"):
+    # The same name can legitimately appear in two categories (e.g. a
+    # PLT stub ``foo`` and an extern body ``foo`` from the same caller).
+    # Dedup by ``(name, type)``, not by name alone.
+    called: "set[tuple[str, CallTargetType]]" = set()
+    for category_key, category_type in _V2_CATEGORY_TYPES:
         for entry in meta.get(category_key, ()) or ():
             if isinstance(entry, dict):
                 name = entry.get("name")
                 if isinstance(name, str):
-                    called.add(name)
-    return sorted(called)
+                    called.add((name, category_type))
+    return sorted(called, key=lambda nt: (nt[0], nt[1].value))
 
 
-def _called_from_v1_opaque_metadata(opaque_metadata: str) -> List[str]:
+def _called_from_v1_opaque_metadata(
+    opaque_metadata: str,
+) -> list[tuple[str, CallTargetType]]:
     try:
         meta = ast.literal_eval(opaque_metadata)
-        called = set()
+        called: "set[tuple[str, CallTargetType]]" = set()
         for entry in meta:
             if isinstance(entry, tuple) and len(entry) >= 5:
                 name = entry[2]
                 type_field = entry[3]
                 if type_field == "local_function":
-                    called.add(name)
-        return sorted(called)
+                    called.add((name, CallTargetType.LOCAL))
+        return sorted(called, key=lambda nt: nt[0])
     except Exception:
         return []
 

@@ -72,7 +72,7 @@ def process_matched_function(
         return None
 
     unique_called = sorted(
-        {fn for rec in matched.records.values() for fn in rec.called_funcs}
+        {name for rec in matched.records.values() for (name, _type) in rec.called_funcs}
     )
 
     version_data = []
@@ -84,7 +84,7 @@ def process_matched_function(
         version_data.append(
             {
                 "vkey": version_keys[variant_index],
-                "called": rec.called_funcs,
+                "called": [name for (name, _type) in rec.called_funcs],
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
@@ -148,11 +148,11 @@ def process_unmatched_function(
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
-                "called": set(rec.called_funcs),
+                "called": {name for (name, _type) in rec.called_funcs},
             }
         )
         registry.add(func_name)
-        for called_name in rec.called_funcs:
+        for called_name, _type in rec.called_funcs:
             registry.add(called_name)
 
     return entries
