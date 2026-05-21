@@ -97,6 +97,17 @@ class MemmapBinWriter:
         """Read ``length`` bytes starting at ``offset`` from the mapping."""
         return bytes(self._mm[offset : offset + length])
 
+    def view(self) -> memoryview:
+        """Return a zero-copy ``memoryview`` of the already-written region.
+
+        Spans bytes ``[0, cursor)``. Callers that need to walk the written
+        bytes in-place (e.g. a finalize-time verification sweep) MUST use
+        this instead of :meth:`read` to avoid a multi-GB copy at corpus
+        scale. The slice is valid until the mapping is grown or closed;
+        do NOT keep references past :meth:`finalize`.
+        """
+        return memoryview(self._mm)[: self._cursor]
+
     def patch(self, offset: int, data: bytes) -> None:
         """Rewrite ``len(data)`` bytes at ``offset`` without moving the cursor.
 

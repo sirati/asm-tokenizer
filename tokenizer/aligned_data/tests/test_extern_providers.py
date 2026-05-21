@@ -54,7 +54,7 @@ def test_first_added_library_returns_line_one() -> None:
 def test_prelude_mismatch_raises_value_error(tmp_path: Path) -> None:
     bad = tmp_path / "bad_extern_providers.txt"
     bad.write_text("# format=999999\nlibc.so.6\n", encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="prelude"):
         list(iter_extern_providers(bad))
 
 
@@ -62,8 +62,16 @@ def test_prelude_missing_raises_value_error(tmp_path: Path) -> None:
     bad = tmp_path / "no_prelude.txt"
     # No prelude at all: first line is a library name.
     bad.write_text("libc.so.6\n", encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="prelude"):
         list(iter_extern_providers(bad))
+
+
+def test_empty_registry_writes_prelude_only_file(tmp_path: Path) -> None:
+    """Empty registry → file contains only the prelude; iter yields nothing."""
+    reg = ExternProviderRegistry()
+    path = reg.write_sidecar(tmp_path, "mybin")
+    assert path.read_text(encoding="utf-8") == f"# format={MEMMAP_FORMAT_VERSION}\n"
+    assert list(iter_extern_providers(path)) == []
 
 
 def test_written_prelude_matches_current_format_version(tmp_path: Path) -> None:

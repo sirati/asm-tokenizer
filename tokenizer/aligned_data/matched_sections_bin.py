@@ -528,21 +528,49 @@ class SectionWriter:
         bug (e.g. forgetting to register a per-variant slot in the
         hole record) would leak through; this sweep surfaces it
         before the bin is sealed.
+
+        The memmap is closed unconditionally in a ``finally``: if the
+        sweep or any of the structural checks raises, the underlying
+        bin still gets unmapped + truncated rather than leaking until
+        process exit.
         """
-        if self._current_fid is not None:
-            raise ValueError(
-                "finalize called while section "
-                f"function_name_ptr={self._current_fid} is still open"
-            )
-        if self._pending_holes:
-            unresolved = sorted(self._pending_holes.keys())
-            raise ValueError(
-                f"finalize: {len(unresolved)} callee section(s) were "
-                f"referenced but never written: function_name_ptrs="
-                f"{unresolved!r}"
-            )
-        self._sweep_for_unresolved_sentinels()
+        try:
+            if self._current_fid is not None:
+                raise ValueError(
+                    "finalize called while section "
+                    f"function_name_ptr={self._current_fid} is still open"
+                )
+            if self._pending_holes:
+                unresolved = sorted(self._pending_holes.keys())
+                raise ValueError(
+                    f"finalize: {len(unresolved)} callee section(s) were "
+                    f"referenced but never written: function_name_ptrs="
+                    f"{unresolved!r}"
+                )
+            self._sweep_for_unresolved_sentinels()
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Flush + unmap the underlying bin without running checks.
+
+        Idempotent. The happy-path entry is :meth:`finalize`, which
+        runs the structural assertions first; ``close`` exists as the
+        always-runs cleanup so an error mid-finalize still releases
+        the mmap. Safe to call from a ``try``/``finally`` or
+        ``__exit__``.
+        """
         self._writer.finalize()
+
+    def __enter__(self) -> "SectionWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # If the body raised, callers haven't reached finalize; close
+        # the mmap so the exception path doesn't leak it. If the body
+        # already finalized cleanly, ``close`` is a no-op
+        # (``MemmapBinWriter.finalize`` is idempotent).
+        self.close()
 
     # ------------------------------------------------------------------
     # Internals
@@ -612,7 +640,7 @@ class SectionWriter:
         if spec.type is CallTargetType.EXTERN:
             if spec.extern_provider_line_no is None:
                 return UNKNOWN_EXTERN_PROVIDER
-            return int(spec.extern_provider_line_no)
+            return spec.extern_provider_line_no
 
         # LOCAL / PLT.
         known = self._known_sections.get(spec.function_name_ptr)
@@ -678,20 +706,32 @@ class SectionWriter:
         emit-side layout: any section the parser produces is also
         what the bin will look like to readers, and we check every
         per-call entry's ``section_variant_index``.
+
+        Uses a zero-copy :meth:`MemmapBinWriter.view` over the
+        already-written region instead of :meth:`MemmapBinWriter.read`
+        — at corpus scale the bin is multi-GB and a ``bytes`` copy at
+        finalize-time would more than double peak RAM. The memoryview
+        is explicitly :meth:`memoryview.release`-d in a ``finally`` so
+        the subsequent :meth:`MemmapBinWriter.finalize` (which calls
+        ``mmap.close``) does not trip on an exported pointer being
+        held alive by the traceback of an in-flight exception.
         """
-        end = self._writer.cursor
-        blob = memoryview(self._writer.read(0, end))
-        offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
-        while offset < end:
-            section, offset = parse_section_bin(blob, offset)
-            for v_idx, variant in enumerate(section.variants):
-                for called_idx, sv_idx in variant.per_call_entries:
-                    if sv_idx == UNRESOLVED_VARIANT_INDEX:
-                        raise ValueError(
-                            f"unresolved section_variant_index in section "
-                            f"function_name_ptr={section.function_name_ptr} "
-                            f"variant_idx={v_idx} called_idx={called_idx}"
-                        )
+        blob = self._writer.view()
+        try:
+            end = len(blob)
+            offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+            while offset < end:
+                section, offset = parse_section_bin(blob, offset)
+                for v_idx, variant in enumerate(section.variants):
+                    for called_idx, sv_idx in variant.per_call_entries:
+                        if sv_idx == UNRESOLVED_VARIANT_INDEX:
+                            raise ValueError(
+                                f"unresolved section_variant_index in section "
+                                f"function_name_ptr={section.function_name_ptr} "
+                                f"variant_idx={v_idx} called_idx={called_idx}"
+                            )
+        finally:
+            blob.release()
 
 
 # ---------------------------------------------------------------------------

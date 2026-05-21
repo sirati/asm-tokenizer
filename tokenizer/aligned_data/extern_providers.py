@@ -29,7 +29,7 @@ the library as unknown without consulting this sidecar.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterator, Tuple
+from typing import Iterator
 
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
@@ -50,7 +50,7 @@ class ExternProviderRegistry:
         # line number. We could derive the line number from positional
         # insertion, but storing it explicitly makes ``add`` O(1) idempotent
         # without re-walking the dict.
-        self._line_no: Dict[str, int] = {}
+        self._line_no: dict[str, int] = {}
 
     def add(self, library: str) -> int:
         """Register ``library`` (if new) and return its 1-indexed line number.
@@ -85,7 +85,7 @@ class ExternProviderRegistry:
         return path
 
 
-def iter_extern_providers(path: Path) -> Iterator[Tuple[int, str]]:
+def iter_extern_providers(path: Path) -> Iterator[tuple[int, str]]:
     """Yield ``(line_no_1indexed, library_name)`` for each registered library.
 
     Validates the ``# format=N`` prelude line; mismatch raises
