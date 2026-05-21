@@ -43,13 +43,51 @@ from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.tokens import Category, TokenType
 
 from ..matched_sections_bin import Section
+from .decoded.category_tokens import FID_KEYED_CATEGORIES
 from .function_data import FunctionData
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     from .decoded.decoded_function import DecodedFunction
+
+
+# Splice's FID-resolution lookup keys by Category; the BIN's call_target
+# rows key by CallTargetType. Single source of truth for the mapping
+# the session-level FID lookup walks.
+_CALL_TARGET_TYPE_TO_FID_CATEGORY: Dict[CallTargetType, Category] = {
+    CallTargetType.LOCAL: Category.LOCAL_FUNC,
+    CallTargetType.PLT: Category.PLT_FUNC,
+    CallTargetType.EXTERN: Category.EXT_FUNC,
+}
+
+
+def _build_fids_per_category(section: Section) -> Dict[Category, np.ndarray]:
+    """Per-Category ``uint32`` FID array indexed by caller-local id.
+
+    Plan Decisions 21 + 22: ``Section.call_targets[]`` is encounter-
+    ordered within each :class:`CallTargetType`, categories concatenated
+    LOCAL -> PLT -> EXT. The K-th LOCAL call_target row is the function
+    with encoder-allocated LOCAL_FUNC identity ``K`` (mirror for PLT /
+    EXT); the row's ``function_name_ptr`` is the callee's globally-
+    unique FID. So each per-category list collected here, in the order
+    the call_targets table emits, is exactly the lookup the decoder
+    consumes to resolve a caller-local id into a FID.
+    """
+    per_category: Dict[Category, list] = {
+        category: [] for category in FID_KEYED_CATEGORIES
+    }
+    for ct in section.call_targets:
+        category = _CALL_TARGET_TYPE_TO_FID_CATEGORY.get(ct.type)
+        if category is None:  # defensive -- no other CallTargetType exists today
+            continue
+        per_category[category].append(ct.function_name_ptr)
+    return {
+        category: np.array(values, dtype=np.uint32)
+        for category, values in per_category.items()
+    }
 
 
 class _BinarySessionSpliceMixin:
@@ -222,7 +260,7 @@ class _BinarySessionSpliceMixin:
         ``is_callee_present=False``: their call-site tokens stay in
         the caller's stream but their bodies are not spliced.
         """
-        from .decoded.extract import decode_raw_tokens
+        from .decoded.extract import _decode_to_staging
         from .decoded.splice import splice_with_callees as _splice_walker
 
         cat_ids, num_ids = self._get_token_id_caches()
@@ -237,15 +275,17 @@ class _BinarySessionSpliceMixin:
         else:
             raise ValueError(f"unknown arm: {arm!r}")
 
-        root_decoded = decode_raw_tokens(
+        root_fids = _build_fids_per_category(root_section)
+        root_staging = _decode_to_staging(
             root_fd.full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
+            fids_per_category=root_fids,
             func_name=root_fd.func_name,
             metadata=root_fd.metadata,
         )
 
-        def _decode_callee(callee_offset: int, callee_arm: str):
+        def _decode_callee_to_staging(callee_offset: int, callee_arm: str):
             callee_idx = self._idx_for_section_offset(
                 callee_offset, callee_arm
             )
@@ -262,14 +302,16 @@ class _BinarySessionSpliceMixin:
                 fd, sec, _off = self._load_matched_for_splice(callee_idx, 0)
             else:
                 fd, sec, _off = self._load_unmatched_for_splice(callee_idx)
-            decoded = decode_raw_tokens(
+            callee_fids = _build_fids_per_category(sec)
+            staging = _decode_to_staging(
                 fd.full_token_stream(),
                 id_token_ids=cat_ids,
                 number_token_ids=num_ids,
+                fids_per_category=callee_fids,
                 func_name=fd.func_name,
                 metadata=fd.metadata,
             )
-            return decoded, sec
+            return staging, sec
 
         def _is_present(callee_offset: int, callee_arm: str) -> bool:
             return (
@@ -278,11 +320,11 @@ class _BinarySessionSpliceMixin:
             )
 
         return _splice_walker(
-            root_decoded=root_decoded,
+            root_staging=root_staging,
             root_arm=arm,
             root_section=root_section,
             root_section_offset=root_offset,
-            decode_callee=_decode_callee,
+            decode_callee_to_staging=_decode_callee_to_staging,
             is_callee_present=_is_present,
             max_depth=max_depth,
         )

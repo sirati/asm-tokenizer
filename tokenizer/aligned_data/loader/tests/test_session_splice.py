@@ -220,16 +220,20 @@ def _build_splice_corpus(
 
 @pytest.fixture
 def splice_corpus_single(tmp_path: Path) -> Dict[str, Any]:
-    """Single matched function, no callees -- depth=0 + cache tests."""
+    """Single matched function, no callees -- depth=0 + cache tests.
+
+    Body emits zero LOCAL_FUNC tokens because the function has no
+    declared callees: every caller-local id WOULD resolve out-of-range
+    in the FID-resolution decode (plan Decisions 22, 28). The cache
+    tests only need a valid two-variant function with a real section,
+    so dropping the orphan identity slots is the correct shape for the
+    new design.
+    """
     spec = MatchedFunctionSpec(
         func_name="only_fn",
         variants=(
-            _variant_spec(
-                ("only", 0), local_func_identities=(0, 1, 2)
-            ),
-            _variant_spec(
-                ("only", 1), local_func_identities=(3,)
-            ),
+            _variant_spec(("only", 0)),
+            _variant_spec(("only", 1)),
         ),
         called=(),
     )
@@ -238,27 +242,39 @@ def splice_corpus_single(tmp_path: Path) -> Dict[str, Any]:
 
 @pytest.fixture
 def splice_corpus_caller_callee(tmp_path: Path) -> Dict[str, Any]:
-    """Two matched functions: ``caller`` calls ``callee``.
+    """Three matched functions: ``caller`` calls ``callee`` + ``other``,
+    ``callee`` calls ``other`` (FID unification fixture).
 
-    Both functions emit LOCAL_FUNC identities so the splicer's
-    per-Category rebase has work to do (callee identity 0 should land
-    at ``caller_max + 1`` after rebase).
+    The caller body emits two LOCAL_FUNC tokens (caller-local ids 0, 1
+    resolving to ``callee`` + ``other`` per the encounter-ordered
+    call_targets table). ``callee``'s body emits one LOCAL_FUNC token
+    referencing ``other`` again. After splice + compaction the same
+    callee FID (``other``) appearing in both the caller's reference
+    AND the spliced callee's reference shares ONE compacted id --
+    that's the FID-unification invariant the new design buys.
     """
+    other_spec = MatchedFunctionSpec(
+        func_name="other",
+        variants=(_variant_spec(("other", 0)),),
+        called=(),
+    )
     callee_spec = MatchedFunctionSpec(
         func_name="callee",
-        variants=(_variant_spec(("callee", 0), local_func_identities=(0, 1)),),
-        called=(),
+        variants=(_variant_spec(("callee", 0), local_func_identities=(0,)),),
+        called=("other",),
     )
     caller_spec = MatchedFunctionSpec(
         func_name="caller",
         variants=(
             _variant_spec(
-                ("caller", 0), local_func_identities=(0, 1, 2)
+                ("caller", 0), local_func_identities=(0, 1)
             ),
         ),
-        called=("callee",),
+        called=("callee", "other"),
     )
-    return _build_splice_corpus(tmp_path, (callee_spec, caller_spec))
+    return _build_splice_corpus(
+        tmp_path, (other_spec, callee_spec, caller_spec)
+    )
 
 
 def _caller_idx(corpus: Dict[str, Any]) -> int:
@@ -400,37 +416,70 @@ def test_idx_for_section_offset_unmatched_arm_absent(splice_corpus_single):
 
 
 def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
-    """``max_depth=0`` returns the decoded root with no splicing."""
-    from tokenizer.aligned_data.loader.decoded.extract import decode_raw_tokens
+    """``max_depth=0`` returns the decoded root unchanged.
+
+    The fixture's only function has no LOCAL_FUNC tokens (no declared
+    callees), so the post-compaction identity arrays are empty for
+    every Category. The depth-0 splice and a direct FID-resolved
+    decode of the same body match byte-for-byte.
+    """
+    from tokenizer.aligned_data.loader._session_splice import (
+        _build_fids_per_category,
+    )
+    from tokenizer.aligned_data.loader.decoded.extract import _decode_to_staging
+    from tokenizer.aligned_data.loader.decoded.splice import _compact_ids
 
     fb = splice_corpus_single
     with BinarySession(
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
         spliced = sess.splice_with_callees(0, arm="matched", max_depth=0)
-        # Manually decode the first version of the only function for parity.
-        # The splicer decodes the FULL wire stream (variant axis + body)
-        # via ``FunctionData.full_token_stream`` -- mirror that here so the
-        # baseline carries the same VARIANT_AXIS prefix tokens.
         cat_ids, num_ids = sess._get_token_id_caches()
         matched = sess.load_matched(0)
-        baseline = decode_raw_tokens(
+        section, _section_offset, _matched = (
+            sess._load_matched_section_and_versions(0)
+        )
+        fids = _build_fids_per_category(section)
+        staging = _decode_to_staging(
             matched.versions[0].full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
+            fids_per_category=fids,
             func_name=matched.func_name,
             metadata=matched.versions[0].metadata,
         )
-    assert np.array_equal(spliced.real_tokens, baseline.real_tokens)
+        baseline_identities = {
+            c: _compact_ids(staging.identities[c]) for c in Category
+        }
+    assert np.array_equal(spliced.real_tokens, staging.real_tokens)
     for category in Category:
         assert np.array_equal(
             spliced.identities[category],
-            baseline.identities[category],
+            baseline_identities[category],
         )
 
 
-def test_splice_depth_one_concatenates_callee(splice_corpus_caller_callee):
-    """``max_depth=1`` from caller splices in the callee with rebased IDs."""
+def test_splice_depth_one_unifies_shared_fid(splice_corpus_caller_callee):
+    """``max_depth=1`` splices the callee body in and the same callee FID
+    referenced from both caller and callee compacts to ONE id.
+
+    Setup (see ``splice_corpus_caller_callee``):
+      * caller calls ``callee`` (local id 0) + ``other`` (local id 1)
+      * callee calls ``other`` (local id 0 within its own scope)
+
+    Caller's body emits LOCAL_FUNC tokens at caller-local ids ``(0, 1)``;
+    these resolve to ``[FID(callee), FID(other)]``. Callee's body emits
+    one LOCAL_FUNC token at its-own caller-local id ``0`` which resolves
+    to ``FID(other)`` -- the SAME FID the caller already references.
+
+    Depth=0 (caller only) sees two distinct FIDs -> compacted to
+    ``[0, 1]``. Depth=1 (caller + callee body) concatenates a third
+    occurrence of ``FID(other)``; compaction aliases that third slot to
+    the same compacted id ``other`` already got from the caller's slot,
+    giving ``[0, 1, 1]``. That alias is the FID-unification invariant
+    -- one callee, one compacted id, regardless of where in the splice
+    tree it's referenced.
+    """
     fb = splice_corpus_caller_callee
     with BinarySession(
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
@@ -443,16 +492,13 @@ def test_splice_depth_one_concatenates_callee(splice_corpus_caller_callee):
         "depth=1 must grow the stream by the callee body"
     )
 
-    caller_local = depth0.identities[Category.LOCAL_FUNC]
-    spliced_local = depth1.identities[Category.LOCAL_FUNC]
-    # Caller emits identities (0, 1, 2); callee emits (0, 1) which
-    # rebase to (caller_max + 1, caller_max + 2) = (3, 4).
-    assert caller_local.tolist() == [0, 1, 2]
-    expected_callee_rebased = [3, 4]
-    assert spliced_local.tolist() == [
-        *caller_local.tolist(),
-        *expected_callee_rebased,
-    ]
+    # Caller's two LOCAL_FUNC slots: callee + other -> two distinct
+    # compacted ids in encoder-allocation order.
+    assert depth0.identities[Category.LOCAL_FUNC].tolist() == [0, 1]
+    # Depth=1 appends callee's one LOCAL_FUNC slot (referencing other);
+    # that slot's FID matches the caller's second slot, so compaction
+    # aliases to the same compacted id (== 1).
+    assert depth1.identities[Category.LOCAL_FUNC].tolist() == [0, 1, 1]
 
 
 def test_splice_unmatched_arm_supported(tmp_path):

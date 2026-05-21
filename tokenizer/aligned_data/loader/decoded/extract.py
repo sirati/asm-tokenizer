@@ -8,7 +8,8 @@ walker in ``splice.py`` calls into this module once per function body
 and stitches the per-function results.
 
 Plan reference: ``## Algorithm -- decode_raw_tokens`` and ``## Locked-in
-decisions`` items 1, 2, 3, 5, 6, 7, 14, 15.
+decisions`` items 1, 2, 3, 5, 6, 7, 14, 15 + items 22, 26 + 28-31 for
+the FID resolution + staging shape.
 
 Algorithm shape:
 
@@ -16,8 +17,15 @@ Algorithm shape:
    ``decoded.run_lengths``); used by BOTH the identity arm and the
    number arm.
 2. Identity arm: per category, mask + positions + per-position inline-byte
-   decode -> uint16 array (sentinel ``0xFFFF`` on overflow).  Pure read
-   pass over ``raw_tokens``; does NOT mutate the working buffer.
+   decode -> identity array.  Pure read pass over ``raw_tokens``; does
+   NOT mutate the working buffer.  For categories in
+   :data:`FID_KEYED_CATEGORIES` the per-position decode produces a
+   caller-local id; when a section-derived
+   ``fids_per_category[c]`` lookup is provided the local id is then
+   indexed into that array to resolve the callee's globally-unique
+   function identity (FID).  The result is staged as a ``uint32`` array
+   for the FID-keyed branches (FIDs cannot be safely clipped to ``uint16``)
+   and as ``uint16`` for the other five categories.
 3. Number arm: per number-type, mask + positions + per-position payload
    decode via a per-type dispatch table (no if-chain over TokenType); the
    resulting per-position ``(sig, sign_exp)`` chunks are sorted into
@@ -40,16 +48,30 @@ each other's category / TokenType.  Identities are owned by ``Category``;
 numbers are owned by ``TokenType``.  The two key-sets are disjoint by
 construction (the resolvers in ``category_tokens.py`` are the single
 source of truth).
+
+Staging vs DecodedFunction: the FID-resolved identity branch produces
+``uint32`` per-position arrays, which violates :class:`DecodedFunction`'s
+``uint16`` invariant.  The split internal entry
+:func:`_decode_to_staging` returns a :class:`_StagingDecoded` carrying
+possibly-mixed dtypes; :func:`decode_raw_tokens` is the
+backwards-compatible u16-only public wrapper used by the synthetic-test
+and standalone single-function decode paths (no ``fids_per_category``
+lookup; identities follow the legacy "inline payload IS the identity
+value" contract).  Splice integration calls
+:func:`_decode_to_staging` directly and runs compaction at the splice
+top level (see :mod:`tokenizer.aligned_data.loader.decoded.splice`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
 from tokenizer.tokens import Category, TokenType
 
+from .category_tokens import FID_KEYED_CATEGORIES
 from .custom_float import (
     from_bfloat16,
     from_float16,
@@ -63,6 +85,33 @@ from .decoded_function import DecodedFunction
 from .run_lengths import run_lengths
 
 __all__ = ["decode_raw_tokens"]
+
+
+# u32 sentinel for FID-keyed identity staging.  Compaction (in splice.py)
+# folds these positions back to the public uint16 sentinel ``0xFFFF`` in
+# the final :class:`DecodedFunction`.
+_IDENTITY_SENTINEL_U32 = np.uint32(0xFFFFFFFF)
+
+
+@dataclass(frozen=True)
+class _StagingDecoded:
+    """Private mid-pipeline view: same fields as :class:`DecodedFunction`
+    but with NO dtype invariant on the per-Category identity arrays.
+
+    The splice walker concatenates these verbatim and runs per-Category
+    compaction at the top level; the public :class:`DecodedFunction`
+    is constructed only after compaction so the u16 invariant holds for
+    consumers.  Treat the arrays as read-only -- consumers MUST NOT
+    mutate them (the splicer reuses the same arrays across the concat
+    step).
+    """
+
+    real_tokens: np.ndarray
+    identities: Dict[Category, np.ndarray]
+    numbers_significant: np.ndarray
+    numbers_sign_exponent: np.ndarray
+    func_name: str
+    metadata: Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
@@ -190,38 +239,90 @@ def _decode_identity_payload(payload: bytes) -> int:
     return value
 
 
+def _resolve_fid_payload(
+    payload: bytes,
+    *,
+    fid_lookup: np.ndarray,
+) -> int:
+    """Decode an FID-keyed identity payload to the looked-up callee FID.
+
+    Empty payload decodes as caller-local id 0 (``int.from_bytes(b'',
+    ...)``); a local id beyond ``len(fid_lookup)`` yields the u32
+    sentinel which compaction will fold to the public u16 sentinel
+    downstream.  Returning a Python ``int`` keeps the call-site free
+    from numpy-dtype dispatch -- the per-category array build below
+    casts to ``uint32`` once.
+    """
+    local_id = int.from_bytes(payload, byteorder="big", signed=False)
+    if local_id >= len(fid_lookup):
+        return int(_IDENTITY_SENTINEL_U32)
+    return int(fid_lookup[local_id])
+
+
 def _extract_identities(
     raw_tokens: np.ndarray,
     runlen: np.ndarray,
     id_token_ids: Dict[Category, int],
+    *,
+    fids_per_category: "Optional[Dict[Category, np.ndarray]]" = None,
 ) -> Dict[Category, np.ndarray]:
-    """Build one uint16 array per ``Category``.
+    """Build one identity array per ``Category``.
 
-    Pre-fills every ``Category`` member with an empty uint16 array so
-    the returned dict always carries the full 8-key set regardless of
+    Pre-fills every ``Category`` member with an empty array of the
+    expected staging dtype (``uint32`` for FID-keyed categories when
+    ``fids_per_category`` is provided, otherwise ``uint16``) so the
+    returned dict always carries the full 8-key set regardless of
     which Categories the caller's ``id_token_ids`` map covers.  Any
     Category present in ``id_token_ids`` then overwrites its empty
-    slot with the decoded occurrences; Categories absent from
-    ``id_token_ids`` keep their empty array (the vocab does not
-    advertise that TokenType, so there are by definition zero
-    occurrences in the stream).
+    slot with the decoded occurrences.
 
     Pure read pass over ``raw_tokens``; never touches the number arm's
     working buffer.  Iteration order over positions is stream-ascending
-    (``_iter_token_occurrences`` yields in ``np.nonzero`` ascending order),
     so the per-category array order matches the order of category-token
     occurrences in the final post-strip real-token stream.
+
+    FID resolution branch (plan Decision 22): for each category in
+    :data:`FID_KEYED_CATEGORIES` whose
+    ``fids_per_category[c]`` is supplied, the inline-digit payload is
+    decoded as a caller-local id, then indexed into the per-category
+    FID array to produce the callee's globally-unique function
+    identity (FID).  Out-of-range caller-local ids resolve to the u32
+    sentinel; compaction downstream folds them to the public u16
+    sentinel.  Categories NOT in ``FID_KEYED_CATEGORIES`` and the
+    FID-keyed categories whose ``fids_per_category`` is absent fall
+    back to the legacy "inline payload IS the identity value" decode
+    (u16, sentinel 0xFFFF on overflow).
     """
-    identities: Dict[Category, np.ndarray] = {
-        category: np.empty(0, dtype=np.uint16) for category in Category
-    }
+    use_fid_lookup = fids_per_category is not None
+    identities: Dict[Category, np.ndarray] = {}
+    for category in Category:
+        # Empty-array dtype matches the staging dtype for this category
+        # so concat downstream stays dtype-consistent.
+        if use_fid_lookup and category in FID_KEYED_CATEGORIES:
+            identities[category] = np.empty(0, dtype=np.uint32)
+        else:
+            identities[category] = np.empty(0, dtype=np.uint16)
+
     for category, type_token_id in id_token_ids.items():
+        fid_lookup: "Optional[np.ndarray]" = (
+            fids_per_category[category]  # type: ignore[index]
+            if use_fid_lookup and category in FID_KEYED_CATEGORIES
+            else None
+        )
         values_list: List[int] = []
         for _position, payload in _iter_token_occurrences(
             raw_tokens, runlen, type_token_id
         ):
-            values_list.append(_decode_identity_payload(payload))
-        identities[category] = np.array(values_list, dtype=np.uint16)
+            if fid_lookup is not None:
+                values_list.append(
+                    _resolve_fid_payload(payload, fid_lookup=fid_lookup)
+                )
+            else:
+                values_list.append(_decode_identity_payload(payload))
+        if fid_lookup is not None:
+            identities[category] = np.array(values_list, dtype=np.uint32)
+        else:
+            identities[category] = np.array(values_list, dtype=np.uint16)
     return identities
 
 
@@ -301,51 +402,42 @@ def _flatten_number_chunks(
 # ---------------------------------------------------------------------------
 
 
-def decode_raw_tokens(
+def _decode_to_staging(
     raw_tokens: np.ndarray,
     *,
     id_token_ids: Dict[Category, int],
     number_token_ids: Dict[TokenType, int],
+    fids_per_category: "Optional[Dict[Category, np.ndarray]]" = None,
     func_name: str = "decoded",
     metadata: Optional[Dict[str, Any]] = None,
-) -> DecodedFunction:
-    """Decode one v2 raw-token stream into a ``DecodedFunction``.
+) -> _StagingDecoded:
+    """Decode one v2 raw-token stream into a :class:`_StagingDecoded`.
+
+    Plan reference: ``## Algorithm changes`` -- this is the entry the
+    splice walker calls per-callee (passes a section-derived
+    ``fids_per_category``); the public :func:`decode_raw_tokens` is
+    the u16-only standalone wrapper that delegates here with
+    ``fids_per_category=None``.
 
     See module docstring for the algorithm.  ``raw_tokens`` itself is
     never mutated -- a working copy is allocated internally and the
     multi-chunk promotion writes back into that copy only.
-
-    Args:
-        raw_tokens: ``uint16[N]`` v2 wire-format stream.  Real tokens
-            at id >= 256; inline-digit bytes at id < 256.  The first
-            position MUST be a real token (precondition of
-            ``run_lengths`` and of the v2 codec contract: inline data
-            never leads the stream).
-        id_token_ids: ``dict[Category, int]`` of size 8 from
-            ``resolve_category_token_ids``.  Each value is the uint16
-            vocab id of the v2 type-token whose occurrences own that
-            ``Category``'s identity space.
-        number_token_ids: ``dict[TokenType, int]`` of size 7 from
-            ``resolve_number_token_ids``.  One entry per number-
-            carrying TokenType (VALUED_CONST_V2 + 6 FLOAT* variants).
-        func_name: human-readable root function name.  Defaults to
-            ``"decoded"``; callers that have a real name should pass it.
-        metadata: optional free-form dict attached to the result.
-
-    Returns:
-        ``DecodedFunction`` with strip-and-promote ``real_tokens``, one
-        identity array per ``Category`` (length-0 if no occurrences),
-        and the shared ``(numbers_significant, numbers_sign_exponent)``
-        pair carrying ordered chunks for every number-token occurrence
-        in the final stream.
     """
     n = int(raw_tokens.shape[0])
 
+    use_fid_lookup = fids_per_category is not None
+    empty_identities: Dict[Category, np.ndarray] = {}
+    for category in Category:
+        if use_fid_lookup and category in FID_KEYED_CATEGORIES:
+            empty_identities[category] = np.empty(0, dtype=np.uint32)
+        else:
+            empty_identities[category] = np.empty(0, dtype=np.uint16)
+
     # ---- Empty stream short-circuit ----
     if n == 0:
-        return DecodedFunction(
+        return _StagingDecoded(
             real_tokens=np.empty(0, dtype=np.uint16),
-            identities={c: np.empty(0, dtype=np.uint16) for c in Category},
+            identities=empty_identities,
             numbers_significant=np.empty(0, dtype=np.uint64),
             numbers_sign_exponent=np.empty(0, dtype=np.uint32),
             func_name=func_name,
@@ -366,7 +458,12 @@ def decode_raw_tokens(
     runlen = run_lengths(inline_mask)
 
     # ---- Identity arm: pure read pass over the ORIGINAL raw_tokens ----
-    identities = _extract_identities(raw_tokens, runlen, id_token_ids)
+    identities = _extract_identities(
+        raw_tokens,
+        runlen,
+        id_token_ids,
+        fids_per_category=fids_per_category,
+    )
 
     # ---- Number arm: collect chunks per source in stream order, then
     # promote inline slots, then flatten to the side-array pair. ----
@@ -396,11 +493,72 @@ def decode_raw_tokens(
             "promotion or stream-order alignment bug"
         )
 
-    return DecodedFunction(
+    return _StagingDecoded(
         real_tokens=real_tokens,
         identities=identities,
         numbers_significant=numbers_significant,
         numbers_sign_exponent=numbers_sign_exponent,
         func_name=func_name,
         metadata=dict(metadata) if metadata else {},
+    )
+
+
+def decode_raw_tokens(
+    raw_tokens: np.ndarray,
+    *,
+    id_token_ids: Dict[Category, int],
+    number_token_ids: Dict[TokenType, int],
+    func_name: str = "decoded",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> DecodedFunction:
+    """Decode one v2 raw-token stream into a ``DecodedFunction``.
+
+    See module docstring for the algorithm.  ``raw_tokens`` itself is
+    never mutated.  This standalone entry point uses the legacy
+    "inline payload IS the identity value" decode -- the FID-resolved
+    path lives on the internal :func:`_decode_to_staging` and is
+    consumed by the splice walker, which can defer compaction to the
+    top of the spliced view.  Single-function consumers (synthetic
+    tests, ad-hoc decode of one body without a section) keep the
+    backwards-compatible u16-identity shape.
+
+    Args:
+        raw_tokens: ``uint16[N]`` v2 wire-format stream.  Real tokens
+            at id >= 256; inline-digit bytes at id < 256.  The first
+            position MUST be a real token (precondition of
+            ``run_lengths`` and of the v2 codec contract: inline data
+            never leads the stream).
+        id_token_ids: ``dict[Category, int]`` of size 8 from
+            ``resolve_category_token_ids``.  Each value is the uint16
+            vocab id of the v2 type-token whose occurrences own that
+            ``Category``'s identity space.
+        number_token_ids: ``dict[TokenType, int]`` of size 7 from
+            ``resolve_number_token_ids``.  One entry per number-
+            carrying TokenType (VALUED_CONST_V2 + 6 FLOAT* variants).
+        func_name: human-readable root function name.  Defaults to
+            ``"decoded"``; callers that have a real name should pass it.
+        metadata: optional free-form dict attached to the result.
+
+    Returns:
+        ``DecodedFunction`` with strip-and-promote ``real_tokens``, one
+        identity array per ``Category`` (length-0 if no occurrences),
+        and the shared ``(numbers_significant, numbers_sign_exponent)``
+        pair carrying ordered chunks for every number-token occurrence
+        in the final stream.
+    """
+    staging = _decode_to_staging(
+        raw_tokens,
+        id_token_ids=id_token_ids,
+        number_token_ids=number_token_ids,
+        fids_per_category=None,
+        func_name=func_name,
+        metadata=metadata,
+    )
+    return DecodedFunction(
+        real_tokens=staging.real_tokens,
+        identities=staging.identities,
+        numbers_significant=staging.numbers_significant,
+        numbers_sign_exponent=staging.numbers_sign_exponent,
+        func_name=staging.func_name,
+        metadata=staging.metadata,
     )
