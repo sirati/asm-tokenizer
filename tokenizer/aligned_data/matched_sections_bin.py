@@ -72,8 +72,22 @@ PER_CALL_ENTRY_SIZE: int = 4
 SECTION_ALIGNMENT: int = 4
 
 #: Sentinel value for ``section_variant_index`` placeholder slots; replaced
-#: with the resolved variant index at back-patch time.
+#: with the resolved variant index at back-patch time. The finalize-time
+#: sweep rejects any of these remaining — they signal a writer bug
+#: (a hole was opened but never resolved).
 UNRESOLVED_VARIANT_INDEX: int = 0xFFFF
+
+#: Sentinel value for ``section_variant_index`` when the callee section
+#: exists but does not have a variant matching the caller's vkey. This
+#: happens at corpus scale when caller and callee have different
+#: surviving-variant sets after pass-1's drop rules (encoder skip,
+#: dedup-to-same-offset). The per-call entry still records "this call
+#: existed", but the callee's variant is not directly addressable; the
+#: loader treats the slot as "no inlined callee body for this vkey".
+#: Distinct from :data:`UNRESOLVED_VARIANT_INDEX` so the finalize sweep
+#: can tell a writer bug (`0xFFFF`) from a legitimate cross-arm vkey
+#: mismatch (`0xFFFE`).
+MISSING_VARIANT_INDEX: int = 0xFFFE
 
 #: Sentinel value for ``function_section_ptr`` on extern call_targets
 #: whose provider library is unknown.
@@ -498,16 +512,16 @@ class SectionWriter:
             for slot_offset, callee_vkey in hole.per_variant_holes:
                 variant_idx = self._known_section_variants.get((fid, callee_vkey))
                 if variant_idx is None:
-                    # Caller declared a per-call entry referencing
-                    # (callee=fid, vkey=callee_vkey) but the section
-                    # never emitted that variant. Builder bug — surface
-                    # eagerly with the referencing section offset.
-                    raise ValueError(
-                        f"per-call back-patch unresolved: callee section "
-                        f"function_name_ptr={fid} did not emit a variant "
-                        f"for vkey={callee_vkey!r} (referenced from "
-                        f"section at offset {hole.section_offset})"
-                    )
+                    # Cross-arm vkey mismatch: the caller emitted a per-
+                    # call entry tagged with its own vkey, but the callee
+                    # section did not survive pass-1 in that vkey (e.g.
+                    # the variant got dedup-dropped to another variant's
+                    # offset, or the encoder skipped it). The call still
+                    # happened semantically, so we stamp
+                    # :data:`MISSING_VARIANT_INDEX` rather than fail the
+                    # build — the loader can interpret it as "no inlined
+                    # callee body available for this vkey".
+                    variant_idx = MISSING_VARIANT_INDEX
                 self._writer.patch(slot_offset, struct.pack("<H", variant_idx))
 
         # Clear per-section state.

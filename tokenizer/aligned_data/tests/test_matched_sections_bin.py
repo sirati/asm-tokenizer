@@ -32,6 +32,7 @@ import pytest
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_bin import (
     CALL_TARGET_ENTRY_SIZE,
+    MISSING_VARIANT_INDEX,
     PER_CALL_ENTRY_SIZE,
     SECTION_HEADER_SIZE,
     UNKNOWN_EXTERN_PROVIDER,
@@ -363,10 +364,13 @@ def test_finalize_asserts_on_unresolved_hole(tmp_path: Path):
         writer.finalize()
 
 
-def test_finalize_asserts_on_unresolved_per_variant_hole(tmp_path: Path):
-    """Callee section IS written but never emits the referenced vkey ⇒
-    end_section raises (the per-variant hole resolution catches it before
-    finalize even runs)."""
+def test_per_variant_hole_with_missing_callee_vkey_lands_as_missing_sentinel(tmp_path: Path):
+    """Cross-arm vkey mismatch: callee section IS written but never emits
+    the caller's vkey. The per-call slot lands on
+    :data:`MISSING_VARIANT_INDEX` (= 0xFFFE) instead of raising — the
+    legitimate corpus-scale case where caller and callee have different
+    surviving-variant sets after pass-1's drop rules. The finalize sweep
+    rejects only 0xFFFF (unresolved hole), not 0xFFFE."""
     path = tmp_path / "missing_variant.bin"
     writer = SectionWriter(path)
 
@@ -392,15 +396,21 @@ def test_finalize_asserts_on_unresolved_per_variant_hole(tmp_path: Path):
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
 
-    # Section B: only emits vkey="x86_O3" — A's per-call hole stays
-    # unresolved.
+    # Section B: only emits vkey="x86_O3" — A's per-call hole resolves
+    # to MISSING_VARIANT_INDEX rather than failing the build.
     writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
     writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     writer.end_variant(vkey="x86_O3")
-    with pytest.raises(ValueError, match="did not emit a variant"):
-        writer.end_section()
+    writer.end_section()
+    writer.finalize()
+
+    sections = list(iter_sections_bin(path))
+    a = next(s for s in sections if s.function_name_ptr == 1)
+    (called_idx, sv_idx), = a.variants[0].per_call_entries
+    assert called_idx == 0
+    assert sv_idx == MISSING_VARIANT_INDEX
 
 
 def test_called_idx_validation(tmp_path: Path):
