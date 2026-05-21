@@ -72,7 +72,8 @@ def process_matched_function(
         return None
 
     unique_called = sorted(
-        {name for rec in matched.records.values() for (name, _type) in rec.called_funcs}
+        {pair for rec in matched.records.values() for pair in rec.called_funcs},
+        key=lambda nt: (nt[0], nt[1].value),
     )
 
     version_data = []
@@ -84,7 +85,7 @@ def process_matched_function(
         version_data.append(
             {
                 "vkey": version_keys[variant_index],
-                "called": [name for (name, _type) in rec.called_funcs],
+                "called": set(rec.called_funcs),
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
@@ -98,13 +99,18 @@ def process_matched_function(
     if len(unique_offsets) == 1:
         return None
 
+    extern_libraries = _union_extern_libraries(
+        matched.records, func_name=func_name, error_log=error_log
+    )
+
     registry.add(func_name)
-    for called_name in unique_called:
+    for called_name, _type in unique_called:
         registry.add(called_name)
 
     return {
         "func_name": func_name,
         "unique_called": unique_called,
+        "extern_libraries": extern_libraries,
         "version_data": version_data,
     }
 
@@ -148,7 +154,8 @@ def process_unmatched_function(
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
-                "called": {name for (name, _type) in rec.called_funcs},
+                "called": set(rec.called_funcs),
+                "extern_libraries": dict(rec.extern_libraries),
             }
         )
         registry.add(func_name)
@@ -156,6 +163,36 @@ def process_unmatched_function(
             registry.add(called_name)
 
     return entries
+
+
+def _union_extern_libraries(
+    records: "Dict[int, ParsedRecord]",
+    *,
+    func_name: str,
+    error_log,
+) -> "dict[str, str]":
+    """Union per-variant ``extern_libraries`` dicts for one function.
+
+    Iterates variants in sorted ``variant_index`` order for determinism.
+    First writer wins on conflict: if two variants report different
+    libraries for the same EXTERN callee, log a single warning into
+    ``error_log`` (if open) and keep the first variant's value. A repeat
+    of the same library is a no-op.
+    """
+    merged: dict[str, str] = {}
+    for variant_index in sorted(records):
+        rec = records[variant_index]
+        for name, library in rec.extern_libraries.items():
+            existing = merged.get(name)
+            if existing is None:
+                merged[name] = library
+            elif existing != library:
+                if error_log is not None:
+                    error_log.write(
+                        f"WARN: function {func_name} extern library mismatch "
+                        f"across variants: {dict(rec.extern_libraries)}\n"
+                    )
+    return merged
 
 
 def _emit_record(

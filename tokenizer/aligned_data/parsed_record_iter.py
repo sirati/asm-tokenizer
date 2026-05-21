@@ -51,13 +51,20 @@ from .match import (
 
 @dataclass
 class ParsedRecord:
-    """One function row from one input CSV, fully parsed + hashed."""
+    """One function row from one input CSV, fully parsed + hashed.
+
+    ``extern_libraries`` maps EXTERN-callee names to the library string
+    reported by the disassembler. v1 rows (which never carry library
+    info) always populate an empty dict; v2 rows populate one entry per
+    ``ext_funcs`` member whose ``library`` is not ``None``.
+    """
 
     func_name: str
     insn_runlength: np.ndarray
     block_runlength: np.ndarray
     tokens: np.ndarray
     called_funcs: list[tuple[str, CallTargetType]]
+    extern_libraries: dict[str, str]
     content_hash: int
 
 
@@ -176,7 +183,7 @@ def _parse_row(
     insn_runlength = base64_to_ndarray_vec(
         row[column_index["instruction_runlength_base64"]]
     )
-    called = _extract_called_funcs(row, column_index)
+    called, extern_libraries = _extract_called_funcs(row, column_index)
     content_hash = _hash_record_body(insn_runlength, block_runlength, tokens)
     return ParsedRecord(
         func_name=func_name,
@@ -184,6 +191,7 @@ def _parse_row(
         block_runlength=block_runlength,
         tokens=tokens,
         called_funcs=called,
+        extern_libraries=extern_libraries,
         content_hash=content_hash,
     )
 
@@ -209,43 +217,56 @@ _V2_CATEGORY_TYPES: "tuple[tuple[str, CallTargetType], ...]" = (
 def _extract_called_funcs(
     row: List[str],
     column_index: "dict[str, int]",
-) -> list[tuple[str, CallTargetType]]:
-    # Schema dispatch mirrors the pre-refactor
-    # ``helpers.get_called_functions_from_row`` — v2 carries a
-    # ``metadata`` JSON column; v1 carries the Python-repr
-    # ``opaque_metadata`` column.
+) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
+    """Return ``(typed_called, extern_libraries)`` for one CSV row.
+
+    Schema dispatch mirrors the pre-refactor
+    ``helpers.get_called_functions_from_row`` — v2 carries a ``metadata``
+    JSON column; v1 carries the Python-repr ``opaque_metadata`` column.
+    The library dict is only populated by v2; v1 always returns ``{}``.
+    """
     if "metadata" in column_index:
         return _called_from_v2_metadata(row[column_index["metadata"]])
     if "opaque_metadata" in column_index:
         return _called_from_v1_opaque_metadata(row[column_index["opaque_metadata"]])
-    return []
+    return [], {}
 
 
-def _called_from_v2_metadata(metadata_cell: str) -> list[tuple[str, CallTargetType]]:
+def _called_from_v2_metadata(
+    metadata_cell: str,
+) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
     if not metadata_cell:
-        return []
+        return [], {}
     try:
         meta = json.loads(metadata_cell)
     except Exception:
-        return []
+        return [], {}
     if not isinstance(meta, dict):
-        return []
+        return [], {}
     # The same name can legitimately appear in two categories (e.g. a
     # PLT stub ``foo`` and an extern body ``foo`` from the same caller).
     # Dedup by ``(name, type)``, not by name alone.
     called: "set[tuple[str, CallTargetType]]" = set()
+    extern_libraries: dict[str, str] = {}
     for category_key, category_type in _V2_CATEGORY_TYPES:
         for entry in meta.get(category_key, ()) or ():
             if isinstance(entry, dict):
                 name = entry.get("name")
                 if isinstance(name, str):
                     called.add((name, category_type))
-    return sorted(called, key=lambda nt: (nt[0], nt[1].value))
+                    if category_type is CallTargetType.EXTERN:
+                        library = entry.get("library")
+                        if isinstance(library, str):
+                            extern_libraries[name] = library
+    return (
+        sorted(called, key=lambda nt: (nt[0], nt[1].value)),
+        extern_libraries,
+    )
 
 
 def _called_from_v1_opaque_metadata(
     opaque_metadata: str,
-) -> list[tuple[str, CallTargetType]]:
+) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
     try:
         meta = ast.literal_eval(opaque_metadata)
         called: "set[tuple[str, CallTargetType]]" = set()
@@ -255,9 +276,9 @@ def _called_from_v1_opaque_metadata(
                 type_field = entry[3]
                 if type_field == "local_function":
                     called.add((name, CallTargetType.LOCAL))
-        return sorted(called, key=lambda nt: nt[0])
+        return sorted(called, key=lambda nt: nt[0]), {}
     except Exception:
-        return []
+        return [], {}
 
 
 def _hash_record_body(

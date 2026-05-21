@@ -41,12 +41,13 @@ def test_v2_same_name_in_plt_and_ext_stays_distinct():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called = _extract_called_funcs(row, column_index)
+    called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [
         ("foo", CallTargetType.PLT),
         ("foo", CallTargetType.EXTERN),
     ]
+    assert extern_libraries == {}
 
 
 def test_v2_categories_emit_typed_tuples_per_category():
@@ -58,13 +59,14 @@ def test_v2_categories_emit_typed_tuples_per_category():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called = _extract_called_funcs(row, column_index)
+    called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [
         ("ext", CallTargetType.EXTERN),
         ("loc", CallTargetType.LOCAL),
         ("stub", CallTargetType.PLT),
     ]
+    assert extern_libraries == {}
 
 
 def test_v2_duplicate_within_same_category_deduplicates():
@@ -74,9 +76,37 @@ def test_v2_duplicate_within_same_category_deduplicates():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called = _extract_called_funcs(row, column_index)
+    called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [("loc", CallTargetType.LOCAL)]
+    assert extern_libraries == {}
+
+
+def test_v2_extern_library_threaded_through_extraction():
+    """v2 ``ext_funcs`` entries with a ``library`` populate the second
+    return value; entries without ``library`` (or ``library=None``) are
+    absent from the dict; non-EXTERN categories never appear."""
+    metadata = {
+        "local_funcs": [{"name": "loc", "library": "libignored.so"}],
+        "plt_funcs": [{"name": "stub", "library": "libplt.so"}],
+        "ext_funcs": [
+            {"name": "ext_known", "library": "libfoo.so"},
+            {"name": "ext_none", "library": None},
+            {"name": "ext_missing"},
+        ],
+    }
+    row, column_index = _row_with_v2_metadata(metadata)
+
+    called, extern_libraries = _extract_called_funcs(row, column_index)
+
+    assert called == [
+        ("ext_known", CallTargetType.EXTERN),
+        ("ext_missing", CallTargetType.EXTERN),
+        ("ext_none", CallTargetType.EXTERN),
+        ("loc", CallTargetType.LOCAL),
+        ("stub", CallTargetType.PLT),
+    ]
+    assert extern_libraries == {"ext_known": "libfoo.so"}
 
 
 def test_v1_opaque_metadata_emits_only_local_entries():
@@ -90,7 +120,7 @@ def test_v1_opaque_metadata_emits_only_local_entries():
     )
     row, column_index = _row_with_v1_opaque_metadata(opaque)
 
-    called = _extract_called_funcs(row, column_index)
+    called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [
         ("alpha", CallTargetType.LOCAL),
@@ -98,6 +128,7 @@ def test_v1_opaque_metadata_emits_only_local_entries():
     ]
     for _name, ttype in called:
         assert ttype is CallTargetType.LOCAL
+    assert extern_libraries == {}
 
 
 def test_v1_opaque_metadata_filters_non_local_entries():
@@ -111,6 +142,17 @@ def test_v1_opaque_metadata_filters_non_local_entries():
     )
     row, column_index = _row_with_v1_opaque_metadata(opaque)
 
-    called = _extract_called_funcs(row, column_index)
+    called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [("kept", CallTargetType.LOCAL)]
+    assert extern_libraries == {}
+
+
+def test_v1_opaque_metadata_always_empty_library_dict():
+    """v1 has no library info — the second return value is always {}."""
+    opaque = repr([(0, 0, "alpha", "local_function", "x")])
+    row, column_index = _row_with_v1_opaque_metadata(opaque)
+
+    _called, extern_libraries = _extract_called_funcs(row, column_index)
+
+    assert extern_libraries == {}

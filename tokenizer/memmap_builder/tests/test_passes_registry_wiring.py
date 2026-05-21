@@ -12,6 +12,7 @@ the small fixtures with no truncation).
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -41,6 +42,7 @@ def _make_record(
     *,
     n_tokens: int = 4,
     token_fill: int = 0,
+    extern_libraries: "dict[str, str] | None" = None,
 ) -> ParsedRecord:
     """One synthetic ParsedRecord that will round-trip through the encoder."""
     tokens = np.full(n_tokens, token_fill, dtype=np.uint16)
@@ -60,6 +62,7 @@ def _make_record(
         block_runlength=block_runlength,
         tokens=tokens,
         called_funcs=typed_called,
+        extern_libraries=extern_libraries or {},
         content_hash=content_hash,
     )
 
@@ -162,6 +165,116 @@ def test_unmatched_walker_handles_multi_variant_records(tmp_path):
         "beta_callee",
         "gamma_callee",
     }
+
+
+def test_matched_entry_dict_shape_matches_phase3_contract(tmp_path):
+    """Matched walker entry dict carries the typed-tuple keys Phase 3.2
+    consumes: ``unique_called`` sorted ``list[(name, type)]``, per-variant
+    ``called`` set of typed tuples, and an ``extern_libraries`` dict
+    populated from the records' library info."""
+    vkey_a = _FakeVKey("a")
+    vkey_b = _FakeVKey("b")
+    rec_a = _make_record(
+        "fn",
+        ["loc_a"],
+        token_fill=1,
+        extern_libraries={"shared_extern": "libfoo.so"},
+    )
+    rec_b = _make_record(
+        "fn",
+        ["loc_b"],
+        token_fill=2,
+        extern_libraries={"shared_extern": "libfoo.so", "only_b": "libbar.so"},
+    )
+    matched = Matched(func_name="fn", records={0: rec_a, 1: rec_b})
+
+    registry = FunctionNamesRegistry()
+    state = _make_arm_state(tmp_path, "matched_shape")
+    try:
+        entry = process_matched_function(matched, [vkey_a, vkey_b], state, registry)
+    finally:
+        state.writer.finalize()
+
+    assert entry is not None
+    assert entry["func_name"] == "fn"
+    assert entry["unique_called"] == [
+        ("loc_a", CallTargetType.LOCAL),
+        ("loc_b", CallTargetType.LOCAL),
+    ]
+    assert entry["extern_libraries"] == {
+        "shared_extern": "libfoo.so",
+        "only_b": "libbar.so",
+    }
+    by_vkey = {vd["vkey"]: vd for vd in entry["version_data"]}
+    assert by_vkey[vkey_a]["called"] == {("loc_a", CallTargetType.LOCAL)}
+    assert by_vkey[vkey_b]["called"] == {("loc_b", CallTargetType.LOCAL)}
+
+
+def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path):
+    """If two variants report different libraries for the same EXTERN
+    name, the union picks the first variant's value and writes one warn
+    line into ``error_log``."""
+    vkey_a = _FakeVKey("a")
+    vkey_b = _FakeVKey("b")
+    rec_a = _make_record(
+        "fn",
+        ["any"],
+        token_fill=1,
+        extern_libraries={"conflicting": "libfirst.so"},
+    )
+    rec_b = _make_record(
+        "fn",
+        ["any"],
+        token_fill=2,
+        extern_libraries={"conflicting": "libsecond.so"},
+    )
+    matched = Matched(func_name="fn", records={0: rec_a, 1: rec_b})
+
+    registry = FunctionNamesRegistry()
+    state = _make_arm_state(tmp_path, "matched_lib_conflict")
+    error_log = io.StringIO()
+    try:
+        entry = process_matched_function(
+            matched,
+            [vkey_a, vkey_b],
+            state,
+            registry,
+            error_log=error_log,
+        )
+    finally:
+        state.writer.finalize()
+
+    assert entry is not None
+    assert entry["extern_libraries"] == {"conflicting": "libfirst.so"}
+    log = error_log.getvalue()
+    assert "WARN:" in log
+    assert "extern library mismatch" in log
+    assert "fn" in log
+
+
+def test_unmatched_entry_dict_shape_matches_phase3_contract(tmp_path):
+    """Per-variant unmatched entries carry typed ``called`` sets and
+    a per-record ``extern_libraries`` dict (no union — single source)."""
+    vkey_a = _FakeVKey("a")
+    rec = _make_record(
+        "fn",
+        ["loc"],
+        extern_libraries={"ext_known": "libfoo.so"},
+    )
+    entries = process_unmatched_function(
+        "fn",
+        {0: rec},
+        [vkey_a],
+        _make_arm_state(tmp_path, "unmatched_shape"),
+        FunctionNamesRegistry(),
+    )
+
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["func_name"] == "fn"
+    assert e["vkey"] is vkey_a
+    assert e["called"] == {("loc", CallTargetType.LOCAL)}
+    assert e["extern_libraries"] == {"ext_known": "libfoo.so"}
 
 
 def test_matched_walker_skips_dotL_prefix(tmp_path):
