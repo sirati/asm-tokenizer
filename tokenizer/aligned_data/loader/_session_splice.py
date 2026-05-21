@@ -11,6 +11,16 @@ rather than in either :mod:`session` (which would balloon past the
 file-size cap) or :mod:`decoded.splice` (which would couple the pure
 walker to the session's I/O surface).
 
+Both the root function and every callee are fed to
+:func:`decode_raw_tokens` via
+:py:meth:`~tokenizer.aligned_data.loader.function_data.FunctionData.full_token_stream`
+rather than the body-only ``FunctionData.tokens`` slice. The wire-
+format stream that the v2 codec was designed for is the concatenated
+``variant_tokens + tokens`` view: the variant-axis prefix carries its
+own inline-digit runs which the body-only slice would amputate
+mid-metatoken, dropping the leading real-token invariant
+``decode_raw_tokens`` enforces.
+
 Exposed as a mixin :class:`_BinarySessionSpliceMixin` so the public
 :py:meth:`splice_with_callees` method stays on :class:`BinarySession`
 itself -- callers do not need to know about the split. Mixin
@@ -228,7 +238,7 @@ class _BinarySessionSpliceMixin:
             raise ValueError(f"unknown arm: {arm!r}")
 
         root_decoded = decode_raw_tokens(
-            root_fd.tokens,
+            root_fd.full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
             func_name=root_fd.func_name,
@@ -253,7 +263,7 @@ class _BinarySessionSpliceMixin:
             else:
                 fd, sec, _off = self._load_unmatched_for_splice(callee_idx)
             decoded = decode_raw_tokens(
-                fd.tokens,
+                fd.full_token_stream(),
                 id_token_ids=cat_ids,
                 number_token_ids=num_ids,
                 func_name=fd.func_name,

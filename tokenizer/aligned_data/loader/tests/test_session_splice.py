@@ -409,10 +409,13 @@ def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
     ) as sess:
         spliced = sess.splice_with_callees(0, arm="matched", max_depth=0)
         # Manually decode the first version of the only function for parity.
+        # The splicer decodes the FULL wire stream (variant axis + body)
+        # via ``FunctionData.full_token_stream`` -- mirror that here so the
+        # baseline carries the same VARIANT_AXIS prefix tokens.
         cat_ids, num_ids = sess._get_token_id_caches()
         matched = sess.load_matched(0)
         baseline = decode_raw_tokens(
-            matched.versions[0].tokens,
+            matched.versions[0].full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
             func_name=matched.func_name,
@@ -508,10 +511,11 @@ def test_splice_unmatched_arm_supported(tmp_path):
 
     with BinarySession(base, binary_name, vocab, metadata) as sess:
         spliced = sess.splice_with_callees(0, arm="unmatched", max_depth=0)
+        # Splicer decodes the FULL wire stream; baseline must do the same.
         cat_ids, num_ids = sess._get_token_id_caches()
         fd = sess.load_unmatched(0)
         baseline = decode_raw_tokens(
-            fd.tokens,
+            fd.full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
             func_name=fd.func_name,
