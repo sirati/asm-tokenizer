@@ -96,29 +96,25 @@ def extract_metadata_from_variant_block(
 ) -> Dict[str, Any]:
     """Build the per-variant metadata dict from a parsed BIN variant.
 
-    Output shape (preserved across the Phase 4 CSV→BIN cutover so
-    consumers reading the dict by key keep working):
-
     * ``variant_ref`` -- hex string (no ``0x`` prefix) of the variant
       block's ``variant_ref_offset`` u32. Matches the legacy CSV cell
       so :class:`BinarySession.get_variant_by_ref` round-trips through
       ``int(ref, 16)`` unchanged.
-    * ``inlining_data`` -- ``[[called_idx, function_section_ptr,
+    * ``call_targets`` -- ``[[called_idx, function_section_ptr,
       section_variant_index, is_matched_int]]`` derived from the
       variant's ``per_call_entries``. Per-call entry's ``called_idx``
       indexes into ``section.call_targets``; the call_target's
       ``function_section_ptr`` and ``is_matched`` flag are surfaced
       alongside the ``section_variant_index`` so consumers retain a
-      structurally-equivalent 4-tuple view. Phase 4.1 will rename this
-      key + slim the cell shape to match the new semantics.
+      structurally-equivalent 4-tuple view.
     * ``data_offset`` -- real byte offset into ``_data.bin`` (matched)
       or ``_unmatched_data.bin`` (unmatched), recovered from the
       variant's ``data_offset_shifted << 4``.
     """
-    inlining_data: List[List[int]] = []
+    call_targets: List[List[int]] = []
     for called_idx, section_variant_index in variant.per_call_entries:
         call_target = section.call_targets[called_idx]
-        inlining_data.append(
+        call_targets.append(
             [
                 called_idx,
                 call_target.function_section_ptr,
@@ -128,6 +124,6 @@ def extract_metadata_from_variant_block(
         )
     return {
         "variant_ref": f"{variant.variant_ref_offset:x}",
-        "inlining_data": inlining_data,
+        "call_targets": call_targets,
         "data_offset": variant.data_offset_shifted << 4,
     }

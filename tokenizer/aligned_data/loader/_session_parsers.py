@@ -124,10 +124,9 @@ def build_unmatched_function_data(
 ) -> FunctionData:
     """Assemble an unmatched ``FunctionData`` from its BIN section + bytes.
 
-    Output dict shape preserved across the Phase 4 cutover: callers
-    read ``variant_refs``, ``variants``, ``called``, ``inlining_data``,
-    and ``data_offset`` by key. Fields derive from ``section``'s
-    parsed call_target table + per-variant blocks:
+    Output dict carries ``variant_refs``, ``variants``, ``called``,
+    ``call_targets``, and ``data_offset``. Fields derive from
+    ``section``'s parsed call_target table + per-variant blocks:
 
     * ``variant_refs`` -- hex strings from each variant block's
       ``variant_ref_offset``.
@@ -135,11 +134,10 @@ def build_unmatched_function_data(
       (legacy datasets without ``_variants.bin`` see an empty list).
     * ``called`` -- function names recovered from each call_target's
       ``function_name_ptr`` via ``line_to_name``.
-    * ``inlining_data`` -- ``[[called_idx, function_section_ptr,
+    * ``call_targets`` -- ``[[called_idx, function_section_ptr,
       section_variant_index, is_matched_int]]`` flattened across every
-      variant's ``per_call_entries`` (Phase 4.1 will rename + slim
-      this cell). Records are self-describing in ``_data.bin`` so no
-      length / overlong flag crosses this boundary.
+      variant's ``per_call_entries``. Records are self-describing in
+      ``_data.bin`` so no length / overlong flag crosses this boundary.
     * ``data_offset`` -- the per-record offset the session passed in
       (from ``unmatched_index.bin``).
     """
@@ -152,11 +150,11 @@ def build_unmatched_function_data(
         name = line_to_name.get(ct.function_name_ptr)
         if name is not None:
             called.append(name)
-    inlining_data: List[List[int]] = []
+    call_targets: List[List[int]] = []
     for variant in section.variants:
         for called_idx, section_variant_index in variant.per_call_entries:
             ct = section.call_targets[called_idx]
-            inlining_data.append(
+            call_targets.append(
                 [
                     called_idx,
                     ct.function_section_ptr,
@@ -173,7 +171,7 @@ def build_unmatched_function_data(
         "variant_refs": variant_refs,
         "variants": variants,
         "called": called,
-        "inlining_data": inlining_data,
+        "call_targets": call_targets,
         "data_offset": start,
     }
     # Unmatched functions span multiple variants; ``FunctionData.variant_tokens``

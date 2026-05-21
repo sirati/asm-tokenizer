@@ -3,7 +3,7 @@
 Covers the basic open + slice + close + idempotent-exit flow against
 the post matched-arm restructuring wire format
 (``[variant_ref, inlining_str, indexer_hex]`` per matched variant row;
-``[line_no_b64, variant_refs, called_line_nos, inlining_data,
+``[line_no_b64, variant_refs, called_line_nos, call_targets,
 indexer_hex]`` per unmatched row). The fixture and ``_FakeArm`` /
 ``_FakeVocab`` shims live in :mod:`._session_fixture`.
 
