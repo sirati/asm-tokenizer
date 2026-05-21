@@ -82,12 +82,12 @@ def compare_matched_arm(
 
     csv_version_keys = {vdata["vkey"] for vdata in version_data_csv}
 
-    for memmap_version in matched_func.variants:
+    for memmap_variant in matched_func.variants:
         vkey = VersionKey(
-            arch=memmap_version.metadata["arch"],
-            compiler=memmap_version.metadata["compiler"],
-            compilerversion=memmap_version.metadata["compilerversion"],
-            opt=memmap_version.metadata["opt"],
+            arch=memmap_variant.metadata["arch"],
+            compiler=memmap_variant.metadata["compiler"],
+            compilerversion=memmap_variant.metadata["compilerversion"],
+            opt=memmap_variant.metadata["opt"],
         )
 
         if vkey not in csv_version_keys:
@@ -102,27 +102,27 @@ def compare_matched_arm(
         if csv_version is None:
             continue
 
-        if not np.array_equal(memmap_version.tokens, csv_version["tokens"]):
+        if not np.array_equal(memmap_variant.tokens, csv_version["tokens"]):
             mismatch_details = format_token_mismatch(
-                memmap_version.tokens, csv_version["tokens"], vocab_manager
+                memmap_variant.tokens, csv_version["tokens"], vocab_manager
             )
             error_msg = f"Tokens mismatch for {func_name} version {vkey}\n{mismatch_details}"
             stats.errors.append(error_msg)
             continue
 
-        if not np.array_equal(memmap_version.block_runlength, csv_version["block_rl"]):
+        if not np.array_equal(memmap_variant.block_runlength, csv_version["block_rl"]):
             error_msg = (
                 f"Block runlength mismatch for {func_name} version {vkey}\n"
-                f"  Memmap: {memmap_version.block_runlength}\n"
+                f"  Memmap: {memmap_variant.block_runlength}\n"
                 f"  CSV: {csv_version['block_rl']}"
             )
             stats.errors.append(error_msg)
             continue
 
-        if not np.array_equal(memmap_version.insn_runlength, csv_version["insn_rl"]):
+        if not np.array_equal(memmap_variant.insn_runlength, csv_version["insn_rl"]):
             error_msg = (
                 f"Instruction runlength mismatch for {func_name} version {vkey}\n"
-                f"  Memmap: {memmap_version.insn_runlength}\n"
+                f"  Memmap: {memmap_variant.insn_runlength}\n"
                 f"  CSV: {csv_version['insn_rl']}"
             )
             stats.errors.append(error_msg)

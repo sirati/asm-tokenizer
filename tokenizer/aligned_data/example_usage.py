@@ -21,7 +21,7 @@ KEY CONCEPTS
 Matched Functions:
   - Functions that appear in ALL compilation versions
   - Useful for cross-version analysis, compiler comparison, training translation models
-  - Each MatchedFunction contains multiple FunctionData objects (one per version)
+  - Each MatchedFunction contains multiple FunctionData objects (one per variant)
 
 Unmatched Functions:
   - Functions that appear in only some compilation versions
@@ -159,7 +159,7 @@ def example_load_matched_functions():
 
     for i, func in enumerate(functions, 1):
         print(f"\n--- Function {i}: {func.func_name} ---")
-        print(f"  Number of versions: {len(func.variants)}")
+        print(f"  Number of variants: {len(func.variants)}")
         print(f"  Average length: {len(func)} tokens")
 
         for version in func.variants:
@@ -282,7 +282,7 @@ def example_analyze_function_structure():
 
     func = functions[0]
     print(f"Analyzing function: {func.func_name}")
-    print(f"Versions: {len(func.variants)}")
+    print(f"Variants: {len(func.variants)}")
 
     for version in func.variants:
         print(f"\n  Version: {version.metadata['arch']}-{version.metadata['compiler']}-{version.metadata['opt']}")
