@@ -40,19 +40,24 @@ class _StubVariantRegistry:
     """Bare ``.ref(vkey) -> str`` / ``.byte_offset`` surface — pass 2's
     matched-arm CSV path needs the hex string for the variant_ref cell;
     the BIN path needs the integer for the variant_ref_offset slot.
-    Both derive from the same per-vkey crc32 so the values are stable
-    across runs without dragging the unified vocab encoder in.
+    Both derive from the SAME per-vkey crc32 (mod ``0xFFFFFFFF``) so
+    the hex string and the integer round-trip — a maintainer adding a
+    cross-encoding round-trip assertion won't trip on a width
+    mismatch.
     """
 
     def __init__(self) -> None:
         import zlib
         self._zlib = zlib
 
+    def _slot(self, vkey) -> int:
+        return self._zlib.crc32(repr(vkey).encode()) & 0xFFFFFFFF
+
     def ref(self, vkey) -> str:
-        return f"0x{self._zlib.crc32(repr(vkey).encode()) & 0xFFFF:x}"
+        return f"0x{self._slot(vkey):x}"
 
     def byte_offset(self, vkey) -> int:
-        return self._zlib.crc32(repr(vkey).encode()) & 0xFFFFFFFF
+        return self._slot(vkey)
 
 
 def _build_registry(*names: str) -> FunctionNamesRegistry:

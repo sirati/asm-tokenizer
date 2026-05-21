@@ -164,8 +164,8 @@ def load_unmatched_arm(
     )
     # Per-record -> per-section lookup table. Without this, the
     # session's per-record dispatch would re-parse sections from index
-    # 0 on every load_unmatched(idx) call (O(M*K) per-corpus instead
-    # of O(M)).
+    # 0 on every load_unmatched(idx) call -- O(K) per record, so
+    # O(N*K) to walk the whole corpus instead of O(N).
     record_to_section_idx = _build_record_to_section_idx(
         variant_counts, total_records=len(starts)
     )

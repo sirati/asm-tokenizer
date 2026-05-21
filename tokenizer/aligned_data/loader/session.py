@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -321,7 +321,10 @@ class BinarySession:
         The unmatched index is per-RECORD (one entry per
         ``_unmatched_data.bin`` record). The arm pre-computes
         ``record_to_section_idx[idx]`` at load time (O(M) once over
-        the BIN walk) so this dispatch is O(1) per call.
+        the BIN walk); this dispatch is O(1) for the section-idx
+        lookup plus O(log K) for the slot-base ``np.searchsorted``
+        — negligible compared to the BIN parse this dispatch then
+        triggers.
 
         Sanity-checks the section's variant at the matching slot:
         its ``data_offset_shifted << 4`` must equal ``start``. A
@@ -333,7 +336,7 @@ class BinarySession:
         section_starts = getattr(arm, "section_starts", None)
         section_offset = int(section_starts[section_idx])
         section = self._parse_section_at(section_offset)
-        slot = idx - self._unmatched_record_slot_base(arm, idx, section_idx)
+        slot = idx - self._unmatched_record_slot_base(arm, section_idx)
         variant = section.variants[slot]
         if (variant.data_offset_shifted << 4) != start:
             raise ValueError(
@@ -376,13 +379,12 @@ class BinarySession:
             )
         return int(mapping[idx])
 
-    def _unmatched_record_slot_base(
-        self, arm: Any, idx: int, section_idx: int
-    ) -> int:
+    def _unmatched_record_slot_base(self, arm: Any, section_idx: int) -> int:
         """First record index belonging to section ``section_idx``.
 
         Derived once per call from the pre-cached mapping; the slot
-        within the section is ``idx - base``. This is the same O(1)
+        within the section is ``idx - base``. ``np.searchsorted`` on
+        the contiguous-section mapping is O(log K) — the same
         derivation the legacy section-walk used to accumulate via the
         ``consumed`` counter, just sourced from the mapping instead
         of re-parsing the BIN.

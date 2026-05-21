@@ -38,31 +38,7 @@ from tokenizer.memmap_builder._pass2 import (
 )
 from tokenizer.memmap_builder.function_names import FunctionNamesRegistry
 
-
-class _StubVariants:
-    """Bare ``.ref(vkey)`` + ``.byte_offset(vkey)`` registry.
-
-    The hex string and the integer come from the same deterministic
-    per-vkey counter so the CSV cell and BIN field stay in sync. No
-    unified-vocab dependency — keeps the test focused on the BIN
-    contract.
-    """
-
-    def __init__(self) -> None:
-        self._slots: dict = {}
-        self._next = 0x10
-
-    def _ensure(self, vkey) -> int:
-        if vkey not in self._slots:
-            self._slots[vkey] = self._next
-            self._next += 0x10
-        return self._slots[vkey]
-
-    def ref(self, vkey) -> str:
-        return f"{self._ensure(vkey):x}"
-
-    def byte_offset(self, vkey) -> int:
-        return self._ensure(vkey)
+from ._fixtures import StubVariants as _StubVariants
 
 
 def _make_registry(*names: str) -> FunctionNamesRegistry:
