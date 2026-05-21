@@ -288,6 +288,29 @@ def _callee_idx(corpus: Dict[str, Any]) -> int:
     return func_names.index("callee")
 
 
+@pytest.fixture
+def splice_corpus_multi_variant(tmp_path: Path) -> Dict[str, Any]:
+    """Single matched function with five distinct-bodied variants.
+
+    Each variant carries a distinct ``token_seed``-equivalent body
+    (the BLOCK_V2-prefixed wire stream's length depends on
+    ``local_func_identities``); the per-variant ``func_name`` stays
+    ``"multi"`` so the matched arm groups them into one function with
+    five variants. No callees -- this fixture exists to exercise the
+    N-variant sampling rule (D3) without dragging callee resolution
+    into the assertion surface.
+    """
+    spec = MatchedFunctionSpec(
+        func_name="multi",
+        variants=tuple(
+            _variant_spec(("multi", i), block_count=i + 1)
+            for i in range(5)
+        ),
+        called=(),
+    )
+    return _build_splice_corpus(tmp_path, (spec,))
+
+
 # ---------------------------------------------------------------------------
 # Token-id cache
 # ---------------------------------------------------------------------------
@@ -336,12 +359,12 @@ def test_token_id_cache_populated_on_first_call_and_reused(
         assert sess._category_token_ids is None
         assert sess._number_token_ids is None
 
-        sess.splice_with_callees(0, arm="matched", max_depth=0)
+        sess.splice_with_callees(0, arm="matched", max_depth=0)[0]
         assert call_count == {"category": 1, "number": 1}
         assert sess._category_token_ids is not None
         assert sess._number_token_ids is not None
 
-        sess.splice_with_callees(0, arm="matched", max_depth=0)
+        sess.splice_with_callees(0, arm="matched", max_depth=0)[0]
         # Cache hit: no further resolver calls.
         assert call_count == {"category": 1, "number": 1}
 
@@ -353,7 +376,7 @@ def test_token_id_cache_cleared_on_exit(splice_corpus_single):
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     )
     with sess:
-        sess.splice_with_callees(0, arm="matched", max_depth=0)
+        sess.splice_with_callees(0, arm="matched", max_depth=0)[0]
         assert sess._category_token_ids is not None
     assert sess._category_token_ids is None
     assert sess._number_token_ids is None
@@ -361,7 +384,7 @@ def test_token_id_cache_cleared_on_exit(splice_corpus_single):
     # Re-enter the same instance: caches re-populate on first splice.
     with sess:
         assert sess._category_token_ids is None
-        sess.splice_with_callees(0, arm="matched", max_depth=0)
+        sess.splice_with_callees(0, arm="matched", max_depth=0)[0]
         assert sess._category_token_ids is not None
 
 
@@ -433,11 +456,11 @@ def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
     with BinarySession(
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
-        spliced = sess.splice_with_callees(0, arm="matched", max_depth=0)
+        spliced = sess.splice_with_callees(0, arm="matched", max_depth=0)[0]
         cat_ids, num_ids = sess._get_token_id_caches()
         matched = sess.load_matched(0)
         section, _section_offset, _matched = (
-            sess._load_matched_section_and_versions(0)
+            sess._load_matched_section_and_variants(0)
         )
         fids = _build_fids_per_category(section)
         staging = _decode_to_staging(
@@ -485,8 +508,8 @@ def test_splice_depth_one_unifies_shared_fid(splice_corpus_caller_callee):
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
         caller_idx = _caller_idx(fb)
-        depth0 = sess.splice_with_callees(caller_idx, arm="matched", max_depth=0)
-        depth1 = sess.splice_with_callees(caller_idx, arm="matched", max_depth=1)
+        depth0 = sess.splice_with_callees(caller_idx, arm="matched", max_depth=0)[0]
+        depth1 = sess.splice_with_callees(caller_idx, arm="matched", max_depth=1)[0]
 
     assert depth1.real_tokens.shape[0] > depth0.real_tokens.shape[0], (
         "depth=1 must grow the stream by the callee body"
@@ -556,7 +579,7 @@ def test_splice_unmatched_arm_supported(tmp_path):
     }
 
     with BinarySession(base, binary_name, vocab, metadata) as sess:
-        spliced = sess.splice_with_callees(0, arm="unmatched", max_depth=0)
+        spliced = sess.splice_with_callees(0, arm="unmatched", max_depth=0)[0]
         # Splicer decodes the FULL wire stream; baseline must do the same.
         cat_ids, num_ids = sess._get_token_id_caches()
         fd = sess.load_unmatched(0)
@@ -570,16 +593,6 @@ def test_splice_unmatched_arm_supported(tmp_path):
     assert np.array_equal(spliced.real_tokens, baseline.real_tokens)
 
 
-def test_splice_rejects_out_of_range_matched_version(splice_corpus_single):
-    """``version`` out of range for the matched arm raises ``IndexError``."""
-    fb = splice_corpus_single
-    with BinarySession(
-        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
-    ) as sess:
-        with pytest.raises(IndexError, match="variant"):
-            sess.splice_with_callees(0, arm="matched", max_depth=0, version=99)
-
-
 def test_splice_rejects_unknown_arm(splice_corpus_single):
     fb = splice_corpus_single
     with BinarySession(
@@ -587,3 +600,188 @@ def test_splice_rejects_unknown_arm(splice_corpus_single):
     ) as sess:
         with pytest.raises(ValueError, match="unknown arm"):
             sess.splice_with_callees(0, arm="bogus", max_depth=0)
+
+
+# ---------------------------------------------------------------------------
+# N-variant sampling (D2 / D3)
+# ---------------------------------------------------------------------------
+
+
+def test_splice_rejects_max_variants_zero(splice_corpus_multi_variant):
+    """``max_variants < 1`` is programmer error, raises ``ValueError``."""
+    fb = splice_corpus_multi_variant
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        with pytest.raises(ValueError, match="max_variants"):
+            sess.splice_with_callees(0, arm="matched", max_depth=0, max_variants=0)
+
+
+def test_splice_returns_list_for_single_variant(splice_corpus_multi_variant):
+    """``max_variants=1`` (default) returns a single-element list."""
+    fb = splice_corpus_multi_variant
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        result = sess.splice_with_callees(0, arm="matched", max_depth=0)
+        assert isinstance(result, list)
+        assert len(result) == 1
+
+
+def test_splice_returns_n_streams_for_max_variants_n(splice_corpus_multi_variant):
+    """``max_variants=N`` returns ``N`` streams with distinct primary bodies."""
+    fb = splice_corpus_multi_variant
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        rng = np.random.default_rng(seed=12345)
+        result = sess.splice_with_callees(
+            0, arm="matched", max_depth=0, max_variants=3, rng=rng
+        )
+        assert len(result) == 3
+        # Each variant has block_count=i+1, so its decoded real_tokens
+        # length encodes the variant index (one real-token per BLOCK_V2).
+        lengths = sorted(int(df.real_tokens.shape[0]) for df in result)
+        # All distinct (each variant has a different block_count).
+        assert len(set(lengths)) == 3
+
+
+def test_splice_max_variants_clamps_when_exceeds_total(splice_corpus_multi_variant):
+    """``max_variants > len(variants)`` clamps to ``len(variants)``.
+
+    The fixture has 5 variants; asking for 99 yields 5 (all of them).
+    No rng is needed because the all-variants branch skips sampling
+    and returns the existing index order.
+    """
+    fb = splice_corpus_multi_variant
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        result = sess.splice_with_callees(
+            0, arm="matched", max_depth=0, max_variants=99
+        )
+        assert len(result) == 5
+        # Each variant has a distinct block_count, so each real_tokens
+        # array has a distinct length spanning [1, 5].
+        lengths = sorted(int(df.real_tokens.shape[0]) for df in result)
+        assert lengths == [1, 2, 3, 4, 5]
+
+
+def test_splice_seeded_rng_is_deterministic(splice_corpus_multi_variant):
+    """Two calls with the same seed produce the same variant selection."""
+    fb = splice_corpus_multi_variant
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        rng_a = np.random.default_rng(seed=20260521)
+        rng_b = np.random.default_rng(seed=20260521)
+        result_a = sess.splice_with_callees(
+            0, arm="matched", max_depth=0, max_variants=2, rng=rng_a
+        )
+        result_b = sess.splice_with_callees(
+            0, arm="matched", max_depth=0, max_variants=2, rng=rng_b
+        )
+    lengths_a = [int(df.real_tokens.shape[0]) for df in result_a]
+    lengths_b = [int(df.real_tokens.shape[0]) for df in result_b]
+    assert lengths_a == lengths_b
+
+
+def test_splice_unseeded_rng_diverges_across_calls(splice_corpus_multi_variant):
+    """``rng=None`` constructs a fresh non-deterministic generator per call.
+
+    With 5 variants and ``max_variants=2`` there are ``C(5, 2) = 10``
+    possible selections. Running 32 trials drives the probability that
+    every pair matches the first below ``(1/10)^31 ~= 10^-31`` -- if the
+    sampler were silently deterministic, every trial would share the
+    first's signature. We accept the test passes once any divergence
+    appears.
+    """
+    fb = splice_corpus_multi_variant
+    signatures: List[tuple] = []
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        for _ in range(32):
+            result = sess.splice_with_callees(
+                0, arm="matched", max_depth=0, max_variants=2
+            )
+            sig = tuple(sorted(int(df.real_tokens.shape[0]) for df in result))
+            signatures.append(sig)
+    assert len(set(signatures)) > 1, (
+        f"unseeded rng produced identical selection across 32 trials: "
+        f"{signatures[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inlining-equivalence flag (D5)
+# ---------------------------------------------------------------------------
+#
+# The session-level integration tests below cover the flag's wiring
+# through the walker callback (D6). Rich per-variant divergence cases
+# (some variants call K, some don't) live in the walker's own unit
+# tests under ``decoded/tests/`` -- the loader corpus builder shares
+# one ``called`` set across every variant of a function, so the only
+# session-observable inlining-flag state with this corpus is the
+# "all variants call K" branch (and its negation).
+
+
+def test_splice_inlining_flag_off_matches_legacy_depth_one(
+    splice_corpus_caller_callee,
+):
+    """Flag OFF + depth=1 keeps splicing the callee body in (regression).
+
+    Identical to ``test_splice_depth_one_unifies_shared_fid`` but
+    spelled out as the flag-OFF regression cell. With the flag OFF
+    the walker uses standard cycle + present checks only -- the
+    inlining-equivalence narrowing never fires.
+    """
+    fb = splice_corpus_caller_callee
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        caller_idx = _caller_idx(fb)
+        depth1 = sess.splice_with_callees(
+            caller_idx,
+            arm="matched",
+            max_depth=1,
+            inlined_equivalent_call_targets_only=False,
+        )[0]
+        depth0 = sess.splice_with_callees(
+            caller_idx,
+            arm="matched",
+            max_depth=0,
+            inlined_equivalent_call_targets_only=False,
+        )[0]
+    assert depth1.real_tokens.shape[0] > depth0.real_tokens.shape[0]
+    assert depth1.identities[Category.LOCAL_FUNC].tolist() == [0, 1, 1]
+
+
+def test_splice_inlining_flag_on_skips_universally_called_targets(
+    splice_corpus_caller_callee,
+):
+    """Flag ON + all variants call K -> walker skips K.
+
+    The caller fixture has one variant which trivially "all variants
+    call" every call_target. Under the flag the walker must skip
+    every K -- depth=1 collapses to the same shape as depth=0.
+    """
+    fb = splice_corpus_caller_callee
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        caller_idx = _caller_idx(fb)
+        depth0 = sess.splice_with_callees(
+            caller_idx,
+            arm="matched",
+            max_depth=0,
+            inlined_equivalent_call_targets_only=True,
+        )[0]
+        depth1 = sess.splice_with_callees(
+            caller_idx,
+            arm="matched",
+            max_depth=1,
+            inlined_equivalent_call_targets_only=True,
+        )[0]
+    assert depth1.real_tokens.shape[0] == depth0.real_tokens.shape[0]
+    assert np.array_equal(depth1.real_tokens, depth0.real_tokens)
