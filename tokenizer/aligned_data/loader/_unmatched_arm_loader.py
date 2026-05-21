@@ -1,85 +1,119 @@
-"""Unmatched-arm loader.
+"""Unmatched-arm loader (BIN catalog).
 
-Single concern: assemble the unmatched ``SectionArm`` from the v1
+Single concern: assemble the unmatched ``SectionArm`` from
 ``<binary>_unmatched_index.bin`` (per-record data-bin locator, one
-entry per function -- unmatched functions have a single record) and
-the post-restructuring 5-cell unmatched sections CSV whose first cell
-is a base64 line number into the function-names sidecar.
+entry per unmatched ``_unmatched_data.bin`` record) and
+``<binary>_sections.bin`` (the BIN catalog; unmatched sections are
+emitted by ``write_unmatched_sections_pass2`` immediately after the
+matched arm's sections in encounter order).
 
-Records are self-describing in ``_data.bin`` (the record header
-carries ``token_count``), so the index entry is a bare offset and
-there is no length / sentinel / overlong shadow to carry on the
-loader side.
+Records are self-describing in ``_unmatched_data.bin`` (the record
+header carries ``token_count``), so the per-record index entry is a
+bare offset and there is no length / sentinel / overlong shadow.
+
+How the unmatched arm finds its sections in the shared BIN: the
+builder always emits matched sections first, then unmatched. The
+matched-arm locator (``matched_index.bin``) lists every matched
+section's offset + length. The byte just past the last matched
+section is the start of the unmatched region; from there the walker
+streams sections via :func:`parse_section_bin` until EOF. An empty
+matched arm starts the walk at the file-level prelude end.
 """
 
 from __future__ import annotations
 
-import csv
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.csv_format import parse_function_line_no
+from tokenizer.aligned_data.csv_section_index import (
+    read_csv_section_index_arrays,
+)
+from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
+from tokenizer.aligned_data.memmap_format import (
+    MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
+    assert_matched_sections_prelude,
+)
 
 
-def _walk_unmatched_rows(
-    paths,
+def _unmatched_region_start(
+    sections_bin: Path, matched_index: Path
+) -> int:
+    """Compute the BIN byte offset at which the unmatched region begins.
+
+    Matched sections are emitted first in encounter order; the last
+    matched section's end (``bin_offset + bin_section_length``) is the
+    first unmatched section's start. With no matched arm the walk
+    begins at the BIN's file-level prelude end.
+    """
+    if not matched_index.exists():
+        return MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+    pair = read_csv_section_index_arrays(matched_index)
+    if pair is None:
+        return MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+    bin_starts, bin_lengths = pair
+    if len(bin_starts) == 0:
+        return MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+    # ``matched_index.bin`` preserves encounter order, so the
+    # last-emitted entry holds the matched region's terminal offset.
+    last_start = int(bin_starts[-1])
+    last_length = int(bin_lengths[-1])
+    return last_start + last_length
+
+
+def _walk_unmatched_sections(
+    sections_bin: Path,
+    region_start: int,
     line_to_name: Dict[int, str],
-    open_sections_csv,
 ) -> Tuple[List[str], np.ndarray]:
-    """Walk line-by-line, recording per-row CSV byte offsets (content-
-    relative). Manual ``readline()`` (not ``csv.reader``) so ``tell()``
-    stays accurate -- ``csv.reader`` buffers ahead. Each unmatched row
-    is single-line by format. The first cell is a base64 line number
-    into the function-names sidecar; resolved via ``line_to_name`` so
-    callers see names. Hard cutover: a legacy 6-cell row raises with a
-    migration-pointing message.
+    """Parse every section in ``[region_start, EOF)`` of ``sections_bin``.
+
+    Returns ``(func_names, section_starts)`` where ``section_starts[i]``
+    is the BIN offset of the i-th unmatched section and
+    ``func_names[i]`` is its resolved function name. The walker honours
+    encounter order so the i-th entry of both arrays describes the
+    same section.
     """
     func_names: List[str] = []
-    section_offsets: List[int] = []
-    if not paths.sections_csv.exists():
+    section_starts: List[int] = []
+    if not sections_bin.exists():
         return func_names, np.zeros(0, dtype=np.int64)
-    f, content_offset = open_sections_csv(paths.sections_csv)
-    try:
-        while True:
-            row_start = f.tell() - content_offset
-            line = f.readline()
-            if not line:
-                break
-            row = list(csv.reader([line]))[0]
-            if not row:
-                continue
-            if len(row) == 6:
-                raise ValueError(
-                    f"{paths.sections_csv}: legacy 6-cell unmatched "
-                    f"row {row!r}; re-run memmap_builder to regenerate "
-                    f"at the current format (5-cell layout with "
-                    f"indexer_hex)"
-                )
-            if len(row) != 5:
-                continue
-            line_no = parse_function_line_no(row[0])
-            if line_no not in line_to_name:
-                raise ValueError(
-                    f"{paths.sections_csv}: row references line {line_no} "
-                    f"which is absent from the function-names sidecar; "
-                    f"re-run memmap_builder to regenerate"
-                )
-            func_names.append(line_to_name[line_no])
-            section_offsets.append(row_start)
-    finally:
-        f.close()
-    return func_names, np.array(section_offsets, dtype=np.int64)
+    raw = sections_bin.read_bytes()
+    assert_matched_sections_prelude(raw, path=str(sections_bin))
+    blob = memoryview(raw)
+    end = len(raw)
+    cursor = region_start
+    while cursor < end:
+        section, next_cursor = parse_section_bin(blob, cursor)
+        fid = section.function_name_ptr
+        if fid not in line_to_name:
+            raise ValueError(
+                f"{sections_bin}: section at offset {cursor} references "
+                f"function_name_ptr={fid} which is absent from the "
+                f"function-names sidecar; re-run memmap_builder to "
+                f"regenerate"
+            )
+        func_names.append(line_to_name[fid])
+        section_starts.append(cursor)
+        cursor = next_cursor
+    return func_names, np.array(section_starts, dtype=np.int64)
 
 
 def load_unmatched_arm(
     paths,
     line_to_name: Dict[int, str],
+    *,
+    matched_index: Path,
 ):
-    """Build the unmatched ``SectionArm`` from v1 index + 5-cell CSV.
+    """Build the unmatched ``SectionArm`` from BIN walk + v1 data index.
 
     Empty (no unmatched functions) -> the orchestrator's canonical
-    ``_empty_arm()``.
+    ``_empty_arm()``. ``paths.index_bin`` is the v1
+    ``<binary>_unmatched_index.bin`` (per-record data-bin offsets);
+    ``paths.sections_bin`` is the shared section catalog;
+    ``matched_index`` locates the matched region so the unmatched
+    walker knows where to start streaming sections.
     """
     # Local imports break the import cycle between the orchestrator
     # (``metadata_loader``) and this module.
@@ -89,7 +123,6 @@ def load_unmatched_arm(
         build_length_lookup_tables,
         load_index_once,
         load_unmatched_lengths,
-        open_sections_csv,
     )
 
     if not paths.index_bin.exists():
@@ -103,8 +136,9 @@ def load_unmatched_arm(
         token_counts, scale_factor=1
     )
 
-    func_names, section_starts = _walk_unmatched_rows(
-        paths, line_to_name, open_sections_csv
+    region_start = _unmatched_region_start(paths.sections_bin, matched_index)
+    func_names, section_starts = _walk_unmatched_sections(
+        paths.sections_bin, region_start, line_to_name
     )
     return SectionArm(
         starts=starts,

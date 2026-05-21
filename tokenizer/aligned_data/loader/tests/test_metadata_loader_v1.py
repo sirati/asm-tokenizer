@@ -127,6 +127,7 @@ def test_load_unmatched_lengths_reads_token_count_from_header(tmp_path):
     starts = np.array([off_a, off_b, off_c], dtype=np.int64)
     paths = BinaryArmPaths(
         sections_csv=tmp_path / "unused.csv",  # not read here
+        sections_bin=tmp_path / "unused.bin",
         index_bin=tmp_path / "unused_index.bin",
         data_bin=data_path,
     )
@@ -139,6 +140,7 @@ def test_load_unmatched_lengths_empty_starts_returns_empty(tmp_path):
     """No records -> empty int32 array; never touches the data file."""
     paths = BinaryArmPaths(
         sections_csv=tmp_path / "unused.csv",
+        sections_bin=tmp_path / "unused.bin",
         index_bin=tmp_path / "unused_index.bin",
         data_bin=tmp_path / "absent_data.bin",  # missing on purpose
     )
@@ -152,6 +154,7 @@ def test_load_unmatched_lengths_missing_data_bin_returns_empty(tmp_path):
     starts = np.array([0], dtype=np.int64)
     paths = BinaryArmPaths(
         sections_csv=tmp_path / "unused.csv",
+        sections_bin=tmp_path / "unused.bin",
         index_bin=tmp_path / "unused_index.bin",
         data_bin=tmp_path / "absent_data.bin",
     )

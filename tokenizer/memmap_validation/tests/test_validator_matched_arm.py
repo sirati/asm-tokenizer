@@ -101,11 +101,11 @@ def test_run_v1_post_checks_clean_with_variable_length_names(
     )
     dataset = _matched_dataset(corpus)
 
-    # Pin the writer's CSV-start alignment invariant. A regression
-    # here would also surface in this validator-side test, not only
-    # in the loader-side fixture invariants.
-    csv_starts = corpus.read_matched_csv_starts()
-    assert_starts_4_byte_aligned(csv_starts)
+    # Pin the writer's BIN-section-start alignment invariant. A
+    # regression here would also surface in this validator-side test,
+    # not only in the loader-side fixture invariants.
+    bin_starts = corpus.read_matched_bin_starts()
+    assert_starts_4_byte_aligned(bin_starts)
 
     errors = run_v1_post_checks(
         matched_index=corpus.matched_index_bin,

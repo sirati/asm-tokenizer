@@ -73,8 +73,8 @@ def test_allowed_reasons_set_is_exhaustive() -> None:
     """Guard against silent reason-set drift relative to the design.
 
     The self-describing record codec contributes four overflow reasons
-    (insn_len / block_word_count / token_count / offset); the pre-v1
-    ``matched_index.bin`` codec adds two more (csv_offset / csv_length).
+    (insn_len / block_word_count / token_count / offset); the
+    ``matched_index.bin`` codec adds two more (bin_offset / bin_length).
     Adding further reasons MUST be accompanied by a writer-surface
     review at the same time.
     """
@@ -84,7 +84,7 @@ def test_allowed_reasons_set_is_exhaustive() -> None:
             "block_word_count_overflow",
             "token_count_overflow",
             "offset_overflow",
-            "csv_offset_overflow",
-            "csv_length_overflow",
+            "bin_offset_overflow",
+            "bin_length_overflow",
         }
     )

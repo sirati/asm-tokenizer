@@ -98,8 +98,8 @@ class CorpusPaths:
     def unmatched_function_names(self) -> Tuple[str, ...]:
         return tuple(spec.func_name for spec in self.unmatched_specs)
 
-    def read_matched_csv_starts(self) -> np.ndarray:
-        """Read the matched_index.bin CSV starts back from disk.
+    def read_matched_bin_starts(self) -> np.ndarray:
+        """Read the matched_index.bin BIN-section starts back from disk.
 
         Returns an empty array when the index file is absent or empty
         (matches the loader's behaviour).

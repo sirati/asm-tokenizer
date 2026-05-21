@@ -55,25 +55,36 @@ class BinaryDataset:
         self.binary_name = binary_name
         self.vocab_manager = vocab_manager
 
-        # Public path attributes consumed by callers
-        # (validator: ``unmatched_sections.exists()`` etc.).
+        # Public path attributes consumed by callers. Post-Phase 4
+        # cutover the loader's hot path reads sections out of
+        # ``*_sections.bin`` (matched + unmatched share the same
+        # binary catalog); the CSV catalogs stay on disk for debug +
+        # validator cross-checks. The ``matched_sections_bin`` and
+        # ``unmatched_sections_bin`` attributes alias the shared file
+        # so each arm's consumer has a kind-tagged path attribute.
         self.matched_sections = self.base_path / f"{binary_name}_sections.csv"
+        self.matched_sections_bin = self.base_path / f"{binary_name}_sections.bin"
         self.matched_data = self.base_path / f"{binary_name}_data.bin"
         self.matched_index = self.base_path / f"{binary_name}_index.bin"
         self.unmatched_sections = self.base_path / f"{binary_name}_unmatched_sections.csv"
+        self.unmatched_sections_bin = self.matched_sections_bin
         self.unmatched_data = self.base_path / f"{binary_name}_unmatched_data.bin"
         self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
         self.variants_sidecar = self.base_path / f"{binary_name}_variants.csv"
         self.function_names_sidecar = (
             self.base_path / f"{binary_name}_function_names.txt"
         )
+        self.extern_providers = (
+            self.base_path / f"{binary_name}_extern_providers.txt"
+        )
 
         # Function-names sidecar: hard cutover. Required whenever either
-        # arm exists; both arms' section CSVs reference names through
-        # base64 line numbers into this file. A missing or bad-prelude
-        # sidecar raises ValueError with a migration-pointing message
-        # via ``load_function_names``. The all-arms-empty path skips it
-        # to keep the loader usable on a brand-new (empty) output dir.
+        # arm exists; both arms' section catalogs reference names
+        # through base64 line numbers into this file. A missing or
+        # bad-prelude sidecar raises ValueError with a migration-
+        # pointing message via ``load_function_names``. The all-arms-
+        # empty path skips it to keep the loader usable on a brand-
+        # new (empty) output dir.
         if self.matched_index.exists() or self.unmatched_index.exists():
             self.name_to_line, self.line_to_name = load_function_names(
                 self.function_names_sidecar
@@ -82,16 +93,20 @@ class BinaryDataset:
             self.name_to_line, self.line_to_name = {}, {}
 
         # Build both section arms via the shared dispatch (single
-        # implementation in ``metadata_loader``).
+        # implementation in ``metadata_loader``). The matched-arm
+        # index path is threaded into the unmatched-arm loader so its
+        # BIN walker can find the matched-region end.
         self._matched_arm: SectionArm = load_section_arm(
             SectionKind.MATCHED,
             self._arm_paths(SectionKind.MATCHED),
             self.line_to_name,
+            matched_index=self.matched_index,
         )
         self._unmatched_arm: SectionArm = load_section_arm(
             SectionKind.UNMATCHED,
             self._arm_paths(SectionKind.UNMATCHED),
             self.line_to_name,
+            matched_index=self.matched_index,
         )
         self._publish_arm("matched", self._matched_arm)
         self._publish_arm("unmatched", self._unmatched_arm)
@@ -107,17 +122,20 @@ class BinaryDataset:
     # Construction helpers
     # ------------------------------------------------------------------
     def _arm_paths(self, kind: SectionKind) -> BinaryArmPaths:
-        """Bundle the per-arm path triple. Single switch point — the rest
-        of the shell only sees ``BinaryArmPaths``.
+        """Bundle the per-arm path quad. Single switch point — the rest
+        of the shell only sees ``BinaryArmPaths``. ``sections_bin``
+        points at the shared per-binary catalog regardless of arm.
         """
         if kind is SectionKind.MATCHED:
             return BinaryArmPaths(
                 sections_csv=self.matched_sections,
+                sections_bin=self.matched_sections_bin,
                 index_bin=self.matched_index,
                 data_bin=self.matched_data,
             )
         return BinaryArmPaths(
             sections_csv=self.unmatched_sections,
+            sections_bin=self.unmatched_sections_bin,
             index_bin=self.unmatched_index,
             data_bin=self.unmatched_data,
         )
@@ -132,9 +150,11 @@ class BinaryDataset:
         per-RECORD ``_data.bin`` offset (matched = per-variant flat,
         unmatched = per-function); records are self-describing so no
         companion ``_lengths`` / ``_is_overlong`` / ``_avg_lengths``
-        array exists. The ``<prefix>_csv_starts`` / ``_csv_lengths``
-        mirror the per-function CSV-section locator for the matched
-        arm (empty on the unmatched arm where rows are single-line).
+        array exists. The ``<prefix>_bin_starts`` / ``_bin_lengths``
+        mirror the per-function BIN-section locator for the matched
+        arm (empty on the unmatched arm whose section starts live in
+        ``section_starts`` and whose lengths are recoverable by re-
+        parsing the section on demand).
         """
         setattr(self, f"{attr_prefix}_starts", arm.starts)
         setattr(self, f"{attr_prefix}_edge_indices", arm.edge_indices)
@@ -142,8 +162,8 @@ class BinaryDataset:
         setattr(self, f"{attr_prefix}_func_names", arm.func_names)
         setattr(self, f"{attr_prefix}_count", arm.count)
         setattr(self, f"{attr_prefix}_section_starts", arm.section_starts)
-        setattr(self, f"{attr_prefix}_csv_starts", arm.csv_starts)
-        setattr(self, f"{attr_prefix}_csv_lengths", arm.csv_lengths)
+        setattr(self, f"{attr_prefix}_bin_starts", arm.bin_starts)
+        setattr(self, f"{attr_prefix}_bin_lengths", arm.bin_lengths)
 
     # ------------------------------------------------------------------
     # Session API

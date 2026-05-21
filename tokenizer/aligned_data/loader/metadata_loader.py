@@ -1,22 +1,22 @@
 """Per-binary matched / unmatched metadata loading.
 
-Matched-arm specifics (pre-v1 CSV-section locator + inline-indexer-
-bearing section rows) live in :mod:`_matched_arm_loader`; unmatched-
-arm specifics (v1 data-bin locator + 5-cell per-row CSV + sidecar
-line-no resolution) live in :mod:`_unmatched_arm_loader`. Both plug
-into a closed ``SectionKind`` enum dispatch -- a third arm adds an
+Matched-arm specifics (BIN-section locator + ``sections.bin`` walk)
+live in :mod:`_matched_arm_loader`; unmatched-arm specifics (per-
+version data-bin locator + ``sections.bin`` walk + sidecar line-no
+resolution) live in :mod:`_unmatched_arm_loader`. Both plug into a
+closed ``SectionKind`` enum dispatch -- a third arm adds an
 ``_ArmSpec`` entry, never an ``elif`` cascade.
 
-Matched arm WAS / IS: ``starts`` once held per-function CSV byte
-offsets decoded via the v1 reader. Post-restructuring it holds
-per-VARIANT data-bin record positions decoded from the section-CSV
-variant rows' ``indexer_hex`` cell; per-function CSV positions move
-to ``csv_starts`` / ``csv_lengths``, loaded via the pre-v1
+Matched arm: ``starts`` holds per-VARIANT ``_data.bin`` record
+positions decoded from each section's variant blocks
+(``data_offset_shifted << 4``); per-function BIN section positions
+live in ``bin_starts`` / ``bin_lengths``, loaded via
 :func:`csv_section_index.read_csv_section_index_arrays`. Records in
 ``_data.bin`` are self-describing -- header carries the geometry --
 so the arm no longer shadows per-record lengths or overlong flags.
-Header-row base64 line numbers resolve to names through the
-``<binary>_function_names.txt`` sidecar (loaded by ``BinaryDataset``).
+Function name resolution is via the ``<binary>_function_names.txt``
+sidecar (loaded by ``BinaryDataset``) keyed on each BIN section's
+``function_name_ptr`` field.
 """
 
 from __future__ import annotations
@@ -58,15 +58,17 @@ class SectionArm:
       ``_data.bin`` -- the record header carries ``insn_len``,
       ``block_word_count`` and ``token_count`` -- so the arm no longer
       shadows per-record lengths or overlong flags.
-    * Per-FUNCTION: ``func_names``, ``csv_starts``, ``csv_lengths``,
+    * Per-FUNCTION: ``func_names``, ``bin_starts``, ``bin_lengths``,
       ``edge_indices``, ``count_per_length``, ``section_starts``,
       ``count``.
 
-    ``csv_starts`` / ``csv_lengths``: per-function CSV-section locator
-    in BYTES, content-offset-relative. Matched: from the pre-v1
-    ``<binary>_index.bin`` (``csv_section_index``); unmatched: from the
-    per-row walker (``csv_lengths`` empty -- unmatched rows are single-
-    line so length is implicit). ``section_starts`` aliases ``csv_starts``.
+    ``bin_starts`` / ``bin_lengths``: per-function locator into
+    ``<binary>_sections.bin``. Matched: from
+    ``<binary>_matched_index.bin`` (``csv_section_index``); unmatched:
+    derived by walking the BIN past the matched region
+    (``bin_lengths`` empty -- the unmatched walker only records starts,
+    section width is recoverable by re-parsing). ``section_starts``
+    aliases ``bin_starts``.
 
     ``edge_indices`` / ``count_per_length`` drive O(1) length-band
     sampling; both arms compute them from real token counts
@@ -81,10 +83,10 @@ class SectionArm:
     section_starts: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int64)
     )
-    csv_starts: np.ndarray = field(
+    bin_starts: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int64)
     )
-    csv_lengths: np.ndarray = field(
+    bin_lengths: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.uint32)
     )
 
@@ -104,9 +106,22 @@ class SectionArm:
 
 @dataclass(frozen=True)
 class BinaryArmPaths:
-    """Per-binary file paths for one arm."""
+    """Per-binary file paths for one arm.
+
+    ``sections_bin`` is the shared per-binary section catalog
+    (``<binary>_sections.bin``); both arms' :class:`BinaryArmPaths`
+    point at the same file because the bin holds matched + unmatched
+    sections back-to-back. The matched arm reads it via the per-
+    function locator in ``index_bin``; the unmatched arm walks it past
+    the matched region.
+
+    ``sections_csv`` is the debug-only text catalog kept for human
+    inspection; the loader's hot path no longer reads it post-Phase 4
+    cutover. The validator still uses it for CSV cross-checks.
+    """
 
     sections_csv: Path
+    sections_bin: Path
     index_bin: Path
     data_bin: Path
 
@@ -114,11 +129,13 @@ class BinaryArmPaths:
 @dataclass(frozen=True)
 class _ArmSpec:
     """Per-arm dispatch: one ``loader`` callable from per-arm paths +
-    sidecar ``line_to_name`` to a fully populated ``SectionArm``.
+    sidecar ``line_to_name`` + the matched-index locator (so the
+    unmatched arm's walker can find the matched-region end) to a fully
+    populated ``SectionArm``.
     """
 
     kind: SectionKind
-    loader: Callable[[BinaryArmPaths, Dict[int, str]], "SectionArm"]
+    loader: Callable[..., "SectionArm"]
 
 
 # --- Module-level helpers (formerly ``BinaryDataset._*`` methods) ----------
@@ -208,16 +225,32 @@ def load_unmatched_lengths(
 
 # --- Per-arm loader dispatch ----------------------------------------------
 # Each arm is fully owned by its own module. The dispatch is one entry
-# per arm; a third arm is one entry, not an ``elif`` cascade.
+# per arm; a third arm is one entry, not an ``elif`` cascade. The
+# unmatched arm needs to know where the matched region of
+# ``<binary>_sections.bin`` ends -- the orchestrator threads the
+# matched-arm index path through the loader so the unmatched walker
+# can start at the correct offset.
 
 
-def _load_matched(paths: BinaryArmPaths, line_to_name: Dict[int, str]) -> SectionArm:
-    return load_matched_arm(paths.sections_csv, paths.index_bin, line_to_name)
+def _load_matched(
+    paths: BinaryArmPaths,
+    line_to_name: Dict[int, str],
+    *,
+    matched_index: Path,
+) -> SectionArm:
+    # ``matched_index`` is always ``paths.index_bin`` on the matched
+    # arm; accepting it via kw keeps the dispatch signature uniform.
+    return load_matched_arm(paths.sections_bin, paths.index_bin, line_to_name)
 
 
-def _load_unmatched(paths: BinaryArmPaths, line_to_name: Dict[int, str]) -> SectionArm:
+def _load_unmatched(
+    paths: BinaryArmPaths,
+    line_to_name: Dict[int, str],
+    *,
+    matched_index: Path,
+) -> SectionArm:
     from ._unmatched_arm_loader import load_unmatched_arm
-    return load_unmatched_arm(paths, line_to_name)
+    return load_unmatched_arm(paths, line_to_name, matched_index=matched_index)
 
 
 _ARM_SPECS: dict[SectionKind, _ArmSpec] = {
@@ -236,8 +269,8 @@ def _empty_arm() -> SectionArm:
         count_per_length=np.zeros(1, dtype=np.int32),
         func_names=[],
         section_starts=np.zeros(0, dtype=np.int64),
-        csv_starts=np.zeros(0, dtype=np.int64),
-        csv_lengths=np.zeros(0, dtype=np.uint32),
+        bin_starts=np.zeros(0, dtype=np.int64),
+        bin_lengths=np.zeros(0, dtype=np.uint32),
     )
 
 
@@ -245,16 +278,37 @@ def load_section_arm(
     kind: SectionKind,
     paths: BinaryArmPaths,
     line_to_name: Optional[Dict[int, str]] = None,
+    *,
+    matched_index: Optional[Path] = None,
 ) -> SectionArm:
     """Build one ``SectionArm`` for the requested kind via the per-arm
-    loader. ``line_to_name`` resolves base64 line numbers in the
-    section CSVs back to function names; required whenever the arm
-    actually reads a section CSV (i.e. both matched and unmatched
-    when their index file exists). Pass an empty dict only for the
-    "no functions at all" path.
+    loader. ``line_to_name`` resolves each BIN section's
+    ``function_name_ptr`` to a function name; required whenever the
+    arm actually reads sections (i.e. both matched and unmatched when
+    their index file exists). Pass an empty dict only for the "no
+    functions at all" path.
+
+    ``matched_index`` is the matched-arm's locator file (which the
+    unmatched arm consults to find the matched-region end in the
+    shared ``sections.bin``). Defaults to ``paths.index_bin`` for the
+    matched arm; on the unmatched arm the caller MUST supply the
+    SIBLING matched-arm path explicitly (the unmatched arm's
+    ``paths.index_bin`` is the per-record data-bin locator, not a
+    section locator).
     """
     spec = _ARM_SPECS[kind]
-    return spec.loader(paths, line_to_name or {})
+    if matched_index is None:
+        if kind is SectionKind.MATCHED:
+            matched_index = paths.index_bin
+        else:
+            raise ValueError(
+                "load_section_arm(UNMATCHED, ...) requires the "
+                "``matched_index`` kwarg pointing at the matched-arm "
+                "locator file; the unmatched arm's paths.index_bin "
+                "is the per-record data-bin locator, not a section "
+                "locator. Pass the matched arm's ``index_bin`` here."
+            )
+    return spec.loader(paths, line_to_name or {}, matched_index=matched_index)
 
 
 def load_metadata(
@@ -263,8 +317,17 @@ def load_metadata(
     line_to_name: Optional[Dict[int, str]] = None,
 ) -> Tuple[SectionArm, SectionArm]:
     """Compose both arms for one binary; pure function on paths +
-    sidecar lookup."""
+    sidecar lookup. The matched-arm index path is threaded into the
+    unmatched-arm loader so the unmatched walker can find the matched-
+    region end in the shared ``sections.bin``.
+    """
     return (
-        load_section_arm(SectionKind.MATCHED, matched_paths, line_to_name),
-        load_section_arm(SectionKind.UNMATCHED, unmatched_paths, line_to_name),
+        load_section_arm(
+            SectionKind.MATCHED, matched_paths, line_to_name,
+            matched_index=matched_paths.index_bin,
+        ),
+        load_section_arm(
+            SectionKind.UNMATCHED, unmatched_paths, line_to_name,
+            matched_index=matched_paths.index_bin,
+        ),
     )

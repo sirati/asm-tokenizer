@@ -17,8 +17,8 @@ ALLOWED_REASONS: frozenset[str] = frozenset(
         "block_word_count_overflow",
         "token_count_overflow",
         "offset_overflow",
-        "csv_offset_overflow",
-        "csv_length_overflow",
+        "bin_offset_overflow",
+        "bin_length_overflow",
     }
 )
 

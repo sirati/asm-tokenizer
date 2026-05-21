@@ -458,13 +458,18 @@ class SectionWriter:
         self._current_variant_n_calls_slot = None
         return variant_idx
 
-    def end_section(self) -> int:
+    def end_section(self) -> tuple[int, int]:
         """Close the current section.
 
         Patches ``n_variants``, pads to a 4-byte boundary, then walks
         ``_pending_holes[current_FID]`` resolving every header slot
         and per-variant slot that referenced this section. Returns
-        the section's offset.
+        ``(section_offset, section_length)`` -- the start byte the
+        section was opened at and the trailer-aligned byte width the
+        section occupies in the bin. The length is what the per-binary
+        ``matched_index.bin`` u24 stores; both are 4-byte aligned (the
+        section trailer pad enforced above guarantees the length is a
+        multiple of :data:`SECTION_ALIGNMENT`).
         """
         self._assert_section_open()
         if self._current_variant_n_calls_slot is not None:
@@ -483,6 +488,7 @@ class SectionWriter:
 
         # Resolve back-patches whose callee == THIS section.
         section_offset = self._current_section_offset
+        section_length = self._writer.cursor - section_offset
         fid = self._current_fid
         holes = self._pending_holes.pop(fid, [])
         for hole in holes:
@@ -513,7 +519,7 @@ class SectionWriter:
         self._current_variant_n_calls_slot = None
         self._current_section_holes_by_callee = {}
 
-        return section_offset
+        return section_offset, section_length
 
     def finalize(self) -> None:
         """Close the underlying memmap; assert no holes leaked.

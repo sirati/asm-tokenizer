@@ -52,19 +52,19 @@ class _FakeArm:
         starts: np.ndarray,
         func_names: List[str] | None = None,
         section_starts: np.ndarray | None = None,
-        csv_starts: np.ndarray | None = None,
-        csv_lengths: np.ndarray | None = None,
+        bin_starts: np.ndarray | None = None,
+        bin_lengths: np.ndarray | None = None,
     ) -> None:
         self.starts = starts
         self.func_names = func_names or []
         self.section_starts = section_starts
-        # Matched arm: session.load_matched(idx) slices the section CSV
-        # via these per-function fields (per F2-A's SectionArm shape);
-        # ``starts`` carries per-variant data-bin offsets for the
-        # validator. Unmatched arm leaves these as None and reuses
+        # Matched arm: session.load_matched(idx) slices ``sections.bin``
+        # via these per-function fields (per the Phase 4 SectionArm
+        # shape); ``starts`` carries per-variant data-bin offsets for
+        # the validator. Unmatched arm leaves these as None and reuses
         # ``starts`` directly.
-        self.csv_starts = csv_starts
-        self.csv_lengths = csv_lengths
+        self.bin_starts = bin_starts
+        self.bin_lengths = bin_lengths
 
 
 class _FakeVocab:
@@ -181,10 +181,16 @@ def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
     matched_arm = _matched_arm_from_corpus(corpus)
     unmatched_arm = _unmatched_arm_from_corpus(corpus)
 
+    from tokenizer.aligned_data.loader.function_names_loader import (
+        load_function_names,
+    )
+    _, line_to_name = load_function_names(corpus.function_names_sidecar)
+
     metadata = {
         "matched_arm": matched_arm,
         "unmatched_arm": unmatched_arm,
         "offset_to_filename": {variant_offset: "tinybin-x64-gcc-13.2.0-O2"},
+        "line_to_name": line_to_name,
     }
     return {
         "base_path": base,
@@ -198,26 +204,41 @@ def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
 def _matched_arm_from_corpus(corpus) -> _FakeArm:
     pair = read_csv_section_index_arrays(corpus.matched_index_bin)
     assert pair is not None and pair[0].shape == (1,)
-    csv_starts, csv_lengths = pair
+    bin_starts, bin_lengths = pair
     # arm.starts is only read by validators / iterators (not by
-    # load_matched after the F2-A contract change); populate an empty
-    # placeholder so any inadvertent slice surfaces clearly.
+    # load_matched after the Phase 4 contract change); populate an
+    # empty placeholder so any inadvertent slice surfaces clearly.
     empty = np.zeros(0, dtype=np.int64)
     return _FakeArm(
         starts=empty,
         func_names=["my_func"],
-        csv_starts=csv_starts,
-        csv_lengths=csv_lengths,
+        bin_starts=bin_starts,
+        bin_lengths=bin_lengths,
     )
 
 
 def _unmatched_arm_from_corpus(corpus) -> _FakeArm:
     starts = read_index_arrays(corpus.unmatched_index_bin)
     assert starts is not None
+    # Unmatched section in the BIN sits right after the matched-arm
+    # region; the matched-index's last entry's end is the start of the
+    # unmatched region (single unmatched function -> single section).
+    matched_pair = read_csv_section_index_arrays(corpus.matched_index_bin)
+    assert matched_pair is not None
+    matched_starts, matched_lengths = matched_pair
+    if len(matched_starts) > 0:
+        unmatched_section_offset = int(
+            matched_starts[-1] + matched_lengths[-1]
+        )
+    else:
+        from tokenizer.aligned_data.memmap_format import (
+            MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
+        )
+        unmatched_section_offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
     return _FakeArm(
         starts=starts,
         func_names=["lonely_func"],
-        section_starts=np.array([0], dtype=np.int64),
+        section_starts=np.array([unmatched_section_offset], dtype=np.int64),
     )
 
 

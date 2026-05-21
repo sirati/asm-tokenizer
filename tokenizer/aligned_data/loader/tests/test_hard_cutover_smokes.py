@@ -4,12 +4,15 @@ clear migration message rather than silently producing wrong arrays.
 Pins the raise paths the post-restructuring loader / validator now
 own:
 
-* Legacy 4-cell matched variant row → ``_matched_arm_loader`` raises.
+* Stale / missing BIN prelude on ``<binary>_sections.bin`` →
+  ``_matched_arm_loader`` raises (the prelude assertion at the BIN
+  walker's entry point).
 * Missing ``<binary>_function_names.txt`` → ``BinaryDataset`` raises
   (the sidecar reader's ``ValueError`` is rethrown from the ctor).
 * Bad sidecar prelude → ``load_function_names`` raises.
 * Legacy 6-cell unmatched section row → validator's
-  ``build_unmatched_index_lookup`` raises.
+  ``build_unmatched_index_lookup`` raises (the validator still
+  cross-checks the CSV catalog).
 
 The raise paths exist in the production code already; these tests
 keep the migration messages from silently becoming stale.
@@ -40,6 +43,7 @@ from ._corpus import build_corpus, matched_spec, unmatched_spec
 def _matched_paths(corpus) -> BinaryArmPaths:
     return BinaryArmPaths(
         sections_csv=corpus.matched_sections_csv,
+        sections_bin=corpus.sections_bin,
         index_bin=corpus.matched_index_bin,
         data_bin=corpus.matched_data_bin,
     )
@@ -50,30 +54,21 @@ def _line_to_name(corpus):
     return line_to_name
 
 
-def test_legacy_4_cell_matched_variant_row_raises(tmp_path: Path) -> None:
-    """Rewrite a matched_sections.csv variant row to the pre-batch 4-cell
-    layout ``[variant_ref, inlining, data_offset_hex, data_len_hex]`` and
-    confirm the matched-arm walker raises with a migration message.
+def test_stale_sections_bin_prelude_raises(tmp_path: Path) -> None:
+    """Overwrite the BIN's prelude with the wrong magic and confirm the
+    matched-arm walker raises with a migration message at open time
+    rather than silently producing wrong sections.
     """
     corpus = build_corpus(tmp_path, "bin", matched=[matched_spec("zeta_fn")])
-    text = corpus.matched_sections_csv.read_text("utf-8")
-    lines = text.splitlines(keepends=True)
-    # Find the first variant row (3-cell, comma-separated). Lines[0] is
-    # the # format=1 prelude; lines[1] is the header row (2 cells). The
-    # very next non-empty line is a variant row.
-    variant_idx = next(
-        i for i, line in enumerate(lines)
-        if i >= 2 and line.strip() and line.count(",") == 2
-    )
-    cells = lines[variant_idx].rstrip("\r\n").split(",")
-    assert len(cells) == 3, f"sanity: expected 3-cell row, got {cells!r}"
-    legacy = ",".join(cells[:2] + ["deadbeef", "00000004"])
-    lines[variant_idx] = legacy + "\n"
-    corpus.matched_sections_csv.write_text("".join(lines), encoding="utf-8")
+    raw = corpus.sections_bin.read_bytes()
+    # Stamp a wrong magic in bytes 0..3; rest of the file stays intact.
+    bad = b"BAD!" + raw[4:]
+    corpus.sections_bin.write_bytes(bad)
 
-    with pytest.raises(ValueError, match="re-run memmap_builder"):
+    with pytest.raises(ValueError, match="magic"):
         load_section_arm(
-            SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus)
+            SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus),
+            matched_index=corpus.matched_index_bin,
         )
 
 

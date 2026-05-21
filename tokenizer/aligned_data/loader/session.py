@@ -2,7 +2,7 @@
 
 Single concern: own the three file handles a ``BinaryDataset`` uses
 while serving a batch of slicing operations on ONE binary
-(``_sections.csv``/``_unmatched_sections.csv``, ``_data.bin``,
+(``<binary>_sections.bin``, ``_data.bin`` / ``_unmatched_data.bin``,
 ``_variants.bin``), and guarantee deterministic close on exit.
 
 Lazy opens + a single ``contextlib.ExitStack``: handles nobody touches
@@ -12,7 +12,7 @@ the stack on ``__exit__``, even when a mid-batch slice raises.
 
 This module does NOT load metadata (``metadata_loader``), parse
 data-bin records (``aligned_data.io.parse_function_data_memmap``), or
-own the variant-ref decoder (``variant_resolver``). Row→FunctionData
+own the variant-ref decoder (``variant_resolver``). Section-parsing
 glue lives in ``_session_parsers``.
 
 **Lifetime contract (egress copy)**: every ``FunctionData`` /
@@ -28,7 +28,6 @@ which already copies ``variant_tokens`` for the same reason.
 
 from __future__ import annotations
 
-import csv
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -41,6 +40,11 @@ from ..binary_format import (
     parse_binary_header,
     record_total_size,
 )
+from ..matched_sections_bin import Section, parse_section_bin
+from ..memmap_format import (
+    MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
+    assert_matched_sections_prelude,
+)
 from ._worker_guard import assert_main_process
 from ._session_parsers import (
     arm_arrays,
@@ -49,7 +53,6 @@ from ._session_parsers import (
 )
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
-from .metadata_loader import open_sections_csv
 from .variant_resolver import get_variant_by_ref as _resolve_variant_by_ref
 
 
@@ -70,17 +73,24 @@ class BinarySession:
     Accessed attribute-first, dict-fallback. Expected keys/attrs:
 
       * ``matched_arm``        -- SectionArm: ``.starts`` (per-variant
-                                  data-bin offsets), ``.csv_starts`` /
-                                  ``.csv_lengths`` (per-function CSV
-                                  locator), ``.func_names``
-      * ``unmatched_arm``      -- SectionArm: ``.starts`` (per-function
+                                  data-bin offsets), ``.bin_starts`` /
+                                  ``.bin_lengths`` (per-function BIN
+                                  catalog locator), ``.func_names``
+      * ``unmatched_arm``      -- SectionArm: ``.starts`` (per-record
                                   data-bin offsets), ``.func_names``,
-                                  ``.section_starts``
+                                  ``.section_starts`` (per-function
+                                  BIN catalog offsets)
       * ``offset_to_filename`` -- ``dict[int, str]``
+      * ``line_to_name``       -- ``dict[int, str]`` for resolving
+                                  unmatched ``call_target`` FIDs to
+                                  function names.
 
     ``_data.bin`` records are self-describing -- their headers carry
     insn / block / token geometry -- so no companion ``lengths`` or
-    ``is_overlong`` array crosses any boundary here.
+    ``is_overlong`` array crosses any boundary here. Section parsing
+    happens against an in-memory ``memoryview`` of
+    ``<binary>_sections.bin``; the BIN's prelude is validated on first
+    open and a per-session memoryview is held until ``__exit__``.
     """
 
     def __init__(
@@ -95,9 +105,8 @@ class BinarySession:
         self._vocab_manager = vocab_manager
         self._metadata = metadata
 
-        self._sections_handle: Optional[Any] = None
-        self._sections_content_offset: int = 0
-        self._sections_kind: Optional[str] = None
+        self._sections_bin_blob: Optional[bytes] = None
+        self._sections_bin_view: Optional[memoryview] = None
         self._data_mmap: Optional[np.ndarray] = None
         self._data_kind: Optional[str] = None
         self._variants_mmap: Optional[np.ndarray] = None
@@ -121,12 +130,16 @@ class BinarySession:
         self._stack = None
         # Drop refs BEFORE stack unwinds so stray mid-unwind slice calls
         # see a torn-down session, not a half-closed handle.
-        self._sections_handle = None
-        self._sections_content_offset = 0
-        self._sections_kind = None
+        view = self._sections_bin_view
+        self._sections_bin_view = None
+        self._sections_bin_blob = None
         self._data_mmap = None
         self._data_kind = None
         self._variants_mmap = None
+        if view is not None:
+            # memoryview.release() drops the export so the underlying
+            # bytes object can be GC'd without warning.
+            view.release()
         if stack is not None:
             stack.close()
         return False
@@ -138,20 +151,22 @@ class BinarySession:
 
     def load_matched(self, idx: int) -> MatchedFunction:
         arm = self._meta_get("matched_arm")
-        csv_starts, csv_lengths = arm_arrays(arm, "matched", self._binary_name)
-        if idx >= len(csv_starts):
+        bin_starts, bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if idx >= len(bin_starts):
             raise IndexError(f"Index {idx} out of bounds for matched functions")
-        csv_start = int(csv_starts[idx])
-        csv_length = int(csv_lengths[idx])
-        sections = self._open_sections("matched")
-        sections.seek(csv_start + self._sections_content_offset)
-        section_data = sections.read(csv_length)
+        section_offset = int(bin_starts[idx])
+        section = self._parse_section_at(section_offset)
         data_mmap = self._open_data("matched")
         func_names = getattr(arm, "func_names", None) or []
-        func_name_override = func_names[idx] if idx < len(func_names) else None
+        if idx >= len(func_names):
+            raise IndexError(
+                f"matched arm func_names short of index {idx} "
+                f"(have {len(func_names)})"
+            )
+        func_name = func_names[idx]
         return parse_matched_section(
-            section_data,
-            func_name_override=func_name_override,
+            section,
+            func_name=func_name,
             data_slice=lambda o: self._slice_data_record(data_mmap, o),
             resolve_ref=self.get_variant_by_ref,
         )
@@ -164,13 +179,16 @@ class BinarySession:
         start = int(starts[idx])
         data_mmap = self._open_data("unmatched")
         insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
+        section = self._unmatched_section_for_record(arm, idx, start)
+        line_to_name = self._meta_get("line_to_name") or {}
         return build_unmatched_function_data(
-            self._read_unmatched_row(arm, idx),
+            section,
             idx,
             self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
             resolve_ref=self.get_variant_by_ref,
+            line_to_name=line_to_name,
         )
 
     def _slice_data_record(self, data_mmap, offset: int):
@@ -217,26 +235,47 @@ class BinarySession:
 
     # --- lazy openers ----------------------------------------------
 
-    def _open_sections(self, kind: str):
+    def _open_sections_bin(self) -> memoryview:
+        """Lazy-load the per-binary section catalog as a memoryview.
+
+        The BIN is small relative to ``_data.bin`` (sections carry
+        header + call_targets + per-variant blocks but no token
+        payload), so we read the whole file into memory once per
+        session rather than mmap-ing it; the memoryview keeps parser
+        slicing zero-copy. Prelude is validated on first open.
+        """
         if self._stack is None:
             raise RuntimeError("BinarySession used outside its with-block")
-        if self._sections_handle is not None:
-            if self._sections_kind != kind:
-                raise RuntimeError(
-                    f"BinarySession already opened {self._sections_kind} "
-                    f"sections; cannot switch to {kind} mid-session"
-                )
-            return self._sections_handle
-        suffix = "_sections.csv" if kind == "matched" else "_unmatched_sections.csv"
-        path = self._base_path / f"{self._binary_name}{suffix}"
-        # Prelude validation + content-offset accounting belong to
-        # ``open_sections_csv`` (single v1 ``# format=N`` consumer).
-        f, content_offset = open_sections_csv(path)
-        self._stack.callback(f.close)
-        self._sections_handle = f
-        self._sections_kind = kind
-        self._sections_content_offset = content_offset
-        return f
+        if self._sections_bin_view is not None:
+            return self._sections_bin_view
+        # ``matched_arm`` and ``unmatched_arm`` share the same BIN file;
+        # which arm's path we resolve doesn't matter, but we walk through
+        # the conventional per-binary filename for clarity.
+        path = self._base_path / f"{self._binary_name}_sections.bin"
+        raw = path.read_bytes()
+        assert_matched_sections_prelude(raw, path=str(path))
+        view = memoryview(raw)
+        # Pin the bytes so the view stays valid for the session lifetime.
+        self._sections_bin_blob = raw
+        self._sections_bin_view = view
+        return view
+
+    def _parse_section_at(self, offset: int) -> Section:
+        """Parse one BIN section at the given byte offset.
+
+        Single chokepoint: every slice call routes through here so the
+        prelude assertion fires exactly once per session and the
+        zero-copy memoryview is reused across calls.
+        """
+        if offset < MATCHED_SECTIONS_BIN_PRELUDE_SIZE:
+            raise ValueError(
+                f"section offset {offset} is inside the BIN prelude "
+                f"(<{MATCHED_SECTIONS_BIN_PRELUDE_SIZE}); the index "
+                f"file is corrupt"
+            )
+        blob = self._open_sections_bin()
+        section, _end = parse_section_bin(blob, offset)
+        return section
 
     def _open_data(self, kind: str) -> np.ndarray:
         if self._stack is None:
@@ -279,34 +318,82 @@ class BinarySession:
 
     # --- internal helpers ------------------------------------------
 
-    def _read_unmatched_row(self, arm: Any, idx: int) -> Optional[List[str]]:
-        # Row layout (5 cells): line_no_b64, variant_refs, called_b64,
-        # inlining, indexer_hex (post matched-arm restructuring).
+    def _unmatched_section_for_record(
+        self, arm: Any, idx: int, start: int
+    ) -> Section:
+        """Resolve the BIN section that owns the per-record ``start``.
+
+        The unmatched index is per-RECORD (one entry per
+        ``_unmatched_data.bin`` record). The arm's ``section_starts``
+        is per-FUNCTION (one entry per unmatched section); records map
+        to functions in encounter order. A function with N versions
+        contributes N records and one section. We find the owning
+        section by selecting the index of the section whose first
+        variant block carries this exact record offset.
+
+        Single-version corpora (the dominant case in current tests)
+        resolve in O(1) since the cardinality match holds; multi-
+        version corpora may incur an O(K) scan of the function's
+        variant offsets to find the slot.
+        """
         section_starts = getattr(arm, "section_starts", None)
-        sections_path = (
-            self._base_path / f"{self._binary_name}_unmatched_sections.csv"
-        )
-        if section_starts is None or not sections_path.exists():
-            return None
-        sections = self._open_sections("unmatched")
-        try:
-            sections.seek(
-                int(section_starts[idx]) + self._sections_content_offset
+        if section_starts is None or len(section_starts) == 0:
+            raise IndexError(
+                f"unmatched arm has no section_starts for record {idx} "
+                f"on binary {self._binary_name}"
             )
-        except (IndexError, ValueError):
-            return None
-        line = sections.readline()
-        if not line:
-            return None
-        row = next(csv.reader([line]), None)
-        return row if row and len(row) == 5 else None
+        # Walk sections in encounter order; on the first one whose
+        # variant blocks include ``start`` we win. ``idx`` is the
+        # per-record offset into ``starts``; ``starts`` is in section
+        # encounter order, so the section containing record ``idx``
+        # has cumulative variant count ≥ idx + 1. We don't have the
+        # cumulative count cached, so we scan and accumulate.
+        consumed = 0
+        for section_idx, section_offset in enumerate(section_starts):
+            section = self._parse_section_at(int(section_offset))
+            consumed_next = consumed + len(section.variants)
+            if idx < consumed_next:
+                # Sanity check: the section's variant at slot
+                # ``idx - consumed`` should have data_offset == start.
+                variant = section.variants[idx - consumed]
+                if (variant.data_offset_shifted << 4) != start:
+                    raise ValueError(
+                        f"unmatched section[{section_idx}] variant "
+                        f"[{idx - consumed}] data_offset "
+                        f"{variant.data_offset_shifted << 4} does not "
+                        f"match record offset {start} (record idx={idx})"
+                    )
+                return section
+            consumed = consumed_next
+        raise IndexError(
+            f"unmatched record idx={idx} (start={start}) does not fall "
+            f"into any section on binary {self._binary_name}"
+        )
 
     def _unmatched_func_name(self, arm: Any, idx: int) -> str:
-        # Row first cell is base64-of-line-number; ``metadata_loader``
-        # resolves via the function-names sidecar and surfaces names on
-        # ``arm.func_names`` in row order. Placeholder fallback on miss.
+        # The unmatched arm's ``func_names`` is per-FUNCTION while
+        # ``starts`` is per-RECORD; for multi-version unmatched
+        # functions ``idx`` may exceed ``len(func_names)``. We can
+        # resolve through ``section_starts``: walking sections in
+        # encounter order and counting variants gives the function
+        # index. Single-version (dominant case in tests) just falls
+        # through to ``func_names[idx]``.
         names = getattr(arm, "func_names", None) or []
-        return names[idx] if 0 <= idx < len(names) else f"unmatched_{idx}"
+        if 0 <= idx < len(names):
+            # Common path: 1:1 record:function cardinality.
+            return names[idx]
+        # Multi-version path: resolve via section walk.
+        section_starts = getattr(arm, "section_starts", None) or []
+        consumed = 0
+        for section_idx, section_offset in enumerate(section_starts):
+            section = self._parse_section_at(int(section_offset))
+            consumed_next = consumed + len(section.variants)
+            if idx < consumed_next:
+                if section_idx < len(names):
+                    return names[section_idx]
+                break
+            consumed = consumed_next
+        return f"unmatched_{idx}"
 
     def _meta_get(self, key: str) -> Any:
         if self._metadata is None:

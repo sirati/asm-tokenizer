@@ -1,34 +1,33 @@
-"""Pre-v1 layout codec for ``<binary>_matched_index.bin``.
+"""Codec for ``<binary>_matched_index.bin``: the function-to-section locator.
 
 Single concern: the on-disk byte stream that maps function index to a
-(section CSV byte offset, section CSV byte length) pair. This file is a
-*function-to-CSV-section locator* — it indexes a TEXT file
-(``<binary>_matched_sections.csv``), not the ``_data.bin`` record
-stream.
+(section offset, section length) pair into ``<binary>_sections.bin``.
+Pre-Phase-4 this file located CSV sections; post-cutover it locates
+sections in the binary catalog. The codec bytes are unchanged because
+sections in both formats are 4-byte aligned; only the referent (and the
+kwarg names) move.
 
 Layout (flat, no prelude, 8 bytes per entry, packed little-endian into
 64 bits)::
 
-    bits  0-39   u40  csv_offset_shifted          ``csv_offset >> 2``
-    bits 40-63   u24  csv_section_length_shifted  ``csv_section_length >> 2``
+    bits  0-39   u40  bin_offset_shifted          ``bin_offset >> 2``
+    bits 40-63   u24  bin_section_length_shifted  ``bin_section_length >> 2``
 
-Both fields are stored as ``>> 2`` because matched-section starts and
-lengths are written on a 4-byte boundary (the section CSV writer pads
-the gap between sections with explicit ``\\n`` bytes); shifting recovers
-two address bits per field. Real caps therefore are:
+Both fields are stored as ``>> 2`` because BIN sections are 4-byte
+aligned (the :class:`SectionWriter` pads each section trailer up to a
+4-byte boundary); shifting recovers two address bits per field. Real
+caps therefore are:
 
-* ``csv_offset``         < ``(1 << 40) << 2``  (4 TiB per CSV)
-* ``csv_section_length`` < ``(1 << 24) << 2``  (64 MiB per section)
+* ``bin_offset``         < ``(1 << 40) << 2``  (4 TiB per BIN)
+* ``bin_section_length`` < ``(1 << 24) << 2``  (64 MiB per section)
 
-Why pre-v1 (no ``IDX1`` prelude, no alignment shift in the format
-sense): the v1 wire format (see ``index_format.py``) indexes
-``_data.bin`` records that the writer 16-byte-aligns; this locator
-indexes a text file. The two layouts therefore stay in *separate*
-modules to keep each codec's single concern intact: this file owns the
-locator into the section CSV; ``index_format.py`` owns the locator into
-the v1 data binary. Per-variant pointers into the data binary are
-carried inline in the section CSV via the inline-indexer codec, not
-through this file.
+Why a separate codec from ``index_format.py``: ``index_format.py``
+indexes ``_data.bin`` records that the writer 16-byte-aligns; this
+locator indexes ``<binary>_sections.bin`` whose sections are 4-byte
+aligned. The two layouts therefore stay in *separate* modules to keep
+each codec's single concern intact: this file owns the locator into the
+section catalog; ``index_format.py`` owns the locator into the v1 data
+binary.
 """
 
 from __future__ import annotations
@@ -43,50 +42,50 @@ from tokenizer.aligned_data.binary_format import IndexEntrySkip
 
 ENTRY_SIZE: int = 8
 
-_CSV_OFFSET_BITS: int = 40
-_CSV_LENGTH_BITS: int = 24
-_CSV_ALIGN_SHIFT: int = 2
-_CSV_ALIGN: int = 1 << _CSV_ALIGN_SHIFT  # = 4
+_BIN_OFFSET_BITS: int = 40
+_BIN_LENGTH_BITS: int = 24
+_BIN_ALIGN_SHIFT: int = 2
+_BIN_ALIGN: int = 1 << _BIN_ALIGN_SHIFT  # = 4
 
 # Real-value caps (exclusive upper bound — i.e. the first value that
-# overflows). Stored fields are ``value >> _CSV_ALIGN_SHIFT``.
-MAX_CSV_OFFSET: int = (1 << _CSV_OFFSET_BITS) << _CSV_ALIGN_SHIFT
-MAX_CSV_LENGTH: int = (1 << _CSV_LENGTH_BITS) << _CSV_ALIGN_SHIFT
+# overflows). Stored fields are ``value >> _BIN_ALIGN_SHIFT``.
+MAX_BIN_OFFSET: int = (1 << _BIN_OFFSET_BITS) << _BIN_ALIGN_SHIFT
+MAX_BIN_LENGTH: int = (1 << _BIN_LENGTH_BITS) << _BIN_ALIGN_SHIFT
 
-_CSV_OFFSET_MASK: int = (1 << _CSV_OFFSET_BITS) - 1
-_CSV_LENGTH_MASK: int = (1 << _CSV_LENGTH_BITS) - 1
+_BIN_OFFSET_MASK: int = (1 << _BIN_OFFSET_BITS) - 1
+_BIN_LENGTH_MASK: int = (1 << _BIN_LENGTH_BITS) - 1
 
 
-def pack_csv_section_index_entry(csv_offset: int, csv_section_length: int) -> bytes:
+def pack_csv_section_index_entry(bin_offset: int, bin_section_length: int) -> bytes:
     """Pack one 8-byte entry.
 
     Both values must be 4-byte aligned (asserted). Raises
-    :class:`IndexEntrySkip` with ``csv_offset_overflow`` /
-    ``csv_length_overflow`` when the real value reaches its cap
+    :class:`IndexEntrySkip` with ``bin_offset_overflow`` /
+    ``bin_length_overflow`` when the real value reaches its cap
     (``(1 << 40) << 2`` for offset, ``(1 << 24) << 2`` for length).
     Returns exactly :data:`ENTRY_SIZE` bytes, little-endian.
     """
-    assert csv_offset % _CSV_ALIGN == 0, (
-        f"csv_offset must be {_CSV_ALIGN}-byte aligned, got {csv_offset}"
+    assert bin_offset % _BIN_ALIGN == 0, (
+        f"bin_offset must be {_BIN_ALIGN}-byte aligned, got {bin_offset}"
     )
-    assert csv_section_length % _CSV_ALIGN == 0, (
-        f"csv_section_length must be {_CSV_ALIGN}-byte aligned, "
-        f"got {csv_section_length}"
+    assert bin_section_length % _BIN_ALIGN == 0, (
+        f"bin_section_length must be {_BIN_ALIGN}-byte aligned, "
+        f"got {bin_section_length}"
     )
-    if csv_offset >= MAX_CSV_OFFSET:
-        raise IndexEntrySkip("csv_offset_overflow", csv_offset)
-    if csv_section_length >= MAX_CSV_LENGTH:
-        raise IndexEntrySkip("csv_length_overflow", csv_section_length)
-    stored_offset = csv_offset >> _CSV_ALIGN_SHIFT
-    stored_length = csv_section_length >> _CSV_ALIGN_SHIFT
-    packed = stored_offset | (stored_length << _CSV_OFFSET_BITS)
+    if bin_offset >= MAX_BIN_OFFSET:
+        raise IndexEntrySkip("bin_offset_overflow", bin_offset)
+    if bin_section_length >= MAX_BIN_LENGTH:
+        raise IndexEntrySkip("bin_length_overflow", bin_section_length)
+    stored_offset = bin_offset >> _BIN_ALIGN_SHIFT
+    stored_length = bin_section_length >> _BIN_ALIGN_SHIFT
+    packed = stored_offset | (stored_length << _BIN_OFFSET_BITS)
     return struct.pack("<Q", packed)
 
 
 def unpack_csv_section_index_entry(entry_bytes: bytes) -> Tuple[int, int]:
     """Inverse of :func:`pack_csv_section_index_entry`.
 
-    Returns ``(csv_offset, csv_section_length)`` as real (post-shift)
+    Returns ``(bin_offset, bin_section_length)`` as real (post-shift)
     integers. Input must be exactly :data:`ENTRY_SIZE` bytes.
     """
     if len(entry_bytes) != ENTRY_SIZE:
@@ -94,15 +93,15 @@ def unpack_csv_section_index_entry(entry_bytes: bytes) -> Tuple[int, int]:
             f"entry_bytes must be {ENTRY_SIZE} bytes, got {len(entry_bytes)}"
         )
     (packed,) = struct.unpack("<Q", entry_bytes)
-    stored_offset = packed & _CSV_OFFSET_MASK
-    stored_length = (packed >> _CSV_OFFSET_BITS) & _CSV_LENGTH_MASK
-    return (stored_offset << _CSV_ALIGN_SHIFT, stored_length << _CSV_ALIGN_SHIFT)
+    stored_offset = packed & _BIN_OFFSET_MASK
+    stored_length = (packed >> _BIN_OFFSET_BITS) & _BIN_LENGTH_MASK
+    return (stored_offset << _BIN_ALIGN_SHIFT, stored_length << _BIN_ALIGN_SHIFT)
 
 
 def write_csv_section_index_entry(
     file_handle,
-    csv_offset: int,
-    csv_section_length: int,
+    bin_offset: int,
+    bin_section_length: int,
     *,
     func_name: str = "",
     error_log: Optional[TextIO] = None,
@@ -115,7 +114,7 @@ def write_csv_section_index_entry(
     appends exactly :data:`ENTRY_SIZE` bytes.
     """
     try:
-        entry_bytes = pack_csv_section_index_entry(csv_offset, csv_section_length)
+        entry_bytes = pack_csv_section_index_entry(bin_offset, bin_section_length)
     except IndexEntrySkip as exc:
         if error_log is None:
             raise
@@ -155,10 +154,11 @@ def read_csv_section_index_arrays(
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """Load ``matched_index.bin`` into column ndarrays.
 
-    Returns ``(csv_starts, csv_lengths)`` with dtypes ``int64`` (real
-    byte offsets) and ``uint32`` (real byte lengths). Returns ``None``
-    if the file does not exist. Raises :class:`ValueError` on stride
-    mismatch (see :func:`_read_entries_uint64`).
+    Returns ``(bin_starts, bin_lengths)`` with dtypes ``int64`` (real
+    byte offsets into ``<binary>_sections.bin``) and ``uint32`` (real
+    byte lengths). Returns ``None`` if the file does not exist. Raises
+    :class:`ValueError` on stride mismatch (see
+    :func:`_read_entries_uint64`).
     """
     raw = _read_entries_uint64(path)
     if raw is None:
@@ -174,13 +174,13 @@ def read_csv_section_index_arrays(
         # bits → stored length. Multiply back by the alignment factor
         # to recover real byte positions / lengths.
         packed = np.asarray(raw, dtype=np.uint64)
-        stored_offsets = (packed & np.uint64(_CSV_OFFSET_MASK)).astype(np.int64)
+        stored_offsets = (packed & np.uint64(_BIN_OFFSET_MASK)).astype(np.int64)
         stored_lengths = (
-            (packed >> np.uint64(_CSV_OFFSET_BITS)) & np.uint64(_CSV_LENGTH_MASK)
+            (packed >> np.uint64(_BIN_OFFSET_BITS)) & np.uint64(_BIN_LENGTH_MASK)
         ).astype(np.uint32)
-        csv_starts = stored_offsets << _CSV_ALIGN_SHIFT
-        csv_lengths = stored_lengths << np.uint32(_CSV_ALIGN_SHIFT)
-        return csv_starts, csv_lengths
+        bin_starts = stored_offsets << _BIN_ALIGN_SHIFT
+        bin_lengths = stored_lengths << np.uint32(_BIN_ALIGN_SHIFT)
+        return bin_starts, bin_lengths
     finally:
         if isinstance(raw, np.memmap):
             del raw
@@ -189,7 +189,7 @@ def read_csv_section_index_arrays(
 def iter_csv_section_index_entries(
     path: Path,
 ) -> Iterator[Tuple[int, int]]:
-    """Yield ``(csv_offset, csv_section_length)`` per entry in file order."""
+    """Yield ``(bin_offset, bin_section_length)`` per entry in file order."""
     with open(path, "rb") as fh:
         while True:
             raw = fh.read(ENTRY_SIZE)

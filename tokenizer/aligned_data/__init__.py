@@ -35,8 +35,8 @@ from .match import (
     open_csv_skip_vocab,
 )
 from .metadata import (
-    extract_all_metadata_from_section_rows,
-    extract_metadata_from_section_row,
+    extract_metadata_from_variant_block,
+    parse_inlining_data,
 )
 from .parsed_record_iter import (
     Matched,
@@ -80,8 +80,8 @@ __all__ = [
     "open_parsed_record_iter",
     "lockstep_records",
     # metadata
-    "extract_metadata_from_section_row",
-    "extract_all_metadata_from_section_rows",
+    "extract_metadata_from_variant_block",
+    "parse_inlining_data",
     # sections
     "read_function_section",
 ]

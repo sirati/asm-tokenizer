@@ -16,12 +16,11 @@ Layout responsibilities:
   record). No per-variant entry in any index file. Record geometry is
   recovered from the self-describing record header, so the inline
   encoding no longer carries a length.
-* ``matched_index.bin`` is the function-to-CSV-section locator
-  (u40 ``csv_offset >> 2`` + u24 ``csv_section_length >> 2``, 8 bytes).
-  Both quantities are 4-byte aligned: after every section's blank-row
-  terminator the writer pads with raw ``\\n`` bytes until the next
-  section start lands on a 4-byte boundary AND ≥ 1 fully empty line of
-  separation is guaranteed.
+* ``matched_index.bin`` is the function-to-section locator into
+  ``<binary>_sections.bin`` (u40 ``bin_offset >> 2`` + u24
+  ``bin_section_length >> 2``, 8 bytes). Sections are 4-byte aligned
+  in the BIN (the :class:`SectionWriter` pads each section trailer);
+  the same packing works for both CSV and BIN offsets.
 * ``unmatched_index.bin`` is one entry per version's data-bin record
   (16-byte aligned offsets, 4-byte entries) and continues using
   ``write_index_entry``.
@@ -321,12 +320,12 @@ def write_matched_sections_pass2(
     """
     content_offset = sections_file.tell()
     writer = csv.writer(sections_file, lineterminator=_SECTION_LINE_TERMINATOR)
-    # (func_name, section_start, section_len) per function in encounter
-    # order. The previous avg-len-bucket sort fed
-    # ``select_random_function_by_length`` (now a NotImplementedError
-    # stub), so the index no longer carries an avg_len column and the
-    # writer no longer reorders entries: readers do not depend on entry
-    # order matching CSV row order.
+    # (func_name, bin_offset, bin_section_length) per function in
+    # encounter order. The index now locates BIN sections (Phase 4
+    # cutover); the CSV is kept on disk as the debug-only catalog. The
+    # previous avg-len-bucket sort fed ``select_random_function_by_length``
+    # (now a NotImplementedError stub), so the index no longer carries
+    # an avg_len column and the writer no longer reorders entries.
     pending_index_entries: List = []
 
     for entry in matched_data_entries:
@@ -343,7 +342,6 @@ def write_matched_sections_pass2(
             name: idx for idx, name in enumerate(called_names_unique)
         }
 
-        section_start = sections_file.tell() - content_offset
         line_no_b64 = format_function_line_no(registry.line_no(func_name))
         called_line_nos_b64 = format_function_line_nos_csv(
             [registry.line_no(name) for name in called_names_unique]
@@ -403,18 +401,17 @@ def write_matched_sections_pass2(
             section_writer.end_variant(vkey=vkey)
 
         writer.writerow([])
-        section_end = _pad_section_to_alignment(sections_file, content_offset)
+        _pad_section_to_alignment(sections_file, content_offset)
+        bin_offset, bin_section_length = section_writer.end_section()
         pending_index_entries.append(
-            (func_name, section_start, section_end - section_start)
+            (func_name, bin_offset, bin_section_length)
         )
 
-        section_writer.end_section()
-
-    for func_name, section_start, section_len in pending_index_entries:
+    for func_name, bin_offset, bin_section_length in pending_index_entries:
         write_csv_section_index_entry(
             index_file,
-            csv_offset=section_start,
-            csv_section_length=section_len,
+            bin_offset=bin_offset,
+            bin_section_length=bin_section_length,
             func_name=func_name,
             error_log=error_log,
         )

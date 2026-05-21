@@ -1,34 +1,31 @@
-"""Matched-arm loader.
+"""Matched-arm loader (BIN catalog).
 
-Single concern: assemble the matched ``SectionArm`` from the pre-v1
-``matched_index.bin`` (function-to-CSV-section locator) and the v1
-sections CSV whose variant rows carry inline indexer hex (per-variant
-data-bin offsets).
+Single concern: assemble the matched ``SectionArm`` from
+``<binary>_matched_index.bin`` (function-to-BIN-section locator) and
+``<binary>_sections.bin`` (the BIN catalog parsed by
+:mod:`tokenizer.aligned_data.matched_sections_bin`).
 
 Layout split that makes this module possible:
 
-* ``<binary>_index.bin`` (matched arm) -- pre-v1 8-byte layout, no
-  prelude. Each entry locates ONE function's section in the text CSV
-  as ``(csv_offset, csv_section_length)`` (u40 + u24, both
-  4-byte-aligned). Decoded via
-  :func:`tokenizer.aligned_data.csv_section_index.read_csv_section_index_arrays`.
-* ``<binary>_sections.csv`` -- function sections separated by blank
-  rows. Header row first cell is the base64 line number into
-  ``<binary>_function_names.txt``; subsequent rows (until blank) are
-  3-cell variant rows ``[variant_ref, inlining_str, indexer_hex]``
-  whose ``indexer_hex`` (8 hex chars = one u32 ``offset >> 4``)
-  decodes to a single ``data_offset`` into ``<binary>_data.bin``. The
-  record at that offset is self-describing -- its header carries every
-  geometry field a reader needs -- so no length or overlong flag rides
-  alongside the offset.
+* ``<binary>_matched_index.bin`` -- packed u40/u24 layout, no prelude.
+  Each entry locates ONE function's section in ``sections.bin`` as
+  ``(bin_offset, bin_section_length)`` (both 4-byte-aligned). Decoded
+  via :func:`tokenizer.aligned_data.csv_section_index.read_csv_section_index_arrays`.
+* ``<binary>_sections.bin`` -- 16-byte ``MSEC`` prelude + a stream of
+  4-byte-aligned section records. Each section header carries the
+  function's line number (FID), the call_target table, and N
+  variant blocks. The reader-side codec is
+  :func:`tokenizer.aligned_data.matched_sections_bin.parse_section_bin`.
 
-The previous matched-arm shape carried CSV byte positions in
-``starts`` / ``lengths``. Post-restructuring those arrays hold
-**data-bin positions per VARIANT** (one entry per
-``write_function_binary_data`` call pass 1 emitted); the per-function
-CSV-section locator moves to dedicated ``csv_starts`` / ``csv_lengths``
-fields. ``func_names`` is per-function, resolved from the sidecar's
-``line_to_name`` dict.
+The arm's per-function arrays come from walking each matched section's
+BIN payload:
+
+* ``func_names`` -- resolved from ``section.function_name_ptr`` via
+  ``line_to_name``.
+* ``starts`` -- flat per-VARIANT array of real ``_data.bin`` offsets,
+  recovered from each variant block's ``data_offset_shifted << 4``.
+* ``bin_starts`` / ``bin_lengths`` -- per-function locator into
+  ``sections.bin`` (same arrays the matched_index.bin codec returns).
 
 ``select_random_function_by_length`` is a NotImplementedError stub for
 the matched arm, so the length-band lookup tables collapse to empty
@@ -38,135 +35,102 @@ them.
 
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.csv_format import parse_function_line_no
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
-from tokenizer.aligned_data.inline_indexer import decode_inline_indexer
+from tokenizer.aligned_data.matched_sections_bin import (
+    Section,
+    iter_sections_bin,
+    parse_section_bin,
+)
+from tokenizer.aligned_data.memmap_format import (
+    MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
+    assert_matched_sections_prelude,
+)
 
 
-def _slice_section_rows(
-    sections_csv: Path,
-    csv_starts: np.ndarray,
-    csv_lengths: np.ndarray,
-    line_to_name: Dict[int, str],
-) -> Tuple[List[str], List[List[int]]]:
-    """Per-function: slice the CSV section bytes, decode the header line
-    number to a function name, decode each variant row's ``indexer_hex``.
+def _read_sections_bin_blob(sections_bin: Path) -> bytes:
+    """Read the whole BIN once + validate its prelude.
 
-    Returns ``(func_names, per_function_variant_offsets)`` where the
-    inner list is ``[data_offset]`` for every variant of that function
-    (one int per ``write_function_binary_data`` call pass 1 emitted).
-    The CSV is opened ONCE via :func:`metadata_loader.open_sections_csv`
-    so the v1 prelude check fires exactly once.
+    Returned as ``bytes`` (not a memmap) because the loader walks the
+    file once at construction time to derive the per-function arms and
+    does not hold the file open afterwards. Slicing happens off a
+    :class:`memoryview` so the parse cost stays zero-copy.
     """
-    from .metadata_loader import open_sections_csv
+    raw = sections_bin.read_bytes()
+    assert_matched_sections_prelude(raw, path=str(sections_bin))
+    return raw
 
+
+def _walk_matched_sections(
+    sections_bin: Path,
+    bin_starts: np.ndarray,
+    line_to_name: Dict[int, str],
+) -> Tuple[List[str], List[Section]]:
+    """Per-function: parse the BIN section at each ``bin_starts[i]``.
+
+    Returns ``(func_names, sections)`` where ``sections[i]`` is the
+    parsed :class:`Section` for ``bin_starts[i]`` and ``func_names[i]``
+    is its resolved function name. The matched_index.bin walks the BIN
+    in encounter order -- this function preserves that order.
+    """
     func_names: List[str] = []
-    per_function: List[List[int]] = []
-    if not sections_csv.exists() or len(csv_starts) == 0:
-        return func_names, per_function
-
-    f, content_offset = open_sections_csv(sections_csv)
-    try:
-        for i in range(len(csv_starts)):
-            f.seek(int(csv_starts[i]) + content_offset)
-            blob = f.read(int(csv_lengths[i]))
-            func_name, variant_offsets = _parse_section_blob(
-                blob, line_to_name, sections_csv
+    sections: List[Section] = []
+    if not sections_bin.exists() or len(bin_starts) == 0:
+        return func_names, sections
+    raw = _read_sections_bin_blob(sections_bin)
+    blob = memoryview(raw)
+    for i in range(len(bin_starts)):
+        section, _end = parse_section_bin(blob, int(bin_starts[i]))
+        fid = section.function_name_ptr
+        if fid not in line_to_name:
+            raise ValueError(
+                f"{sections_bin}: section at offset {int(bin_starts[i])} "
+                f"references function_name_ptr={fid} which is absent from "
+                f"the function-names sidecar; re-run memmap_builder to "
+                f"regenerate"
             )
-            func_names.append(func_name)
-            per_function.append(variant_offsets)
-    finally:
-        f.close()
-    return func_names, per_function
+        func_names.append(line_to_name[fid])
+        sections.append(section)
+    return func_names, sections
 
 
-def _parse_section_blob(
-    blob: str,
-    line_to_name: Dict[int, str],
-    sections_csv: Path,
-) -> Tuple[str, List[int]]:
-    """Decode one CSV section blob.
+def _flat_variant_starts(sections: List[Section]) -> np.ndarray:
+    """Flatten per-section variant ``data_offset`` lists into one array.
 
-    Header row: ``[base64_line_no, base64_called_funcs_csv]`` -> name
-    via :func:`parse_function_line_no` + ``line_to_name``.
-
-    Variant rows: ``[variant_ref, inlining_str, indexer_hex]``
-    (3 cells). Each ``indexer_hex`` is 8 hex chars and decodes to one
-    ``data_offset`` (the record at that offset is self-describing).
-    Iteration stops at the first empty row (the trailing blank
-    separator that the writer emits) or at EOF. Any 4-cell legacy row
-    raises with a migration-pointing message; the legacy 16-hex-char
-    inline indexer is caught one layer down by
-    :func:`decode_inline_indexer` -- both are hard cutovers.
+    Each variant block's ``data_offset_shifted`` is the ``>> 4`` of the
+    real ``_data.bin`` offset (16-byte record alignment). Recovering
+    the real offsets here keeps the arm's ``starts`` semantics in
+    lockstep with ``unmatched_index.bin``-derived offsets (both are
+    real, post-shift byte positions).
     """
-    reader = csv.reader(blob.splitlines())
-    rows = list(reader)
-    if not rows:
-        raise ValueError(
-            f"{sections_csv}: empty section blob; re-run memmap_builder "
-            f"to regenerate"
-        )
-    header = rows[0]
-    if not header or not header[0]:
-        raise ValueError(
-            f"{sections_csv}: section header missing base64 line number; "
-            f"re-run memmap_builder to regenerate"
-        )
-    line_no = parse_function_line_no(header[0])
-    if line_no not in line_to_name:
-        raise ValueError(
-            f"{sections_csv}: header references line {line_no} which is "
-            f"absent from the function-names sidecar; re-run memmap_builder "
-            f"to regenerate"
-        )
-    func_name = line_to_name[line_no]
-
-    variant_offsets: List[int] = []
-    for row in rows[1:]:
-        if not row:
-            # Blank row = end-of-section separator.
-            break
-        if len(row) == 4:
-            raise ValueError(
-                f"{sections_csv}: legacy 4-cell variant row "
-                f"{row!r} detected (expected 3 cells "
-                f"[variant_ref, inlining_str, indexer_hex]); re-run "
-                f"memmap_builder to regenerate at the current format"
-            )
-        if len(row) != 3:
-            raise ValueError(
-                f"{sections_csv}: variant row has {len(row)} cells "
-                f"(expected 3); row={row!r}"
-            )
-        indexer_hex = row[2]
-        variant_offsets.append(decode_inline_indexer(indexer_hex))
-    return func_name, variant_offsets
+    flat_offsets: List[int] = [
+        variant.data_offset_shifted << 4
+        for section in sections
+        for variant in section.variants
+    ]
+    return np.array(flat_offsets, dtype=np.int64)
 
 
 def load_matched_arm(
-    sections_csv: Path,
+    sections_bin: Path,
     matched_index: Path,
     line_to_name: Dict[int, str],
 ):
-    """Build the matched ``SectionArm`` from the pre-v1 matched_index +
-    inline-indexer-bearing sections CSV.
+    """Build the matched ``SectionArm`` from ``matched_index.bin`` + BIN catalog.
 
     Empty (no matched functions) -> the orchestrator's canonical
-    ``_empty_arm()``. The matched_index is the function-to-CSV-section
-    locator; its entries point at TEXT-file byte positions and obey
-    the section CSV's 4-byte alignment rule -- they are not subject to
-    the ``_data.bin`` 16-byte alignment. The per-variant data-bin
-    positions ARE 16-byte-aligned (decoded from the 8-hex-char inline
-    indexer in each variant row) and produce the per-record
-    ``starts`` array.
+    ``_empty_arm()``. The matched_index is the function-to-section
+    locator into ``sections.bin``; its entries are 4-byte aligned (the
+    :class:`SectionWriter` pads each section trailer up to the next
+    4-byte boundary). Per-variant data-bin positions are 16-byte
+    aligned and recovered from each variant block's
+    ``data_offset_shifted`` field.
     """
     # Local import to break the import cycle between this module and
     # the orchestrator (``metadata_loader`` imports ``load_matched_arm``).
@@ -178,21 +142,18 @@ def load_matched_arm(
     section_index = read_csv_section_index_arrays(matched_index)
     if section_index is None:
         return _empty_arm()
-    csv_starts, csv_lengths = section_index
+    bin_starts, bin_lengths = section_index
 
-    func_names, per_function = _slice_section_rows(
-        sections_csv, csv_starts, csv_lengths, line_to_name
+    func_names, sections = _walk_matched_sections(
+        sections_bin, bin_starts, line_to_name
     )
 
     # Flatten variants into per-record offsets. ``func_names`` stays
     # per-function (one entry per matched section); ``starts`` is
-    # per-variant (one entry per ``write_function_binary_data`` call
-    # pass 1 made). No length or overlong flag -- the record at each
-    # offset is self-describing.
-    flat_starts: List[int] = [
-        offset for offsets in per_function for offset in offsets
-    ]
-    starts = np.array(flat_starts, dtype=np.int64)
+    # per-variant (one entry per variant block in encounter order).
+    # No length or overlong flag -- the record at each offset is
+    # self-describing.
+    starts = _flat_variant_starts(sections)
 
     # ``select_random_function_by_length`` is a NotImplementedError
     # stub for the matched arm, so the length-band lookup tables have
@@ -206,7 +167,34 @@ def load_matched_arm(
         edge_indices=edge_indices,
         count_per_length=count_per_length,
         func_names=func_names,
-        section_starts=csv_starts.astype(np.int64),
-        csv_starts=csv_starts.astype(np.int64),
-        csv_lengths=csv_lengths.astype(np.uint32),
+        section_starts=bin_starts.astype(np.int64),
+        bin_starts=bin_starts.astype(np.int64),
+        bin_lengths=bin_lengths.astype(np.uint32),
     )
+
+
+def iter_matched_sections_in_order(
+    sections_bin: Path,
+    bin_starts: np.ndarray,
+    line_to_name: Dict[int, str],
+):
+    """Yield ``(func_name, section)`` for each matched-index entry.
+
+    Convenience helper for callers (validator + loader tests) that want
+    the parsed-section view without rebuilding the full ``SectionArm``.
+    Iterates in matched_index.bin entry order.
+    """
+    func_names, sections = _walk_matched_sections(
+        sections_bin, bin_starts, line_to_name
+    )
+    yield from zip(func_names, sections)
+
+
+# Re-export so callers (validator, unmatched walker) have a single
+# import point for the BIN-walk helpers without reaching into the
+# SectionArm builder.
+__all__ = [
+    "iter_matched_sections_in_order",
+    "iter_sections_bin",
+    "load_matched_arm",
+]

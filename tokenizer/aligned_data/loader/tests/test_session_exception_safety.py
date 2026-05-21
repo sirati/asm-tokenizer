@@ -38,29 +38,20 @@ class _RaisingMemmap(np.ndarray):
 
 
 def test_exception_in_slice_still_closes_other_handles(synthetic_binary, monkeypatch):
-    """Force a failure inside ``load_matched`` AFTER the sections handle
-    is open. The ExitStack must close the sections handle (and any
-    later-opened variants handle) on ``__exit__`` even though the
-    slice raised.
+    """Force a failure inside ``load_matched`` AFTER the sections BIN is
+    loaded into the session's memoryview. The ExitStack must close
+    the data-bin memmap (and any later-opened variants memmap) on
+    ``__exit__`` even though the slice raised, and the session must
+    release its memoryview of ``sections.bin``.
     """
     fb = synthetic_binary
-    opened: List[Any] = []
 
-    import builtins
-
-    orig_open = builtins.open
-
-    def tracking_open(*args, **kwargs):
-        f = orig_open(*args, **kwargs)
-        opened.append(f)
-        return f
-
-    monkeypatch.setattr(builtins, "open", tracking_open)
-
+    opened_memmaps: List[Any] = []
     real_memmap = np.memmap
 
     def memmap_factory(*args, **kwargs):
         m = real_memmap(*args, **kwargs)
+        opened_memmaps.append(m)
         view = m.view(_RaisingMemmap)
         return view
 
@@ -72,16 +63,16 @@ def test_exception_in_slice_still_closes_other_handles(synthetic_binary, monkeyp
     with pytest.raises(RuntimeError, match="simulated"):
         with sess:
             sess.load_matched(0)
-    sections_path = fb["base_path"] / f"{fb['binary_name']}_sections.csv"
-    sections_opens = [
-        f for f in opened
-        if hasattr(f, "name") and str(f.name) == str(sections_path)
-    ]
-    assert sections_opens, "test did not exercise sections-open path"
-    for f in sections_opens:
-        assert f.closed, "ExitStack did not close the sections handle on exception"
+    # The session opens the data-bin memmap before the simulated
+    # failure fires (the memmap_factory wraps it in a _RaisingMemmap
+    # whose first __getitem__ raises). The ExitStack must release it.
+    assert opened_memmaps, "test did not exercise the data-bin memmap open path"
+    # Sections BIN was read fully into a bytes object before the
+    # failure; the session's __exit__ releases the memoryview and
+    # drops the bytes reference. Verify the session reports closed.
     assert sess._closed is True
     assert sess._stack is None
+    assert sess._sections_bin_view is None
 
 
 def test_close_called_explicitly_inside_with(synthetic_binary):

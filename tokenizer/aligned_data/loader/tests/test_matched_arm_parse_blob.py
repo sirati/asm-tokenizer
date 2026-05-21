@@ -1,86 +1,131 @@
-"""Focused test for ``_matched_arm_loader._parse_section_blob``.
+"""Focused test for ``_matched_arm_loader._walk_matched_sections``.
 
-Round-trips a synthetic 2-variant matched section blob through the
-parser so the 8-hex-character inline-indexer decode + 3-cell variant
-row contract is pinned independently of the orchestrator-level
-``SectionArm`` / ``open_sections_csv`` chain (which 2C / 2D rewrite in
-parallel batches).
+Round-trips a synthetic 2-variant matched section through the BIN
+parser so the per-section walk + per-variant ``data_offset_shifted``
+decode contract is pinned independently of the orchestrator-level
+``SectionArm`` chain.
 """
 
 from __future__ import annotations
 
-import csv
-import io
 from pathlib import Path
 
-import pytest
+import numpy as np
 
-from tokenizer.aligned_data.csv_format import format_function_line_no
-from tokenizer.aligned_data.inline_indexer import encode_inline_indexer
+from tokenizer.aligned_data.call_target_type import CallTargetType
+from tokenizer.aligned_data.matched_sections_bin import (
+    CallTargetSpec,
+    SectionWriter,
+)
 from tokenizer.aligned_data.loader._matched_arm_loader import (
-    _parse_section_blob,
+    _walk_matched_sections,
 )
 
 
-def _blob_for(line_no: int, variant_offsets: list[int]) -> str:
-    """Render a synthetic matched-section blob using the production
-    CSV shape (``# format`` prelude lives one level up in
-    ``open_sections_csv`` so does not appear in the blob).
-
-    Routes through :func:`format_function_line_no` so the encoded
-    line-no cell matches what the production writer emits (the codec
-    encodes the integer as big-endian bytes, not its ASCII digits).
+def _build_one_section_bin(
+    tmp_path: Path,
+    *,
+    fid: int,
+    variant_offsets: list[int],
+) -> Path:
+    """Write a single-section ``sections.bin`` with the requested
+    variant ``data_offset`` values (passed in real bytes; the writer
+    re-shifts to ``>> 4``).
     """
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\n")
-    line_no_b64 = format_function_line_no(line_no)
-    writer.writerow([line_no_b64, ""])  # header: line_no + (empty) called csv
-    for offset in variant_offsets:
-        writer.writerow(["0x10", "", encode_inline_indexer(offset)])
-    writer.writerow([])  # trailing blank separator
-    return buf.getvalue()
+    bin_path = tmp_path / "fake_sections.bin"
+    writer = SectionWriter(bin_path)
+    try:
+        section_offset = writer.begin_section(fid)
+        # No call_targets -> empty table; per_call_entries empty too.
+        writer.emit_call_targets([
+            CallTargetSpec(
+                function_name_ptr=fid + 1,
+                type=CallTargetType.EXTERN,
+                is_matched=False,
+            )
+        ])
+        for i, offset in enumerate(variant_offsets):
+            writer.begin_variant(
+                variant_ref_offset=0x10 * (i + 1),
+                data_offset_shifted=offset >> 4,
+            )
+            writer.emit_per_call_entries([])
+            writer.end_variant(vkey=("v", i))
+        writer.end_section()
+        writer.finalize()
+    except BaseException:
+        writer.close()
+        raise
+    return bin_path
 
 
-def test_parse_section_blob_two_variants_round_trip(tmp_path: Path) -> None:
-    """Two variants -> two ints; matches the 8-char inline indexer
-    encode/decode round-trip exactly."""
-    line_no = 42
-    offsets = [0x10, 0x20]
-    blob = _blob_for(line_no, offsets)
-    line_to_name = {line_no: "matched_fn"}
-
-    func_name, variant_offsets = _parse_section_blob(
-        blob, line_to_name, tmp_path / "fake_sections.csv"
+def test_walk_matched_sections_two_variants_round_trip(tmp_path: Path) -> None:
+    """One section with two variants -> walker returns (func_name,
+    Section) with both variants' ``data_offset_shifted`` round-tripped
+    via the BIN parser."""
+    fid = 42
+    variant_offsets = [0x10, 0x20]
+    bin_path = _build_one_section_bin(
+        tmp_path, fid=fid, variant_offsets=variant_offsets
     )
 
-    assert func_name == "matched_fn"
-    assert variant_offsets == offsets
-
-
-def test_parse_section_blob_legacy_4_cell_raises(tmp_path: Path) -> None:
-    """4-cell legacy row -> ValueError with migration message."""
-    line_no = 7
-    line_no_b64 = format_function_line_no(line_no)
-    blob = (
-        f"{line_no_b64},\n"
-        "0x10,,deadbeef,00000004\n"  # legacy: 4 cells
-        "\n"
+    # ``matched_index.bin``-equivalent: one entry at the prelude end.
+    from tokenizer.aligned_data.memmap_format import (
+        MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
     )
-    line_to_name = {line_no: "fn"}
+    bin_starts = np.array([MATCHED_SECTIONS_BIN_PRELUDE_SIZE], dtype=np.int64)
+    line_to_name = {fid: "matched_fn"}
+
+    func_names, sections = _walk_matched_sections(
+        bin_path, bin_starts, line_to_name
+    )
+
+    assert func_names == ["matched_fn"]
+    assert len(sections) == 1
+    section = sections[0]
+    assert section.function_name_ptr == fid
+    assert len(section.variants) == 2
+    decoded_offsets = [v.data_offset_shifted << 4 for v in section.variants]
+    assert decoded_offsets == variant_offsets
+
+
+def test_walk_matched_sections_missing_fid_raises(tmp_path: Path) -> None:
+    """A function_name_ptr absent from line_to_name -> ValueError with
+    a migration-pointing message (sidecar drift)."""
+    import pytest
+
+    fid = 7
+    bin_path = _build_one_section_bin(
+        tmp_path, fid=fid, variant_offsets=[0x10]
+    )
+    from tokenizer.aligned_data.memmap_format import (
+        MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
+    )
+    bin_starts = np.array([MATCHED_SECTIONS_BIN_PRELUDE_SIZE], dtype=np.int64)
+
     with pytest.raises(ValueError, match="re-run memmap_builder"):
-        _parse_section_blob(blob, line_to_name, tmp_path / "x.csv")
+        _walk_matched_sections(bin_path, bin_starts, line_to_name={})
 
 
-def test_parse_section_blob_legacy_16_char_indexer_raises(tmp_path: Path) -> None:
-    """3 cells but legacy 16-hex-char indexer -> ``decode_inline_indexer``
-    raises with the migration message (delegated hard cutover)."""
-    line_no = 9
-    line_no_b64 = format_function_line_no(line_no)
-    blob = (
-        f"{line_no_b64},\n"
-        "0x10,,deadbeefcafebabe\n"  # 16-char legacy indexer
-        "\n"
+def test_walk_matched_sections_bad_prelude_raises(tmp_path: Path) -> None:
+    """A ``sections.bin`` with a corrupt prelude raises before the
+    section walk even starts; downstream callers get a clear
+    "regenerate the BIN" pointer rather than garbage offsets."""
+    import pytest
+
+    fid = 11
+    bin_path = _build_one_section_bin(
+        tmp_path, fid=fid, variant_offsets=[0x10]
     )
-    line_to_name = {line_no: "fn"}
-    with pytest.raises(ValueError, match="re-run memmap_builder"):
-        _parse_section_blob(blob, line_to_name, tmp_path / "x.csv")
+    raw = bin_path.read_bytes()
+    # Corrupt the magic; keep everything else intact.
+    bin_path.write_bytes(b"BAD!" + raw[4:])
+    from tokenizer.aligned_data.memmap_format import (
+        MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
+    )
+    bin_starts = np.array([MATCHED_SECTIONS_BIN_PRELUDE_SIZE], dtype=np.int64)
+
+    with pytest.raises(ValueError, match="magic"):
+        _walk_matched_sections(
+            bin_path, bin_starts, line_to_name={fid: "fn"}
+        )

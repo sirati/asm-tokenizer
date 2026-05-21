@@ -5,7 +5,7 @@ which drives the production pass-2 writers + the function-names
 registry. Function-name lengths cycle across 8 distinct values
 (``7..14``) so matched-section CSV starts span every ``mod 4`` residue
 non-coincidentally (see
-:func:`test_matched_index_csv_starts_cover_every_mod4_residue` -- the
+:func:`test_matched_index_bin_starts_are_all_4_byte_aligned` -- the
 audit-driven assertion that documents the fixture's intent and
 prevents a future "let's reintroduce alignment on this path"
 regression from passing CI).
@@ -48,6 +48,7 @@ from ._corpus import (
 def _matched_paths(corpus) -> BinaryArmPaths:
     return BinaryArmPaths(
         sections_csv=corpus.matched_sections_csv,
+        sections_bin=corpus.sections_bin,
         index_bin=corpus.matched_index_bin,
         data_bin=corpus.matched_data_bin,
     )
@@ -56,6 +57,7 @@ def _matched_paths(corpus) -> BinaryArmPaths:
 def _unmatched_paths(corpus) -> BinaryArmPaths:
     return BinaryArmPaths(
         sections_csv=corpus.unmatched_sections_csv,
+        sections_bin=corpus.sections_bin,
         index_bin=corpus.unmatched_index_bin,
         data_bin=corpus.unmatched_data_bin,
     )
@@ -99,15 +101,14 @@ def _full_corpus(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_matched_index_csv_starts_are_all_4_byte_aligned(tmp_path):
-    """Writer-enforced invariant: matched-index CSV starts are all
-    4-byte aligned (the writer pads each section with 1-4 trailing
-    ``\\n`` bytes so the next section header lands on a 4-aligned
-    offset). Variable-length fixture names ensure the padding code
-    runs against every input residue.
+def test_matched_index_bin_starts_are_all_4_byte_aligned(tmp_path):
+    """Writer-enforced invariant: matched-index BIN starts are all
+    4-byte aligned (the :class:`SectionWriter` pads each section
+    trailer up to the next 4-byte boundary). Variable-length fixture
+    names ensure the padding code runs against every input residue.
     """
     corpus = _matched_corpus(tmp_path)
-    starts = corpus.read_matched_csv_starts()
+    starts = corpus.read_matched_bin_starts()
     assert len(starts) >= 4, (
         "fixture must produce at least 4 sections to demonstrate "
         f"alignment coverage; got {len(starts)}"
@@ -173,9 +174,9 @@ def test_unmatched_arm_matches_legacy_attributes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_matched_arm_csv_starts_index_section_csv_bytes(tmp_path):
-    """Matched ``load(idx)`` seeks the section CSV via
-    ``csv_starts``/``csv_lengths`` (per-function); ``starts`` carries
+def test_matched_arm_bin_starts_index_section_bin_bytes(tmp_path):
+    """Matched ``load(idx)`` seeks ``<binary>_sections.bin`` via
+    ``bin_starts``/``bin_lengths`` (per-function); ``starts`` carries
     per-variant data-bin offsets for the validator. Function names
     recovered from the sidecar match ``arm.func_names``.
     """
@@ -183,8 +184,8 @@ def test_matched_arm_csv_starts_index_section_csv_bytes(tmp_path):
     arm = load_section_arm(
         SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus)
     )
-    assert arm.csv_starts is not None and len(arm.csv_starts) == len(arm.func_names)
-    assert arm.csv_lengths is not None and len(arm.csv_lengths) == len(arm.func_names)
+    assert arm.bin_starts is not None and len(arm.bin_starts) == len(arm.func_names)
+    assert arm.bin_lengths is not None and len(arm.bin_lengths) == len(arm.func_names)
     sidecar_names = (
         corpus.function_names_sidecar.read_text("utf-8").splitlines()[1:]
     )
@@ -194,14 +195,14 @@ def test_matched_arm_csv_starts_index_section_csv_bytes(tmp_path):
         )
 
 
-def test_unmatched_section_starts_point_to_rows(tmp_path):
-    """``section_starts[i]`` is the byte offset of the row whose first
-    cell (base64 line_no) maps to ``func_names[i]``.
+def test_unmatched_section_starts_point_to_bin_sections(tmp_path):
+    """``section_starts[i]`` is the BIN byte offset of the section
+    whose ``function_name_ptr`` maps to ``func_names[i]``.
 
-    Post-restructure: 5-cell row ``[line_no_b64, variant_refs,
-    called_line_nos_b64, inlining_data, indexer_hex]``; the post-F2-A
-    walker translates the base64 line_no via the function-names
-    sidecar so ``arm.func_names`` returns raw names.
+    Post-Phase-4 cutover: the unmatched-arm walker streams sections
+    out of ``<binary>_sections.bin`` starting after the matched
+    region. The arm's ``func_names`` resolves each section's FID
+    against the function-names sidecar so callers see raw names.
     """
     corpus = build_corpus(
         tmp_path,
@@ -209,26 +210,31 @@ def test_unmatched_section_starts_point_to_rows(tmp_path):
         unmatched=[unmatched_spec(n) for n in ("unfn_a", "unfn_bb", "unfn_ccc")],
     )
     arm = load_section_arm(
-        SectionKind.UNMATCHED, _unmatched_paths(corpus), _line_to_name(corpus)
+        SectionKind.UNMATCHED, _unmatched_paths(corpus), _line_to_name(corpus),
+        matched_index=corpus.matched_index_bin,
     )
 
     assert arm.func_names == ["unfn_a", "unfn_bb", "unfn_ccc"]
     assert len(arm.section_starts) == 3
 
-    f, content_offset = open_sections_csv(corpus.unmatched_sections_csv)
+    from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
+    from tokenizer.aligned_data.memmap_format import (
+        assert_matched_sections_prelude,
+    )
+    line_to_name = _line_to_name(corpus)
+    raw = corpus.sections_bin.read_bytes()
+    assert_matched_sections_prelude(raw, path=str(corpus.sections_bin))
+    blob = memoryview(raw)
     try:
         for i, offset in enumerate(arm.section_starts):
-            f.seek(int(offset) + content_offset)
-            line = f.readline()
-            row = next(csv.reader([line]), None)
-            assert row is not None and len(row) == 5, (
-                f"unmatched row at section_starts[{i}]={offset} did not "
-                f"parse as 5-cell: got {row!r}"
+            section, _end = parse_section_bin(blob, int(offset))
+            resolved = line_to_name[section.function_name_ptr]
+            assert resolved == arm.func_names[i], (
+                f"section at section_starts[{i}]={offset} resolves to "
+                f"{resolved!r} but arm.func_names[{i}]={arm.func_names[i]!r}"
             )
-            # First cell is a non-empty base64 line number.
-            assert row[0], f"row[0] (base64 line_no) is empty at index {i}"
     finally:
-        f.close()
+        blob.release()
 
 
 def test_section_kind_enum_is_closed_typed():
@@ -252,6 +258,7 @@ def test_empty_arm_when_index_missing(tmp_path):
     arithmetic doesn't degrade)."""
     paths = BinaryArmPaths(
         sections_csv=tmp_path / "absent_sections.csv",
+        sections_bin=tmp_path / "absent_sections.bin",
         index_bin=tmp_path / "absent_index.bin",
         data_bin=tmp_path / "absent_data.bin",
     )
@@ -277,9 +284,13 @@ def test_zero_entry_index_yields_empty_arm(tmp_path):
         write_index_prelude(f)
     paths = BinaryArmPaths(
         sections_csv=tmp_path / "empty_sections.csv",
+        sections_bin=tmp_path / "empty_sections.bin",
         index_bin=index_path,
         data_bin=tmp_path / "empty_data.bin",
     )
-    arm = load_section_arm(SectionKind.UNMATCHED, paths)
+    arm = load_section_arm(
+        SectionKind.UNMATCHED, paths,
+        matched_index=tmp_path / "absent_matched_index.bin",
+    )
     assert arm.count == 0
     assert len(arm.starts) == 0
