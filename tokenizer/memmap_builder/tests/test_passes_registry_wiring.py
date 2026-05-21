@@ -22,6 +22,7 @@ from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.parsed_record_iter import Matched, ParsedRecord
 from tokenizer.memmap_builder._dedup import open_arm_dedup_state
 from tokenizer.memmap_builder.function_names import FunctionNamesRegistry
+from tokenizer.memmap_builder._pass2 import group_unmatched_entries_by_function
 from tokenizer.memmap_builder.passes import (
     process_matched_function,
     process_unmatched_function,
@@ -234,7 +235,9 @@ def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path, caplog):
     registry = FunctionNamesRegistry()
     state = _make_arm_state(tmp_path, "matched_lib_conflict")
     try:
-        with caplog.at_level("WARNING", logger="tokenizer.memmap_builder.passes"):
+        with caplog.at_level(
+            "WARNING", logger="tokenizer.memmap_builder._extern_library_merge"
+        ):
             entry = process_matched_function(
                 matched,
                 [vkey_a, vkey_b],
@@ -247,7 +250,10 @@ def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path, caplog):
     assert entry is not None
     assert entry["extern_libraries"] == {"conflicting": "libfirst.so"}
     assert any(
-        "extern library mismatch" in record.getMessage() and "fn" in record.getMessage()
+        "extern library" in record.getMessage()
+        and "mismatch" in record.getMessage()
+        and "fn" in record.getMessage()
+        and "conflicting" in record.getMessage()
         for record in caplog.records
     )
 
@@ -299,3 +305,45 @@ def test_matched_walker_skips_dotL_prefix(tmp_path):
     assert entry is None
     registry.finalize()
     assert registry._sorted == ()  # noqa: SLF001
+
+
+def test_unmatched_group_extern_library_mismatch_first_wins_and_logs(caplog):
+    """Symmetric mismatch coverage for the unmatched arm: two per-variant
+    entries of the SAME unmatched function group report different
+    libraries for the same EXTERN name. The grouping helper runs the
+    shared :func:`merge_extern_libraries` and the warning surfaces via
+    the same module logger the matched-arm test asserts on."""
+    vkey_a = _FakeVKey("a")
+    vkey_b = _FakeVKey("b")
+    entries = [
+        {
+            "func_name": "fn",
+            "vkey": vkey_a,
+            "data_offset": 0x20,
+            "data_len": 0x40,
+            "token_len": 4,
+            "called": {("loc", CallTargetType.LOCAL)},
+            "extern_libraries": {"conflicting": "libfirst.so"},
+        },
+        {
+            "func_name": "fn",
+            "vkey": vkey_b,
+            "data_offset": 0x60,
+            "data_len": 0x40,
+            "token_len": 4,
+            "called": {("loc", CallTargetType.LOCAL)},
+            "extern_libraries": {"conflicting": "libsecond.so"},
+        },
+    ]
+    with caplog.at_level(
+        "WARNING", logger="tokenizer.memmap_builder._extern_library_merge"
+    ):
+        grouped = group_unmatched_entries_by_function(entries)
+    assert grouped["fn"]["extern_libraries"] == {"conflicting": "libfirst.so"}
+    assert any(
+        "extern library" in record.getMessage()
+        and "mismatch" in record.getMessage()
+        and "fn" in record.getMessage()
+        and "conflicting" in record.getMessage()
+        for record in caplog.records
+    )

@@ -67,6 +67,7 @@ from ..aligned_data.matched_sections_bin import (
     PerCallEntry,
     SectionWriter,
 )
+from ._extern_library_merge import merge_extern_libraries
 from .function_names import FunctionNamesRegistry
 from .variants import VariantRegistry, write_warn_log_entry
 
@@ -145,19 +146,6 @@ def _project_called_names_unique(
         seen.add(name)
         out.append(name)
     return out
-
-
-def _build_matched_func_name_set(matched_data_entries: List[dict]) -> "set[str]":
-    """Collect the set of function names that survived the matched arm.
-
-    The BIN's call_target ``is_matched`` flag asks whether the CALLEE's
-    section will land in the matched-arm catalog. The matched arm
-    consults ``matched_data_entries`` (which has been filtered down by
-    pass-1's drop rules — name-starts-with-.L, all-encoders-skipped,
-    all-variants-deduped-to-the-same-offset); a callee that doesn't
-    appear here will land in the unmatched-arm catalog instead.
-    """
-    return {entry["func_name"] for entry in matched_data_entries}
 
 
 def _build_call_targets_spec(
@@ -463,7 +451,7 @@ def group_unmatched_entries_by_function(
                 "version_data_list": [],
                 "called_by_version": [],
                 "vkeys": [],
-                "extern_libraries": {},
+                "_per_variant_extern_libraries": [],
             }
 
         group = unmatched_by_func[func_name]
@@ -474,19 +462,16 @@ def group_unmatched_entries_by_function(
         comp_set_id = len(group["vkeys"])
         group["vkeys"].append(vkey)
         group["called_by_version"].append((comp_set_id, entry["called"]))
-        for name, lib in entry["extern_libraries"].items():
-            if name in group["extern_libraries"] and group["extern_libraries"][name] != lib:
-                # Same extern name reports two different libraries
-                # across variants of the SAME function. Builder bug —
-                # the BIN walker logs the conflict; here we just keep
-                # the first encountered so the in-memory state stays
-                # deterministic. The conflict report is deferred to
-                # the BIN emitter where we have an error_log handle.
-                group.setdefault("_extern_library_conflicts", []).append(
-                    (name, group["extern_libraries"][name], lib)
-                )
-                continue
-            group["extern_libraries"][name] = lib
+        group["_per_variant_extern_libraries"].append(entry["extern_libraries"])
+
+    # Single-source-of-truth merge: same helper the matched arm uses,
+    # same first-wins + warn semantics. The per-variant ordering is
+    # whatever the caller fed us (typically variant-index order).
+    for func_name, group in unmatched_by_func.items():
+        group["extern_libraries"] = merge_extern_libraries(
+            group.pop("_per_variant_extern_libraries"),
+            func_name=func_name,
+        )
 
     return unmatched_by_func
 
@@ -548,43 +533,6 @@ def _format_unmatched_inlining_str(inlining_data_list: List) -> str:
     return ";".join(merged_entries)
 
 
-def _log_extern_library_conflicts(
-    func_name: str,
-    conflicts: "list[tuple[str, str, str]]",
-) -> None:
-    """Surface same-name-different-library extern conflicts via the module logger.
-
-    Builder bug: the same extern callee name should report the same
-    provider library across every variant of the same unmatched
-    function group. ``<binary>.error.log`` is reserved for structured
-    cap-overflow rows (see ``ALLOWED_REASONS`` in
-    :mod:`tokenizer.memmap_builder.error_log`); a library mismatch is
-    a builder-bug signal, not a per-function skip event, so it routes
-    through the same channel Phase 3.1's
-    :func:`passes._union_extern_libraries` uses for the matched arm.
-
-    .. note::
-        Matched-arm union + warning lives in
-        ``passes.py:_union_extern_libraries`` (Phase 3.1); the
-        unmatched-arm union + warning lives in
-        :func:`group_unmatched_entries_by_function` here. Two arms,
-        two sources, but identical first-wins + warn semantics. A
-        follow-up refactor could lift the union into a shared helper
-        once both arms can agree on the iteration shape (the matched
-        arm walks ``Dict[variant_index, ParsedRecord]``, the unmatched
-        arm walks a flat sequence of per-variant dicts).
-    """
-    for name, kept, dropped in conflicts:
-        logger.warning(
-            "function %s extern library mismatch across variants: %s/%s -> kept %s, dropped %s",
-            func_name,
-            func_name,
-            name,
-            kept,
-            dropped,
-        )
-
-
 def write_unmatched_sections_pass2(
     unmatched_data_entries: List[dict],
     function_lookup: dict,
@@ -632,9 +580,6 @@ def write_unmatched_sections_pass2(
         called_by_version = data["called_by_version"]
         vkeys = data["vkeys"]
         extern_libraries: "dict[str, str]" = data["extern_libraries"]
-        _log_extern_library_conflicts(
-            func_name, data.get("_extern_library_conflicts", [])
-        )
 
         if not version_data_list:
             continue
