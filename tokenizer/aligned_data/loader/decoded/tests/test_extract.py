@@ -364,3 +364,66 @@ def test_caller_raw_tokens_unchanged_after_decode():
     snapshot = raw.copy()
     _decode(raw)
     np.testing.assert_array_equal(raw, snapshot)
+
+
+def test_interleaved_multi_chunk_sources_preserve_per_source_chunk_contiguity():
+    """A stream with [VALUED_CONST_V2 u128, FLOAT64, VALUED_CONST_V2 u128] must:
+
+    - emit 5 number-side-array entries (2 + 1 + 2),
+    - in stream-position order (NOT clustered: f64 entry between the two
+      u128 chunk groups, not after both),
+    - with each u128's two chunks contiguous (NO interleaving WITHIN one
+      source).
+
+    Locks the invariant that the splicer relies on: side-array index
+    range ``[k, k + chunk_count_k)`` belongs to exactly one source.
+    """
+    # Distinct u128 values: every chunk (low + high) differs between
+    # the two sources so any cross-source mixup would be detectable
+    # via a mismatched chunk pair.
+    u128_a = 0x0123456789ABCDEF_FEDCBA9876543210
+    u128_b = 0xDEADBEEFCAFEBABE_1234567890ABCDEF
+    a_bytes = u128_a.to_bytes(16, byteorder="big", signed=False)
+    b_bytes = u128_b.to_bytes(16, byteorder="big", signed=False)
+    # A recognisable f64 value (1.0) between them.
+    f64_bits = struct.unpack(">Q", struct.pack(">d", 1.0))[0]
+    f64_bytes = f64_bits.to_bytes(8, byteorder="big", signed=False)
+    raw = _u16(
+        400, *a_bytes,    # VALUED_CONST_V2 = u128_a -> 2 chunks
+        404, *f64_bytes,  # FLOAT64 = 1.0 -> 1 chunk
+        400, *b_bytes,    # VALUED_CONST_V2 = u128_b -> 2 chunks
+    )
+    out = _decode(raw)
+
+    # Five side-array entries: 2 + 1 + 2.
+    assert out.numbers_significant.shape == (5,)
+    assert out.numbers_sign_exponent.shape == (5,)
+
+    # Real-token stream after strip-and-promote: u128_a paints two
+    # VALUED_CONST_V2 slots; FLOAT64 is single-token; u128_b paints two
+    # VALUED_CONST_V2 slots.  Order: [VC, VC, F64, VC, VC].
+    np.testing.assert_array_equal(
+        out.real_tokens, _u16(400, 400, 404, 400, 400)
+    )
+
+    # Reconstruct each source from its chunk range and compare against
+    # the canonical encoder output.  This catches BOTH cross-source
+    # mixup (a's chunks mixed with b's) AND intra-source interleaving
+    # (a's high chunk swapped with the f64 chunk, etc.).
+    expected_a = from_int(u128_a, sign=+1)
+    expected_f64 = from_float64(f64_bits)
+    expected_b = from_int(u128_b, sign=+1)
+    assert len(expected_a) == 2
+    assert len(expected_f64) == 1
+    assert len(expected_b) == 2
+
+    expected = expected_a + expected_f64 + expected_b
+    for idx, (sig, sign_exp) in enumerate(expected):
+        assert int(out.numbers_significant[idx]) == int(sig), (
+            f"significand mismatch at side-array index {idx}: "
+            f"expected {int(sig):#x}, got {int(out.numbers_significant[idx]):#x}"
+        )
+        assert int(out.numbers_sign_exponent[idx]) == int(sign_exp), (
+            f"sign_exp mismatch at side-array index {idx}: "
+            f"expected {int(sign_exp):#x}, got {int(out.numbers_sign_exponent[idx]):#x}"
+        )

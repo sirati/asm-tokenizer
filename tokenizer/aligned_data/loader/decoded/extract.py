@@ -44,7 +44,7 @@ source of truth).
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -63,6 +63,45 @@ from .decoded_function import DecodedFunction
 from .run_lengths import run_lengths
 
 __all__ = ["decode_raw_tokens"]
+
+
+# ---------------------------------------------------------------------------
+# Shared occurrence iterator -- single source of truth for the
+# "mask -> positions -> per-position (position, payload_bytes)" walk used
+# by BOTH the identity arm and the number arm.  Per-position payload
+# decoding (identity-vs-number value semantics) stays in each arm; only
+# the raw-stream traversal is shared.
+# ---------------------------------------------------------------------------
+
+
+def _iter_token_occurrences(
+    raw_tokens: np.ndarray,
+    runlen: np.ndarray,
+    token_id: int,
+) -> Iterator[Tuple[int, bytes]]:
+    """Yield ``(position, payload_bytes)`` for every occurrence of ``token_id``.
+
+    ``payload_bytes`` is the contiguous run of inline-digit bytes
+    immediately following each occurrence, materialised from the uint16
+    stream as a big-endian byte sequence.  Tail-position occurrences
+    (no room for a trailing inline run) yield ``b''``.
+
+    Pure read pass over ``raw_tokens`` -- never mutates the caller's
+    array.  ``np.nonzero`` returns sorted ascending indices, so the
+    yielded ``position`` values are stream-ascending.
+    """
+    n = raw_tokens.shape[0]
+    mask = raw_tokens == token_id
+    positions = np.nonzero(mask)[0]
+    for position in positions:
+        position_int = int(position)
+        if position_int + 1 < n:
+            inline_len = int(runlen[position_int + 1])
+            payload_end = position_int + 1 + inline_len
+            payload = bytes(raw_tokens[position_int + 1 : payload_end].tolist())
+        else:
+            payload = b""
+        yield position_int, payload
 
 
 # ---------------------------------------------------------------------------
@@ -138,20 +177,13 @@ _IDENTITY_SENTINEL = 0xFFFF
 _IDENTITY_MAX_NON_SENTINEL = 0xFFFE
 
 
-def _decode_identity_value(
-    raw_tokens: np.ndarray, position: int, inline_len: int
-) -> int:
-    """Decode the inline-digit run after ``position`` as a big-endian uint.
+def _decode_identity_payload(payload: bytes) -> int:
+    """Decode an identity-arm payload as a big-endian unsigned integer.
 
-    Inline-bytes range is ``raw_tokens[position + 1 : position + 1 +
-    inline_len]``; values land in the digit-slot id range ``[0, 256)`` so
-    each numpy element is one byte.  Empty payload (``inline_len == 0``)
-    decodes as 0.  A decoded value exceeding ``0xFFFE`` clips to the
-    sentinel ``0xFFFF`` per plan decision 7.
+    Empty payload decodes as 0 (``int.from_bytes(b'', ...)`` returns 0).
+    A decoded value exceeding ``0xFFFE`` clips to the sentinel ``0xFFFF``
+    per plan decision 7.
     """
-    if inline_len <= 0:
-        return 0
-    payload = bytes(raw_tokens[position + 1 : position + 1 + inline_len].tolist())
     value = int.from_bytes(payload, byteorder="big", signed=False)
     if value > _IDENTITY_MAX_NON_SENTINEL:
         return _IDENTITY_SENTINEL
@@ -162,36 +194,23 @@ def _extract_identities(
     raw_tokens: np.ndarray,
     runlen: np.ndarray,
     id_token_ids: Dict[Category, int],
-    n: int,
 ) -> Dict[Category, np.ndarray]:
     """Build one uint16 array per ``Category``.
 
     Pure read pass over ``raw_tokens``; never touches the number arm's
     working buffer.  Iteration order over positions is stream-ascending
-    (``np.nonzero`` returns sorted ascending indices), so the per-category
-    array order matches the order of category-token occurrences in the
-    final post-strip real-token stream.
+    (``_iter_token_occurrences`` yields in ``np.nonzero`` ascending order),
+    so the per-category array order matches the order of category-token
+    occurrences in the final post-strip real-token stream.
     """
     identities: Dict[Category, np.ndarray] = {}
     for category, type_token_id in id_token_ids.items():
-        cat_mask = raw_tokens == type_token_id
-        cat_positions = np.nonzero(cat_mask)[0]
-        if cat_positions.size == 0:
-            identities[category] = np.empty(0, dtype=np.uint16)
-            continue
-
-        values = np.empty(cat_positions.size, dtype=np.uint16)
-        for out_idx, position in enumerate(cat_positions.tolist()):
-            # Bounds: a type-token at the final position has no inline
-            # run at p+1; treat as inline_len = 0.
-            if position + 1 < n:
-                inline_len = int(runlen[position + 1])
-            else:
-                inline_len = 0
-            values[out_idx] = _decode_identity_value(
-                raw_tokens, position, inline_len
-            )
-        identities[category] = values
+        values_list: List[int] = []
+        for _position, payload in _iter_token_occurrences(
+            raw_tokens, runlen, type_token_id
+        ):
+            values_list.append(_decode_identity_payload(payload))
+        identities[category] = np.array(values_list, dtype=np.uint16)
     return identities
 
 
@@ -204,7 +223,6 @@ def _collect_number_sources(
     raw_tokens: np.ndarray,
     runlen: np.ndarray,
     number_token_ids: Dict[TokenType, int],
-    n: int,
 ) -> List[Tuple[int, int, List[Tuple[np.uint64, np.uint32]]]]:
     """Collect (position, type_token_id, chunks) for every number-source.
 
@@ -217,17 +235,9 @@ def _collect_number_sources(
     """
     sources: List[Tuple[int, int, List[Tuple[np.uint64, np.uint32]]]] = []
     for token_type, type_token_id in number_token_ids.items():
-        num_mask = raw_tokens == type_token_id
-        num_positions = np.nonzero(num_mask)[0]
-        for position in num_positions.tolist():
-            if position + 1 < n:
-                inline_len = int(runlen[position + 1])
-            else:
-                inline_len = 0
-            payload_end = position + 1 + inline_len
-            payload = bytes(
-                raw_tokens[position + 1 : payload_end].tolist()
-            )
+        for position, payload in _iter_token_occurrences(
+            raw_tokens, runlen, type_token_id
+        ):
             chunks = _decode_number_payload(payload, token_type=token_type)
             sources.append((position, type_token_id, chunks))
 
@@ -345,15 +355,11 @@ def decode_raw_tokens(
     runlen = run_lengths(inline_mask)
 
     # ---- Identity arm: pure read pass over the ORIGINAL raw_tokens ----
-    identities = _extract_identities(
-        raw_tokens, runlen, id_token_ids, n
-    )
+    identities = _extract_identities(raw_tokens, runlen, id_token_ids)
 
     # ---- Number arm: collect chunks per source in stream order, then
     # promote inline slots, then flatten to the side-array pair. ----
-    sources = _collect_number_sources(
-        raw_tokens, runlen, number_token_ids, n
-    )
+    sources = _collect_number_sources(raw_tokens, runlen, number_token_ids)
     _promote_inline_slots(working_tokens, sources)
     numbers_significant, numbers_sign_exponent = _flatten_number_chunks(sources)
 
