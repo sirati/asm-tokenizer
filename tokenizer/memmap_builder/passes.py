@@ -63,19 +63,24 @@ def process_matched_function(
       re-routes it through :func:`process_unmatched_function`).
 
     On success the returned dict carries ``func_name``,
-    ``unique_called`` (sorted union of callees across surviving
-    variants), and ``version_data`` (per-variant offset/length plus
-    the variant's local callee set). The shape matches what
+    ``unique_called`` (first-seen order-preserving union of callees
+    across variants, anchored on the lowest-index variant's encoder
+    allocation order; later variants only contribute novel callees at
+    the tail), and ``version_data`` (per-variant offset/length plus the
+    variant's local callee set). The shape matches what
     :func:`_pass2.write_matched_sections_pass2` consumes.
     """
     func_name = matched.func_name
     if func_name.startswith(".L"):
         return None
 
-    unique_called = sorted(
-        {pair for rec in matched.records.values() for pair in rec.called_funcs},
-        key=lambda nt: (nt[0], nt[1].value),
-    )
+    unique_called: List[tuple] = []
+    seen: set = set()
+    for variant_index in sorted(matched.records):
+        for entry in matched.records[variant_index].called_funcs:
+            if entry not in seen:
+                seen.add(entry)
+                unique_called.append(entry)
 
     version_data = []
     for variant_index, rec in matched.records.items():
