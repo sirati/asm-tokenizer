@@ -57,6 +57,7 @@ class _FakeArm:
         section_starts: np.ndarray | None = None,
         bin_starts: np.ndarray | None = None,
         bin_lengths: np.ndarray | None = None,
+        record_to_section_idx: np.ndarray | None = None,
     ) -> None:
         self.starts = starts
         self.func_names = func_names or []
@@ -68,6 +69,9 @@ class _FakeArm:
         # ``starts`` directly.
         self.bin_starts = bin_starts
         self.bin_lengths = bin_lengths
+        # Per-record -> per-section mapping; the unmatched session
+        # path looks it up to resolve owning sections in O(1).
+        self.record_to_section_idx = record_to_section_idx
 
 
 class _FakeVocab:
@@ -227,10 +231,15 @@ def _unmatched_arm_from_corpus(corpus) -> _FakeArm:
     # region; reuse the loader's own offset helper instead of mirroring
     # its logic in the fixture.
     unmatched_section_offset = unmatched_region_start(corpus.matched_index_bin)
+    # Synthetic fixture: one unmatched function -> one section -> one
+    # record. Pin the per-record -> per-section mapping to that single
+    # slot so the session's O(1) dispatch finds the owning section.
+    record_to_section_idx = np.zeros(len(starts), dtype=np.uint32)
     return _FakeArm(
         starts=starts,
         func_names=["lonely_func"],
         section_starts=np.array([unmatched_section_offset], dtype=np.int64),
+        record_to_section_idx=record_to_section_idx,
     )
 
 

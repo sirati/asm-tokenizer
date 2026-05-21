@@ -40,19 +40,26 @@ def _walk_unmatched_sections(
     sections_bin: Path,
     region_start: int,
     line_to_name: Dict[int, str],
-) -> Tuple[List[str], np.ndarray]:
+) -> Tuple[List[str], np.ndarray, np.ndarray]:
     """Parse every section in ``[region_start, EOF)`` of ``sections_bin``.
 
-    Returns ``(func_names, section_starts)`` where ``section_starts[i]``
-    is the BIN offset of the i-th unmatched section and
-    ``func_names[i]`` is its resolved function name. The walker honours
-    encounter order so the i-th entry of both arrays describes the
-    same section.
+    Returns ``(func_names, section_starts, section_variant_counts)``
+    where ``section_starts[i]`` is the BIN offset of the i-th unmatched
+    section, ``func_names[i]`` is its resolved function name, and
+    ``section_variant_counts[i]`` is the per-section variant count
+    (used by the loader to build the per-record -> per-section lookup
+    table). The walker honours encounter order so the i-th entry of
+    every array describes the same section.
     """
     func_names: List[str] = []
     section_starts: List[int] = []
+    variant_counts: List[int] = []
     if not sections_bin.exists():
-        return func_names, np.zeros(0, dtype=np.int64)
+        return (
+            func_names,
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+        )
     raw, blob = read_sections_bin_blob(sections_bin)
     end = len(raw)
     cursor = region_start
@@ -65,8 +72,54 @@ def _walk_unmatched_sections(
             )
         )
         section_starts.append(cursor)
+        variant_counts.append(len(section.variants))
         cursor = next_cursor
-    return func_names, np.array(section_starts, dtype=np.int64)
+    return (
+        func_names,
+        np.array(section_starts, dtype=np.int64),
+        np.array(variant_counts, dtype=np.int64),
+    )
+
+
+def _build_record_to_section_idx(
+    variant_counts: np.ndarray, total_records: int
+) -> np.ndarray:
+    """Build the per-record -> per-section index mapping.
+
+    Sections are emitted in encounter order; per-record offsets in
+    ``starts`` follow the same order, with ``variant_counts[i]``
+    consecutive records belonging to section ``i``. The mapping is
+    derived once at arm-load (O(M)) so the session's per-record
+    dispatch is ``arm.record_to_section_idx[idx]`` (O(1)) instead of
+    an O(K) section re-walk per call.
+
+    A cardinality mismatch (sections.bin claims a different total than
+    unmatched_index.bin advertises) raises :class:`ValueError` with a
+    migration-pointing message rather than silently writing past the
+    end of the mapping; this is the single chokepoint that catches
+    builder-side index/catalog drift.
+    """
+    mapping = np.zeros(total_records, dtype=np.uint32)
+    cursor = 0
+    for section_idx, count in enumerate(variant_counts):
+        n = int(count)
+        if cursor + n > total_records:
+            raise ValueError(
+                f"unmatched section[{section_idx}] declares {n} variants "
+                f"but only {total_records - cursor} records remain on the "
+                f"unmatched index; sections.bin / unmatched_index.bin are "
+                f"out of sync, re-run memmap_builder to regenerate"
+            )
+        mapping[cursor:cursor + n] = section_idx
+        cursor += n
+    if cursor != total_records:
+        raise ValueError(
+            f"unmatched arm consumed {cursor} records across "
+            f"{len(variant_counts)} sections but unmatched_index.bin has "
+            f"{total_records} entries; sections.bin / unmatched_index.bin "
+            f"are out of sync, re-run memmap_builder to regenerate"
+        )
+    return mapping
 
 
 def load_unmatched_arm(
@@ -106,8 +159,15 @@ def load_unmatched_arm(
     )
 
     region_start = unmatched_region_start(matched_index)
-    func_names, section_starts = _walk_unmatched_sections(
+    func_names, section_starts, variant_counts = _walk_unmatched_sections(
         paths.sections_bin, region_start, line_to_name
+    )
+    # Per-record -> per-section lookup table. Without this, the
+    # session's per-record dispatch would re-parse sections from index
+    # 0 on every load_unmatched(idx) call (O(M*K) per-corpus instead
+    # of O(M)).
+    record_to_section_idx = _build_record_to_section_idx(
+        variant_counts, total_records=len(starts)
     )
     return SectionArm(
         starts=starts,
@@ -115,4 +175,5 @@ def load_unmatched_arm(
         count_per_length=count_per_length,
         func_names=func_names,
         section_starts=section_starts,
+        record_to_section_idx=record_to_section_idx,
     )

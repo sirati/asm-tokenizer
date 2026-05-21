@@ -319,76 +319,79 @@ class BinarySession:
         """Resolve the BIN section that owns the per-record ``start``.
 
         The unmatched index is per-RECORD (one entry per
-        ``_unmatched_data.bin`` record). The arm's ``section_starts``
-        is per-FUNCTION (one entry per unmatched section); records map
-        to functions in encounter order. A function with N versions
-        contributes N records and one section. We find the owning
-        section by selecting the index of the section whose first
-        variant block carries this exact record offset.
+        ``_unmatched_data.bin`` record). The arm pre-computes
+        ``record_to_section_idx[idx]`` at load time (O(M) once over
+        the BIN walk) so this dispatch is O(1) per call.
 
-        Single-version corpora (the dominant case in current tests)
-        resolve in O(1) since the cardinality match holds; multi-
-        version corpora may incur an O(K) scan of the function's
-        variant offsets to find the slot.
+        Sanity-checks the section's variant at the matching slot:
+        its ``data_offset_shifted << 4`` must equal ``start``. A
+        mismatch surfaces as :class:`ValueError`, not a silent wrong-
+        section return, since it indicates the unmatched_index.bin /
+        sections.bin drifted apart at build time.
         """
+        section_idx = self._unmatched_section_idx(arm, idx)
         section_starts = getattr(arm, "section_starts", None)
-        if section_starts is None or len(section_starts) == 0:
-            raise IndexError(
-                f"unmatched arm has no section_starts for record {idx} "
-                f"on binary {self._binary_name}"
+        section_offset = int(section_starts[section_idx])
+        section = self._parse_section_at(section_offset)
+        slot = idx - self._unmatched_record_slot_base(arm, idx, section_idx)
+        variant = section.variants[slot]
+        if (variant.data_offset_shifted << 4) != start:
+            raise ValueError(
+                f"unmatched section[{section_idx}] variant [{slot}] "
+                f"data_offset {variant.data_offset_shifted << 4} does "
+                f"not match record offset {start} (record idx={idx})"
             )
-        # Walk sections in encounter order; on the first one whose
-        # variant blocks include ``start`` we win. ``idx`` is the
-        # per-record offset into ``starts``; ``starts`` is in section
-        # encounter order, so the section containing record ``idx``
-        # has cumulative variant count ≥ idx + 1. We don't have the
-        # cumulative count cached, so we scan and accumulate.
-        consumed = 0
-        for section_idx, section_offset in enumerate(section_starts):
-            section = self._parse_section_at(int(section_offset))
-            consumed_next = consumed + len(section.variants)
-            if idx < consumed_next:
-                # Sanity check: the section's variant at slot
-                # ``idx - consumed`` should have data_offset == start.
-                variant = section.variants[idx - consumed]
-                if (variant.data_offset_shifted << 4) != start:
-                    raise ValueError(
-                        f"unmatched section[{section_idx}] variant "
-                        f"[{idx - consumed}] data_offset "
-                        f"{variant.data_offset_shifted << 4} does not "
-                        f"match record offset {start} (record idx={idx})"
-                    )
-                return section
-            consumed = consumed_next
-        raise IndexError(
-            f"unmatched record idx={idx} (start={start}) does not fall "
-            f"into any section on binary {self._binary_name}"
-        )
+        return section
 
     def _unmatched_func_name(self, arm: Any, idx: int) -> str:
-        # The unmatched arm's ``func_names`` is per-FUNCTION while
-        # ``starts`` is per-RECORD; for multi-version unmatched
-        # functions ``idx`` may exceed ``len(func_names)``. We can
-        # resolve through ``section_starts``: walking sections in
-        # encounter order and counting variants gives the function
-        # index. Single-version (dominant case in tests) just falls
-        # through to ``func_names[idx]``.
+        """Per-record function name via the pre-cached mapping.
+
+        Falls through to the ``unmatched_<idx>`` sentinel only when
+        the section index points beyond ``func_names`` -- this
+        indicates the function-names sidecar drifted from the BIN
+        catalog at build time and is normally caught earlier by the
+        arm-load FID-resolution check.
+        """
         names = getattr(arm, "func_names", None) or []
-        if 0 <= idx < len(names):
-            # Common path: 1:1 record:function cardinality.
-            return names[idx]
-        # Multi-version path: resolve via section walk.
-        section_starts = getattr(arm, "section_starts", None) or []
-        consumed = 0
-        for section_idx, section_offset in enumerate(section_starts):
-            section = self._parse_section_at(int(section_offset))
-            consumed_next = consumed + len(section.variants)
-            if idx < consumed_next:
-                if section_idx < len(names):
-                    return names[section_idx]
-                break
-            consumed = consumed_next
+        section_idx = self._unmatched_section_idx(arm, idx)
+        if 0 <= section_idx < len(names):
+            return names[section_idx]
         return f"unmatched_{idx}"
+
+    def _unmatched_section_idx(self, arm: Any, idx: int) -> int:
+        """Look up the per-record -> per-section index via the arm's
+        pre-cached mapping. Raises :class:`IndexError` on out-of-range
+        ``idx`` with the same wording the legacy section walk used.
+        """
+        mapping = getattr(arm, "record_to_section_idx", None)
+        if mapping is None or len(mapping) == 0:
+            raise IndexError(
+                f"unmatched arm has no record_to_section_idx for record "
+                f"{idx} on binary {self._binary_name}"
+            )
+        if idx < 0 or idx >= len(mapping):
+            raise IndexError(
+                f"unmatched record idx={idx} out of bounds (have "
+                f"{len(mapping)} records on binary {self._binary_name})"
+            )
+        return int(mapping[idx])
+
+    def _unmatched_record_slot_base(
+        self, arm: Any, idx: int, section_idx: int
+    ) -> int:
+        """First record index belonging to section ``section_idx``.
+
+        Derived once per call from the pre-cached mapping; the slot
+        within the section is ``idx - base``. This is the same O(1)
+        derivation the legacy section-walk used to accumulate via the
+        ``consumed`` counter, just sourced from the mapping instead
+        of re-parsing the BIN.
+        """
+        mapping = arm.record_to_section_idx
+        # np.searchsorted on the contiguous-section mapping returns
+        # the first record index whose section_idx >= target; for an
+        # exact match this is exactly the section's base record.
+        return int(np.searchsorted(mapping, section_idx, side="left"))
 
     def _meta_get(self, key: str) -> Any:
         if self._metadata is None:

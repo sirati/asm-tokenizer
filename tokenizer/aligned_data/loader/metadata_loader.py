@@ -74,6 +74,14 @@ class SectionArm:
     sampling; both arms compute them from real token counts
     (unmatched: ``load_unmatched_lengths`` over the data records;
     matched: per-function aggregation owned by the matched loader).
+
+    ``record_to_section_idx`` (unmatched arm only): per-RECORD lookup
+    table giving the index into ``section_starts`` whose section owns
+    that record. Built once at arm-load (O(M)) so the session's per-
+    record dispatch is O(1) instead of an O(K) section re-walk per
+    ``load_unmatched`` call. Empty on the matched arm (its per-record
+    indexing is the validator's concern; the loader's hot path keys on
+    ``bin_starts``).
     """
 
     starts: np.ndarray
@@ -87,6 +95,9 @@ class SectionArm:
         default_factory=lambda: np.zeros(0, dtype=np.int64)
     )
     bin_lengths: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.uint32)
+    )
+    record_to_section_idx: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.uint32)
     )
 
@@ -271,6 +282,7 @@ def _empty_arm() -> SectionArm:
         section_starts=np.zeros(0, dtype=np.int64),
         bin_starts=np.zeros(0, dtype=np.int64),
         bin_lengths=np.zeros(0, dtype=np.uint32),
+        record_to_section_idx=np.zeros(0, dtype=np.uint32),
     )
 
 
