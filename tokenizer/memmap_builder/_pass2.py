@@ -227,15 +227,19 @@ def _emit_variant_per_call_entries(
     ``is_matched`` flag still encodes the "this callee is unsectioned"
     fact at the table level.
 
-    Iteration order is sorted by ``(name, type.value)`` so the BIN's
-    per-call entries are deterministic across runs and matched/unmatched
-    arms.
+    Iteration order is the variant's encoder-allocation order
+    (``rec.called_funcs`` order, threaded through pass-1's
+    ``version_data["called"]`` list). Per-call entries are decoupled
+    from the section's ``call_target`` table ordering — each entry
+    carries an explicit ``called_idx`` into the table — so this
+    function's iteration order is purely a determinism + smoke-test
+    legibility choice. The list-position match between
+    ``rec.called_funcs`` and the table (now both encounter-ordered
+    per plan Decisions 20 + 21) keeps per-call emissions adjacent in
+    BIN-position to their table entries.
     """
-    sorted_calls = sorted(
-        variant_called, key=lambda nt: (nt[0], nt[1].value)
-    )
     entries: List[PerCallEntry] = []
-    for callee_name, callee_type in sorted_calls:
+    for callee_name, callee_type in variant_called:
         if callee_type is CallTargetType.EXTERN:
             continue
         if callee_name not in sectioned_func_names:
