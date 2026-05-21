@@ -93,7 +93,7 @@ def parse_matched_section(
     its header carries every geometry field a reader needs -- so no
     companion length / overlong flag rides alongside the offset.
     """
-    versions: List[FunctionData] = []
+    variants: List[FunctionData] = []
     for variant in section.variants:
         metadata = extract_metadata_from_variant_block(section, variant)
         variant_row = resolve_ref(metadata["variant_ref"])
@@ -101,13 +101,13 @@ def parse_matched_section(
             for k, v in variant_row.items():
                 metadata.setdefault(k, v)
         insn_rl, block_rl, tokens = data_slice(metadata["data_offset"])
-        versions.append(
+        variants.append(
             FunctionData(
                 func_name, metadata, tokens, insn_rl, block_rl,
                 variant_tokens=_variant_tokens_from_row(variant_row),
             )
         )
-    return MatchedFunction(func_name, versions)
+    return MatchedFunction(func_name, variants)
 
 
 def build_unmatched_function_data(

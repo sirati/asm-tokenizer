@@ -82,7 +82,7 @@ def compare_matched_arm(
 
     csv_version_keys = {vdata["vkey"] for vdata in version_data_csv}
 
-    for memmap_version in matched_func.versions:
+    for memmap_version in matched_func.variants:
         vkey = VersionKey(
             arch=memmap_version.metadata["arch"],
             compiler=memmap_version.metadata["compiler"],

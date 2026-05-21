@@ -441,12 +441,12 @@ def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
         )
         fids = _build_fids_per_category(section)
         staging = _decode_to_staging(
-            matched.versions[0].full_token_stream(),
+            matched.variants[0].full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
             fids_per_category=fids,
             func_name=matched.func_name,
-            metadata=matched.versions[0].metadata,
+            metadata=matched.variants[0].metadata,
         )
         baseline_identities = {
             c: _compact_ids(staging.identities[c]) for c in Category
@@ -576,7 +576,7 @@ def test_splice_rejects_out_of_range_matched_version(splice_corpus_single):
     with BinarySession(
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
-        with pytest.raises(IndexError, match="version"):
+        with pytest.raises(IndexError, match="variant"):
             sess.splice_with_callees(0, arm="matched", max_depth=0, version=99)
 
 

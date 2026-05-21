@@ -1,5 +1,5 @@
 """
-MatchedFunction class for representing a function with multiple compilation versions.
+MatchedFunction class for representing a function with multiple compilation variants.
 """
 
 from typing import List
@@ -10,15 +10,15 @@ from .function_data import FunctionData
 
 
 class MatchedFunction:
-    """Represents a matched function with multiple versions."""
+    """Represents a matched function with multiple variants."""
 
-    def __init__(self, func_name: str, versions: List[FunctionData]):
+    def __init__(self, func_name: str, variants: List[FunctionData]):
         self.func_name = func_name
-        self.versions = versions
+        self.variants = variants
 
     def __len__(self):
-        """Return average token count across all versions."""
-        return int(np.mean([len(v) for v in self.versions]))
+        """Return average token count across all variants."""
+        return int(np.mean([len(v) for v in self.variants]))
 
     def __repr__(self):
-        return f"MatchedFunction({self.func_name}, {len(self.versions)} versions, avg {len(self)} tokens)"
+        return f"MatchedFunction({self.func_name}, {len(self.variants)} variants, avg {len(self)} tokens)"

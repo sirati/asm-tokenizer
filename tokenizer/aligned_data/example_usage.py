@@ -74,7 +74,7 @@ TYPICAL USAGE
     # Load matched functions for cross-version analysis
     functions = loader.load_matched_functions(n=10, target_length=128)
     for func in functions:
-        for version in func.versions:
+        for version in func.variants:
             print(f"{func.func_name}: {version.metadata['arch']}-{version.metadata['compiler']}")
             print(f"  Tokens: {version.tokens[:10]}...")
 
@@ -159,10 +159,10 @@ def example_load_matched_functions():
 
     for i, func in enumerate(functions, 1):
         print(f"\n--- Function {i}: {func.func_name} ---")
-        print(f"  Number of versions: {len(func.versions)}")
+        print(f"  Number of versions: {len(func.variants)}")
         print(f"  Average length: {len(func)} tokens")
 
-        for version in func.versions:
+        for version in func.variants:
             print(
                 f"    - {version.metadata['arch']}-{version.metadata['compiler']}-"
                 f"{version.metadata['opt']}: {len(version)} tokens"
@@ -186,7 +186,7 @@ def example_load_specific_length():
     functions = loader.load_matched_functions(n=3, target_length=target_length)
 
     for func in functions:
-        actual_lengths = [len(v) for v in func.versions]
+        actual_lengths = [len(v) for v in func.variants]
         print(f"  {func.func_name}: {min(actual_lengths)}-{max(actual_lengths)} tokens (avg: {len(func)})")
 
 
@@ -227,7 +227,7 @@ def example_load_random_sections():
     for i, section in enumerate(sections[:5], 1):  # Show first 5
         if isinstance(section, MatchedFunction):
             print(f"{i}. [MATCHED] {section.func_name}")
-            print(f"   {len(section.versions)} versions, avg {len(section)} tokens")
+            print(f"   {len(section.variants)} variants, avg {len(section)} tokens")
         else:  # FunctionData
             print(f"{i}. [UNMATCHED] {section.func_name}")
             print(f"   {len(section)} tokens")
@@ -282,9 +282,9 @@ def example_analyze_function_structure():
 
     func = functions[0]
     print(f"Analyzing function: {func.func_name}")
-    print(f"Versions: {len(func.versions)}")
+    print(f"Versions: {len(func.variants)}")
 
-    for version in func.versions:
+    for version in func.variants:
         print(f"\n  Version: {version.metadata['arch']}-{version.metadata['compiler']}-{version.metadata['opt']}")
         print(f"    Total tokens: {len(version.tokens)}")
         print(f"    Instructions: {len(version.insn_runlength)}")

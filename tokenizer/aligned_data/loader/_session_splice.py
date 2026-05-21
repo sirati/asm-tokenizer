@@ -189,27 +189,27 @@ class _BinarySessionSpliceMixin:
     # --- per-arm load wrappers ---------------------------------------
 
     def _load_matched_for_splice(  # type: ignore[no-untyped-def]
-        self, idx: int, version: int
+        self, idx: int, variant_index: int
     ) -> Tuple[FunctionData, Section, int]:
-        """Resolve one matched function-version for splicing.
+        """Resolve one matched function variant for splicing.
 
-        ``idx`` is the per-function idx; ``version`` is the index into
-        :py:attr:`MatchedFunction.versions`. Returns the single
+        ``idx`` is the per-function idx; ``variant_index`` is the index
+        into :py:attr:`MatchedFunction.variants`. Returns the single
         :class:`FunctionData`, the parsed :class:`Section`, and the
         section's BIN byte offset. Raises :class:`IndexError` if
-        ``version`` is out of range -- the caller chose to splice a
-        specific version, so silent wrap-around would hide the bug.
+        ``variant_index`` is out of range -- the caller chose to splice
+        a specific variant, so silent wrap-around would hide the bug.
         """
         section, section_offset, matched = (
             self._load_matched_section_and_versions(idx)
         )
-        if version < 0 or version >= len(matched.versions):
+        if variant_index < 0 or variant_index >= len(matched.variants):
             raise IndexError(
                 f"matched function idx={idx} ({matched.func_name!r}) has "
-                f"{len(matched.versions)} versions; version {version} "
-                "out of range"
+                f"{len(matched.variants)} variants; variant_index "
+                f"{variant_index} out of range"
             )
-        return matched.versions[version], section, section_offset
+        return matched.variants[variant_index], section, section_offset
 
     def _load_unmatched_for_splice(  # type: ignore[no-untyped-def]
         self, idx: int
@@ -244,8 +244,8 @@ class _BinarySessionSpliceMixin:
         section-call_target ordering.
 
         For ``arm="matched"`` ``version`` selects the index into the
-        :py:attr:`MatchedFunction.versions` list (default ``0`` -- the
-        first version). For ``arm="unmatched"`` ``version`` is ignored
+        :py:attr:`MatchedFunction.variants` list (default ``0`` -- the
+        first variant). For ``arm="unmatched"`` ``version`` is ignored
         (one record per FunctionData by construction); callers must
         pass the per-record idx the same way
         :py:meth:`BinarySession.load_unmatched` does.

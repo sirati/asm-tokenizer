@@ -36,8 +36,8 @@ def test_session_opens_and_closes_cleanly(synthetic_binary):
     with sess:
         m = sess.load_matched(0)
         assert m.func_name == "my_func"
-        assert len(m.versions) == 2
-        v = m.versions[0]
+        assert len(m.variants) == 2
+        v = m.variants[0]
         # variant resolver attached the filename + axes
         assert v.metadata.get("filename") == "tinybin-x64-gcc-13.2.0-O2"
         assert v.metadata.get("arch") == "x64"
