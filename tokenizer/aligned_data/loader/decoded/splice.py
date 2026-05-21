@@ -8,16 +8,15 @@ identity-space compaction pass at the top level so the final
 
 The splicer is **pure on its inputs**: callee decode + presence are
 delegated to ``decode_callee_to_staging`` and ``is_callee_present``
-callbacks supplied by the caller. The Phase-4 wiring closes those
+callbacks supplied by the caller. The session wiring closes those
 callbacks over a ``BinarySession``; this module's tests close them over
 hand-built stubs.
 
-Algorithm (per plan ``## Algorithm changes`` + ``## Locked-in decisions``
-items 8, 9, 13, 19, 22, 26, 28, 30, 31):
+Algorithm:
 
-* Cycle key = ``(arm, section_offset)`` (decision 13). Initialised with
-  the root's own key, so a callee that recurses back into the root is
-  caught on the first level.
+* Cycle key = ``(arm, section_offset)``. Initialised with the root's
+  own key, so a callee that recurses back into the root is caught on
+  the first level.
 * Depth budget decrements once per recursion step. At ``depth == 0`` or
   on an empty ``call_targets`` list, the walker returns the staging
   unchanged.
@@ -26,14 +25,32 @@ items 8, 9, 13, 19, 22, 26, 28, 30, 31):
   callee's globally-unique FID, so the same callee gets the same value
   everywhere; per-function-counter categories carry per-source values
   that compaction densifies).
-* Top-level compaction (:func:`_compact_ids`, plan Decision 28) maps
-  the per-Category value space to a dense ``[0, K)`` range,
-  first-occurrence wins. Aliases collapse to the same compacted id;
-  sentinel positions map to the reserved u16 sentinel ``0xFFFF``.
-* DAG-active-path visited semantics: a callee FID is added to
+* Top-level compaction (:func:`_compact_ids`) maps the per-Category
+  value space to a dense ``[0, K)`` range, first-occurrence wins.
+  Aliases collapse to the same compacted id; sentinel positions map to
+  the reserved u16 sentinel ``0xFFFF``.
+* DAG-active-path visited semantics: a callee key is added to
   ``visited`` before recursion and removed after. A callee reachable
   through two separate branches gets spliced once per visit; only an
   *active* call chain back to itself blocks the recursion.
+
+Variant selection state (threaded through every recursion level):
+
+* ``primary_variant_idx`` -- the v_idx in ``section.variants`` whose
+  body was decoded into ``root_staging`` (or, at deeper levels, into
+  the callee's staging). Drives the per-call-target callee variant
+  pick (see ``_choose_callee_variant``).
+* ``initial_selection_vkeys`` -- the frozenset of vkeys (variant_ref_
+  offset values) that the session sampled for this splice. The walker
+  intersects each section's variants against this set to derive the
+  in-section selection. Used by the inlining-equivalence check (when
+  on) and by the recursion-level narrowing (also when on).
+* ``inlined_equivalent_call_targets_only`` -- heuristic for compiler
+  inlining: when True, the walker skips a callee K iff EVERY selected
+  variant called K (no inlining variation) OR NONE did (call site
+  belongs to a variant outside the selection). When False, the
+  selection state is threaded through unchanged but does not gate
+  recursion.
 """
 
 from __future__ import annotations
@@ -46,6 +63,12 @@ from tokenizer.tokens import Category
 
 from .decoded_function import DecodedFunction
 from .extract import _StagingDecoded
+from ._variant_selection import (
+    called_by_in_selection as _called_by_in_selection,
+    choose_callee_variant as _choose_callee_variant,
+    narrow_selection_vkeys as _narrow_selection_vkeys,
+    selection_v_idxs_in_section as _selection_v_idxs_in_section,
+)
 
 
 # Public uint16 sentinel that consumers see in the post-compaction
@@ -201,9 +224,14 @@ def splice_with_callees(
     root_arm: str,
     root_section,
     root_section_offset: int,
-    decode_callee_to_staging: Callable[[int, str], Tuple[_StagingDecoded, object]],
+    decode_callee_to_staging: Callable[
+        [int, str, int], Tuple[_StagingDecoded, object]
+    ],
     is_callee_present: Callable[[int, str], bool],
     max_depth: int,
+    primary_variant_idx: int,
+    initial_selection_vkeys: frozenset,
+    inlined_equivalent_call_targets_only: bool = False,
 ) -> DecodedFunction:
     """Depth-capped DFS splice with top-level per-Category compaction.
 
@@ -217,20 +245,25 @@ def splice_with_callees(
             per-source values that compaction densifies.
         root_arm: ``"matched"`` or ``"unmatched"`` -- the arm the root
             was loaded from. Propagated into the cycle key alongside
-            section offsets (plan Decision 13).
+            section offsets.
         root_section: Section object describing the root's
-            ``call_targets``. Only the ``call_targets`` attribute is
-            read; each call_target must expose ``function_section_ptr``
-            (callee section offset).
+            ``call_targets`` + ``variants``. Each call_target must
+            expose ``function_section_ptr`` (callee section offset).
+            Each variant must expose ``variant_ref_offset`` (vkey) and
+            ``per_call_entries`` (``list[tuple[called_idx,
+            section_variant_index]]``).
         root_section_offset: Section offset of the root itself. Seeded
             into the visited set so a callee that recurses back into
             the root is caught on the first level.
-        decode_callee_to_staging: ``(callee_section_offset, arm) ->
-            (_StagingDecoded, callee_section)`` callback. Loads +
-            FID-resolved-decodes the callee and returns its own parsed
-            section so the walker can recurse on the callee's
-            call_targets. Phase 4 wires this through
-            :class:`BinarySession`; tests inject a stub.
+        decode_callee_to_staging: ``(callee_section_offset, arm,
+            callee_variant_index) -> (_StagingDecoded, callee_section)``
+            callback. Loads + FID-resolved-decodes the callee at the
+            requested variant index and returns its own parsed section
+            so the walker can recurse on the callee's call_targets +
+            variants. The session wiring closes this over a
+            :class:`BinarySession`; tests inject a stub. The third arg
+            is computed by the walker from the caller's
+            ``per_call_entries`` (see ``_choose_callee_variant``).
         is_callee_present: ``(callee_section_offset, arm) -> bool``.
             Returns ``True`` iff the callee was emitted in the requested
             arm and will resolve via ``decode_callee_to_staging``. Externs
@@ -240,6 +273,21 @@ def splice_with_callees(
         max_depth: Recursion budget. ``0`` returns the (compacted) root
             staging unchanged. Each level of nested callee consumes one
             budget unit.
+        primary_variant_idx: v_idx in ``root_section.variants`` whose
+            body was decoded into ``root_staging``. Drives the callee
+            variant pick at this level (and, recursively, at deeper
+            levels via the per_call_entries lookup).
+        initial_selection_vkeys: Frozenset of vkeys
+            (``variant_ref_offset`` values) that the caller sampled for
+            this splice. Used for the inlining-equivalence check (when
+            on) and the recursion-level narrowing (also when on).
+        inlined_equivalent_call_targets_only: When True, a callee K is
+            spliced iff SOME variants in the current selection called
+            it AND some didn't (heuristic for compiler inlining: the
+            variants that didn't call K presumably inlined its body).
+            When False (default), every call_target K is considered
+            for splicing -- standard legacy behavior, modulo cycle +
+            presence gates.
 
     Returns:
         A :class:`DecodedFunction` whose arrays are the concatenation of
@@ -260,6 +308,9 @@ def splice_with_callees(
         visited=visited,
         decode_callee_to_staging=decode_callee_to_staging,
         is_callee_present=is_callee_present,
+        primary_variant_idx=primary_variant_idx,
+        current_selection_vkeys=initial_selection_vkeys,
+        inlining_flag=inlined_equivalent_call_targets_only,
     )
 
     # ---- Top-level per-Category compaction (plan Decision 30) ----
@@ -289,8 +340,13 @@ def _decode_then_splice(
     arm: str,
     depth: int,
     visited: set,
-    decode_callee_to_staging: Callable[[int, str], Tuple[_StagingDecoded, object]],
+    decode_callee_to_staging: Callable[
+        [int, str, int], Tuple[_StagingDecoded, object]
+    ],
     is_callee_present: Callable[[int, str], bool],
+    primary_variant_idx: int,
+    current_selection_vkeys: frozenset,
+    inlining_flag: bool,
 ) -> _StagingDecoded:
     """Recursive worker. See :func:`splice_with_callees` for the contract.
 
@@ -303,8 +359,12 @@ def _decode_then_splice(
     if depth == 0 or len(section.call_targets) == 0:
         return staging
 
+    selection_v_idxs_here = _selection_v_idxs_in_section(
+        section, current_selection_vkeys
+    )
+
     callee_pieces: list[_StagingDecoded] = []
-    for ct in section.call_targets:
+    for called_idx, ct in enumerate(section.call_targets):
         callee_offset = ct.function_section_ptr
         cycle_key = (arm, callee_offset)
 
@@ -317,11 +377,42 @@ def _decode_then_splice(
             # call-site tokens stay, body NOT spliced.
             continue
 
+        called_by_sel = _called_by_in_selection(
+            section, selection_v_idxs_here, called_idx
+        )
+        if inlining_flag:
+            # Inlining-equivalence heuristic: skip K iff every selected
+            # variant called it (no inlining variation) or none did
+            # (call site belongs to a variant outside the selection).
+            # Only the "some called, some didn't" case adds signal.
+            if not called_by_sel or called_by_sel == selection_v_idxs_here:
+                continue
+
+        callee_variant_idx = _choose_callee_variant(
+            section,
+            primary_variant_idx,
+            called_by_sel,
+            called_idx,
+        )
+
         visited.add(cycle_key)
         try:
             callee_staging, callee_section = decode_callee_to_staging(
-                callee_offset, arm
+                callee_offset, arm, callee_variant_idx
             )
+            if inlining_flag:
+                new_selection_vkeys = _narrow_selection_vkeys(
+                    section,
+                    callee_section,
+                    called_by_sel,
+                    called_idx,
+                )
+            else:
+                # Flag OFF: thread the original selection through
+                # unchanged. The selection has no semantic effect when
+                # the inlining check is off, so a branched recursion
+                # signature would be wasted complexity.
+                new_selection_vkeys = current_selection_vkeys
             callee_subtree = _decode_then_splice(
                 staging=callee_staging,
                 section=callee_section,
@@ -330,6 +421,9 @@ def _decode_then_splice(
                 visited=visited,
                 decode_callee_to_staging=decode_callee_to_staging,
                 is_callee_present=is_callee_present,
+                primary_variant_idx=callee_variant_idx,
+                current_selection_vkeys=new_selection_vkeys,
+                inlining_flag=inlining_flag,
             )
         finally:
             # DAG-active-path semantics: a callee reachable via a

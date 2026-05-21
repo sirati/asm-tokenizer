@@ -32,9 +32,35 @@ class _StubCallTarget:
         self.is_matched = True
 
 
+class _StubVariant:
+    """Single-variant default mirroring ``test_splice._StubVariant``."""
+
+    def __init__(
+        self,
+        per_call_entries: List[Tuple[int, int]],
+        variant_ref_offset: int = 0,
+    ) -> None:
+        self.per_call_entries = per_call_entries
+        self.variant_ref_offset = variant_ref_offset
+
+
 class _StubSection:
     def __init__(self, call_targets: List[_StubCallTarget]) -> None:
         self.call_targets = call_targets
+        # Default single-variant section: every call_target maps to
+        # J=0 in the only variant. Mirrors test_splice._StubSection so
+        # the saturation tests pass through the new walker contract
+        # without behavior change.
+        self.variants = [
+            _StubVariant(
+                per_call_entries=[(i, 0) for i in range(len(call_targets))],
+                variant_ref_offset=0,
+            )
+        ]
+
+
+_DEFAULT_PRIMARY_VARIANT_IDX = 0
+_DEFAULT_SELECTION_VKEYS = frozenset({0})
 
 
 def _make_staging_with_block_ids(
@@ -90,7 +116,14 @@ def test_block_compaction_no_saturation_at_depth_3() -> None:
         400: (d, _StubSection([])),
     }
 
-    def decode_callee_to_staging(offset: int, arm: str):
+    def decode_callee_to_staging(
+        offset: int, arm: str, callee_variant_index: int
+    ):
+        # Single-variant section default: J must always be 0.
+        assert callee_variant_index == 0, (
+            f"saturation test stub expects callee_variant_index=0; "
+            f"got {callee_variant_index}"
+        )
         return table[offset]
 
     def is_callee_present(offset: int, arm: str) -> bool:
@@ -104,6 +137,8 @@ def test_block_compaction_no_saturation_at_depth_3() -> None:
         decode_callee_to_staging=decode_callee_to_staging,
         is_callee_present=is_callee_present,
         max_depth=3,
+        primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+        initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
     )
 
     block = out.identities[Category.BLOCK]
@@ -147,7 +182,14 @@ def test_block_compaction_disjoint_ids_dense_output() -> None:
         400: (stagings[3], _StubSection([])),
     }
 
-    def decode_callee_to_staging(offset: int, arm: str):
+    def decode_callee_to_staging(
+        offset: int, arm: str, callee_variant_index: int
+    ):
+        # Single-variant section default: J must always be 0.
+        assert callee_variant_index == 0, (
+            f"saturation test stub expects callee_variant_index=0; "
+            f"got {callee_variant_index}"
+        )
         return table[offset]
 
     def is_callee_present(offset: int, arm: str) -> bool:
@@ -161,6 +203,8 @@ def test_block_compaction_disjoint_ids_dense_output() -> None:
         decode_callee_to_staging=decode_callee_to_staging,
         is_callee_present=is_callee_present,
         max_depth=3,
+        primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+        initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
     )
     block = out.identities[Category.BLOCK]
     assert block.size == 200

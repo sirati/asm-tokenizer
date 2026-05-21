@@ -107,14 +107,51 @@ class _StubCallTarget:
         self.is_matched = is_matched
 
 
+class _StubVariant:
+    """Duck-type for ``aligned_data.matched_sections_bin.VariantBlock``.
+
+    Only the two attributes the walker reads are exposed:
+
+    * ``per_call_entries: list[tuple[int, int]]`` -- (called_idx,
+      section_variant_index) pairs.
+    * ``variant_ref_offset: int`` -- the vkey (variant_ref_offset on
+      the real type).
+    """
+
+    def __init__(
+        self,
+        per_call_entries: List[Tuple[int, int]],
+        variant_ref_offset: int = 0,
+    ):
+        self.per_call_entries = per_call_entries
+        self.variant_ref_offset = variant_ref_offset
+
+
 class _StubSection:
     """Duck-type for ``aligned_data.matched_sections_bin.Section``.
 
-    Only ``call_targets`` is read.
+    Reads ``call_targets`` + ``variants``. Default ``variants`` builds
+    a single variant with ``vkey=0`` whose ``per_call_entries`` maps
+    each call_target index to ``section_variant_index=0`` -- the
+    legacy single-variant default that all pre-variants tests inherit.
     """
 
-    def __init__(self, call_targets: List[_StubCallTarget]):
+    def __init__(
+        self,
+        call_targets: List[_StubCallTarget],
+        variants: "List[_StubVariant] | None" = None,
+    ):
         self.call_targets = call_targets
+        if variants is None:
+            variants = [
+                _StubVariant(
+                    per_call_entries=[
+                        (i, 0) for i in range(len(call_targets))
+                    ],
+                    variant_ref_offset=0,
+                )
+            ]
+        self.variants = variants
 
 
 def _make_table(
@@ -123,19 +160,37 @@ def _make_table(
     """Build a ``(decode_callee_to_staging, is_callee_present, table)`` triple.
 
     ``entries`` is ``(section_offset, staging, call_targets_list)``.
+    The callback accepts the new ``callee_variant_index`` arg per the
+    walker contract and ignores it (the default stub section's per_call
+    entries always map J=0).
     """
     table: Dict[int, Tuple[_StagingDecoded, _StubSection]] = {
         offset: (staging, _StubSection(call_targets))
         for offset, staging, call_targets in entries
     }
 
-    def decode_callee_to_staging(offset: int, arm: str):
+    def decode_callee_to_staging(
+        offset: int, arm: str, callee_variant_index: int
+    ):
+        # Default stub: per_call_entries maps J=0 for every call_target,
+        # so the walker should always request J=0 here. The assertion
+        # is cheap and catches regressions in the J propagation path.
+        assert callee_variant_index == 0, (
+            f"default _make_table stub expects callee_variant_index=0; "
+            f"got {callee_variant_index}"
+        )
         return table[offset]
 
     def is_callee_present(offset: int, arm: str) -> bool:
         return offset in table
 
     return decode_callee_to_staging, is_callee_present, table
+
+
+# Single-variant defaults: every legacy test instantiates the walker
+# with these to match the pre-variants behavior under the new API.
+_DEFAULT_PRIMARY_VARIANT_IDX = 0
+_DEFAULT_SELECTION_VKEYS = frozenset({0})
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +343,8 @@ class TestDepthZeroAndEmpty:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=0,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.real_tokens, root.real_tokens)
         # Root LOCAL_FUNC = [42, 99, 42] -> compacted [0, 1, 0].
@@ -318,6 +375,8 @@ class TestDepthZeroAndEmpty:
                 decode_callee_to_staging=decode_callee,
                 is_callee_present=is_callee_present,
                 max_depth=depth,
+                primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+                initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
             )
             np.testing.assert_array_equal(out.real_tokens, root.real_tokens)
             np.testing.assert_array_equal(
@@ -340,6 +399,8 @@ class TestDepthZeroAndEmpty:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=2,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.real_tokens, root.real_tokens)
         np.testing.assert_array_equal(
@@ -380,6 +441,8 @@ class TestSingleCalleeCompaction:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(
             out.identities[Category.LOCAL_FUNC], [0, 1, 2, 0, 3]
@@ -405,6 +468,8 @@ class TestSingleCalleeCompaction:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         # Empty + [10, 20, 10] -> compact [0, 1, 0].
         np.testing.assert_array_equal(
@@ -443,6 +508,8 @@ class TestTwoCalleesShareFid:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(
             out.identities[Category.LOCAL_FUNC], [0, 0]
@@ -474,6 +541,8 @@ class TestSentinelOnSplice:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         # Concat: [10, sentinel, 99, sentinel, 5]
         # Compact: [0, 0xFFFF, 1, 0xFFFF, 2]
@@ -517,6 +586,8 @@ class TestAllCategoriesIndependent:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
 
         # Per Category, concat is (root_ids + [0, 2]); compaction gives
@@ -561,6 +632,8 @@ class TestCycleDetection:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=3,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.real_tokens, root.real_tokens)
         np.testing.assert_array_equal(
@@ -594,6 +667,8 @@ class TestCycleDetection:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=2,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
 
         np.testing.assert_array_equal(
@@ -633,6 +708,8 @@ class TestCycleDetection:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.real_tokens, [300, 400, 400])
         # Concat: [42, 99, 99]; compact [0, 1, 1] -- B's body spliced
@@ -672,6 +749,8 @@ class TestDepthCapBudget:
             decode_callee_to_staging=dc,
             is_callee_present=icp,
             max_depth=3,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(
             out.real_tokens, [300, 400, 500, 600]
@@ -687,6 +766,8 @@ class TestDepthCapBudget:
             decode_callee_to_staging=dc,
             is_callee_present=icp,
             max_depth=2,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.real_tokens, [300, 400, 500])
 
@@ -700,6 +781,8 @@ class TestDepthCapBudget:
             decode_callee_to_staging=dc,
             is_callee_present=icp,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.real_tokens, [300, 400])
 
@@ -734,6 +817,8 @@ class TestRootMetadataPropagation:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         assert out.func_name == "caller"
         assert out.metadata == {"origin": "caller"}
@@ -769,6 +854,8 @@ class TestNumberConcat:
             decode_callee_to_staging=decode_callee,
             is_callee_present=is_callee_present,
             max_depth=1,
+            primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+            initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
         )
         np.testing.assert_array_equal(out.numbers_significant, [1, 2, 99])
         np.testing.assert_array_equal(
@@ -795,6 +882,8 @@ class TestPublicGuards:
                 decode_callee_to_staging=decode_callee,
                 is_callee_present=is_callee_present,
                 max_depth=-1,
+                primary_variant_idx=_DEFAULT_PRIMARY_VARIANT_IDX,
+                initial_selection_vkeys=_DEFAULT_SELECTION_VKEYS,
             )
 
 
