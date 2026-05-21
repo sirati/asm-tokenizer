@@ -197,13 +197,24 @@ def _extract_identities(
 ) -> Dict[Category, np.ndarray]:
     """Build one uint16 array per ``Category``.
 
+    Pre-fills every ``Category`` member with an empty uint16 array so
+    the returned dict always carries the full 8-key set regardless of
+    which Categories the caller's ``id_token_ids`` map covers.  Any
+    Category present in ``id_token_ids`` then overwrites its empty
+    slot with the decoded occurrences; Categories absent from
+    ``id_token_ids`` keep their empty array (the vocab does not
+    advertise that TokenType, so there are by definition zero
+    occurrences in the stream).
+
     Pure read pass over ``raw_tokens``; never touches the number arm's
     working buffer.  Iteration order over positions is stream-ascending
     (``_iter_token_occurrences`` yields in ``np.nonzero`` ascending order),
     so the per-category array order matches the order of category-token
     occurrences in the final post-strip real-token stream.
     """
-    identities: Dict[Category, np.ndarray] = {}
+    identities: Dict[Category, np.ndarray] = {
+        category: np.empty(0, dtype=np.uint16) for category in Category
+    }
     for category, type_token_id in id_token_ids.items():
         values_list: List[int] = []
         for _position, payload in _iter_token_occurrences(

@@ -427,3 +427,84 @@ def test_interleaved_multi_chunk_sources_preserve_per_source_chunk_contiguity():
             f"sign_exp mismatch at side-array index {idx}: "
             f"expected {int(sign_exp):#x}, got {int(out.numbers_sign_exponent[idx]):#x}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Partial vocab: missing TokenTypes are silently absent from the id maps;
+# the decoder must still return a DecodedFunction with all 8 Category keys.
+# ---------------------------------------------------------------------------
+
+
+def test_partial_vocab_decode_succeeds_with_empty_identity_arrays_for_missing_types():
+    """A vocab that only exposes LOCAL_FUNC (identity) + FLOAT64 (number)
+    yields ``id_token_ids`` / ``number_token_ids`` dicts smaller than the
+    canonical 8 / 7.  ``decode_raw_tokens`` must:
+
+    - keep all 8 ``Category`` keys in ``identities`` (the
+      ``DecodedFunction.__post_init__`` invariant);
+    - populate LOCAL_FUNC with the decoded values;
+    - leave the other 7 Category arrays empty (length 0);
+    - emit number side-array entries ONLY for FLOAT64 (the only
+      number-token type the partial vocab advertises).
+
+    Crucially the stream contains a real-token id (303) that the partial
+    vocab does NOT recognise.  Because nothing in the partial map points
+    at 303, that token is preserved verbatim in the real-token stream
+    but never appears in any identity / number side array — vocab
+    incompleteness leaves stream content untouched, only the side-
+    channel decoding is partial.
+    """
+    # Build the partial id maps directly — bypassing the resolver — so
+    # this test isolates ``decode_raw_tokens``'s handling of partial maps
+    # from the resolver's "absent TokenType -> omitted key" behaviour
+    # (which is covered in test_category_tokens.py).
+    id_token_ids = {Category.LOCAL_FUNC: 301}
+    number_token_ids = {TokenType.FLOAT64: 404}
+
+    # Stream: LOCAL_FUNC(5), <unknown real-token 303>, FLOAT64(2.5), FLOAT64(4.5).
+    bits_a = struct.unpack(">Q", struct.pack(">d", 2.5))[0]
+    bits_b = struct.unpack(">Q", struct.pack(">d", 4.5))[0]
+    a_bytes = tuple(bits_a.to_bytes(8, byteorder="big", signed=False))
+    b_bytes = tuple(bits_b.to_bytes(8, byteorder="big", signed=False))
+    raw = _u16(
+        301, 5,               # LOCAL_FUNC = 5
+        303,                  # unknown real-token (id 303 — partial vocab ignores it)
+        404, *a_bytes,        # FLOAT64 = 2.5
+        404, *b_bytes,        # FLOAT64 = 4.5
+    )
+
+    out = decode_raw_tokens(
+        raw,
+        id_token_ids=id_token_ids,
+        number_token_ids=number_token_ids,
+        func_name="t",
+    )
+
+    # All 8 Category keys are present (DecodedFunction invariant).
+    assert set(out.identities.keys()) == set(Category)
+
+    # LOCAL_FUNC carries the decoded value.
+    np.testing.assert_array_equal(
+        out.identities[Category.LOCAL_FUNC], _u16(5)
+    )
+
+    # Every other Category is empty.
+    for category in Category:
+        if category is Category.LOCAL_FUNC:
+            continue
+        assert out.identities[category].shape == (0,), (
+            f"{category.name} should be empty but has shape "
+            f"{out.identities[category].shape}"
+        )
+
+    # FLOAT64 side-array entries: one per occurrence.
+    expected_numbers = from_float64(bits_a) + from_float64(bits_b)
+    assert out.numbers_significant.shape == (len(expected_numbers),)
+    assert out.numbers_sign_exponent.shape == (len(expected_numbers),)
+    for idx, (sig, sign_exp) in enumerate(expected_numbers):
+        assert int(out.numbers_significant[idx]) == int(sig)
+        assert int(out.numbers_sign_exponent[idx]) == int(sign_exp)
+
+    # Real-token stream preserves the unknown id 303 verbatim alongside
+    # LOCAL_FUNC + the two FLOAT64 occurrences.
+    np.testing.assert_array_equal(out.real_tokens, _u16(301, 303, 404, 404))

@@ -188,25 +188,54 @@ def test_resolvers_are_idempotent() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_missing_category_type_raises() -> None:
-    """A vocab that omits one Category's TokenType raises ``ValueError``."""
+def test_missing_category_silently_omitted() -> None:
+    """A vocab that lacks one Category's TokenType silently omits that
+    Category from the returned dict.  No raise: corpora may legitimately
+    lack TokenTypes whose source data was never encountered."""
     stub = _build_stub_vocab(omit=TokenType.JUMP_TABLE)
 
-    with pytest.raises(ValueError) as excinfo:
-        resolve_category_token_ids(stub)
+    result = resolve_category_token_ids(stub)
 
-    assert "JUMP_TABLE" in str(excinfo.value)
-    assert "missing" in str(excinfo.value).lower()
+    assert Category.JUMP_TABLE not in result
+    assert len(result) == 7
+    # Every other Category is still present + at a valid id.
+    for category in Category:
+        if category is Category.JUMP_TABLE:
+            continue
+        assert category in result
+        assert result[category] >= 256
 
 
-def test_missing_number_type_raises() -> None:
-    """A vocab that omits one number TokenType raises ``ValueError``."""
+def test_missing_number_type_silently_omitted() -> None:
+    """A vocab that lacks one number TokenType silently omits that
+    TokenType from the returned dict; the result has fewer than 7 keys
+    and the other number types are still resolved."""
     stub = _build_stub_vocab(omit=TokenType.FLOAT128)
 
-    with pytest.raises(ValueError) as excinfo:
-        resolve_number_token_ids(stub)
+    result = resolve_number_token_ids(stub)
 
-    assert "FLOAT128" in str(excinfo.value)
+    assert TokenType.FLOAT128 not in result
+    assert len(result) == 6
+    for token_type in _NUMBER_TOKEN_TYPES:
+        if token_type is TokenType.FLOAT128:
+            continue
+        assert token_type in result
+        assert result[token_type] >= 256
+
+
+def test_resolvers_return_empty_when_vocab_has_no_v2_type_tokens() -> None:
+    """A vocab carrying ONLY digit tokens (no v2 type-token at >=256)
+    returns an empty dict from both resolvers — every TokenType is
+    absent, every TokenType is silently omitted, no raise."""
+    capacity = 512
+    arr = np.full(capacity, TokenType.UNRESOLVED, dtype=np.int8)
+    stub = SimpleNamespace(id_to_token_type=arr)
+
+    cat_result = resolve_category_token_ids(stub)
+    num_result = resolve_number_token_ids(stub)
+
+    assert cat_result == {}
+    assert num_result == {}
 
 
 def test_duplicate_category_type_raises() -> None:

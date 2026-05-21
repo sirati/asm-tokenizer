@@ -8,10 +8,17 @@ ids — no further string lookups, no hardcoded ids leaking into the
 extract / splice passes.
 
 The resolver consults ``vocab_manager.id_to_token_type`` — the int8
-ndarray indexed by vocab id, holding ``TokenType`` values — and asserts
-that each requested TokenType maps to exactly one vocab id. Anything
-else (zero matches, multiple matches, or an id outside the valid
-[256, vocab_size) range) is a bug in the vocab and raises a typed
+ndarray indexed by vocab id, holding ``TokenType`` values. A requested
+TokenType that has **zero matches** is silently omitted from the
+returned dict: real corpora may legitimately lack a TokenType whose
+source data was never encountered (e.g. an unmatched-only corpus
+without EXT_FUNC, or a no-bigfloat corpus without FLOAT80/FLOAT128).
+Downstream consumers handle the absent-key case by treating the
+identity / number side-array as empty for that TokenType.
+
+Anything that IS in the vocab but in a malformed state — multiple
+matches for the same TokenType, or a match in the reserved [0, 256)
+digit-slot range — is a real vocab bug and still raises a typed
 ``ValueError`` immediately rather than silently producing a wrong
 decode.
 
@@ -77,12 +84,14 @@ def _resolve_token_type_ids(
     vocab_manager: "VocabularyManager",
     token_types: Iterable[TokenType],
 ) -> dict[TokenType, int]:
-    """Map each TokenType to its unique uint16 vocab id.
+    """Map each present TokenType to its unique uint16 vocab id.
 
     The mapping is derived by scanning ``vocab_manager.id_to_token_type``
-    once. Each requested TokenType must appear at exactly one vocab id
-    in the [256, vocab_size) range; otherwise the vocab is malformed
-    for the decoded pipeline and the caller is told loudly.
+    once. A requested TokenType with **zero matches** is silently
+    omitted from the returned dict (vocabs derived from corpora that
+    never encountered that TokenType legitimately lack it). A TokenType
+    with **multiple matches** or a match in the reserved [0, 256)
+    digit-slot range is a malformed vocab and raises ``ValueError``.
     """
     type_array = np.asarray(vocab_manager.id_to_token_type)
 
@@ -90,12 +99,9 @@ def _resolve_token_type_ids(
     for token_type in token_types:
         positions = np.flatnonzero(type_array == int(token_type))
         if positions.size == 0:
-            raise ValueError(
-                f"vocab is missing the v2 type-token for {token_type.name} "
-                f"(TokenType={int(token_type)}); the decoded pipeline "
-                "requires a v1 unified vocab that exposes every v2 "
-                "category + number token."
-            )
+            # Absent TokenType: silently omitted. Consumers treat the
+            # corresponding side-array as empty for this TokenType.
+            continue
         if positions.size > 1:
             raise ValueError(
                 f"vocab has {positions.size} entries tagged with "
@@ -122,12 +128,14 @@ def _resolve_token_type_ids(
 def resolve_category_token_ids(
     vocab_manager: "VocabularyManager",
 ) -> dict[Category, int]:
-    """Map every v2 identity ``Category`` to its uint16 vocab id.
+    """Map every present v2 identity ``Category`` to its uint16 vocab id.
 
-    Returns one entry per ``Category`` member (exactly 8). Each value is
-    the unique vocab id whose ``id_to_token_type`` slot holds the
-    matching v2 TokenType. Raises ``ValueError`` if any required type
-    is missing or duplicated in the vocab.
+    Returns one entry per ``Category`` whose backing TokenType is
+    present in the vocab. A Category whose TokenType has zero matches
+    in ``vocab_manager.id_to_token_type`` is silently omitted from the
+    returned dict — the result may be a proper subset of ``Category``.
+    Raises ``ValueError`` only when a TokenType is malformed
+    (duplicate ids, or an id in the reserved [0, 256) range).
     """
     type_to_id = _resolve_token_type_ids(
         vocab_manager, _CATEGORY_TO_TOKEN_TYPE.values()
@@ -135,16 +143,19 @@ def resolve_category_token_ids(
     return {
         category: type_to_id[token_type]
         for category, token_type in _CATEGORY_TO_TOKEN_TYPE.items()
+        if token_type in type_to_id
     }
 
 
 def resolve_number_token_ids(
     vocab_manager: "VocabularyManager",
 ) -> dict[TokenType, int]:
-    """Map every number-carrying v2 ``TokenType`` to its uint16 vocab id.
+    """Map every present number-carrying v2 ``TokenType`` to its uint16 vocab id.
 
-    Returns one entry per number TokenType (exactly 7: VALUED_CONST_V2
-    plus the six FLOAT* variants). Same single-match invariant as
+    Returns one entry per number TokenType whose tag exists in the
+    vocab. A TokenType with zero matches is silently omitted from the
+    returned dict (so the result may have fewer than the 7 canonical
+    keys). Same malformed-vocab raise contract as
     :func:`resolve_category_token_ids`.
     """
     return _resolve_token_type_ids(vocab_manager, _NUMBER_TOKEN_TYPES)
