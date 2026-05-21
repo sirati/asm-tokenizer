@@ -91,7 +91,13 @@ def process_matched_function(
         version_data.append(
             {
                 "vkey": version_keys[variant_index],
-                "called": set(rec.called_funcs),
+                # Per-variant typed callee iterable in the parsed-record's
+                # encoder allocation order (categories concatenated LOCAL
+                # -> PLT -> EXT). Stored as a list so the downstream
+                # per-variant inlining-data emit can walk it in encounter
+                # order; the matched-arm table-level order comes from
+                # ``unique_called`` separately (plan Decisions 20 + 21).
+                "called": list(rec.called_funcs),
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
@@ -161,7 +167,12 @@ def process_unmatched_function(
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
-                "called": set(rec.called_funcs),
+                # Per-variant typed callee iterable in the parsed-record's
+                # encoder allocation order. Stored as a list so the
+                # unmatched grouper's order-preserving union (and the
+                # downstream per-variant inlining-data emit) walk it in
+                # encounter order (plan Decisions 20 + 21).
+                "called": list(rec.called_funcs),
                 "extern_libraries": dict(rec.extern_libraries),
             }
         )

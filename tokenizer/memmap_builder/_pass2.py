@@ -197,7 +197,7 @@ def _build_call_targets_spec(
 
 def _emit_variant_per_call_entries(
     section_writer: SectionWriter,
-    variant_called: "set[TypedCallee]",
+    variant_called: "list[TypedCallee]",
     unique_called_index_map: "dict[TypedCallee, int]",
     callee_vkey,
     registry: FunctionNamesRegistry,
@@ -347,7 +347,7 @@ def write_matched_sections_pass2(
 
         for vdata in version_data:
             vkey = vdata["vkey"]
-            called: "set[TypedCallee]" = vdata["called"]
+            called: "list[TypedCallee]" = vdata["called"]
             data_offset = vdata["data_offset"]
 
             variant_ref = variants.ref(vkey)
@@ -422,6 +422,16 @@ def group_unmatched_entries_by_function(
     variants on the SAME extern name is a builder bug; the first
     encountered library wins and a warning is logged at the BIN-
     emission site (this aggregator stays I/O-free).
+
+    ``all_called`` is an order-preserving union of every version's
+    ``entry["called"]`` iterable: first-seen wins, subsequent versions'
+    novel callees append at the tail. Per-category sub-order (LOCAL ->
+    PLT -> EXT) is whatever the upstream parsed-record layer carries;
+    this aggregator stays category-agnostic. Implemented via an
+    insertion-ordered ``dict`` whose keys are the typed callee tuples
+    (values are placeholder ``None``); CPython 3.7+ dict iteration
+    preserves insertion order, so ``list(all_called)`` downstream is
+    the encoder-allocation-order union (plan Decisions 20 + 21).
     """
     unmatched_by_func: Dict[str, dict] = {}
     for entry in unmatched_data_entries:
@@ -430,7 +440,7 @@ def group_unmatched_entries_by_function(
 
         if func_name not in unmatched_by_func:
             unmatched_by_func[func_name] = {
-                "all_called": set(),
+                "all_called": {},
                 "version_data_list": [],
                 "called_by_version": [],
                 "vkeys": [],
@@ -438,7 +448,10 @@ def group_unmatched_entries_by_function(
             }
 
         group = unmatched_by_func[func_name]
-        group["all_called"].update(entry["called"])
+        all_called = group["all_called"]
+        for typed_callee in entry["called"]:
+            if typed_callee not in all_called:
+                all_called[typed_callee] = None
         group["version_data_list"].append(
             (entry["data_offset"], entry["data_len"], entry["token_len"])
         )
@@ -561,7 +574,7 @@ def write_unmatched_sections_pass2(
     unmatched_by_func = group_unmatched_entries_by_function(unmatched_data_entries)
 
     for func_name, data in unmatched_by_func.items():
-        all_called: "set[TypedCallee]" = data["all_called"]
+        all_called: "dict[TypedCallee, None]" = data["all_called"]
         version_data_list = data["version_data_list"]
         called_by_version = data["called_by_version"]
         vkeys = data["vkeys"]
@@ -570,13 +583,14 @@ def write_unmatched_sections_pass2(
         if not version_data_list:
             continue
 
-        # Typed sorted union of all callees seen across this function
-        # group's variants — drives BOTH the BIN's call_target table
-        # AND the CSV cell shape (Phase 4.1: the CSV cell carries the
-        # typed form, no name-only projection step).
-        typed_unique_called: "list[TypedCallee]" = sorted(
-            all_called, key=lambda nt: (nt[0], nt[1].value)
-        )
+        # Typed encounter-ordered union of all callees seen across this
+        # function group's variants — drives BOTH the BIN's call_target
+        # table AND the CSV cell shape (Phase 4.1: the CSV cell carries
+        # the typed form, no name-only projection step). First-seen wins
+        # across variants; per-category sub-order (LOCAL -> PLT -> EXT)
+        # is carried verbatim from the parsed-record layer (plan
+        # Decisions 20 + 21).
+        typed_unique_called: "list[TypedCallee]" = list(all_called)
         typed_unique_called_index: "dict[TypedCallee, int]" = {
             nt: idx for idx, nt in enumerate(typed_unique_called)
         }

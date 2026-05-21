@@ -206,8 +206,8 @@ def test_matched_entry_dict_shape_matches_phase3_contract(tmp_path):
         "only_b": "libbar.so",
     }
     by_vkey = {vd["vkey"]: vd for vd in entry["version_data"]}
-    assert by_vkey[vkey_a]["called"] == {("loc_a", CallTargetType.LOCAL)}
-    assert by_vkey[vkey_b]["called"] == {("loc_b", CallTargetType.LOCAL)}
+    assert by_vkey[vkey_a]["called"] == [("loc_a", CallTargetType.LOCAL)]
+    assert by_vkey[vkey_b]["called"] == [("loc_b", CallTargetType.LOCAL)]
 
 
 def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path, caplog):
@@ -279,7 +279,7 @@ def test_unmatched_entry_dict_shape_matches_phase3_contract(tmp_path):
     e = entries[0]
     assert e["func_name"] == "fn"
     assert e["vkey"] is vkey_a
-    assert e["called"] == {("loc", CallTargetType.LOCAL)}
+    assert e["called"] == [("loc", CallTargetType.LOCAL)]
     assert e["extern_libraries"] == {"ext_known": "libfoo.so"}
 
 
@@ -322,7 +322,7 @@ def test_unmatched_group_extern_library_mismatch_first_wins_and_logs(caplog):
             "data_offset": 0x20,
             "data_len": 0x40,
             "token_len": 4,
-            "called": {("loc", CallTargetType.LOCAL)},
+            "called": [("loc", CallTargetType.LOCAL)],
             "extern_libraries": {"conflicting": "libfirst.so"},
         },
         {
@@ -331,7 +331,7 @@ def test_unmatched_group_extern_library_mismatch_first_wins_and_logs(caplog):
             "data_offset": 0x60,
             "data_len": 0x40,
             "token_len": 4,
-            "called": {("loc", CallTargetType.LOCAL)},
+            "called": [("loc", CallTargetType.LOCAL)],
             "extern_libraries": {"conflicting": "libsecond.so"},
         },
     ]
