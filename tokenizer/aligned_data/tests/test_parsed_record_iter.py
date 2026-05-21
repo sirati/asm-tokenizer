@@ -51,7 +51,11 @@ def test_v2_same_name_in_plt_and_ext_stays_distinct():
 
 
 def test_v2_categories_emit_typed_tuples_per_category():
-    """Every v2 metadata category maps to its own CallTargetType."""
+    """Every v2 metadata category maps to its own CallTargetType.
+
+    Output ordering is encoder-allocation-order per category, with
+    categories concatenated LOCAL -> PLT -> EXTERN (not alphabetical).
+    """
     metadata = {
         "local_funcs": [{"name": "loc"}],
         "plt_funcs": [{"name": "stub"}],
@@ -62,9 +66,9 @@ def test_v2_categories_emit_typed_tuples_per_category():
     called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [
-        ("ext", CallTargetType.EXTERN),
         ("loc", CallTargetType.LOCAL),
         ("stub", CallTargetType.PLT),
+        ("ext", CallTargetType.EXTERN),
     ]
     assert extern_libraries == {}
 
@@ -100,11 +104,11 @@ def test_v2_extern_library_threaded_through_extraction():
     called, extern_libraries = _extract_called_funcs(row, column_index)
 
     assert called == [
-        ("ext_known", CallTargetType.EXTERN),
-        ("ext_missing", CallTargetType.EXTERN),
-        ("ext_none", CallTargetType.EXTERN),
         ("loc", CallTargetType.LOCAL),
         ("stub", CallTargetType.PLT),
+        ("ext_known", CallTargetType.EXTERN),
+        ("ext_none", CallTargetType.EXTERN),
+        ("ext_missing", CallTargetType.EXTERN),
     ]
     assert extern_libraries == {"ext_known": "libfoo.so"}
 

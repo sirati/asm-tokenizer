@@ -63,6 +63,9 @@ class ParsedRecord:
     insn_runlength: np.ndarray
     block_runlength: np.ndarray
     tokens: np.ndarray
+    # Encoder-allocation order preserved per category, concatenated in
+    # LOCAL -> PLT -> EXTERN order. The K-th entry of category C in this
+    # list equals the function whose encoder-assigned identity for C is K.
     called_funcs: list[tuple[str, CallTargetType]]
     extern_libraries: dict[str, str]
     content_hash: int
@@ -243,40 +246,52 @@ def _called_from_v2_metadata(
         return [], {}
     if not isinstance(meta, dict):
         return [], {}
-    # The same name can legitimately appear in two categories (e.g. a
-    # PLT stub ``foo`` and an extern body ``foo`` from the same caller).
-    # Dedup by ``(name, type)``, not by name alone.
-    called: "set[tuple[str, CallTargetType]]" = set()
+    # Preserve the encoder's per-category allocation order: each
+    # ``_V2_CATEGORY_TYPES`` array is the CSV's identity-indexed
+    # metadata cell, so the K-th name in category C is the function
+    # whose encoder-assigned identity for C is K. Dedupe inside one
+    # category via ``dict.fromkeys`` (order-preserving primitive); the
+    # same name appearing in two categories (e.g. PLT ``foo`` + EXTERN
+    # ``foo``) still surfaces as two distinct ``(name, type)`` entries.
+    # Categories are concatenated in LOCAL -> PLT -> EXTERN order.
+    called: list[tuple[str, CallTargetType]] = []
     extern_libraries: dict[str, str] = {}
     for category_key, category_type in _V2_CATEGORY_TYPES:
+        names_in_order: list[str] = []
         for entry in meta.get(category_key, ()) or ():
             if isinstance(entry, dict):
                 name = entry.get("name")
                 if isinstance(name, str):
-                    called.add((name, category_type))
+                    names_in_order.append(name)
                     if category_type is CallTargetType.EXTERN:
                         library = entry.get("library")
                         if isinstance(library, str):
                             extern_libraries[name] = library
-    return (
-        sorted(called, key=lambda nt: (nt[0], nt[1].value)),
-        extern_libraries,
-    )
+        for unique_name in dict.fromkeys(names_in_order):
+            called.append((unique_name, category_type))
+    return called, extern_libraries
 
 
 def _called_from_v1_opaque_metadata(
     opaque_metadata: str,
 ) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
+    # v1 carries only ``local_function`` callees, in disassembler
+    # encounter order. Mirror the v2 path: order-preserving dedupe via
+    # ``dict.fromkeys`` instead of set + alphabetical sort, so the K-th
+    # surviving name equals the encoder's K-th LOCAL allocation.
     try:
         meta = ast.literal_eval(opaque_metadata)
-        called: "set[tuple[str, CallTargetType]]" = set()
+        names_in_order: list[str] = []
         for entry in meta:
             if isinstance(entry, tuple) and len(entry) >= 5:
                 name = entry[2]
                 type_field = entry[3]
                 if type_field == "local_function":
-                    called.add((name, CallTargetType.LOCAL))
-        return sorted(called, key=lambda nt: nt[0]), {}
+                    names_in_order.append(name)
+        return (
+            [(name, CallTargetType.LOCAL) for name in dict.fromkeys(names_in_order)],
+            {},
+        )
     except Exception:
         return [], {}
 
