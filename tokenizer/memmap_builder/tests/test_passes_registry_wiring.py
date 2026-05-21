@@ -12,7 +12,6 @@ the small fixtures with no truncation).
 
 from __future__ import annotations
 
-import io
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -210,10 +209,12 @@ def test_matched_entry_dict_shape_matches_phase3_contract(tmp_path):
     assert by_vkey[vkey_b]["called"] == {("loc_b", CallTargetType.LOCAL)}
 
 
-def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path):
+def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path, caplog):
     """If two variants report different libraries for the same EXTERN
-    name, the union picks the first variant's value and writes one warn
-    line into ``error_log``."""
+    name, the union picks the first variant's value and surfaces one
+    warning via the module logger. The ``<binary>.error.log`` TSV is
+    reserved for structured cap-overflow rows; a library mismatch is
+    a builder-bug signal that belongs in Python logging instead."""
     vkey_a = _FakeVKey("a")
     vkey_b = _FakeVKey("b")
     rec_a = _make_record(
@@ -232,24 +233,23 @@ def test_matched_extern_library_mismatch_first_wins_and_logs(tmp_path):
 
     registry = FunctionNamesRegistry()
     state = _make_arm_state(tmp_path, "matched_lib_conflict")
-    error_log = io.StringIO()
     try:
-        entry = process_matched_function(
-            matched,
-            [vkey_a, vkey_b],
-            state,
-            registry,
-            error_log=error_log,
-        )
+        with caplog.at_level("WARNING", logger="tokenizer.memmap_builder.passes"):
+            entry = process_matched_function(
+                matched,
+                [vkey_a, vkey_b],
+                state,
+                registry,
+            )
     finally:
         state.writer.finalize()
 
     assert entry is not None
     assert entry["extern_libraries"] == {"conflicting": "libfirst.so"}
-    log = error_log.getvalue()
-    assert "WARN:" in log
-    assert "extern library mismatch" in log
-    assert "fn" in log
+    assert any(
+        "extern library mismatch" in record.getMessage() and "fn" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_unmatched_entry_dict_shape_matches_phase3_contract(tmp_path):

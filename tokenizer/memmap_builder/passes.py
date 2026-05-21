@@ -20,10 +20,13 @@ function if no variant survived; unmatched simply omits the offending
 variant.
 """
 
+import logging
 from typing import Dict, List, Optional
 
 from tokenizer.aligned_data._writers import assemble_function_record
 from tokenizer.aligned_data.parsed_record_iter import Matched, ParsedRecord, Unmatched
+
+logger = logging.getLogger(__name__)
 
 from ._dedup import ArmDedupState, dedup_and_write
 from ._pass2 import (  # re-export so builder.py's import stays one module
@@ -99,9 +102,7 @@ def process_matched_function(
     if len(unique_offsets) == 1:
         return None
 
-    extern_libraries = _union_extern_libraries(
-        matched.records, func_name=func_name, error_log=error_log
-    )
+    extern_libraries = _union_extern_libraries(matched.records, func_name=func_name)
 
     registry.add(func_name)
     for called_name, _type in unique_called:
@@ -169,15 +170,18 @@ def _union_extern_libraries(
     records: "Dict[int, ParsedRecord]",
     *,
     func_name: str,
-    error_log,
 ) -> "dict[str, str]":
     """Union per-variant ``extern_libraries`` dicts for one function.
 
     Iterates variants in sorted ``variant_index`` order for determinism.
     First writer wins on conflict: if two variants report different
-    libraries for the same EXTERN callee, log a single warning into
-    ``error_log`` (if open) and keep the first variant's value. A repeat
-    of the same library is a no-op.
+    libraries for the same EXTERN callee, surface a warning via the
+    module logger and keep the first variant's value. The
+    ``<binary>.error.log`` TSV is reserved for structured cap-overflow
+    rows (see ``ALLOWED_REASONS`` in
+    :mod:`tokenizer.memmap_builder.error_log`); a library mismatch is
+    a builder-bug signal, not a per-function skip event, so it does
+    not belong in that file.
     """
     merged: dict[str, str] = {}
     for variant_index in sorted(records):
@@ -187,11 +191,11 @@ def _union_extern_libraries(
             if existing is None:
                 merged[name] = library
             elif existing != library:
-                if error_log is not None:
-                    error_log.write(
-                        f"WARN: function {func_name} extern library mismatch "
-                        f"across variants: {dict(rec.extern_libraries)}\n"
-                    )
+                logger.warning(
+                    "function %s extern library mismatch across variants: %s",
+                    func_name,
+                    dict(rec.extern_libraries),
+                )
     return merged
 
 
