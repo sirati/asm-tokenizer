@@ -30,9 +30,11 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+
+from tokenizer.tokens import Category, TokenType
 
 from ..binary_format import (
     MAX_HEADER_BYTES,
@@ -43,12 +45,13 @@ from ..binary_format import (
 from ..matched_sections_bin import Section, parse_section_bin
 from ..memmap_format import MATCHED_SECTIONS_BIN_PRELUDE_SIZE
 from ._sections_bin_walk import read_sections_bin_blob
-from ._worker_guard import assert_main_process
 from ._session_parsers import (
     arm_arrays,
     build_unmatched_function_data,
     parse_matched_section,
 )
+from ._session_splice import _BinarySessionSpliceMixin
+from ._worker_guard import assert_main_process
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
 from .variant_resolver import get_variant_by_ref as _resolve_variant_by_ref
@@ -64,7 +67,7 @@ def _close_memmap(mmap_obj) -> None:
             pass
 
 
-class BinarySession:
+class BinarySession(_BinarySessionSpliceMixin):
     """Context manager bundling the three per-binary handles.
 
     ``metadata`` is a pre-loaded bag (built by ``metadata_loader``).
@@ -109,6 +112,16 @@ class BinarySession:
         self._data_kind: Optional[str] = None
         self._variants_mmap: Optional[np.ndarray] = None
 
+        # Per-session token-id caches for the decoded splice path
+        # (Category / TokenType -> uint16 vocab id). Lazily resolved
+        # via ``_get_token_id_caches`` on the first ``splice_with_callees``
+        # call so sessions that never splice pay nothing. Reset on
+        # ``__exit__`` -- the cache is single-session-scoped because the
+        # vocab handle could in principle change between session opens
+        # on the same instance.
+        self._category_token_ids: Optional[Dict[Category, int]] = None
+        self._number_token_ids: Optional[Dict[TokenType, int]] = None
+
         self._stack: Optional[ExitStack] = None
         self._closed: bool = False
 
@@ -118,6 +131,12 @@ class BinarySession:
         assert_main_process()
         self._stack = ExitStack()
         self._closed = False
+        # Token-id caches stay ``None`` here; ``_get_token_id_caches``
+        # resolves them on first decoded-splice use. Reset explicitly
+        # in case the same session instance is re-entered after a
+        # prior ``__exit__`` cleared them (see ``__exit__``).
+        self._category_token_ids = None
+        self._number_token_ids = None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -134,6 +153,11 @@ class BinarySession:
         self._data_mmap = None
         self._data_kind = None
         self._variants_mmap = None
+        # Drop the token-id caches -- they were resolved against
+        # ``self._vocab_manager`` and the vocab could be swapped before
+        # the next ``__enter__``. Plain dicts so GC handles the rest.
+        self._category_token_ids = None
+        self._number_token_ids = None
         if view is not None:
             # memoryview.release() drops the export so the underlying
             # bytes object can be GC'd without warning.
@@ -148,8 +172,37 @@ class BinarySession:
     # --- public slice methods --------------------------------------
 
     def load_matched(self, idx: int) -> MatchedFunction:
+        _section, _offset, matched = self._load_matched_section_and_versions(idx)
+        return matched
+
+    def load_unmatched(self, idx: int) -> FunctionData:
+        _section, _offset, fd = self._load_unmatched_record_and_section(idx)
+        return fd
+
+    # --- internal load + section helpers ---------------------------
+    #
+    # The matched + unmatched ``load_*`` paths share a need with the
+    # decoded splicer: BOTH want the parsed :class:`Section` (for
+    # call_target walking) and the BIN section offset (for cycle keys)
+    # alongside the per-function data. Factoring those reads into
+    # dedicated private helpers keeps ``load_matched`` /
+    # ``load_unmatched`` byte-for-byte semantically identical (single
+    # source of truth) while exposing the section + offset to
+    # ``_load_*_for_splice`` without re-parsing.
+
+    def _load_matched_section_and_versions(
+        self, idx: int
+    ) -> Tuple[Section, int, MatchedFunction]:
+        """Parse the matched section at ``idx`` + build all its versions.
+
+        Returns ``(section, section_offset, MatchedFunction)``. The
+        ``Section`` is the parsed BIN catalog entry (call_targets +
+        variant blocks); ``section_offset`` is the BIN byte offset
+        from ``bin_starts[idx]``. Shared by :py:meth:`load_matched`
+        and the decoded splicer.
+        """
         arm = self._meta_get("matched_arm")
-        bin_starts, bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
         if idx >= len(bin_starts):
             raise IndexError(f"Index {idx} out of bounds for matched functions")
         section_offset = int(bin_starts[idx])
@@ -162,14 +215,24 @@ class BinarySession:
                 f"(have {len(func_names)})"
             )
         func_name = func_names[idx]
-        return parse_matched_section(
+        matched = parse_matched_section(
             section,
             func_name=func_name,
             data_slice=lambda o: self._slice_data_record(data_mmap, o),
             resolve_ref=self.get_variant_by_ref,
         )
+        return section, section_offset, matched
 
-    def load_unmatched(self, idx: int) -> FunctionData:
+    def _load_unmatched_record_and_section(
+        self, idx: int
+    ) -> Tuple[Section, int, FunctionData]:
+        """Parse the unmatched record at ``idx`` + its owning section.
+
+        Returns ``(section, section_offset, FunctionData)`` where
+        ``section_offset`` is the BIN byte offset of the owning section
+        (NOT the per-record ``_unmatched_data.bin`` offset). Shared by
+        :py:meth:`load_unmatched` and the decoded splicer.
+        """
         arm = self._meta_get("unmatched_arm")
         starts = arm_arrays(arm, "unmatched", self._binary_name)
         if idx >= len(starts):
@@ -177,9 +240,11 @@ class BinarySession:
         start = int(starts[idx])
         data_mmap = self._open_data("unmatched")
         insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
-        section = self._unmatched_section_for_record(arm, idx, start)
+        section, section_offset = self._unmatched_section_for_record(
+            arm, idx, start
+        )
         line_to_name = self._meta_get("line_to_name") or {}
-        return build_unmatched_function_data(
+        fd = build_unmatched_function_data(
             section,
             self._unmatched_func_name(arm, idx),
             start,
@@ -187,6 +252,7 @@ class BinarySession:
             resolve_ref=self.get_variant_by_ref,
             line_to_name=line_to_name,
         )
+        return section, section_offset, fd
 
     def _slice_data_record(self, data_mmap, offset: int):
         """Slice + parse + egress-copy one record (memmap-view detach).
@@ -315,7 +381,7 @@ class BinarySession:
 
     def _unmatched_section_for_record(
         self, arm: Any, idx: int, start: int
-    ) -> Section:
+    ) -> Tuple[Section, int]:
         """Resolve the BIN section that owns the per-record ``start``.
 
         The unmatched index is per-RECORD (one entry per
@@ -325,6 +391,10 @@ class BinarySession:
         lookup plus O(log K) for the slot-base ``np.searchsorted``
         — negligible compared to the BIN parse this dispatch then
         triggers.
+
+        Returns ``(section, section_offset)`` -- the parsed section and
+        its BIN byte offset, so callers (notably the decoded splicer)
+        can use the offset as a cycle key without re-deriving it.
 
         Sanity-checks the section's variant at the matching slot:
         its ``data_offset_shifted << 4`` must equal ``start``. A
@@ -344,7 +414,7 @@ class BinarySession:
                 f"data_offset {variant.data_offset_shifted << 4} does "
                 f"not match record offset {start} (record idx={idx})"
             )
-        return section
+        return section, section_offset
 
     def _unmatched_func_name(self, arm: Any, idx: int) -> str:
         """Per-record function name via the pre-cached mapping.
