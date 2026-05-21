@@ -1,11 +1,15 @@
 """Per-binary ``(func_name, vkey) -> unmatched_index`` lookup builder.
 
 Single concern: walk the unmatched sections CSV (post-restructuring
-5-cell layout ``[line_no_b64, variant_refs, called_b64,
-inlining_data, indexer_hex]``), resolve the base64 line numbers
+5-cell layout ``[line_no_b64, variant_refs, called_line_nos,
+call_targets, indexer_hex]``), resolve the base64 line numbers
 through the function-names sidecar, and assign each variant_ref a
 running unmatched-arm index that matches the order
-``unmatched_index.bin`` records them in.
+``unmatched_index.bin`` records them in. Only ``line_no_b64`` and
+``variant_refs`` are consumed here; the ``called_line_nos`` and
+``call_targets`` cells are not touched by this lookup builder, so
+the typed-cell rewrites that ride alongside the call_targets rename
+do not affect this code path.
 
 Extracted from ``validator.validate_memmap_output`` so the
 orchestrator stops carrying the prelude-routing + sidecar-resolution
