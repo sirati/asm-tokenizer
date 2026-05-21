@@ -26,8 +26,20 @@ def run_lengths(mask):
 
 
 def inline_data_runlength_after_real_tokens(runlen, real_mask):
-    # For each real-token position p (in order), returns the inline-data run
-    # length starting at p+1. The final real-token's trailing run is the
-    # caller's concern (no position p+1 exists when p == N-1, so the slice
-    # implicitly drops it via real_mask[:-1]).
-    return runlen[1:][real_mask[:-1]]
+    """For each real-token position p in input order, return the inline-data
+    run length starting at p+1.
+
+    Output shape is ``(real_mask.sum(),)`` — one entry per real token in
+    order.  Real tokens at non-final positions get the run length at p+1
+    from ``runlen``.  A real token at the FINAL position has no p+1 slot,
+    so its entry is 0 (zero-padded by construction).  This makes the
+    helper self-contained: callers do not need to pad the tail.
+    """
+    out = np.zeros(int(real_mask.sum()), dtype=np.uint16)
+    # Real tokens at positions strictly less than N-1 (i.e. those with a
+    # valid p+1 slot) populate the leading entries of ``out``.  When the
+    # FINAL position is a real token, its slot in ``out`` is the trailing
+    # zero-pad — no write needed.
+    non_last_real_count = int(real_mask[:-1].sum())
+    out[:non_last_real_count] = runlen[1:][real_mask[:-1]]
+    return out

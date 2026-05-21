@@ -142,14 +142,14 @@ def test_batched_three_dims():
 
 def test_inline_data_runlength_after_real_tokens_basic():
     # Synthetic: stream of 7 tokens, real at positions {1, 3, 4}; inline runs
-    # immediately after them are of length 1, 0, 2 respectively (the run after
-    # the last real token at index 4 is "outside" the slice and is not
-    # returned by this helper).
+    # immediately after them are of length 1, 0, 2 respectively. The helper
+    # returns one entry per real token (shape == real_mask.sum()).
     real_mask = np.array([False, True, False, True, True, False, False])
     runlen = np.array([0, 0, 1, 0, 0, 2, 0], dtype=np.uint16)
     got = inline_data_runlength_after_real_tokens(runlen, real_mask)
     expected = np.array([1, 0, 2], dtype=np.uint16)
     np.testing.assert_array_equal(got, expected)
+    assert got.shape == (int(real_mask.sum()),)
 
 
 def test_inline_data_runlength_after_real_tokens_no_reals():
@@ -160,13 +160,26 @@ def test_inline_data_runlength_after_real_tokens_no_reals():
 
 
 def test_inline_data_runlength_after_real_tokens_real_at_tail():
-    # Real token at the final position is excluded from the returned slice
-    # (real_mask[:-1] drops it). Callers handle "tail real token's trailing
-    # run is zero" separately.
+    # Real token at the final position: the helper still emits one entry for
+    # it (shape == real_mask.sum()), and that entry is the zero-pad (no p+1
+    # slot exists). The non-tail real token uses runlen[p+1] as before.
     real_mask = np.array([False, True, False, True])
     runlen = np.array([0, 0, 1, 0], dtype=np.uint16)
     got = inline_data_runlength_after_real_tokens(runlen, real_mask)
-    expected = np.array([1], dtype=np.uint16)
+    expected = np.array([1, 0], dtype=np.uint16)
+    np.testing.assert_array_equal(got, expected)
+    assert got.shape == (int(real_mask.sum()),)
+    assert got[-1] == 0
+
+
+def test_inline_data_runlength_after_real_tokens_only_tail_real():
+    # Single real token at the final position: helper returns a one-entry
+    # array of zero (the tail-pad), proving padding works in the degenerate
+    # "all-pad" case too.
+    real_mask = np.array([False, False, False, True])
+    runlen = np.zeros(4, dtype=np.uint16)
+    got = inline_data_runlength_after_real_tokens(runlen, real_mask)
+    expected = np.array([0], dtype=np.uint16)
     np.testing.assert_array_equal(got, expected)
 
 

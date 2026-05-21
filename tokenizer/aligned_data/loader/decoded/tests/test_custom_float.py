@@ -545,6 +545,49 @@ def test_from_float80_nan():
     assert sig == 1 and _is_infnan_sentinel(chunks[0])
 
 
+def test_from_float80_unnormal_renormalizes_lossless():
+    """x87 pseudo-denormal / unnormal encodings (biased_exp > 0 with explicit
+    leading bit == 0) are NOT raised on. They route through the same denormal
+    renormalization path as a legit denormal: pure left-shift, no rounding.
+    The original x87 hardware treats these as invalid since the Pentium, but
+    the asm-tokenizer pipeline encounters them as raw bytes in compiled
+    constants (e.g. a misaligned read from .rodata) and the encoder MUST NOT
+    crash on them — verbatim reinterpretation is the right policy at the
+    dataloader layer.
+
+    This test pins the current behavior. Changing it requires updating both
+    the test and the from_float80 docstring."""
+    # Construct an x87 unnormal: biased_exp=2 (would be normal if the
+    # explicit-leading bit were set), explicit_leading=0, fraction=1.
+    sign_bit = 0
+    biased_exp = 2
+    explicit_leading = 0
+    fraction = 1
+    mantissa = (explicit_leading << 63) | fraction
+    bits = _f80_bits(sign_bit, biased_exp, mantissa)
+
+    chunks = from_float80(bits)
+    assert len(chunks) == 1
+    sig, sign, exp = _unpack(chunks[0])
+
+    # Derivation of the pinned values (all from the locked-in unnormal
+    # routing rule — biased_exp > 0 + explicit_leading == 0 -> denormal
+    # path; pure left-shift normalization, no rounding):
+    #   * effective fractional mantissa = 1 (low bit of the 63-bit
+    #     fractional field; the leading-1 position is stripped because it
+    #     is 0).
+    #   * actual_exp = 1 - bias = 1 - 16383 = -16382 (denormal-style
+    #     exponent, NOT biased_exp - bias).
+    #   * base_exponent_unbiased = actual_exp - (mantissa_bits - 1)
+    #                            = -16382 - 63 = -16445 (the chunk's
+    #     "integer-mantissa" exponent base before normalization).
+    #   * The lone 1-bit normalizes by shifting up 63 places, so
+    #     significand = 1 << 63 and exponent = base - 63 = -16508.
+    assert sig == (1 << 63)
+    assert sign == +1
+    assert exp == -16508
+
+
 # ----- from_float128 -----------------------------------------------------------
 
 def test_from_float128_positive_zero():

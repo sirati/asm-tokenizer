@@ -179,26 +179,43 @@ def _encode_fp_normalized(
     mantissa_bits: int,
     exponent_bits: int,
     bias: int,
+    has_explicit_leading_bit: bool = False,
 ) -> list[tuple[np.uint64, np.uint32]]:
     """Generic IEEE-754-style FP -> custom-float kernel.
 
     ``bits`` is the raw bit pattern of the source value, interpreted as
     ``[sign : 1 | biased_exp : exponent_bits | mantissa : mantissa_bits]``
-    from MSB downward.  ``mantissa_bits`` does NOT count the implicit
-    leading 1; sources without an implicit leading 1 (e.g. x87 f80, which
-    stores the leading bit explicitly) should still pass the *fractional*
-    width here and let the explicit-leading-bit be picked up via the wider
-    raw mantissa (see ``from_float80``).
+    from MSB downward.
+
+    ``has_explicit_leading_bit`` selects between two mantissa conventions:
+
+    * ``False`` (IEEE-754 path, default — f16 / bf16 / f32 / f64 / f128):
+      the source mantissa field does NOT include the leading 1.  Normal
+      values get an implicit ``1 << mantissa_bits`` OR'd in.  Denormals
+      carry no leading 1.
+    * ``True`` (x87 f80 path): the source mantissa field's TOP bit (bit
+      ``mantissa_bits - 1``) IS the leading 1 of a normal value, stored
+      explicitly.  ``mantissa_bits`` is therefore the TOTAL mantissa width
+      (e.g. 64 for f80, not 63).  Normal values use the raw mantissa
+      directly; encodings with ``biased_exp > 0`` but explicit-leading
+      == 0 are x87 pseudo-denormals / unnormals (invalid in hardware
+      since the Pentium) — the kernel routes them through the same
+      denormal renormalization path as a legit denormal, preserving the
+      raw fractional bits as a pure left-shifted value rather than
+      raising (see ``from_float80`` for the rationale).
 
     The encoder:
       * splits sign / biased_exp / mantissa via bit-masks;
       * maps source NaN / Inf (biased_exp = all-ones) to the single-chunk
         ``INFNAN_EXPONENT_UNBIASED`` sentinel (Inf -> sig=0; NaN -> sig=1);
+        Inf detection respects the explicit-leading-bit convention (f80
+        Inf is ``raw_mantissa == 1 << (mantissa_bits - 1)``);
       * emits a single signed-zero chunk for source ``±0``;
-      * renormalizes denormals via pure left-shift (lossless);
-      * for sources with ``mantissa_bits + 1 <= TARGET_SIGNIFICAND_BITS``,
-        emits one chunk; for wider sources (f128) delegates to
-        ``_split_to_chunks`` for the multi-chunk path.
+      * renormalizes denormals (and x87 unnormals when
+        ``has_explicit_leading_bit``) via pure left-shift (lossless);
+      * for sources whose effective mantissa fits in one u64, emits one
+        chunk; for wider sources (f128) delegates to ``_split_to_chunks``
+        for the multi-chunk path.
     """
     total_bits = 1 + exponent_bits + mantissa_bits
     if not (0 <= bits < (1 << total_bits)):
@@ -215,22 +232,55 @@ def _encode_fp_normalized(
     sign_bit = (bits >> (mantissa_bits + exponent_bits)) & 1
     sign = -1 if sign_bit else +1
 
+    # Position of the leading-1 bit inside the *integer-form* effective
+    # mantissa we feed to ``_emit_chunk`` / ``_split_to_chunks``.  IEEE
+    # path: implicit-1 sits at bit ``mantissa_bits`` after OR-ing; f80
+    # path: explicit-1 sits at bit ``mantissa_bits - 1`` of the raw field.
+    leading_bit_position = (
+        mantissa_bits - 1 if has_explicit_leading_bit else mantissa_bits
+    )
+
     if biased_exp == exp_field_mask:
         # Source NaN / Inf collapse to a single chunk regardless of source
         # width; multi-chunk delegation never runs on these sources.
-        return [_encode_infnan(sign=sign, mantissa_is_zero=raw_mantissa == 0)]
+        if has_explicit_leading_bit:
+            is_inf = raw_mantissa == (1 << (mantissa_bits - 1))
+        else:
+            is_inf = raw_mantissa == 0
+        return [_encode_infnan(sign=sign, mantissa_is_zero=is_inf)]
 
-    is_denormal = biased_exp == 0
-    if is_denormal:
-        effective_mantissa = raw_mantissa
-        actual_exp = 1 - bias
+    if has_explicit_leading_bit:
+        explicit_leading = (raw_mantissa >> (mantissa_bits - 1)) & 1
+        # x87 unnormals (biased_exp > 0 with explicit-leading == 0) route
+        # through the denormal path alongside legit denormals; this
+        # reinterprets the value as a raw-fraction signal, intentionally,
+        # per the dataloader's "don't crash on .rodata-derived bytes"
+        # policy.  See ``from_float80`` docstring + the pinning test.
+        if biased_exp == 0 or explicit_leading == 0:
+            effective_mantissa = raw_mantissa & ((1 << (mantissa_bits - 1)) - 1)
+            actual_exp = 1 - bias
+        else:
+            effective_mantissa = raw_mantissa
+            actual_exp = biased_exp - bias
     else:
-        effective_mantissa = (1 << mantissa_bits) | raw_mantissa
-        actual_exp = biased_exp - bias
+        is_denormal = biased_exp == 0
+        if is_denormal:
+            effective_mantissa = raw_mantissa
+            actual_exp = 1 - bias
+        else:
+            effective_mantissa = (1 << mantissa_bits) | raw_mantissa
+            actual_exp = biased_exp - bias
 
-    base_exponent_unbiased = actual_exp - mantissa_bits
+    base_exponent_unbiased = actual_exp - leading_bit_position
 
-    if mantissa_bits + 1 <= TARGET_SIGNIFICAND_BITS:
+    # Effective mantissa width: explicit-leading path tops out at
+    # ``mantissa_bits`` bits (the leading-1 IS bit mantissa_bits-1);
+    # IEEE path tops out at ``mantissa_bits + 1`` (implicit-1 above the
+    # raw field).
+    effective_width = (
+        mantissa_bits if has_explicit_leading_bit else mantissa_bits + 1
+    )
+    if effective_width <= TARGET_SIGNIFICAND_BITS:
         return [
             _emit_chunk(
                 effective_mantissa,
@@ -276,63 +326,41 @@ def from_float64(bits: int) -> list[tuple[np.uint64, np.uint32]]:
 def from_float80(bits: int) -> list[tuple[np.uint64, np.uint32]]:
     """x87 80-bit extended precision: 1 sign + 15 exponent + 64 mantissa.
 
-    Unlike IEEE-754, the leading mantissa bit is stored explicitly (not
-    implicit) — it occupies bit 63 of the 64-bit mantissa field for normal
-    values, leaving 63 fractional bits.  We expose the *fractional* width
-    (63) to the generic kernel and synthesise the same value by passing
-    ``mantissa_bits=63``; the explicit leading 1 of normals then collides
-    with the implicit one the kernel reconstructs, which is correct.
+    Unlike IEEE-754, the leading mantissa bit is stored explicitly (bit
+    63 of the 64-bit mantissa field for normals).  The shared kernel
+    handles this via ``has_explicit_leading_bit=True`` with
+    ``mantissa_bits=64`` (the TOTAL mantissa width, including the
+    explicit leading-1 position).
 
-    Denormals (biased_exp == 0) and pseudo-denormals / unnormals (biased_exp
-    > 0 but explicit-leading-bit == 0) are both treated as raw fractional
-    mantissas via the denormal renormalization path — pure left-shift, no
-    rounding.
+    Why the kernel does NOT raise on pseudo-denormals / unnormals
+    (biased_exp > 0 with explicit-leading-bit == 0): x87 hardware has
+    treated these as invalid since the Pentium, but the asm-tokenizer
+    dataloader encounters them as raw byte sequences in compiled
+    constants (e.g. a misaligned read from ``.rodata``).  Crashing the
+    loader on a stray byte pattern is unacceptable; verbatim
+    reinterpretation through the denormal renormalization path (pure
+    left-shift, no rounding) is the right policy at this layer.  The
+    behavior is pinned by ``test_from_float80_unnormal_renormalizes_lossless``.
     """
-    total_bits = 80
-    if not (0 <= bits < (1 << total_bits)):
-        raise ValueError(f"bits=0x{bits:x} out of range for f80 layout")
-    raw_mantissa = bits & ((1 << 64) - 1)
-    biased_exp = (bits >> 64) & ((1 << 15) - 1)
-    sign_bit = (bits >> 79) & 1
-    sign = -1 if sign_bit else +1
-    bias = 16383
-
-    explicit_leading = (raw_mantissa >> 63) & 1
-    fractional = raw_mantissa & ((1 << 63) - 1)
-
-    if biased_exp == (1 << 15) - 1:
-        # x87 f80: biased_exp=0x7FFF + explicit_leading=1 + fractional=0 is
-        # the canonical Inf encoding; everything else with this exponent is
-        # a NaN (quiet/signaling) or a pseudo-* encoding (invalid on modern
-        # CPUs).  We collapse all pseudo-* forms into NaN, matching the
-        # "drop payload, canonical sig=1" convention.
-        is_inf = explicit_leading == 1 and fractional == 0
-        return [_encode_infnan(sign=sign, mantissa_is_zero=is_inf)]
-
-    if biased_exp == 0 or explicit_leading == 0:
-        actual_exp = 1 - bias
-        effective_mantissa = fractional
-    else:
-        actual_exp = biased_exp - bias
-        effective_mantissa = (1 << 63) | fractional
-
-    base_exponent_unbiased = actual_exp - 63
-    return [
-        _emit_chunk(
-            effective_mantissa,
-            sign=sign,
-            chunk_exponent_base=base_exponent_unbiased,
-        )
-    ]
+    return _encode_fp_normalized(
+        bits,
+        mantissa_bits=64,
+        exponent_bits=15,
+        bias=16383,
+        has_explicit_leading_bit=True,
+    )
 
 
 def from_float128(bits: int) -> list[tuple[np.uint64, np.uint32]]:
     """IEEE-754 binary128: 1 / 15 / 112 bits, bias 16383.
 
     Lossless: the 113-bit effective mantissa (1 implicit + 112 stored)
-    splits into two u64 chunks via ``_split_to_chunks``; the same sign
-    rides both chunks; the low chunk carries the trailing 49 bits
-    left-aligned at bit 63.
+    splits into two u64 chunks via ``_split_to_chunks`` (plan Decision
+    15) — ``chunks[0]`` (low) holds bits ``[0, 64)``, ``chunks[1]``
+    (high) holds bits ``[64, 113)`` (49 bits, then normalize-shifted so
+    the leading 1 lands at bit 63).  Both chunks carry the same sign;
+    bit-exact reconstruction is verified by the lossless round-trip
+    tests.
     """
     return _encode_fp_normalized(
         bits, mantissa_bits=112, exponent_bits=15, bias=16383
