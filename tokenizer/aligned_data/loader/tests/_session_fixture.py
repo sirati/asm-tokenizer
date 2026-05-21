@@ -28,6 +28,9 @@ from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
 from tokenizer.aligned_data.index_format import read_index_arrays
+from tokenizer.aligned_data.loader._sections_bin_walk import (
+    unmatched_region_start,
+)
 
 from ._corpus import (
     MatchedFunctionSpec,
@@ -221,20 +224,9 @@ def _unmatched_arm_from_corpus(corpus) -> _FakeArm:
     starts = read_index_arrays(corpus.unmatched_index_bin)
     assert starts is not None
     # Unmatched section in the BIN sits right after the matched-arm
-    # region; the matched-index's last entry's end is the start of the
-    # unmatched region (single unmatched function -> single section).
-    matched_pair = read_csv_section_index_arrays(corpus.matched_index_bin)
-    assert matched_pair is not None
-    matched_starts, matched_lengths = matched_pair
-    if len(matched_starts) > 0:
-        unmatched_section_offset = int(
-            matched_starts[-1] + matched_lengths[-1]
-        )
-    else:
-        from tokenizer.aligned_data.memmap_format import (
-            MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
-        )
-        unmatched_section_offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+    # region; reuse the loader's own offset helper instead of mirroring
+    # its logic in the fixture.
+    unmatched_section_offset = unmatched_region_start(corpus.matched_index_bin)
     return _FakeArm(
         starts=starts,
         func_names=["lonely_func"],

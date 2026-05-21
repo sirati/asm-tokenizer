@@ -279,7 +279,7 @@ def load_section_arm(
     paths: BinaryArmPaths,
     line_to_name: Optional[Dict[int, str]] = None,
     *,
-    matched_index: Optional[Path] = None,
+    matched_index: Path,
 ) -> SectionArm:
     """Build one ``SectionArm`` for the requested kind via the per-arm
     loader. ``line_to_name`` resolves each BIN section's
@@ -288,26 +288,15 @@ def load_section_arm(
     their index file exists). Pass an empty dict only for the "no
     functions at all" path.
 
-    ``matched_index`` is the matched-arm's locator file (which the
-    unmatched arm consults to find the matched-region end in the
-    shared ``sections.bin``). Defaults to ``paths.index_bin`` for the
-    matched arm; on the unmatched arm the caller MUST supply the
-    SIBLING matched-arm path explicitly (the unmatched arm's
-    ``paths.index_bin`` is the per-record data-bin locator, not a
-    section locator).
+    ``matched_index`` is the matched-arm's section locator file. Both
+    arms consume it: the matched arm reads its per-function locator
+    directly from it; the unmatched arm consults it to find the
+    matched-region end in the shared ``sections.bin``. Required for
+    every call -- the orchestrator already knows the matched-arm path,
+    so threading it explicitly keeps the dispatch signature uniform
+    and removes the "kind-discriminating None default" wart.
     """
     spec = _ARM_SPECS[kind]
-    if matched_index is None:
-        if kind is SectionKind.MATCHED:
-            matched_index = paths.index_bin
-        else:
-            raise ValueError(
-                "load_section_arm(UNMATCHED, ...) requires the "
-                "``matched_index`` kwarg pointing at the matched-arm "
-                "locator file; the unmatched arm's paths.index_bin "
-                "is the per-record data-bin locator, not a section "
-                "locator. Pass the matched arm's ``index_bin`` here."
-            )
     return spec.loader(paths, line_to_name or {}, matched_index=matched_index)
 
 

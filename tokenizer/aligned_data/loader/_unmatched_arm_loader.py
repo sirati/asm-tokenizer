@@ -27,39 +27,13 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.csv_section_index import (
-    read_csv_section_index_arrays,
-)
 from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
-from tokenizer.aligned_data.memmap_format import (
-    MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
-    assert_matched_sections_prelude,
+
+from ._sections_bin_walk import (
+    read_sections_bin_blob,
+    resolve_func_name_or_raise,
+    unmatched_region_start,
 )
-
-
-def _unmatched_region_start(
-    sections_bin: Path, matched_index: Path
-) -> int:
-    """Compute the BIN byte offset at which the unmatched region begins.
-
-    Matched sections are emitted first in encounter order; the last
-    matched section's end (``bin_offset + bin_section_length``) is the
-    first unmatched section's start. With no matched arm the walk
-    begins at the BIN's file-level prelude end.
-    """
-    if not matched_index.exists():
-        return MATCHED_SECTIONS_BIN_PRELUDE_SIZE
-    pair = read_csv_section_index_arrays(matched_index)
-    if pair is None:
-        return MATCHED_SECTIONS_BIN_PRELUDE_SIZE
-    bin_starts, bin_lengths = pair
-    if len(bin_starts) == 0:
-        return MATCHED_SECTIONS_BIN_PRELUDE_SIZE
-    # ``matched_index.bin`` preserves encounter order, so the
-    # last-emitted entry holds the matched region's terminal offset.
-    last_start = int(bin_starts[-1])
-    last_length = int(bin_lengths[-1])
-    return last_start + last_length
 
 
 def _walk_unmatched_sections(
@@ -79,22 +53,17 @@ def _walk_unmatched_sections(
     section_starts: List[int] = []
     if not sections_bin.exists():
         return func_names, np.zeros(0, dtype=np.int64)
-    raw = sections_bin.read_bytes()
-    assert_matched_sections_prelude(raw, path=str(sections_bin))
-    blob = memoryview(raw)
+    raw, blob = read_sections_bin_blob(sections_bin)
     end = len(raw)
     cursor = region_start
     while cursor < end:
         section, next_cursor = parse_section_bin(blob, cursor)
-        fid = section.function_name_ptr
-        if fid not in line_to_name:
-            raise ValueError(
-                f"{sections_bin}: section at offset {cursor} references "
-                f"function_name_ptr={fid} which is absent from the "
-                f"function-names sidecar; re-run memmap_builder to "
-                f"regenerate"
+        func_names.append(
+            resolve_func_name_or_raise(
+                section.function_name_ptr, line_to_name,
+                sections_bin, cursor,
             )
-        func_names.append(line_to_name[fid])
+        )
         section_starts.append(cursor)
         cursor = next_cursor
     return func_names, np.array(section_starts, dtype=np.int64)
@@ -136,7 +105,7 @@ def load_unmatched_arm(
         token_counts, scale_factor=1
     )
 
-    region_start = _unmatched_region_start(paths.sections_bin, matched_index)
+    region_start = unmatched_region_start(matched_index)
     func_names, section_starts = _walk_unmatched_sections(
         paths.sections_bin, region_start, line_to_name
     )

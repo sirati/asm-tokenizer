@@ -19,7 +19,6 @@ current v1 ``read_index_arrays``-based loader until F2-A lands.
 
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +32,6 @@ from tokenizer.aligned_data.loader.metadata_loader import (
     BinaryArmPaths,
     SectionKind,
     load_section_arm,
-    open_sections_csv,
 )
 
 from ._corpus import (
@@ -126,8 +124,14 @@ def test_section_arm_equality_same_inputs(tmp_path):
     arms whose fields are element-equal."""
     corpus = _matched_corpus(tmp_path)
     line_to_name = _line_to_name(corpus)
-    arm_a = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus), line_to_name)
-    arm_b = load_section_arm(SectionKind.MATCHED, _matched_paths(corpus), line_to_name)
+    arm_a = load_section_arm(
+        SectionKind.MATCHED, _matched_paths(corpus), line_to_name,
+        matched_index=corpus.matched_index_bin,
+    )
+    arm_b = load_section_arm(
+        SectionKind.MATCHED, _matched_paths(corpus), line_to_name,
+        matched_index=corpus.matched_index_bin,
+    )
 
     assert np.array_equal(arm_a.starts, arm_b.starts)
     assert np.array_equal(arm_a.edge_indices, arm_b.edge_indices)
@@ -182,7 +186,8 @@ def test_matched_arm_bin_starts_index_section_bin_bytes(tmp_path):
     """
     corpus = _matched_corpus(tmp_path)
     arm = load_section_arm(
-        SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus)
+        SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus),
+        matched_index=corpus.matched_index_bin,
     )
     assert arm.bin_starts is not None and len(arm.bin_starts) == len(arm.func_names)
     assert arm.bin_lengths is not None and len(arm.bin_lengths) == len(arm.func_names)
@@ -262,7 +267,10 @@ def test_empty_arm_when_index_missing(tmp_path):
         index_bin=tmp_path / "absent_index.bin",
         data_bin=tmp_path / "absent_data.bin",
     )
-    arm = load_section_arm(SectionKind.MATCHED, paths)
+    arm = load_section_arm(
+        SectionKind.MATCHED, paths,
+        matched_index=tmp_path / "absent_matched_index.bin",
+    )
     assert arm.count == 0
     assert arm.starts.dtype == np.int64
     assert arm.edge_indices.dtype == np.int32

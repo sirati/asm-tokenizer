@@ -112,7 +112,6 @@ def parse_matched_section(
 
 def build_unmatched_function_data(
     section: Section,
-    idx: int,
     func_name: str,
     start: int,
     tokens,

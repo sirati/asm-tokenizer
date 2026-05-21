@@ -41,10 +41,8 @@ from ..binary_format import (
     record_total_size,
 )
 from ..matched_sections_bin import Section, parse_section_bin
-from ..memmap_format import (
-    MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
-    assert_matched_sections_prelude,
-)
+from ..memmap_format import MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+from ._sections_bin_walk import read_sections_bin_blob
 from ._worker_guard import assert_main_process
 from ._session_parsers import (
     arm_arrays,
@@ -183,7 +181,6 @@ class BinarySession:
         line_to_name = self._meta_get("line_to_name") or {}
         return build_unmatched_function_data(
             section,
-            idx,
             self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
@@ -252,10 +249,8 @@ class BinarySession:
         # which arm's path we resolve doesn't matter, but we walk through
         # the conventional per-binary filename for clarity.
         path = self._base_path / f"{self._binary_name}_sections.bin"
-        raw = path.read_bytes()
-        assert_matched_sections_prelude(raw, path=str(path))
-        view = memoryview(raw)
         # Pin the bytes so the view stays valid for the session lifetime.
+        raw, view = read_sections_bin_blob(path)
         self._sections_bin_blob = raw
         self._sections_bin_view = view
         return view

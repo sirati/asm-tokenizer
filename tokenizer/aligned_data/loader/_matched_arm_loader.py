@@ -45,26 +45,13 @@ from tokenizer.aligned_data.csv_section_index import (
 )
 from tokenizer.aligned_data.matched_sections_bin import (
     Section,
-    iter_sections_bin,
     parse_section_bin,
 )
-from tokenizer.aligned_data.memmap_format import (
-    MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
-    assert_matched_sections_prelude,
+
+from ._sections_bin_walk import (
+    read_sections_bin_blob,
+    resolve_func_name_or_raise,
 )
-
-
-def _read_sections_bin_blob(sections_bin: Path) -> bytes:
-    """Read the whole BIN once + validate its prelude.
-
-    Returned as ``bytes`` (not a memmap) because the loader walks the
-    file once at construction time to derive the per-function arms and
-    does not hold the file open afterwards. Slicing happens off a
-    :class:`memoryview` so the parse cost stays zero-copy.
-    """
-    raw = sections_bin.read_bytes()
-    assert_matched_sections_prelude(raw, path=str(sections_bin))
-    return raw
 
 
 def _walk_matched_sections(
@@ -83,19 +70,16 @@ def _walk_matched_sections(
     sections: List[Section] = []
     if not sections_bin.exists() or len(bin_starts) == 0:
         return func_names, sections
-    raw = _read_sections_bin_blob(sections_bin)
-    blob = memoryview(raw)
+    _raw, blob = read_sections_bin_blob(sections_bin)
     for i in range(len(bin_starts)):
-        section, _end = parse_section_bin(blob, int(bin_starts[i]))
-        fid = section.function_name_ptr
-        if fid not in line_to_name:
-            raise ValueError(
-                f"{sections_bin}: section at offset {int(bin_starts[i])} "
-                f"references function_name_ptr={fid} which is absent from "
-                f"the function-names sidecar; re-run memmap_builder to "
-                f"regenerate"
+        cursor = int(bin_starts[i])
+        section, _end = parse_section_bin(blob, cursor)
+        func_names.append(
+            resolve_func_name_or_raise(
+                section.function_name_ptr, line_to_name,
+                sections_bin, cursor,
             )
-        func_names.append(line_to_name[fid])
+        )
         sections.append(section)
     return func_names, sections
 
@@ -167,34 +151,7 @@ def load_matched_arm(
         edge_indices=edge_indices,
         count_per_length=count_per_length,
         func_names=func_names,
-        section_starts=bin_starts.astype(np.int64),
-        bin_starts=bin_starts.astype(np.int64),
-        bin_lengths=bin_lengths.astype(np.uint32),
+        section_starts=bin_starts,
+        bin_starts=bin_starts,
+        bin_lengths=bin_lengths,
     )
-
-
-def iter_matched_sections_in_order(
-    sections_bin: Path,
-    bin_starts: np.ndarray,
-    line_to_name: Dict[int, str],
-):
-    """Yield ``(func_name, section)`` for each matched-index entry.
-
-    Convenience helper for callers (validator + loader tests) that want
-    the parsed-section view without rebuilding the full ``SectionArm``.
-    Iterates in matched_index.bin entry order.
-    """
-    func_names, sections = _walk_matched_sections(
-        sections_bin, bin_starts, line_to_name
-    )
-    yield from zip(func_names, sections)
-
-
-# Re-export so callers (validator, unmatched walker) have a single
-# import point for the BIN-walk helpers without reaching into the
-# SectionArm builder.
-__all__ = [
-    "iter_matched_sections_in_order",
-    "iter_sections_bin",
-    "load_matched_arm",
-]
