@@ -10,7 +10,7 @@ This module provides utilities for:
 
 from .io import (
     assemble_function_record,
-    format_inlining_dict,
+    format_call_targets_dict,
     format_variant_refs,
     parse_function_data_header,
     parse_function_data_memmap,
@@ -36,7 +36,8 @@ from .match import (
 )
 from .metadata import (
     extract_metadata_from_variant_block,
-    parse_inlining_data,
+    parse_call_targets,
+    parse_called_line_nos_typed,
 )
 from .parsed_record_iter import (
     Matched,
@@ -58,7 +59,7 @@ __all__ = [
     "load_single_matched_function",
     # io
     "assemble_function_record",
-    "format_inlining_dict",
+    "format_call_targets_dict",
     "format_variant_refs",
     "write_function_binary_data",
     "write_index_entry",
@@ -81,7 +82,8 @@ __all__ = [
     "lockstep_records",
     # metadata
     "extract_metadata_from_variant_block",
-    "parse_inlining_data",
+    "parse_call_targets",
+    "parse_called_line_nos_typed",
     # sections
     "read_function_section",
 ]

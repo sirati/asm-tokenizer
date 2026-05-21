@@ -8,7 +8,7 @@ from .binary_format import (
     parse_binary_header,
     record_total_size,
 )
-from .csv_format import format_inlining_dict, format_variant_refs
+from .csv_format import format_call_targets_dict, format_variant_refs
 from .index_format import iter_index_entries
 from ._writers import (  # re-export
     assemble_function_record,
@@ -36,7 +36,7 @@ __all__ = (
 def write_function_section_csv(
     writer,
     variant_ref,
-    inlining_list,
+    call_targets_list,
     indexer_hex,
 ):
     """Write one matched-section variant row (3 cells).
@@ -49,6 +49,13 @@ def write_function_section_csv(
     keeping them out of the section CSV avoids the per-row repetition
     that conflated variants sharing the canonical-4 axes.
 
+    ``call_targets_list`` is a list of
+    ``(called_idx, data_offset, is_matched)`` triples (one per
+    per-variant call-target reference); the writer encodes it via
+    :func:`format_call_targets_dict` into the semicolon-joined cell
+    shape ``idx,hex_offset,is_matched;...``. ``hex_length`` is gone
+    post-Phase 4.1 because ``_data.bin`` records are self-describing.
+
     ``indexer_hex`` is the 8-hex-char inline encoding of the v1
     4-byte index entry for this variant's ``_data.bin`` record
     (one ``u32 = offset >> 4``; records are self-describing so no
@@ -58,11 +65,11 @@ def write_function_section_csv(
     this writer treats it as an opaque string and emits it verbatim,
     so the writer stays unaware of the entry layout.
     """
-    inlining_str = format_inlining_dict(inlining_list)
+    call_targets_str = format_call_targets_dict(call_targets_list)
     writer.writerow(
         [
             variant_ref,
-            inlining_str,
+            call_targets_str,
             indexer_hex,
         ]
     )
@@ -73,7 +80,7 @@ def write_unmatched_section_csv(
     line_no_b64,
     variant_refs,
     called_functions_str,
-    inlining_data_str,
+    call_targets_str,
     indexer_hex,
 ):
     """Write one unmatched-section row (5 cells).
@@ -81,15 +88,20 @@ def write_unmatched_section_csv(
     ``line_no_b64`` is the compact urlsafe-base64 of this function's
     1-indexed line number in the ``<binary>_function_names.txt``
     sidecar; callers compute it via the registry. ``called_functions_str``
-    likewise carries comma-joined base64 line nos (NOT raw function
-    names) produced by the caller -- the writer is unaware of either
-    indirection.
+    likewise carries comma-joined ``<base64_line_no>:<L|P|E>`` tokens
+    (NOT raw function names) produced by the caller — the writer is
+    unaware of either indirection or the type tag.
 
     ``variant_refs`` is the ordered list of ``0x<hex>`` row indices
     (one per version present for this unmatched function). Encoded
     semicolon-joined into a single cell, mirroring the structure of
     the legacy ``compiler_sets`` cell so the column count stays
     constant across the section CSV.
+
+    ``call_targets_str`` is the pre-encoded call-targets cell built by
+    the caller — semicolon-joined ``idx[-comp_set],hex_offset,is_matched``
+    entries (no ``hex_length`` field post-Phase 4.1). The writer
+    treats it as an opaque string.
 
     ``indexer_hex`` is the 8-hex-char inline encoding of the v1
     4-byte index entry for this function's first variant ``_data.bin``
@@ -105,7 +117,7 @@ def write_unmatched_section_csv(
             line_no_b64,
             variants_str,
             called_functions_str,
-            inlining_data_str,
+            call_targets_str,
             indexer_hex,
         ]
     )

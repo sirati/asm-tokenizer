@@ -24,17 +24,24 @@ Layout responsibilities:
 * ``unmatched_index.bin`` is one entry per version's data-bin record
   (16-byte aligned offsets, 4-byte entries) and continues using
   ``write_index_entry``.
-* Inlining-data cells keep LOCAL ``called_func_id`` indices.
+* Per-variant call-targets cells use LOCAL ``called_func_id`` indices
+  into the section's typed ``unique_called`` list (the per-call-site
+  type tag rides on the header's called-funcs cell, not the per-variant
+  cell).
 * All ``csv.writer`` callsites in this module pin
   ``lineterminator='\\n'`` so byte counts (and therefore the
   matched-arm pad arithmetic) are deterministic.
 
-Typed-callee contract (Phase 3 wiring): pass-1 emits
+Typed-callee contract (Phase 3 + Phase 4.1 wiring): pass-1 emits
 ``unique_called`` as ``list[tuple[name, CallTargetType]]`` and per-
 variant ``called`` as ``set[tuple[name, CallTargetType]]``. The CSV
-cell shapes do not yet expose the type (Phase 4 widens the header's
-called_line_nos cell), so the CSV path projects the typed tuples to a
-name-only dedup; the BIN path consumes the typed tuples directly.
+header's called-funcs cell carries the typed form
+``<base64_line_no>:<L|P|E>`` (Phase 4.1 widening), so the CSV path
+consumes the same typed tuples the BIN path does — no name-only
+projection step. The dedup index that maps a callee back to its CSV
+column position keys on ``(name, type)`` to keep two same-name-
+different-type entries distinct, matching the BIN's call_target
+table layout.
 ``extern_libraries`` (``dict[name, library]``) flows through the
 matched entry dict and the unmatched per-variant entry dict so the
 BIN's extern call_targets can stamp the right
@@ -58,8 +65,8 @@ from ..aligned_data.io import (
     write_unmatched_section_csv,
 )
 from ..aligned_data.csv_format import (
+    format_called_line_nos_typed,
     format_function_line_no,
-    format_function_line_nos_csv,
 )
 from ..aligned_data.matched_sections_bin import (
     CallTargetSpec,
@@ -119,32 +126,6 @@ def _pad_section_to_alignment(sections_file, content_offset: int) -> int:
     pad = next_start - end0
     sections_file.write(_SECTION_LINE_TERMINATOR * pad)
     return sections_file.tell() - content_offset
-
-
-def _project_called_names_unique(
-    typed_callees: "list[TypedCallee]",
-) -> List[str]:
-    """Project a typed callee list to a name-only ordered dedup.
-
-    The Phase-3 CSV cell shape (matched-arm header's
-    ``called_line_nos_b64`` and the unmatched-arm equivalent) does not
-    yet carry the type tag, so the CSV writer needs a NAME-ONLY list to
-    feed :func:`format_function_line_nos_csv`. Phase 4 will widen the
-    cell with the type-character suffix and drop this projection.
-
-    Order is preserved from the input (Phase 3.1 hands matched
-    entries' ``unique_called`` already sorted by ``(name, type.value)``;
-    unmatched-arm aggregation re-sorts the union); the first
-    occurrence wins for the dedup.
-    """
-    seen: "set[str]" = set()
-    out: List[str] = []
-    for name, _type in typed_callees:
-        if name in seen:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out
 
 
 def _build_call_targets_spec(
@@ -334,19 +315,22 @@ def write_matched_sections_pass2(
         extern_libraries: "dict[str, str]" = entry["extern_libraries"]
         version_data = entry["version_data"]
 
-        # ----- CSV section header + per-variant inlining rows -----
-        # The CSV path still consumes a name-only view (Phase 4 widens
-        # the cell). The BIN path consumes the typed tuples directly.
-        called_names_unique = _project_called_names_unique(typed_unique_called)
-        called_name_to_csv_idx = {
-            name: idx for idx, name in enumerate(called_names_unique)
-        }
-
+        # ----- CSV section header + per-variant call-targets rows -----
+        # The CSV cell carries the typed form post-Phase 4.1; both the
+        # header's called-funcs cell and the BIN's call_target table
+        # consume the same ``(name, CallTargetType)`` tuples. The CSV
+        # column index for each callee is the position in
+        # ``typed_unique_called``; the BIN-side index map produced by
+        # :func:`_build_call_targets_spec` is identical (same input,
+        # same enumerate order), so we use it directly for both paths.
         line_no_b64 = format_function_line_no(registry.line_no(func_name))
-        called_line_nos_b64 = format_function_line_nos_csv(
-            [registry.line_no(name) for name in called_names_unique]
+        called_line_nos_typed = format_called_line_nos_typed(
+            [
+                (registry.line_no(name), call_type)
+                for name, call_type in typed_unique_called
+            ]
         )
-        writer.writerow([line_no_b64, called_line_nos_b64])
+        writer.writerow([line_no_b64, called_line_nos_typed])
 
         # ----- BIN: open section + emit call_targets table -----
         function_name_ptr = registry.line_no(func_name)
@@ -367,23 +351,25 @@ def write_matched_sections_pass2(
             data_offset = vdata["data_offset"]
 
             variant_ref = variants.ref(vkey)
-            inlining_data = {}
-            for (called_name, _type) in called:
-                csv_idx = called_name_to_csv_idx[called_name]
+            call_targets_per_variant = {}
+            for (called_name, called_type) in called:
+                csv_idx = unique_called_index_map[(called_name, called_type)]
                 lookup_key = (called_name, vkey)
                 if lookup_key in function_lookup:
-                    func_offset, func_len, is_matched = function_lookup[lookup_key]
-                    inlining_data[csv_idx] = (func_offset, func_len, is_matched)
+                    func_offset, _func_len, is_matched = function_lookup[lookup_key]
+                    call_targets_per_variant[csv_idx] = (func_offset, is_matched)
                 else:
                     write_warn_log_entry(warn_log, func_name, variant_ref, called_name)
 
-            inlining_list = [
-                [idx, start, length, is_matched]
-                for idx, (start, length, is_matched) in sorted(inlining_data.items())
+            call_targets_list = [
+                [idx, start, is_matched]
+                for idx, (start, is_matched) in sorted(call_targets_per_variant.items())
             ]
 
             indexer_hex = encode_inline_indexer(data_offset)
-            write_function_section_csv(writer, variant_ref, inlining_list, indexer_hex)
+            write_function_section_csv(
+                writer, variant_ref, call_targets_list, indexer_hex
+            )
 
             # ----- BIN: variant block -----
             section_writer.begin_variant(
@@ -473,59 +459,62 @@ def group_unmatched_entries_by_function(
     return unmatched_by_func
 
 
-def _build_unmatched_inlining_data_list(
+def _build_unmatched_call_targets_list(
     called_by_version,
-    unique_called_list: List[str],
+    typed_unique_called_index: "dict[TypedCallee, int]",
     vkeys: List,
     function_lookup: dict,
     warn_log,
     func_name: str,
     variants: VariantRegistry,
 ) -> List:
-    """Resolve each unmatched call site into the on-disk inlining tuple.
+    """Resolve each unmatched call site into the on-disk call-targets tuple.
 
     ``called_by_version`` carries the typed callee set per version
-    (``set[(name, CallTargetType)]``); this helper projects to the
-    name-only CSV index space (matching ``unique_called_list``, which
-    is a name-only ordered dedup) for the inlining-cell ``called_func_id``
-    field. Phase 4 will widen the inlining cell to carry the type tag
-    and drop the projection.
+    (``set[(name, CallTargetType)]``); ``typed_unique_called_index``
+    maps each ``(name, type)`` pair to its position in the section's
+    typed call-target list (= the CSV column index). The cell shape
+    matches the BIN call_target table — two same-name-different-type
+    entries stay distinct via the typed lookup. ``hex_length`` is gone
+    post-Phase 4.1; records in ``_unmatched_data.bin`` are
+    self-describing.
     """
-    inlining_data_list = []
+    call_targets_data_list = []
     for comp_set_id, called_funcs in called_by_version:
-        for (called_name, _type) in called_funcs:
-            called_func_id = unique_called_list.index(called_name)
+        for (called_name, called_type) in called_funcs:
+            called_func_id = typed_unique_called_index[(called_name, called_type)]
             lookup_key = (called_name, vkeys[comp_set_id])
             if lookup_key in function_lookup:
-                func_offset, func_len, is_matched = function_lookup[lookup_key]
-                inlining_data_list.append(
-                    [called_func_id, comp_set_id, func_offset, func_len, is_matched]
+                func_offset, _func_len, is_matched = function_lookup[lookup_key]
+                call_targets_data_list.append(
+                    [called_func_id, comp_set_id, func_offset, is_matched]
                 )
             else:
                 write_warn_log_entry(
                     warn_log, func_name, variants.ref(vkeys[comp_set_id]), called_name
                 )
-    return inlining_data_list
+    return call_targets_data_list
 
 
-def _format_unmatched_inlining_str(inlining_data_list: List) -> str:
-    """Merge per-version tuples + format the on-disk inlining-data cell.
+def _format_unmatched_call_targets_str(call_targets_data_list: List) -> str:
+    """Merge per-version tuples + format the on-disk call-targets cell.
 
-    ``called_func_id`` is a LOCAL index into the section's
-    ``unique_called`` list (NOT a function name). Duplicate
-    ``(called_func_id, offset, length, is_matched)`` tuples appearing
+    ``called_func_id`` is a LOCAL index into the section's typed
+    ``unique_called`` list (NOT a function name; the per-call-site
+    type tag lives in the section header's called-funcs cell). Duplicate
+    ``(called_func_id, offset, is_matched)`` tuples appearing
     across multiple versions collapse into one entry whose
     ``comp_set_id`` field underscore-joins the contributing version IDs.
     """
     grouped = defaultdict(list)
-    for called_func_id, comp_set_id, offset, length, is_matched in inlining_data_list:
-        grouped[(called_func_id, offset, length, is_matched)].append(comp_set_id)
+    for called_func_id, comp_set_id, offset, is_matched in call_targets_data_list:
+        grouped[(called_func_id, offset, is_matched)].append(comp_set_id)
 
     merged_entries = []
-    for (called_func_id, offset, length, is_matched), comp_set_ids in sorted(grouped.items()):
+    for (called_func_id, offset, is_matched), comp_set_ids in sorted(grouped.items()):
         comp_set_str = "_".join(map(str, sorted(comp_set_ids)))
         merged_entries.append(
-            f"{called_func_id}-{comp_set_str},{offset:x},{length:x},{is_matched}"
+            f"{called_func_id}-{comp_set_str},{offset:x},{is_matched}"
         )
     return ";".join(merged_entries)
 
@@ -582,17 +571,20 @@ def write_unmatched_sections_pass2(
             continue
 
         # Typed sorted union of all callees seen across this function
-        # group's variants — drives the BIN's call_target table.
+        # group's variants — drives BOTH the BIN's call_target table
+        # AND the CSV cell shape (Phase 4.1: the CSV cell carries the
+        # typed form, no name-only projection step).
         typed_unique_called: "list[TypedCallee]" = sorted(
             all_called, key=lambda nt: (nt[0], nt[1].value)
         )
-        # Name-only projection for the CSV path.
-        unique_called_list = _project_called_names_unique(typed_unique_called)
+        typed_unique_called_index: "dict[TypedCallee, int]" = {
+            nt: idx for idx, nt in enumerate(typed_unique_called)
+        }
         first_offset = version_data_list[0][0]
 
-        inlining_data_list = _build_unmatched_inlining_data_list(
+        call_targets_data_list = _build_unmatched_call_targets_list(
             called_by_version,
-            unique_called_list,
+            typed_unique_called_index,
             vkeys,
             function_lookup,
             warn_log,
@@ -602,18 +594,21 @@ def write_unmatched_sections_pass2(
 
         variant_refs = [variants.ref(vkey) for vkey in vkeys]
         line_no_b64 = format_function_line_no(registry.line_no(func_name))
-        called_line_nos_b64 = format_function_line_nos_csv(
-            [registry.line_no(name) for name in unique_called_list]
+        called_line_nos_typed = format_called_line_nos_typed(
+            [
+                (registry.line_no(name), call_type)
+                for name, call_type in typed_unique_called
+            ]
         )
-        inlining_data_str = _format_unmatched_inlining_str(inlining_data_list)
+        call_targets_str = _format_unmatched_call_targets_str(call_targets_data_list)
         indexer_hex = encode_inline_indexer(first_offset)
 
         write_unmatched_section_csv(
             writer,
             line_no_b64,
             variant_refs,
-            called_line_nos_b64,
-            inlining_data_str,
+            called_line_nos_typed,
+            call_targets_str,
             indexer_hex,
         )
 
