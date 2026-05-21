@@ -442,21 +442,40 @@ def test_called_idx_validation(tmp_path: Path):
         )
 
 
-def test_dup_section_rejected(tmp_path: Path):
-    """begin_section with an already-written FID raises."""
+def test_dup_section_overwrites_known_sections_with_latest_offset(tmp_path: Path):
+    """Two sections sharing a FID are both written; ``known_sections``
+    tracks the latest section's offset.
+
+    Clang emits compiler-internal helpers (``OUTLINED_FUNCTION_N``)
+    that share names across distinct bodies, so the matched arm can
+    legitimately produce multiple sections with the same
+    ``function_name_ptr``. The writer accepts the collision and the
+    matched_index.bin records all sections independently (the loader
+    indexes by position, not by name)."""
     path = tmp_path / "dup.bin"
     writer = SectionWriter(path)
 
     writer.begin_section(function_name_ptr=1)
     writer.emit_call_targets([])
+    first_offset, _ = writer.end_section()
+
+    second_offset = writer.begin_section(function_name_ptr=1)
+    writer.emit_call_targets([])
     writer.end_section()
+    writer.finalize()
 
-    with pytest.raises(ValueError, match="already written"):
-        writer.begin_section(function_name_ptr=1)
+    assert second_offset != first_offset
+    assert writer._known_sections[1] == second_offset  # noqa: SLF001 — internal-state assertion is the point of this test
+    sections = list(iter_sections_bin(path))
+    assert len(sections) == 2
+    assert {s.function_name_ptr for s in sections} == {1}
 
 
-def test_dup_variant_vkey_rejected(tmp_path: Path):
-    """end_variant with a vkey already seen in this section raises."""
+def test_dup_variant_vkey_overwrites_known_section_variants_with_latest(tmp_path: Path):
+    """A vkey can re-appear within a section (or across sections sharing
+    a FID); the latest emission's variant_idx wins for back-patch
+    resolution, matching the pre-refactor ``function_lookup``
+    last-write-wins semantics."""
     path = tmp_path / "dup_vkey.bin"
     writer = SectionWriter(path)
 
@@ -464,12 +483,17 @@ def test_dup_variant_vkey_rejected(tmp_path: Path):
     writer.emit_call_targets([])
     writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
-    writer.end_variant(vkey="x86_O0")
+    first_idx = writer.end_variant(vkey="x86_O0")
 
     writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
-    with pytest.raises(ValueError, match="already registered"):
-        writer.end_variant(vkey="x86_O0")
+    second_idx = writer.end_variant(vkey="x86_O0")
+    writer.end_section()
+    writer.finalize()
+
+    assert first_idx == 0
+    assert second_idx == 1
+    assert writer._known_section_variants[(1, "x86_O0")] == second_idx  # noqa: SLF001
 
 
 def test_section_alignment_padding(tmp_path: Path):

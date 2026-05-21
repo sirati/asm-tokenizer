@@ -306,17 +306,25 @@ class SectionWriter:
         FID emitted by EARLIER sections remain in ``_pending_holes`` —
         they're resolved when this section closes via
         :meth:`end_section`.
+
+        Function names are not globally unique within a binary: clang
+        emits ``OUTLINED_FUNCTION_N`` for compiler-internal helpers
+        and these share names across distinct bodies. The matched arm
+        therefore yields multiple entries with the same ``func_name``,
+        producing multiple sections that share a
+        ``function_name_ptr``. We accept the collision and overwrite
+        ``known_sections`` with the latest section's offset — matching
+        the pre-refactor ``function_lookup`` semantics (which keyed on
+        ``(name, vkey)`` and silently let later writes win). The
+        ``matched_index.bin`` locator records every section
+        independently so the loader can still address all of them by
+        index; only the ``function_section_ptr`` back-patch path
+        collapses to the latest body.
         """
         self._assert_no_open_section()
         self._pad_to_alignment()
         section_offset = self._writer.cursor
 
-        if function_name_ptr in self._known_sections:
-            raise ValueError(
-                f"section for function_name_ptr={function_name_ptr} "
-                f"already written at offset "
-                f"{self._known_sections[function_name_ptr]}"
-            )
         self._known_sections[function_name_ptr] = section_offset
 
         self._current_fid = function_name_ptr
@@ -450,6 +458,12 @@ class SectionWriter:
         ``known_section_variants[(current_FID, vkey)] = variant_idx``
         mapping. Future emissions referencing this ``(FID, vkey)``
         will resolve directly without back-patching.
+
+        Multiple sections sharing a ``function_name_ptr`` (see the
+        :meth:`begin_section` docstring) can emit overlapping vkeys;
+        the latest write wins for the purposes of per-call back-patch
+        resolution, matching the pre-refactor ``function_lookup``
+        last-write-wins semantics.
         """
         self._assert_variant_open()
         variant_idx = self._current_variant_count
@@ -461,12 +475,6 @@ class SectionWriter:
                 f"0xFFFF as the unresolved-hole sentinel)"
             )
         key = (self._current_fid, vkey)
-        if key in self._known_section_variants:
-            raise ValueError(
-                f"vkey {vkey!r} already registered for "
-                f"function_name_ptr={self._current_fid} "
-                f"at variant_idx={self._known_section_variants[key]}"
-            )
         self._known_section_variants[key] = variant_idx
         self._current_variant_count += 1
         self._current_variant_n_calls_slot = None
