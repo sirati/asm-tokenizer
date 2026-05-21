@@ -364,6 +364,44 @@ def test_finalize_asserts_on_unresolved_hole(tmp_path: Path):
         writer.finalize()
 
 
+def test_backward_per_call_to_closed_section_missing_vkey_stamps_missing_directly(tmp_path: Path):
+    """If a section's per-call entry references a callee whose section
+    has ALREADY CLOSED but does not have this caller's vkey, the slot
+    stamps :data:`MISSING_VARIANT_INDEX` directly at emit time — opening
+    a back-patch hole would never resolve since the only place that
+    pops :data:`_pending_holes` is the callee's :meth:`end_section`,
+    which has already run."""
+    path = tmp_path / "backward_miss.bin"
+    writer = SectionWriter(path)
+
+    # Section B: emits ONLY vkey="x86_O3".
+    writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="x86_O3")
+    writer.end_section()
+
+    # Section A (emitted AFTER B closes): references B at vkey="x86_O0".
+    writer.begin_section(function_name_ptr=1)
+    writer.emit_call_targets(
+        [CallTargetSpec(function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True)]
+    )
+    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey="x86_O0")]
+    )
+    writer.end_variant(vkey="x86_O0")
+    writer.end_section()
+    writer.finalize()
+
+    sections = {s.function_name_ptr: s for s in iter_sections_bin(path)}
+    a = sections[1]
+    (called_idx, sv_idx), = a.variants[0].per_call_entries
+    assert called_idx == 0
+    assert sv_idx == MISSING_VARIANT_INDEX
+
+
 def test_per_variant_hole_with_missing_callee_vkey_lands_as_missing_sentinel(tmp_path: Path):
     """Cross-arm vkey mismatch: callee section IS written but never emits
     the caller's vkey. The per-call slot lands on

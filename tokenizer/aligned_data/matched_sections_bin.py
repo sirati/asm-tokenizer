@@ -272,6 +272,14 @@ class SectionWriter:
         self._known_sections: dict[int, int] = {}
         self._known_section_variants: dict[tuple[int, Hashable], int] = {}
         self._pending_holes: dict[int, list[_HoleRecord]] = {}
+        # FIDs whose section already CLOSED (end_section ran). Used by
+        # :meth:`emit_per_call_entries` to distinguish a forward
+        # reference (callee not started, open a back-patch hole) from
+        # a backward reference where the callee did NOT emit the
+        # caller's vkey (stamp MISSING_VARIANT_INDEX directly — the
+        # back-patch loop only runs at end_section so a hole opened
+        # AFTER the callee closed would leak to finalize).
+        self._closed_sections: set[int] = set()
 
         # Per-section state (cleared on every begin_section).
         self._current_fid: Optional[int] = None
@@ -412,13 +420,24 @@ class SectionWriter:
         """Write the variant's per-call entries + patch ``n_calls``.
 
         For each entry, the writer looks up
-        ``known_section_variants[(callee_FID, callee_vkey)]``; a hit
-        stamps the u16 directly, a miss stamps
-        :data:`UNRESOLVED_VARIANT_INDEX` and records a back-patch
-        target. The HoleRecord is shared across multiple per-call
-        slots referencing the same callee from this section — the
-        ``_current_section_holes_by_callee`` map carries the
-        deduplication so we never duplicate header_hole_offset.
+        ``known_section_variants[(callee_FID, callee_vkey)]``. Three
+        cases:
+
+        * Hit ⇒ stamp the resolved u16 directly.
+        * Miss AND callee section already exists in
+          ``_known_sections`` ⇒ the callee emitted but does NOT have
+          this caller vkey (cross-arm/cross-section vkey mismatch:
+          caller and callee have different surviving-variant sets
+          after pass-1's drop rules). Stamp
+          :data:`MISSING_VARIANT_INDEX` directly; no back-patch hole
+          can ever resolve this because the callee section has
+          already closed.
+        * Miss AND callee section not yet written (forward reference) ⇒
+          stamp :data:`UNRESOLVED_VARIANT_INDEX` and record a back-
+          patch target. The HoleRecord is shared across multiple per-
+          call slots referencing the same callee from this section —
+          the ``_current_section_holes_by_callee`` map carries the
+          deduplication so we never duplicate header_hole_offset.
         """
         self._assert_variant_open()
 
@@ -431,15 +450,17 @@ class SectionWriter:
             resolved = self._known_section_variants.get(
                 (entry.callee_function_name_ptr, entry.callee_vkey)
             )
-            if resolved is None:
+            if resolved is not None:
+                section_variant_index = resolved
+            elif entry.callee_function_name_ptr in self._closed_sections:
+                section_variant_index = MISSING_VARIANT_INDEX
+            else:
                 section_variant_index = UNRESOLVED_VARIANT_INDEX
                 self._record_per_variant_hole(
                     callee_fid=entry.callee_function_name_ptr,
                     slot_offset=slot_offset,
                     callee_vkey=entry.callee_vkey,
                 )
-            else:
-                section_variant_index = resolved
             self._writer.write(
                 struct.pack("<HH", entry.called_idx, section_variant_index)
             )
@@ -531,6 +552,12 @@ class SectionWriter:
                     # callee body available for this vkey".
                     variant_idx = MISSING_VARIANT_INDEX
                 self._writer.patch(slot_offset, struct.pack("<H", variant_idx))
+
+        # Mark FID as closed so emit_per_call_entries from LATER
+        # sections can distinguish "callee section already closed
+        # without this vkey" (stamp MISSING) from "callee section not
+        # started yet" (open a hole).
+        self._closed_sections.add(fid)
 
         # Clear per-section state.
         self._current_fid = None
