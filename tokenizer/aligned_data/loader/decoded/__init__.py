@@ -20,6 +20,7 @@ from __future__ import annotations
 from tokenizer.tokens import Category
 
 from .category_tokens import (
+    FID_KEYED_CATEGORIES,
     resolve_category_token_ids,
     resolve_number_token_ids,
 )
@@ -36,6 +37,7 @@ from .splice import IDENTITY_SENTINEL, splice_with_callees
 __all__ = [
     "Category",
     "DecodedFunction",
+    "FID_KEYED_CATEGORIES",
     "IDENTITY_SENTINEL",
     "INFNAN_EXPONENT_UNBIASED",
     "TARGET_EXPONENT_BIAS",

@@ -22,6 +22,7 @@ from .binary_dataset import BinaryDataset
 from .decoded import (
     Category,
     DecodedFunction,
+    FID_KEYED_CATEGORIES,
     IDENTITY_SENTINEL,
     INFNAN_EXPONENT_UNBIASED,
     TARGET_EXPONENT_BIAS,
@@ -41,6 +42,7 @@ __all__ = [
     "BinaryDataset",
     "Category",
     "DecodedFunction",
+    "FID_KEYED_CATEGORIES",
     "FunctionData",
     "IDENTITY_SENTINEL",
     "INFNAN_EXPONENT_UNBIASED",

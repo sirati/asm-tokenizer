@@ -25,6 +25,7 @@ import tokenizer.aligned_data.loader.decoded as decoded_pkg
 from tokenizer.aligned_data.loader.decoded import (  # noqa: F401
     Category as DecodedCategory,
     DecodedFunction as DecodedDecodedFunction,
+    FID_KEYED_CATEGORIES as DECODED_FID_KEYED_CATEGORIES,
     IDENTITY_SENTINEL as DECODED_IDENTITY_SENTINEL,
     INFNAN_EXPONENT_UNBIASED as DECODED_INFNAN_EXPONENT_UNBIASED,
     TARGET_EXPONENT_BIAS as DECODED_TARGET_EXPONENT_BIAS,
@@ -41,6 +42,7 @@ from tokenizer.aligned_data.loader import (  # noqa: F401
     BinaryDataset,
     Category,
     DecodedFunction,
+    FID_KEYED_CATEGORIES,
     FunctionData,
     IDENTITY_SENTINEL,
     INFNAN_EXPONENT_UNBIASED,
@@ -59,6 +61,7 @@ from tokenizer.aligned_data.loader import (  # noqa: F401
 DECODED_EXPECTED_SYMBOLS = (
     "Category",
     "DecodedFunction",
+    "FID_KEYED_CATEGORIES",
     "IDENTITY_SENTINEL",
     "INFNAN_EXPONENT_UNBIASED",
     "TARGET_EXPONENT_BIAS",
@@ -88,12 +91,28 @@ def test_decoded_all_contains_expected_symbols() -> None:
 
 def test_decoded_all_has_no_unexpected_symbols() -> None:
     # The decoded package is a tight, plan-defined surface — anything outside
-    # the 11 documented symbols would be drift. If a new symbol is added by
+    # the documented symbols would be drift. If a new symbol is added by
     # design, extend DECODED_EXPECTED_SYMBOLS in the same commit.
     assert set(decoded_pkg.__all__) == set(DECODED_EXPECTED_SYMBOLS), (
         "decoded.__all__ drifted from the documented Phase 4.2 surface: "
         f"unexpected={set(decoded_pkg.__all__) - set(DECODED_EXPECTED_SYMBOLS)}"
     )
+
+
+def test_fid_keyed_categories_membership_pinned() -> None:
+    # Single source of truth for "which categories carry FIDs"; the splice
+    # + extract pipelines branch on membership here. A drift would mean
+    # the resolve / compaction passes silently treat a different category
+    # as FID-keyed.
+    assert DECODED_FID_KEYED_CATEGORIES == frozenset(
+        {
+            DecodedCategory.LOCAL_FUNC,
+            DecodedCategory.PLT_FUNC,
+            DecodedCategory.EXT_FUNC,
+        }
+    )
+    # Same object on both surfaces (loader vs decoded) — re-export, not copy.
+    assert FID_KEYED_CATEGORIES is DECODED_FID_KEYED_CATEGORIES
 
 
 def test_decoded_all_has_no_private_names() -> None:

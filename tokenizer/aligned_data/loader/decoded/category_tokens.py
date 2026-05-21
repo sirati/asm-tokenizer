@@ -73,6 +73,23 @@ _NUMBER_TOKEN_TYPES: tuple[TokenType, ...] = (
     TokenType.FLOAT128,
 )
 
+# Function-reference identity Categories whose identity values are FIDs
+# (``Section.call_targets[*].function_name_ptr``) rather than per-function
+# encoder counters. The session-level FID lookup in
+# ``_session_splice._build_fids_per_category`` populates one u32 array per
+# entry; the decode + splice pipeline branches on membership here to
+# decide whether to resolve a caller-local id into an FID. Single source
+# of truth — every consumer that needs the per-call-target FID resolution
+# imports this set rather than re-listing the three categories inline
+# (plan Decisions 22 + 26).
+FID_KEYED_CATEGORIES: frozenset[Category] = frozenset(
+    {
+        Category.LOCAL_FUNC,
+        Category.PLT_FUNC,
+        Category.EXT_FUNC,
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Internal resolver — shared by both public functions so the lookup

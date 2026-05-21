@@ -36,6 +36,27 @@ class DecodedFunction:
             category's real-token occurrences in ``real_tokens``. Sentinel
             ``0xFFFF`` flags an unresolved / overflowing identity (see
             plan Locked-in decision 7).
+
+            Post-splice semantics (plan Decisions 22 + 28 + 29):
+
+            * For categories in ``FID_KEYED_CATEGORIES``
+              (``LOCAL_FUNC``, ``PLT_FUNC``, ``EXT_FUNC``) the pre-
+              compaction value at each slot is the callee's function
+              identity (FID) -- equal to the matching
+              ``Section.call_targets[*].function_name_ptr``. Same FID
+              everywhere a given callee is referenced, regardless of
+              where in the splice tree the reference originates.
+            * For the other five categories (``BLOCK``,
+              ``RO_DATA_PTR``, ``RW_DATA_PTR``, ``STRING_PTR``,
+              ``JUMP_TABLE``) the pre-compaction value is the
+              per-function encoder counter offset by a running max
+              across the splice tree (legacy rebase path).
+
+            All eight categories then run through the splicer's per-
+            Category compaction pass, which maps the value space to a
+            dense ``[0, K)`` range (sentinel-preserving) so the final
+            arrays exposed here are uniformly ``uint16`` regardless of
+            the upstream identity domain.
         numbers_significant: ``uint64[Nn]`` -- one entry per number-token
             occurrence in ``real_tokens`` (after multi-chunk promotion).
         numbers_sign_exponent: ``uint32[Nn]`` -- paired with
