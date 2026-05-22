@@ -55,7 +55,7 @@ Variant selection state (threaded through every recursion level):
 
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
@@ -225,7 +225,7 @@ def splice_with_callees(
     root_section,
     root_section_offset: int,
     decode_callee_to_staging: Callable[
-        [int, str, int], Tuple[_StagingDecoded, object]
+        [int, str, int], Optional[Tuple[_StagingDecoded, object]]
     ],
     is_callee_present: Callable[[int, str], bool],
     max_depth: int,
@@ -256,14 +256,21 @@ def splice_with_callees(
             into the visited set so a callee that recurses back into
             the root is caught on the first level.
         decode_callee_to_staging: ``(callee_section_offset, arm,
-            callee_variant_index) -> (_StagingDecoded, callee_section)``
-            callback. Loads + FID-resolved-decodes the callee at the
-            requested variant index and returns its own parsed section
-            so the walker can recurse on the callee's call_targets +
-            variants. The session wiring closes this over a
-            :class:`BinarySession`; tests inject a stub. The third arg
-            is computed by the walker from the caller's
+            callee_variant_index) -> Optional[(_StagingDecoded,
+            callee_section)]`` callback. Loads + FID-resolved-decodes
+            the callee at the requested variant index and returns its
+            own parsed section so the walker can recurse on the
+            callee's call_targets + variants. The session wiring closes
+            this over a :class:`BinarySession`; tests inject a stub.
+            The third arg is computed by the walker from the caller's
             ``per_call_entries`` (see ``_choose_callee_variant``).
+            Returning ``None`` signals "no faithful callee body
+            available for this vkey": the walker treats it the same as
+            a missing callee -- call-site tokens stay in the caller's
+            stream, body is NOT spliced. Used by the session-side
+            defensive guard against out-of-range ``J`` produced by the
+            writer's same-FID-section collision (see
+            ``matched_sections_bin.py:317-330``).
         is_callee_present: ``(callee_section_offset, arm) -> bool``.
             Returns ``True`` iff the callee was emitted in the requested
             arm and will resolve via ``decode_callee_to_staging``. Externs
@@ -341,7 +348,7 @@ def _decode_then_splice(
     depth: int,
     visited: set,
     decode_callee_to_staging: Callable[
-        [int, str, int], Tuple[_StagingDecoded, object]
+        [int, str, int], Optional[Tuple[_StagingDecoded, object]]
     ],
     is_callee_present: Callable[[int, str], bool],
     primary_variant_idx: int,
@@ -402,9 +409,18 @@ def _decode_then_splice(
 
         visited.add(cycle_key)
         try:
-            callee_staging, callee_section = decode_callee_to_staging(
+            decoded = decode_callee_to_staging(
                 callee_offset, arm, callee_variant_idx
             )
+            if decoded is None:
+                # Session-side guard returned "no faithful callee body
+                # available" -- treat the same as a missing callee:
+                # caller's call-site tokens stay in the stream, body
+                # is NOT spliced. Currently only triggered by the
+                # out-of-range J defense (writer's same-FID section
+                # collision; see matched_sections_bin.py:317-330).
+                continue
+            callee_staging, callee_section = decoded
             if inlining_flag:
                 new_selection_vkeys = _narrow_selection_vkeys(
                     section,

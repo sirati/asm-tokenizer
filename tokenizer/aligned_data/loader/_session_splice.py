@@ -329,9 +329,26 @@ class _BinarySessionSpliceMixin:
                     "is_callee_present must gate this"
                 )
             if callee_arm == "matched":
-                fd, sec, _off = self._load_matched_for_splice(
-                    callee_idx, callee_variant_index
-                )
+                try:
+                    fd, sec, _off = self._load_matched_for_splice(
+                        callee_idx, callee_variant_index
+                    )
+                except IndexError:
+                    # Same-FID section collision: the writer's
+                    # ``_known_section_variants`` is keyed by
+                    # ``(callee_FID, callee_vkey)`` and overwrites on
+                    # later same-FID variants (clang OUTLINED_FUNCTION_N
+                    # pattern; see matched_sections_bin.py:317-330). The
+                    # J stamped into the caller's per_call_entry may
+                    # then index into a DIFFERENT same-FID section's
+                    # variant list than the one the call_target's
+                    # ``function_section_ptr`` resolves to. When J is
+                    # out of range for the resolved callee, treat it
+                    # the same as :data:`MISSING_VARIANT_INDEX`:
+                    # signal "no faithful callee body" so the walker
+                    # leaves the call-site tokens in the caller's
+                    # stream and does not splice a body.
+                    return None
             else:
                 # Unmatched callees have exactly one variant by the
                 # matched_sections_bin invariant; ignore the
