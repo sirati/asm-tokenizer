@@ -70,20 +70,6 @@ from tokenizer.aligned_data.memmap_format import (
 from tokenizer.aligned_data.memmap_writer import MemmapBinWriter
 
 # ---------------------------------------------------------------------------
-# Reader-dependent tests are temporarily xfailed pending the
-# ``parse_section_bin`` rewrite for the new jump-table format. The writer
-# now emits an 8-byte variant header and an ``n_variants × u16`` jump
-# table after the section header; the reader still raises
-# :class:`NotImplementedError` because B.2 has not yet shipped its
-# rewrite. Every test that round-trips through ``iter_sections_bin`` /
-# ``parse_section_bin`` (directly or via the finalize-time sentinel
-# sweep) currently fails. Re-enable each test once B.2 lands.
-_PENDING_READER_XFAIL = pytest.mark.xfail(
-    reason="pending parse_section_bin rewrite for jump-table format",
-    strict=False,
-)
-
-# ---------------------------------------------------------------------------
 # Prelude helpers
 # ---------------------------------------------------------------------------
 
@@ -165,7 +151,6 @@ def _read_u16(path: Path, offset: int) -> int:
         return struct.unpack("<H", fh.read(2))[0]
 
 
-@_PENDING_READER_XFAIL
 def test_section_round_trip(tmp_path: Path):
     """One section, two call_targets, two variants, every field round-trips."""
     path = tmp_path / "rt_sections.bin"
@@ -256,7 +241,6 @@ def test_section_round_trip(tmp_path: Path):
     assert section.variants[1].per_call_entries == [(0, 0)]
 
 
-@_PENDING_READER_XFAIL
 def test_header_back_patch(tmp_path: Path):
     """Section A forward-references section B; B's section_offset
     lands in A's call_target slot after end_section(B)."""
@@ -295,7 +279,6 @@ def test_header_back_patch(tmp_path: Path):
     assert offset_a == MATCHED_SECTIONS_BIN_PRELUDE_SIZE
 
 
-@_PENDING_READER_XFAIL
 def test_per_variant_back_patch(tmp_path: Path):
     """Section A's variant references B's variant_ref_offset=0x50 before
     B is written; after B emits that variant the slot equals B's
@@ -353,7 +336,6 @@ def test_per_variant_back_patch(tmp_path: Path):
             assert sv_idx != UNRESOLVED_VARIANT_INDEX
 
 
-@_PENDING_READER_XFAIL
 def test_extern_library_unknown_lands_as_zero(tmp_path: Path):
     """``extern_provider_line_no=None`` → function_section_ptr=0."""
     path = tmp_path / "extern_unknown.bin"
@@ -400,7 +382,6 @@ def test_finalize_asserts_on_unresolved_hole(tmp_path: Path):
         writer.finalize()
 
 
-@_PENDING_READER_XFAIL
 def test_backward_per_call_to_closed_section_missing_vkey_stamps_missing_at_finalize(tmp_path: Path):
     """If a section's per-call entry references a callee whose section
     has already been written but does not carry a variant matching the
@@ -440,7 +421,6 @@ def test_backward_per_call_to_closed_section_missing_vkey_stamps_missing_at_fina
     assert sv_idx == MISSING_VARIANT_INDEX
 
 
-@_PENDING_READER_XFAIL
 def test_per_variant_hole_with_missing_callee_vkey_lands_as_missing_sentinel(tmp_path: Path):
     """Cross-arm vkey mismatch: callee section IS written but never emits
     the caller's vkey. The per-call slot lands on
@@ -531,7 +511,6 @@ def test_called_idx_validation(tmp_path: Path):
         )
 
 
-@_PENDING_READER_XFAIL
 def test_dup_section_overwrites_known_sections_with_latest_offset(tmp_path: Path):
     """Two sections sharing a FID are both written; ``known_sections``
     tracks the latest section's offset.
@@ -561,7 +540,6 @@ def test_dup_section_overwrites_known_sections_with_latest_offset(tmp_path: Path
     assert {s.function_name_ptr for s in sections} == {1}
 
 
-@_PENDING_READER_XFAIL
 def test_dup_variant_ref_offset_within_section(tmp_path: Path):
     """A variant_ref_offset can re-appear within a section (legacy
     pre-refactor ``function_lookup`` last-write-wins behaviour). With
@@ -665,7 +643,6 @@ def test_section_alignment_padding(tmp_path: Path):
     writer.finalize()
 
 
-@_PENDING_READER_XFAIL
 def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
     """If a writer bug leaves a 0xFFFF slot AND empties pending_holes,
     the belt-and-braces sweep in finalize() still catches it.
@@ -728,7 +705,6 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
         writer.finalize()
 
 
-@_PENDING_READER_XFAIL
 def test_two_sections_share_callee(tmp_path: Path):
     """Two distinct sections both forward-reference the same callee
     section; both get patched at the callee's end_section."""
@@ -769,7 +745,6 @@ def test_two_sections_share_callee(tmp_path: Path):
     assert sections[2].call_targets[0].function_section_ptr == c_off
 
 
-@_PENDING_READER_XFAIL
 def test_multiple_per_variant_entries_to_same_callee(tmp_path: Path):
     """Two distinct per-call slots in the same variant both reference
     the same unwritten callee's same vkey; both get patched."""
@@ -851,7 +826,6 @@ def test_section_writer_close_is_idempotent(tmp_path: Path):
     writer.close()  # second call is a no-op
 
 
-@_PENDING_READER_XFAIL
 def test_section_writer_finalize_closes_on_sweep_error(tmp_path: Path):
     """If the finalize sweep raises, the mmap must still be released
     (otherwise the bin handle leaks until process exit)."""
@@ -974,7 +948,6 @@ def test_finalize_rejects_open_section(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@_PENDING_READER_XFAIL
 def test_outlined_function_siblings_disjoint_vkeys_each_patch_their_own(
     tmp_path: Path,
 ):
@@ -1049,7 +1022,6 @@ def test_outlined_function_siblings_disjoint_vkeys_each_patch_their_own(
     assert "missing_variant:" not in warn_log.getvalue()
 
 
-@_PENDING_READER_XFAIL
 def test_outlined_function_siblings_with_unregistered_vkey_lands_as_missing_at_finalize(
     tmp_path: Path,
 ):
@@ -1109,7 +1081,6 @@ def test_outlined_function_siblings_with_unregistered_vkey_lands_as_missing_at_f
     assert f"caller_section@{a_offset}" in log_text
 
 
-@_PENDING_READER_XFAIL
 def test_outlined_function_siblings_function_section_ptr_last_write_wins(
     tmp_path: Path,
 ):

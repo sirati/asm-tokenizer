@@ -616,12 +616,16 @@ class SectionWriter:
         callee section pointed at by ``_known_sections[callee_fid]``.
 
         ``None`` when the callee FID has no closed section yet
-        (forward reference) OR the closed section's local variant
-        table does not carry ``callee_vkey`` (e.g. the loader will
-        observe the call but the inlined callee body is not directly
-        addressable — handled later by the hole path) OR the parser
-        is not yet equipped to read the current wire format (the
-        transitional state during the B.1 → B.2 hand-off).
+        (forward reference) OR the callee FID is THIS section (the
+        in-flight section's header carries ``n_variants=0`` placeholder
+        until :meth:`end_section`, so its bytes are not yet
+        parser-readable — the per-variant hole path is used instead,
+        and :meth:`end_section`'s post-close re-parse will resolve it
+        once the section's own bytes describe its variant table) OR
+        the closed section's local variant table does not carry
+        ``callee_vkey`` (legitimate cross-arm vkey mismatch — the
+        loader will observe the call but the inlined callee body is
+        not directly addressable, also handled by the hole path).
 
         The section we re-parse is the SAME one whose offset will end
         up in the call_target row's ``function_section_ptr`` after the
@@ -633,41 +637,20 @@ class SectionWriter:
         already-written region; the view is released in a ``finally``
         to keep the mmap unmappable on later finalize.
         """
+        if callee_fid == self._current_fid:
+            return None
         section_offset = self._known_sections.get(callee_fid)
         if section_offset is None:
             return None
-        parsed = self._try_parse_section(section_offset)
-        if parsed is None:
-            return None
+        blob = self._writer.view()
+        try:
+            parsed, _end = parse_section_bin(blob, section_offset)
+        finally:
+            blob.release()
         for i, variant in enumerate(parsed.variants):
             if variant.variant_ref_offset == callee_vkey:
                 return i
         return None
-
-    def _try_parse_section(self, section_offset: int) -> Optional["Section"]:
-        """Re-parse a section from the in-flight bin, or ``None`` if the
-        parser cannot yet read the current wire format.
-
-        TODO: pending B.2 reader rewrite. The B.1 wire-format change
-        (8-byte variant header + per-section jump table) lands on the
-        writer side before :func:`parse_section_bin` is taught to read
-        it; until B.2 ships, every parser call from the writer's
-        in-flight resolution paths raises :class:`NotImplementedError`
-        and is treated as "not yet resolvable" so the per-variant
-        hole stays open and gets stamped with
-        :data:`MISSING_VARIANT_INDEX` at :meth:`finalize`. Header
-        back-patches do not go through this helper (they read
-        ``_known_sections`` directly) and remain fully functional.
-        """
-        blob = self._writer.view()
-        try:
-            try:
-                parsed, _end = parse_section_bin(blob, section_offset)
-            except NotImplementedError:
-                return None
-            return parsed
-        finally:
-            blob.release()
 
     def end_variant(self, vkey: Hashable) -> int:
         """Finalise the currently-open variant.
@@ -750,18 +733,15 @@ class SectionWriter:
         fid = self._current_fid
 
         # Recover THIS section's variant table from its own bytes —
-        # each section is self-describing. Returns ``None`` in the
-        # transitional B.1 → B.2 hand-off (parser not yet equipped for
-        # the jump-table wire format), in which case every per_variant
-        # hole stays open and gets :data:`MISSING_VARIANT_INDEX` at
-        # :meth:`finalize`.
-        parsed = self._try_parse_section(section_offset)
-        if parsed is None:
-            vkey_to_idx: dict[Hashable, int] = {}
-        else:
-            vkey_to_idx = {
-                v.variant_ref_offset: i for i, v in enumerate(parsed.variants)
-            }
+        # each section is self-describing.
+        blob = self._writer.view()
+        try:
+            parsed, _end = parse_section_bin(blob, section_offset)
+        finally:
+            blob.release()
+        vkey_to_idx: dict[Hashable, int] = {
+            v.variant_ref_offset: i for i, v in enumerate(parsed.variants)
+        }
 
         # Resolve back-patches whose callee FID == THIS section's FID.
         # Header slots: stamp this section's offset every time a
@@ -1057,23 +1037,13 @@ class SectionWriter:
         ``mmap.close``) does not trip on an exported pointer being
         held alive by the traceback of an in-flight exception.
 
-        TODO: pending B.2 reader rewrite. Until :func:`parse_section_bin`
-        learns the jump-table wire format, the sweep cannot decode
-        sections and silently no-ops — the writer's pending-holes book
-        is still consulted at :meth:`_resolve_or_stamp_remaining_holes`
-        so any ``UNRESOLVED`` slot whose hole was correctly registered
-        gets stamped with :data:`MISSING_VARIANT_INDEX`. B.2 restores
-        the belt-and-braces sweep.
         """
         blob = self._writer.view()
         try:
             end = len(blob)
             offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
             while offset < end:
-                try:
-                    section, offset = parse_section_bin(blob, offset)
-                except NotImplementedError:
-                    return
+                section, offset = parse_section_bin(blob, offset)
                 for v_idx, variant in enumerate(section.variants):
                     for called_idx, sv_idx in variant.per_call_entries:
                         if sv_idx == UNRESOLVED_VARIANT_INDEX:
@@ -1098,19 +1068,91 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
     section's trailing alignment padding (so the caller can call
     again with the new offset to read the next section).
 
-    Currently raises :class:`NotImplementedError`: pending B.2 reader
-    rewrite. The B.1 wire-format change shrank the variant header to
-    8 bytes and inserted a per-section ``n_variants × u16`` jump table
-    between the section header and the call_target table. Decoding the
-    new layout requires consuming the jump table to compute per-variant
-    payload sizes; that rewrite lands in B.2. Writer-side resolution
-    paths catch this exception and treat the section as "not yet
-    resolvable" (per-variant holes pile up and get stamped with
-    :data:`MISSING_VARIANT_INDEX` at :meth:`SectionWriter.finalize`).
+    Wire format from ``offset``:
+
+    1. 8 B section header — ``<IHH`` →
+       ``function_name_ptr | n_call_targets | n_variants``.
+    2. ``n_variants × u16`` jump table — slot ``i`` holds the number of
+       per-call entries that variant ``i``'s block carries. ``cumsum``
+       of the jump table gives variant-start offsets within the
+       variants region, so the reader can address variant_i in O(1).
+    3. ``n_call_targets × 12 B`` call_target rows — ``<IIHH`` →
+       ``function_name_ptr | function_section_ptr | flags | reserved``.
+    4. Variant blocks (one per declared variant). Each block is
+       8 B header (``<II`` → ``variant_ref_offset | data_offset_shifted``)
+       followed by ``jump_table[i] × 4 B`` per-call entries
+       (``<HH`` → ``called_idx | section_variant_index``).
+    5. Trailer pad up to :data:`SECTION_ALIGNMENT`.
+
+    All multi-byte integers are little-endian.
     """
-    raise NotImplementedError(
-        "pending parse_section_bin rewrite for jump-table format"
+    section_offset = offset
+
+    (
+        function_name_ptr,
+        n_call_targets,
+        n_variants,
+    ) = struct.unpack_from("<IHH", blob, offset)
+    offset += SECTION_HEADER_SIZE
+
+    jump_table: list[int] = list(
+        struct.unpack_from(f"<{n_variants}H", blob, offset)
     )
+    offset += n_variants * JUMP_TABLE_ENTRY_SIZE
+
+    call_targets: list[CallTarget] = []
+    for _ in range(n_call_targets):
+        (
+            ct_function_name_ptr,
+            function_section_ptr,
+            flags,
+            _reserved,
+        ) = struct.unpack_from("<IIHH", blob, offset)
+        offset += CALL_TARGET_ENTRY_SIZE
+        call_type, is_matched = _unpack_flags(flags)
+        call_targets.append(
+            CallTarget(
+                function_name_ptr=ct_function_name_ptr,
+                function_section_ptr=function_section_ptr,
+                type=call_type,
+                is_matched=is_matched,
+            )
+        )
+
+    variants: list[VariantBlock] = []
+    for n_calls in jump_table:
+        variant_ref_offset, data_offset_shifted = struct.unpack_from(
+            "<II", blob, offset
+        )
+        offset += VARIANT_HEADER_SIZE
+        if n_calls:
+            raw = struct.unpack_from(f"<{2 * n_calls}H", blob, offset)
+            per_call_entries = list(zip(raw[0::2], raw[1::2]))
+        else:
+            per_call_entries = []
+        offset += n_calls * PER_CALL_ENTRY_SIZE
+        variants.append(
+            VariantBlock(
+                variant_ref_offset=variant_ref_offset,
+                data_offset_shifted=data_offset_shifted,
+                per_call_entries=per_call_entries,
+            )
+        )
+
+    # Trailer pad — round up to SECTION_ALIGNMENT so the next section
+    # starts on a 4-byte boundary (the writer pre-pays this pad at
+    # :meth:`SectionWriter.end_section`).
+    rem = offset % SECTION_ALIGNMENT
+    if rem:
+        offset += SECTION_ALIGNMENT - rem
+
+    section = Section(
+        function_name_ptr=function_name_ptr,
+        section_offset=section_offset,
+        call_targets=call_targets,
+        variants=variants,
+    )
+    return section, offset
 
 
 def iter_sections_bin(path: Path) -> Iterator[Section]:

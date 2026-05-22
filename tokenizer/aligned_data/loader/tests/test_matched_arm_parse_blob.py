@@ -35,7 +35,7 @@ def _build_one_section_bin(
     bin_path = tmp_path / "fake_sections.bin"
     writer = SectionWriter(bin_path)
     try:
-        section_offset = writer.begin_section(fid)
+        section_offset = writer.begin_section(fid, n_variants=len(variant_offsets))
         # No call_targets -> empty table; per_call_entries empty too.
         writer.emit_call_targets([
             CallTargetSpec(
