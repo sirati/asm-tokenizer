@@ -57,6 +57,10 @@ def _emit_arm_disp_value_tokens(
     to a bare ``valued_const`` and lose the ``string_ptr`` emission).
     """
     tokens: List[Tokens] = []
+    # Width-bucket / classifier-lookup decisions use the magnitude; the
+    # signed ``value`` is what reaches ``process_constant_v2`` so the
+    # v2 emitter can own sign decomposition (postfix ``value_negative``
+    # for negatives, per the v2 sign-handling contract).
     abs_value = abs(value)
     # Memory operand → an FP load against a resolved pointer gets a
     # postfix ``floatXX`` (precedence.md "Postfix FP"). Only Ghidra
@@ -65,14 +69,27 @@ def _emit_arm_disp_value_tokens(
     # reports None.
     fp_postfix = op.fp_type
     if abs_value <= 0xFF and not is_resolved_target:
-        tokens.append(vocab_manager.ValuedConst(abs_value))
+        # Small-disp short-circuit: bypass classifier metadata (small
+        # values can't be addresses) but still route through the v2
+        # emitter so sign decomposition is owned in one place. With
+        # ``meta=None`` the classifier falls through to step 11
+        # (``_emit_valued_const``), yielding a bare valued_const_v2 for
+        # non-negatives and ``[valued_const_v2, value_negative]`` for
+        # negatives.
+        disp_tokens = constant_handler.process_constant_v2(
+            value,
+            meta=None,
+            is_arithmetic=False,
+            fp_postfix_type=None,
+        )
+        tokens.extend(disp_tokens)
     else:
         force_opaque = not has_base
         meta = lookup.lookup(abs_value)
 
         if force_opaque or (abs_value > (1 << 18)) or is_resolved_target:
             disp_tokens = constant_handler.process_constant_v2(
-                abs_value,
+                value,
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
@@ -81,14 +98,14 @@ def _emit_arm_disp_value_tokens(
         else:
             if (text_start <= abs_value < text_end) or (abs_value < func_min_addr or abs_value > func_max_addr):
                 disp_tokens = constant_handler.process_constant_v2(
-                    abs_value,
+                    value,
                     meta=meta,
                     is_arithmetic=False,
                     fp_postfix_type=fp_postfix,
                 )
                 tokens.extend(disp_tokens)
             else:
-                disp_tokens = constant_handler.process_constant_v2(abs_value, is_arithmetic=True)
+                disp_tokens = constant_handler.process_constant_v2(value, is_arithmetic=True)
                 tokens.extend(disp_tokens)
     return tokens
 
@@ -161,9 +178,13 @@ def tokenize_operand_memory(
     # the in-bracket disp emission; the disp is rendered after the
     # close-bracket + separator below.
     if has_disp and not post_indexed:
-        if classified_value < 0:
-            tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
-        elif has_base or has_index:
+        # Sign is now owned by the v2 valued_const emitter (postfix
+        # ``value_negative`` metatoken). The arch operand path no
+        # longer pre-flattens negative disps; the structural MEM_PLUS
+        # separator is emitted only when there is a preceding operand
+        # to separate from (bare-disp ``mem[#imm]`` stays operator-
+        # less).
+        if has_base or has_index:
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
         tokens.extend(
             _emit_arm_disp_value_tokens(
@@ -189,8 +210,9 @@ def tokenize_operand_memory(
         tokens.append(
             vocab_manager.MemoryOperand(MemoryOperandSymbol.POST_INDEX_SEPARATOR)
         )
-        if classified_value < 0:
-            tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
+        # Post-indexed ARM addressing is always ``[base], #imm`` with a
+        # base; the sign of the disp is owned by the v2 valued_const
+        # emitter (postfix ``value_negative``), no caller-side flip.
         tokens.extend(
             _emit_arm_disp_value_tokens(
                 classified_value,
