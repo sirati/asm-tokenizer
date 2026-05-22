@@ -211,7 +211,7 @@ def main_loop(
         sidecar: Optional[StringSidecar] = (
             StringSidecar(_strings_path_for(Path(csv_path))) if is_v2 else None
         )
-        writer = csv.writer(csvfile)
+        writer = csv.writer(csvfile, lineterminator='\n')
         if is_v2:
             # Prelude row: single cell announcing the wire-format
             # version. Readers MUST consume this row before parsing
@@ -332,7 +332,7 @@ def main_loop(
                         occurence += 1
                     else:
                         occurence = 0
-                    writer = csv.writer(csvfile)
+                    writer = csv.writer(csvfile, lineterminator='\n')
                     if filter.filter_fns(func_tokens, func_name, vocab_manager):
                         occurence -= 1
                         filtered_count += 1

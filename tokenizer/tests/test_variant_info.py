@@ -94,7 +94,7 @@ def test_legacy_filename_only(tmp_path: Path, caplog: pytest.LogCaptureFixture):
 def test_legacy_filename_with_variant_id_suffix(tmp_path: Path):
     """``__<8hex>`` suffix is peeled into ``variant_id`` and the
     cleaned ``pkg`` is preserved. Matches the existing
-    ``_split_variant_suffix`` semantics."""
+    ``split_variant_id_suffix`` semantics."""
     base = "arm32-clang-10-O3_minigzip__15f3f338"
     csv = _write_csv(tmp_path, base)
     info = VariantInfo.from_csv(csv)

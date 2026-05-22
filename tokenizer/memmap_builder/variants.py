@@ -1,194 +1,222 @@
 """Per-binary-group variant registry.
 
 A ``VariantRegistry`` is the single authority over the
-``vkey -> 0-based row index`` mapping inside one
-``build_memmap_files`` invocation. It owns:
+``vkey -> byte_offset`` mapping inside one ``build_memmap_files``
+invocation. It owns:
 
-  * the index assignment (insertion order matches the iteration order
-    the builder uses to consume ``versions``),
-  * the on-disk hex-string encoding (``0x<lowercase-hex>``),
-  * the per-group sidecar file ``<binary>_variants.csv``.
+  * the on-disk record placement in ``<binary>_variants.bin`` (each
+    variant's record is appended in registration order; the byte
+    offset the writer assigns is the registry's canonical reference),
+  * the hex-string encoding section CSVs cite as ``variant_ref``
+    (bare lowercase hex of the byte offset; same shape every other
+    byte-offset cell in the section CSV uses — see
+    ``aligned_data/io.py``'s ``f"{data_offset:x}"`` precedent),
+  * the slim back-reference CSV ``<binary>_variants.csv`` mapping
+    ``filename -> offset`` for human / filename-recovery tooling.
 
 Section writers and the warn-log writer take an opaque
 ``variant_ref: str`` from this registry; they don't know about the
-4-axis canonical tuple, the per-variant ``extra_metadata``, or the
-``filename`` slot. That keeps the section-CSV schema flat: one
-discriminator cell per row instead of repeating the full identity on
-every row.
+bin layout or the unified vocab. The hex shape of the cell is
+unchanged from the previous (row-index) regime — only the integer's
+meaning flipped from "row index in verbose CSV" to "byte offset
+into ``_variants.bin``", so existing section-CSV consumers parse
+the cell the same way and dispatch to the new memmap path.
 
-Design intent: the row index is the *only* cross-reference between
+Design intent: the byte offset is the *only* cross-reference between
 ``<binary>_sections.csv`` / ``<binary>_unmatched_sections.csv`` /
-``<binary>.warn.log`` rows and the sidecar metadata. Two variants
-that share the canonical-4 axes (arch/compiler/version/opt) but
-differ in flag_set / hardening / sanitizer / march therefore get
-distinct rows and remain distinguishable in the output.
+``<binary>.warn.log`` rows and the per-variant token record in the
+bin. The dataloader's hot path memmaps the bin once and slices at
+``offset`` — no CSV consultation. The slim CSV is purely a
+human-readable filename lookup; the dataloader never reads it on
+the hot path.
+
+Two variants that share the canonical-4 axes (arch/compiler/version/
+opt) but differ in flag_set / hardening / sanitizer / march therefore
+get distinct ``vkey``s (via ``variant_id``) and distinct bin records
+and remain distinguishable.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import csv
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Dict, Iterable, List
 
-
-@dataclass(frozen=True)
-class VariantRecord:
-    """Sidecar-CSV row contents for one variant.
-
-    ``flags`` is the canonical single-cell encoding of
-    ``extra_metadata`` (sorted-key pipe-joined ``key=value`` pairs);
-    empty string when the dict is empty.
-    """
-
-    filename: str
-    arch: str
-    compiler: str
-    version: str
-    opt: str
-    pkg: str
-    flags: str
-
-
-def encode_flags(extra_metadata: Mapping[str, Any]) -> str:
-    """Stable single-cell encoding of the opaque ``extra_metadata`` dict.
-
-    Sorted by key so two equal dicts produce identical strings
-    regardless of insertion order. Values are stringified via ``str()``
-    — the upstream sidecar JSON already carries primitive scalars
-    (strings, ints, bools); deeper structures are passed through
-    verbatim and the encoding remains lossy-but-stable for those
-    edge cases.
-    """
-    if not extra_metadata:
-        return ""
-    return "|".join(f"{k}={extra_metadata[k]}" for k in sorted(extra_metadata))
+from tokenizer.aligned_data.csv_format import write_csv_prelude
+from tokenizer.token_manager import VocabularyManager
+from tokenizer.variant_tokens.record import write_record
 
 
 class VariantRegistry:
-    """Assigns a stable row index to each variant and emits the sidecar.
+    """Assigns a stable byte offset to each variant and emits the bin + slim CSV.
 
-    Construction takes the same ordered sequence of
-    ``BinaryVersionInfo`` that ``build_memmap_files`` will iterate;
-    every section/warn-log row that the builder writes for variant
-    ``i`` carries the hex ref returned by ``ref(vkey_of_i)``.
+    The registry hard-depends on the unified ``VocabularyManager`` —
+    encoding each record requires looking up every axis-token string
+    in the unified vocab. Passing the vocab in the constructor (rather
+    than per call to ``write_sidecar``) makes that dependency explicit
+    at construction time and matches the "registry owns the encoding
+    concern" boundary.
+
+    Construction takes the same ordered sequence of ``BinaryVersionInfo``
+    that ``build_memmap_files`` will iterate. ``write_sidecar`` MUST
+    run before any caller invokes ``ref(vkey)``; the orchestration in
+    ``build_memmap_files`` already enforces this ordering (sidecar
+    write precedes the matched / unmatched section passes).
     """
 
-    def __init__(self, records: Iterable[VariantRecord], indices: Dict[Any, int]) -> None:
-        self._records: List[VariantRecord] = list(records)
-        self._indices = indices
-
-    @classmethod
-    def from_versions(cls, versions: Iterable[Any]) -> "VariantRegistry":
-        """Build a registry from a ``List[BinaryVersionInfo]``.
-
-        Each version's row index is its position in the input
-        iteration; the ``vkey`` derived from the version's canonical-4
-        + ``variant_id`` is the lookup key. Duplicate vkeys collapse to
-        the first occurrence — the builder's pairing logic already
-        de-duplicates by ``vkey`` before reaching here, so any later
-        duplicate represents a bug upstream.
-        """
-        from .builder import VersionKey
-
-        records: List[VariantRecord] = []
-        indices: Dict[VersionKey, int] = {}
+    def __init__(
+        self,
+        versions: Iterable[Any],
+        unified_vocab: VocabularyManager,
+    ) -> None:
+        # Two complementary views over the input sequence:
+        #
+        # * ``_ordered_versions`` — vkey-deduped, in first-encounter
+        #   order. Drives the bin file (one record per unique vkey).
+        # * ``_all_versions`` — every ``BinaryVersionInfo`` the caller
+        #   handed in, in encounter order, no dedup. Drives the slim
+        #   CSV (one row per source artefact). Two BVIs that share a
+        #   vkey collapse to one bin record but produce TWO csv rows
+        #   sharing the same ``offset`` cell, so downstream tooling
+        #   can recover every source filename + build-config hash
+        #   without losing provenance.
+        self._unified_vocab = unified_vocab
+        self._ordered_versions: List[Any] = []
+        self._all_versions: List[Any] = []
+        self._vkey_index: Dict[Any, int] = {}
         for version in versions:
-            vkey = VersionKey(
-                arch=version.arch,
-                compiler=version.compiler,
-                compilerversion=version.compilerversion,
-                opt=version.opt,
-                variant_id=version.variant_id,
-            )
-            if vkey in indices:
+            vkey = _vkey_for_version(version)
+            self._all_versions.append(version)
+            if vkey in self._vkey_index:
                 continue
-            indices[vkey] = len(records)
-            records.append(
-                VariantRecord(
-                    filename=getattr(version, "filename", "") or "",
-                    arch=version.arch,
-                    compiler=version.compiler,
-                    version=version.compilerversion,
-                    opt=version.opt,
-                    pkg=version.pkg,
-                    flags=encode_flags(version.extra_metadata),
-                )
-            )
-        return cls(records, indices)
+            self._vkey_index[vkey] = len(self._ordered_versions)
+            self._ordered_versions.append(version)
+        # Populated by ``write_sidecar``. Empty until then; ``ref``
+        # raises KeyError on lookup so a caller-ordering bug surfaces
+        # loudly rather than emitting bogus 0-offset refs.
+        self._offsets: Dict[Any, int] = {}
 
     @classmethod
-    def from_vkeys(
+    def from_versions(
         cls,
-        vkeys: Iterable[Any],
-        *,
-        filename: str = "",
-        pkg: str = "",
+        versions: Iterable[Any],
+        unified_vocab: VocabularyManager,
     ) -> "VariantRegistry":
-        """Build a registry directly from an ordered list of vkeys.
+        """Convenience factory — symmetric naming with the old API.
 
-        The legacy ``aligned_data.export`` entry-point lacks the per-
-        variant filename and metadata that the runner-driven path
-        carries; it only knows the canonical-4 axes. This factory lets
-        that path still emit a well-formed ``_variants.csv`` (with
-        empty ``flags`` and a caller-supplied ``filename`` / ``pkg``)
-        without forcing the export module to synthesise full
-        ``BinaryVersionInfo`` records.
+        Equivalent to calling the constructor directly; kept so
+        ``build_memmap_files`` and tests retain the previously-typed
+        ``VariantRegistry.from_versions(...)`` call shape.
         """
-        records: List[VariantRecord] = []
-        indices: Dict[Any, int] = {}
-        for vkey in vkeys:
-            if vkey in indices:
-                continue
-            indices[vkey] = len(records)
-            records.append(
-                VariantRecord(
-                    filename=filename,
-                    arch=vkey.arch,
-                    compiler=vkey.compiler,
-                    version=vkey.compilerversion,
-                    opt=vkey.opt,
-                    pkg=pkg,
-                    flags="",
-                )
-            )
-        return cls(records, indices)
+        return cls(versions, unified_vocab)
 
     def ref(self, vkey: Any) -> str:
-        """Return the row index of ``vkey`` as bare lowercase hex.
+        """Return ``vkey``'s byte offset into ``_variants.bin`` as hex.
 
-        Raises ``KeyError`` if the vkey was never registered — that's
-        a programming error (every vkey the builder uses must come
-        from the same ``versions`` list the registry was built from).
+        Format: bare lowercase hex (no ``0x`` prefix) to match the
+        ``f"{data_offset:x}"`` convention every other byte-offset
+        cell in the section CSV already uses (see
+        ``aligned_data/io.py:write_function_section_csv`` and
+        ``write_unmatched_section_csv``).
+
+        Raises ``KeyError`` if ``write_sidecar`` has not yet run OR
+        if the vkey was never registered. Both are programming
+        errors — ``build_memmap_files`` calls ``write_sidecar`` before
+        the section passes, and every vkey a section writer uses must
+        come from the same ``versions`` list the registry was built
+        from.
         """
-        return f"{self._indices[vkey]:x}"
+        return f"{self._offsets[vkey]:x}"
+
+    def byte_offset(self, vkey: Any) -> int:
+        """Return ``vkey``'s byte offset into ``_variants.bin`` as an integer.
+
+        Wire-format companion to :meth:`ref`: the matched-sections BIN
+        codec stamps the offset as a little-endian ``u32`` rather than
+        the CSV's hex string, so it needs the raw integer. The hex
+        string and the integer are two encodings of the same authority
+        (``self._offsets[vkey]``), keeping the registry as the single
+        owner of the vkey -> bin-offset mapping for both consumers.
+
+        Same precondition / failure mode as :meth:`ref`: raises
+        ``KeyError`` if the registry is unfinalised or the vkey was
+        never registered.
+        """
+        return self._offsets[vkey]
 
     def write_sidecar(self, output_dir: Path, binary_name: str) -> Path:
-        """Emit ``<binary>_variants.csv`` and return the path written.
+        """Emit ``<binary>_variants.bin`` and slim ``<binary>_variants.csv``.
 
-        Format: a header row (``filename,arch,compiler,version,opt,pkg,flags``)
-        followed by one row per variant in registration order. The
-        header makes the file self-describing for downstream consumers
-        without forcing them to consult schema docs.
+        The bin file holds one record per UNIQUE variant in
+        registration order (uint16 little-endian via
+        ``variant_tokens.record.write_record``). Each record's
+        starting byte offset is captured into ``self._offsets`` so
+        ``ref(vkey)`` can return it.
+
+        The slim CSV has three columns — ``filename,variant_id,offset``
+        — and carries one row per ``BinaryVersionInfo`` the caller
+        handed in (NOT deduped by vkey on this side). Multiple rows
+        may therefore share the same ``offset`` cell when two source
+        binaries are the same variant; ``variant_id`` (the 8-hex
+        build-config hash, zero-padded to match the
+        ``__<8hex>`` filename suffix convention in
+        :func:`tokenizer.output_filename.format_output_basename`) is
+        the canonical discriminator readers should reach for. Length
+        is intentionally omitted: the bin record's first u16
+        (``n_tokens``) self-describes the slice length, so a back-
+        reference table need not duplicate it.
+
+        Returns the bin path (the slim CSV path is derivable as a
+        sibling). The bin is the primary artefact; the CSV is a
+        back-reference.
         """
-        import csv
+        bin_path = output_dir / f"{binary_name}_variants.bin"
+        csv_path = output_dir / f"{binary_name}_variants.csv"
 
-        path = output_dir / f"{binary_name}_variants.csv"
-        with open(path, "w", newline="", encoding="ascii") as f:
-            writer = csv.writer(f)
-            writer.writerow(["filename", "arch", "compiler", "version", "opt", "pkg", "flags"])
-            for record in self._records:
+        # Bin: one record per unique variant; the offset becomes the
+        # canonical cross-reference used by section CSVs.
+        with open(bin_path, "wb") as bin_handle:
+            for version in self._ordered_versions:
+                vkey = _vkey_for_version(version)
+                offset = write_record(bin_handle, version, self._unified_vocab)
+                self._offsets[vkey] = offset
+
+        # Slim CSV: one row per BVI (no dedup); reuses the resolved
+        # offset for any BVI that shared a vkey with an earlier entry.
+        with open(csv_path, "w", newline="", encoding="ascii") as csv_handle:
+            write_csv_prelude(csv_handle)
+            writer = csv.writer(csv_handle, lineterminator='\n')
+            writer.writerow(["filename", "variant_id", "offset"])
+            for version in self._all_versions:
+                vkey = _vkey_for_version(version)
+                filename = getattr(version, "filename", "") or ""
                 writer.writerow(
                     [
-                        record.filename,
-                        record.arch,
-                        record.compiler,
-                        record.version,
-                        record.opt,
-                        record.pkg,
-                        record.flags,
+                        filename,
+                        f"{version.variant_id:08x}",
+                        f"{self._offsets[vkey]:x}",
                     ]
                 )
-        return path
+
+        return bin_path
+
+
+def _vkey_for_version(version: Any) -> Any:
+    """Build the ``VersionKey`` used for dedup + lookup.
+
+    Imported lazily from ``builder`` to keep the registry's import
+    graph one-way (builder imports variants; variants does not
+    import builder at module load).
+    """
+    from .builder import VersionKey
+
+    return VersionKey(
+        arch=version.arch,
+        compiler=version.compiler,
+        compilerversion=version.compilerversion,
+        opt=version.opt,
+        variant_id=version.variant_id,
+    )
 
 
 def write_warn_log_entry(warn_log, func_name: str, variant_ref: str, called_func: str) -> None:

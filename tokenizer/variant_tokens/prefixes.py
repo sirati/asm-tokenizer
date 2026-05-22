@@ -29,18 +29,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, List, Mapping, Tuple
 
-# Sibling subtask 1C adds ``arch_to_variant_arch`` to
-# ``tokenizer.arch_translation``. If that subtask has not merged yet
-# (running in worktree isolation), fall back to identity so this
-# module is independently importable; the orchestrator-side merge of
-# 1A + 1C will replace the placeholder with the real alias collapse.
-try:  # pragma: no cover - import path depends on merge order
-    from tokenizer.arch_translation import arch_to_variant_arch
-except ImportError:  # pragma: no cover - 1C not landed in this worktree
-    # TODO(1C-merge): drop this fallback once arch_to_variant_arch
-    # ships in tokenizer/arch_translation.py.
-    def arch_to_variant_arch(s: str) -> str:
-        return s
+from tokenizer.arch_translation import arch_to_variant_arch
 
 
 # Prefix string constants — exported so other modules (encoder

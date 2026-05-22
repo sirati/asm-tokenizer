@@ -8,19 +8,12 @@ This module provides utilities for:
 - Index management for fast function lookup by length
 """
 
-from .index import (
-    create_length_lookup_map,
-    extract_avg_lengths,
-    load_index_memmap,
-    read_index_entry,
-    select_random_function_by_length,
-)
 from .io import (
-    decode_and_translate_tokens,
-    decode_runlengths,
-    format_inlining_dict,
+    assemble_function_record,
+    format_call_targets_dict,
     format_variant_refs,
     parse_function_data_header,
+    parse_function_data_memmap,
     read_data_file,
     read_function_data_memmap,
     read_index_file,
@@ -39,12 +32,19 @@ from .loader import (
 )
 from .match import (
     is_vocab_row,
-    lockstep_function_match,
     open_csv_skip_vocab,
 )
 from .metadata import (
-    extract_all_metadata_from_section_rows,
-    extract_metadata_from_section_row,
+    extract_metadata_from_variant_block,
+    parse_call_targets,
+    parse_called_line_nos_typed,
+)
+from .parsed_record_iter import (
+    Matched,
+    ParsedRecord,
+    Unmatched,
+    lockstep_records,
+    open_parsed_record_iter,
 )
 from .sections import (
     read_function_section,
@@ -58,9 +58,8 @@ __all__ = [
     "MatchedFunction",
     "load_single_matched_function",
     # io
-    "decode_and_translate_tokens",
-    "decode_runlengths",
-    "format_inlining_dict",
+    "assemble_function_record",
+    "format_call_targets_dict",
     "format_variant_refs",
     "write_function_binary_data",
     "write_index_entry",
@@ -70,20 +69,21 @@ __all__ = [
     "read_sections_file",
     "read_data_file",
     "read_function_data_memmap",
+    "parse_function_data_memmap",
     "parse_function_data_header",
     # match
     "is_vocab_row",
     "open_csv_skip_vocab",
-    "lockstep_function_match",
+    # parsed_record_iter
+    "ParsedRecord",
+    "Matched",
+    "Unmatched",
+    "open_parsed_record_iter",
+    "lockstep_records",
     # metadata
-    "extract_metadata_from_section_row",
-    "extract_all_metadata_from_section_rows",
+    "extract_metadata_from_variant_block",
+    "parse_call_targets",
+    "parse_called_line_nos_typed",
     # sections
     "read_function_section",
-    # index
-    "load_index_memmap",
-    "extract_avg_lengths",
-    "create_length_lookup_map",
-    "select_random_function_by_length",
-    "read_index_entry",
 ]

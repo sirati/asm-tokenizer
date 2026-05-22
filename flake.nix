@@ -9,6 +9,14 @@
     # Generic semantic-layering helpers + extract-layer-assignment tool
     # (replaces the in-tree `nix/semantic-layering.nix` import).
     nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
+    # In-tree pyo3 extension providing the `u64 -> u32` primary dedup
+    # map used by `tokenizer.memmap_builder`. Lives in its own
+    # subfolder + flake (maturin is scoped there, not in the outer
+    # tokenizer dev shell). The overlay below injects
+    # `pkgs.python3Packages.dedup-hashmap` (and every other Python
+    # version's pkgs) so `python314.pkgs.dedup-hashmap` resolves.
+    dedup-hashmap.url = "path:./dedup_hashmap";
+    dedup-hashmap.inputs.nixpkgs.follows = "nixpkgs";
     gitignore = {
       url = "github:hercules-ci/gitignore.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -21,6 +29,7 @@
       nixpkgs,
       dynamic-runner,
       nix-docker-layered-image,
+      dedup-hashmap,
       gitignore,
     }:
     let
@@ -92,12 +101,17 @@
             # Injects `dynamic-runner` into every Python package set,
             # so `pkgs.python314.pkgs.dynamic-runner` is in scope.
             dynamic-runner.overlays.default
+            # Injects `dedup-hashmap` (in-tree subflake) into every
+            # Python package set, so `pkgs.python314.pkgs.dedup-hashmap`
+            # is in scope.
+            dedup-hashmap.overlays.default
           ];
         };
 
       # Package definitions
       deploymentPythonPackages =
-        python-pkgs: with python-pkgs; [
+        python-pkgs:
+        (with python-pkgs; [
           # Core binary analysis and disassembly
           angr
           capstone
@@ -112,7 +126,12 @@
           portalocker
           aioquic
           websockets
-        ];
+          xxhash
+        ])
+        # `dedup-hashmap` has a dash in its attr name; `with python-pkgs;`
+        # would parse the bare identifier as subtraction, so it ships via
+        # explicit attribute access alongside the `with`-block.
+        ++ [ python-pkgs.dedup-hashmap ];
 
       devPythonPackages =
         python-pkgs: with python-pkgs; [
@@ -195,6 +214,8 @@
           # Pre-built rust+python wheel from the external dynamic-runner
           # flake (consumed via its overlay; see `pkgsFor`).
           runnerWheel = pkgs.python314.pkgs.dynamic-runner;
+          # In-tree pyo3 wheel for the memmap-builder primary dedup map.
+          dedupHashmapWheel = pkgs.python314.pkgs.dedup-hashmap;
           inherit (gitignore.lib) gitignoreSource;
           semanticLayering = nix-docker-layered-image.lib.${system}.semanticLayering;
 
@@ -424,6 +445,11 @@
               {
                 name = "rust-wheel";
                 roots = [ runnerWheel ];
+                isolate = true;
+              }
+              {
+                name = "dedup-hashmap-wheel";
+                roots = [ dedupHashmapWheel ];
                 isolate = true;
               }
               {

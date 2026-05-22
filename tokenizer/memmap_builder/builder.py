@@ -1,17 +1,31 @@
-import json
+import contextlib
 import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
+from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+from tokenizer.aligned_data.parsed_record_iter import (
+    Matched,
+    Unmatched,
+    lockstep_records,
+    open_parsed_record_iter,
+)
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
+from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
-from ..aligned_data.match import lockstep_function_match
+from ._dedup import open_arm_dedup_state
+from ._output_files import (
+    open_matched_section_outputs,
+    open_sections_bin_outputs,
+    open_unmatched_section_outputs,
+)
+from .function_names import FunctionNamesRegistry
 from .passes import (
     build_function_lookup_table,
-    process_matched_function_pass1,
-    process_unmatched_function_pass1,
+    process_matched_function,
+    process_unmatched_function,
     write_matched_sections_pass2,
     write_unmatched_sections_pass2,
 )
@@ -50,9 +64,9 @@ class BinaryVersionInfo:
     `extra_metadata` is the opaque pass-through dict reconstructed from
     the per-variant sidecar (`<basename>_meta.json`) during worker
     decoding. Legacy versions without a sidecar carry an empty dict —
-    the metadata is forwarded verbatim to the per-binary
-    `<binary>_versions.json` writer and is never inspected by the
-    builder itself.
+    the metadata is forwarded to the per-binary `_variants.bin` record
+    encoder (via the unified vocab's variant-axis tokens) and is never
+    inspected by the builder itself.
     """
 
     path: Path
@@ -82,64 +96,63 @@ def get_mapping(mapping_path: Path):
     return None
 
 
-def _write_versions_sidecar(
+def build_memmap_files(
     versions: List[BinaryVersionInfo],
     output_dir: Path,
     binary_name: str,
+    unified_vocab_path: Path,
 ) -> None:
-    """Emit ``<binary>_versions.json`` with one entry per version in
-    the same iteration order as ``build_memmap_files`` consumes
-    ``versions``. The reader matches a section row to its version
-    record by the canonical-4 axes plus ``variant_id``; the
-    ``version_idx`` field is a positional convenience and equals the
-    list position.
+    """Build memory-mapped binary files from aligned CSV data.
 
-    `_sections.csv` deliberately stays flat (no `variant_id` column,
-    no embedded metadata) — the sidecar is purely additive lookup.
+    `unified_vocab_path` points at the corpus-wide ``unified_vocab.csv``
+    produced by ``tokenizer.vocab_unifier``. It is loaded once here
+    (``MEMMAP_FORMAT_VERSION`` required) and threaded into
+    ``VariantRegistry`` so the per-variant token records emitted into
+    ``<binary>_variants.bin`` can resolve each axis string (``arch:*``,
+    ``comp:*``, ``cver:*``, ``opt:*``, plus per-metadata-pair tokens) to
+    its assigned uint16 ID. Any non-current-version (or missing) unified
+    vocab is rejected loudly here rather than silently corrupting the bin
+    via stub IDs.
     """
-    payload = []
-    for idx, version in enumerate(versions):
-        payload.append(
-            {
-                "version_idx": idx,
-                "variant_id": version.variant_id,
-                "arch": version.arch,
-                "compiler": version.compiler,
-                "compiler_version": version.compilerversion,
-                "opt": version.opt,
-                "pkg": version.pkg,
-                "extra_metadata": version.extra_metadata,
-            }
-        )
-
-    versions_path = output_dir / f"{binary_name}_versions.json"
-    logger.info(f"  Creating: {versions_path}")
-    with open(versions_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=False)
-    logger.info(f"  Closed: {versions_path}")
-
-
-def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, binary_name: str) -> None:
-    """Build memory-mapped binary files from aligned CSV data."""
 
     logger.info(f"  Output directory: {output_dir}")
+
+    # Unified vocab is a hard dependency of the variant-token encoder
+    # (every axis string must already have an assigned uint16 ID before
+    # the registry walks its records). Load before constructing the
+    # registry so a vocab-shape mismatch fails this group up front
+    # instead of mid-record-write.
+    unified_vocab = load_unified_vocab_manager(unified_vocab_path)
+    if unified_vocab is None:
+        raise ValueError(
+            f"build_memmap_files: failed to load unified vocab from "
+            f"{unified_vocab_path}; cannot encode variant-axis tokens."
+        )
+    if unified_vocab.format_version != MEMMAP_FORMAT_VERSION:
+        raise ValueError(
+            f"build_memmap_files: unified vocab at {unified_vocab_path} "
+            f"reports format_version={unified_vocab.format_version}; "
+            f"v{MEMMAP_FORMAT_VERSION} required for the memmap-output "
+            f"chain. Re-run tokenizer.vocab_unifier against the per-binary "
+            f"CSV inputs to regenerate."
+        )
 
     # Variant registry: single authority on the `vkey -> 0x<hex>` ref
     # used by every section-CSV row and the warn-log. Built up front
     # so the assignment is fixed before any matched/unmatched pass
-    # consults it, and the sidecar `<binary>_variants.csv` written at
-    # the start (alongside the data files) of this group's output.
-    variants = VariantRegistry.from_versions(versions)
+    # consults it. ``write_sidecar`` MUST run before the section passes
+    # since `ref(vkey)` only returns a usable byte offset once the bin
+    # has been written; today's ordering (sidecar -> section passes)
+    # already satisfies that invariant.
+    variants = VariantRegistry.from_versions(versions, unified_vocab=unified_vocab)
     variants_path = variants.write_sidecar(output_dir, binary_name)
     logger.info(f"  Wrote: {variants_path}")
 
-    mapping_dict = {}
     csv_paths = []
     version_keys = []
+    mappings = []
 
     for version in versions:
-        mapping = get_mapping(version.mapping_path)
-
         vkey = VersionKey(
             arch=version.arch,
             compiler=version.compiler,
@@ -147,10 +160,9 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
             opt=version.opt,
             variant_id=version.variant_id,
         )
-
-        mapping_dict[vkey] = mapping
         csv_paths.append(str(version.path))
         version_keys.append(vkey)
+        mappings.append(get_mapping(version.mapping_path))
 
     prefix = binary_name
     unmatched_prefix = f"{binary_name}_unmatched"
@@ -160,114 +172,161 @@ def build_memmap_files(versions: List[BinaryVersionInfo], output_dir: Path, bina
 
     matched_data_path = output_dir / f"{prefix}_data.bin"
     unmatched_data_path = output_dir / f"{unmatched_prefix}_data.bin"
-    logger.info(f"  Creating: {matched_data_path}")
-    logger.info(f"  Creating: {unmatched_data_path}")
-    matched_data_file = open(matched_data_path, "wb")
-    unmatched_data_file = open(unmatched_data_path, "wb")
+    error_log_path = output_dir / f"{binary_name}.error.log"
+    warn_log_path = output_dir / f"{binary_name}.warn.log"
 
-    progress_callback = None
-    pbar = None
-    if sys.stdout.isatty():
-        try:
-            from tqdm import tqdm
+    # ExitStack owns every file handle the build opens so an exception
+    # in any phase (pass 1, sidecar emission, pass 2) reliably closes
+    # them in reverse open order. Partial output is intentionally left
+    # on disk — clean-up on retry is the caller's responsibility.
+    function_names_registry = FunctionNamesRegistry()
 
-            total_size = sum(Path(csv_path).stat().st_size for csv_path in csv_paths)
-            pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Processing {binary_name}", leave=False)
-            progress_callback = pbar.update
-            last_bytes = [0]
+    with contextlib.ExitStack() as stack:
+        logger.info(f"  Creating: {matched_data_path}")
+        logger.info(f"  Creating: {unmatched_data_path}")
+        logger.info(f"  Creating: {error_log_path}")
+        matched_state = open_arm_dedup_state(matched_data_path)
+        unmatched_state = open_arm_dedup_state(unmatched_data_path)
+        stack.callback(matched_state.writer.finalize)
+        stack.callback(unmatched_state.writer.finalize)
+        error_log = stack.enter_context(open(error_log_path, "w", encoding="ascii"))
 
-            def progress_wrapper(current_bytes):
-                delta = current_bytes - last_bytes[0]
-                last_bytes[0] = current_bytes
-                pbar.update(delta)
+        wrappers = []
+        per_csv_iters = []
+        for csv_path, mapping in zip(csv_paths, mappings):
+            wrapper, it, _header = open_parsed_record_iter(csv_path, mapping)
+            wrappers.append(wrapper)
+            per_csv_iters.append(it)
+            stack.callback(wrapper.close)
 
-            progress_callback = progress_wrapper
-        except ImportError:
-            pass
+        progress_callback = None
+        pbar = None
+        if sys.stdout.isatty():
+            try:
+                from tqdm import tqdm
 
-    for match_data in lockstep_function_match(csv_paths, progress_callback):
-        func_name = match_data["function_name"]
-        rows = match_data["rows"]
-        count = match_data["count"]
+                total_size = sum(Path(csv_path).stat().st_size for csv_path in csv_paths)
+                pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc=f"Processing {binary_name}", leave=False)
+                stack.callback(pbar.close)
+                last_bytes = [0]
 
-        if count >= 2:
-            entry = process_matched_function_pass1(func_name, rows, version_keys, mapping_dict, matched_data_file)
-            if entry is not None:
-                matched_data_entries.append(entry)
-            else:
-                entries = process_unmatched_function_pass1(
-                    func_name, rows, version_keys, mapping_dict, unmatched_data_file
+                def progress_wrapper(current_bytes):
+                    delta = current_bytes - last_bytes[0]
+                    last_bytes[0] = current_bytes
+                    pbar.update(delta)
+
+                progress_callback = progress_wrapper
+            except ImportError:
+                pass
+
+        for item in lockstep_records(per_csv_iters, wrappers, progress_callback):
+            if isinstance(item, Matched):
+                entry = process_matched_function(
+                    item,
+                    version_keys,
+                    matched_state,
+                    function_names_registry,
+                    error_log=error_log,
+                )
+                if entry is not None:
+                    matched_data_entries.append(entry)
+                else:
+                    entries = process_unmatched_function(
+                        item.func_name,
+                        item.records,
+                        version_keys,
+                        unmatched_state,
+                        function_names_registry,
+                        error_log=error_log,
+                    )
+                    unmatched_data_entries.extend(entries)
+            elif isinstance(item, Unmatched):
+                entries = process_unmatched_function(
+                    item.func_name,
+                    {item.variant_index: item.record},
+                    version_keys,
+                    unmatched_state,
+                    function_names_registry,
+                    error_log=error_log,
                 )
                 unmatched_data_entries.extend(entries)
+            else:
+                raise TypeError(f"unexpected lockstep yield: {type(item).__name__}")
 
-        elif count == 1:
-            entries = process_unmatched_function_pass1(func_name, rows, version_keys, mapping_dict, unmatched_data_file)
-            unmatched_data_entries.extend(entries)
+        # Pass 1 done — finalize + emit the sidecar BEFORE pass 2 so
+        # pass 2 can resolve every section-CSV function-name cell to
+        # its 1-indexed line number.
+        function_names_registry.finalize()
+        sidecar_path = function_names_registry.write_sidecar(output_dir, binary_name)
+        logger.info(f"  Wrote: {sidecar_path}")
 
-    if pbar is not None:
-        pbar.close()
+        function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
+        matched_func_names = {entry["func_name"] for entry in matched_data_entries}
+        # ``sectioned_func_names`` is the set of every function name
+        # whose section will land in ``<binary>_sections.bin`` — the
+        # union of matched and unmatched survivors. Threaded into
+        # pass-2 so the BIN walker can demote LOCAL/PLT call_targets to
+        # the EXTERN-unknown sentinel when the callee was dropped by
+        # pass-1 filters (otherwise the SectionWriter would leak a
+        # forever-unresolved header hole).
+        sectioned_func_names = matched_func_names | {
+            entry["func_name"] for entry in unmatched_data_entries
+        }
 
-    matched_data_file.close()
-    logger.info(f"  Closed: {matched_data_path}")
-    unmatched_data_file.close()
-    logger.info(f"  Closed: {unmatched_data_path}")
+        logger.info(f"  Creating: {warn_log_path}")
+        warn_log = stack.enter_context(open(warn_log_path, "w", encoding="ascii"))
 
-    function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
+        # The BIN catalog (``<binary>_sections.bin``) holds matched +
+        # unmatched sections per Phase-3 layout decision; a single
+        # SectionWriter is therefore threaded into both arms. The
+        # ExternProviderRegistry collects unique library names across
+        # the binary's extern call_targets and is serialised to disk
+        # by ``sections_bin_outputs.finalize`` AFTER both arms run.
+        sections_bin_outputs = open_sections_bin_outputs(output_dir, binary_name)
+        # close() is the always-runs cleanup; finalize() runs the
+        # structural assertions + writes the sidecar. We register the
+        # cleanup with ExitStack so an exception mid-build still
+        # releases the mmap, and run finalize() explicitly at the
+        # bottom of the with-block once both arms have emitted.
+        stack.callback(sections_bin_outputs.close)
 
-    matched_sections_path = output_dir / f"{prefix}_sections.csv"
-    matched_index_path = output_dir / f"{prefix}_index.bin"
-    warn_log_path = output_dir / f"{binary_name}.warn.log"
-    logger.info(f"  Creating: {matched_sections_path}")
-    logger.info(f"  Creating: {matched_index_path}")
-    logger.info(f"  Creating: {warn_log_path}")
-    matched_sections_file = open(matched_sections_path, "w", newline="", encoding="ascii")
-    matched_index_file = open(matched_index_path, "wb")
-    warn_log = open(warn_log_path, "w", encoding="ascii")
+        matched_outputs = open_matched_section_outputs(output_dir, prefix)
+        stack.callback(matched_outputs.close)
+        write_matched_sections_pass2(
+            matched_data_entries,
+            function_lookup,
+            matched_outputs.sections_file,
+            matched_outputs.index_file,
+            warn_log,
+            variants,
+            function_names_registry,
+            sections_bin_outputs.section_writer,
+            sections_bin_outputs.extern_providers,
+            matched_func_names,
+            sectioned_func_names,
+            error_log=error_log,
+        )
 
-    write_matched_sections_pass2(
-        matched_data_entries,
-        function_lookup,
-        matched_sections_file,
-        matched_index_file,
-        warn_log,
-        variants,
-    )
+        unmatched_outputs = open_unmatched_section_outputs(output_dir, unmatched_prefix)
+        stack.callback(unmatched_outputs.close)
+        write_unmatched_sections_pass2(
+            unmatched_data_entries,
+            function_lookup,
+            unmatched_outputs.sections_file,
+            unmatched_outputs.index_file,
+            warn_log,
+            variants,
+            function_names_registry,
+            sections_bin_outputs.section_writer,
+            sections_bin_outputs.extern_providers,
+            matched_func_names,
+            sectioned_func_names,
+            error_log=error_log,
+        )
 
-    matched_sections_file.close()
-    logger.info(f"  Closed: {matched_sections_path}")
-    matched_index_file.close()
-    logger.info(f"  Closed: {matched_index_path}")
-
-    unmatched_sections_path = output_dir / f"{unmatched_prefix}_sections.csv"
-    unmatched_index_path = output_dir / f"{unmatched_prefix}_index.bin"
-    logger.info(f"  Creating: {unmatched_sections_path}")
-    logger.info(f"  Creating: {unmatched_index_path}")
-    unmatched_sections_file = open(
-        unmatched_sections_path,
-        "w",
-        newline="",
-        encoding="ascii",
-    )
-    unmatched_index_file = open(unmatched_index_path, "wb")
-
-    write_unmatched_sections_pass2(
-        unmatched_data_entries,
-        function_lookup,
-        unmatched_sections_file,
-        unmatched_index_file,
-        warn_log,
-        variants,
-    )
-
-    unmatched_sections_file.close()
-    logger.info(f"  Closed: {unmatched_sections_path}")
-    unmatched_index_file.close()
-    logger.info(f"  Closed: {unmatched_index_path}")
-    warn_log.close()
-    logger.info(f"  Closed: {warn_log_path}")
-
-    # Per-binary metadata sidecar: one record per version in the same
-    # iteration order as the matched/unmatched CSV writers consumed
-    # `versions`. Empty `extra_metadata` for legacy versions; populated
-    # from the per-variant `_meta.json` for sidecar-format inputs.
-    _write_versions_sidecar(versions, output_dir, binary_name)
+        # Both arms done — finalize the BIN (runs the pending_holes +
+        # 0xFFFF sentinel sweep + writes the extern-provider sidecar).
+        # Failure here will surface BEFORE the ExitStack unwinds, so
+        # the registered ``close`` callback degrades to a no-op (the
+        # finalize path already called close internally).
+        sections_bin_outputs.finalize()

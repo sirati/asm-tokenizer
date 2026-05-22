@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import re
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from collections.abc import Iterable
@@ -33,6 +32,7 @@ from dynamic_runner import _native
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 from tokenizer.arch_translation import arch_to_platform
+from tokenizer.variant_info import split_variant_id_suffix
 
 from dynrunner.binary_selection import (
     BinaryIdentifier,
@@ -70,26 +70,13 @@ _MAPPING_SUFFIX = "_out\\put.ma\\p\\ping.b64\\c"
 _META_SUFFIX = "_meta.json"
 
 # Variant-id suffix on the binary_name slot of sidecar-emitted
-# filenames: `<binary>__<8hex>` (e.g. `helloworld__15f3f338`). The
-# greedy `binary_name = ".+"` regex in the file-format parser swallows
-# the `__<8hex>` into `binary_name`; this regex peels it back off so
-# the pairing key collapses to the same group across legacy and
-# sidecar variants while still distinguishing different variants of
-# the same binary.
-_VARIANT_SUFFIX_RE = re.compile(r"^(?P<binary>.*)__(?P<hex>[0-9a-fA-F]{8})$")
-
-
-def _split_variant_suffix(binary_name: str) -> tuple[str, int]:
-    """Strip the optional ``__<8hex>`` suffix from a parsed binary_name.
-
-    Returns ``(stripped_name, variant_id)``. Legacy filenames without
-    the suffix yield ``(binary_name, 0)`` — preserves the canonical
-    default per the variant-info spec.
-    """
-    match = _VARIANT_SUFFIX_RE.match(binary_name)
-    if match is None:
-        return binary_name, 0
-    return match.group("binary"), int(match.group("hex"), 16)
+# filenames: `<binary>__<8hex>` (e.g. `helloworld__15f3f338`) is
+# peeled off by ``tokenizer.variant_info.split_variant_id_suffix``
+# — the canonical owner of the regex. The greedy
+# `binary_name = ".+"` regex in the file-format parser swallows the
+# `__<8hex>` into `binary_name`; the helper strips it so the pairing
+# key collapses to the same group across legacy and sidecar variants
+# while still distinguishing different variants of the same binary.
 
 
 def _csv_format(base_format: str) -> str:
@@ -293,7 +280,7 @@ class MemmapBuilderTask:
         # canonical-4 + variant_id partition.
         def _key(item) -> tuple[str, str, str, str, str, int]:
             ident = item.identifier
-            stripped_name, variant_id = _split_variant_suffix(ident.binary_name)
+            stripped_name, variant_id = split_variant_id_suffix(ident.binary_name)
             return (
                 stripped_name,
                 arch_to_platform(ident.platform),
@@ -324,7 +311,7 @@ class MemmapBuilderTask:
         # different metadata still belongs to one memmap group).
         groups: dict[str, list] = defaultdict(list)
         for csv_item in matched_csv_items:
-            stripped_name, _vid = _split_variant_suffix(
+            stripped_name, _vid = split_variant_id_suffix(
                 csv_item.identifier.binary_name
             )
             groups[stripped_name].append(csv_item)
@@ -403,7 +390,8 @@ class MemmapBuilderTask:
                         # when absent (legacy outputs predating the
                         # sidecar). Worker consumption is downstream:
                         # `meta_path` reconstructs `VariantInfo` so the
-                        # builder library can persist `_versions.json`.
+                        # builder library can encode variant-axis tokens
+                        # into `_variants.bin` via the unified vocab.
                         "meta_path": (
                             str(meta_item.path) if meta_item is not None else None
                         ),
@@ -413,7 +401,7 @@ class MemmapBuilderTask:
                         "opt": csv_item.identifier.opt_level,
                         # `variant_id` is the integer suffix peeled off
                         # the parsed binary_name (see
-                        # `_split_variant_suffix`). 0 for legacy
+                        # `split_variant_id_suffix`). 0 for legacy
                         # filenames, otherwise the 8-hex suffix decoded
                         # as base-16. Disambiguates same-`pkg` variants
                         # that share the canonical-4 axes.
@@ -509,6 +497,24 @@ class MemmapBuilderTask:
                 "--source-already-staged."
             ),
         )
+        # Per-run constant: the corpus-wide unified vocab (v3) the
+        # variant-token encoder needs to resolve axis strings to uint16
+        # IDs. Required since the v3 cutover removed the vocab-less
+        # mode of `build_memmap_files`. Flows planner -> worker via
+        # `build_worker_command_args` as a CLI flag (NOT via
+        # `TaskInfo.payload` — the same constant for every task in the
+        # dispatch belongs in argv, not duplicated into N payloads;
+        # mirrors the existing `--vocab-source` precedent in this file).
+        parser.add_argument(
+            "--unified-vocab",
+            type=str,
+            required=True,
+            help=(
+                "Path to the corpus-wide unified_vocab.csv "
+                "(format_version=3) produced by the unify_vocab phase. "
+                "Required — the v3 cutover removed the vocab-less mode."
+            ),
+        )
 
     def build_worker_command_args(
         self,
@@ -532,6 +538,16 @@ class MemmapBuilderTask:
             args, "source_already_staged", None
         ):
             cmd.extend(["--vocab-source", str(args.vocab_source)])
+        # `--unified-vocab` is required at argparse time, so it is
+        # always present on `args`. Forward verbatim — the worker
+        # validates existence at startup. Under SLURM
+        # `--source-already-staged`, the user-supplied path must be
+        # resolvable inside the container (typically a path under the
+        # bind-mounted source root; the unify_vocab phase writes the
+        # file under `output_dir`, which becomes build_memmap's
+        # `source_dir` per the routing rule, so a relative-to-source
+        # convention naturally satisfies this).
+        cmd.extend(["--unified-vocab", str(args.unified_vocab)])
         return cmd
 
     def get_output_filename_pattern(

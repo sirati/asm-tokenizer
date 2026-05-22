@@ -1,0 +1,17 @@
+"""Local pytest bootstrap so this test file can run from any cwd.
+
+Mirrors the bootstrap in the top-level ``tests/conftest.py`` — the
+asm-tokenizer flat package tree has no installable ``pyproject.toml``,
+so pytest needs the repo root injected into ``sys.path`` explicitly
+when these tests run in isolation (e.g. ``pytest tokenizer/
+memmap_builder/tests/`` from a subagent worktree).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))

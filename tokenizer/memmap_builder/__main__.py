@@ -147,7 +147,7 @@ def main() -> None:
             for binary in binaries
         ]
 
-        build_memmap_files(versions, config.output_dir, binary_name)
+        build_memmap_files(versions, config.output_dir, binary_name, unified_vocab_path)
 
         logger.info(f"  Completed: {binary_name}")
 

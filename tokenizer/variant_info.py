@@ -80,7 +80,8 @@ _OUTPUT_CSV_SUFFIX = "_output.csv"
 _META_SIDECAR_SUFFIX = "_meta.json"
 
 # Variant-id suffix on the binary_name slot: ``<binary>__<8hex>``.
-# Mirrors ``dynrunner.build_memmap.memmap_builder_task._VARIANT_SUFFIX_RE``.
+# Single source of truth (build_memmap imports `split_variant_id_suffix`
+# below rather than parallel-implementing this regex).
 _VARIANT_SUFFIX_RE: re.Pattern = re.compile(
     r"^(?P<binary>.*)__(?P<hex>[0-9a-fA-F]{8})$"
 )
@@ -244,7 +245,7 @@ class VariantInfo:
             # Greedy ``binary_name`` group swallows any optional
             # ``__<8hex>`` variant suffix; peel it back off.
             platform, compiler, version, opt_level, binary_name = parsed
-            pkg, variant_id = _split_variant_id_suffix(binary_name)
+            pkg, variant_id = split_variant_id_suffix(binary_name)
             filename_axes = {
                 "arch": platform, "compiler": compiler,
                 "compiler_version": version, "opt": opt_level,
@@ -281,9 +282,12 @@ class VariantInfo:
         )
 
 
-def _split_variant_id_suffix(binary_name: str) -> tuple[str, int]:
-    """Peel the optional ``__<8hex>`` variant suffix; mirrors
-    ``dynrunner.build_memmap.memmap_builder_task._split_variant_suffix``.
+def split_variant_id_suffix(binary_name: str) -> tuple[str, int]:
+    """Peel the optional ``__<8hex>`` variant suffix.
+
+    Single source of truth for the suffix regex — the dynrunner
+    memmap-builder task imports this helper directly rather than
+    parallel-implementing the same pattern.
     """
     match = _VARIANT_SUFFIX_RE.match(binary_name)
     if match is None:

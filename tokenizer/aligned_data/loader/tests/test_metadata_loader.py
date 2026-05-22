@@ -1,0 +1,304 @@
+"""Tests for ``tokenizer.aligned_data.loader.metadata_loader``.
+
+Post matched-arm restructuring: corpora come from :mod:`_corpus`,
+which drives the production pass-2 writers + the function-names
+registry. Function-name lengths cycle across 8 distinct values
+(``7..14``) so matched-section CSV starts span every ``mod 4`` residue
+non-coincidentally (see
+:func:`test_matched_index_bin_starts_are_all_4_byte_aligned` -- the
+audit-driven assertion that documents the fixture's intent and
+prevents a future "let's reintroduce alignment on this path"
+regression from passing CI).
+
+The matched arm tests rely on the post-batch-2A
+``metadata_loader.load_section_arm`` consuming
+``matched_index.bin`` via :func:`read_csv_section_index_arrays`
+(pre-v1 layout, no alignment shift); they will fail with the
+current v1 ``read_index_arrays``-based loader until F2-A lands.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from tokenizer.aligned_data.index_format import write_index_prelude
+from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
+from tokenizer.aligned_data.loader.function_names_loader import (
+    load_function_names,
+)
+from tokenizer.aligned_data.loader.metadata_loader import (
+    BinaryArmPaths,
+    SectionKind,
+    load_section_arm,
+)
+
+from ._corpus import (
+    assert_starts_4_byte_aligned,
+    build_corpus,
+    make_variable_length_names,
+    matched_spec,
+    unmatched_spec,
+)
+
+
+def _matched_paths(corpus) -> BinaryArmPaths:
+    return BinaryArmPaths(
+        sections_csv=corpus.matched_sections_csv,
+        sections_bin=corpus.sections_bin,
+        index_bin=corpus.matched_index_bin,
+        data_bin=corpus.matched_data_bin,
+    )
+
+
+def _unmatched_paths(corpus) -> BinaryArmPaths:
+    return BinaryArmPaths(
+        sections_csv=corpus.unmatched_sections_csv,
+        sections_bin=corpus.sections_bin,
+        index_bin=corpus.unmatched_index_bin,
+        data_bin=corpus.unmatched_data_bin,
+    )
+
+
+def _line_to_name(corpus):
+    """Read the function-names sidecar produced by the corpus builder
+    and return the ``line_no -> name`` dict; ``load_section_arm`` needs
+    it to resolve the base64 line-no cells back to function names.
+    """
+    _, line_to_name = load_function_names(corpus.function_names_sidecar)
+    return line_to_name
+
+
+def _matched_corpus(tmp_path: Path):
+    """A matched-only corpus with variable-length names spanning every
+    mod-4 residue. No callees -> uniform section widths -> the residue
+    coverage rides exclusively on the name-length cycling.
+    """
+    names = sorted(make_variable_length_names("matched_fn", count=8))
+    specs = [matched_spec(n) for n in names]
+    return build_corpus(tmp_path, "bin", matched=specs)
+
+
+def _full_corpus(tmp_path: Path):
+    """Matched + unmatched + cross-arm callee references. Use this when
+    a test wants ``BinaryDataset`` (the full shell) rather than a single
+    arm: both arms are non-empty, so both ``_arm_paths`` resolve to real
+    files."""
+    matched_names = sorted(make_variable_length_names("matched_fn", count=6))
+    unmatched_names = ["unfn_a", "unfn_bb", "unfn_ccc"]
+    matched = [matched_spec(n) for n in matched_names]
+    unmatched = [unmatched_spec(n) for n in unmatched_names]
+    return build_corpus(
+        tmp_path, "bin", matched=matched, unmatched=unmatched
+    )
+
+
+# ---------------------------------------------------------------------------
+# Residue-coverage intent assertion (the load-bearing fixture invariant)
+# ---------------------------------------------------------------------------
+
+
+def test_matched_index_bin_starts_are_all_4_byte_aligned(tmp_path):
+    """Writer-enforced invariant: matched-index BIN starts are all
+    4-byte aligned (the :class:`SectionWriter` pads each section
+    trailer up to the next 4-byte boundary). Variable-length fixture
+    names ensure the padding code runs against every input residue.
+    """
+    corpus = _matched_corpus(tmp_path)
+    starts = corpus.read_matched_bin_starts()
+    assert len(starts) >= 4, (
+        "fixture must produce at least 4 sections to demonstrate "
+        f"alignment coverage; got {len(starts)}"
+    )
+    assert_starts_4_byte_aligned(starts)
+
+
+# ---------------------------------------------------------------------------
+# SectionArm contract (unchanged across batches)
+# ---------------------------------------------------------------------------
+
+
+def test_section_arm_equality_same_inputs(tmp_path):
+    """``SectionArm`` is a frozen dataclass: identical inputs produce
+    arms whose fields are element-equal."""
+    corpus = _matched_corpus(tmp_path)
+    line_to_name = _line_to_name(corpus)
+    arm_a = load_section_arm(
+        SectionKind.MATCHED, _matched_paths(corpus), line_to_name,
+        matched_index=corpus.matched_index_bin,
+    )
+    arm_b = load_section_arm(
+        SectionKind.MATCHED, _matched_paths(corpus), line_to_name,
+        matched_index=corpus.matched_index_bin,
+    )
+
+    assert np.array_equal(arm_a.starts, arm_b.starts)
+    assert np.array_equal(arm_a.edge_indices, arm_b.edge_indices)
+    assert np.array_equal(arm_a.count_per_length, arm_b.count_per_length)
+    assert arm_a.func_names == arm_b.func_names
+    assert np.array_equal(arm_a.section_starts, arm_b.section_starts)
+    assert arm_a.count == arm_b.count
+
+
+def test_matched_arm_matches_legacy_attributes(tmp_path):
+    """``BinaryDataset.matched_*`` attributes equal the matched
+    ``SectionArm`` fields -- pre/post-refactor surface is byte-equal."""
+    corpus = _full_corpus(tmp_path)
+    dataset = BinaryDataset(corpus.base_path, corpus.binary_name)
+    arm = dataset._matched_arm
+
+    assert np.array_equal(dataset.matched_starts, arm.starts)
+    assert np.array_equal(dataset.matched_edge_indices, arm.edge_indices)
+    assert np.array_equal(
+        dataset.matched_count_per_length, arm.count_per_length
+    )
+    assert dataset.matched_func_names == arm.func_names
+    assert dataset.matched_count == arm.count
+
+
+def test_unmatched_arm_matches_legacy_attributes(tmp_path):
+    """``BinaryDataset.unmatched_*`` attributes equal the unmatched
+    ``SectionArm`` fields."""
+    corpus = _full_corpus(tmp_path)
+    dataset = BinaryDataset(corpus.base_path, corpus.binary_name)
+    arm = dataset._unmatched_arm
+
+    assert np.array_equal(dataset.unmatched_starts, arm.starts)
+    assert np.array_equal(dataset.unmatched_edge_indices, arm.edge_indices)
+    assert np.array_equal(
+        dataset.unmatched_count_per_length, arm.count_per_length
+    )
+    assert dataset.unmatched_func_names == arm.func_names
+    assert dataset.unmatched_count == arm.count
+
+
+# ---------------------------------------------------------------------------
+# section_starts semantics
+# ---------------------------------------------------------------------------
+
+
+def test_matched_arm_bin_starts_index_section_bin_bytes(tmp_path):
+    """Matched ``load(idx)`` seeks ``<binary>_sections.bin`` via
+    ``bin_starts``/``bin_lengths`` (per-function); ``starts`` carries
+    per-variant data-bin offsets for the validator. Function names
+    recovered from the sidecar match ``arm.func_names``.
+    """
+    corpus = _matched_corpus(tmp_path)
+    arm = load_section_arm(
+        SectionKind.MATCHED, _matched_paths(corpus), _line_to_name(corpus),
+        matched_index=corpus.matched_index_bin,
+    )
+    assert arm.bin_starts is not None and len(arm.bin_starts) == len(arm.func_names)
+    assert arm.bin_lengths is not None and len(arm.bin_lengths) == len(arm.func_names)
+    sidecar_names = (
+        corpus.function_names_sidecar.read_text("utf-8").splitlines()[1:]
+    )
+    for name in arm.func_names:
+        assert name in sidecar_names, (
+            f"matched walker recovered name {name!r} not in sidecar"
+        )
+
+
+def test_unmatched_section_starts_point_to_bin_sections(tmp_path):
+    """``section_starts[i]`` is the BIN byte offset of the section
+    whose ``function_name_ptr`` maps to ``func_names[i]``.
+
+    Post-Phase-4 cutover: the unmatched-arm walker streams sections
+    out of ``<binary>_sections.bin`` starting after the matched
+    region. The arm's ``func_names`` resolves each section's FID
+    against the function-names sidecar so callers see raw names.
+    """
+    corpus = build_corpus(
+        tmp_path,
+        "bin",
+        unmatched=[unmatched_spec(n) for n in ("unfn_a", "unfn_bb", "unfn_ccc")],
+    )
+    arm = load_section_arm(
+        SectionKind.UNMATCHED, _unmatched_paths(corpus), _line_to_name(corpus),
+        matched_index=corpus.matched_index_bin,
+    )
+
+    assert arm.func_names == ["unfn_a", "unfn_bb", "unfn_ccc"]
+    assert len(arm.section_starts) == 3
+
+    from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
+    from tokenizer.aligned_data.memmap_format import (
+        assert_matched_sections_prelude,
+    )
+    line_to_name = _line_to_name(corpus)
+    raw = corpus.sections_bin.read_bytes()
+    assert_matched_sections_prelude(raw, path=str(corpus.sections_bin))
+    blob = memoryview(raw)
+    try:
+        for i, offset in enumerate(arm.section_starts):
+            section, _end = parse_section_bin(blob, int(offset))
+            resolved = line_to_name[section.function_name_ptr]
+            assert resolved == arm.func_names[i], (
+                f"section at section_starts[{i}]={offset} resolves to "
+                f"{resolved!r} but arm.func_names[{i}]={arm.func_names[i]!r}"
+            )
+    finally:
+        blob.release()
+
+
+def test_section_kind_enum_is_closed_typed():
+    """Sanity: ``SectionKind`` is an enum (not a bool), and both arms
+    are registered. Future arms add an enum value + spec; no boolean
+    toggle in the caller.
+    """
+    assert SectionKind.MATCHED is not SectionKind.UNMATCHED
+    assert SectionKind.MATCHED.value == "matched"
+    assert SectionKind.UNMATCHED.value == "unmatched"
+
+
+# ---------------------------------------------------------------------------
+# Degenerate inputs
+# ---------------------------------------------------------------------------
+
+
+def test_empty_arm_when_index_missing(tmp_path):
+    """Missing index file yields the canonical empty arm with
+    dtype-preserving placeholders (so downstream length / indexing
+    arithmetic doesn't degrade)."""
+    paths = BinaryArmPaths(
+        sections_csv=tmp_path / "absent_sections.csv",
+        sections_bin=tmp_path / "absent_sections.bin",
+        index_bin=tmp_path / "absent_index.bin",
+        data_bin=tmp_path / "absent_data.bin",
+    )
+    arm = load_section_arm(
+        SectionKind.MATCHED, paths,
+        matched_index=tmp_path / "absent_matched_index.bin",
+    )
+    assert arm.count == 0
+    assert arm.starts.dtype == np.int64
+    assert arm.edge_indices.dtype == np.int32
+    assert arm.count_per_length.dtype == np.int32
+    assert arm.func_names == []
+    assert arm.section_starts.dtype == np.int64
+    assert len(arm.section_starts) == 0
+
+
+def test_zero_entry_index_yields_empty_arm(tmp_path):
+    """v1 index with only the 16-byte prelude (zero entries) -> empty arm.
+
+    Exercises the unmatched arm: matched ``_index.bin`` is pre-v1
+    layout (no prelude); the v1 reader path lives only on the
+    unmatched side post-restructure.
+    """
+    index_path = tmp_path / "empty_index.bin"
+    with open(index_path, "wb") as f:
+        write_index_prelude(f)
+    paths = BinaryArmPaths(
+        sections_csv=tmp_path / "empty_sections.csv",
+        sections_bin=tmp_path / "empty_sections.bin",
+        index_bin=index_path,
+        data_bin=tmp_path / "empty_data.bin",
+    )
+    arm = load_section_arm(
+        SectionKind.UNMATCHED, paths,
+        matched_index=tmp_path / "absent_matched_index.bin",
+    )
+    assert arm.count == 0
+    assert len(arm.starts) == 0

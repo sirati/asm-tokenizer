@@ -26,7 +26,7 @@ def load_all_pickles(*file_paths):
 
         try:
             with open(new_filename, "w", newline="", encoding="utf-8") as csvfile:
-                writer = csv.writer(csvfile)
+                writer = csv.writer(csvfile, lineterminator='\n')
                 if isinstance(data, dict):
                     for k, v in data.items():
                         writer.writerow([k, v])

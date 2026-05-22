@@ -4,23 +4,14 @@ Covers:
   * dispatch via `get_token_class_for_type(TokenType.VARIANT_AXIS)`
   * registration through the dispatched class (ID assignment + type lookup)
   * `iter_representative_tokens` yields one wrapper per registered
-    Variant_Axis token under format_version=3
-  * format_version=3 reserved-digit layout matches format_version=2
+    Variant_Axis token under format_version=1 (unified vocab)
+  * format_version=1 reserved-digit layout matches format_version=2
   * v2 inline-digit Inner classes (e.g. ValuedConstV2, BlockV2) remain
-    instantiable on a v3 VM (strict-superset guarantee)
+    instantiable on a v1 VM (the unified vocab is a strict superset of
+    the per-binary v2 wire encoding)
 """
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-# Match the conftest bootstrap pattern: the asm-tokenizer codebase is a
-# flat package tree at the repo root; tests under tokenizer/tests/ need
-# the repo root on sys.path so `from tokenizer.*` imports resolve.
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 import pytest
@@ -32,9 +23,9 @@ from tokenizer.tokens import TokenType, VariantAxisToken
 _V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
 
 
-def _make_v3_vm() -> VocabularyManager:
-    """Construct an empty unified-style v3 VocabularyManager (platform=None)."""
-    return VocabularyManager(platform=None, format_version=3)
+def _make_v1_vm() -> VocabularyManager:
+    """Construct an empty unified-style v1 VocabularyManager (platform=None)."""
+    return VocabularyManager(platform=None, format_version=1)
 
 
 def _make_v2_vm() -> VocabularyManager:
@@ -50,7 +41,7 @@ def _make_v2_vm() -> VocabularyManager:
 def test_get_token_class_for_type_returns_variant_axis_class():
     """`get_token_class_for_type(VARIANT_AXIS)` must return the per-VM
     Variant_Axis Inner class (the same class accessible as `vm.Variant_Axis`)."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
     assert cls is vm.Variant_Axis
     # The class must declare the right token_type at the class level.
@@ -62,7 +53,7 @@ def test_get_token_class_for_type_returns_variant_axis_class():
 def test_variant_axis_registration_assigns_id_and_token_type():
     """Registering a Variant_Axis token (via dispatch) populates the
     vocab dict, exposes the assigned ID, and tags it with VARIANT_AXIS."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
 
     token = cls("arch:x64")
@@ -79,7 +70,7 @@ def test_variant_axis_registration_assigns_id_and_token_type():
 def test_variant_axis_registration_idempotent_per_string():
     """Registering the same axis string twice returns the same vocab id
     (matches `_private_add_token`'s idempotency contract)."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
 
     t1 = cls("comp:gcc")
@@ -91,9 +82,9 @@ def test_variant_axis_registration_idempotent_per_string():
 
 def test_variant_axis_distinct_strings_get_distinct_ids():
     """Two different prefixed strings register as two distinct vocab ids,
-    contiguous from the first non-reserved slot (no gaps under v3 reserved
-    layout)."""
-    vm = _make_v3_vm()
+    contiguous from the first non-reserved slot (no gaps under the v1
+    unified vocab reserved layout)."""
+    vm = _make_v1_vm()
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
 
     arch_tok = cls("arch:x64")
@@ -113,7 +104,7 @@ def test_variant_axis_distinct_strings_get_distinct_ids():
 def test_variant_axis_round_trip_from_token_ids():
     """`_from_token_ids([id])` reconstructs an instance carrying the same
     string + id as the original registration."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
 
     original = cls("cver:gcc:13.2.0")
@@ -129,7 +120,7 @@ def test_variant_axis_round_trip_from_token_ids():
 def test_variant_axis_get_token_ids_shape():
     """Wire form is exactly one uint id; the array contract for
     consumers (the unifier, the validator) must be a length-1 ndarray."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     token = vm.Variant_Axis("opt:O2")
 
     ids = token.get_token_ids()
@@ -142,14 +133,14 @@ def test_variant_axis_rejects_whitespace():
     """Spaces in the prefixed string would break vocab.csv round-trip
     (whitespace is the field separator). Mirror PlatformToken's same
     guard."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     with pytest.raises(ValueError):
         vm.Variant_Axis("arch: x64")
 
 
 def test_variant_axis_from_token_ids_rejects_wrong_arity():
     """Single-id wire form: 0 ids and >1 ids must both raise."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     with pytest.raises(ValueError):
         vm.Variant_Axis._from_token_ids([])
     with pytest.raises(ValueError):
@@ -162,10 +153,10 @@ def test_variant_axis_from_token_ids_rejects_wrong_arity():
 
 
 def test_iter_representative_tokens_yields_one_wrapper_per_variant_axis():
-    """Under v3, each registered Variant_Axis vocab id must appear as
+    """Under v1 (unified vocab), each registered Variant_Axis vocab id must appear as
     one wrapper in `iter_representative_tokens` — matching the
     one-wrapper-per-id contract for opaque-string families."""
-    vm = _make_v3_vm()
+    vm = _make_v1_vm()
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
 
     strings = ["arch:x64", "comp:gcc", "cver:gcc:13.2.0", "opt:O2",
@@ -181,104 +172,106 @@ def test_iter_representative_tokens_yields_one_wrapper_per_variant_axis():
     assert sorted(t.token for t in variant_reps) == sorted(strings)
 
 
-def test_iter_representative_tokens_skips_reserved_digits_under_v3():
+def test_iter_representative_tokens_skips_reserved_digits_under_v1():
     """The 256 reserved digit slots must NOT appear as representatives
     (their token_type is UNRESOLVED — the dispatch table would fail).
-    With an empty v3 VM, iter_representative_tokens yields nothing."""
-    vm = _make_v3_vm()
+    With an empty v1 VM, iter_representative_tokens yields nothing."""
+    vm = _make_v1_vm()
     reps = list(vm.iter_representative_tokens())
     assert reps == []
 
 
 # --------------------------------------------------------------------------
-# format_version=3 reserved-digit layout parity with v2
+# format_version=1 reserved-digit layout parity with v2
 # --------------------------------------------------------------------------
 
 
-def test_v3_vm_reserves_same_digit_slots_as_v2():
-    """v3 = v2 + variant tokens (additive). The reserved-digit prelude
-    (256 `digit_<HH>` placeholders typed UNRESOLVED) must be byte-identical
-    between v2 and v3 VMs."""
+def test_v1_vm_reserves_same_digit_slots_as_v2():
+    """v1 unified vocab = v2 wire encoding + variant tokens (additive).
+    The reserved-digit prelude (256 `digit_<HH>` placeholders typed
+    UNRESOLVED) must be byte-identical between v2 and v1 VMs."""
     v2_vm = _make_v2_vm()
-    v3_vm = _make_v3_vm()
+    v1_vm = _make_v1_vm()
 
     assert v2_vm.size == _V2_RESERVED_DIGIT_COUNT
-    assert v3_vm.size == _V2_RESERVED_DIGIT_COUNT
+    assert v1_vm.size == _V2_RESERVED_DIGIT_COUNT
     # Placeholder names match.
     assert v2_vm.id_to_token[:_V2_RESERVED_DIGIT_COUNT] == \
-        v3_vm.id_to_token[:_V2_RESERVED_DIGIT_COUNT]
+        v1_vm.id_to_token[:_V2_RESERVED_DIGIT_COUNT]
     # Token-type tags match (all UNRESOLVED in both).
     assert np.array_equal(
         np.asarray(v2_vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT]),
-        np.asarray(v3_vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT]),
+        np.asarray(v1_vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT]),
     )
     # Both VMs reserve the digit names from the token_to_id lookup so
     # that the digit ids are addressed purely by numeric position.
     for i in range(_V2_RESERVED_DIGIT_COUNT):
-        assert v3_vm.get_token_id(f"digit_{i:02X}") == -1
+        assert v1_vm.get_token_id(f"digit_{i:02X}") == -1
 
 
-def test_v3_vm_first_real_token_lands_at_reserved_boundary():
-    """First registered token on a v3 VM gets id 256 — same as v2 — so
+def test_v1_vm_first_real_token_lands_at_reserved_boundary():
+    """First registered token on a v1 VM gets id 256 — same as v2 — so
     the variant block starts at the documented boundary."""
-    v3_vm = _make_v3_vm()
-    tok = v3_vm.Variant_Axis("arch:x64")
+    v1_vm = _make_v1_vm()
+    tok = v1_vm.Variant_Axis("arch:x64")
     assert tok._token_id == _V2_RESERVED_DIGIT_COUNT
 
 
-def test_v3_vm_rejects_reserved_digit_name():
-    """The `digit_<HH>` collision guard applies under v3 too (same
+def test_v1_vm_rejects_reserved_digit_name():
+    """The `digit_<HH>` collision guard applies under v1 too (same
     reserved-digit-protocol invariant as v2)."""
-    v3_vm = _make_v3_vm()
+    v1_vm = _make_v1_vm()
     with pytest.raises(AssertionError):
-        v3_vm.Variant_Axis("digit_00")
+        v1_vm.Variant_Axis("digit_00")
 
 
-def test_v3_vm_valued_const_dispatch_uses_v2_form():
+def test_v1_vm_valued_const_dispatch_uses_v2_form():
     """The format-aware `ValuedConst` / `BlockId` factories must dispatch
-    to the v2 inline-digit Inner classes under v3 (strict-superset rule)."""
-    v3_vm = _make_v3_vm()
-    vc = v3_vm.ValuedConst(0)
-    bk = v3_vm.BlockId(0)
+    to the v2 inline-digit Inner classes under v1 (the unified vocab
+    shares the v2 wire encoding for instruction-stream tokens)."""
+    v1_vm = _make_v1_vm()
+    vc = v1_vm.ValuedConst(0)
+    bk = v1_vm.BlockId(0)
     assert vc.token_type == TokenType.VALUED_CONST_V2
     assert bk.token_type == TokenType.BLOCK_V2
 
 
-def test_v3_vm_accepts_v2_inner_class_instantiation():
-    """v3 = v2 + variant tokens means v2 inline-digit category tokens
-    must remain instantiable on a v3 VM unchanged (otherwise the unifier
-    couldn't register instruction-stream tokens through
-    `iter_representative_tokens` against a v3 unified VM)."""
-    v3_vm = _make_v3_vm()
+def test_v1_vm_accepts_v2_inner_class_instantiation():
+    """v1 unified vocab = v2 wire encoding + variant tokens means v2
+    inline-digit category tokens must remain instantiable on a v1 VM
+    unchanged (otherwise the unifier couldn't register
+    instruction-stream tokens through `iter_representative_tokens`
+    against a v1 unified VM)."""
+    v1_vm = _make_v1_vm()
     # One representative from each v2 family (identity, valued_const_v2,
     # float, modifier) must construct without raising the
-    # `format_version in (2, 3)` assertion.
-    v3_vm.Local_Func(0)
-    v3_vm.Valued_Const_V2(42)
-    v3_vm.Float32(None)
-    v3_vm.Thread_Local()
+    # `format_version in (1, 2)` assertion.
+    v1_vm.Local_Func(0)
+    v1_vm.Valued_Const_V2(42)
+    v1_vm.Float32(None)
+    v1_vm.Thread_Local()
 
 
 def test_variant_axis_and_v2_token_coexist_with_distinct_ids():
     """Mixing a Variant_Axis registration with v2 inline-digit token
     registrations (which is what the unifier will do in Batch 3) must
     produce distinct vocab ids and correctly-tagged type cache entries."""
-    v3_vm = _make_v3_vm()
+    v1_vm = _make_v1_vm()
 
     # Register two variant axes first (Batch 3's Pass 1 order).
-    va1 = v3_vm.Variant_Axis("arch:x64")
-    va2 = v3_vm.Variant_Axis("comp:gcc")
+    va1 = v1_vm.Variant_Axis("arch:x64")
+    va2 = v1_vm.Variant_Axis("comp:gcc")
     # Then a v2 identity token (Batch 3's Pass 2 representative).
-    lf = v3_vm.Local_Func(0)
+    lf = v1_vm.Local_Func(0)
     # And a v2 modifier.
-    tl = v3_vm.Thread_Local()
+    tl = v1_vm.Thread_Local()
 
     ids = {va1._token_id, va2._token_id, lf._type_token_id, tl._type_token_id}
     assert len(ids) == 4
     # All sit above the reserved-digit boundary.
     assert all(i >= _V2_RESERVED_DIGIT_COUNT for i in ids)
     # Type cache distinguishes them.
-    assert v3_vm.id_to_token_type[va1._token_id] == TokenType.VARIANT_AXIS
-    assert v3_vm.id_to_token_type[va2._token_id] == TokenType.VARIANT_AXIS
-    assert v3_vm.id_to_token_type[lf._type_token_id] == TokenType.LOCAL_FUNC
-    assert v3_vm.id_to_token_type[tl._type_token_id] == TokenType.THREAD_LOCAL
+    assert v1_vm.id_to_token_type[va1._token_id] == TokenType.VARIANT_AXIS
+    assert v1_vm.id_to_token_type[va2._token_id] == TokenType.VARIANT_AXIS
+    assert v1_vm.id_to_token_type[lf._type_token_id] == TokenType.LOCAL_FUNC
+    assert v1_vm.id_to_token_type[tl._type_token_id] == TokenType.THREAD_LOCAL

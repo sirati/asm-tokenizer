@@ -228,7 +228,7 @@ def token_to_insn(input_path: str, output_path: str, vocab_manager: VocabularyMa
             token_list.append((function_name, string_stream))
 
     with open(output_path, mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
+        writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL, lineterminator='\n')
         for k, v in token_list:
             writer.writerow([k, v])
 
@@ -284,7 +284,7 @@ def datastructures_to_insn(
 
     # Write the result to a CSV
     with open("reconstructed_disassembly_test.csv", mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
+        writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL, lineterminator='\n')
         for k, v in reconstructed.items():
             writer.writerow([k, v])
 

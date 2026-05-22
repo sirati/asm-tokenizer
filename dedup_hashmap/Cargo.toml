@@ -1,0 +1,18 @@
+[package]
+name = "dedup-hashmap"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "u64 -> u32 hashmap exposed to Python for asm-tokenizer content-addressed dedup."
+
+[lib]
+name = "dedup_hashmap"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+hashbrown = "0.15"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

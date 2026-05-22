@@ -7,7 +7,9 @@ per-version pairing data the starting instance prepared. The worker:
 
 1. Parses ``command.payload`` into a ``versions`` list of
    ``{csv_path, mapping_path, arch, compiler, compilerversion, opt}``.
-2. Reconstructs ``BinaryVersionInfo`` instances.
+2. Reconstructs ``BinaryVersionInfo`` instances (per-variant pkg +
+   ``extra_metadata`` recovered via ``VariantInfo.from_csv`` when a
+   ``_meta.json`` sidecar was declared by the planner).
 3. Calls ``tokenizer.memmap_builder.builder.build_memmap_files`` once
    for the group and replies ``done``.
 
@@ -28,6 +30,7 @@ from dynamic_runner.worker import Task, WorkerOutput, run, task_function
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
 from tokenizer.output_staging import staged_publish
+from tokenizer.variant_info import VariantInfo
 
 logger = logging.getLogger(__name__)
 
@@ -36,30 +39,16 @@ logger = logging.getLogger(__name__)
 # mirrors the runtime's contract that the handler closes over the
 # parsed CLI args via the on_args hook rather than passing them
 # through the Task object (which carries only per-task data).
+#
+# `_UNIFIED_VOCAB_PATH` is a per-run constant (the same corpus-wide
+# vocab is read by every task in this dispatch) so it lands as a CLI
+# arg here, mirroring `--vocab-source` and the unify_vocab worker's
+# `--out-unified-vocab`. Per-variant data still travels through
+# `TaskInfo.payload`; per-run config travels through CLI argv.
 _SOURCE_DIR: Path
 _VOCAB_DIR: Path
 _OUTPUT_DIR: Path
-
-
-def _load_meta_sidecar(
-    meta_path: Path,
-) -> tuple[str | None, dict]:
-    """Read a `_meta.json` sidecar emitted by the tokenize worker and
-    extract the `(pkg, extra_metadata)` pair carried inside.
-
-    The sidecar is a serialized `VariantInfo` (canonical-4 + pkg +
-    variant_id + extra_metadata). The worker uses only `pkg` and
-    `extra_metadata` from it; the canonical-4 + `variant_id` are
-    authoritative from the wire payload (the planner emits both
-    together). Forward-compat: missing keys collapse to defaults
-    rather than raising — the per-variant metadata is opaque
-    pass-through and an undecodable sidecar must not fail the whole
-    binary group.
-    """
-    raw = json.loads(meta_path.read_text(encoding="utf-8"))
-    pkg = raw.get("pkg")
-    extra_metadata = raw.get("extra_metadata") or {}
-    return pkg, extra_metadata
+_UNIFIED_VOCAB_PATH: Path
 
 
 def _process_payload(
@@ -69,6 +58,7 @@ def _process_payload(
     source_dir: Path,
     vocab_dir: Path,
     output_dir: Path,
+    unified_vocab_path: Path,
 ) -> None:
     """Parse the inline payload, reconstruct BinaryVersionInfo, build memmap.
 
@@ -86,14 +76,25 @@ def _process_payload(
     fail the whole group if NO entries survive (no usable input at
     all).
 
-    `variant_id` and `meta_path` plumb the per-variant metadata
-    through to `build_memmap_files`. The canonical-4 axes plus
-    `variant_id` come from the payload (authoritative); the
-    `_meta.json` sidecar (when present) supplements with `pkg` and
-    the opaque `extra_metadata` dict. Legacy entries without a
+    `variant_id` and the optional `_meta.json` sidecar plumb the
+    per-variant metadata through to `build_memmap_files`. The
+    canonical-4 axes plus `variant_id` come from the wire payload
+    (authoritative — the planner already parsed them out of the
+    matched filename). The `_meta.json` sidecar (when present)
+    supplements with `pkg` and the opaque `extra_metadata` dict via
+    `VariantInfo.from_csv`, which is the single source of truth for
+    filename + sidecar identity recovery. Legacy entries without a
     sidecar default `pkg` to the group's `binary_name` and
-    `extra_metadata` to an empty dict — the same shape produced by
-    `VariantInfo.from_legacy_filename`.
+    `extra_metadata` to an empty dict.
+
+    `BinaryVersionInfo.filename` keeps the planner-supplied value
+    verbatim (the variant folder name for sidecar variants, the CSV
+    basename for legacy 4-axis) — it is the canonical on-disk
+    identity for the slim `_variants.csv`. `VariantInfo.from_csv`
+    derives a different `filename` shape (the CSV basename always),
+    which would collide same-binary sidecar variants onto a single
+    row; we deliberately use only its `pkg` + `extra_metadata`
+    outputs at this boundary.
     """
     data = json.loads(payload_json)
     versions_raw = data["versions"]
@@ -109,25 +110,23 @@ def _process_payload(
             skipped.append(f"{entry['arch']}-{entry['compiler']}-{entry['compilerversion']}-{entry['opt']} (mapping missing: {mapping_path})")
             continue
 
-        # Default the per-variant metadata to the legacy shape; if a
-        # sidecar is present and readable, override.
+        # Resolve per-variant metadata via the canonical
+        # ``VariantInfo.from_csv`` entry-point. Only invoked when the
+        # planner declared a sidecar path (legacy entries skip the
+        # call entirely to preserve the old default shape — pkg =
+        # group's binary_name, extra_metadata = {}). The declared-
+        # but-missing warning is emitted by ``from_csv`` itself
+        # (mirrors the prior in-worker behavior; just relocated to
+        # the canonical owner).
         pkg: str = binary_name
         extra_metadata: dict = {}
         meta_path_rel = entry.get("meta_path")
         if meta_path_rel is not None:
-            meta_path = source_dir / meta_path_rel
-            if meta_path.exists():
-                meta_pkg, meta_extra = _load_meta_sidecar(meta_path)
-                if meta_pkg is not None:
-                    pkg = meta_pkg
-                extra_metadata = meta_extra
-            else:
-                logger.warning(
-                    "[!] %s: meta sidecar declared but missing on disk: %s "
-                    "— falling back to empty metadata.",
-                    binary_name,
-                    meta_path,
-                )
+            info = VariantInfo.from_csv(
+                csv_path, meta_path=source_dir / meta_path_rel
+            )
+            pkg = info.pkg
+            extra_metadata = info.extra_metadata
 
         versions.append(
             BinaryVersionInfo(
@@ -141,10 +140,10 @@ def _process_payload(
                 variant_id=int(entry.get("variant_id", 0)),
                 extra_metadata=extra_metadata,
                 # ``filename`` flows from the planner verbatim (the
-                # CSV's parent folder name). The worker forwards it
-                # so the builder's per-group ``_variants.csv``
-                # sidecar can record each variant's stable on-disk
-                # identity.
+                # CSV's parent folder name for sidecar variants, CSV
+                # basename for legacy). See function docstring for
+                # why ``VariantInfo.from_csv``'s filename is *not*
+                # used here.
                 filename=entry.get("filename", "") or "",
             )
         )
@@ -171,7 +170,7 @@ def _process_payload(
     # and atomic-publish to `output_dir` only on clean exit. A worker
     # killed mid-write leaves nothing partial on `/app/out-network`.
     with staged_publish(task, output_dir, scope=f"build_memmap/{binary_name}") as stage_dir:
-        build_memmap_files(versions, stage_dir, binary_name)
+        build_memmap_files(versions, stage_dir, binary_name, unified_vocab_path)
 
 
 @task_function
@@ -207,7 +206,15 @@ def handle(task: Task) -> WorkerOutput | None:
     task.set_phase("build_memmap")
 
     try:
-        _process_payload(task, binary_name, payload_str, _SOURCE_DIR, _VOCAB_DIR, _OUTPUT_DIR)
+        _process_payload(
+            task,
+            binary_name,
+            payload_str,
+            _SOURCE_DIR,
+            _VOCAB_DIR,
+            _OUTPUT_DIR,
+            _UNIFIED_VOCAB_PATH,
+        )
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         # Filesystem-shape errors are permanent for this input set —
         # re-running won't make a missing path appear. Surface as
@@ -263,6 +270,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--unified-vocab",
+        type=str,
+        required=True,
+        help=(
+            "Path to the corpus-wide unified_vocab.csv (format_version=3) "
+            "produced by the unify_vocab phase. Loaded once per worker "
+            "and threaded into build_memmap_files so variant-axis tokens "
+            "resolve to their assigned uint16 IDs. Required: v3 cutover "
+            "removed the vocab-less mode."
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         help="Log file instead of stdout/err",
@@ -283,7 +302,7 @@ def _on_args(args: argparse.Namespace) -> None:
     """Hook invoked by `run()` before the loop starts. Sets up
     logging and the module-level config the handler closes over.
     """
-    global _SOURCE_DIR, _VOCAB_DIR, _OUTPUT_DIR
+    global _SOURCE_DIR, _VOCAB_DIR, _OUTPUT_DIR, _UNIFIED_VOCAB_PATH
 
     increase_csv_field_size_limit()
 
@@ -317,9 +336,21 @@ def _on_args(args: argparse.Namespace) -> None:
         Path(args.vocab_source).resolve() if args.vocab_source else _SOURCE_DIR
     )
     _OUTPUT_DIR = Path(args.output).resolve()
+    _UNIFIED_VOCAB_PATH = Path(args.unified_vocab).resolve()
+
+    # Fail fast at worker startup if the unified vocab isn't reachable —
+    # every task in this dispatch will hit the same miss inside
+    # `build_memmap_files`, so surfacing here turns a per-task storm of
+    # identical errors into a single readable startup failure.
+    if not _UNIFIED_VOCAB_PATH.is_file():
+        raise FileNotFoundError(
+            f"build_memmap worker: --unified-vocab path does not exist "
+            f"or is not a regular file: {_UNIFIED_VOCAB_PATH}"
+        )
 
     logger.info(f"[*] Source directory: {_SOURCE_DIR}")
     logger.info(f"[*] Output directory: {_OUTPUT_DIR}")
+    logger.info(f"[*] Unified vocab: {_UNIFIED_VOCAB_PATH}")
 
 
 if __name__ == "__main__":
