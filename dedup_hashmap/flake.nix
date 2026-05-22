@@ -1,5 +1,5 @@
 {
-  description = "dedup_hashmap - u64 -> u32 hashmap for asm-tokenizer content-addressed dedup";
+  description = "dedup_hashmap - u64 -> u32 and u32 -> u32 hashmaps for asm-tokenizer dedup + writer state";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

@@ -3,7 +3,7 @@ name = "dedup-hashmap"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "u64 -> u32 hashmap exposed to Python for asm-tokenizer content-addressed dedup."
+description = "u64 -> u32 and u32 -> u32 hashmaps exposed to Python for asm-tokenizer dedup + writer state."
 
 [lib]
 name = "dedup_hashmap"
