@@ -72,6 +72,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Hashable, Iterator, Optional, TextIO
 
+import numpy as np
+
 from dedup_hashmap import HashMapU32U32
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
@@ -767,18 +769,30 @@ class SectionWriter:
         fid = self._current_fid
 
         # Recover THIS section's variant table from its own bytes —
-        # each section is self-describing. The vkey_to_idx map is
-        # used by both the step-2 self-resolve pass (for self-call
-        # per-call entries) and step-3 sibling-close Case B (for
-        # caller per-call entries).
+        # each section is self-describing. Two numpy arrays drive both
+        # the step-2 self-resolve pass (self-call per-call entries) and
+        # step-3 sibling-close Case B (caller per-call entries):
+        # ``my_sorted_vrefs`` is the section's variant_ref_offsets in
+        # ascending order for a single ``np.searchsorted``;
+        # ``my_sort_order`` maps each sorted position back to the
+        # variant's declared index (== on-wire ``section_variant_index``).
         blob = self._writer.view()
         try:
             parsed_self, _end = parse_section_bin(blob, section_offset)
         finally:
             blob.release()
-        my_vkey_to_idx: dict[Hashable, int] = {
-            v.variant_ref_offset: i for i, v in enumerate(parsed_self.variants)
-        }
+        my_vrefs = np.fromiter(
+            (v.variant_ref_offset for v in parsed_self.variants),
+            dtype=np.uint32,
+            count=len(parsed_self.variants),
+        )
+        # ``kind="stable"`` preserves declared-order among equal vrefs so
+        # the resolver below can pick the LAST declared variant by
+        # taking ``searchsorted(side="right") - 1`` — preserving the
+        # legacy ``vkey_to_idx`` dict's last-write-wins semantics when a
+        # section legitimately repeats the same ``variant_ref_offset``.
+        my_sort_order = np.argsort(my_vrefs, kind="stable").astype(np.int64)
+        my_sorted_vrefs = my_vrefs[my_sort_order]
 
         # Step 2: self-resolve. Re-stamp call_target rows + resolve
         # per-call entries for any row whose ``name_ptr`` is in
@@ -791,7 +805,8 @@ class SectionWriter:
             caller_section_offset=section_offset,
             callee_fid=fid,
             callee_section_offset=section_offset,
-            callee_vkey_to_idx=my_vkey_to_idx,
+            callee_sorted_vrefs=my_sorted_vrefs,
+            callee_sort_order=my_sort_order,
         )
 
         # Step 3: sibling-close patches. Walk every caller section
@@ -803,7 +818,8 @@ class SectionWriter:
                 caller_section_offset=caller_section_offset,
                 callee_fid=fid,
                 callee_section_offset=section_offset,
-                callee_vkey_to_idx=my_vkey_to_idx,
+                callee_sorted_vrefs=my_sorted_vrefs,
+                callee_sort_order=my_sort_order,
             )
 
         # Clear per-section state.
@@ -1055,26 +1071,31 @@ class SectionWriter:
         caller_section_offset: int,
         callee_fid: int,
         callee_section_offset: int,
-        callee_vkey_to_idx: dict[Hashable, int],
+        callee_sorted_vrefs: "np.ndarray",
+        callee_sort_order: "np.ndarray",
     ) -> None:
-        """Re-parse one caller section's bytes; patch Cases A + B.
+        """Re-derive caller's slot positions; write Cases A + B in place
+        through the live mmap.
 
-        * Case A (``function_section_ptr``): for every call_target
-          row in the caller whose ``function_name_ptr == callee_fid``,
-          stamp ``callee_section_offset`` into the row's
-          ``function_section_ptr`` slot (W2 last-write-wins on
-          sibling collisions).
+        Each dtype gets exactly one numpy view of the writer's bytes
+        (uint8 / uint16 / uint32 of the same buffer); slot positions
+        inside the variants region are derived from the section's own
+        jump table by ``(slot << 2) + 8 → byte length → cumsum → byte
+        offsets``.
 
-        * Case B (``section_variant_index``): for every per-call
-          entry in the caller whose ``called_idx`` points at one of
-          those rows AND whose slot is still
-          :data:`UNRESOLVED_VARIANT_INDEX`, look up the OWNING caller
-          variant's ``variant_ref_offset`` (== the entry's intended
-          ``callee_vkey`` by Step 7's on-wire invariant) in
-          ``callee_vkey_to_idx``; on a hit, stamp the resolved
-          index. A miss leaves the slot ``UNRESOLVED`` for a later
-          sibling close (or :meth:`finalize`'s MISSING-stamp pass) to
-          handle.
+        * Case A (``function_section_ptr``): every call_target row
+          whose ``name_ptr == callee_fid`` gets its ``section_ptr``
+          column stamped (last-write-wins on sibling collisions).
+
+        * Case B (``section_variant_index``): every per-call entry
+          whose ``called_idx`` points at one of those rows AND whose
+          slot is still :data:`UNRESOLVED_VARIANT_INDEX` gets
+          resolved against the caller variant's
+          ``variant_ref_offset`` (== intended callee_vkey by Step 7's
+          on-wire invariant) via ``np.searchsorted`` on the
+          pre-built sort index. First-resolver-wins; misses leave
+          the slot ``UNRESOLVED`` for a sibling close or
+          :meth:`finalize` to mark MISSING.
 
         Used by both the step-2 self-resolve pass
         (``caller_section_offset == callee_section_offset``) and the
@@ -1083,59 +1104,96 @@ class SectionWriter:
         appear in ``_pending_holes[my_fid]``, so the same call_target
         + per-call slot is never patched twice.
         """
-        blob = self._writer.view()
-        try:
-            caller, _end = parse_section_bin(blob, caller_section_offset)
-        finally:
-            blob.release()
+        bin_u8 = self._writer.writable_u8_view()
+        bin_u16 = bin_u8.view(np.uint16)
+        bin_u32 = bin_u8.view(np.uint32)
 
-        # Case A: function_section_ptr re-stamps.
-        call_targets_start = (
-            caller_section_offset
-            + SECTION_HEADER_SIZE
-            + _padded_jump_table_bytes(len(caller.variants))
+        _caller_fid, n_call_targets, n_variants = struct.unpack_from(
+            "<IHH", bin_u8, caller_section_offset
         )
-        target_called_idxs: set[int] = set()
-        packed_section_offset = struct.pack("<I", callee_section_offset)
-        for i, ct in enumerate(caller.call_targets):
-            if ct.function_name_ptr != callee_fid:
-                continue
-            target_called_idxs.add(i)
-            # function_section_ptr is the second u32 of the row.
-            row_offset = call_targets_start + i * CALL_TARGET_ENTRY_SIZE
-            self._writer.patch(row_offset + 4, packed_section_offset)
-
-        if not target_called_idxs:
+        if n_call_targets == 0:
             return
 
-        # Case B: per-call entry section_variant_index resolves.
-        for v_idx, variant in enumerate(caller.variants):
-            resolved_idx = callee_vkey_to_idx.get(variant.variant_ref_offset)
-            if resolved_idx is None:
-                # Caller variant's vkey not in the callee's local
-                # variant table; leave its slots alone — a sibling
-                # close or :meth:`finalize` may resolve / MISSING-
-                # stamp them.
-                continue
-            variant_offset = _variant_block_offset(caller, v_idx)
-            entry_offset = variant_offset + VARIANT_HEADER_SIZE
-            packed_resolved = struct.pack("<H", resolved_idx)
-            for called_idx, sv_idx in variant.per_call_entries:
-                slot_offset = entry_offset + 2
-                entry_offset += PER_CALL_ENTRY_SIZE
-                if called_idx not in target_called_idxs:
-                    continue
-                if sv_idx != UNRESOLVED_VARIANT_INDEX:
-                    # Already patched by a prior sibling close (or
-                    # by step-2 self-resolve for the self-call). Do
-                    # not overwrite — the existing value carries a
-                    # different sibling's variant index that the
-                    # loader will follow via ``function_section_ptr``
-                    # = LAST sibling, so the slot is intentionally
-                    # last-write-wins on the FIRST resolver that
-                    # carries this vkey.
-                    continue
-                self._writer.patch(slot_offset, packed_resolved)
+        jump_table_offset = caller_section_offset + SECTION_HEADER_SIZE
+        call_targets_start = jump_table_offset + _padded_jump_table_bytes(n_variants)
+        variants_region_start = (
+            call_targets_start + n_call_targets * CALL_TARGET_ENTRY_SIZE
+        )
+
+        # Case A: stamp function_section_ptr. 3*u32 view of call_targets
+        # (name_ptr | section_ptr | flags_packed).
+        ct = bin_u32[
+            call_targets_start // 4 : variants_region_start // 4
+        ].reshape(n_call_targets, 3)
+        ct_mask = ct[:, 0] == np.uint32(callee_fid)
+        if not ct_mask.any():
+            return
+        ct[ct_mask, 1] = callee_section_offset
+
+        if n_variants == 0:
+            return
+
+        # Jump-table decode — slot = (variant_byte_len - 8) >> 2 = n_calls.
+        jump_slots = bin_u16[
+            jump_table_offset // 2 : jump_table_offset // 2 + n_variants
+        ]
+        total_entries = int(jump_slots.astype(np.uint32).sum())
+        if total_entries == 0:
+            return
+
+        # Per-call entry positions inside the variants region (u16 units).
+        # Derivation:
+        #   variant v's header u16-offset = 4*v + 2*cumsum_entries[v]
+        #   entry j of variant v at u16-offset header + 4 + 2*j
+        #   For global entry k where j = k - cumsum_entries[v]:
+        #     called_idx_u16[k] = 4*v + 4 + 2*k   (cumsum_entries cancels)
+        #     sv_idx_u16[k]     = 4*v + 5 + 2*k
+        entry_to_variant = np.repeat(
+            np.arange(n_variants, dtype=np.int64),
+            jump_slots.astype(np.int64),
+        )
+        k = np.arange(total_entries, dtype=np.int64)
+        sv_idx_pos = 4 * entry_to_variant + 5 + 2 * k
+        called_idx_pos = sv_idx_pos - 1
+
+        variants_u16 = bin_u16[variants_region_start // 2 :]
+
+        target_called_idxs = np.nonzero(ct_mask)[0].astype(np.uint16)
+        hole_mask = (
+            np.isin(variants_u16[called_idx_pos], target_called_idxs)
+            & (variants_u16[sv_idx_pos] == np.uint16(UNRESOLVED_VARIANT_INDEX))
+        )
+        if not hole_mask.any():
+            return
+
+        # Caller variant_ref_offsets — first u32 of each variant header.
+        cumsum = np.concatenate(
+            ([np.int64(0)], np.cumsum(jump_slots.astype(np.int64)))
+        )
+        hdr_u32_pos = 2 * np.arange(n_variants, dtype=np.int64) + cumsum[:-1]
+        variants_u32 = bin_u32[variants_region_start // 4 :]
+        caller_vrefs = variants_u32[hdr_u32_pos]
+
+        # Resolve via pre-built sort index — single searchsorted, no
+        # Python dict. ``side="right"`` paired with ``- 1`` picks the
+        # LAST equal entry (the callee's argsort is stable, so this
+        # reproduces the legacy ``vkey_to_idx`` dict's last-write-wins
+        # tie-break on a repeated ``variant_ref_offset``).
+        hole_indices = np.nonzero(hole_mask)[0]
+        hole_vrefs = caller_vrefs[entry_to_variant[hole_indices]]
+        ss = np.searchsorted(callee_sorted_vrefs, hole_vrefs, side="right") - 1
+        in_bounds = ss >= 0
+        matches = np.zeros_like(hole_indices, dtype=bool)
+        matches[in_bounds] = (
+            callee_sorted_vrefs[ss[in_bounds]] == hole_vrefs[in_bounds]
+        )
+        if not matches.any():
+            return
+
+        # In-place writes through the live mmap.
+        variants_u16[sv_idx_pos[hole_indices[matches]]] = (
+            callee_sort_order[ss[matches]].astype(np.uint16)
+        )
 
     def _sweep_for_unresolved_sentinels(self) -> None:
         """Walk the bin sections; assert no ``0xFFFF`` slot leaked.
