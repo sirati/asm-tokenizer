@@ -1,11 +1,13 @@
-"""Pass-1 matched-walker ``unique_called`` preserves encoder-allocation order.
+"""Pass-1 matched-walker ``unique_called`` is category-grouped (LOCAL →
+PLT → EXTERN) with intra-category encoder-allocation order preserved.
 
-The matched-function walker unions called-function names across surviving
-variants of the same function. The order of that union is now anchored
-on the FIRST surviving variant's per-row callee order; subsequent
-variants contribute their NOVEL callees at the tail. No alphabetical
-sort — pass 2 indexes the list positionally and the ordering choice is
-purely a determinism + encoder-alignment one (plan Decisions 20 + 21).
+The matched-function walker unions called-function names across
+surviving variants of the same function via the shared
+``_typed_called_union.category_grouped_first_seen_union`` helper:
+first-seen wins on duplicates, intra-category encounter order is
+anchored on the FIRST surviving variant that introduced each name, and
+the categories are stable-sorted into LOCAL → PLT → EXTERN blocks
+(plan Decisions 20 + 21).
 
 These tests construct :class:`ParsedRecord` instances directly so the
 per-row ``called_funcs`` order is dictated by the test, NOT by any
@@ -139,14 +141,20 @@ def test_unique_called_shuffled_input_not_alphabetised(tmp_path):
     ]
 
 
-def test_unique_called_cross_category_preserves_per_variant_order(tmp_path):
-    """Variant 0's callees mix LOCAL/PLT/EXTERN in a specific order
-    (``[(a, LOCAL), (b, PLT), (c, EXTERN), (d, LOCAL)]``). The union
-    preserves that intra-variant order across category boundaries —
-    no per-category re-sort, no alphabetical sort. (Per-category ordering
-    is enforced at the parser layer in
-    ``parsed_record_iter._called_from_v2_metadata``; the pass-1 union
-    layer must respect whatever ordering its input carries.)"""
+def test_unique_called_cross_category_is_local_plt_extern_grouped(tmp_path):
+    """Variant 0's callees mix LOCAL/PLT/EXTERN in a non-grouped order
+    (``[(a, LOCAL), (b, PLT), (c, EXTERN), (d, LOCAL)]``); variant 1
+    contributes ``[(c, EXTERN), (b, PLT), (e, PLT)]``. The section-level
+    union enforces LOCAL → PLT → EXTERN grouping
+    (``Section.call_targets[]`` invariant asserted at
+    ``loader/_session_splice.py``); intra-category order preserves
+    first-seen encounter order across variants (stable sort).
+
+    Expected:
+    - LOCAL block: ``a`` (v0), ``d`` (v0).
+    - PLT block: ``b`` (v0), ``e`` (v1, novel).
+    - EXTERN block: ``c`` (v0).
+    """
     LOCAL = CallTargetType.LOCAL
     PLT = CallTargetType.PLT
     EXTERN = CallTargetType.EXTERN
@@ -183,8 +191,8 @@ def test_unique_called_cross_category_preserves_per_variant_order(tmp_path):
     assert entry is not None
     assert entry["unique_called"] == [
         ("a", LOCAL),
-        ("b", PLT),
-        ("c", EXTERN),
         ("d", LOCAL),
+        ("b", PLT),
         ("e", PLT),
+        ("c", EXTERN),
     ]

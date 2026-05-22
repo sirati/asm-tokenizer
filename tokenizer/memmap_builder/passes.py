@@ -32,6 +32,7 @@ from ._pass2 import (  # re-export so builder.py's import stays one module
     write_matched_sections_pass2,
     write_unmatched_sections_pass2,
 )
+from ._typed_called_union import category_grouped_first_seen_union
 from .function_names import FunctionNamesRegistry
 
 __all__ = (
@@ -63,24 +64,23 @@ def process_matched_function(
       re-routes it through :func:`process_unmatched_function`).
 
     On success the returned dict carries ``func_name``,
-    ``unique_called`` (first-seen order-preserving union of callees
-    across variants, anchored on the lowest-index variant's encoder
-    allocation order; later variants only contribute novel callees at
-    the tail), and ``version_data`` (per-variant offset/length plus the
-    variant's local callee set). The shape matches what
+    ``unique_called`` (category-grouped first-seen union of callees
+    across variants — LOCAL → PLT → EXT blocks, intra-category
+    encounter-ordered, anchored on the lowest-index variant that first
+    introduced each callee; see
+    :func:`_typed_called_union.category_grouped_first_seen_union`), and
+    ``version_data`` (per-variant offset/length plus the variant's
+    local callee set). The shape matches what
     :func:`_pass2.write_matched_sections_pass2` consumes.
     """
     func_name = matched.func_name
     if func_name.startswith(".L"):
         return None
 
-    unique_called: List[tuple] = []
-    seen: set = set()
-    for variant_index in sorted(matched.records):
-        for entry in matched.records[variant_index].called_funcs:
-            if entry not in seen:
-                seen.add(entry)
-                unique_called.append(entry)
+    unique_called = category_grouped_first_seen_union(
+        matched.records[variant_index].called_funcs
+        for variant_index in sorted(matched.records)
+    )
 
     version_data = []
     for variant_index, rec in matched.records.items():

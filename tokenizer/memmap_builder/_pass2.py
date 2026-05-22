@@ -74,6 +74,7 @@ from ..aligned_data.matched_sections_bin import (
     SectionWriter,
 )
 from ._extern_library_merge import merge_extern_libraries
+from ._typed_called_union import category_grouped_first_seen_union
 from .function_names import FunctionNamesRegistry
 from .variants import VariantRegistry, write_warn_log_entry
 
@@ -163,10 +164,24 @@ def _build_call_targets_spec(
     with ``extern_provider_line_no=None`` (= the "library unknown"
     sentinel). The CSV path is unchanged — it records names verbatim
     and Phase 4 widens the cell to expose the type tag.
+
+    Output ordering: the emitted ``specs`` are stable-sorted by
+    :attr:`CallTargetSpec.type` so the BIN's ``Section.call_targets[]``
+    is concatenated LOCAL → PLT → EXTERN (the invariant asserted at
+    :mod:`tokenizer.aligned_data.loader._session_splice`). The upstream
+    parsed-record contract already groups by *declared* type
+    (see :func:`_typed_called_union.category_grouped_first_seen_union`);
+    this seam additionally re-shuffles any LOCAL/PLT row demoted to
+    EXTERN above into the EXTERN block so the *effective* type
+    sequence is also non-decreasing. The stable sort preserves
+    intra-category encounter order produced upstream.
     """
-    specs: List[CallTargetSpec] = []
-    index_map: "dict[TypedCallee, int]" = {}
-    for idx, (callee_name, callee_type) in enumerate(typed_unique_called):
+    # Pass 1: compute effective_type per declared callee. The
+    # declared-type tuple is what per-variant ``called`` sets carry, so
+    # ``index_map`` keys on it; the emitted spec carries the effective
+    # type after the demotion remap.
+    pending: List[Tuple[TypedCallee, CallTargetSpec]] = []
+    for callee_name, callee_type in typed_unique_called:
         callee_fid = registry.line_no(callee_name)
         is_matched = callee_name in matched_func_names
         effective_type = callee_type
@@ -183,15 +198,28 @@ def _build_call_targets_spec(
             # there is no matched-arm section to refer to.
             effective_type = CallTargetType.EXTERN
             is_matched = False
-        specs.append(
-            CallTargetSpec(
-                function_name_ptr=callee_fid,
-                type=effective_type,
-                is_matched=is_matched,
-                extern_provider_line_no=extern_line,
+        pending.append(
+            (
+                (callee_name, callee_type),
+                CallTargetSpec(
+                    function_name_ptr=callee_fid,
+                    type=effective_type,
+                    is_matched=is_matched,
+                    extern_provider_line_no=extern_line,
+                ),
             )
         )
-        index_map[(callee_name, callee_type)] = idx
+
+    # Pass 2: stable-sort by effective type so LOCAL/PLT demoted rows
+    # land in the EXTERN block. Within each effective-type block the
+    # upstream encounter order is preserved (Python's ``sorted`` is
+    # stable). Index map is rebuilt against the post-sort positions so
+    # downstream per-call resolution stays consistent.
+    pending.sort(key=lambda item: item[1].type)
+    specs = [spec for _key, spec in pending]
+    index_map: "dict[TypedCallee, int]" = {
+        key: idx for idx, (key, _spec) in enumerate(pending)
+    }
     return specs, index_map
 
 
@@ -427,15 +455,13 @@ def group_unmatched_entries_by_function(
     encountered library wins and a warning is logged at the BIN-
     emission site (this aggregator stays I/O-free).
 
-    ``all_called`` is an order-preserving union of every version's
-    ``entry["called"]`` iterable: first-seen wins, subsequent versions'
-    novel callees append at the tail. Per-category sub-order (LOCAL ->
-    PLT -> EXT) is whatever the upstream parsed-record layer carries;
-    this aggregator stays category-agnostic. Implemented via an
-    insertion-ordered ``dict`` whose keys are the typed callee tuples
-    (values are placeholder ``None``); CPython 3.7+ dict iteration
-    preserves insertion order, so ``list(all_called)`` downstream is
-    the encoder-allocation-order union (plan Decisions 20 + 21).
+    ``all_called`` is a category-grouped first-seen union over every
+    version's ``entry["called"]`` iterable (LOCAL → PLT → EXT blocks,
+    intra-category encoder-allocation-ordered; see
+    :func:`_typed_called_union.category_grouped_first_seen_union`). The
+    union runs once at the post-collection finalize step, fed the
+    per-version callee lists in encounter order; the resulting list
+    drives the section's ``call_targets[]`` ordering.
     """
     unmatched_by_func: Dict[str, dict] = {}
     for entry in unmatched_data_entries:
@@ -444,7 +470,6 @@ def group_unmatched_entries_by_function(
 
         if func_name not in unmatched_by_func:
             unmatched_by_func[func_name] = {
-                "all_called": {},
                 "version_data_list": [],
                 "called_by_version": [],
                 "vkeys": [],
@@ -452,10 +477,6 @@ def group_unmatched_entries_by_function(
             }
 
         group = unmatched_by_func[func_name]
-        all_called = group["all_called"]
-        for typed_callee in entry["called"]:
-            if typed_callee not in all_called:
-                all_called[typed_callee] = None
         group["version_data_list"].append(
             (entry["data_offset"], entry["data_len"], entry["token_len"])
         )
@@ -464,13 +485,16 @@ def group_unmatched_entries_by_function(
         group["called_by_version"].append((comp_set_id, entry["called"]))
         group["_per_variant_extern_libraries"].append(entry["extern_libraries"])
 
-    # Single-source-of-truth merge: same helper the matched arm uses,
-    # same first-wins + warn semantics. The per-variant ordering is
-    # whatever the caller fed us (typically variant-index order).
+    # Single-source-of-truth merges (extern libraries + typed-callee
+    # union). Per-variant ordering is whatever the caller fed us
+    # (typically variant-index order).
     for func_name, group in unmatched_by_func.items():
         group["extern_libraries"] = merge_extern_libraries(
             group.pop("_per_variant_extern_libraries"),
             func_name=func_name,
+        )
+        group["all_called"] = category_grouped_first_seen_union(
+            called for _comp_set_id, called in group["called_by_version"]
         )
 
     return unmatched_by_func
@@ -578,7 +602,7 @@ def write_unmatched_sections_pass2(
     unmatched_by_func = group_unmatched_entries_by_function(unmatched_data_entries)
 
     for func_name, data in unmatched_by_func.items():
-        all_called: "dict[TypedCallee, None]" = data["all_called"]
+        all_called: "list[TypedCallee]" = data["all_called"]
         version_data_list = data["version_data_list"]
         called_by_version = data["called_by_version"]
         vkeys = data["vkeys"]
@@ -587,13 +611,13 @@ def write_unmatched_sections_pass2(
         if not version_data_list:
             continue
 
-        # Typed encounter-ordered union of all callees seen across this
-        # function group's variants — drives BOTH the BIN's call_target
-        # table AND the CSV cell shape (Phase 4.1: the CSV cell carries
-        # the typed form, no name-only projection step). First-seen wins
-        # across variants; per-category sub-order (LOCAL -> PLT -> EXT)
-        # is carried verbatim from the parsed-record layer (plan
-        # Decisions 20 + 21).
+        # Section-level typed callee table: category-grouped first-seen
+        # union (LOCAL → PLT → EXT) of every variant's
+        # ``entry["called"]`` iterable. Drives BOTH the BIN's
+        # call_target table AND the CSV cell shape (Phase 4.1: the CSV
+        # cell carries the typed form, no name-only projection step).
+        # The grouping is enforced upstream in
+        # :func:`group_unmatched_entries_by_function`.
         typed_unique_called: "list[TypedCallee]" = list(all_called)
         typed_unique_called_index: "dict[TypedCallee, int]" = {
             nt: idx for idx, nt in enumerate(typed_unique_called)
