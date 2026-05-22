@@ -99,6 +99,21 @@ SECTION_HEADER_SIZE: int = 8
 #: rather than the variable-length variant walk it used to need.
 JUMP_TABLE_ENTRY_SIZE: int = 2
 
+
+def _padded_jump_table_bytes(n_variants: int) -> int:
+    """Reserved byte width of the jump-table region for ``n_variants``.
+
+    The table itself is ``n_variants × u16``, but when ``n_variants`` is
+    odd that is a non-multiple of 4. Downstream callers reinterpret the
+    bin as ``uint32`` to vectorise hole-fills, which requires the bytes
+    that FOLLOW the jump table (call_targets, variants region) to start
+    on a u32 boundary. Padding the table out to the next multiple of 4
+    keeps the post-table offsets aligned without changing any per-slot
+    semantics — the trailing u16 (when present) is a deterministic
+    zero that the reader skips over.
+    """
+    return ((n_variants + 1) // 2) * 4
+
 #: Bytes per call_target table entry
 #: (``u32 function_name_ptr | u32 function_section_ptr | u16 flags | u16 reserved``).
 CALL_TARGET_ENTRY_SIZE: int = 12
@@ -373,9 +388,11 @@ class SectionWriter:
 
         ``n_variants`` is the exact number of variants the caller is
         about to emit. It is used to reserve ``n_variants × u16`` bytes
-        for the per-section jump table immediately after the section
-        header (see :data:`JUMP_TABLE_ENTRY_SIZE`). The reader uses that
-        table to address variant_i in O(1). Declaring a count that
+        (rounded up to a multiple of 4 — see
+        :func:`_padded_jump_table_bytes`) for the per-section jump table
+        immediately after the section header (see
+        :data:`JUMP_TABLE_ENTRY_SIZE`). The reader uses that table to
+        address variant_i in O(1). Declaring a count that
         differs from the actual number of :meth:`end_variant` calls is
         rejected at :meth:`end_section`; the writer cannot recover from
         the mismatch because the call_targets block sits at a fixed
@@ -434,10 +451,11 @@ class SectionWriter:
         ``n_variants`` is stamped at ``0`` in the header and patched in
         :meth:`end_section` from the observed variant count. The jump
         table sits between the header and the call_target table; it is
-        reserved with zero bytes here and each entry is stamped by
-        :meth:`emit_per_call_entries` for its owning variant. The caller
-        is responsible for having deduplicated ``call_targets`` by
-        ``(function_name_ptr, type)``; SectionWriter does not check.
+        reserved with zero bytes here (rounded up to a multiple of 4 so
+        the call_targets table is u32-aligned) and each entry is stamped
+        by :meth:`emit_per_call_entries` for its owning variant. The
+        caller is responsible for having deduplicated ``call_targets``
+        by ``(function_name_ptr, type)``; SectionWriter does not check.
         """
         self._assert_section_open()
         if self._n_variants_slot is not None:
@@ -459,9 +477,13 @@ class SectionWriter:
         # The reservation is zero-initialised; each entry is patched by
         # :meth:`emit_per_call_entries` when the owning variant's per-call
         # entries are written. Sized from the caller-declared n_variants
-        # so the call_target table that follows starts at a deterministic
-        # offset.
-        jump_table_bytes = self._current_n_variants_declared * JUMP_TABLE_ENTRY_SIZE
+        # AND padded out to a multiple of 4 (see
+        # :func:`_padded_jump_table_bytes`) so the call_target table that
+        # follows starts on a u32 boundary — downstream vectorised
+        # hole-fills reinterpret the bin as ``uint32``.
+        jump_table_bytes = _padded_jump_table_bytes(
+            self._current_n_variants_declared
+        )
         if jump_table_bytes:
             self._writer.write(b"\x00" * jump_table_bytes)
 
@@ -1071,7 +1093,7 @@ class SectionWriter:
         call_targets_start = (
             caller_section_offset
             + SECTION_HEADER_SIZE
-            + len(caller.variants) * JUMP_TABLE_ENTRY_SIZE
+            + _padded_jump_table_bytes(len(caller.variants))
         )
         target_called_idxs: set[int] = set()
         packed_section_offset = struct.pack("<I", callee_section_offset)
@@ -1169,7 +1191,7 @@ def _variant_block_offset(section: Section, variant_idx: int) -> int:
     variants_region_start = (
         section.section_offset
         + SECTION_HEADER_SIZE
-        + len(section.variants) * JUMP_TABLE_ENTRY_SIZE
+        + _padded_jump_table_bytes(len(section.variants))
         + len(section.call_targets) * CALL_TARGET_ENTRY_SIZE
     )
     preceding_entries = sum(
@@ -1197,6 +1219,9 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
        per-call entries that variant ``i``'s block carries. ``cumsum``
        of the jump table gives variant-start offsets within the
        variants region, so the reader can address variant_i in O(1).
+       The region is padded up to a multiple of 4 (one trailing zero
+       ``u16`` when ``n_variants`` is odd) so the call_targets table
+       that follows is u32-aligned for vectorised downstream readers.
     3. ``n_call_targets × 12 B`` call_target rows — ``<IIHH`` →
        ``function_name_ptr | function_section_ptr | flags | reserved``.
     4. Variant blocks (one per declared variant). Each block is
@@ -1219,7 +1244,10 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
     jump_table: list[int] = list(
         struct.unpack_from(f"<{n_variants}H", blob, offset)
     )
-    offset += n_variants * JUMP_TABLE_ENTRY_SIZE
+    # Skip the table AND the trailing u16 of zero padding that the
+    # writer reserves when n_variants is odd, so the call_targets table
+    # that follows is u32-aligned.
+    offset += _padded_jump_table_bytes(n_variants)
 
     call_targets: list[CallTarget] = []
     for _ in range(n_call_targets):
