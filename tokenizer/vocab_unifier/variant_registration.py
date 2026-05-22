@@ -15,10 +15,12 @@ instruction tokens — those are pass 2's concern.
 Order discipline: ``VariantInventory.iter_tokens`` yields strings in
 alphabetical order. The unifier registers them on a freshly
 constructed unified ``VocabularyManager`` (``MEMMAP_FORMAT_VERSION``)
-whose first registerable ID is ``_V2_RESERVED_DIGIT_COUNT`` (256).
-Variant tokens therefore land at contiguous IDs
-``[256, 256 + n_variants)``. Two runs over the same corpus produce
-byte-identical unified vocabs.
+whose first caller-registerable ID is
+``_V2_VALUE_NEGATIVE_TOKEN_ID + 1`` (257) — one past the eagerly-pinned
+``value_negative`` marker that now occupies id 256 (the slot directly
+above the 256-entry reserved digit band). Variant tokens therefore
+land at contiguous IDs ``[257, 257 + n_variants)``. Two runs over the
+same corpus produce byte-identical unified vocabs.
 """
 
 from __future__ import annotations

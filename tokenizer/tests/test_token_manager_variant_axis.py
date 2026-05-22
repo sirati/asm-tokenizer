@@ -227,7 +227,7 @@ def test_v1_vm_reserves_same_digit_slots_as_v2():
         assert v1_vm.get_token_id(f"digit_{i:02X}") == -1
 
 
-def test_v1_vm_first_real_token_lands_at_reserved_boundary():
+def test_v1_vm_first_caller_token_lands_one_past_value_negative():
     """First caller-driven token on a v1 VM gets id 257 — one past the
     eagerly-pinned `value_negative` marker — so the variant block starts
     at the documented post-marker boundary, same as v2."""

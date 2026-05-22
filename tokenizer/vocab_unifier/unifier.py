@@ -60,9 +60,10 @@ def unify_vocab(
         mapping_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Unified vocab: variant-axis tokens occupy a low contiguous
-    # block starting at id 256 (the v2 reserved-digit boundary);
-    # instruction representatives from the per-binary v2 CSVs land
-    # above that block via pass 2. The unified VM is built at
+    # block starting at id 257 (one past the eagerly-pinned
+    # `value_negative` marker at id 256); instruction representatives
+    # from the per-binary v2 CSVs land above that block via pass 2.
+    # The unified VM is built at
     # ``MEMMAP_FORMAT_VERSION`` from the start so ``_private_add_token``
     # recognises the reserved-digit layout for both variant and
     # instruction registrations.
@@ -158,10 +159,16 @@ def unify_vocab(
     # arch and unify per slice instead.
     total_ids = len(unified_vm.id_to_token)
     if total_ids > _UINT16_CEILING:
+        # `-1` accounts for the eagerly-pinned `value_negative` marker at
+        # id 256 (one slot above the 256-entry reserved digit band); the
+        # instruction representatives start at id 257 alongside the
+        # variant block, so the remaining count after subtracting the
+        # digit band, the marker, and the variant block is purely
+        # instruction-representative tokens.
         raise ValueError(
             f"unify_vocab: unified vocab has {total_ids} tokens "
             f"({n_variants} variant + "
-            f"{total_ids - VocabularyManager._V2_RESERVED_DIGIT_COUNT - n_variants} "
+            f"{total_ids - VocabularyManager._V2_RESERVED_DIGIT_COUNT - 1 - n_variants} "
             f"instruction), exceeds uint16 ceiling ({_UINT16_CEILING}). "
             f"Split the corpus by architecture and unify each slice "
             f"separately, or prune low-frequency tokens before unifying."

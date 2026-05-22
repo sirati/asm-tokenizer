@@ -3,7 +3,9 @@
 Single concern: walk many ``BinaryVersionInfo`` records, collect every
 distinct prefixed token string they imply, and iterate them in a
 deterministic order so the unifier can register them at stable,
-low-numbered vocab IDs (``[256, 256 + n_variants)`` per the plan).
+low-numbered vocab IDs (``[257, 257 + n_variants)`` per the plan — the
+block starts one past the eagerly-pinned ``value_negative`` marker at
+id 256).
 
 The accumulator also enforces the metadata-key invariant ``":" not in
 key`` at ``add()`` time. Without this guard, a future sidecar key like
