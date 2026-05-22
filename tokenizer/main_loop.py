@@ -232,9 +232,6 @@ def main_loop(
 
         occurence = 0
         prev_func_name = ""
-        prev_tokens_base64 = ""
-        prev_block_base64 = ""
-        prev_insn_base64 = ""
 
         logger.info("Starting main loop")
         task.set_phase(TokenizerPhase.TOKENIZATION.value)
@@ -341,14 +338,6 @@ def main_loop(
                         filtered_count += 1
                         continue
 
-                    if (
-                        prev_block_base64 == block_base64
-                        and prev_insn_base64 == insn_base64
-                        and prev_tokens_base64 == tokens_base64
-                    ):
-                        occurence -= 1
-                        continue
-
                     if is_v2:
                         # v2 metadata column: JSON-serialized per-category
                         # metadata. ``_build_v2_metadata_json`` is also
@@ -372,10 +361,6 @@ def main_loop(
 
                     writer.writerow(row)
                     prev_func_name = func_name
-
-                    prev_tokens_base64 = tokens_base64
-                    prev_block_base64 = block_base64
-                    prev_insn_base64 = insn_base64
 
                     if i & 16383 == 16383:
                         save_vocabulary(vocab_manager, writer)
