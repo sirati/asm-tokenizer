@@ -186,3 +186,15 @@ Documented in `dynrunner/SLURM_RUNBOOK.md` under "## slurm-test-env coverage gap
 - A1-A9 — worker2 sd-bus mystery; **dropped** per user direction (self-inflicted from prior session's process kills, not a real bug)
 - B1 (pids-limit ceiling), B2 (memory cap), B4 (drop `--privileged`), B5 (concurrent `up.sh`), C4 (atime divergence), E4 (MaxStartups), E5 (IPv6), E6 (port collision), F3 (RO source-file re-upload), F4 (image staleness), G3 (UID conflict), H1-H4 (cleanup / `down.sh` hygiene)
 - These are deep-tier or destructive; not blocking for the discovery campaign. Worth scheduling as follow-up if a specific bug class needs verification.
+
+## Probe campaign results (2026-05-18 — Pillar C follow-up on consts-smoke)
+
+Plan `immutable-whistling-twilight.md` Pillar C fast-tier probes. Cluster: `consts-smoke` (port 2226), 4 idle workers, partition `debug*`, RealMemory=3500, CPUs=2 per node.
+
+| Probe | Description | Result |
+|-------|-------------|--------|
+| C-B1 | pids-limit ceiling | ✓ characterized — cgroup `pids.max` = **32768**, shell `ulimit -u` = 376190. Effective limit is 32768 (well above any plausible asm-tokenizer worker fan-out; --cores 2 × --jobs N never reaches this). No fix needed. |
+| C-B2 | `--mem` math vs RealMemory=3500 | ✓ characterized — `--mem=3700` rejected pre-flight: `Memory specification can not be satisfied / Requested node configuration is not available`. `--mem=3500` accepted; cgroup honors request (3.4 GB bytearray inside `--mem=3500` succeeds). Hard ceiling enforced by slurmctld, not by cgroup OOM. Framework dispatches must request ≤3500 on slurm-test-env (LMU Krater has different RealMemory; same probe shape applies). |
+| B7 | wrapper-internal cleanup leaves no residue post-c8536bc | ✓ confirmed on validation dispatch; residue inventory (6 dirs/worker, sizes 28K-4.7G, mtimes 08:14-10:43 UTC) is **pre-c8536bc iteration history**, not post-fix leakage. c8536bc-validated dispatch (forced TIMEOUT, 24 binaries) cleaned its own prefix. Legacy residue is one-time cost of cleanup-arc development; cleanup requires explicit user authorization (mass-rm on shared SLURM workers exceeds session-autonomy scope). |
+| D2 | corpus shape baseline (Ghidra artifact filter) | ✓ baseline recorded — sidecar-corpus `minigzipsh` shape: **264 files raw**, **235 binaries post-filter** (29 ghidra workspace artifacts `.lock`/`.gpr`/`.rep`/`_ghidra/*` excluded). Green criterion for a future dispatch: queued count = 235. |
+| Tier-0-imports | framework consumer surface | ✓ green at c8536bc — framework imports (`TaskDeploymentSpec`, `Task`, `TaskInfo`, `PodmanPackaging`, etc.) load cleanly; `nix flake check` passes; all 12 SLURM_RUNBOOK flags present in `--help`. **Plan-update note**: plan `immutable-whistling-twilight.md` Tier 0 imports `find_matching_binaries` from `dynamic_runner._shared`; this symbol was vendored out to asm-tokenizer's `shared/binary_selector.py` in 6c65bb7. Adjust plan if re-used. |

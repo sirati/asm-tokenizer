@@ -176,3 +176,32 @@ def resolve_number_token_ids(
     :func:`resolve_category_token_ids`.
     """
     return _resolve_token_type_ids(vocab_manager, _NUMBER_TOKEN_TYPES)
+
+
+def resolve_value_negative_token_id(
+    vocab_manager: "VocabularyManager",
+) -> int | None:
+    """Resolve the uint16 vocab id of the ``value_negative`` postfix metatoken.
+
+    The v2 emitter writes ``[Valued_Const_V2(|value|), Value_Negative()]``
+    for negative integer immediates / displacements; the decoder needs
+    the metatoken's vocab id to detect the postfix and flip the chunk
+    sign for the preceding ``valued_const_v2`` source. Reservation pins
+    the id at ``256`` (see ``VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID``),
+    but the decoder consults this resolver rather than the literal so a
+    future invariant break surfaces as a vocab-side raise instead of a
+    silently-wrong decode.
+
+    Returns ``None`` when the vocab has no ``value_negative`` token --
+    legacy / non-v2 vocabs and the (single source of truth) "no entry
+    tagged with TokenType.VALUE_NEGATIVE" branch from the underlying
+    resolver share that absent-key path. Raises ``ValueError`` only on
+    a malformed vocab (duplicate tagging). Slot 256 passes the shared
+    resolver's ``id >= 256`` range check, so the pinned reservation
+    does not collide with the digit-slot-protection invariant the
+    Category / Number resolvers share.
+    """
+    resolved = _resolve_token_type_ids(
+        vocab_manager, (TokenType.VALUE_NEGATIVE,)
+    )
+    return resolved.get(TokenType.VALUE_NEGATIVE)

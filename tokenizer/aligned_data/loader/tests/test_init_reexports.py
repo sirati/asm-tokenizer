@@ -34,6 +34,7 @@ from tokenizer.aligned_data.loader.decoded import (  # noqa: F401
     decode_raw_tokens as decoded_decode_raw_tokens,
     resolve_category_token_ids as decoded_resolve_category_token_ids,
     resolve_number_token_ids as decoded_resolve_number_token_ids,
+    resolve_value_negative_token_id as decoded_resolve_value_negative_token_id,
     splice_with_callees as decoded_splice_with_callees,
 )
 
@@ -54,6 +55,7 @@ from tokenizer.aligned_data.loader import (  # noqa: F401
     load_single_matched_function,
     resolve_category_token_ids,
     resolve_number_token_ids,
+    resolve_value_negative_token_id,
     splice_with_callees,
 )
 
@@ -70,6 +72,7 @@ DECODED_EXPECTED_SYMBOLS = (
     "decode_raw_tokens",
     "resolve_category_token_ids",
     "resolve_number_token_ids",
+    "resolve_value_negative_token_id",
     "splice_with_callees",
 )
 

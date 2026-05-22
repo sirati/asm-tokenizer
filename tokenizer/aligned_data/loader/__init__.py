@@ -31,6 +31,7 @@ from .decoded import (
     decode_raw_tokens,
     resolve_category_token_ids,
     resolve_number_token_ids,
+    resolve_value_negative_token_id,
     splice_with_callees,
 )
 from .function_data import FunctionData
@@ -54,5 +55,6 @@ __all__ = [
     "load_single_matched_function",
     "resolve_category_token_ids",
     "resolve_number_token_ids",
+    "resolve_value_negative_token_id",
     "splice_with_callees",
 ]

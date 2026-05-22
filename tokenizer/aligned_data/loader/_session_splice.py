@@ -105,18 +105,23 @@ class _BinarySessionSpliceMixin:
 
     def _get_token_id_caches(  # type: ignore[no-untyped-def]
         self,
-    ) -> Tuple[Dict[Category, int], Dict[TokenType, int]]:
-        """Lazily resolve + cache the v2 Category + number-TokenType ids.
+    ) -> Tuple[Dict[Category, int], Dict[TokenType, int], Optional[int]]:
+        """Lazily resolve + cache the v2 Category + number-TokenType ids
+        plus the ``value_negative`` postfix-metatoken id.
 
-        Both maps are derived from ``self._vocab_manager`` via the
+        All three are derived from ``self._vocab_manager`` via the
         :mod:`decoded.category_tokens` resolvers; the result is cached
-        per session (cleared in ``BinarySession.__exit__``). Plain
-        ``dict`` so no further lifecycle hooks are needed.
+        per session (cleared in ``BinarySession.__exit__``). The
+        ``value_negative`` id may legitimately resolve to ``None`` when
+        the vocab predates the postfix shape; the decoder treats the
+        ``None`` case as "skip sign-handling" so the legacy-decode path
+        stays exercised by such vocabs.
         """
         if self._category_token_ids is None or self._number_token_ids is None:
             from .decoded.category_tokens import (
                 resolve_category_token_ids,
                 resolve_number_token_ids,
+                resolve_value_negative_token_id,
             )
             self._category_token_ids = resolve_category_token_ids(
                 self._vocab_manager
@@ -124,7 +129,14 @@ class _BinarySessionSpliceMixin:
             self._number_token_ids = resolve_number_token_ids(
                 self._vocab_manager
             )
-        return self._category_token_ids, self._number_token_ids
+            self._value_negative_token_id = resolve_value_negative_token_id(
+                self._vocab_manager
+            )
+        return (
+            self._category_token_ids,
+            self._number_token_ids,
+            self._value_negative_token_id,
+        )
 
     # --- inverse section lookup --------------------------------------
 
@@ -291,7 +303,7 @@ class _BinarySessionSpliceMixin:
         from .decoded.extract import _decode_to_staging
         from .decoded.splice import splice_with_callees as _splice_walker
 
-        cat_ids, num_ids = self._get_token_id_caches()
+        cat_ids, num_ids, vneg_id = self._get_token_id_caches()
 
         # Resolve the root section + each selected variant's FunctionData
         # exactly once -- the per-stream loop body parses tokens but does
@@ -360,6 +372,7 @@ class _BinarySessionSpliceMixin:
                 id_token_ids=cat_ids,
                 number_token_ids=num_ids,
                 fids_per_category=callee_fids,
+                value_negative_token_id=vneg_id,
                 func_name=fd.func_name,
                 metadata=fd.metadata,
             )
@@ -380,6 +393,7 @@ class _BinarySessionSpliceMixin:
                 id_token_ids=cat_ids,
                 number_token_ids=num_ids,
                 fids_per_category=root_fids,
+                value_negative_token_id=vneg_id,
                 func_name=root_fd.func_name,
                 metadata=root_fd.metadata,
             )

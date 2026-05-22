@@ -154,6 +154,13 @@ class TokenType(IntEnum):
     # the unified vocab (format_version=3) to make per-binary build
     # provenance vocab-resolvable for ML consumers.
     VARIANT_AXIS = 29
+    # v2 sign marker — postfix annotation for `valued_const_v2`. No identity,
+    # no payload; pinned at vocab id 256 (the first slot after the reserved
+    # digit range) so the wire form is deterministic across vocabs. Distinct
+    # from `MEMORY_OPERAND.MINUS` (`MEM_MINUS`): `value_negative` is emitted
+    # iff the disassembler reported the value as signed, whereas `MEM_MINUS`
+    # remains the addressing-operator minus inside `mem[ ... ]mem`.
+    VALUE_NEGATIVE = 30
     UNRESOLVED = -1
 
 
@@ -745,6 +752,35 @@ class CodePtrTableToken(ModifierToken, ABC):
 
     @abstractmethod
     def __init__(self) -> None: ...
+
+
+class ValueNegativeToken(Tokens, ABC):
+    """Protocol for the v2 `value_negative` postfix sign marker.
+
+    Parameterless, single-vocab-id wire form. Emitted by the v2 valued_const
+    emitter immediately after the magnitude bytes of a `valued_const_v2` token
+    iff the disassembler reported the source value as signed-negative. The
+    Inner class is registered eagerly at construction time of any
+    `format_version in (1, 2)` `VocabularyManager` so its vocab id is pinned
+    to ``VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID`` (256) — the first
+    slot after the reserved digit range.
+
+    Distinct from ``MemoryOperandSymbol.MINUS`` (``MEM_MINUS``):
+    ``value_negative`` is a stream-level sign marker for a literal whose
+    signedness was reported by the disassembler; ``MEM_MINUS`` remains the
+    addressing-operator minus inside ``mem[ ... ]mem`` (and the correct
+    emission for any future non-disasm-sourced minus).
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.VALUE_NEGATIVE
+
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+    def _register_on(self, cls_other):
+        return cls_other()
 
 
 @EnumTokenCls(MemoryOperandSymbol)

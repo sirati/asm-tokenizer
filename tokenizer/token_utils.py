@@ -198,7 +198,10 @@ class TokenUtils:
             inner_lit_name: The name for inner tokens (e.g., "Identifier_Lit", "VALUED_CONST")
             vocab_manager: The vocabulary manager instance
             max_key: Maximum key value for determining hex format
-            support_negative: Whether to check for negative values (MEM_MINUS token)
+            support_negative: Whether to check for negative values via a
+                value_negative postfix metatoken (v2 wire shape; on the
+                legacy V1 path the equivalent role is played by
+                ``MemoryOperand.MINUS``).
             token_class: The token class to use for reverse cache lookups (optional)
             inner_token_class: The inner token class to use for reverse cache lookups (optional)
 

@@ -6,7 +6,11 @@ the produced ``unified_vocab.csv`` back through
 ``load_unified_vocab_manager`` and asserts:
 
 * ``format_version == MEMMAP_FORMAT_VERSION``
-* variant-axis tokens populate ids ``[256, 256+n_variants)``
+* the ``value_negative`` postfix sign marker is pinned at id 256 (the
+  first slot after the reserved-digit range, eagerly registered by the
+  unified VM constructor before any caller-driven registrations)
+* variant-axis tokens populate ids ``[257, 257+n_variants)`` — one
+  past the marker
 * instruction-representative tokens populate ids above the variant
   block
 * per-binary ``.mapping.b64c`` files exist
@@ -87,6 +91,12 @@ def test_unify_vocab_emits_unified_with_variant_block(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.format_version == MEMMAP_FORMAT_VERSION
 
+    # The eagerly-pinned `value_negative` marker occupies id 256; the
+    # caller-driven variant-axis block starts one past it.
+    assert loaded.get_token_id("value_negative") == 256
+    assert loaded.id_to_token_type[256] == TokenType.VALUE_NEGATIVE
+    variant_block_start = 257
+
     # Variant tokens: 2 archs + 2 compilers + 2 cver + 2 opts = 8
     expected_variants = {
         "arch:x64", "arch:arm64",
@@ -97,15 +107,16 @@ def test_unify_vocab_emits_unified_with_variant_block(tmp_path: Path) -> None:
     n_variants = len(expected_variants)
     for offset, token in enumerate(sorted(expected_variants)):
         tid = loaded.get_token_id(token)
-        assert tid == 256 + offset, (
-            f"variant {token!r} got id {tid}, expected {256 + offset}"
+        assert tid == variant_block_start + offset, (
+            f"variant {token!r} got id {tid}, "
+            f"expected {variant_block_start + offset}"
         )
         assert loaded.id_to_token_type[tid] == TokenType.VARIANT_AXIS
 
     # First instruction-id band must start exactly above the variants.
     # Block_V2 registers a `block_v2` representative token, so we know
-    # ids 256+n_variants and up are non-variant.
-    first_after_variants = 256 + n_variants
+    # ids variant_block_start+n_variants and up are non-variant.
+    first_after_variants = variant_block_start + n_variants
     assert loaded.id_to_token_type[first_after_variants] != TokenType.VARIANT_AXIS
 
     # mapping.b64c sidecars must exist alongside each input CSV.

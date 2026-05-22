@@ -124,9 +124,10 @@ class ConstantHandler(_V1LegacyMixin, _V2EmittersMixin):
         Args:
             value: the immediate's raw integer value (signed Python int).
                 Negative values reach step 11 (``valued_const``) which
-                emits ``[MEM_MINUS, valued_const_v2(abs(value))]`` per
-                the v2 sign convention (memory file
-                ``open_design_v2_negative_valued_const.md`` option 2).
+                emits ``[valued_const_v2(|value|), value_negative]`` --
+                the v2 emitter is the sole owner of sign decomposition
+                (postfix ``value_negative`` metatoken, see
+                ``_emit_valued_const``).
             meta: typed ``AddressMetadataView`` returned by
                 ``MetadataLookup.lookup(addr)``. May be ``None`` when the
                 caller hasn't done a lookup; the fallback emitter still

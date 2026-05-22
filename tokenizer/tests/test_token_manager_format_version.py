@@ -30,16 +30,24 @@ _V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
 def test_constructor_reserves_digit_slots_for_inline_digit_versions(fv):
     """v1 (unified) and v2 (per-binary CSV) both use the inline-digit
     wire encoding and therefore pre-populate IDs 0..255 with
-    `digit_<HH>` placeholders tagged UNRESOLVED."""
+    `digit_<HH>` placeholders tagged UNRESOLVED. The constructor also
+    eagerly registers the `value_negative` postfix sign marker
+    immediately after the digit range, pinning it at id 256; the
+    detailed invariant for that pinning lives in
+    ``test_value_negative_token_id_pinned_at_first_post_digit_slot``.
+    """
     vm = VocabularyManager(platform=None, format_version=fv)
-    assert len(vm.id_to_token) == _V2_RESERVED_DIGIT_COUNT
+    # Reserved digit range fills ids 0..255 unchanged.
     assert all(
         vm.id_to_token[i] == f"digit_{i:02X}"
         for i in range(_V2_RESERVED_DIGIT_COUNT)
     )
-    # The token_type cache marks every reserved slot UNRESOLVED.
     type_cache = np.asarray(vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT])
     assert np.all(type_cache == TokenType.UNRESOLVED)
+    # Post-digit baseline: the constructor adds exactly one entry — the
+    # `value_negative` marker at id `_V2_RESERVED_DIGIT_COUNT`.
+    assert len(vm.id_to_token) == _V2_RESERVED_DIGIT_COUNT + 1
+    assert vm.id_to_token[_V2_RESERVED_DIGIT_COUNT] == "value_negative"
 
 
 def test_constructor_with_format_version_3_does_not_reserve_digits():
@@ -142,3 +150,73 @@ def test_private_add_token_rejects_digit_slot_name_under_inline_digit_vm(fv):
     cls = vm.get_token_class_for_type(TokenType.VARIANT_AXIS)
     with pytest.raises(AssertionError):
         vm._private_add_token("digit_00", cls)
+
+
+# --------------------------------------------------------------------------
+# value_negative postfix sign marker pinned at id 256 on every v1/v2 VM
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fv", [1, 2])
+def test_value_negative_token_id_pinned_at_first_post_digit_slot(fv):
+    """The `value_negative` postfix sign marker is registered eagerly in
+    the constructor immediately after the reserved-digit pre-population,
+    so its vocab id is pinned to `_V2_VALUE_NEGATIVE_TOKEN_ID` (= 256 =
+    the first slot after the digit range). The invariant is published as
+    the `value_negative_token_id` attribute and exercised through the
+    `Value_Negative()` factory."""
+    vm = VocabularyManager(platform=None, format_version=fv)
+    assert vm.value_negative_token_id == VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID == 256
+    assert vm.Value_Negative().get_token_ids().tolist() == [256]
+    # The factory returns instances of an Inner class whose vocab type
+    # tag is the dedicated VALUE_NEGATIVE; the dispatch table can resolve
+    # the class back from the type tag.
+    assert vm.Value_Negative().token_type == TokenType.VALUE_NEGATIVE
+    assert vm.get_token_class_for_type(TokenType.VALUE_NEGATIVE) is vm.Value_Negative
+
+
+@pytest.mark.parametrize("fv", [1, 2])
+def test_value_negative_factory_is_idempotent(fv):
+    """Repeated `Value_Negative()` calls hit the `_private_add_token`
+    short-circuit and reuse the pinned id; no second registration, no
+    drift of the cached `value_negative_token_id`."""
+    vm = VocabularyManager(platform=None, format_version=fv)
+    pre_size = vm.size
+    [first_id] = vm.Value_Negative().get_token_ids().tolist()
+    [second_id] = vm.Value_Negative().get_token_ids().tolist()
+    assert first_id == second_id == 256
+    assert vm.size == pre_size  # no new vocab entries
+    assert vm.value_negative_token_id == 256
+
+
+def test_value_negative_factory_rejected_on_non_inline_digit_vm():
+    """On vocabs outside the inline-digit set (v3 etc.) the constructor
+    does not pin the marker, and instantiating the Inner class raises
+    the standard v2-format-version assertion."""
+    vm = VocabularyManager(platform=None, format_version=3)
+    assert vm.value_negative_token_id is None
+    with pytest.raises(AssertionError) as exc_info:
+        vm.Value_Negative()
+    assert "format_version=1 (unified) or =2 (per-binary CSV)" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("fv", [1, 2])
+def test_value_negative_round_trip_via_from_token_ids(fv):
+    """`_from_token_ids([256])` reconstructs a Value_Negative instance;
+    the reconstructed instance emits the same single-id wire form."""
+    vm = VocabularyManager(platform=None, format_version=fv)
+    reconstructed = vm.Value_Negative._from_token_ids([256])
+    assert reconstructed.get_token_ids().tolist() == [256]
+    assert reconstructed.token_type == TokenType.VALUE_NEGATIVE
+
+
+@pytest.mark.parametrize("fv", [1, 2])
+def test_first_caller_registration_lands_after_value_negative(fv):
+    """The first caller-driven (non-eager) vocab entry on a v1/v2 VM must
+    land at id 257 — strictly after the pinned `value_negative` slot —
+    so the marker's id stays stable across vocabs."""
+    vm = VocabularyManager(platform=None, format_version=fv)
+    # Register one VariantAxis token (an arbitrary opaque-string Inner
+    # whose id assignment is auto-incrementing); it must take id 257.
+    first = vm.Variant_Axis("arch:x64")
+    assert first.get_token_ids().tolist() == [257]

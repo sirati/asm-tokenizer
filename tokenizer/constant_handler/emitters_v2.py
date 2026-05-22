@@ -17,7 +17,7 @@ from typing import List, Optional
 from tokenizer.constant_handler.ctx import _Ctx
 from tokenizer.disasm.metadata import AddressMetadataView
 from tokenizer.disasm.types import FpType
-from tokenizer.tokens import Category, MemoryOperandSymbol, Tokens
+from tokenizer.tokens import Category, Tokens
 
 
 class _V2EmittersMixin:
@@ -290,20 +290,31 @@ class _V2EmittersMixin:
     def _emit_valued_const(self, value: int, meta: Optional[AddressMetadataView], ctx: _Ctx) -> List[Tokens]:
         """Step 11: fallback -> ``valued_const_v2``.
 
-        Negative values use the MEM_MINUS-prefix convention (memory file
-        ``open_design_v2_negative_valued_const.md`` option 2): emit
-        ``[MEM_MINUS, valued_const_v2(abs(value))]``. The ``valued_const_v2``
-        Inner class is unsigned-only so the absolute value goes inline;
-        the sign is recovered from the MEM_MINUS prefix at decode time.
-        Deliberately mirrors v1's negative-immediate handling and is
-        open for user revisit.
+        Sole owner of sign handling for v2 valued_const. The
+        ``ValuedConstV2Inner`` class is unsigned-only (its contract
+        asserts ``value >= 0``), so the emitter decomposes a signed
+        Python int into an unsigned magnitude + an optional postfix
+        ``value_negative`` metatoken:
+
+        - non-negative: ``[Valued_Const_V2(value), fp_postfix?]``
+        - negative:     ``[Valued_Const_V2(|value|), Value_Negative(), fp_postfix?]``
+
+        ``value_negative`` and the FP-postfix metatokens both have ids
+        >= 256, so neither can be misread as a digit-stream byte by the
+        v2 decoder (which terminates the inline-digit run on the first
+        id >= 256). The decoder consumes them as separate metatokens.
+
+        Sign-decomposition uses an explicit unary-minus rather than
+        ``abs()`` for symmetry with the ``value < 0`` discriminant and
+        to avoid relying on ``abs()`` for the (already-impossible-in-
+        Python's arbitrary-precision ints) signed-overflow case.
         """
+        abs_value = -value if value < 0 else value
+        tokens: List[Tokens] = [self.vocab_manager.Valued_Const_V2(abs_value)]
         if value < 0:
-            return [
-                self.vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS),
-                self.vocab_manager.Valued_Const_V2(-value),
-            ]
-        return [self.vocab_manager.Valued_Const_V2(value)]
+            tokens.append(self.vocab_manager.Value_Negative())
+        tokens.extend(self._postfix_fp_annotation(ctx))
+        return tokens
 
     def _postfix_fp_annotation(self, ctx: _Ctx) -> List[Tokens]:
         """Append a postfix ``floatXX`` annotation when the load is FP-typed.

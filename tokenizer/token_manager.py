@@ -39,6 +39,7 @@ from tokenizer.tokens import (
     ThreadLocalToken,
     Tokens,
     TokenType,
+    ValueNegativeToken,
     ValuedConstToken,
     ValuedConstTokenV2,
     VariantAxisToken,
@@ -83,9 +84,54 @@ class VocabularyManager:
     # IDs 0..255 are protocol-reserved digit slots under format_version
     # in (1, 2) (v1 unified vocab + v2 per-binary CSV; both share the
     # inline-digit wire encoding). `_V2_RESERVED_DIGIT_COUNT` is the
-    # literal boundary — the first vocab entry registered on such a VM
-    # lands at id _V2_RESERVED_DIGIT_COUNT.
+    # literal count of those reserved digit slots — the first vocab
+    # entry available after the digit range is id
+    # `_V2_RESERVED_DIGIT_COUNT` (= 256).
+    #
+    # Id 256 (the first slot after the digit range) is itself pinned to
+    # the `value_negative` postfix sign marker — registered eagerly in
+    # `__init__` immediately after the digit pre-population so its id is
+    # deterministic across vocabs. The constant
+    # `_V2_VALUE_NEGATIVE_TOKEN_ID` captures this invariant; the first
+    # caller-driven registration on a v1/v2 VM therefore lands at id 257.
+    # The invariant is asserted at construction time and exposed via the
+    # `value_negative_token_id` instance attribute for crash-early
+    # checks at downstream call sites.
     _V2_RESERVED_DIGIT_COUNT = 256
+    _V2_VALUE_NEGATIVE_TOKEN_ID = 256
+
+    # The two reserved-count constants below have distinct semantics and
+    # MUST be kept separate:
+    #
+    # * `_V2_RESERVED_DIGIT_COUNT` (= 256) is the wire-stream protocol
+    #   invariant — the digit-vs-metatoken distinguisher used by
+    #   `tokenizer/aligned_data/loader/decoded/extract.py`,
+    #   `tokenizer/token_utils.py`, and `tokenizer/function_token_list.py`.
+    #   This boundary does NOT change.
+    #
+    # * `_V2_RESERVED_TOKEN_COUNT` (= 257) is the CSV-slot strip boundary
+    #   — digits 0..255 PLUS `value_negative` at slot 256 are protocol-
+    #   reserved and not serialised. The saver strips from this boundary;
+    #   the loader reconstructs the digit names + `value_negative` from
+    #   this boundary.
+    #
+    # The `_V2_NUMBER_BLOCK_*` / `_V2_IDENTITY_BLOCK_*` / `_V2_EAGER_BLOCK_END`
+    # constants are canonical-block anchors on the unified VM only. Per-
+    # binary VMs never reach `_V2_EAGER_BLOCK_END` via construction
+    # (number/identity tokens land lazily, anywhere `>= 257`). These
+    # anchors are consumed by the unifier when it pre-registers the
+    # canonical number- and identity-carrying type-marker tokens at fixed
+    # slots on the unified VM.
+    _V2_RESERVED_TOKEN_COUNT = 257    # saver/loader strip boundary
+                                      # (= digits 0..255 + value_negative at 256)
+    _V2_NUMBER_BLOCK_START = 257
+    _V2_NUMBER_BLOCK_COUNT = 7
+    _V2_IDENTITY_BLOCK_START = 264    # = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT
+    _V2_IDENTITY_BLOCK_COUNT = 8
+    _V2_EAGER_BLOCK_END = 272         # = _V2_IDENTITY_BLOCK_START + _V2_IDENTITY_BLOCK_COUNT
+                                      # — first id where instruction-rep
+                                      # registration may land on the
+                                      # unified VM
 
     def __init__(self, platform: typing.Optional[str], _init=True, format_version: int = 1):
         self.platform = platform
@@ -150,6 +196,30 @@ class VocabularyManager:
         # Create unique inner classes for this instance
         self._create_inner_classes()
 
+        # Eagerly pin `value_negative` at id `_V2_VALUE_NEGATIVE_TOKEN_ID`
+        # (256) on every v1/v2 VM. The digit-slot pre-population above
+        # already filled ids 0..255, so the very first vocab registration
+        # under v1/v2 must land at id 256 — by registering here we
+        # guarantee that slot belongs to `value_negative` regardless of
+        # which caller-driven category registers next. Format versions
+        # outside `(1, 2)` neither pre-populate digit slots nor accept
+        # v2 Inner classes (the constructor asserts), so the marker is
+        # not registered on those vocabs.
+        if format_version in (1, 2):
+            _vneg = self.Value_Negative()
+            (vneg_id,) = _vneg.get_token_ids().tolist()
+            assert vneg_id == self._V2_VALUE_NEGATIVE_TOKEN_ID, (
+                f"value_negative invariant broken: got id {vneg_id}, "
+                f"expected {self._V2_VALUE_NEGATIVE_TOKEN_ID}"
+            )
+            self.value_negative_token_id: int = vneg_id
+        else:
+            # On non-inline-digit vocabs the marker is not registered;
+            # callers that depend on the id MUST first check
+            # `format_version in (1, 2)`. Expose `None` to make the
+            # absence explicit (and crash AttributeError-free at probes).
+            self.value_negative_token_id: typing.Optional[int] = None
+
     @staticmethod
     def from_vocab(
         platform: str,
@@ -174,8 +244,13 @@ class VocabularyManager:
         v_man = VocabularyManager(platform, format_version=format_version)
         # Reassigning id_to_token wholesale replaces the constructor's
         # placeholder population (intentional — the caller has the
-        # authoritative list).
+        # authoritative list). Clear token_to_id too so any entries
+        # populated by the constructor's eager registrations (e.g. the
+        # `value_negative` postfix marker pinned at id 256) cannot leak
+        # in as stale dict keys when the supplied vocab_list rebuilds
+        # the forward map below.
         v_man.id_to_token = vocab_list
+        v_man.token_to_id.clear()
         v_man.last_id = len(vocab_list)
         platform_token = f"{platform}_"
 
@@ -226,6 +301,8 @@ class VocabularyManager:
                     token_type = TokenType.MEMORY_OPERAND
                 elif value.startswith("REG_LIST_"):
                     token_type = TokenType.REGISTER_LIST
+                elif value == "value_negative":
+                    token_type = TokenType.VALUE_NEGATIVE
 
                 token_types.append(token_type)
 
@@ -243,6 +320,13 @@ class VocabularyManager:
             v_man._lit_end_cache = np.array(lit_end_tokens, dtype=np.int_)
             v_man._lit_end_count = len(lit_end_tokens)
 
+        # Refresh the `value_negative_token_id` cache to mirror the
+        # supplied vocab. The constructor pinned it to 256 on a freshly
+        # built v1/v2 VM, but `from_vocab` callers reassigned id_to_token
+        # wholesale; the authoritative source post-reassignment is
+        # `token_to_id`. Absence (None) is reported when the supplied
+        # vocab predates the marker.
+        v_man.value_negative_token_id = v_man.token_to_id.get("value_negative")
         return v_man
 
     def _private_add_token(
@@ -255,7 +339,9 @@ class VocabularyManager:
     ) -> int:
         """Add a token to the vocabulary and return its ID, optionally setting platform instruction type."""
         if token in self.token_to_id:
-            return self.token_to_id[token]
+            existing_id = self.token_to_id[token]
+            self._maybe_promote_to_unified_platform(existing_id, platform)
+            return existing_id
 
         assert (not (token.startswith("Block") or token.startswith("OPAQUE_CONST"))) or (
             token[-2] == "_" or "Lit" in token or token == "Block_Def"
@@ -351,6 +437,53 @@ class VocabularyManager:
         # Regular tokens don't get added to lit caches at all
         return token_id
 
+    def _maybe_promote_to_unified_platform(
+        self, existing_id: int, incoming_platform: Optional[str]
+    ) -> None:
+        """Upgrade ``token_to_platform[existing_id]`` to ``unified_<family>``
+        when an already-registered token gains a second contributing ISA
+        in the same family.
+
+        The unified-VM family-merge collapses cross-bitness mnemonics
+        (e.g. ``mov`` from x86 and x64) into one token id. Without this
+        promotion the per-token platform entry would silently retain
+        whichever ISA arrived first, indistinguishable downstream from a
+        token only ever seen in that one bitness.
+
+        No-op on per-ISA VMs, on platform-agnostic tokens, on repeat
+        registrations from the same ISA, and on families that aren't in
+        ``PLATFORM_UNIFIED`` (non-canonical platform names — the token
+        prefix already encodes the platform verbatim, so cross-bitness
+        collision doesn't apply).
+        """
+        if self.platform is not None or incoming_platform is None:
+            return
+        existing_pid = int(self.token_to_platform[existing_id])
+        if existing_pid < 0:
+            return
+        existing_platform = self.platform_list[existing_pid]
+        if existing_platform == incoming_platform:
+            return
+        from tokenizer.arch import PLATFORM_FAMILY, PLATFORM_UNIFIED
+        family = PLATFORM_FAMILY.get(incoming_platform)
+        unified_name = PLATFORM_UNIFIED.get(family) if family is not None else None
+        if unified_name is None:
+            return
+        if existing_platform == unified_name:
+            return
+        assert PLATFORM_FAMILY.get(existing_platform) == family, (
+            f"Cross-family token collision: token id {existing_id} "
+            f"registered for platform {existing_platform!r} "
+            f"(family {PLATFORM_FAMILY.get(existing_platform)!r}); "
+            f"incoming platform {incoming_platform!r} (family {family!r})."
+        )
+        unified_pid = self.platform_reverse.get(unified_name, -1)
+        if unified_pid == -1:
+            unified_pid = len(self.platform_list)
+            self.platform_list.append(unified_name)
+            self.platform_reverse[unified_name] = unified_pid
+        self.token_to_platform[existing_id] = unified_pid
+
     @property
     def id_to_token_type(self) -> npt.NDArray[np.int8]:
         """Get readonly view of id_to_token_type array"""
@@ -400,6 +533,21 @@ class VocabularyManager:
     def size(self) -> int:
         """Return the number of tokens in the vocabulary"""
         return len(self.id_to_token)
+
+    @property
+    def number_block_range(self) -> tuple[int, int]:
+        """`[start, end)` range of number-carrying type-marker token-ids on
+        the unified VM. Returns an empty interval `(size, size)` on per-
+        binary VMs and on unified VMs that have not been pre-registered
+        yet — callers can use the same range-membership test for both."""
+        return getattr(self, "_number_block_range", (self.size, self.size))
+
+    @property
+    def identity_block_range(self) -> tuple[int, int]:
+        """`[start, end)` range of identity-carrying type-marker token-ids
+        on the unified VM. Empty interval `(size, size)` on per-binary VMs
+        and on unified VMs that have not been pre-registered yet."""
+        return getattr(self, "_identity_block_range", (self.size, self.size))
 
     def to_dict(self) -> dict[str, int]:
         """Convert to dictionary format for backward compatibility"""
@@ -486,6 +634,8 @@ class VocabularyManager:
             return self.Code_Ptr_Table
         elif token_type == TokenType.VARIANT_AXIS:
             return self.Variant_Axis
+        elif token_type == TokenType.VALUE_NEGATIVE:
+            return self.Value_Negative
         else:
             raise ValueError(f"Unknown token type: {token_type}")
 
@@ -1222,14 +1372,18 @@ class VocabularyManager:
                     "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
-                # Plan reserves negative-value semantics; current impl
-                # restricts to non-negative until the ConstantHandler
-                # rewrite (Phase 1.C.1) settles on a two's-complement vs.
-                # MEM_MINUS-prefix vs. sign-byte choice. Failing fast here
-                # surfaces the gap rather than silently emitting a corrupt
-                # stream.
+                # ``ValuedConstV2Inner``'s contract is unsigned-payload:
+                # callers MUST pass a non-negative magnitude. Sign
+                # decomposition is owned by the v2 emitter
+                # ``_V2EmittersMixin._emit_valued_const``, which is the
+                # only legitimate caller; it splits a signed input into
+                # ``[Valued_Const_V2(abs(value)), Value_Negative()?]``.
+                # The assert below traps any code path that tries to
+                # embed a sign byte into the magnitude stream -- fail-
+                # fast surfaces the design break rather than silently
+                # emitting a corrupt token sequence.
                 assert value >= 0, (
-                    f"v2 valued_const negative-value encoding is not yet specified; got {value}"
+                    f"v2 valued_const magnitude must be non-negative; got {value}"
                 )
                 self.value = value
                 self._type_token_id = vocab_manager._private_add_token("valued_const_v2", self.__class__)
@@ -1482,6 +1636,49 @@ class VocabularyManager:
         assert issubclass(CodePtrTableInner, ModifierToken)
         assert issubclass(CodePtrTableInner, CodePtrTableToken)
 
+        # Value_Negative Inner — parameterless postfix sign marker for
+        # `valued_const_v2`. Mechanical shape matches the modifier-token
+        # family (single vocab id, no payload), but kept as a standalone
+        # Inner class because the semantic role (stream-level sign
+        # annotation) is distinct from a base-category modifier — and
+        # placing it in `_V2ModifierInner` would conflate the families.
+        # Vocab id is pinned at `_V2_VALUE_NEGATIVE_TOKEN_ID` (= 256) by
+        # the eager registration in `VocabularyManager.__init__`; the
+        # invariant is checked there.
+
+        class ValueNegativeInner(TokensInner, ValueNegativeToken):
+            __slots__ = ("_type_token_id",)
+
+            def __init__(self):
+                assert vocab_manager.format_version in (1, 2), (
+                    "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
+                    f"got format_version={vocab_manager.format_version}"
+                )
+                self._type_token_id = vocab_manager._private_add_token(
+                    "value_negative", self.__class__
+                )
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "ValueNegativeInner":
+                if len(token_ids) != 1:
+                    raise ValueError(
+                        f"v2 value_negative token must have exactly one id, got {token_ids}"
+                    )
+                return cls()
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array([self._type_token_id], dtype=np.int_)
+
+            def to_string(self) -> str:
+                return "value_negative"
+
+            def to_asm_like(self) -> str:
+                return "value_negative"
+
+        assert issubclass(ValueNegativeInner, Tokens)
+        assert issubclass(ValueNegativeInner, ValueNegativeToken)
+        assert ValueNegativeInner.token_type == TokenType.VALUE_NEGATIVE
+
         # Variant_Axis Inner — opaque-string family. Each instance holds
         # one prefixed axis string (e.g. `arch:x64`, `comp:gcc`,
         # `cver:gcc:13.2.0`, `opt:O2`, `<metakey>:<metaval>`) that
@@ -1699,6 +1896,12 @@ class VocabularyManager:
         self.Thread_Local = ThreadLocalInner
         self.Vtable = VtableInner
         self.Code_Ptr_Table = CodePtrTableInner
+        # Postfix sign marker for valued_const_v2. Registered eagerly in
+        # `__init__` to pin its vocab id at `_V2_VALUE_NEGATIVE_TOKEN_ID`
+        # (256); the factory exposed here lets callers re-emit it without
+        # a fresh registration (the `_private_add_token` short-circuit
+        # returns the cached id on repeat name lookups).
+        self.Value_Negative = ValueNegativeInner
         # Variant-axis opaque-string token (v1 unified vocab only).
         # Registered on every VM so the dispatch table is complete; the
         # unifier is the only intended caller.

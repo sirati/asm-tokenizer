@@ -21,8 +21,11 @@ Three concerns:
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -107,3 +110,55 @@ def arm32_provider(request) -> DisassemblyProvider:
     if name == "angr":
         return request.getfixturevalue("arm32_angr_provider")
     raise ValueError(f"Unknown provider name: {name}")
+
+
+# ---- Standalone-tokenizer subprocess factory ------------------------------
+@pytest.fixture
+def fresh_ghidra_csv(tmp_path: Path) -> Callable[[str, Path], Path]:
+    """Factory that invokes the standalone ``python -m tokenizer --backend
+    ghidra --batch ...`` pipeline on a single binary and returns the path
+    to the freshly emitted CSV under the test's ``tmp_path``.
+
+    Tests that pin post-refactor wire shapes (rather than the cached
+    ``/tmp/asm_smoke/out/`` snapshot, which can pre-date the refactor)
+    use this fixture to guarantee they exercise current producer output.
+    The cost is a Ghidra spin-up per call (~30-120s); callers should
+    carry the ``slow`` marker.
+    """
+    def _make(binary_name: str, source_root: Path) -> Path:
+        queue = tmp_path / "queue.txt"
+        queue.write_text(f"{binary_name}\n")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "tokenizer",
+            "--backend", "ghidra",
+            "--batch", str(queue),
+            "--source", str(source_root),
+            "--output", str(out_dir),
+            "--platform", "auto",
+        ]
+        env = dict(os.environ)
+        env["ASM_TOKENIZER_FORMAT_VERSION"] = "2"
+
+        proc = subprocess.run(
+            cmd,
+            cwd=str(_PROJECT_ROOT),
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert proc.returncode == 0, (
+            f"tokenize failed (rc={proc.returncode}) for {binary_name}\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+        csv_path = out_dir / f"{binary_name}_output.csv"
+        assert csv_path.is_file(), f"CSV not emitted at {csv_path}"
+        return csv_path
+
+    return _make
