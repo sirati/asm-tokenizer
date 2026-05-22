@@ -92,14 +92,19 @@ def test_register_simple_corpus(tmp_path: Path) -> None:
     expected = expected_arch | expected_comp | expected_cver | expected_opt
     assert n == len(expected), f"expected {len(expected)} distinct, got {n}"
 
-    # Every expected token is registered and resolves; v3 reserved-digit
-    # boundary places variant ids at >= 256.
+    # Every expected token is registered and resolves; the
+    # reserved-digit + pinned-value_negative prelude places variant ids
+    # at >= 257 (digit range 0..255, value_negative at 256).
+    first_caller_id = VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID + 1
     for token in expected:
         tid = vm.get_token_id(token)
-        assert tid >= 256, f"variant token {token!r} got id {tid}"
+        assert tid >= first_caller_id, (
+            f"variant token {token!r} got id {tid} (below first "
+            f"caller-assignable id {first_caller_id})"
+        )
 
-    # Variant tokens occupy a contiguous low block [256, 256+n).
-    variant_id_range = set(range(256, 256 + n))
+    # Variant tokens occupy a contiguous block one past the marker.
+    variant_id_range = set(range(first_caller_id, first_caller_id + n))
     actual_ids = {vm.get_token_id(t) for t in expected}
     assert actual_ids == variant_id_range, (
         f"variant ids {sorted(actual_ids)} do not match expected "

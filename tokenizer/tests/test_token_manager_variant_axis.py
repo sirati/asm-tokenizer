@@ -21,6 +21,12 @@ from tokenizer.tokens import TokenType, VariantAxisToken
 
 
 _V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+# First vocab id that caller-driven registrations can claim on a v1/v2 VM:
+# the digit range occupies 0.._V2_RESERVED_DIGIT_COUNT-1, the
+# `value_negative` postfix sign marker is pinned at
+# `_V2_VALUE_NEGATIVE_TOKEN_ID` (= _V2_RESERVED_DIGIT_COUNT), so the
+# first caller-assignable slot starts one past the marker.
+_V1_FIRST_CALLER_ID = VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID + 1
 
 
 def _make_v1_vm() -> VocabularyManager:
@@ -58,13 +64,14 @@ def test_variant_axis_registration_assigns_id_and_token_type():
 
     token = cls("arch:x64")
 
-    # ID landed at the first non-reserved slot.
-    assert token._token_id == _V2_RESERVED_DIGIT_COUNT
+    # ID landed at the first caller-assignable slot (post digit range +
+    # past the eagerly-pinned `value_negative` marker at id 256).
+    assert token._token_id == _V1_FIRST_CALLER_ID
     # Round-trip via the public id_to_token / token_to_id surface.
-    assert vm.get_token_id("arch:x64") == _V2_RESERVED_DIGIT_COUNT
-    assert vm.get_token_str(_V2_RESERVED_DIGIT_COUNT) == "arch:x64"
+    assert vm.get_token_id("arch:x64") == _V1_FIRST_CALLER_ID
+    assert vm.get_token_str(_V1_FIRST_CALLER_ID) == "arch:x64"
     # The id_to_token_type cache reflects VARIANT_AXIS.
-    assert vm.id_to_token_type[_V2_RESERVED_DIGIT_COUNT] == TokenType.VARIANT_AXIS
+    assert vm.id_to_token_type[_V1_FIRST_CALLER_ID] == TokenType.VARIANT_AXIS
 
 
 def test_variant_axis_registration_idempotent_per_string():
@@ -77,7 +84,9 @@ def test_variant_axis_registration_idempotent_per_string():
     t2 = cls("comp:gcc")
 
     assert t1._token_id == t2._token_id
-    assert vm.size == _V2_RESERVED_DIGIT_COUNT + 1
+    # Baseline = reserved-digit range (256) + value_negative (1) + the
+    # single registered variant axis (1).
+    assert vm.size == _V1_FIRST_CALLER_ID + 1
 
 
 def test_variant_axis_distinct_strings_get_distinct_ids():
@@ -95,10 +104,10 @@ def test_variant_axis_distinct_strings_get_distinct_ids():
 
     ids = [arch_tok._token_id, comp_tok._token_id, cver_tok._token_id,
            opt_tok._token_id, meta_tok._token_id]
-    assert ids == [_V2_RESERVED_DIGIT_COUNT + i for i in range(5)]
+    assert ids == [_V1_FIRST_CALLER_ID + i for i in range(5)]
     # All five are tagged VARIANT_AXIS in the type cache.
     for i in range(5):
-        assert vm.id_to_token_type[_V2_RESERVED_DIGIT_COUNT + i] == TokenType.VARIANT_AXIS
+        assert vm.id_to_token_type[_V1_FIRST_CALLER_ID + i] == TokenType.VARIANT_AXIS
 
 
 def test_variant_axis_round_trip_from_token_ids():
@@ -144,7 +153,7 @@ def test_variant_axis_from_token_ids_rejects_wrong_arity():
     with pytest.raises(ValueError):
         vm.Variant_Axis._from_token_ids([])
     with pytest.raises(ValueError):
-        vm.Variant_Axis._from_token_ids([_V2_RESERVED_DIGIT_COUNT, _V2_RESERVED_DIGIT_COUNT + 1])
+        vm.Variant_Axis._from_token_ids([_V1_FIRST_CALLER_ID, _V1_FIRST_CALLER_ID + 1])
 
 
 # --------------------------------------------------------------------------
@@ -175,10 +184,13 @@ def test_iter_representative_tokens_yields_one_wrapper_per_variant_axis():
 def test_iter_representative_tokens_skips_reserved_digits_under_v1():
     """The 256 reserved digit slots must NOT appear as representatives
     (their token_type is UNRESOLVED — the dispatch table would fail).
-    With an empty v1 VM, iter_representative_tokens yields nothing."""
+    On a freshly-constructed v1 VM the only registered token is the
+    eagerly-pinned `value_negative` marker, so iter_representative_tokens
+    yields exactly that one representative."""
     vm = _make_v1_vm()
     reps = list(vm.iter_representative_tokens())
-    assert reps == []
+    assert len(reps) == 1
+    assert reps[0].token_type == TokenType.VALUE_NEGATIVE
 
 
 # --------------------------------------------------------------------------
@@ -189,16 +201,22 @@ def test_iter_representative_tokens_skips_reserved_digits_under_v1():
 def test_v1_vm_reserves_same_digit_slots_as_v2():
     """v1 unified vocab = v2 wire encoding + variant tokens (additive).
     The reserved-digit prelude (256 `digit_<HH>` placeholders typed
-    UNRESOLVED) must be byte-identical between v2 and v1 VMs."""
+    UNRESOLVED) plus the eagerly-pinned `value_negative` marker must be
+    byte-identical between v2 and v1 VMs."""
     v2_vm = _make_v2_vm()
     v1_vm = _make_v1_vm()
 
-    assert v2_vm.size == _V2_RESERVED_DIGIT_COUNT
-    assert v1_vm.size == _V2_RESERVED_DIGIT_COUNT
-    # Placeholder names match.
+    # Baseline size = digit range (256) + the value_negative marker (1).
+    assert v2_vm.size == _V1_FIRST_CALLER_ID
+    assert v1_vm.size == _V1_FIRST_CALLER_ID
+    # Placeholder names match across the reserved digit range.
     assert v2_vm.id_to_token[:_V2_RESERVED_DIGIT_COUNT] == \
         v1_vm.id_to_token[:_V2_RESERVED_DIGIT_COUNT]
-    # Token-type tags match (all UNRESOLVED in both).
+    # And the post-digit pinned slot matches: both VMs register
+    # `value_negative` at the same id.
+    assert v2_vm.id_to_token[_V2_RESERVED_DIGIT_COUNT] == \
+        v1_vm.id_to_token[_V2_RESERVED_DIGIT_COUNT] == "value_negative"
+    # Token-type tags match (all UNRESOLVED across the digit range in both).
     assert np.array_equal(
         np.asarray(v2_vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT]),
         np.asarray(v1_vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT]),
@@ -210,11 +228,12 @@ def test_v1_vm_reserves_same_digit_slots_as_v2():
 
 
 def test_v1_vm_first_real_token_lands_at_reserved_boundary():
-    """First registered token on a v1 VM gets id 256 — same as v2 — so
-    the variant block starts at the documented boundary."""
+    """First caller-driven token on a v1 VM gets id 257 — one past the
+    eagerly-pinned `value_negative` marker — so the variant block starts
+    at the documented post-marker boundary, same as v2."""
     v1_vm = _make_v1_vm()
     tok = v1_vm.Variant_Axis("arch:x64")
-    assert tok._token_id == _V2_RESERVED_DIGIT_COUNT
+    assert tok._token_id == _V1_FIRST_CALLER_ID
 
 
 def test_v1_vm_rejects_reserved_digit_name():

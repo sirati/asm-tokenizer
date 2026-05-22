@@ -39,6 +39,7 @@ from tokenizer.tokens import (
     ThreadLocalToken,
     Tokens,
     TokenType,
+    ValueNegativeToken,
     ValuedConstToken,
     ValuedConstTokenV2,
     VariantAxisToken,
@@ -83,9 +84,21 @@ class VocabularyManager:
     # IDs 0..255 are protocol-reserved digit slots under format_version
     # in (1, 2) (v1 unified vocab + v2 per-binary CSV; both share the
     # inline-digit wire encoding). `_V2_RESERVED_DIGIT_COUNT` is the
-    # literal boundary — the first vocab entry registered on such a VM
-    # lands at id _V2_RESERVED_DIGIT_COUNT.
+    # literal count of those reserved digit slots — the first vocab
+    # entry available after the digit range is id
+    # `_V2_RESERVED_DIGIT_COUNT` (= 256).
+    #
+    # Id 256 (the first slot after the digit range) is itself pinned to
+    # the `value_negative` postfix sign marker — registered eagerly in
+    # `__init__` immediately after the digit pre-population so its id is
+    # deterministic across vocabs. The constant
+    # `_V2_VALUE_NEGATIVE_TOKEN_ID` captures this invariant; the first
+    # caller-driven registration on a v1/v2 VM therefore lands at id 257.
+    # The invariant is asserted at construction time and exposed via the
+    # `value_negative_token_id` instance attribute for crash-early
+    # checks at downstream call sites.
     _V2_RESERVED_DIGIT_COUNT = 256
+    _V2_VALUE_NEGATIVE_TOKEN_ID = 256
 
     def __init__(self, platform: typing.Optional[str], _init=True, format_version: int = 1):
         self.platform = platform
@@ -150,6 +163,30 @@ class VocabularyManager:
         # Create unique inner classes for this instance
         self._create_inner_classes()
 
+        # Eagerly pin `value_negative` at id `_V2_VALUE_NEGATIVE_TOKEN_ID`
+        # (256) on every v1/v2 VM. The digit-slot pre-population above
+        # already filled ids 0..255, so the very first vocab registration
+        # under v1/v2 must land at id 256 — by registering here we
+        # guarantee that slot belongs to `value_negative` regardless of
+        # which caller-driven category registers next. Format versions
+        # outside `(1, 2)` neither pre-populate digit slots nor accept
+        # v2 Inner classes (the constructor asserts), so the marker is
+        # not registered on those vocabs.
+        if format_version in (1, 2):
+            _vneg = self.Value_Negative()
+            (vneg_id,) = _vneg.get_token_ids().tolist()
+            assert vneg_id == self._V2_VALUE_NEGATIVE_TOKEN_ID, (
+                f"value_negative invariant broken: got id {vneg_id}, "
+                f"expected {self._V2_VALUE_NEGATIVE_TOKEN_ID}"
+            )
+            self.value_negative_token_id: int = vneg_id
+        else:
+            # On non-inline-digit vocabs the marker is not registered;
+            # callers that depend on the id MUST first check
+            # `format_version in (1, 2)`. Expose `None` to make the
+            # absence explicit (and crash AttributeError-free at probes).
+            self.value_negative_token_id: typing.Optional[int] = None
+
     @staticmethod
     def from_vocab(
         platform: str,
@@ -174,8 +211,13 @@ class VocabularyManager:
         v_man = VocabularyManager(platform, format_version=format_version)
         # Reassigning id_to_token wholesale replaces the constructor's
         # placeholder population (intentional — the caller has the
-        # authoritative list).
+        # authoritative list). Clear token_to_id too so any entries
+        # populated by the constructor's eager registrations (e.g. the
+        # `value_negative` postfix marker pinned at id 256) cannot leak
+        # in as stale dict keys when the supplied vocab_list rebuilds
+        # the forward map below.
         v_man.id_to_token = vocab_list
+        v_man.token_to_id.clear()
         v_man.last_id = len(vocab_list)
         platform_token = f"{platform}_"
 
@@ -226,6 +268,8 @@ class VocabularyManager:
                     token_type = TokenType.MEMORY_OPERAND
                 elif value.startswith("REG_LIST_"):
                     token_type = TokenType.REGISTER_LIST
+                elif value == "value_negative":
+                    token_type = TokenType.VALUE_NEGATIVE
 
                 token_types.append(token_type)
 
@@ -243,6 +287,13 @@ class VocabularyManager:
             v_man._lit_end_cache = np.array(lit_end_tokens, dtype=np.int_)
             v_man._lit_end_count = len(lit_end_tokens)
 
+        # Refresh the `value_negative_token_id` cache to mirror the
+        # supplied vocab. The constructor pinned it to 256 on a freshly
+        # built v1/v2 VM, but `from_vocab` callers reassigned id_to_token
+        # wholesale; the authoritative source post-reassignment is
+        # `token_to_id`. Absence (None) is reported when the supplied
+        # vocab predates the marker.
+        v_man.value_negative_token_id = v_man.token_to_id.get("value_negative")
         return v_man
 
     def _private_add_token(
@@ -535,6 +586,8 @@ class VocabularyManager:
             return self.Code_Ptr_Table
         elif token_type == TokenType.VARIANT_AXIS:
             return self.Variant_Axis
+        elif token_type == TokenType.VALUE_NEGATIVE:
+            return self.Value_Negative
         else:
             raise ValueError(f"Unknown token type: {token_type}")
 
@@ -1531,6 +1584,49 @@ class VocabularyManager:
         assert issubclass(CodePtrTableInner, ModifierToken)
         assert issubclass(CodePtrTableInner, CodePtrTableToken)
 
+        # Value_Negative Inner — parameterless postfix sign marker for
+        # `valued_const_v2`. Mechanical shape matches the modifier-token
+        # family (single vocab id, no payload), but kept as a standalone
+        # Inner class because the semantic role (stream-level sign
+        # annotation) is distinct from a base-category modifier — and
+        # placing it in `_V2ModifierInner` would conflate the families.
+        # Vocab id is pinned at `_V2_VALUE_NEGATIVE_TOKEN_ID` (= 256) by
+        # the eager registration in `VocabularyManager.__init__`; the
+        # invariant is checked there.
+
+        class ValueNegativeInner(TokensInner, ValueNegativeToken):
+            __slots__ = ("_type_token_id",)
+
+            def __init__(self):
+                assert vocab_manager.format_version in (1, 2), (
+                    "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
+                    f"got format_version={vocab_manager.format_version}"
+                )
+                self._type_token_id = vocab_manager._private_add_token(
+                    "value_negative", self.__class__
+                )
+
+            @classmethod
+            def _from_token_ids(cls, token_ids: List[int]) -> "ValueNegativeInner":
+                if len(token_ids) != 1:
+                    raise ValueError(
+                        f"v2 value_negative token must have exactly one id, got {token_ids}"
+                    )
+                return cls()
+
+            def get_token_ids(self) -> npt.NDArray[np.int_]:
+                return np.array([self._type_token_id], dtype=np.int_)
+
+            def to_string(self) -> str:
+                return "value_negative"
+
+            def to_asm_like(self) -> str:
+                return "value_negative"
+
+        assert issubclass(ValueNegativeInner, Tokens)
+        assert issubclass(ValueNegativeInner, ValueNegativeToken)
+        assert ValueNegativeInner.token_type == TokenType.VALUE_NEGATIVE
+
         # Variant_Axis Inner — opaque-string family. Each instance holds
         # one prefixed axis string (e.g. `arch:x64`, `comp:gcc`,
         # `cver:gcc:13.2.0`, `opt:O2`, `<metakey>:<metaval>`) that
@@ -1748,6 +1844,12 @@ class VocabularyManager:
         self.Thread_Local = ThreadLocalInner
         self.Vtable = VtableInner
         self.Code_Ptr_Table = CodePtrTableInner
+        # Postfix sign marker for valued_const_v2. Registered eagerly in
+        # `__init__` to pin its vocab id at `_V2_VALUE_NEGATIVE_TOKEN_ID`
+        # (256); the factory exposed here lets callers re-emit it without
+        # a fresh registration (the `_private_add_token` short-circuit
+        # returns the cached id on repeat name lookups).
+        self.Value_Negative = ValueNegativeInner
         # Variant-axis opaque-string token (v1 unified vocab only).
         # Registered on every VM so the dispatch table is complete; the
         # unifier is the only intended caller.
