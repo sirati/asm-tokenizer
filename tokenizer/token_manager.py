@@ -100,6 +100,39 @@ class VocabularyManager:
     _V2_RESERVED_DIGIT_COUNT = 256
     _V2_VALUE_NEGATIVE_TOKEN_ID = 256
 
+    # The two reserved-count constants below have distinct semantics and
+    # MUST be kept separate:
+    #
+    # * `_V2_RESERVED_DIGIT_COUNT` (= 256) is the wire-stream protocol
+    #   invariant — the digit-vs-metatoken distinguisher used by
+    #   `tokenizer/aligned_data/loader/decoded/extract.py`,
+    #   `tokenizer/token_utils.py`, and `tokenizer/function_token_list.py`.
+    #   This boundary does NOT change.
+    #
+    # * `_V2_RESERVED_TOKEN_COUNT` (= 257) is the CSV-slot strip boundary
+    #   — digits 0..255 PLUS `value_negative` at slot 256 are protocol-
+    #   reserved and not serialised. The saver strips from this boundary;
+    #   the loader reconstructs the digit names + `value_negative` from
+    #   this boundary.
+    #
+    # The `_V2_NUMBER_BLOCK_*` / `_V2_IDENTITY_BLOCK_*` / `_V2_EAGER_BLOCK_END`
+    # constants are canonical-block anchors on the unified VM only. Per-
+    # binary VMs never reach `_V2_EAGER_BLOCK_END` via construction
+    # (number/identity tokens land lazily, anywhere `>= 257`). These
+    # anchors are consumed by the unifier when it pre-registers the
+    # canonical number- and identity-carrying type-marker tokens at fixed
+    # slots on the unified VM.
+    _V2_RESERVED_TOKEN_COUNT = 257    # saver/loader strip boundary
+                                      # (= digits 0..255 + value_negative at 256)
+    _V2_NUMBER_BLOCK_START = 257
+    _V2_NUMBER_BLOCK_COUNT = 7
+    _V2_IDENTITY_BLOCK_START = 264    # = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT
+    _V2_IDENTITY_BLOCK_COUNT = 8
+    _V2_EAGER_BLOCK_END = 272         # = _V2_IDENTITY_BLOCK_START + _V2_IDENTITY_BLOCK_COUNT
+                                      # — first id where instruction-rep
+                                      # registration may land on the
+                                      # unified VM
+
     def __init__(self, platform: typing.Optional[str], _init=True, format_version: int = 1):
         self.platform = platform
         # Wire-format version: 1 = unified vocab (inline-digit stream;
@@ -500,6 +533,21 @@ class VocabularyManager:
     def size(self) -> int:
         """Return the number of tokens in the vocabulary"""
         return len(self.id_to_token)
+
+    @property
+    def number_block_range(self) -> tuple[int, int]:
+        """`[start, end)` range of number-carrying type-marker token-ids on
+        the unified VM. Returns an empty interval `(size, size)` on per-
+        binary VMs and on unified VMs that have not been pre-registered
+        yet — callers can use the same range-membership test for both."""
+        return getattr(self, "_number_block_range", (self.size, self.size))
+
+    @property
+    def identity_block_range(self) -> tuple[int, int]:
+        """`[start, end)` range of identity-carrying type-marker token-ids
+        on the unified VM. Empty interval `(size, size)` on per-binary VMs
+        and on unified VMs that have not been pre-registered yet."""
+        return getattr(self, "_identity_block_range", (self.size, self.size))
 
     def to_dict(self) -> dict[str, int]:
         """Convert to dictionary format for backward compatibility"""
