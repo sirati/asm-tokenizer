@@ -376,8 +376,16 @@ def write_matched_sections_pass2(
         writer.writerow([line_no_b64, called_line_nos_typed])
 
         # ----- BIN: open section + emit call_targets table -----
+        # ``n_variants`` reserves the per-variant jump-table slot count
+        # at section start; the writer asserts in :meth:`end_section`
+        # that exactly this many ``begin_variant``/``end_variant`` pairs
+        # followed. ``version_data`` is the iterable that drives the
+        # variant-emission loop below, so its length IS the count.
         function_name_ptr = registry.line_no(func_name)
-        section_writer.begin_section(function_name_ptr)
+        section_writer.begin_section(
+            function_name_ptr=function_name_ptr,
+            n_variants=len(version_data),
+        )
         call_targets, unique_called_index_map = _build_call_targets_spec(
             typed_unique_called,
             extern_libraries,
@@ -682,8 +690,16 @@ def write_unmatched_sections_pass2(
             )
 
         # ----- BIN: section header + call_targets + per-variant blocks -----
+        # ``vkeys`` and ``called_by_version`` are built in lock-step by
+        # :func:`group_unmatched_entries_by_function` (one append each
+        # per source entry), so ``len(vkeys)`` matches the variant-block
+        # loop below — exactly what the writer's jump-table reservation
+        # and ``end_section`` assertion expect.
         function_name_ptr = registry.line_no(func_name)
-        section_writer.begin_section(function_name_ptr)
+        section_writer.begin_section(
+            function_name_ptr=function_name_ptr,
+            n_variants=len(vkeys),
+        )
         call_targets, unique_called_index_map = _build_call_targets_spec(
             typed_unique_called,
             extern_libraries,
