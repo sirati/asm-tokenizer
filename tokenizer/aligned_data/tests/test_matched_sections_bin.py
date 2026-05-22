@@ -534,7 +534,7 @@ def test_dup_section_overwrites_known_sections_with_latest_offset(tmp_path: Path
     writer.finalize()
 
     assert second_offset != first_offset
-    assert writer._known_sections[1] == second_offset  # noqa: SLF001 — internal-state assertion is the point of this test
+    assert writer._known_sections.get(1) == second_offset  # noqa: SLF001 — internal-state assertion is the point of this test
     sections = list(iter_sections_bin(path))
     assert len(sections) == 2
     assert {s.function_name_ptr for s in sections} == {1}
