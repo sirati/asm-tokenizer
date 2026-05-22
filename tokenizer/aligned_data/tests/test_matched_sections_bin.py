@@ -178,11 +178,12 @@ def test_section_round_trip(tmp_path: Path):
         ]
     )
 
-    # Variant 1: calls call_target idx=0 (self-ref) targeting variant
-    # variant_ref_offset=0x100 — the same value the writer stamps on
-    # this variant's header. The per-call entry's callee_vkey shares
-    # that value-space so end_section's parse-and-match resolves the
-    # slot to variant_idx=0.
+    # Variant 1: calls call_target idx=0 (self-ref). The per-call
+    # entry inherits its owning caller variant's
+    # ``variant_ref_offset`` as the callee_vkey (Step 7's on-wire
+    # invariant), so the writer's parse-and-match resolves the slot
+    # to the callee variant whose ``variant_ref_offset`` matches —
+    # variant_idx=0 here, since this is the same section.
     writer.begin_variant(variant_ref_offset=0x100, data_offset_shifted=0x20)
     writer.emit_per_call_entries(
         [
@@ -196,16 +197,17 @@ def test_section_round_trip(tmp_path: Path):
     v0 = writer.end_variant(vkey="x86_O0")
     assert v0 == 0
 
-    # Variant 2: also calls call_target idx=0 (self-ref) but targets
-    # this same variant_ref_offset=0x100 — proves the matching is by
-    # vkey not by variant order.
+    # Variant 2: also calls call_target idx=0 (self-ref); its
+    # ``variant_ref_offset`` is different from variant 1's, so the
+    # per-call entry's callee_vkey matches a different variant_idx
+    # — proves the matching is by vkey not by variant order.
     writer.begin_variant(variant_ref_offset=0x140, data_offset_shifted=0x40)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
                 called_idx=0,
                 callee_function_name_ptr=1,
-                callee_vkey=0x100,
+                callee_vkey=0x140,
             ),
         ]
     )
@@ -236,9 +238,9 @@ def test_section_round_trip(tmp_path: Path):
     assert section.variants[0].per_call_entries == [(0, 0)]
     assert section.variants[1].variant_ref_offset == 0x140
     assert section.variants[1].data_offset_shifted == 0x40
-    # variant 2's per-call points at idx 0, resolved to variant_idx 0
-    # of FID=1's section.
-    assert section.variants[1].per_call_entries == [(0, 0)]
+    # variant 2's per-call points at idx 0, resolved to variant_idx 1
+    # of FID=1's section (the variant whose vkey is 0x140).
+    assert section.variants[1].per_call_entries == [(0, 1)]
 
 
 def test_header_back_patch(tmp_path: Path):
@@ -296,7 +298,11 @@ def test_per_variant_back_patch(tmp_path: Path):
             ),
         ]
     )
-    writer.begin_variant(variant_ref_offset=0x10, data_offset_shifted=0x20)
+    # Step 7's on-wire invariant: the per-call entry's callee_vkey
+    # equals its owning caller variant's variant_ref_offset (since
+    # the same _variants.bin byte position is shared when caller and
+    # callee carry the same VersionKey).
+    writer.begin_variant(variant_ref_offset=0x50, data_offset_shifted=0x20)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
@@ -647,13 +653,18 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
     """If a writer bug leaves a 0xFFFF slot AND empties pending_holes,
     the belt-and-braces sweep in finalize() still catches it.
 
-    This is a defensive test: we patch the writer's back-patch loop to
-    no-op so a real-bin sentinel leaks past the pending_holes check,
-    proving the sweep is the second line of defence.
+    This is a defensive test: we simulate a buggy writer that
+    forgot to mark a caller as waiting on a callee (the
+    ``pending_holes`` book got cleared) but ALSO failed to back-patch
+    the per-call slot, so an UNRESOLVED sentinel leaks past every
+    structural check. The sweep is the second line of defence.
     """
     path = tmp_path / "leak.bin"
     writer = SectionWriter(path)
 
+    # A normal forward-ref setup: caller A references callee B at
+    # vkey 0xE0; B exposes that vkey, so the sibling-close path
+    # legitimately resolves the per-call slot.
     writer.begin_section(function_name_ptr=1, n_variants=1)
     writer.emit_call_targets(
         [
@@ -662,7 +673,7 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
             ),
         ]
     )
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xE0, data_offset_shifted=0)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
@@ -680,14 +691,11 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
 
-    # Drop the pending-holes book without performing the per-variant
-    # patches that resolved them; the on-disk per-call slot is
-    # consequently still 0xFFFF.
-    # Re-write the slot to 0xFFFF (simulate the dropped patch).
-    # The per-call section_variant_index slot in section A is at:
-    #   section A offset (16) + header (8) + 1 jump-table slot (2)
-    #     + 1 call_target (12) + variant header (8)
-    #     + 2 (skip called_idx) = 48.
+    # Simulate a writer bug: pending_holes got wiped before finalize
+    # could run its MISSING-stamp sweep, AND the per-call slot was
+    # corrupted back to UNRESOLVED (e.g. a bad partial patch
+    # restored the placeholder). The sweep is the only thing that
+    # can catch this combination.
     slot_offset = (
         MATCHED_SECTIONS_BIN_PRELUDE_SIZE
         + SECTION_HEADER_SIZE
@@ -696,11 +704,9 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
         + VARIANT_HEADER_SIZE
         + 2  # skip u16 called_idx; section_variant_index is the second field
     )
-    # The slot was already patched by end_section(FID=2); poke it back.
     writer._writer.patch(slot_offset, struct.pack("<H", UNRESOLVED_VARIANT_INDEX))
+    writer._pending_holes.clear()  # noqa: SLF001 — simulating writer-bug
 
-    # _pending_holes is already empty (real back-patch ran), so the
-    # only line of defence is the sweep.
     with pytest.raises(ValueError, match="unresolved section_variant_index"):
         writer.finalize()
 
@@ -765,7 +771,7 @@ def test_multiple_per_variant_entries_to_same_callee(tmp_path: Path):
             ),
         ]
     )
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xF0, data_offset_shifted=0)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
