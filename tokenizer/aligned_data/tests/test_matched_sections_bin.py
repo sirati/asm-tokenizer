@@ -39,6 +39,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
@@ -1146,3 +1147,113 @@ def test_outlined_function_siblings_function_section_ptr_last_write_wins(
     # variant_idx (sibling-2 has the matching vkey=0xA2).
     (_called, sv_idx), = caller.variants[0].per_call_entries
     assert sv_idx == 0  # variant_idx 0 inside sibling-2
+
+
+# ---------------------------------------------------------------------------
+# np.view() write-through proof
+# ---------------------------------------------------------------------------
+
+
+def test_numpy_view_writes_persist_to_bin(tmp_path: Path):
+    """In-place numpy writes through a ``.view(uint32)`` go through to
+    the mmap-backed bin.
+
+    Downstream vectorised hole-fills reinterpret the already-written
+    bin as ``uint32`` and assign into it. For that to be a real
+    in-place write (and not a silent copy that gets discarded), the
+    numpy array must be backed by the mmap region directly. This test
+    pins the property: open a writer, emit one section with an odd
+    ``n_variants=3`` (so jump-table padding is exercised), patch a
+    known u32-aligned offset via a ``.view(uint32)`` slice, finalize,
+    re-read the file, and assert the patched bytes survive. The
+    padding bytes themselves are also asserted to be zero on disk.
+    """
+    path = tmp_path / "view_writethrough.bin"
+    writer = SectionWriter(path)
+
+    # Section with n_variants=3 — jump-table region is 6 bytes raw, 8
+    # bytes once padded. The trailing u16 (bytes 6..7 of the table)
+    # must be zero on disk; the 8 bytes are guaranteed u32-aligned.
+    section_offset = writer.begin_section(function_name_ptr=1, n_variants=3)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=1, type=CallTargetType.LOCAL, is_matched=True
+            ),
+        ]
+    )
+    for vkey in (0x10, 0x20, 0x30):
+        writer.begin_variant(variant_ref_offset=vkey, data_offset_shifted=0)
+        writer.emit_per_call_entries(
+            [PerCallEntry(called_idx=0, callee_function_name_ptr=1, callee_vkey=vkey)]
+        )
+        writer.end_variant(vkey=vkey)
+    writer.end_section()
+
+    # Build a writable u8 numpy array over the already-written region
+    # of the underlying mmap. ``np.frombuffer`` on a memoryview slice
+    # shares storage with the mmap; ``setflags(write=True)`` is the
+    # explicit opt-in for numpy's safety check.
+    cursor = writer._writer.cursor  # noqa: SLF001 — exercising the mmap
+    bin_u8 = np.frombuffer(writer._writer._mm, dtype=np.uint8, count=cursor)  # noqa: SLF001
+    bin_u8.setflags(write=True)
+
+    # Reinterpret as u32. The view shares storage with bin_u8, which
+    # shares storage with the mmap. An in-place assignment here MUST
+    # land in the file.
+    bin_u32 = bin_u8.view(np.uint32)
+
+    # Pick a u32-aligned slot that we can verify post-finalize: the
+    # call_target row's ``function_section_ptr`` u32 is at
+    # section_offset + SECTION_HEADER_SIZE + padded_jump_table + 4
+    # (the second u32 of the row). All operands are multiples of 4 so
+    # the byte offset divides by 4 and the u32 index is well-defined.
+    ptr_byte_offset = (
+        section_offset
+        + SECTION_HEADER_SIZE
+        + _padded_jump_table_bytes(3)
+        + 4  # skip the first u32 of the call_target row (function_name_ptr)
+    )
+    assert ptr_byte_offset % 4 == 0, "test invariant: u32-aligned patch site"
+    u32_index = ptr_byte_offset // 4
+
+    sentinel = 0xDEADBEEF
+    bin_u32[u32_index] = sentinel
+
+    # Drop both numpy refs before finalize: they hold buffer pointers
+    # into the mmap and ``mmap.close`` (called from
+    # :meth:`MemmapBinWriter.finalize`) refuses while exported
+    # pointers exist. This mirrors what real downstream code paths
+    # must do — the .view() handle is short-lived around the
+    # vectorised hole-fill, not held across finalize.
+    del bin_u32
+    del bin_u8
+
+    # Finalize (truncates + closes); reopen from disk and verify the
+    # sentinel survived as little-endian bytes.
+    writer.finalize()
+    raw = path.read_bytes()
+    on_disk = struct.unpack_from("<I", raw, ptr_byte_offset)[0]
+    assert on_disk == sentinel, (
+        f"in-place .view(uint32) write at byte offset {ptr_byte_offset} "
+        f"did not persist: expected 0x{sentinel:08X}, got 0x{on_disk:08X}"
+    )
+
+    # Jump-table padding (the trailing u16 for n_variants=3) must be a
+    # deterministic zero on disk — the reader skips it but a non-zero
+    # value would tell us garbage leaked through the reservation.
+    pad_offset = (
+        section_offset
+        + SECTION_HEADER_SIZE
+        + 3 * JUMP_TABLE_ENTRY_SIZE  # raw table width (the three real slots)
+    )
+    table_end = section_offset + SECTION_HEADER_SIZE + _padded_jump_table_bytes(3)
+    assert pad_offset + 2 == table_end, (
+        "test invariant: the padding u16 occupies the final 2 bytes of "
+        "the padded jump-table region"
+    )
+    pad_value = struct.unpack_from("<H", raw, pad_offset)[0]
+    assert pad_value == 0, (
+        f"jump-table padding u16 at byte offset {pad_offset} should be "
+        f"zero, got 0x{pad_value:04X}"
+    )
