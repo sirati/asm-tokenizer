@@ -258,6 +258,79 @@ def test_negative_imm_mem_minus_riscv64_xcalloc() -> None:
     )
 
 
+# ---------- 3b. Provider-direct: IMM scalar arrives signed --------------
+
+
+_RISCV64_HELLO_BINARY = Path(
+    "/tmp/asm_smoke/src/riscv64-clang-10-O2_hello"
+)
+
+
+def test_negative_imm_signed_at_provider_riscv64_xcalloc() -> None:
+    """riscv64 ``xcalloc`` opens with ``c.addi sp, -0x10``. Reading the
+    operand straight off the Ghidra provider (BEFORE the operand
+    tokenizer's ``abs(...)`` rebind / MEM_MINUS pre-emission), the IMM
+    scalar must arrive as ``-16`` — Ghidra's signed reinterpretation of
+    the i6 immediate's stored bit pattern, matching what Ghidra renders
+    in disassembly. This pins the Scalar.getSignedValue() decoding in
+    ``decode_helper.operand_spec``; without it, ``Scalar.getValue()``
+    surfaces the unsigned bit pattern and ``op.imm`` would be
+    non-negative for every Ghidra-decoded immediate.
+    """
+    if not _RISCV64_HELLO_BINARY.is_file():
+        pytest.skip(
+            f"riscv64 fixture missing at {_RISCV64_HELLO_BINARY}; "
+            f"run test_ghidra_e2e_smoke.py first to stage it"
+        )
+
+    # Local import: keep the Ghidra provider construction inside this
+    # test function so module-level collection stays cheap (Ghidra
+    # spin-up only pays when this test actually runs).
+    from tokenizer.disasm import get_disassembly_provider
+    from tokenizer.disasm.types import OperandKind
+
+    provider = get_disassembly_provider("ghidra", _RISCV64_HELLO_BINARY)
+    provider.build_cfg()
+    try:
+        xcalloc = None
+        for _addr, name, function in provider.iter_functions():
+            if name == "xcalloc":
+                xcalloc = function
+                break
+        assert xcalloc is not None, "xcalloc function not found in riscv64 fixture"
+
+        negative_imms: list[int] = []
+        addi_sp_negative_found = False
+        for block in xcalloc.blocks:
+            for insn in block.instructions:
+                base_mn = insn.base_mnemonic
+                for op in insn.operands:
+                    if op.kind != OperandKind.IMM:
+                        continue
+                    if op.imm < 0:
+                        negative_imms.append(int(op.imm))
+                    # The canonical c.addi sp, -0x10 stack-adjust is the
+                    # most reliable single-instruction probe; pin it
+                    # explicitly when present so a regression that
+                    # changes only this site (e.g. a future refactor
+                    # that re-introduces getValue() under a different
+                    # branch) trips here directly.
+                    if base_mn in ("c.addi", "addi") and op.imm == -16:
+                        addi_sp_negative_found = True
+
+        assert negative_imms, (
+            "no negative IMM operand surfaced in riscv64 xcalloc; "
+            "Scalar.getSignedValue() decoding appears broken (every "
+            "Ghidra IMM came back non-negative)"
+        )
+        assert addi_sp_negative_found, (
+            "expected c.addi/addi with imm == -16 (the canonical stack "
+            f"adjust at xcalloc entry); negative IMMs observed: {negative_imms}"
+        )
+    finally:
+        provider.close()
+
+
 # ---------- 4. MIPS delay-slot collapse --------------------------------
 
 

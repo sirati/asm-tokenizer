@@ -530,7 +530,7 @@ class _GhidraDecodeHelper:
             return spec
         if isinstance(first, Scalar):
             spec["kind"] = OperandKind.IMM
-            spec["imm"] = int(first.getValue())
+            spec["imm"] = int(first.getSignedValue())
             try:
                 spec["size"] = int(first.bitLength()) // 8
             except Exception:
