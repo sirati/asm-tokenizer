@@ -93,7 +93,8 @@ class VocabularyManager:
     # `__init__` immediately after the digit pre-population so its id is
     # deterministic across vocabs. The constant
     # `_V2_VALUE_NEGATIVE_TOKEN_ID` captures this invariant; the first
-    # caller-driven registration on a v1/v2 VM therefore lands at id 257.
+    # caller-driven registration on a v1/v2 VM therefore lands at id
+    # `_V2_RESERVED_TOKEN_COUNT` (= 257).
     # The invariant is asserted at construction time and exposed via the
     # `value_negative_token_id` instance attribute for crash-early
     # checks at downstream call sites.

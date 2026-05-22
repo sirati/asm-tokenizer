@@ -78,8 +78,8 @@ def unify_vocab(
     # Pass 2 — instruction-representative walk against each per-binary
     # vocab CSV. The mapping array translates the per-binary id space
     # into the unified id space; the unified vocab reuses v2's
-    # reserved-digit semantics so the identity remap for IDs 0..255
-    # stays valid.
+    # reserved-prefix semantics so the identity remap for IDs 0..256
+    # (digits 0..255 + `value_negative` at slot 256) stays valid.
     loaded_count = 0
     for csv_file in csv_files:
         print(f"Loading vocabulary from {csv_file}")
@@ -106,14 +106,15 @@ def unify_vocab(
 
         mappings = np.full_like(current_vocab_manager.id_to_token_type, -1, dtype=np.int32)
 
-        # Under format_version=2, IDs 0..255 are protocol-reserved digit
-        # slots. The plan requires explicit identity remap for that range —
-        # both per-binary VM and unified VM agree on those positions by
-        # construction, so the inline-digit stream survives `mapping[tokens]`
-        # unchanged. Filling here before the representative loop is
-        # idempotent (the loop only touches IDs >= 256 under v2 since
-        # `iter_representative_tokens` skips reserved digits).
-        reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+        # Under format_version=2, IDs 0..256 are protocol-reserved: the
+        # 256 inline-digit slots plus `value_negative` at slot 256. Both
+        # per-binary VM and unified VM agree on those positions by
+        # construction (the constructor pre-populates the digit slots
+        # and eagerly pins `value_negative` at slot 256), so identity
+        # remap is the correct translation across this whole prefix.
+        # Filling here before the representative loop is idempotent —
+        # the loop only registers caller-driven tokens above slot 256.
+        reserved = VocabularyManager._V2_RESERVED_TOKEN_COUNT
         mappings[:reserved] = np.arange(reserved, dtype=mappings.dtype)
 
         for tokens in current_vocab_manager.iter_representative_tokens():
@@ -159,16 +160,16 @@ def unify_vocab(
     # arch and unify per slice instead.
     total_ids = len(unified_vm.id_to_token)
     if total_ids > _UINT16_CEILING:
-        # `-1` accounts for the eagerly-pinned `value_negative` marker at
-        # id 256 (one slot above the 256-entry reserved digit band); the
-        # instruction representatives start at id 257 alongside the
-        # variant block, so the remaining count after subtracting the
-        # digit band, the marker, and the variant block is purely
+        # `_V2_RESERVED_TOKEN_COUNT` (= 257) covers the 256-entry reserved
+        # digit band plus the eagerly-pinned `value_negative` marker at
+        # slot 256; the variant block and instruction representatives
+        # together fill everything past that prefix, so the remaining
+        # count after subtracting reserved and variant is purely
         # instruction-representative tokens.
         raise ValueError(
             f"unify_vocab: unified vocab has {total_ids} tokens "
             f"({n_variants} variant + "
-            f"{total_ids - VocabularyManager._V2_RESERVED_DIGIT_COUNT - 1 - n_variants} "
+            f"{total_ids - VocabularyManager._V2_RESERVED_TOKEN_COUNT - n_variants} "
             f"instruction), exceeds uint16 ceiling ({_UINT16_CEILING}). "
             f"Split the corpus by architecture and unify each slice "
             f"separately, or prune low-frequency tokens before unifying."
