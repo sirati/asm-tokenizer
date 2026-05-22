@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, TextIO
 
 from tokenizer.aligned_data.csv_format import write_csv_prelude
 from tokenizer.aligned_data.extern_providers import ExternProviderRegistry
@@ -113,7 +114,9 @@ class SectionsBinOutputs:
 
 
 def open_sections_bin_outputs(
-    output_dir: Path, binary_name: str
+    output_dir: Path,
+    binary_name: str,
+    warn_log: Optional[TextIO] = None,
 ) -> SectionsBinOutputs:
     """Open ``<binary>_sections.bin`` + a fresh extern-provider registry.
 
@@ -123,11 +126,16 @@ def open_sections_bin_outputs(
     only on-disk side effect of this opener is creating the BIN
     mapping (which :class:`SectionWriter` truncates / unmaps on
     :meth:`close` if the build fails mid-flight).
+
+    ``warn_log`` is threaded into the :class:`SectionWriter` so its
+    finalize-time :data:`MISSING_VARIANT_INDEX` stamps can emit one
+    ``missing_variant:`` line each. Defaults to ``None`` for test
+    fixtures that build a BIN without a sidecar warn-log.
     """
     sections_bin_path = output_dir / f"{binary_name}_sections.bin"
     logger.info(f"  Creating: {sections_bin_path}")
     return SectionsBinOutputs(
-        section_writer=SectionWriter(sections_bin_path),
+        section_writer=SectionWriter(sections_bin_path, warn_log=warn_log),
         extern_providers=ExternProviderRegistry(),
         sections_bin_path=sections_bin_path,
         output_dir=output_dir,
