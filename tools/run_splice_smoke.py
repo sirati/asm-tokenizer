@@ -189,12 +189,39 @@ def _splice_one_binary(
             # denominator for the deeper depths.
             depth_0_len: Optional[int] = None
             for depth in depths:
-                spliced = sess.splice_with_callees(
+                # ``splice_with_callees`` now returns ``list[DecodedFunction]``
+                # of length ``min(max_variants, len(section.variants))``;
+                # the smoke runner pins ``max_variants=1`` to keep the
+                # baseline shape stable, so we unwrap the single stream
+                # for per-function metrics.
+                #
+                # Deterministic per-(binary, func_idx) seed so the
+                # baseline JSON is reproducible across runs even though
+                # ``max_variants=1`` now SAMPLES one variant (legacy
+                # ``version=0`` was a fixed pick). The seed deliberately
+                # does NOT include ``depth`` -- a fresh ``default_rng``
+                # built from the same SeedSequence is statistically
+                # equivalent across depth iterations, so every depth
+                # for a given (binary, func_idx) samples the SAME root
+                # variant. That keeps the length-ratio vs depth-0
+                # meaningful (same numerator + denominator function).
+                # ``binary_name`` is folded in via its UTF-8 byte hash
+                # (built-in ``hash()`` is process-randomized;
+                # ``int.from_bytes`` is stable).
+                name_seed = int.from_bytes(
+                    binary_name.encode("utf-8"), "little"
+                ) & 0xFFFFFFFF
+                rng = np.random.default_rng(
+                    np.random.SeedSequence([name_seed, func_idx])
+                )
+                spliced_streams = sess.splice_with_callees(
                     func_idx,
                     arm="matched",
                     max_depth=depth,
-                    version=0,
+                    max_variants=1,
+                    rng=rng,
                 )
+                spliced = spliced_streams[0]
                 n_real = int(spliced.real_tokens.shape[0])
                 per_depth_functions[depth] += 1
                 per_depth_real_tokens[depth] += n_real
