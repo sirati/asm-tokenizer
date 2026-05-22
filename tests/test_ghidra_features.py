@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -501,3 +504,140 @@ def test_string_ptr_metadata_arm32_minigzip() -> None:
             f"string_ptr line {line_index} out of range "
             f"(sidecar has {len(lines)} lines)"
         )
+
+
+# ---------- 7. Negative bracket disp: arm32 ldr r6, [r5, #-4] ----------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ARM32_ZLIB_BINARY = Path(
+    os.environ.get("ASM_TOKENIZER_ZLIB_SRC")
+    or "/home/sirati/devel/python/asm-tokenizer/src/zlib"
+) / "arm32-gcc-7-Os_minigzip"
+
+
+def _tokenize_inplace(binary: Path, tmp_path: Path) -> Path:
+    """Re-tokenize ``binary`` via the standalone ``--batch`` entry-point
+    into ``tmp_path/out`` and return the resulting CSV path. Mirrors
+    ``test_ghidra_e2e_smoke.py``'s single-binary smoke pattern so the
+    bracket-shape assertions below exercise the full Ghidra → tokenizer
+    pipeline (not just an in-process operand-tokenizer probe) on a CSV
+    that was produced *after* the postfix-``value_negative`` migration.
+    Reusing a stale ``/tmp/asm_smoke/out/`` snapshot would assert the
+    pre-migration shape and would falsely pass against the producer fix.
+    """
+    queue = tmp_path / "queue.txt"
+    queue.write_text(f"{binary.name}\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "tokenizer",
+        "--backend", "ghidra",
+        "--batch", str(queue),
+        "--source", str(binary.parent),
+        "--output", str(out_dir),
+        "--platform", "auto",
+    ]
+    env = dict(os.environ)
+    env["ASM_TOKENIZER_FORMAT_VERSION"] = "2"
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, (
+        f"tokenize failed (rc={proc.returncode}) for {binary.name}\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    csv_path = out_dir / f"{binary.name}_output.csv"
+    assert csv_path.is_file(), f"CSV not emitted at {csv_path}"
+    return csv_path
+
+
+@pytest.mark.slow
+def test_negative_disp_arm32_value_negative_postfix(tmp_path: Path) -> None:
+    """arm32 ``main`` in ``arm32-gcc-7-Os_minigzip`` contains
+    ``ldr r6, [r5, #-4]`` at 0x10a94 (a plain pre-indexed negative-disp
+    load). After the postfix-``value_negative`` migration, the bracket
+    must render as
+    ``mem[ arm32_r5 MEM_PLUS valued_const_v2 <0x04> value_negative ]mem``
+    — the sign rides on a postfix metatoken inside the brackets, NOT as
+    a leading ``MEM_MINUS`` operator.
+
+    This is the ARM32-side counterpart to the riscv64
+    ``test_negative_imm_value_negative_riscv64_xcalloc`` canary (which
+    pins the *outside-brackets* arithmetic-immediate shape); together
+    they cover both endpoints of the v2 sign-handling contract.
+    """
+    if not _ARM32_ZLIB_BINARY.is_file():
+        pytest.skip(f"arm32 fixture missing at {_ARM32_ZLIB_BINARY}")
+
+    csv_path = _tokenize_inplace(_ARM32_ZLIB_BINARY, tmp_path)
+    _, names = _function_tokens(csv_path, "main")
+
+    # Walk every [MEM_OPEN_BRACKET ... MEM_CLOSE_BRACKET] window in
+    # ``main``. The target window contains an ``arm32_<reg>`` base, a
+    # ``MEM_PLUS`` separator, a ``valued_const_v2`` magnitude header,
+    # and a postfix ``value_negative`` marker — in that order — and
+    # NO ``MEM_MINUS`` anywhere inside.
+    matched_window: list[str] | None = None
+    open_idx = -1
+    for i, n in enumerate(names):
+        if n == "MEM_OPEN_BRACKET":
+            open_idx = i
+            continue
+        if n == "MEM_CLOSE_BRACKET" and open_idx >= 0:
+            window = names[open_idx + 1 : i]
+            non_digit = [w for w in window if not w.startswith("<digit_")]
+            if "value_negative" not in non_digit:
+                open_idx = -1
+                continue
+            has_base = any(w.startswith("arm32_") for w in non_digit)
+            try:
+                plus_pos = non_digit.index("MEM_PLUS")
+                vc_pos = non_digit.index("valued_const_v2")
+                vneg_pos = non_digit.index("value_negative")
+            except ValueError:
+                open_idx = -1
+                continue
+            ordered = plus_pos < vc_pos < vneg_pos
+            no_mem_minus = "MEM_MINUS" not in non_digit
+            if has_base and ordered and no_mem_minus:
+                matched_window = window
+                break
+            open_idx = -1
+
+    assert matched_window is not None, (
+        "no mem[ base MEM_PLUS valued_const_v2 ... value_negative ]mem "
+        "window in arm32 main token stream (expected one for "
+        f"ldr r6, [r5, #-4] at 0x10a94); got: {names}"
+    )
+
+    # The magnitude bytes between ``valued_const_v2`` and
+    # ``value_negative`` must decode to 4 (the absolute disp of -4).
+    matched_non_digit_indices = [
+        idx for idx, w in enumerate(matched_window) if not w.startswith("<digit_")
+    ]
+    vc_window_pos = next(
+        idx for idx in matched_non_digit_indices
+        if matched_window[idx] == "valued_const_v2"
+    )
+    vneg_window_pos = next(
+        idx for idx in matched_non_digit_indices
+        if matched_window[idx] == "value_negative"
+    )
+    digit_slots = matched_window[vc_window_pos + 1 : vneg_window_pos]
+    # ``_v2_int_to_minimum_bytes(4)`` yields a single byte ``0x04`` →
+    # one ``<digit_04>`` slot between the magnitude header and the
+    # postfix sign marker.
+    assert digit_slots == ["<digit_04>"], (
+        f"expected single <digit_04> magnitude byte, got {digit_slots} "
+        f"in window {matched_window}"
+    )
