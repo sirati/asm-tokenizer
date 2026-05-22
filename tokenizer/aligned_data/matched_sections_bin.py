@@ -9,24 +9,40 @@ entry), and per-variant blocks each holding a sparse list of
 ``(called_idx, section_variant_index)`` pairs into the section's
 call_target table.
 
-The writer back-patches forward references in two places:
+The writer back-patches forward references in two places, and every
+per-call slot is back-patched (the writer never resolves at emit
+time — uniform defer to ``end_section``):
 
-* ``function_section_ptr`` on a call_target — set to ``0`` when emitting
-  the call_target if the callee section hasn't been written yet;
-  patched once the callee section opens (its ``section_offset`` is
-  registered the moment :meth:`SectionWriter.begin_section` runs, so
-  every call_target referencing it from earlier-emitted sections gets
-  filled in when those *referencing* sections' back-patch queue runs).
+* ``function_section_ptr`` on a call_target — set to ``0`` when
+  emitting the call_target if the callee section hasn't been written
+  yet; patched when the callee section closes. Sibling sections that
+  share a ``function_name_ptr`` (clang's ``OUTLINED_FUNCTION_N``)
+  each stamp their own offset over the placeholder; the loader walks
+  via per-call ``callee_vkey`` to disambiguate which sibling carries
+  the matching variant.
 * ``section_variant_index`` inside a per-call entry — set to
-  ``0xFFFF`` when the callee's variant index isn't known yet (callee
-  section unwritten OR not yet emitted that variant); patched at the
-  callee section's :meth:`SectionWriter.end_section`.
+  :data:`UNRESOLVED_VARIANT_INDEX` at emit time. At the callee
+  section's :meth:`SectionWriter.end_section`, the writer reads back
+  the just-closed section's bytes via :func:`parse_section_bin` and
+  uses the section's OWN variant table to resolve any hole whose
+  callee FID matches THIS section AND whose ``callee_vkey`` is in
+  this section's variant table. Sibling sections with disjoint vkey
+  sets each patch only their own matching holes; holes whose vkey is
+  never registered by any sibling fall through to
+  :meth:`SectionWriter.finalize`, which stamps
+  :data:`MISSING_VARIANT_INDEX` and emits a one-line ``warn-log``
+  entry (so the corpus rebuild can audit how often the cross-arm
+  vkey mismatch fires).
 
-A finalize-time sweep asserts no unresolved holes remain and no
-``0xFFFF`` slot leaked through. Both are builder-bug detectors — a
-correct caller writes a section for every callee FID that any
-call_target references AND a variant for every ``vkey`` any per-call
-entry references.
+Each section is self-describing: the variant table needed to resolve
+back-patches is recoverable from the section's own bytes. No
+cross-section variant map is kept in writer memory.
+
+A finalize-time sweep asserts no ``0xFFFF`` (UNRESOLVED) sentinel
+leaked through to the on-disk bytes. Any unresolved header hole at
+finalize is a hard builder bug (callee section was never written) and
+raises; per-variant holes get the :data:`MISSING_VARIANT_INDEX`
+sentinel + warn-log line (legitimate cross-arm vkey mismatch).
 
 The wire format is documented in detail in
 ``polished-greeting-moler.md`` (Approach → A. Binary section file
@@ -38,7 +54,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Hashable, Iterator, Optional
+from typing import Hashable, Iterator, Optional, TextIO
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.memmap_format import (
@@ -146,9 +162,16 @@ class PerCallEntry:
     """One per-call slot inside a variant block (writer input).
 
     ``called_idx`` is the index into the CURRENT section's call_target
-    table. ``callee_function_name_ptr`` + ``callee_vkey`` together look
-    up the resolved variant index in the callee section's variant block
-    list via ``known_section_variants[(callee_FID, callee_vkey)]``.
+    table. ``callee_function_name_ptr`` + ``callee_vkey`` are used to
+    look up the resolved variant index in the callee section: at the
+    callee's :meth:`SectionWriter.end_section`, the writer parses
+    that section's bytes back and matches each pending hole's
+    ``callee_vkey`` against the on-disk ``variant_ref_offset`` of
+    each variant in the section. Callers MUST therefore use the SAME
+    Hashable value space for ``PerCallEntry.callee_vkey`` and the
+    matching variant's ``begin_variant(variant_ref_offset=...)``
+    argument — typically both are the integer byte offset of the
+    vkey in the per-binary variants sidecar.
     """
 
     called_idx: int
@@ -201,13 +224,10 @@ class _HoleRecord:
     """Tracks one referencing-section's back-patch needs for a callee.
 
     Single owner: :class:`SectionWriter`. Stored in
-    ``_pending_holes[callee_FID]``; resolved at the moment that callee
-    section closes.
-
-    ``section_offset`` is the offset of the REFERENCING section (the
-    section that emitted the slots needing a patch); used for diagnostic
-    messages when the finalizer trips and to deduplicate the per-section
-    record in ``_current_section_holes_by_callee``.
+    ``_pending_holes[(callee_FID, referencing_section_offset)]``; the
+    key shape is what carries the (referencing-section, callee)
+    dedup. The referencing section's offset is therefore implicit in
+    the map key — no field on the record itself.
 
     ``header_hole_offsets`` is the list of byte offsets of ``u32
     function_section_ptr`` slots in the referencing section that need
@@ -224,10 +244,11 @@ class _HoleRecord:
     callee_vkey)`` tuples — each one identifies a ``u16
     section_variant_index`` slot in the referencing section that needs
     to be patched with the variant index that the callee section
-    assigns to that ``vkey``.
+    assigns to that ``vkey``. Resolved at the callee section's
+    :meth:`SectionWriter.end_section` by parsing the just-closed
+    section back from its own bytes and reading the variant table.
     """
 
-    section_offset: int
     header_hole_offsets: list[int] = field(default_factory=list)
     per_variant_holes: list[tuple[int, Hashable]] = field(default_factory=list)
 
@@ -249,17 +270,22 @@ class SectionWriter:
         a. :meth:`begin_variant` — stamps the variant header (with
            ``n_calls = 0`` placeholder).
         b. :meth:`emit_per_call_entries` — writes the per-call slots
+           (always deferring per-variant resolution to end_section)
            and back-patches the variant's ``n_calls`` field.
-        c. :meth:`end_variant` — registers the variant's ``vkey`` →
-           ``variant_idx`` mapping.
+        c. :meth:`end_variant` — increments the section's variant
+           count.
     4. :meth:`end_section` — back-patches ``n_variants``, pads to a
-       4-byte boundary, and resolves any pending holes whose
-       callee_FID equals THIS section's function_name_ptr.
-    5. After all sections: :meth:`finalize` — asserts no holes remain
-       and closes the underlying memmap.
+       4-byte boundary, parses the just-closed section's bytes to
+       recover its variant table, and resolves any pending holes
+       whose callee_FID equals THIS section's function_name_ptr.
+    5. After all sections: :meth:`finalize` — stamps
+       :data:`MISSING_VARIANT_INDEX` on any per_variant_holes still
+       open (with one warn-log line per stamp), raises on any
+       remaining header_hole_offsets (callee section was never
+       written — builder bug), and closes the underlying memmap.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, warn_log: Optional[TextIO] = None) -> None:
         # Prelude is the natural identity of the bin: stamped at open
         # so the first section starts at byte 16. The writer keeps a
         # direct reference to MemmapBinWriter; the public API never
@@ -268,18 +294,36 @@ class SectionWriter:
             Path(path), prelude_bytes=encode_matched_sections_prelude()
         )
 
+        # Optional per-binary warn-log; receives one line per
+        # :data:`MISSING_VARIANT_INDEX` stamped at finalize. ``None``
+        # silences the writer (test-fixture default).
+        self._warn_log: Optional[TextIO] = warn_log
+
         # Cross-section state.
+        #
+        # ``_known_sections``: emit-time O(1) ``callee FID -> section
+        # offset`` lookup for resolving call_target ``function_section_ptr``
+        # on the spot. Sibling sections that share a FID overwrite
+        # (last-write-wins); the loader resolves the ambiguity by
+        # walking via per-call ``callee_vkey``.
         self._known_sections: dict[int, int] = {}
-        self._known_section_variants: dict[tuple[int, Hashable], int] = {}
-        self._pending_holes: dict[int, list[_HoleRecord]] = {}
-        # FIDs whose section already CLOSED (end_section ran). Used by
-        # :meth:`emit_per_call_entries` to distinguish a forward
-        # reference (callee not started, open a back-patch hole) from
-        # a backward reference where the callee did NOT emit the
-        # caller's vkey (stamp MISSING_VARIANT_INDEX directly — the
-        # back-patch loop only runs at end_section so a hole opened
-        # AFTER the callee closed would leak to finalize).
-        self._closed_sections: set[int] = set()
+        # ``_section_variant_tables``: for every CLOSED section, the
+        # ``variant_ref_offset -> variant_idx`` map derived from the
+        # section's own bytes at :meth:`end_section` close time. One
+        # entry per sibling section (clang's ``OUTLINED_FUNCTION_N``
+        # produces multiple sections under the same FID, each
+        # carrying its own disjoint variant table); the emit-time
+        # lookup at :meth:`emit_per_call_entries` searches every
+        # sibling for a matching ``callee_vkey``. A miss falls through
+        # to the back-patch hole path so a FUTURE sibling close (or
+        # :meth:`finalize`) can still resolve it.
+        self._section_variant_tables: dict[int, list[dict[int, int]]] = {}
+        # ``_pending_holes`` keyed on ``(callee_FID,
+        # referencing_section_offset)``: at most one record per
+        # (referencing section, callee) pair. The key shape is what
+        # carries the dedup that the legacy ``_current_section_holes_by_callee``
+        # auxiliary used to enforce.
+        self._pending_holes: dict[tuple[int, int], _HoleRecord] = {}
 
         # Per-section state (cleared on every begin_section).
         self._current_fid: Optional[int] = None
@@ -296,10 +340,6 @@ class SectionWriter:
         # For the currently-open variant: file offset of its u16 n_calls
         # slot. None when no variant is open.
         self._current_variant_n_calls_slot: Optional[int] = None
-        # Holes opened by THIS section, keyed by callee_FID — lets
-        # emit_per_call_entries reuse a HoleRecord (one per
-        # (referencing-section, callee) pair) rather than duplicating.
-        self._current_section_holes_by_callee: dict[int, _HoleRecord] = {}
 
     # ------------------------------------------------------------------
     # Section lifecycle
@@ -321,13 +361,15 @@ class SectionWriter:
         therefore yields multiple entries with the same ``func_name``,
         producing multiple sections that share a
         ``function_name_ptr``. We accept the collision and overwrite
-        ``known_sections`` with the latest section's offset — matching
-        the pre-refactor ``function_lookup`` semantics (which keyed on
-        ``(name, vkey)`` and silently let later writes win). The
+        ``known_sections`` with the latest section's offset; the
+        ``function_section_ptr`` back-patch loop at every sibling's
+        :meth:`end_section` re-stamps the same slot, so the on-disk
+        slot ends up pointing at the LAST sibling. The loader walks
+        sibling sections via the per-call ``callee_vkey`` to resolve
+        which body actually carries the matching variant. The
         ``matched_index.bin`` locator records every section
         independently so the loader can still address all of them by
-        index; only the ``function_section_ptr`` back-patch path
-        collapses to the latest body.
+        index.
         """
         self._assert_no_open_section()
         self._pad_to_alignment()
@@ -341,7 +383,6 @@ class SectionWriter:
         self._current_call_targets = []
         self._current_variant_count = 0
         self._current_variant_n_calls_slot = None
-        self._current_section_holes_by_callee = {}
         return section_offset
 
     def emit_call_targets(self, call_targets: list[CallTargetSpec]) -> None:
@@ -419,25 +460,27 @@ class SectionWriter:
     def emit_per_call_entries(self, entries: list[PerCallEntry]) -> None:
         """Write the variant's per-call entries + patch ``n_calls``.
 
-        For each entry, the writer looks up
-        ``known_section_variants[(callee_FID, callee_vkey)]``. Three
-        cases:
+        Backward references (callee section already closed) try to
+        resolve from the cached sibling variant tables at
+        :attr:`_section_variant_tables`: a hit stamps the resolved
+        ``variant_idx`` directly. A miss — either the callee section
+        is forward-referenced (not yet opened) or no closed sibling
+        has the matching ``callee_vkey`` (a future sibling might) —
+        defers via a back-patch hole, written as
+        :data:`UNRESOLVED_VARIANT_INDEX`. At each callee
+        :meth:`end_section`, the writer parses the just-closed
+        section's bytes and resolves any pending hole whose
+        ``callee_vkey`` matches THIS section's variant table.
+        Anything still unresolved at :meth:`finalize` (cross-arm vkey
+        mismatch) gets :data:`MISSING_VARIANT_INDEX` + a warn-log
+        line.
 
-        * Hit ⇒ stamp the resolved u16 directly.
-        * Miss AND callee section already exists in
-          ``_known_sections`` ⇒ the callee emitted but does NOT have
-          this caller vkey (cross-arm/cross-section vkey mismatch:
-          caller and callee have different surviving-variant sets
-          after pass-1's drop rules). Stamp
-          :data:`MISSING_VARIANT_INDEX` directly; no back-patch hole
-          can ever resolve this because the callee section has
-          already closed.
-        * Miss AND callee section not yet written (forward reference) ⇒
-          stamp :data:`UNRESOLVED_VARIANT_INDEX` and record a back-
-          patch target. The HoleRecord is shared across multiple per-
-          call slots referencing the same callee from this section —
-          the ``_current_section_holes_by_callee`` map carries the
-          deduplication so we never duplicate header_hole_offset.
+        The :class:`_HoleRecord` is shared across multiple per-call
+        slots referencing the same callee from this section: the
+        ``_pending_holes`` map is keyed on ``(callee_FID,
+        current_section_offset)`` so a setdefault returns the same
+        record for both the first call_target row's header-hole and
+        the variant's per-call-slot accumulation.
         """
         self._assert_variant_open()
 
@@ -447,14 +490,15 @@ class SectionWriter:
             # The u16 section_variant_index slot is the second field in
             # the entry (after the u16 called_idx) → +2 from entry start.
             slot_offset = entry_offset + 2
-            resolved = self._known_section_variants.get(
-                (entry.callee_function_name_ptr, entry.callee_vkey)
+            section_variant_index = self._resolve_section_variant_index(
+                callee_fid=entry.callee_function_name_ptr,
+                callee_vkey=entry.callee_vkey,
             )
-            if resolved is not None:
-                section_variant_index = resolved
-            elif entry.callee_function_name_ptr in self._closed_sections:
-                section_variant_index = MISSING_VARIANT_INDEX
-            else:
+            if section_variant_index is None:
+                # Forward reference, OR backward reference whose vkey
+                # no closed sibling has registered yet — defer via
+                # back-patch hole. Stamp the unresolved sentinel; a
+                # future end_section (or finalize) will patch.
                 section_variant_index = UNRESOLVED_VARIANT_INDEX
                 self._record_per_variant_hole(
                     callee_fid=entry.callee_function_name_ptr,
@@ -471,20 +515,43 @@ class SectionWriter:
             struct.pack("<H", len(entries)),
         )
 
+    def _resolve_section_variant_index(
+        self, *, callee_fid: int, callee_vkey: Hashable
+    ) -> Optional[int]:
+        """Look up the callee's ``variant_idx`` from the cached sibling
+        variant tables.
+
+        Returns the variant_idx of the FIRST closed sibling whose
+        local variant table contains ``callee_vkey``. ``None`` if the
+        callee FID has no closed sibling yet OR no closed sibling
+        registers this vkey (might be filled in by a later sibling
+        or by finalize's MISSING-stamp path).
+        """
+        tables = self._section_variant_tables.get(callee_fid)
+        if tables is None:
+            return None
+        for table in tables:
+            variant_idx = table.get(callee_vkey)
+            if variant_idx is not None:
+                return variant_idx
+        return None
+
     def end_variant(self, vkey: Hashable) -> int:
         """Finalise the currently-open variant.
 
-        Computes the variant's 0-based index in the section's variant
-        block list and records the
-        ``known_section_variants[(current_FID, vkey)] = variant_idx``
-        mapping. Future emissions referencing this ``(FID, vkey)``
-        will resolve directly without back-patching.
+        Returns the variant's 0-based index in the section's variant
+        block list. The vkey itself was already stamped into the
+        variant header's ``variant_ref_offset`` field (via
+        :meth:`begin_variant`'s caller-supplied byte offset), so the
+        writer does NOT need a cross-section map of
+        ``(FID, vkey) → variant_idx``: :meth:`end_section` recovers
+        it by parsing the just-closed section back from its own
+        bytes.
 
         Multiple sections sharing a ``function_name_ptr`` (see the
-        :meth:`begin_section` docstring) can emit overlapping vkeys;
-        the latest write wins for the purposes of per-call back-patch
-        resolution, matching the pre-refactor ``function_lookup``
-        last-write-wins semantics.
+        :meth:`begin_section` docstring) can emit overlapping vkeys
+        — each sibling resolves only the per-call holes whose
+        ``callee_vkey`` matches its own local variant table.
         """
         self._assert_variant_open()
         variant_idx = self._current_variant_count
@@ -495,8 +562,6 @@ class SectionWriter:
                 f"{UNRESOLVED_VARIANT_INDEX} per section (u16 slot reserves "
                 f"0xFFFF as the unresolved-hole sentinel)"
             )
-        key = (self._current_fid, vkey)
-        self._known_section_variants[key] = variant_idx
         self._current_variant_count += 1
         self._current_variant_n_calls_slot = None
         return variant_idx
@@ -504,15 +569,25 @@ class SectionWriter:
     def end_section(self) -> tuple[int, int]:
         """Close the current section.
 
-        Patches ``n_variants``, pads to a 4-byte boundary, then walks
-        ``_pending_holes[current_FID]`` resolving every header slot
-        and per-variant slot that referenced this section. Returns
-        ``(section_offset, section_length)`` -- the start byte the
-        section was opened at and the trailer-aligned byte width the
-        section occupies in the bin. The length is what the per-binary
-        ``matched_index.bin`` u24 stores; both are 4-byte aligned (the
-        section trailer pad enforced above guarantees the length is a
-        multiple of :data:`SECTION_ALIGNMENT`).
+        Patches ``n_variants``, pads to a 4-byte boundary, then parses
+        the just-closed section back from its own bytes to recover
+        the variant table. Walks ``_pending_holes`` for every entry
+        whose callee FID equals THIS section: stamps every
+        ``header_hole_offsets`` slot with THIS section's offset
+        (sibling sections that share a FID re-stamp last-write-wins —
+        the loader disambiguates via the per-call ``callee_vkey``)
+        and stamps every ``per_variant_holes`` whose ``callee_vkey``
+        is in THIS section's local table. Holes whose vkey is not in
+        this section's table stay in ``_pending_holes`` for a later
+        sibling (or for :meth:`finalize` to stamp as
+        :data:`MISSING_VARIANT_INDEX`).
+
+        Returns ``(section_offset, section_length)`` — the start byte
+        the section was opened at and the trailer-aligned byte width
+        the section occupies in the bin. The length is what the
+        per-binary ``matched_index.bin`` u24 stores; both are 4-byte
+        aligned (the section trailer pad enforced above guarantees
+        the length is a multiple of :data:`SECTION_ALIGNMENT`).
         """
         self._assert_section_open()
         if self._current_variant_n_calls_slot is not None:
@@ -529,35 +604,59 @@ class SectionWriter:
         # Align section trailer.
         self._pad_to_alignment()
 
-        # Resolve back-patches whose callee == THIS section.
         section_offset = self._current_section_offset
         section_length = self._writer.cursor - section_offset
         fid = self._current_fid
-        holes = self._pending_holes.pop(fid, [])
-        for hole in holes:
-            packed_offset = struct.pack("<I", section_offset)
-            for header_slot in hole.header_hole_offsets:
-                self._writer.patch(header_slot, packed_offset)
-            for slot_offset, callee_vkey in hole.per_variant_holes:
-                variant_idx = self._known_section_variants.get((fid, callee_vkey))
-                if variant_idx is None:
-                    # Cross-arm vkey mismatch: the caller emitted a per-
-                    # call entry tagged with its own vkey, but the callee
-                    # section did not survive pass-1 in that vkey (e.g.
-                    # the variant got dedup-dropped to another variant's
-                    # offset, or the encoder skipped it). The call still
-                    # happened semantically, so we stamp
-                    # :data:`MISSING_VARIANT_INDEX` rather than fail the
-                    # build — the loader can interpret it as "no inlined
-                    # callee body available for this vkey".
-                    variant_idx = MISSING_VARIANT_INDEX
-                self._writer.patch(slot_offset, struct.pack("<H", variant_idx))
 
-        # Mark FID as closed so emit_per_call_entries from LATER
-        # sections can distinguish "callee section already closed
-        # without this vkey" (stamp MISSING) from "callee section not
-        # started yet" (open a hole).
-        self._closed_sections.add(fid)
+        # Recover THIS section's variant table from its own bytes —
+        # each section is self-describing. The memoryview is bounded
+        # to [0, cursor); the section we just closed lies fully
+        # inside that range. Released in a finally so the view does
+        # not outlive the mmap.
+        blob = self._writer.view()
+        try:
+            parsed, _end = parse_section_bin(blob, section_offset)
+            vkey_to_idx = {
+                v.variant_ref_offset: i for i, v in enumerate(parsed.variants)
+            }
+        finally:
+            blob.release()
+        # Cache this sibling's variant table so subsequent
+        # ``emit_per_call_entries`` calls that reference this FID
+        # (backward references) can resolve directly. Sibling
+        # sections each append their own table; the lookup walks all
+        # tables.
+        self._section_variant_tables.setdefault(fid, []).append(vkey_to_idx)
+
+        # Resolve back-patches whose callee FID == THIS section's FID.
+        # Header slots: stamp this section's offset every time a
+        # sibling closes — the on-disk slot ends up pointing at the
+        # LAST sibling to close (W2 last-write-wins). The accumulator
+        # is intentionally NOT cleared so a subsequent sibling
+        # re-patches the same slot. The slot's validity is implicit
+        # in ``fid in _known_sections``, which :meth:`finalize` checks
+        # before deciding a non-empty ``header_hole_offsets`` is a
+        # builder bug.
+        # Per-variant slots: stamp ONLY those whose ``callee_vkey``
+        # is in THIS section's local variant table. Removed once
+        # matched (no other sibling carries the same vkey by
+        # construction — each variant_ref_offset is unique to one
+        # sibling's variant table). Non-matching ones stay for a
+        # later sibling (or :meth:`finalize`) to handle.
+        packed_section_offset = struct.pack("<I", section_offset)
+        for (hole_fid, _ref_offset), record in self._pending_holes.items():
+            if hole_fid != fid:
+                continue
+            for header_slot in record.header_hole_offsets:
+                self._writer.patch(header_slot, packed_section_offset)
+            remaining: list[tuple[int, Hashable]] = []
+            for slot_offset, callee_vkey in record.per_variant_holes:
+                variant_idx = vkey_to_idx.get(callee_vkey)
+                if variant_idx is None:
+                    remaining.append((slot_offset, callee_vkey))
+                    continue
+                self._writer.patch(slot_offset, struct.pack("<H", variant_idx))
+            record.per_variant_holes = remaining
 
         # Clear per-section state.
         self._current_fid = None
@@ -566,28 +665,38 @@ class SectionWriter:
         self._current_call_targets = []
         self._current_variant_count = 0
         self._current_variant_n_calls_slot = None
-        self._current_section_holes_by_callee = {}
 
         return section_offset, section_length
 
     def finalize(self) -> None:
-        """Close the underlying memmap; assert no holes leaked.
+        """Close the underlying memmap; resolve or assert on remaining holes.
 
-        First a structural assertion: ``_pending_holes`` must be empty
-        — any non-empty key means a call_target whose callee section
-        was never written, which is a builder bug.
+        Any remaining ``header_hole_offsets`` are a HARD ERROR: the
+        callee section was never written (builder bug — a call_target
+        rows references a FID that no section opens). Raises with
+        the unresolved FIDs.
 
-        Belt-and-braces: scan the entire written bin for any remaining
+        Any remaining ``per_variant_holes`` are a legitimate
+        corpus-scale outcome (cross-arm/cross-section vkey mismatch:
+        caller and callee survived pass-1 with disjoint vkey sets).
+        The slot is patched with :data:`MISSING_VARIANT_INDEX` and
+        — if a warn-log was supplied — one line is appended naming
+        the callee FID, the unresolved vkey, and the referencing
+        section's offset. The loader treats the sentinel as "no
+        inlined callee body available for this vkey".
+
+        Belt-and-braces: after the pending-holes sweep, scan the
+        entire written bin for any remaining
         :data:`UNRESOLVED_VARIANT_INDEX` slot. The pre-section
-        back-patch queue should have caught everything, but a writer
+        back-patch path plus the finalize-time MISSING stamp should
+        have eliminated every ``0xFFFF`` — a leak indicates a writer
         bug (e.g. forgetting to register a per-variant slot in the
-        hole record) would leak through; this sweep surfaces it
-        before the bin is sealed.
+        hole record); this sweep surfaces it before the bin is
+        sealed.
 
-        The memmap is closed unconditionally in a ``finally``: if the
-        sweep or any of the structural checks raises, the underlying
-        bin still gets unmapped + truncated rather than leaking until
-        process exit.
+        The memmap is closed unconditionally in a ``finally``: if any
+        check raises, the underlying bin still gets unmapped +
+        truncated rather than leaking until process exit.
         """
         try:
             if self._current_fid is not None:
@@ -595,16 +704,54 @@ class SectionWriter:
                     "finalize called while section "
                     f"function_name_ptr={self._current_fid} is still open"
                 )
-            if self._pending_holes:
-                unresolved = sorted(self._pending_holes.keys())
-                raise ValueError(
-                    f"finalize: {len(unresolved)} callee section(s) were "
-                    f"referenced but never written: function_name_ptrs="
-                    f"{unresolved!r}"
-                )
+            self._resolve_or_stamp_remaining_holes()
             self._sweep_for_unresolved_sentinels()
         finally:
             self.close()
+
+    def _resolve_or_stamp_remaining_holes(self) -> None:
+        """Walk ``_pending_holes`` at finalize.
+
+        A record's ``header_hole_offsets`` is allowed to be non-empty
+        IFF ``fid in _known_sections`` — the slots have been patched
+        (possibly repeatedly by sibling closes) and the accumulator
+        is kept around purely so :meth:`end_section` can re-patch on
+        the next sibling close. A record with non-empty
+        ``header_hole_offsets`` AND ``fid not in _known_sections`` is
+        a HARD ERROR: a call_target referenced a FID that no section
+        ever opened (builder bug).
+
+        Per-variant holes left at finalize get
+        :data:`MISSING_VARIANT_INDEX` stamped, with one warn-log line
+        each (silently stamped when no warn-log was supplied).
+        """
+        unresolved: list[tuple[int, int]] = [
+            (fid, ref_offset)
+            for (fid, ref_offset), record in self._pending_holes.items()
+            if record.header_hole_offsets and fid not in self._known_sections
+        ]
+        if unresolved:
+            sorted_unresolved = sorted(unresolved)
+            raise ValueError(
+                f"finalize: {len(sorted_unresolved)} call_target row(s) "
+                "reference a callee section that was never written: "
+                f"(callee_fid, referencing_section_offset)={sorted_unresolved!r}"
+            )
+
+        # Header slots are all resolved. Stamp MISSING on every
+        # remaining per-variant hole and (optionally) log a line each.
+        for (fid, ref_offset), record in self._pending_holes.items():
+            for slot_offset, callee_vkey in record.per_variant_holes:
+                self._writer.patch(
+                    slot_offset, struct.pack("<H", MISSING_VARIANT_INDEX)
+                )
+                if self._warn_log is not None:
+                    self._warn_log.write(
+                        f"missing_variant: callee_fid={fid} "
+                        f"callee_vkey={callee_vkey!r} "
+                        f"caller_section@{ref_offset}\n"
+                    )
+        self._pending_holes.clear()
 
     def close(self) -> None:
         """Flush + unmap the underlying bin without running checks.
@@ -712,12 +859,13 @@ class SectionWriter:
         """Append a header slot to the HoleRecord for a forward-referenced callee.
 
         At most one :class:`_HoleRecord` exists per
-        ``(current_section, callee_fid)`` pair; if a hole was already
-        opened by a previous slot in this section (e.g. another
-        call_target row with the same FID-but-different-type, or an
-        emit_per_call_entries miss that ran first under a different
-        ordering), the existing record gains another header slot in
-        its ``header_hole_offsets`` list.
+        ``(callee_fid, current_section_offset)`` pair — the
+        ``_pending_holes`` key shape carries the dedup. If a hole was
+        already opened by a previous slot in this section (e.g.
+        another call_target row with the same FID-but-different-type,
+        or an emit_per_call_entries miss that ran first under a
+        different ordering), the existing record gains another header
+        slot in its ``header_hole_offsets`` list.
         """
         record = self._get_or_create_section_hole(callee_fid)
         record.header_hole_offsets.append(header_slot_offset)
@@ -732,8 +880,9 @@ class SectionWriter:
         """Append a per-variant slot to the callee's HoleRecord.
 
         Reuses the per-section record if one exists; otherwise creates
-        a fresh record with no header slots (the callee's header was
-        resolved at emit time, only per-variant slots need patching).
+        a fresh record. ``callee_vkey`` is the value that will appear
+        as ``variant_ref_offset`` on the matching variant in the
+        callee section — see :class:`PerCallEntry`.
         """
         record = self._get_or_create_section_hole(callee_fid)
         record.per_variant_holes.append((slot_offset, callee_vkey))
@@ -743,15 +892,15 @@ class SectionWriter:
         on first use.
 
         Centralises the deduplication invariant (one record per
-        ``(current_section, callee_fid)``) so callers — both the
-        header-hole opener and the per-variant-hole opener — share
-        the same accumulator.
+        ``(callee_fid, current_section_offset)``) so callers — both
+        the header-hole opener and the per-variant-hole opener —
+        share the same accumulator.
         """
-        record = self._current_section_holes_by_callee.get(callee_fid)
+        key = (callee_fid, self._current_section_offset)
+        record = self._pending_holes.get(key)
         if record is None:
-            record = _HoleRecord(section_offset=self._current_section_offset)
-            self._current_section_holes_by_callee[callee_fid] = record
-            self._pending_holes.setdefault(callee_fid, []).append(record)
+            record = _HoleRecord()
+            self._pending_holes[key] = record
         return record
 
     def _sweep_for_unresolved_sentinels(self) -> None:

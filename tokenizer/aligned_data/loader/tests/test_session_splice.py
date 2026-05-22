@@ -164,22 +164,34 @@ def _build_splice_corpus(
     empty unless a spec opts in -- splice tests focus on the matched
     path because matched arm pre-cached ``bin_starts`` give clean
     section-offset round-trips.
+
+    Each distinct caller-vkey is assigned a distinct
+    ``variant_ref_offset`` (one fresh ``_variants.bin`` record per
+    unique vkey, in encounter order). The BIN writer keys per-call
+    resolution on this byte offset, so distinct vkeys must produce
+    distinct offsets to exercise both the "vkey matches" and "vkey
+    misses" paths.
     """
     base = tmp_path
     binary_name = "splicebin"
     vocab = _SpliceFakeVocab()
-    variant_offset = _write_variants_bin(base, binary_name, vocab)
-    variant_ref_hex = f"{variant_offset:x}"
 
-    # Map every variant key in every spec to the single hand-laid
-    # variants.bin record so the resolver round-trip stays cheap.
-    vkeys = []
+    # Encounter-ordered unique vkeys → distinct variants.bin offsets.
+    unique_vkeys: list = []
+    seen_vkeys: set = set()
     for spec in matched_specs:
         for variant in spec.variants:
-            vkeys.append(variant.vkey)
-    variants_registry = _VariantStubRegistry(
-        {vkey: variant_ref_hex for vkey in vkeys}
+            if variant.vkey not in seen_vkeys:
+                seen_vkeys.add(variant.vkey)
+                unique_vkeys.append(variant.vkey)
+
+    variant_offsets = _write_variants_bin_records(
+        base, binary_name, vocab, n_records=len(unique_vkeys)
     )
+    hex_for_vkey = {
+        vkey: f"{offset:x}" for vkey, offset in zip(unique_vkeys, variant_offsets)
+    }
+    variants_registry = _VariantStubRegistry(hex_for_vkey)
 
     corpus = build_corpus_with_registry(
         base,
@@ -200,12 +212,16 @@ def _build_splice_corpus(
         bin_lengths=bin_lengths,
     )
 
+    # Every emitted vkey-offset resolves to the same loader-side filename
+    # label (test-only synthetic; offset_to_filename is consulted by
+    # decode helpers, not by the writer's variant-resolution path).
+    offset_to_filename = {
+        offset: f"{binary_name}-x64-gcc-13.2.0-O2" for offset in variant_offsets
+    }
     metadata = {
         "matched_arm": matched_arm,
         "unmatched_arm": None,
-        "offset_to_filename": {
-            variant_offset: f"{binary_name}-x64-gcc-13.2.0-O2"
-        },
+        "offset_to_filename": offset_to_filename,
         "line_to_name": {},
     }
     return {
@@ -216,6 +232,44 @@ def _build_splice_corpus(
         "matched_arm": matched_arm,
         "bin_starts": bin_starts,
     }
+
+
+def _write_variants_bin_records(
+    base: Path,
+    binary_name: str,
+    vocab,
+    *,
+    n_records: int,
+) -> list[int]:
+    """Lay down ``_variants.bin`` with ``n_records`` distinct records;
+    return the per-record byte offsets in encounter order.
+
+    All records share the same encoded payload (only the offsets need
+    to differ — the BIN writer keys variant-resolution on
+    ``variant_ref_offset`` distinctness). Falls back to a single
+    offset-0 record for ``n_records <= 1`` so callers that don't need
+    distinguishable vkeys (e.g. shared-flavor splice fixtures) match
+    the legacy single-record layout.
+    """
+    if n_records <= 1:
+        return [_write_variants_bin(base, binary_name, vocab)]
+    from tokenizer.variant_tokens.encoder import encode_record
+
+    class _V:
+        arch = "x86_64"
+        compiler = "gcc"
+        compilerversion = "13.2.0"
+        opt = "-O2"
+        extra_metadata: Dict[str, Any] = {}
+
+    record_bytes = encode_record(_V(), vocab).tobytes()
+    variants_path = base / f"{binary_name}_variants.bin"
+    offsets: list[int] = []
+    with open(variants_path, "wb") as f:
+        for _ in range(n_records):
+            offsets.append(f.tell())
+            f.write(record_bytes)
+    return offsets
 
 
 @pytest.fixture

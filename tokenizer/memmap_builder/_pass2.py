@@ -199,7 +199,7 @@ def _emit_variant_per_call_entries(
     section_writer: SectionWriter,
     variant_called: "list[TypedCallee]",
     unique_called_index_map: "dict[TypedCallee, int]",
-    callee_vkey,
+    callee_variant_ref_offset: int,
     registry: FunctionNamesRegistry,
     sectioned_func_names: "set[str]",
 ) -> None:
@@ -208,12 +208,15 @@ def _emit_variant_per_call_entries(
     The BIN's per-call entry shape is ``(called_idx,
     section_variant_index)``. ``section_variant_index`` is the index
     of the CALLER's variant inside the CALLEE's section's variant
-    block list, looked up at emit time via
-    ``known_section_variants[(callee_FID, callee_vkey)]``. The variant
-    key here is the caller's own vkey — pass-1 keys ``function_lookup``
-    on ``(callee_name, caller_vkey)`` and the callee section
-    registers its variant slots under the same vkey, so the lookup
-    resolves directly.
+    block list, resolved at the CALLEE's
+    :meth:`SectionWriter.end_section` by parsing the callee section's
+    bytes and matching each pending hole's ``callee_vkey`` against
+    the section's on-disk ``variant_ref_offset`` field. The values
+    therefore live in the SAME space: each ``PerCallEntry.callee_vkey``
+    here is the byte offset of the caller's own vkey in the
+    per-binary ``_variants.bin`` sidecar — the very value the callee
+    section will stamp into its matching variant header at
+    :meth:`SectionWriter.begin_variant`.
 
     Per-call entries are emitted ONLY for callees that will have a
     section in the BIN. Phase 1's codec test pins this behaviour: the
@@ -251,7 +254,7 @@ def _emit_variant_per_call_entries(
             PerCallEntry(
                 called_idx=called_idx,
                 callee_function_name_ptr=callee_fid,
-                callee_vkey=callee_vkey,
+                callee_vkey=callee_variant_ref_offset,
             )
         )
     section_writer.emit_per_call_entries(entries)
@@ -376,15 +379,22 @@ def write_matched_sections_pass2(
             )
 
             # ----- BIN: variant block -----
+            # ``variant_ref_offset`` is the byte offset of this vkey in
+            # the per-binary ``_variants.bin`` sidecar; it is also the
+            # value every caller's :class:`PerCallEntry.callee_vkey`
+            # carries for THIS variant, since
+            # :meth:`SectionWriter.end_section` matches holes against
+            # this section's on-disk ``variant_ref_offset`` field.
+            callee_variant_ref_offset = variants.byte_offset(vkey)
             section_writer.begin_variant(
-                variant_ref_offset=variants.byte_offset(vkey),
+                variant_ref_offset=callee_variant_ref_offset,
                 data_offset_shifted=data_offset >> 4,
             )
             _emit_variant_per_call_entries(
                 section_writer,
                 called,
                 unique_called_index_map,
-                callee_vkey=vkey,
+                callee_variant_ref_offset=callee_variant_ref_offset,
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
             )
@@ -660,15 +670,19 @@ def write_unmatched_sections_pass2(
             variant_data_offset, _data_len, _token_len = version_data_list[
                 comp_set_id
             ]
+            # See the matched-arm equivalent for why ``callee_vkey``
+            # passes the byte-offset value (same value as the variant's
+            # on-disk ``variant_ref_offset``).
+            callee_variant_ref_offset = variants.byte_offset(vkey)
             section_writer.begin_variant(
-                variant_ref_offset=variants.byte_offset(vkey),
+                variant_ref_offset=callee_variant_ref_offset,
                 data_offset_shifted=variant_data_offset >> 4,
             )
             _emit_variant_per_call_entries(
                 section_writer,
                 called_set,
                 unique_called_index_map,
-                callee_vkey=vkey,
+                callee_variant_ref_offset=callee_variant_ref_offset,
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
             )

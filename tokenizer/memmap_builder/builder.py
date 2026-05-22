@@ -282,7 +282,12 @@ def build_memmap_files(
         # ExternProviderRegistry collects unique library names across
         # the binary's extern call_targets and is serialised to disk
         # by ``sections_bin_outputs.finalize`` AFTER both arms run.
-        sections_bin_outputs = open_sections_bin_outputs(output_dir, binary_name)
+        # The warn-log handle threads through ``SectionWriter`` so its
+        # finalize-time ``MISSING_VARIANT_INDEX`` stamps emit a
+        # ``missing_variant:`` line each.
+        sections_bin_outputs = open_sections_bin_outputs(
+            output_dir, binary_name, warn_log=warn_log
+        )
         # close() is the always-runs cleanup; finalize() runs the
         # structural assertions + writes the sidecar. We register the
         # cleanup with ExitStack so an exception mid-build still

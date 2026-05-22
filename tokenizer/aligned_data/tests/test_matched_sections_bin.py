@@ -4,6 +4,13 @@ The writer is the sole producer of ``<binary>_sections.bin``; the
 reader is the sole consumer on the dataloader hot path. Correctness
 here pins both halves of the codec at once.
 
+``PerCallEntry.callee_vkey`` shares the same value-space as the
+matching variant's on-disk ``variant_ref_offset`` (the byte offset of
+the vkey in the per-binary ``_variants.bin`` sidecar). Tests use
+integer offsets directly so the writer's self-describing back-patch
+(parse the just-closed section, match holes against its variant
+table) resolves through to a stable variant_idx.
+
 Coverage:
 
 * round-trip — one section, two call_targets, two variants → reader
@@ -17,6 +24,11 @@ Coverage:
 * extern + unknown library — call_target with EXTERN type and
   ``extern_provider_line_no=None`` lands as the ``0`` sentinel.
 * finalize asserts on a callee whose section was never written.
+* finalize stamps MISSING_VARIANT_INDEX on per-variant holes whose
+  callee_vkey no sibling section ever registered.
+* OUTLINED_FUNCTION_N coherence: two sibling sections with the same
+  FID but disjoint vkey sets each resolve only their own caller's
+  per_call slot.
 * prelude round-trip via the magic-specific helpers.
 * :meth:`MemmapBinWriter.patch` is a separate test (it's the
   random-access primitive the SectionWriter is built on).
@@ -165,30 +177,34 @@ def test_section_round_trip(tmp_path: Path):
         ]
     )
 
-    # Variant 1: calls call_target idx=0 (self-ref) with vkey="x86_O0".
+    # Variant 1: calls call_target idx=0 (self-ref) targeting variant
+    # variant_ref_offset=0x100 — the same value the writer stamps on
+    # this variant's header. The per-call entry's callee_vkey shares
+    # that value-space so end_section's parse-and-match resolves the
+    # slot to variant_idx=0.
     writer.begin_variant(variant_ref_offset=0x100, data_offset_shifted=0x20)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
                 called_idx=0,
                 callee_function_name_ptr=1,
-                callee_vkey="x86_O0",
+                callee_vkey=0x100,
             ),
         ]
     )
     v0 = writer.end_variant(vkey="x86_O0")
     assert v0 == 0
 
-    # Variant 2: calls call_target idx=1 (extern) — but per-call entries
-    # only point at LOCAL/PLT/EXTERN call_targets via called_idx; the
-    # extern target still receives an entry to verify the path.
+    # Variant 2: also calls call_target idx=0 (self-ref) but targets
+    # this same variant_ref_offset=0x100 — proves the matching is by
+    # vkey not by variant order.
     writer.begin_variant(variant_ref_offset=0x140, data_offset_shifted=0x40)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
                 called_idx=0,
                 callee_function_name_ptr=1,
-                callee_vkey="x86_O0",
+                callee_vkey=0x100,
             ),
         ]
     )
@@ -263,14 +279,14 @@ def test_header_back_patch(tmp_path: Path):
 
 
 def test_per_variant_back_patch(tmp_path: Path):
-    """Section A's variant references B's vkey=\"x86_O0\" before B is
-    written; after B emits that variant the slot equals B's variant_idx
-    (not 0xFFFF)."""
+    """Section A's variant references B's variant_ref_offset=0x50 before
+    B is written; after B emits that variant the slot equals B's
+    variant_idx (not 0xFFFF)."""
     path = tmp_path / "variant_patch.bin"
     writer = SectionWriter(path)
 
     # Section A: one call_target referencing B (FID=2), one variant
-    # whose per-call entry points at B's "x86_O0" variant.
+    # whose per-call entry points at B's variant_ref_offset=0x50.
     writer.begin_section(function_name_ptr=1)
     writer.emit_call_targets(
         [
@@ -285,16 +301,17 @@ def test_per_variant_back_patch(tmp_path: Path):
             PerCallEntry(
                 called_idx=0,
                 callee_function_name_ptr=2,
-                callee_vkey="x86_O0",
+                callee_vkey=0x50,
             ),
         ]
     )
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
 
-    # Section B: emits two variants. We want "x86_O0" to land at
-    # variant_idx=1 to make the back-patch non-trivial (0 is the
-    # default unsigned value, so 1 catches a "wrote no bytes" bug too).
+    # Section B: emits two variants. We want variant_ref_offset=0x50 to
+    # land at variant_idx=1 to make the back-patch non-trivial (0 is
+    # the default unsigned value, so 1 catches a "wrote no bytes" bug
+    # too).
     writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
     writer.begin_variant(variant_ref_offset=0x30, data_offset_shifted=0x40)
@@ -360,36 +377,37 @@ def test_finalize_asserts_on_unresolved_hole(tmp_path: Path):
     writer.end_section()
     # Never emit section 2.
 
-    with pytest.raises(ValueError, match="referenced but never written"):
+    with pytest.raises(ValueError, match="callee section that was never written"):
         writer.finalize()
 
 
-def test_backward_per_call_to_closed_section_missing_vkey_stamps_missing_directly(tmp_path: Path):
+def test_backward_per_call_to_closed_section_missing_vkey_stamps_missing_at_finalize(tmp_path: Path):
     """If a section's per-call entry references a callee whose section
-    has ALREADY CLOSED but does not have this caller's vkey, the slot
-    stamps :data:`MISSING_VARIANT_INDEX` directly at emit time — opening
-    a back-patch hole would never resolve since the only place that
-    pops :data:`_pending_holes` is the callee's :meth:`end_section`,
-    which has already run."""
+    has already been written but does not carry a variant matching the
+    caller's vkey, the slot is left as ``UNRESOLVED`` until
+    :meth:`finalize`, which stamps :data:`MISSING_VARIANT_INDEX`. The
+    writer never resolves at emit-time; every per-call slot defers."""
     path = tmp_path / "backward_miss.bin"
     writer = SectionWriter(path)
 
-    # Section B: emits ONLY vkey="x86_O3".
+    # Section B: emits ONLY variant_ref_offset=0xB3 (think
+    # vkey="x86_O3" → byte_offset 0xB3 in the variants sidecar).
     writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xB3, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     writer.end_variant(vkey="x86_O3")
     writer.end_section()
 
-    # Section A (emitted AFTER B closes): references B at vkey="x86_O0".
+    # Section A (emitted AFTER B closes): references B at a different
+    # vkey (variant_ref_offset=0xB0 — the byte offset of "x86_O0").
     writer.begin_section(function_name_ptr=1)
     writer.emit_call_targets(
         [CallTargetSpec(function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True)]
     )
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xB0, data_offset_shifted=0)
     writer.emit_per_call_entries(
-        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey="x86_O0")]
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xB0)]
     )
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
@@ -405,15 +423,20 @@ def test_backward_per_call_to_closed_section_missing_vkey_stamps_missing_directl
 def test_per_variant_hole_with_missing_callee_vkey_lands_as_missing_sentinel(tmp_path: Path):
     """Cross-arm vkey mismatch: callee section IS written but never emits
     the caller's vkey. The per-call slot lands on
-    :data:`MISSING_VARIANT_INDEX` (= 0xFFFE) instead of raising — the
-    legitimate corpus-scale case where caller and callee have different
-    surviving-variant sets after pass-1's drop rules. The finalize sweep
-    rejects only 0xFFFF (unresolved hole), not 0xFFFE."""
-    path = tmp_path / "missing_variant.bin"
-    writer = SectionWriter(path)
+    :data:`MISSING_VARIANT_INDEX` (= 0xFFFE) at :meth:`finalize`
+    instead of raising — the legitimate corpus-scale case where caller
+    and callee have different surviving-variant sets after pass-1's
+    drop rules. The finalize sweep rejects only 0xFFFF (unresolved
+    hole), not 0xFFFE."""
+    import io
 
-    # Section A: references B's vkey="x86_O0" via a per-call entry.
-    writer.begin_section(function_name_ptr=1)
+    path = tmp_path / "missing_variant.bin"
+    warn_log = io.StringIO()
+    writer = SectionWriter(path, warn_log=warn_log)
+
+    # Section A: references B's variant_ref_offset=0xC0 via a per-call
+    # entry — but B only emits variant_ref_offset=0xC3.
+    a_offset = writer.begin_section(function_name_ptr=1)
     writer.emit_call_targets(
         [
             CallTargetSpec(
@@ -421,24 +444,25 @@ def test_per_variant_hole_with_missing_callee_vkey_lands_as_missing_sentinel(tmp
             ),
         ]
     )
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xC0, data_offset_shifted=0)
     writer.emit_per_call_entries(
         [
             PerCallEntry(
                 called_idx=0,
                 callee_function_name_ptr=2,
-                callee_vkey="x86_O0",
+                callee_vkey=0xC0,
             ),
         ]
     )
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
 
-    # Section B: only emits vkey="x86_O3" — A's per-call hole resolves
-    # to MISSING_VARIANT_INDEX rather than failing the build.
+    # Section B: only emits variant_ref_offset=0xC3 — A's per-call hole
+    # falls through to finalize → MISSING_VARIANT_INDEX + warn-log
+    # entry.
     writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xC3, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     writer.end_variant(vkey="x86_O3")
     writer.end_section()
@@ -449,6 +473,12 @@ def test_per_variant_hole_with_missing_callee_vkey_lands_as_missing_sentinel(tmp
     (called_idx, sv_idx), = a.variants[0].per_call_entries
     assert called_idx == 0
     assert sv_idx == MISSING_VARIANT_INDEX
+    # warn-log received exactly one ``missing_variant:`` line for this slot.
+    log_text = warn_log.getvalue()
+    assert log_text.count("missing_variant:") == 1
+    assert "callee_fid=2" in log_text
+    assert "callee_vkey=192" in log_text  # 0xC0 = 192
+    assert f"caller_section@{a_offset}" in log_text
 
 
 def test_called_idx_validation(tmp_path: Path):
@@ -509,21 +539,35 @@ def test_dup_section_overwrites_known_sections_with_latest_offset(tmp_path: Path
     assert {s.function_name_ptr for s in sections} == {1}
 
 
-def test_dup_variant_vkey_overwrites_known_section_variants_with_latest(tmp_path: Path):
-    """A vkey can re-appear within a section (or across sections sharing
-    a FID); the latest emission's variant_idx wins for back-patch
-    resolution, matching the pre-refactor ``function_lookup``
-    last-write-wins semantics."""
+def test_dup_variant_ref_offset_within_section(tmp_path: Path):
+    """A variant_ref_offset can re-appear within a section (legacy
+    pre-refactor ``function_lookup`` last-write-wins behaviour). With
+    the self-describing back-patch, a per-call hole targeting that
+    ref_offset resolves to whichever variant is FIRST in the section's
+    on-disk variant block list (parse-side dict insertion order)."""
     path = tmp_path / "dup_vkey.bin"
     writer = SectionWriter(path)
 
+    # Caller section references FID=2's variant_ref_offset=0xD0.
     writer.begin_section(function_name_ptr=1)
+    writer.emit_call_targets(
+        [CallTargetSpec(function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True)]
+    )
+    writer.begin_variant(variant_ref_offset=0xD0, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xD0)]
+    )
+    writer.end_variant(vkey="x86_O0")
+    writer.end_section()
+
+    # Callee section FID=2: emits the SAME variant_ref_offset=0xD0
+    # twice (first as variant_idx=0, then again as variant_idx=1).
+    writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xD0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     first_idx = writer.end_variant(vkey="x86_O0")
-
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xD0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     second_idx = writer.end_variant(vkey="x86_O0")
     writer.end_section()
@@ -531,7 +575,17 @@ def test_dup_variant_vkey_overwrites_known_section_variants_with_latest(tmp_path
 
     assert first_idx == 0
     assert second_idx == 1
-    assert writer._known_section_variants[(1, "x86_O0")] == second_idx  # noqa: SLF001
+    sections = {s.function_name_ptr: s for s in iter_sections_bin(path)}
+    a = sections[1]
+    # Both variants share ref_offset=0xD0; the local
+    # ``vkey_to_idx`` dict comprehension that ``end_section`` builds
+    # overwrites the key on every iteration, so the LAST variant_idx
+    # wins for back-patch resolution — matching the pre-refactor
+    # ``known_section_variants`` last-write-wins semantics.
+    (_called, sv_idx), = a.variants[0].per_call_entries
+    assert sv_idx == second_idx
+    assert sv_idx != UNRESOLVED_VARIANT_INDEX
+    assert sv_idx != MISSING_VARIANT_INDEX
 
 
 def test_section_alignment_padding(tmp_path: Path):
@@ -545,7 +599,9 @@ def test_section_alignment_padding(tmp_path: Path):
     path = tmp_path / "align.bin"
     writer = SectionWriter(path)
 
-    # Section A produces a 34-byte payload before trailer pad.
+    # Section A produces a 34-byte payload before trailer pad. The
+    # per-call entry self-references the same variant_ref_offset=0 so
+    # the back-patch resolves cleanly inside the section.
     a_offset = writer.begin_section(function_name_ptr=1)
     writer.emit_call_targets(
         [
@@ -558,7 +614,7 @@ def test_section_alignment_padding(tmp_path: Path):
     writer.emit_per_call_entries(
         [
             PerCallEntry(
-                called_idx=0, callee_function_name_ptr=1, callee_vkey="x86_O0"
+                called_idx=0, callee_function_name_ptr=1, callee_vkey=0
             )
         ]
     )
@@ -607,7 +663,7 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
     writer.emit_per_call_entries(
         [
             PerCallEntry(
-                called_idx=0, callee_function_name_ptr=2, callee_vkey="x86_O0"
+                called_idx=0, callee_function_name_ptr=2, callee_vkey=0xE0
             )
         ]
     )
@@ -616,7 +672,7 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
 
     writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xE0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
@@ -708,20 +764,20 @@ def test_multiple_per_variant_entries_to_same_callee(tmp_path: Path):
     writer.emit_per_call_entries(
         [
             PerCallEntry(
-                called_idx=0, callee_function_name_ptr=2, callee_vkey="x86_O0"
+                called_idx=0, callee_function_name_ptr=2, callee_vkey=0xF0
             ),
             PerCallEntry(
-                called_idx=1, callee_function_name_ptr=2, callee_vkey="x86_O0"
+                called_idx=1, callee_function_name_ptr=2, callee_vkey=0xF0
             ),
         ]
     )
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
 
-    # Section B: emits the vkey.
+    # Section B: emits the matching variant_ref_offset.
     writer.begin_section(function_name_ptr=2)
     writer.emit_call_targets([])
-    writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
+    writer.begin_variant(variant_ref_offset=0xF0, data_offset_shifted=0)
     writer.emit_per_call_entries([])
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
@@ -797,7 +853,7 @@ def test_section_writer_finalize_closes_on_sweep_error(tmp_path: Path):
     )
     writer.begin_variant(variant_ref_offset=0, data_offset_shifted=0)
     writer.emit_per_call_entries(
-        [PerCallEntry(called_idx=0, callee_function_name_ptr=1, callee_vkey="x86_O0")]
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=1, callee_vkey=0)]
     )
     writer.end_variant(vkey="x86_O0")
     writer.end_section()
@@ -875,3 +931,205 @@ def test_finalize_rejects_open_section(tmp_path: Path):
     writer.begin_section(function_name_ptr=1)
     with pytest.raises(ValueError, match="still open"):
         writer.finalize()
+
+
+# ---------------------------------------------------------------------------
+# OUTLINED_FUNCTION_N (sibling-FID) coherence — the corpus-scale case
+# clang's compiler-internal helpers produce. Two sections share a FID
+# but carry disjoint vkey sets; the writer's self-describing back-patch
+# routes each per_call_entry to its specific sibling's local variant
+# table without leaking sentinels across siblings.
+# ---------------------------------------------------------------------------
+
+
+def test_outlined_function_siblings_disjoint_vkeys_each_patch_their_own(
+    tmp_path: Path,
+):
+    """Two sibling sections under FID=2 with disjoint vkey sets; the
+    caller references one vkey per variant. Each per_call_entry slot
+    resolves to the matching sibling's local variant_idx — no
+    MISSING_VARIANT_INDEX, no UNRESOLVED leak, no warn-log line."""
+    import io
+
+    path = tmp_path / "outlined_disjoint.bin"
+    warn_log = io.StringIO()
+    writer = SectionWriter(path, warn_log=warn_log)
+
+    # Caller A (FID=1): two variants, each references FID=2 at a
+    # different vkey. Sibling-1 will carry vkey=0xA1 only; sibling-2
+    # will carry vkey=0xA2 only.
+    writer.begin_section(function_name_ptr=1)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True
+            ),
+        ]
+    )
+    writer.begin_variant(variant_ref_offset=0xA1, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xA1)]
+    )
+    writer.end_variant(vkey="caller_v1")
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xA2)]
+    )
+    writer.end_variant(vkey="caller_v2")
+    writer.end_section()
+
+    # Sibling-1 (FID=2, body 1): exposes vkey=0xA1.
+    writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA1, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="sib1_v1")
+    writer.end_section()
+
+    # Sibling-2 (FID=2, body 2): exposes vkey=0xA2.
+    writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="sib2_v1")
+    writer.end_section()
+
+    writer.finalize()
+
+    sections = list(iter_sections_bin(path))
+    # Three sections total: caller + two siblings.
+    assert len(sections) == 3
+    caller = sections[0]
+    assert caller.function_name_ptr == 1
+    # Each variant's per_call_entry resolves to variant_idx=0 inside
+    # its respective sibling (each sibling has exactly one variant).
+    (_called_v1, sv_idx_v1), = caller.variants[0].per_call_entries
+    (_called_v2, sv_idx_v2), = caller.variants[1].per_call_entries
+    assert sv_idx_v1 == 0
+    assert sv_idx_v2 == 0
+    # Neither sentinel leaked.
+    for v in caller.variants:
+        for _called, sv_idx in v.per_call_entries:
+            assert sv_idx != UNRESOLVED_VARIANT_INDEX
+            assert sv_idx != MISSING_VARIANT_INDEX
+    # No warn-log entry was emitted (every hole resolved).
+    assert "missing_variant:" not in warn_log.getvalue()
+
+
+def test_outlined_function_siblings_with_unregistered_vkey_lands_as_missing_at_finalize(
+    tmp_path: Path,
+):
+    """Caller's per_call_entry references a vkey that NEITHER sibling
+    section registers. finalize stamps :data:`MISSING_VARIANT_INDEX`
+    and the warn-log receives one matching line."""
+    import io
+
+    path = tmp_path / "outlined_missing.bin"
+    warn_log = io.StringIO()
+    writer = SectionWriter(path, warn_log=warn_log)
+
+    # Caller A: one variant referencing FID=2 at vkey=0xB7 — neither
+    # sibling will register this.
+    a_offset = writer.begin_section(function_name_ptr=1)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True
+            ),
+        ]
+    )
+    writer.begin_variant(variant_ref_offset=0xB7, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xB7)]
+    )
+    writer.end_variant(vkey="caller_v1")
+    writer.end_section()
+
+    # Sibling-1 (FID=2): exposes only vkey=0xA1.
+    writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA1, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="sib1_v1")
+    writer.end_section()
+
+    # Sibling-2 (FID=2): exposes only vkey=0xA2.
+    writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="sib2_v1")
+    writer.end_section()
+
+    writer.finalize()
+
+    sections = list(iter_sections_bin(path))
+    caller = sections[0]
+    assert caller.function_name_ptr == 1
+    (_called, sv_idx), = caller.variants[0].per_call_entries
+    assert sv_idx == MISSING_VARIANT_INDEX
+    log_text = warn_log.getvalue()
+    assert log_text.count("missing_variant:") == 1
+    assert "callee_fid=2" in log_text
+    assert f"callee_vkey={0xB7}" in log_text
+    assert f"caller_section@{a_offset}" in log_text
+
+
+def test_outlined_function_siblings_function_section_ptr_last_write_wins(
+    tmp_path: Path,
+):
+    """W2 acceptance: when a caller forward-references a FID that two
+    sibling sections will close for, the on-disk
+    ``function_section_ptr`` ends up pointing at the LAST sibling
+    (each sibling's end_section re-patches the same header slot).
+    The loader walks via per-call ``callee_vkey`` to disambiguate
+    which sibling carries the matching variant."""
+    path = tmp_path / "outlined_lww.bin"
+    writer = SectionWriter(path)
+
+    # Caller A: one call_target forward-referencing FID=2; one
+    # variant whose per_call points at sibling-2's vkey=0xA2.
+    writer.begin_section(function_name_ptr=1)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True
+            ),
+        ]
+    )
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xA2)]
+    )
+    writer.end_variant(vkey="caller_v1")
+    writer.end_section()
+
+    # Sibling-1 (FID=2): first to close — header slot gets stamped to
+    # sibling-1's offset.
+    sib1_offset = writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA1, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="sib1_v1")
+    writer.end_section()
+
+    # Sibling-2 (FID=2): closes second — header slot gets re-stamped
+    # to sibling-2's offset (last-write-wins).
+    sib2_offset = writer.begin_section(function_name_ptr=2)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey="sib2_v1")
+    writer.end_section()
+
+    writer.finalize()
+
+    sections = list(iter_sections_bin(path))
+    caller = sections[0]
+    # On-disk function_section_ptr points at the LAST sibling.
+    assert caller.call_targets[0].function_section_ptr == sib2_offset
+    assert caller.call_targets[0].function_section_ptr != sib1_offset
+    # And the caller's per_call_entry resolves to sibling-2's
+    # variant_idx (sibling-2 has the matching vkey=0xA2).
+    (_called, sv_idx), = caller.variants[0].per_call_entries
+    assert sv_idx == 0  # variant_idx 0 inside sibling-2
