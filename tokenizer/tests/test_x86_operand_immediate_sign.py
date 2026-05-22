@@ -85,6 +85,12 @@ def _ids(tokens) -> List[int]:
 
 
 def _mem_minus_id(vm: VocabularyManager) -> int:
+    # Resolved only to assert MEM_MINUS does NOT leak into the post-refactor
+    # x86 immediate token stream. This file does not pin MEM_MINUS as a
+    # sign marker — that role migrated to the postfix ``value_negative``
+    # metatoken in the v2 valued_const emitter; MEM_MINUS remains the
+    # addressing-operator minus inside ``mem[ ... ]mem`` (and the correct
+    # emission for any future non-disasm-sourced minus).
     return int(vm.MemoryOperand(MemoryOperandSymbol.MINUS).get_token_ids().tolist()[0])
 
 
