@@ -23,7 +23,7 @@ from tokenizer.variant_info import VariantInfo
 logger = logging.getLogger(__name__)
 
 
-def _iter_variant_infos(csv_files: Iterable[Path]) -> Iterable[VariantInfo]:
+def iter_variant_infos(csv_files: Iterable[Path]) -> Iterable[VariantInfo]:
     """Yield one ``VariantInfo`` per CSV; skip + warn on parse errors.
 
     A single corrupt sidecar must not abort the discovery walk — the

@@ -25,12 +25,13 @@ from .prefixes import POSITIONAL_PREFIXES, build_axis_strings
 class VariantInventory:
     """Deterministic set-builder for variant-axis token strings.
 
-    Usage::
+    Usage (matches the unifier's Pass-3 registration loop)::
 
         inv = VariantInventory()
         for v in versions:
             inv.add(v)
-        unified_vm.register_each(inv.iter_tokens())  # alphabetical
+        for token_str in inv.iter_tokens_axis_grouped():
+            unified_vm.Variant_Axis(token_str)
     """
 
     def __init__(self) -> None:

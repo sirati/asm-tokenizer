@@ -11,7 +11,7 @@ from tokenizer.variant_tokens import VariantInventory
 
 from .loader import load_vocab_manager
 from .saver import save_vocabulary
-from .variant_registration import _iter_variant_infos
+from .variant_registration import iter_variant_infos
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +122,11 @@ def unify_vocab(
             )
 
         # Collect variant-axis tokens implied by this CSV's filename +
-        # optional `_meta.json` sidecar. `_iter_variant_infos` already
+        # optional `_meta.json` sidecar. `iter_variant_infos` already
         # owns the skip-on-parse-error policy; the inventory deduplicates
         # across the corpus and `iter_tokens_axis_grouped` (Pass 3 below)
         # owns the deterministic registration order.
-        variant_inventory.update(_iter_variant_infos([csv_file]))
+        variant_inventory.update(iter_variant_infos([csv_file]))
 
         mappings = np.full_like(current_vocab_manager.id_to_token_type, -1, dtype=np.int32)
 

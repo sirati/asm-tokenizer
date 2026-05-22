@@ -398,6 +398,18 @@ class VocabularyManager:
             # on-disk vocab or a test fixture that bypassed the unifier
             # flow — both surface here rather than silently mis-routing
             # downstream consumers that key off the range attributes.
+            # The length guard converts a degenerate (digits + value_negative
+            # only) `vocab_list` from an IndexError into the same assertion
+            # contract — realistic unifier output always has >= 272 entries,
+            # so the guard fires only on hand-crafted short fixtures.
+            assert (
+                len(v_man.id_to_token) > VocabularyManager._V2_NUMBER_BLOCK_START
+            ), (
+                "unified vocab too short for canonical layout: got "
+                f"{len(v_man.id_to_token)} entries; need at least "
+                f"{VocabularyManager._V2_NUMBER_BLOCK_START + 1} "
+                "(digits + value_negative + valued_const_v2 head)"
+            )
             assert (
                 v_man.id_to_token[VocabularyManager._V2_NUMBER_BLOCK_START]
                 == "valued_const_v2"

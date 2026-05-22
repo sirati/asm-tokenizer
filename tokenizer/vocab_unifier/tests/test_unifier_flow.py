@@ -295,3 +295,33 @@ def test_from_vocab_rejects_non_canonical_head_of_unified_vocab() -> None:
     raw = _craft_bad_head_row()
     with pytest.raises(AssertionError, match="valued_const_v2"):
         load_vocab_manager_csv_row_bytes(raw, "unified")
+
+
+def test_from_vocab_rejects_degenerate_short_unified_vocab() -> None:
+    """``from_vocab`` length-guards the head-of-vocab assert against a
+    degenerate ``vocab_list`` (digits + ``value_negative`` only, length
+    ``_V2_RESERVED_TOKEN_COUNT``). Without the guard the subsequent
+    ``id_to_token[_V2_NUMBER_BLOCK_START]`` lookup raises IndexError
+    instead of the cleaner AssertionError; the guard fires here with the
+    length message naming the actual + required vocab sizes."""
+    digits = [f"digit_{i:02X}" for i in range(_DIGIT_COUNT)]
+    vocab_list = digits + ["value_negative"]
+    assert len(vocab_list) == _RESERVED
+
+    pitc = np.full(_RESERVED, PlatformInstructionTypes.AGNOSTIC, dtype=np.int8)
+    itt = np.full(_RESERVED, TokenType.UNRESOLVED, dtype=np.int8)
+    itt[VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID] = TokenType.VALUE_NEGATIVE
+    empty_int = np.array([], dtype=np.int_)
+
+    with pytest.raises(AssertionError, match="too short for canonical layout"):
+        VocabularyManager.from_vocab(
+            platform=None,
+            vocab_list=vocab_list,
+            platform_instruction_type_cache=pitc,
+            id_to_token_type=itt,
+            lit_start_cache=empty_int,
+            lit_end_cache=empty_int,
+            platform_list=[],
+            token_to_platform=np.full(_RESERVED, -1, dtype=np.int8),
+            format_version=1,
+        )
