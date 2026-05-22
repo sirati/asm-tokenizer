@@ -208,9 +208,7 @@ def tokenize_operand_memory(
                 f"{insn.mnemonic} {insn.op_str}"
             )
 
-    if classified_value < 0:
-        tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
-    elif has_disp and (has_reg or has_index):
+    if has_disp and (has_reg or has_index):
         tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
 
     # Process displacement
@@ -222,7 +220,12 @@ def tokenize_operand_memory(
         # The resolved-target path always takes the metadata-aware
         # emitter below; a resolved string at e.g. 0x42 would otherwise
         # collapse to a bare ``valued_const`` and lose precedence step 7.
-        tokens.append(vocab_manager.ValuedConst(abs(classified_value)))
+        # Sign is decomposed by the constant handler's ``_emit_valued_const``
+        # (postfix ``value_negative``); ``is_arithmetic=True`` short-circuits
+        # steps 2-10 so this stays a bare valued_const emission for positives.
+        tokens.extend(
+            constant_handler.process_constant_v2(classified_value, is_arithmetic=True)
+        )
 
     else:
         force_opaque = False
