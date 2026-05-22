@@ -1,22 +1,23 @@
 """Phase J.3: Ghidra-only v2 feature assertions on tokenized fixtures.
 
 Each test targets one Ghidra-only feature surface (REG_LIST writeback
-bracketing, MEM disp+base merging, MEM_MINUS negative-immediate prefix
-outside mem brackets, MIPS delay-slot mnemonic collapse, FP-typed
-operand detection, provider string analyzer → ``string_ptr`` metadata).
-The known-function-per-fixture approach lets each assertion be small
-and targeted; if a fixture's binary doesn't contain a matching
-instruction the test ``pytest.skip``s with a clear message so the
-absence is visible in the run-log rather than disguised as a silent
-pass or false fail.
+bracketing, MEM disp+base merging, postfix ``value_negative`` on
+negative immediates / disps, MIPS delay-slot mnemonic collapse,
+FP-typed operand detection, provider string analyzer → ``string_ptr``
+metadata). The known-function-per-fixture approach lets each
+assertion be small and targeted; if a fixture's binary doesn't
+contain a matching instruction the test ``pytest.skip``s with a clear
+message so the absence is visible in the run-log rather than
+disguised as a silent pass or false fail.
 
-Pre-tokenized CSVs at ``/tmp/asm_smoke/out/`` are reused if present
-(the previous run's outputs); otherwise the test ``pytest.skip``s with
-a hint to run the Phase J.2 smoke (``test_ghidra_e2e_smoke.py``) first
-to populate them. Re-tokenization inline would multiply test runtime
-by 7 (the J.2 smoke covers that pathway already), and Phase J.3's
-concern is the wire-format SHAPE of the outputs, not the tokenize
-pipeline's correctness end-to-end.
+Most tests reuse pre-tokenized CSVs at ``/tmp/asm_smoke/out/`` (the
+previous run's outputs) and ``pytest.skip`` if absent, with a hint to
+run the Phase J.2 smoke (``test_ghidra_e2e_smoke.py``) first to
+populate them. Two negative-sign canaries (the riscv64
+arithmetic-immediate test and the arm32 bracket-disp test) instead
+re-tokenize inline via the ``fresh_ghidra_csv`` factory fixture
+because the cached snapshot pre-dates the postfix-``value_negative``
+migration; they carry the ``slow`` marker for the Ghidra spin-up.
 """
 
 from __future__ import annotations
@@ -24,8 +25,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -40,10 +39,9 @@ from tokenizer.vocab_unifier.loader import load_vocab_manager
 
 _OUT_DIR = Path("/tmp/asm_smoke/out")
 # Source roots for inline-tokenization tests that need a fresh CSV (i.e.
-# tests pinning post-Phase-2 wire shapes that the cached
+# tests pinning post-refactor wire shapes that the cached
 # ``/tmp/asm_smoke/out/`` fixture pre-dates). Matches the resolution
 # convention in ``test_ghidra_e2e_smoke.py``.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
 _HELLO_SRC = Path(
     os.environ.get("ASM_TOKENIZER_HELLO_SRC")
     or "/tmp/asm_smoke/src"
@@ -230,7 +228,9 @@ def test_mem_disp_base_merge_riscv64_xcalloc() -> None:
 
 
 @pytest.mark.slow
-def test_negative_imm_value_negative_riscv64_xcalloc(tmp_path: Path) -> None:
+def test_negative_imm_value_negative_riscv64_xcalloc(
+    fresh_ghidra_csv,
+) -> None:
     """riscv64 ``c.addi sp, -0x10`` (stack adjust at function entry):
     the negative immediate must surface as a ``valued_const_v2`` token
     (the absolute-value magnitude ``0x10``) immediately followed by a
@@ -251,10 +251,10 @@ def test_negative_imm_value_negative_riscv64_xcalloc(tmp_path: Path) -> None:
 
     To guarantee we exercise post-refactor producer output (rather
     than a stale pre-refactor CSV cached at ``/tmp/asm_smoke/out/``),
-    this test runs the standalone tokenizer subprocess on the riscv64
-    fixture into ``tmp_path`` every invocation. The cost is a single
-    Ghidra spin-up (~30-120s), which is why the test carries the
-    ``slow`` marker like its J.2 sibling.
+    the test re-tokenizes the riscv64 fixture inline via
+    ``fresh_ghidra_csv``. The cost is a single Ghidra spin-up
+    (~30-120s), which is why the test carries the ``slow`` marker
+    like its J.2 sibling.
     """
     binary_name = "riscv64-clang-10-O2_hello"
     binary = _HELLO_SRC / binary_name
@@ -264,45 +264,7 @@ def test_negative_imm_value_negative_riscv64_xcalloc(tmp_path: Path) -> None:
             f"test_ghidra_e2e_smoke.py first to stage it"
         )
 
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    queue = tmp_path / "queue.txt"
-    queue.write_text(f"{binary_name}\n")
-
-    # Mirror the J.2 smoke's standalone invocation: ``-m tokenizer``
-    # plus ``--batch`` so ``_run_standalone`` drives the pipeline.
-    # Force v2 explicitly so the assertion stays anchored to the v2
-    # token shape regardless of any default-version flip.
-    cmd = [
-        sys.executable,
-        "-m",
-        "tokenizer",
-        "--backend", "ghidra",
-        "--batch", str(queue),
-        "--source", str(_HELLO_SRC),
-        "--output", str(out_dir),
-        "--platform", "auto",
-    ]
-    env = dict(os.environ)
-    env["ASM_TOKENIZER_FORMAT_VERSION"] = "2"
-
-    proc = subprocess.run(
-        cmd,
-        cwd=str(_REPO_ROOT),
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert proc.returncode == 0, (
-        f"tokenize failed (rc={proc.returncode}) for {binary_name}\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    )
-
-    csv_path = out_dir / f"{binary_name}_output.csv"
-    assert csv_path.is_file(), f"CSV not emitted at {csv_path}"
-
+    csv_path = fresh_ghidra_csv(binary_name, _HELLO_SRC)
     _, names = _function_tokens(csv_path, "xcalloc")
 
     # Walk the stream tracking open-bracket depth; the assertion is
@@ -328,11 +290,13 @@ def test_negative_imm_value_negative_riscv64_xcalloc(tmp_path: Path) -> None:
         # ``valued_const_v2`` at depth 0; look ahead past its digit-slot
         # payload bytes (IDs < 256) for the next real token. The
         # post-refactor shape pins that next token to ``value_negative``
-        # when (and only when) the immediate was negative. We're looking
-        # for the magnitude ``0x10`` slot to detect the ``c.addi sp,
-        # -0x10`` site specifically, but we also accept any magnitude —
-        # the negative-sign pairing is the wire-shape contract, the
-        # magnitude is the spot-check.
+        # when (and only when) the immediate was negative. The
+        # magnitude pin (``0x10``) is the spot-check that this match
+        # really is ``c.addi sp, -0x10`` rather than some unrelated
+        # negative valued_const at depth 0 in xcalloc. The wire-shape
+        # contract (postfix ``value_negative``) is the broader
+        # invariant; pinning the magnitude makes the canary specific
+        # enough to fail if either drifts.
         magnitude_digits: list[int] = []
         next_real: str | None = None
         for j in range(i + 1, len(names)):
@@ -607,61 +571,17 @@ def test_string_ptr_metadata_arm32_minigzip() -> None:
 
 # ---------- 7. Negative bracket disp: arm32 ldr r6, [r5, #-4] ----------
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_ARM32_ZLIB_BINARY = Path(
+_ARM32_ZLIB_SRC = Path(
     os.environ.get("ASM_TOKENIZER_ZLIB_SRC")
     or "/home/sirati/devel/python/asm-tokenizer/src/zlib"
-) / "arm32-gcc-7-Os_minigzip"
-
-
-def _tokenize_inplace(binary: Path, tmp_path: Path) -> Path:
-    """Re-tokenize ``binary`` via the standalone ``--batch`` entry-point
-    into ``tmp_path/out`` and return the resulting CSV path. Mirrors
-    ``test_ghidra_e2e_smoke.py``'s single-binary smoke pattern so the
-    bracket-shape assertions below exercise the full Ghidra → tokenizer
-    pipeline (not just an in-process operand-tokenizer probe) on a CSV
-    that was produced *after* the postfix-``value_negative`` migration.
-    Reusing a stale ``/tmp/asm_smoke/out/`` snapshot would assert the
-    pre-migration shape and would falsely pass against the producer fix.
-    """
-    queue = tmp_path / "queue.txt"
-    queue.write_text(f"{binary.name}\n")
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "tokenizer",
-        "--backend", "ghidra",
-        "--batch", str(queue),
-        "--source", str(binary.parent),
-        "--output", str(out_dir),
-        "--platform", "auto",
-    ]
-    env = dict(os.environ)
-    env["ASM_TOKENIZER_FORMAT_VERSION"] = "2"
-
-    proc = subprocess.run(
-        cmd,
-        cwd=str(_REPO_ROOT),
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert proc.returncode == 0, (
-        f"tokenize failed (rc={proc.returncode}) for {binary.name}\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    )
-    csv_path = out_dir / f"{binary.name}_output.csv"
-    assert csv_path.is_file(), f"CSV not emitted at {csv_path}"
-    return csv_path
+)
+_ARM32_ZLIB_BINARY = _ARM32_ZLIB_SRC / "arm32-gcc-7-Os_minigzip"
 
 
 @pytest.mark.slow
-def test_negative_disp_arm32_value_negative_postfix(tmp_path: Path) -> None:
+def test_negative_disp_arm32_value_negative_postfix(
+    fresh_ghidra_csv,
+) -> None:
     """arm32 ``main`` in ``arm32-gcc-7-Os_minigzip`` contains
     ``ldr r6, [r5, #-4]`` at 0x10a94 (a plain pre-indexed negative-disp
     load). After the postfix-``value_negative`` migration, the bracket
@@ -678,7 +598,7 @@ def test_negative_disp_arm32_value_negative_postfix(tmp_path: Path) -> None:
     if not _ARM32_ZLIB_BINARY.is_file():
         pytest.skip(f"arm32 fixture missing at {_ARM32_ZLIB_BINARY}")
 
-    csv_path = _tokenize_inplace(_ARM32_ZLIB_BINARY, tmp_path)
+    csv_path = fresh_ghidra_csv(_ARM32_ZLIB_BINARY.name, _ARM32_ZLIB_SRC)
     _, names = _function_tokens(csv_path, "main")
 
     # Walk every [MEM_OPEN_BRACKET ... MEM_CLOSE_BRACKET] window in
