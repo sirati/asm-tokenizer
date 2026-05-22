@@ -23,6 +23,7 @@ from .category_tokens import (
     FID_KEYED_CATEGORIES,
     resolve_category_token_ids,
     resolve_number_token_ids,
+    resolve_value_negative_token_id,
 )
 from .custom_float import (
     INFNAN_EXPONENT_UNBIASED,
@@ -46,5 +47,6 @@ __all__ = [
     "decode_raw_tokens",
     "resolve_category_token_ids",
     "resolve_number_token_ids",
+    "resolve_value_negative_token_id",
     "splice_with_callees",
 ]

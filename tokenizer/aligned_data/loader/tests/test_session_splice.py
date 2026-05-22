@@ -465,7 +465,7 @@ def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
         fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
     ) as sess:
         spliced = sess.splice_with_callees(0, arm="matched", max_depth=0)[0]
-        cat_ids, num_ids = sess._get_token_id_caches()
+        cat_ids, num_ids, vneg_id = sess._get_token_id_caches()
         matched = sess.load_matched(0)
         section, _section_offset, _matched = (
             sess._load_matched_section_and_variants(0)
@@ -476,6 +476,7 @@ def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
             fids_per_category=fids,
+            value_negative_token_id=vneg_id,
             func_name=matched.func_name,
             metadata=matched.variants[0].metadata,
         )
@@ -589,12 +590,13 @@ def test_splice_unmatched_arm_supported(tmp_path):
     with BinarySession(base, binary_name, vocab, metadata) as sess:
         spliced = sess.splice_with_callees(0, arm="unmatched", max_depth=0)[0]
         # Splicer decodes the FULL wire stream; baseline must do the same.
-        cat_ids, num_ids = sess._get_token_id_caches()
+        cat_ids, num_ids, vneg_id = sess._get_token_id_caches()
         fd = sess.load_unmatched(0)
         baseline = decode_raw_tokens(
             fd.full_token_stream(),
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
+            value_negative_token_id=vneg_id,
             func_name=fd.func_name,
             metadata=fd.metadata,
         )
