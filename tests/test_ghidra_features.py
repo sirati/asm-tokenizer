@@ -39,6 +39,15 @@ from tokenizer.vocab_unifier.loader import load_vocab_manager
 
 
 _OUT_DIR = Path("/tmp/asm_smoke/out")
+# Source roots for inline-tokenization tests that need a fresh CSV (i.e.
+# tests pinning post-Phase-2 wire shapes that the cached
+# ``/tmp/asm_smoke/out/`` fixture pre-dates). Matches the resolution
+# convention in ``test_ghidra_e2e_smoke.py``.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_HELLO_SRC = Path(
+    os.environ.get("ASM_TOKENIZER_HELLO_SRC")
+    or "/tmp/asm_smoke/src"
+)
 
 
 # The token stream's ``v2`` digit slots (IDs 0..255) ride immediately
@@ -220,22 +229,88 @@ def test_mem_disp_base_merge_riscv64_xcalloc() -> None:
 # ---------- 3. Negative immediate: riscv64 c.addi sp, -0x10 -----------
 
 
-def test_negative_imm_mem_minus_riscv64_xcalloc() -> None:
+@pytest.mark.slow
+def test_negative_imm_value_negative_riscv64_xcalloc(tmp_path: Path) -> None:
     """riscv64 ``c.addi sp, -0x10`` (stack adjust at function entry):
-    the negative immediate must be encoded as a leading ``MEM_MINUS``
-    token immediately before a ``valued_const_v2`` token, and that
-    pair must NOT be nested inside a ``MEM_OPEN_BRACKET`` ...
-    ``MEM_CLOSE_BRACKET`` window (a ``mem[ ]mem`` would imply the
-    minus is part of an addressing expression rather than a leading
-    arithmetic sign).
+    the negative immediate must surface as a ``valued_const_v2`` token
+    (the absolute-value magnitude ``0x10``) immediately followed by a
+    postfix ``value_negative`` sign metatoken — with NO intervening
+    ``MEM_MINUS``. The pair must sit at depth 0 (outside any
+    ``MEM_OPEN_BRACKET`` ... ``MEM_CLOSE_BRACKET`` window) so the
+    assertion is about a leading arithmetic sign, not a minus that
+    happens to live inside an addressing expression.
+
+    This test is the canary that gates the producer-side unification
+    of signed-immediate handling onto the ``valued_const_v2`` emitter
+    (``MEM_MINUS`` prefix retired everywhere outside ``mem[ ]mem``
+    brackets). If this test ever flips back to failing, the most
+    likely cause is a producer-side regression that re-introduces a
+    ``MEM_MINUS`` prefix on a bare arithmetic immediate — NOT a test
+    problem. Inspect ``tokenizer/arch/<arch>`` and the
+    ``valued_const_v2`` emitter path before touching this assertion.
+
+    To guarantee we exercise post-refactor producer output (rather
+    than a stale pre-refactor CSV cached at ``/tmp/asm_smoke/out/``),
+    this test runs the standalone tokenizer subprocess on the riscv64
+    fixture into ``tmp_path`` every invocation. The cost is a single
+    Ghidra spin-up (~30-120s), which is why the test carries the
+    ``slow`` marker like its J.2 sibling.
     """
-    csv_path = _csv_path("riscv64-clang-10-O2_hello")
+    binary_name = "riscv64-clang-10-O2_hello"
+    binary = _HELLO_SRC / binary_name
+    if not binary.is_file():
+        pytest.skip(
+            f"riscv64 fixture missing at {binary}; run "
+            f"test_ghidra_e2e_smoke.py first to stage it"
+        )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    queue = tmp_path / "queue.txt"
+    queue.write_text(f"{binary_name}\n")
+
+    # Mirror the J.2 smoke's standalone invocation: ``-m tokenizer``
+    # plus ``--batch`` so ``_run_standalone`` drives the pipeline.
+    # Force v2 explicitly so the assertion stays anchored to the v2
+    # token shape regardless of any default-version flip.
+    cmd = [
+        sys.executable,
+        "-m",
+        "tokenizer",
+        "--backend", "ghidra",
+        "--batch", str(queue),
+        "--source", str(_HELLO_SRC),
+        "--output", str(out_dir),
+        "--platform", "auto",
+    ]
+    env = dict(os.environ)
+    env["ASM_TOKENIZER_FORMAT_VERSION"] = "2"
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, (
+        f"tokenize failed (rc={proc.returncode}) for {binary_name}\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+    csv_path = out_dir / f"{binary_name}_output.csv"
+    assert csv_path.is_file(), f"CSV not emitted at {csv_path}"
+
     _, names = _function_tokens(csv_path, "xcalloc")
 
-    # Track open-bracket depth so we can check the MEM_MINUS is at
-    # depth 0 (outside any mem[ ]mem pair).
+    # Walk the stream tracking open-bracket depth; the assertion is
+    # about the depth-0 view (a ``value_negative`` inside ``mem[ ]mem``
+    # would be a sign on a memory disp, which is out of scope here).
     depth = 0
     found = False
+    depth0_mem_minus_indices: list[int] = []
     for i, n in enumerate(names):
         if n == "MEM_OPEN_BRACKET":
             depth += 1
@@ -243,21 +318,45 @@ def test_negative_imm_mem_minus_riscv64_xcalloc() -> None:
         if n == "MEM_CLOSE_BRACKET":
             depth -= 1
             continue
-        if n == "MEM_MINUS" and depth == 0:
-            # Look ahead for the next non-digit token; should be a
-            # valued_const_v2.
-            for j in range(i + 1, len(names)):
-                if names[j].startswith("<digit_"):
-                    continue
-                if names[j] == "valued_const_v2":
-                    found = True
-                break
-            if found:
-                break
+        if depth != 0:
+            continue
+        if n == "MEM_MINUS":
+            depth0_mem_minus_indices.append(i)
+            continue
+        if n != "valued_const_v2":
+            continue
+        # ``valued_const_v2`` at depth 0; look ahead past its digit-slot
+        # payload bytes (IDs < 256) for the next real token. The
+        # post-refactor shape pins that next token to ``value_negative``
+        # when (and only when) the immediate was negative. We're looking
+        # for the magnitude ``0x10`` slot to detect the ``c.addi sp,
+        # -0x10`` site specifically, but we also accept any magnitude —
+        # the negative-sign pairing is the wire-shape contract, the
+        # magnitude is the spot-check.
+        magnitude_digits: list[int] = []
+        next_real: str | None = None
+        for j in range(i + 1, len(names)):
+            if names[j].startswith("<digit_"):
+                # Capture the digit-slot byte value for the magnitude
+                # spot-check; ``<digit_HH>`` → int(HH, 16).
+                magnitude_digits.append(int(names[j][len("<digit_"):-1], 16))
+                continue
+            next_real = names[j]
+            break
+        if next_real == "value_negative" and 0x10 in magnitude_digits:
+            found = True
+            break
 
     assert found, (
-        "no MEM_MINUS-prefix valued_const_v2 pair at depth 0 in xcalloc "
-        f"token stream ({names})"
+        "no value_negative-postfix valued_const_v2(0x10) pair at depth 0 "
+        f"in xcalloc token stream — producer-side sign unification may "
+        f"have regressed. Stream: {names}"
+    )
+    assert not depth0_mem_minus_indices, (
+        "MEM_MINUS surfaced at depth 0 in xcalloc; the producer-side "
+        "refactor should have eliminated MEM_MINUS outside mem[ ]mem "
+        f"brackets. Offending positions: {depth0_mem_minus_indices}. "
+        f"Stream: {names}"
     )
 
 
