@@ -79,7 +79,55 @@ def _v2_bytes_to_int(byte_ids: typing.Iterable[int]) -> int:
 
 
 class VocabularyManager:
-    """Manages vocabulary for token-to-ID mapping"""
+    """Manages vocabulary for token-to-ID mapping.
+
+    Unified vocab layout (``format_version=1``, ``platform=None``)
+    =============================================================
+
+    +------------+----------------------------+--------------------------------------------+
+    | IDs        | Section                    | Source                                     |
+    +============+============================+============================================+
+    | 0..255     | digit slots                | protocol-reserved (inline-digit wire band) |
+    +------------+----------------------------+--------------------------------------------+
+    | 256        | ``value_negative``         | protocol-reserved postfix marker           |
+    +------------+----------------------------+--------------------------------------------+
+    | 257..263   | NUMBER block               | ``valued_const_v2``, ``float16``,          |
+    |            |                            | ``bfloat16``, ``float32``, ``float64``,    |
+    |            |                            | ``float80``, ``float128``                  |
+    |            |                            | (source-declaration order)                 |
+    +------------+----------------------------+--------------------------------------------+
+    | 264..271   | IDENTITY block             | ``block_v2``, ``local_func``,              |
+    |            |                            | ``plt_func``, ``ext_func``,                |
+    |            |                            | ``string_ptr``, ``jump_table``,            |
+    |            |                            | ``ro_data_ptr``, ``rw_data_ptr``           |
+    |            |                            | (user-canonical, then alphabetical)        |
+    +------------+----------------------------+--------------------------------------------+
+    | 272..X     | instruction reps           | mnemonics / register lists / block defs    |
+    |            |                            | merged from per-binary CSVs                |
+    +------------+----------------------------+--------------------------------------------+
+    | X+1..Y     | metadata-variant tail      | axis-grouped (``arch`` -> ``comp`` ->      |
+    |            |                            | ``cver`` -> ``opt``, then sidecar          |
+    |            |                            | prefixes alphabetical; within each axis    |
+    |            |                            | values alphabetical)                       |
+    +------------+----------------------------+--------------------------------------------+
+
+    Anchors (class constants):
+
+    - ``_V2_RESERVED_DIGIT_COUNT``    = 256 (wire-stream protocol invariant)
+    - ``_V2_VALUE_NEGATIVE_TOKEN_ID`` = 256
+    - ``_V2_RESERVED_TOKEN_COUNT``    = 257 (saver/loader strip boundary)
+    - ``_V2_NUMBER_BLOCK_START``      = 257 (first canonical NUMBER token)
+    - ``_V2_IDENTITY_BLOCK_START``    = 264 (first canonical IDENTITY token)
+    - ``_V2_EAGER_BLOCK_END``         = 272 (first instruction-rep slot)
+
+    Per-binary vocabs (``format_version=2``, ``platform != None``) do NOT
+    pre-register the NUMBER+IDENTITY blocks — those tokens land lazily
+    during normal tokenization at whatever slot happens to come up. The
+    unified vocab's canonical layout is enforced by
+    :meth:`_register_v2_canonical_blocks` at ``unify_vocab`` time and
+    re-asserted by :meth:`from_vocab` when loading a serialised unified
+    vocab.
+    """
 
     # IDs 0..255 are protocol-reserved digit slots under format_version
     # in (1, 2) (v1 unified vocab + v2 per-binary CSV; both share the

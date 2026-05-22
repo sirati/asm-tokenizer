@@ -25,3 +25,7 @@ Never open an implementation file until you can state in one sentence what the s
 when performing renaming or refactoring, never recreate files from memory, instead with mv/cp the file, then perform surgical edits. You MUST always do this as it avoids unintended misedits that you otherwise do all the time.
 
 rules in .rules
+
+## Vocab layout (unified vocab)
+
+Canonical id anchors: `0..255` digits, `256` value_negative, `257..263` NUMBER block (`valued_const_v2`, floats), `264..271` IDENTITY block (`block_v2`, `*_func`, `*_ptr`, `jump_table`), `272..X` instruction reps, tail = axis-grouped metadata-variant block. Only the unified vocab carries this canonical layout — per-binary vocabs are lazy (NUMBER+IDENTITY tokens land wherever first-seen, anywhere `>=257`). See `tokenizer/token_manager.py`'s `VocabularyManager` class docstring for the full table.
