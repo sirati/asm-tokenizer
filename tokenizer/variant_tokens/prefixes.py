@@ -40,10 +40,27 @@ COMP_PREFIX = "comp:"
 CVER_PREFIX = "cver:"
 OPT_PREFIX = "opt:"
 
+# Declared positional-axis order — the single source of truth for any
+# axis-grouped iteration (vocab unifier registration order, encoder
+# layout, debug renderers). ``build_axis_strings`` builds the same
+# order field-by-field; this tuple lets order-aware consumers stay
+# in sync without re-encoding the literal sequence.
+POSITIONAL_PREFIXES: tuple[str, ...] = (
+    ARCH_PREFIX,
+    COMP_PREFIX,
+    CVER_PREFIX,
+    OPT_PREFIX,
+)
+
 # Number of positional axes encoded at the head of every variant
 # record. Co-versioned with the on-disk bin layout — see plan §
 # "Co-versioning between unified vocab and per-record bin layout".
 N_POSITIONAL_AXES = 4
+
+# Tripwire: a new positional axis must update both constants together
+# (and ``build_axis_strings`` below). Asserting at import time turns a
+# silent drift into a loud startup failure.
+assert len(POSITIONAL_PREFIXES) == N_POSITIONAL_AXES
 
 
 def _strip_opt_dash(opt: str) -> str:
