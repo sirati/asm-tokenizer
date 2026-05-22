@@ -56,7 +56,9 @@ from tokenizer.aligned_data.matched_sections_bin import (
     PerCallEntry,
     SectionWriter,
     _padded_jump_table_bytes,
+    _variant_block_offset,
     iter_sections_bin,
+    parse_section_bin,
 )
 from tokenizer.aligned_data.memmap_format import (
     DATA_BIN_PRELUDE_MAGIC,
@@ -1257,3 +1259,191 @@ def test_numpy_view_writes_persist_to_bin(tmp_path: Path):
         f"jump-table padding u16 at byte offset {pad_offset} should be "
         f"zero, got 0x{pad_value:04X}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Vectorized hole-fill byte-equivalence proof
+# ---------------------------------------------------------------------------
+
+
+def _reference_resolve_caller_section(
+    self,
+    *,
+    caller_section_offset: int,
+    callee_fid: int,
+    callee_section_offset: int,
+    callee_sorted_vrefs: "np.ndarray",
+    callee_sort_order: "np.ndarray",
+) -> None:
+    """Python-loop reference implementation of ``_resolve_caller_section``.
+
+    Re-derives the same (vkey -> variant_idx) dict the pre-vectorized
+    code consulted from the (sorted_vrefs, sort_order) pair, then walks
+    the caller section row-by-row exactly as the legacy code did:
+    Case A patches ``function_section_ptr`` per call_target via
+    :meth:`MemmapBinWriter.patch`; Case B re-walks the per-call entries
+    and patches each ``UNRESOLVED`` slot whose owning variant's vkey is
+    in the callee's table. Used as the oracle for the byte-equivalence
+    test below.
+    """
+    # Recover vkey_to_idx with last-write-wins among equal vrefs —
+    # iterating in sorted order means the last appearance of an equal
+    # vref overwrites earlier ones, which matches the legacy dict
+    # comprehension's behaviour on a stably-sorted input.
+    callee_vkey_to_idx: dict[int, int] = {}
+    for sorted_pos in range(callee_sorted_vrefs.shape[0]):
+        callee_vkey_to_idx[int(callee_sorted_vrefs[sorted_pos])] = int(
+            callee_sort_order[sorted_pos]
+        )
+
+    blob = self._writer.view()
+    try:
+        caller, _end = parse_section_bin(blob, caller_section_offset)
+    finally:
+        blob.release()
+
+    call_targets_start = (
+        caller_section_offset
+        + SECTION_HEADER_SIZE
+        + _padded_jump_table_bytes(len(caller.variants))
+    )
+    target_called_idxs: set[int] = set()
+    packed_section_offset = struct.pack("<I", callee_section_offset)
+    for i, ct in enumerate(caller.call_targets):
+        if ct.function_name_ptr != callee_fid:
+            continue
+        target_called_idxs.add(i)
+        row_offset = call_targets_start + i * CALL_TARGET_ENTRY_SIZE
+        self._writer.patch(row_offset + 4, packed_section_offset)
+
+    if not target_called_idxs:
+        return
+
+    for v_idx, variant in enumerate(caller.variants):
+        resolved_idx = callee_vkey_to_idx.get(variant.variant_ref_offset)
+        if resolved_idx is None:
+            continue
+        variant_offset = _variant_block_offset(caller, v_idx)
+        entry_offset = variant_offset + VARIANT_HEADER_SIZE
+        packed_resolved = struct.pack("<H", resolved_idx)
+        for called_idx, sv_idx in variant.per_call_entries:
+            slot_offset = entry_offset + 2
+            entry_offset += PER_CALL_ENTRY_SIZE
+            if called_idx not in target_called_idxs:
+                continue
+            if sv_idx != UNRESOLVED_VARIANT_INDEX:
+                continue
+            self._writer.patch(slot_offset, packed_resolved)
+
+
+def _build_byte_equivalence_fixture(path: Path) -> None:
+    """Drive a writer through a multi-section scenario that exercises
+    every hole-fill case: sibling FIDs, a self-call, a caller variant
+    whose vkey no callee sibling carries (MISSING-stamp at finalize),
+    and an odd ``n_variants`` so the padded jump-table region is also
+    on the path. Used by the vectorized vs. reference oracle test.
+    """
+    writer = SectionWriter(path)
+
+    # Caller section (FID=1) — forward-refs FID=2 (LOCAL) and itself
+    # (LOCAL, exercising the self-call hole-fill path). ``n_variants=3``
+    # so the jump-table padding bytes are part of the captured bytes.
+    writer.begin_section(function_name_ptr=1, n_variants=3)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=2, type=CallTargetType.LOCAL, is_matched=True
+            ),
+            CallTargetSpec(
+                function_name_ptr=1, type=CallTargetType.LOCAL, is_matched=True
+            ),
+        ]
+    )
+    # Variant 0: vkey=0xA1 (matched by sibling-1 of FID=2 below).
+    writer.begin_variant(variant_ref_offset=0xA1, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [
+            PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xA1),
+            PerCallEntry(called_idx=1, callee_function_name_ptr=1, callee_vkey=0xA1),
+        ]
+    )
+    writer.end_variant(vkey=0xA1)
+    # Variant 1: vkey=0xA2 (matched by sibling-2 of FID=2 below).
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [
+            PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xA2),
+        ]
+    )
+    writer.end_variant(vkey=0xA2)
+    # Variant 2: vkey=0xFE — no sibling carries this, MISSING-stamped
+    # at finalize. Exercises both the per-call hole + the MISSING path.
+    writer.begin_variant(variant_ref_offset=0xFE, data_offset_shifted=0)
+    writer.emit_per_call_entries(
+        [
+            PerCallEntry(called_idx=0, callee_function_name_ptr=2, callee_vkey=0xFE),
+        ]
+    )
+    writer.end_variant(vkey=0xFE)
+    writer.end_section()
+
+    # Sibling-1 of FID=2 — carries vkey=0xA1.
+    writer.begin_section(function_name_ptr=2, n_variants=1)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA1, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey=0xA1)
+    writer.end_section()
+
+    # Sibling-2 of FID=2 — carries vkey=0xA2 (disjoint set; last
+    # sibling wins in ``_known_sections`` for the FID).
+    writer.begin_section(function_name_ptr=2, n_variants=1)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0xA2, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey=0xA2)
+    writer.end_section()
+
+    writer.finalize()
+
+
+def test_vectorized_hole_fill_byte_equivalence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vectorized ``_resolve_caller_section`` produces the same
+    on-disk bytes as a correctness-preserving Python-loop oracle.
+
+    Runs the same multi-section fixture twice — once with the live
+    vectorized writer, once with a monkey-patched reference impl that
+    re-implements the legacy dict-lookup loop on the new signature —
+    and compares the raw bytes byte-for-byte. The fixture covers
+    sibling FIDs (sibling close patches), a self-call, a caller-missing
+    vkey (finalize-time MISSING stamp), and an odd ``n_variants`` so
+    jump-table padding is also in the captured region.
+    """
+    vec_path = tmp_path / "vectorized.bin"
+    _build_byte_equivalence_fixture(vec_path)
+    vectorized_bytes = vec_path.read_bytes()
+
+    ref_path = tmp_path / "reference.bin"
+    monkeypatch.setattr(
+        SectionWriter,
+        "_resolve_caller_section",
+        _reference_resolve_caller_section,
+    )
+    _build_byte_equivalence_fixture(ref_path)
+    reference_bytes = ref_path.read_bytes()
+
+    assert len(vectorized_bytes) == len(reference_bytes), (
+        "fixture lengths diverge: vectorized="
+        f"{len(vectorized_bytes)} reference={len(reference_bytes)}"
+    )
+    if vectorized_bytes != reference_bytes:
+        # Surface the first differing byte to make a real failure
+        # diagnosable instead of just "bytes differ".
+        for i, (a, b) in enumerate(zip(vectorized_bytes, reference_bytes)):
+            if a != b:
+                raise AssertionError(
+                    f"vectorized bytes diverge from reference at offset {i}: "
+                    f"vectorized=0x{a:02X} reference=0x{b:02X}"
+                )

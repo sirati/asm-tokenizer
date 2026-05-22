@@ -108,6 +108,18 @@ class MemmapBinWriter:
         """
         return memoryview(self._mm)[: self._cursor]
 
+    def writable_u8_view(self) -> "np.ndarray":
+        """Zero-copy writable numpy uint8 view of [0, cursor).
+
+        Writes through the returned array propagate to the underlying
+        mmap (and hence disk). Invalidated when the mapping is grown
+        or closed; do NOT keep references past :meth:`finalize`.
+        """
+        import numpy as np
+        arr = np.frombuffer(self._mm, dtype=np.uint8, count=self._cursor)
+        arr.setflags(write=True)
+        return arr
+
     def patch(self, offset: int, data: bytes) -> None:
         """Rewrite ``len(data)`` bytes at ``offset`` without moving the cursor.
 
