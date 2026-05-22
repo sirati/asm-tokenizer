@@ -554,14 +554,15 @@ def test_per_call_entries_sorted_by_call_target_type(tmp_path: Path) -> None:
     # Caller is the last section.
     caller_section = sections[-1]
     assert caller_section.function_name_ptr == registry.line_no(caller)
-    # call_targets table stays in encounter order (PLT, LOCAL, PLT, LOCAL):
-    # the sort only applies to per_call_entries, not to the table.
+    # call_targets table is also category-grouped (LOCAL block then PLT
+    # block) — this invariant is owned by the parsed-record union seam,
+    # not by the per_call_entries sort.
     table_types = [ct.type for ct in caller_section.call_targets]
     assert table_types == [
-        CallTargetType.PLT,
+        CallTargetType.LOCAL,
         CallTargetType.LOCAL,
         CallTargetType.PLT,
-        CallTargetType.LOCAL,
+        CallTargetType.PLT,
     ]
 
     # Per_call_entries for the single variant must be in non-decreasing
