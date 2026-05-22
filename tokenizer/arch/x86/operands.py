@@ -304,9 +304,18 @@ def tokenize_operand_immediate(
     """
     tokens = []
 
-    imm_val = abs(op.imm)
-    imm_val_hex_len = num_hex_digits(imm_val)
+    raw_imm = op.imm
+    # Width-only computation: hex-digit count is sign-agnostic and
+    # selects the encoding-size branch, distinct from the value handed
+    # to the constant-handler.
+    imm_val_hex_len = num_hex_digits(abs(raw_imm))
 
+    # Sign of ``raw_imm`` is owned downstream by
+    # ``constant_handler.process_constant_v2`` (postfix ``value_negative``
+    # metatoken on the ``valued_const_v2`` token). This call site does
+    # NOT inspect sign — the value flows through to the emitter
+    # unmodified.
+    #
     # Immediate operand → an FP-tagged immediate (precedence.md step 1) is
     # an inline ``floatXX`` with IEEE bit pattern. Only the Ghidra path
     # stamps a non-None ``fp_type`` on the operand; the angr/Capstone path
@@ -315,7 +324,7 @@ def tokenize_operand_immediate(
 
     if imm_val_hex_len <= 2:  # Small immediate (0x00 to 0xFF)
         imm_token = constant_handler.process_constant_v2(
-            imm_val,
+            raw_imm,
             fp_immediate_type=fp_immediate,
         )
         tokens.extend(imm_token)
@@ -323,7 +332,7 @@ def tokenize_operand_immediate(
         if insn.mnemonic in arithmetic_instructions:
             # Arithmetic instruction - treat as valued constant literal
             imm_token = constant_handler.process_constant_v2(
-                imm_val,
+                raw_imm,
                 is_arithmetic=True,
                 fp_immediate_type=fp_immediate,
             )
@@ -331,37 +340,44 @@ def tokenize_operand_immediate(
         elif insn.mnemonic in addressing_control_flow_instructions:
             # Addressing/control flow instruction - check for metadata.
             # todo we have a major issue here: a lot of targets are NOI in this table, e.g. I got .plt but angr can resolve it cfg.kb.functions.get(call_target_addr)
-            meta = lookup.lookup(imm_val)
+            meta = lookup.lookup(raw_imm)
             # Internal-jump heuristic: a control-flow target inside the
             # current function body (and not at the function entry) is
             # treated as a raw arithmetic value rather than a typed
-            # ``block`` token. Function entries (``start_addr == imm_val``)
+            # ``block`` token. Function entries (``start_addr == raw_imm``)
             # — including recursive calls — fall through to the typed
             # path so the ``local_func`` precedence rule fires.
+            #
+            # Negative ``raw_imm`` never matches a function entry
+            # (provider-reported function addresses are non-negative) and
+            # never falls within ``[func_min_addr, func_max_addr)``
+            # (both bounds non-negative), so the heuristic safely
+            # short-circuits on negative arithmetic immediates that
+            # share a control-flow mnemonic.
             if (
                 meta.kind == AddressKind.LOCAL_FUNCTION
                 and meta.start_addr is not None
-                and meta.start_addr != imm_val
-                and func_min_addr <= imm_val < func_max_addr
+                and meta.start_addr != raw_imm
+                and func_min_addr <= raw_imm < func_max_addr
             ):
                 imm_token = constant_handler.process_constant_v2(
-                    imm_val,
+                    raw_imm,
                     is_arithmetic=True,
                     fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
             else:
                 imm_token = constant_handler.process_constant_v2(
-                    imm_val,
+                    raw_imm,
                     meta=meta,
                     is_arithmetic=False,
                     fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
         else:  # Fallback - create opaque constant
-            meta = lookup.lookup(imm_val)
+            meta = lookup.lookup(raw_imm)
             imm_token = constant_handler.process_constant_v2(
-                imm_val,
+                raw_imm,
                 meta=meta,
                 is_arithmetic=False,
                 fp_immediate_type=fp_immediate,

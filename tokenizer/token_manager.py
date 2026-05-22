@@ -1324,14 +1324,18 @@ class VocabularyManager:
                     "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
-                # Plan reserves negative-value semantics; current impl
-                # restricts to non-negative until the ConstantHandler
-                # rewrite (Phase 1.C.1) settles on a two's-complement vs.
-                # MEM_MINUS-prefix vs. sign-byte choice. Failing fast here
-                # surfaces the gap rather than silently emitting a corrupt
-                # stream.
+                # ``ValuedConstV2Inner``'s contract is unsigned-payload:
+                # callers MUST pass a non-negative magnitude. Sign
+                # decomposition is owned by the v2 emitter
+                # ``_V2EmittersMixin._emit_valued_const``, which is the
+                # only legitimate caller; it splits a signed input into
+                # ``[Valued_Const_V2(abs(value)), Value_Negative()?]``.
+                # The assert below traps any code path that tries to
+                # embed a sign byte into the magnitude stream -- fail-
+                # fast surfaces the design break rather than silently
+                # emitting a corrupt token sequence.
                 assert value >= 0, (
-                    f"v2 valued_const negative-value encoding is not yet specified; got {value}"
+                    f"v2 valued_const magnitude must be non-negative; got {value}"
                 )
                 self.value = value
                 self._type_token_id = vocab_manager._private_add_token("valued_const_v2", self.__class__)

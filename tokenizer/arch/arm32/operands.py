@@ -85,7 +85,14 @@ def _emit_arm_disp_value_tokens(
         tokens.extend(disp_tokens)
     else:
         force_opaque = not has_base
-        meta = lookup.lookup(abs_value)
+        # Address-typed lookup is signed: providers return UNKNOWN for
+        # negative inputs, so a negative arithmetic displacement falls
+        # through to the v2 valued_const fallback (step 11) and the
+        # sign is carried by the postfix ``value_negative`` metatoken.
+        # Keying on ``abs_value`` would let a negative disp whose
+        # magnitude collides with a real string/data address misclassify
+        # as a string_ptr / ro_data_ptr.
+        meta = lookup.lookup(value)
 
         if force_opaque or (abs_value > (1 << 18)) or is_resolved_target:
             disp_tokens = constant_handler.process_constant_v2(
