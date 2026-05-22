@@ -225,8 +225,13 @@ def test_build_memmap_files_rejects_v2_unified_vocab(tmp_path: Path) -> None:
     tokens registered). build_memmap_files must reject it loudly rather
     than silently emit bin records whose token IDs are stub lookups."""
     csv_files, unified_vocab_path = _build_synthetic_corpus(tmp_path)
-    # Hand-roll a v2 unified vocab in place of the v3 one.
+    # Hand-roll a v2 unified vocab in place of the v3 one. The canonical
+    # NUMBER+IDENTITY blocks are pre-registered so the head-of-vocab
+    # invariant ``VocabularyManager.from_vocab`` asserts holds; what's
+    # under test here is the v2-on-unified-path rejection, not a
+    # secondary "slot 257 is empty" artefact of the fixture.
     vm_v2 = VocabularyManager(platform=None, format_version=2)
+    vm_v2._register_v2_canonical_blocks()
     with open(unified_vocab_path, "w", newline="", encoding="ascii") as fh:
         writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm_v2, writer)

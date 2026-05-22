@@ -39,6 +39,35 @@ from tokenizer.vocab_unifier.saver import save_vocabulary
 
 _DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT  # 256
 _RESERVED = VocabularyManager._V2_RESERVED_TOKEN_COUNT  # 257 (digits + value_negative)
+_EAGER_BLOCK_END = VocabularyManager._V2_EAGER_BLOCK_END  # 272 (reserved + canonical blocks)
+
+# Canonical number + identity blocks pre-registered by every unified VM
+# produced by the post-Phase-4 unifier (see
+# ``VocabularyManager._register_v2_canonical_blocks``). The wire-format
+# strings and their TokenTypes are the source-declaration order of the
+# Inner-class registration sequence; mirroring them here keeps test
+# fixtures aligned with the head-of-vocab invariant asserted by
+# ``VocabularyManager.from_vocab``.
+_CANONICAL_BLOCK_NAMES = (
+    # Number block 257..263
+    "valued_const_v2",
+    "float16", "bfloat16", "float32", "float64", "float80", "float128",
+    # Identity block 264..271 (user-canonical first 5 then alphabetical)
+    "block_v2",
+    "local_func", "plt_func", "ext_func", "string_ptr",
+    "jump_table", "ro_data_ptr", "rw_data_ptr",
+)
+_CANONICAL_BLOCK_TYPES = (
+    TokenType.VALUED_CONST_V2,
+    TokenType.FLOAT16, TokenType.BFLOAT16, TokenType.FLOAT32,
+    TokenType.FLOAT64, TokenType.FLOAT80, TokenType.FLOAT128,
+    TokenType.BLOCK_V2,
+    TokenType.LOCAL_FUNC, TokenType.PLT_FUNC, TokenType.EXT_FUNC,
+    TokenType.STRING_PTR, TokenType.JUMP_TABLE,
+    TokenType.RO_DATA_PTR, TokenType.RW_DATA_PTR,
+)
+assert len(_CANONICAL_BLOCK_NAMES) == _EAGER_BLOCK_END - _RESERVED
+assert len(_CANONICAL_BLOCK_TYPES) == _EAGER_BLOCK_END - _RESERVED
 
 
 def _make_vm(
@@ -48,22 +77,32 @@ def _make_vm(
     format_version: int,
 ) -> VocabularyManager:
     """Build a VocabularyManager with the protocol-reserved prefix
-    (256 digit slots + ``value_negative`` at slot 256) up front,
-    followed by ``real_tokens``. Uses ``from_vocab`` so the call is
-    independent of constructor-side prefill logic — but mirrors the
-    same prefix the constructor pins, matching the wire format the
-    saver/loader contract assumes."""
+    (256 digit slots + ``value_negative`` at slot 256) up front, followed
+    by — for unified VMs only — the canonical number+identity blocks at
+    slots 257..271, then ``real_tokens``. Uses ``from_vocab`` so the call
+    is independent of constructor-side prefill logic but mirrors the same
+    wire shape the post-Phase-4 unifier produces (so the head-of-vocab
+    invariant asserted inside ``from_vocab`` for unified VMs holds).
+
+    Per-binary VMs keep the legacy shape — they never carry the canonical
+    blocks (those are registered lazily by tokenization, not eagerly)."""
     digit_names = [f"digit_{i:02X}" for i in range(_DIGIT_COUNT)]
-    vocab_list = digit_names + ["value_negative"] + real_tokens
+    canonical_block = list(_CANONICAL_BLOCK_NAMES) if platform is None else []
+    vocab_list = digit_names + ["value_negative"] + canonical_block + real_tokens
     total = len(vocab_list)
 
     id_to_token_type = np.full(total, TokenType.UNRESOLVED, dtype=np.int8)
     # The `value_negative` marker carries its own token type; the saver/
     # loader round-trip must preserve it.
     id_to_token_type[_DIGIT_COUNT] = TokenType.VALUE_NEGATIVE
+    # Canonical block tokens carry the source-declaration token types
+    # the unifier's `_register_v2_canonical_blocks` writes them with.
+    real_token_start = _RESERVED + len(canonical_block)
+    for offset, ttype in enumerate(_CANONICAL_BLOCK_TYPES[: len(canonical_block)]):
+        id_to_token_type[_RESERVED + offset] = ttype
     # Mark real tokens with a non-reserved type so the round-trip surfaces
     # any normalization bugs in the saver's `- TokenType.UNRESOLVED` step.
-    for i in range(_RESERVED, total):
+    for i in range(real_token_start, total):
         id_to_token_type[i] = TokenType.PLATFORM
 
     platform_instruction_type_cache = np.full(
@@ -79,8 +118,8 @@ def _make_vm(
     if platform is None:
         platform_list = ["x64", "arm64"]
         token_to_platform = np.full(total, -1, dtype=np.int8)
-        for i in range(_RESERVED, total):
-            token_to_platform[i] = (i - _RESERVED) % len(platform_list)
+        for i in range(real_token_start, total):
+            token_to_platform[i] = (i - real_token_start) % len(platform_list)
 
     return VocabularyManager.from_vocab(
         platform=platform,
@@ -345,8 +384,14 @@ def test_saver_strips_value_negative_unified() -> None:
     """Same protocol-reserved treatment for the unified-vocab format
     (``format_version=1``, ``platform=None``)."""
     vm = VocabularyManager(platform=None, format_version=1)
-    # Register one Variant_Axis token so the wire vocab is non-empty;
-    # the strip boundary is what's under test, not the cell contents.
+    # Pre-register the canonical NUMBER+IDENTITY blocks at slots 257..271
+    # so the round-trip lands on a vocab whose head matches the
+    # ``from_vocab`` head-of-vocab invariant; without this, the loader
+    # would assert "expected 'valued_const_v2' at slot 257".
+    vm._register_v2_canonical_blocks()
+    # Register one Variant_Axis token so the wire vocab carries something
+    # past the canonical tail; the strip boundary is what's under test,
+    # not the cell contents.
     vm.Variant_Axis("arch:x64")
 
     buf = io.StringIO()

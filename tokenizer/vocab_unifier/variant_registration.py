@@ -1,26 +1,15 @@
-"""Variant-axis token discovery + registration for the unifier.
+"""Variant-axis sidecar discovery helper for the unifier.
 
-Single concern: walk a corpus of per-binary vocab CSVs, derive every
-distinct variant-axis token string (via the existing
-``VariantInfo.from_csv`` + ``VariantInventory`` chain), and register
-each one into a unified ``VocabularyManager`` in a deterministic
-order.
+Single concern: walk a corpus of per-binary vocab CSVs and yield one
+``VariantInfo`` per CSV, skipping (with a warning) any CSV whose
+filename + optional ``_meta.json`` sidecar fails to parse.
 
-This module sits between ``tokenizer.variant_tokens`` (which knows
-the prefix grammar and the inventory) and
-``tokenizer.vocab_unifier.unifier`` (which orchestrates the two
-passes). It does NOT touch CSV vocab contents, mapping arrays, or
-instruction tokens — those are pass 2's concern.
-
-Order discipline: ``VariantInventory.iter_tokens`` yields strings in
-alphabetical order. The unifier registers them on a freshly
-constructed unified ``VocabularyManager`` (``MEMMAP_FORMAT_VERSION``)
-whose first caller-registerable ID is
-``_V2_VALUE_NEGATIVE_TOKEN_ID + 1`` (257) — one past the eagerly-pinned
-``value_negative`` marker that now occupies id 256 (the slot directly
-above the 256-entry reserved digit band). Variant tokens therefore
-land at contiguous IDs ``[257, 257 + n_variants)``. Two runs over the
-same corpus produce byte-identical unified vocabs.
+Registration of variant tokens onto the unified vocabulary lives in
+``tokenizer.vocab_unifier.unifier`` because the variant block lands at
+the TAIL of the unified vocab (after all instruction representatives)
+and the order is axis-grouped via
+``VariantInventory.iter_tokens_axis_grouped`` — both invariants the
+unifier owns, not this helper.
 """
 
 from __future__ import annotations
@@ -29,10 +18,7 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
-from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
-from tokenizer.token_manager import VocabularyManager
 from tokenizer.variant_info import VariantInfo
-from tokenizer.variant_tokens import VariantInventory
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +26,10 @@ logger = logging.getLogger(__name__)
 def _iter_variant_infos(csv_files: Iterable[Path]) -> Iterable[VariantInfo]:
     """Yield one ``VariantInfo`` per CSV; skip + warn on parse errors.
 
-    A single corrupt sidecar must not abort the discovery pass — the
-    unifier already tolerates per-file load failures in pass 2 and the
-    same robustness applies here. The caller decides what to do with
-    a zero-variants outcome.
+    A single corrupt sidecar must not abort the discovery walk — the
+    unifier already tolerates per-file load failures in its instruction
+    merge and the same robustness applies here. The caller decides what
+    to do with a zero-variants outcome.
     """
     for csv_path in csv_files:
         try:
@@ -52,55 +38,3 @@ def _iter_variant_infos(csv_files: Iterable[Path]) -> Iterable[VariantInfo]:
             logger.warning(
                 "variant discovery: skipping %s (%s)", csv_path, exc,
             )
-
-
-def discover_and_register_variants(
-    csv_files: list[Path],
-    unified_vm: VocabularyManager,
-) -> int:
-    """Pass-1 variant discovery + registration.
-
-    Sidecar-only walk: each CSV is mapped to a ``VariantInfo`` via
-    ``VariantInfo.from_csv`` (which reads only the filename + the
-    optional ``_meta.json`` sidecar — never the CSV body). Every
-    distinct prefixed axis string the corpus implies is registered
-    into ``unified_vm`` via ``unified_vm.Variant_Axis(token_str)``.
-
-    The Inner-class constructor calls ``_private_add_token`` under
-    the hood and is idempotent on duplicate strings, so the per-token
-    registration cost is one dict lookup after the first occurrence.
-
-    ``unified_vm.format_version`` MUST equal ``MEMMAP_FORMAT_VERSION``
-    — variant tokens are meaningful only in the unified vocab. The
-    assert is here (not inside the Inner class) because the Inner
-    class is layout-agnostic and a future format may legitimately
-    reuse it.
-
-    Returns the count of distinct variant tokens registered — the
-    unifier logs this and tests assert it.
-    """
-    assert unified_vm.format_version == MEMMAP_FORMAT_VERSION, (
-        f"discover_and_register_variants requires a unified VM at "
-        f"format_version={MEMMAP_FORMAT_VERSION}; "
-        f"got format_version={unified_vm.format_version}"
-    )
-
-    inventory = VariantInventory()
-    inventory.update(_iter_variant_infos(csv_files))
-
-    # `iter_tokens` yields alphabetically — deterministic across runs
-    # on the same corpus. Each call to `unified_vm.Variant_Axis(s)`
-    # registers `s` at the next free vocab id (starting at 256 on a
-    # fresh unified VM); duplicates are no-ops.
-    n_registered = 0
-    for token_str in inventory.iter_tokens():
-        unified_vm.Variant_Axis(token_str)
-        n_registered += 1
-
-    logger.info(
-        "variant discovery: registered %d distinct variant-axis tokens "
-        "(from %d CSV files)",
-        n_registered,
-        len(csv_files),
-    )
-    return n_registered

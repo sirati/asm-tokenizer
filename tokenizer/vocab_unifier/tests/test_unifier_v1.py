@@ -1,6 +1,6 @@
 """Unifier output is stamped at ``MEMMAP_FORMAT_VERSION``.
 
-Three concerns, one file:
+Two concerns, one file:
 
 1. End-to-end ``unify_vocab`` produces a unified CSV whose
    ``format_version`` equals ``MEMMAP_FORMAT_VERSION`` (and equals 1
@@ -8,8 +8,6 @@ Three concerns, one file:
    without a corresponding cascade rebuild is loud).
 2. Per-binary v2 CSVs remain accepted as input — the boundary check
    at ``unifier.py:96`` is unchanged, and out-of-scope per the plan.
-3. ``discover_and_register_variants`` asserts the unified VM is at
-   ``MEMMAP_FORMAT_VERSION``; any other version raises.
 
 Tests use only the public unifier surface + the public loader
 ``load_unified_vocab_manager`` (sibling subtask owns the loader), so
@@ -21,16 +19,11 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-import pytest
-
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 from tokenizer.vocab_unifier.saver import save_vocabulary
 from tokenizer.vocab_unifier.unifier import unify_vocab
-from tokenizer.vocab_unifier.variant_registration import (
-    discover_and_register_variants,
-)
 
 
 # Padding line so the synthetic per-binary CSV body exceeds the 64
@@ -115,29 +108,3 @@ def test_unifier_accepts_per_binary_v2_input(tmp_path: Path) -> None:
 
     # No raises = boundary check still tolerates v2 inputs.
     unify_vocab(csv_files, out_csv)
-
-
-def test_variant_registration_accepts_unified_vm(tmp_path: Path) -> None:
-    """``discover_and_register_variants`` accepts a VM at
-    ``MEMMAP_FORMAT_VERSION`` without raising."""
-    csv_path = tmp_path / "x64-gcc-13.2.0-O2_hello_output.csv"
-    csv_path.write_text("")  # filename-only; variant discovery reads no body
-
-    vm = VocabularyManager(platform=None, format_version=MEMMAP_FORMAT_VERSION)
-    # Plain call; assertion would raise if the version gate were wrong.
-    n = discover_and_register_variants([csv_path], vm)
-    assert n > 0, "expected at least one variant registered for legacy 4-axis filename"
-
-
-@pytest.mark.parametrize("bad_version", [2, 3])
-def test_variant_registration_rejects_non_memmap_version(
-    tmp_path: Path, bad_version: int,
-) -> None:
-    """Any VM whose format_version != MEMMAP_FORMAT_VERSION trips the
-    assertion in ``discover_and_register_variants``."""
-    csv_path = tmp_path / "x64-gcc-13.2.0-O2_hello_output.csv"
-    csv_path.write_text("")
-
-    vm = VocabularyManager(platform=None, format_version=bad_version)
-    with pytest.raises(AssertionError, match="format_version"):
-        discover_and_register_variants([csv_path], vm)

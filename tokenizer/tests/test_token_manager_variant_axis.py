@@ -25,8 +25,9 @@ _V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
 # the digit range occupies 0.._V2_RESERVED_DIGIT_COUNT-1, the
 # `value_negative` postfix sign marker is pinned at
 # `_V2_VALUE_NEGATIVE_TOKEN_ID` (= _V2_RESERVED_DIGIT_COUNT), so the
-# first caller-assignable slot starts one past the marker.
-_V1_FIRST_CALLER_ID = VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID + 1
+# first caller-assignable slot starts one past the marker — i.e.
+# `_V2_RESERVED_TOKEN_COUNT`.
+_V1_FIRST_CALLER_ID = VocabularyManager._V2_RESERVED_TOKEN_COUNT
 
 
 def _make_v1_vm() -> VocabularyManager:

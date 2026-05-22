@@ -334,12 +334,6 @@ class VocabularyManager:
         # eagerly register the number+identity blocks at the fixed slots
         # 257..271; the range attributes mirror that layout so model heads
         # can route by id range without re-discovering it.
-        #
-        # Note: hand-crafted test fixtures and pre-canonical-layout vocabs
-        # may not carry the canonical names at the expected slots. The
-        # head-of-vocab check below is therefore soft — it tightens to an
-        # invariant only once every unified vocab on disk has been
-        # regenerated under the canonical layout.
         if format_version in (1, 2) and platform is None:
             v_man._number_block_range = (
                 VocabularyManager._V2_NUMBER_BLOCK_START,
@@ -349,12 +343,23 @@ class VocabularyManager:
                 VocabularyManager._V2_IDENTITY_BLOCK_START,
                 VocabularyManager._V2_IDENTITY_BLOCK_START + VocabularyManager._V2_IDENTITY_BLOCK_COUNT,
             )
-            if len(v_man.id_to_token) > VocabularyManager._V2_NUMBER_BLOCK_START:
-                head = v_man.id_to_token[VocabularyManager._V2_NUMBER_BLOCK_START]
-                if head == "valued_const_v2":
-                    pass  # canonical layout — good.
-                # else: silently allow; the unifier post-rewrite will make
-                # this an invariant.
+            # Head-of-vocab invariant: every unified vocab produced by the
+            # canonical-layout unifier carries the number block starting at
+            # ``_V2_NUMBER_BLOCK_START`` with ``valued_const_v2`` at the
+            # head. A mismatch here means either a stale pre-refactor
+            # on-disk vocab or a test fixture that bypassed the unifier
+            # flow — both surface here rather than silently mis-routing
+            # downstream consumers that key off the range attributes.
+            assert (
+                v_man.id_to_token[VocabularyManager._V2_NUMBER_BLOCK_START]
+                == "valued_const_v2"
+            ), (
+                "unified vocab head-of-vocab mismatch: expected "
+                f"'valued_const_v2' at slot "
+                f"{VocabularyManager._V2_NUMBER_BLOCK_START}, "
+                f"got {v_man.id_to_token[VocabularyManager._V2_NUMBER_BLOCK_START]!r}; "
+                "vocab was not produced by the canonical-layout unifier"
+            )
         return v_man
 
     def _private_add_token(

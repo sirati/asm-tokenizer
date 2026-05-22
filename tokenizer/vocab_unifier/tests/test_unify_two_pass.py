@@ -69,7 +69,8 @@ def _write_per_binary_csv(
 
 def test_unify_vocab_emits_unified_with_variant_block(tmp_path: Path) -> None:
     """Two per-binary v2 CSVs -> one unified CSV (at
-    ``MEMMAP_FORMAT_VERSION``) with variant + instruction id bands."""
+    ``MEMMAP_FORMAT_VERSION``) with canonical-block prefix, instruction
+    band, and an axis-grouped variant tail."""
     csv_files = []
     # Filename schema: <platform>-<compiler>-<version>-<opt>_<pkg>_output.csv
     # (default format string: platform-compiler-version-optimisationlevel_binaryname).
@@ -91,33 +92,62 @@ def test_unify_vocab_emits_unified_with_variant_block(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.format_version == MEMMAP_FORMAT_VERSION
 
-    # The eagerly-pinned `value_negative` marker occupies id 256; the
-    # caller-driven variant-axis block starts one past it.
+    # The eagerly-pinned `value_negative` marker occupies id 256.
     assert loaded.get_token_id("value_negative") == 256
     assert loaded.id_to_token_type[256] == TokenType.VALUE_NEGATIVE
-    variant_block_start = 257
 
-    # Variant tokens: 2 archs + 2 compilers + 2 cver + 2 opts = 8
-    expected_variants = {
-        "arch:x64", "arch:arm64",
-        "comp:gcc", "comp:clang",
-        "cver:gcc:13.2.0", "cver:clang:15.0.0",
+    # Canonical NUMBER block at 257..263 (post-Phase-4 unifier
+    # pre-registers these before any caller-driven tokens).
+    assert loaded.get_token_id("valued_const_v2") == 257
+    assert loaded.id_to_token_type[257] == TokenType.VALUED_CONST_V2
+    assert loaded.get_token_id("float128") == 263
+
+    # Canonical IDENTITY block at 264..271.
+    assert loaded.get_token_id("block_v2") == 264
+    assert loaded.id_to_token_type[264] == TokenType.BLOCK_V2
+    assert loaded.get_token_id("rw_data_ptr") == 271
+
+    # Instruction representatives start at 272 — block_v2 is the only
+    # canonical identity token a `Block_V2` registration on the per-binary
+    # VM contributes, and it's already pinned at 264 by the canonical
+    # block. So the next free id past 271 is filled either by per-binary
+    # representatives (none in this fixture beyond what's already pinned)
+    # or by the variant tail directly. Either way, slots starting at the
+    # tail's first id carry VARIANT_AXIS — assert that below.
+    n_variants_expected = 8  # 2 archs + 2 compilers + 2 cver + 2 opts
+    total_ids = len(loaded.id_to_token)
+    variant_tail_start = total_ids - n_variants_expected
+
+    # Variant tail: 8 tokens in axis-grouped order (positional axes
+    # first declared, then alphabetical within axis):
+    #   arch:* in alphabetical -> arm64, x64
+    #   comp:* -> clang, gcc
+    #   cver:* -> clang:15.0.0, gcc:13.2.0
+    #   opt:*  -> O2, O3
+    # No sidecar in this fixture, so no extra-metadata axes.
+    expected_tail_order = [
+        "arch:arm64", "arch:x64",
+        "comp:clang", "comp:gcc",
+        "cver:clang:15.0.0", "cver:gcc:13.2.0",
         "opt:O2", "opt:O3",
-    }
-    n_variants = len(expected_variants)
-    for offset, token in enumerate(sorted(expected_variants)):
+    ]
+    assert len(expected_tail_order) == n_variants_expected
+    for offset, token in enumerate(expected_tail_order):
         tid = loaded.get_token_id(token)
-        assert tid == variant_block_start + offset, (
+        assert tid == variant_tail_start + offset, (
             f"variant {token!r} got id {tid}, "
-            f"expected {variant_block_start + offset}"
+            f"expected {variant_tail_start + offset} (axis-grouped tail)"
         )
         assert loaded.id_to_token_type[tid] == TokenType.VARIANT_AXIS
 
-    # First instruction-id band must start exactly above the variants.
-    # Block_V2 registers a `block_v2` representative token, so we know
-    # ids variant_block_start+n_variants and up are non-variant.
-    first_after_variants = variant_block_start + n_variants
-    assert loaded.id_to_token_type[first_after_variants] != TokenType.VARIANT_AXIS
+    # Slot directly below the variant tail (last instruction-rep slot)
+    # must NOT be a variant token — that's the boundary between the
+    # instruction band and the variant tail.
+    if variant_tail_start > VocabularyManager._V2_EAGER_BLOCK_END:
+        assert (
+            loaded.id_to_token_type[variant_tail_start - 1]
+            != TokenType.VARIANT_AXIS
+        )
 
     # mapping.b64c sidecars must exist alongside each input CSV.
     for csv_file in csv_files:

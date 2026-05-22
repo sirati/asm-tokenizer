@@ -19,6 +19,7 @@ from tokenizer.tokens import TokenType
 
 
 _V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+_V2_RESERVED_TOKEN_COUNT = VocabularyManager._V2_RESERVED_TOKEN_COUNT
 
 
 # --------------------------------------------------------------------------
@@ -45,8 +46,9 @@ def test_constructor_reserves_digit_slots_for_inline_digit_versions(fv):
     type_cache = np.asarray(vm.id_to_token_type[:_V2_RESERVED_DIGIT_COUNT])
     assert np.all(type_cache == TokenType.UNRESOLVED)
     # Post-digit baseline: the constructor adds exactly one entry — the
-    # `value_negative` marker at id `_V2_RESERVED_DIGIT_COUNT`.
-    assert len(vm.id_to_token) == _V2_RESERVED_DIGIT_COUNT + 1
+    # `value_negative` marker at id `_V2_RESERVED_DIGIT_COUNT`. Total
+    # constructor-pinned slot count is `_V2_RESERVED_TOKEN_COUNT` (= 257).
+    assert len(vm.id_to_token) == _V2_RESERVED_TOKEN_COUNT
     assert vm.id_to_token[_V2_RESERVED_DIGIT_COUNT] == "value_negative"
 
 
