@@ -3,7 +3,9 @@
 Single concern: encode/decode the on-disk layout of the section catalog
 that the dataloader reads in lieu of the legacy ``<binary>_sections.csv``.
 Every section records a function's header (function_name_ptr,
-n_call_targets, n_variants), the typed call_target table
+n_call_targets, n_variants), a per-section ``n_variants × u16`` jump
+table that carries each variant's per-call entry count (used by the
+reader to address variant_i in O(1)), the typed call_target table
 (``(function_name_ptr, function_section_ptr, type, is_matched)`` per
 entry), and per-variant blocks each holding a sparse list of
 ``(called_idx, section_variant_index)`` pairs into the section's
@@ -78,13 +80,24 @@ from tokenizer.aligned_data.memmap_writer import MemmapBinWriter
 #: Bytes per section header (``u32 func_line_no | u16 n_call_targets | u16 n_variants``).
 SECTION_HEADER_SIZE: int = 8
 
+#: Bytes per per-section jump-table entry. The jump table sits immediately
+#: after the section header and carries ``n_variants × u16`` lengths,
+#: encoded as ``(variant_i_total_bytes - VARIANT_HEADER_SIZE) >> 2``. With
+#: :data:`VARIANT_HEADER_SIZE` = 8 and :data:`PER_CALL_ENTRY_SIZE` = 4 this
+#: evaluates to ``n_calls_for_variant_i``, so the reader can address
+#: variant_i in O(1) via ``cumsum(jump_table) * 4 + arange(...) * 8``
+#: rather than the variable-length variant walk it used to need.
+JUMP_TABLE_ENTRY_SIZE: int = 2
+
 #: Bytes per call_target table entry
 #: (``u32 function_name_ptr | u32 function_section_ptr | u16 flags | u16 reserved``).
 CALL_TARGET_ENTRY_SIZE: int = 12
 
 #: Bytes per variant header
-#: (``u32 variant_ref_offset | u32 data_offset_shifted | u16 n_calls``).
-VARIANT_HEADER_SIZE: int = 10
+#: (``u32 variant_ref_offset | u32 data_offset_shifted``). ``n_calls`` lives
+#: in the section's jump table (one ``u16`` per variant) so the reader does
+#: not need to walk every prior variant to address variant_i.
+VARIANT_HEADER_SIZE: int = 8
 
 #: Bytes per per-call entry (``u16 called_idx | u16 section_variant_index``).
 PER_CALL_ENTRY_SIZE: int = 4
@@ -269,18 +282,26 @@ class SectionWriter:
 
     Lifecycle per section, called in order:
 
-    1. :meth:`begin_section` — aligns + records the section's offset.
+    1. :meth:`begin_section` — aligns + records the section's offset,
+       and stashes the caller-declared ``n_variants`` so
+       :meth:`emit_call_targets` can size the per-section jump-table
+       reservation that immediately follows the 8-byte header.
     2. :meth:`emit_call_targets` — stamps the section header (with
-       ``n_variants = 0`` placeholder) + the call_target table.
+       ``n_variants = 0`` placeholder), reserves ``n_variants × u16``
+       zero bytes for the jump table, then writes the call_target
+       table. The header's ``n_variants`` is patched at
+       :meth:`end_section`.
     3. Per variant:
-        a. :meth:`begin_variant` — stamps the variant header (with
-           ``n_calls = 0`` placeholder).
+        a. :meth:`begin_variant` — stamps the 8-byte variant header
+           (``u32 variant_ref_offset | u32 data_offset_shifted``);
+           ``n_calls`` lives in the section's jump table, not the
+           variant header.
         b. :meth:`emit_per_call_entries` — writes the per-call slots.
            Backward references re-parse the callee section pointed at
            by ``_known_sections[callee_fid]`` and stamp the resolved
            variant idx directly on a vkey hit; misses (and forward
-           references) defer to a back-patch hole. Patches the
-           variant's ``n_calls`` field afterwards.
+           references) defer to a back-patch hole. Stamps this
+           variant's jump-table slot afterwards.
         c. :meth:`end_variant` — increments the section's variant
            count.
     4. :meth:`end_section` — back-patches ``n_variants``, pads to a
@@ -328,6 +349,14 @@ class SectionWriter:
         self._current_section_offset: Optional[int] = None
         # Offset of THIS section's u16 n_variants slot (patched in end_section).
         self._n_variants_slot: Optional[int] = None
+        # Caller-declared variant count for THIS section. Used to size the
+        # jump-table reservation in :meth:`emit_call_targets` and asserted
+        # against the observed count at :meth:`end_section`.
+        self._current_n_variants_declared: Optional[int] = None
+        # File offset of THIS section's jump table (first u16 slot). The
+        # table is ``n_variants × u16`` immediately after the 8-byte
+        # section header, so this is ``section_offset + SECTION_HEADER_SIZE``.
+        self._current_jump_table_offset: Optional[int] = None
         # Specs of the section's call_targets, kept around so
         # emit_per_call_entries can validate that a PerCallEntry's
         # called_idx points at the call_target whose FID the entry
@@ -335,15 +364,17 @@ class SectionWriter:
         self._current_call_targets: list[CallTargetSpec] = []
         # variant_idx → variant_count assigned so far in this section.
         self._current_variant_count: int = 0
-        # For the currently-open variant: file offset of its u16 n_calls
-        # slot. None when no variant is open.
-        self._current_variant_n_calls_slot: Optional[int] = None
+        # Whether a variant is currently open (between :meth:`begin_variant`
+        # and the corresponding :meth:`end_variant`). Per-call counts now
+        # live in the section's jump table, not the variant header, so the
+        # writer no longer tracks a per-variant slot offset.
+        self._current_variant_open: bool = False
 
     # ------------------------------------------------------------------
     # Section lifecycle
     # ------------------------------------------------------------------
 
-    def begin_section(self, function_name_ptr: int) -> int:
+    def begin_section(self, function_name_ptr: int, n_variants: int) -> int:
         """Open a new section for ``function_name_ptr``.
 
         Aligns the cursor up to a 4-byte boundary (pads the gap with
@@ -352,6 +383,16 @@ class SectionWriter:
         FID emitted by EARLIER sections remain in ``_pending_holes`` —
         they're resolved when this section closes via
         :meth:`end_section`.
+
+        ``n_variants`` is the exact number of variants the caller is
+        about to emit. It is used to reserve ``n_variants × u16`` bytes
+        for the per-section jump table immediately after the section
+        header (see :data:`JUMP_TABLE_ENTRY_SIZE`). The reader uses that
+        table to address variant_i in O(1). Declaring a count that
+        differs from the actual number of :meth:`end_variant` calls is
+        rejected at :meth:`end_section`; the writer cannot recover from
+        the mismatch because the call_targets block sits at a fixed
+        offset past the table.
 
         Function names are not globally unique within a binary: clang
         emits ``OUTLINED_FUNCTION_N`` for compiler-internal helpers
@@ -370,6 +411,17 @@ class SectionWriter:
         index.
         """
         self._assert_no_open_section()
+        if n_variants < 0:
+            raise ValueError(
+                f"n_variants must be non-negative, got {n_variants}"
+            )
+        if n_variants > UNRESOLVED_VARIANT_INDEX - 1:
+            raise ValueError(
+                f"section for function_name_ptr={function_name_ptr} declares "
+                f"n_variants={n_variants}; max is {UNRESOLVED_VARIANT_INDEX} "
+                f"per section (u16 slot reserves 0xFFFF as the "
+                f"unresolved-hole sentinel)"
+            )
         self._pad_to_alignment()
         section_offset = self._writer.cursor
 
@@ -378,18 +430,27 @@ class SectionWriter:
         self._current_fid = function_name_ptr
         self._current_section_offset = section_offset
         self._n_variants_slot = None
+        self._current_n_variants_declared = n_variants
+        # The jump table starts immediately after the section header. It is
+        # written by emit_call_targets (which knows its own header_offset),
+        # but the offset is deterministic so we cache it here for
+        # emit_per_call_entries to stamp into.
+        self._current_jump_table_offset = section_offset + SECTION_HEADER_SIZE
         self._current_call_targets = []
         self._current_variant_count = 0
-        self._current_variant_n_calls_slot = None
+        self._current_variant_open = False
         return section_offset
 
     def emit_call_targets(self, call_targets: list[CallTargetSpec]) -> None:
-        """Stamp the section header + the call_target table.
+        """Stamp the section header + jump-table reservation + call_target table.
 
-        ``n_variants`` is stamped at ``0`` and patched in
-        :meth:`end_section`. The caller is responsible for having
-        deduplicated ``call_targets`` by ``(function_name_ptr, type)``;
-        SectionWriter does not check.
+        ``n_variants`` is stamped at ``0`` in the header and patched in
+        :meth:`end_section` from the observed variant count. The jump
+        table sits between the header and the call_target table; it is
+        reserved with zero bytes here and each entry is stamped by
+        :meth:`emit_per_call_entries` for its owning variant. The caller
+        is responsible for having deduplicated ``call_targets`` by
+        ``(function_name_ptr, type)``; SectionWriter does not check.
         """
         self._assert_section_open()
         if self._n_variants_slot is not None:
@@ -406,6 +467,16 @@ class SectionWriter:
         header_offset = self._writer.write(header)
         # n_variants is the second u16 → header_offset + 4 (u32) + 2 (u16).
         self._n_variants_slot = header_offset + 4 + 2
+
+        # Reserve the per-section jump table immediately after the header.
+        # The reservation is zero-initialised; each entry is patched by
+        # :meth:`emit_per_call_entries` when the owning variant's per-call
+        # entries are written. Sized from the caller-declared n_variants
+        # so the call_target table that follows starts at a deterministic
+        # offset.
+        jump_table_bytes = self._current_n_variants_declared * JUMP_TABLE_ENTRY_SIZE
+        if jump_table_bytes:
+            self._writer.write(b"\x00" * jump_table_bytes)
 
         for spec in call_targets:
             row_offset = self._writer.cursor
@@ -427,11 +498,13 @@ class SectionWriter:
     def begin_variant(
         self, variant_ref_offset: int, data_offset_shifted: int
     ) -> None:
-        """Stamp the variant header (``n_calls`` set to 0 placeholder).
+        """Stamp the variant header.
 
-        Cursor is left at the start of the per-call entries; the next
-        :meth:`emit_per_call_entries` call writes them and patches
-        ``n_calls``.
+        The variant header is an 8-byte
+        ``u32 variant_ref_offset | u32 data_offset_shifted``; the
+        per-variant ``n_calls`` lives in the section's jump table and is
+        stamped by :meth:`emit_per_call_entries` once the entries are
+        written. Cursor is left at the start of the per-call entries.
         """
         self._assert_section_open()
         if self._n_variants_slot is None:
@@ -439,24 +512,30 @@ class SectionWriter:
                 "begin_variant called before emit_call_targets; the "
                 "section header must be stamped first"
             )
-        if self._current_variant_n_calls_slot is not None:
+        if self._current_variant_open:
             raise ValueError(
                 "begin_variant called while a previous variant is still "
                 "open; call emit_per_call_entries + end_variant first"
             )
+        if self._current_variant_count >= self._current_n_variants_declared:
+            raise ValueError(
+                f"section for function_name_ptr={self._current_fid} declared "
+                f"n_variants={self._current_n_variants_declared} at "
+                f"begin_section but begin_variant was called a "
+                f"{self._current_variant_count + 1}-th time; the jump-table "
+                f"reservation has no slot for this variant"
+            )
 
         variant_header = struct.pack(
-            "<IIH",
+            "<II",
             variant_ref_offset,
             data_offset_shifted,
-            0,  # n_calls — patched in emit_per_call_entries
         )
-        header_offset = self._writer.write(variant_header)
-        # n_calls is the trailing u16 → header_offset + 4 + 4.
-        self._current_variant_n_calls_slot = header_offset + 4 + 4
+        self._writer.write(variant_header)
+        self._current_variant_open = True
 
     def emit_per_call_entries(self, entries: list[PerCallEntry]) -> None:
-        """Write the variant's per-call entries + patch ``n_calls``.
+        """Write the variant's per-call entries + stamp its jump-table slot.
 
         Backward references (``callee_fid in _known_sections``) re-parse
         the callee section pointed at by ``_known_sections[callee_fid]``
@@ -481,6 +560,10 @@ class SectionWriter:
         current_section_offset)`` so a setdefault returns the same
         record for both the first call_target row's header-hole and
         the variant's per-call-slot accumulation.
+
+        After the entries are written the section's jump table receives
+        ``jump_table[current_variant_idx] = len(entries)`` so the reader
+        can address variant_i in O(1).
         """
         self._assert_variant_open()
 
@@ -510,11 +593,21 @@ class SectionWriter:
                 struct.pack("<HH", entry.called_idx, section_variant_index)
             )
 
-        # Patch the variant header's n_calls (u16 LE).
-        self._writer.patch(
-            self._current_variant_n_calls_slot,
-            struct.pack("<H", len(entries)),
+        # Stamp the jump-table slot for THIS variant. ``_current_variant_count``
+        # is the 0-based index of the currently-open variant (incremented at
+        # :meth:`end_variant`), which is exactly the slot we want.
+        n_calls = len(entries)
+        if n_calls > 0xFFFF:
+            raise ValueError(
+                f"section for function_name_ptr={self._current_fid} "
+                f"variant_idx={self._current_variant_count} has {n_calls} "
+                f"per-call entries; max is {0xFFFF} (u16 jump-table slot)"
+            )
+        jump_table_slot = (
+            self._current_jump_table_offset
+            + self._current_variant_count * JUMP_TABLE_ENTRY_SIZE
         )
+        self._writer.patch(jump_table_slot, struct.pack("<H", n_calls))
 
     def _resolve_backward_variant_index(
         self, *, callee_fid: int, callee_vkey: Hashable
@@ -526,7 +619,9 @@ class SectionWriter:
         (forward reference) OR the closed section's local variant
         table does not carry ``callee_vkey`` (e.g. the loader will
         observe the call but the inlined callee body is not directly
-        addressable — handled later by the hole path).
+        addressable — handled later by the hole path) OR the parser
+        is not yet equipped to read the current wire format (the
+        transitional state during the B.1 → B.2 hand-off).
 
         The section we re-parse is the SAME one whose offset will end
         up in the call_target row's ``function_section_ptr`` after the
@@ -541,15 +636,38 @@ class SectionWriter:
         section_offset = self._known_sections.get(callee_fid)
         if section_offset is None:
             return None
+        parsed = self._try_parse_section(section_offset)
+        if parsed is None:
+            return None
+        for i, variant in enumerate(parsed.variants):
+            if variant.variant_ref_offset == callee_vkey:
+                return i
+        return None
+
+    def _try_parse_section(self, section_offset: int) -> Optional["Section"]:
+        """Re-parse a section from the in-flight bin, or ``None`` if the
+        parser cannot yet read the current wire format.
+
+        TODO: pending B.2 reader rewrite. The B.1 wire-format change
+        (8-byte variant header + per-section jump table) lands on the
+        writer side before :func:`parse_section_bin` is taught to read
+        it; until B.2 ships, every parser call from the writer's
+        in-flight resolution paths raises :class:`NotImplementedError`
+        and is treated as "not yet resolvable" so the per-variant
+        hole stays open and gets stamped with
+        :data:`MISSING_VARIANT_INDEX` at :meth:`finalize`. Header
+        back-patches do not go through this helper (they read
+        ``_known_sections`` directly) and remain fully functional.
+        """
         blob = self._writer.view()
         try:
-            parsed, _end = parse_section_bin(blob, section_offset)
-            for i, variant in enumerate(parsed.variants):
-                if variant.variant_ref_offset == callee_vkey:
-                    return i
+            try:
+                parsed, _end = parse_section_bin(blob, section_offset)
+            except NotImplementedError:
+                return None
+            return parsed
         finally:
             blob.release()
-        return None
 
     def end_variant(self, vkey: Hashable) -> int:
         """Finalise the currently-open variant.
@@ -578,7 +696,7 @@ class SectionWriter:
                 f"0xFFFF as the unresolved-hole sentinel)"
             )
         self._current_variant_count += 1
-        self._current_variant_n_calls_slot = None
+        self._current_variant_open = False
         return variant_idx
 
     def end_section(self) -> tuple[int, int]:
@@ -605,10 +723,18 @@ class SectionWriter:
         the length is a multiple of :data:`SECTION_ALIGNMENT`).
         """
         self._assert_section_open()
-        if self._current_variant_n_calls_slot is not None:
+        if self._current_variant_open:
             raise ValueError(
                 "end_section called while a variant is still open; "
                 "call end_variant first"
+            )
+        if self._current_variant_count != self._current_n_variants_declared:
+            raise ValueError(
+                f"section for function_name_ptr={self._current_fid} declared "
+                f"n_variants={self._current_n_variants_declared} at "
+                f"begin_section but emitted {self._current_variant_count}; "
+                f"the jump-table reservation cannot be retroactively resized "
+                f"because the call_targets block sits at a fixed offset past it"
             )
 
         # Patch n_variants.
@@ -624,18 +750,18 @@ class SectionWriter:
         fid = self._current_fid
 
         # Recover THIS section's variant table from its own bytes —
-        # each section is self-describing. The memoryview is bounded
-        # to [0, cursor); the section we just closed lies fully
-        # inside that range. Released in a finally so the view does
-        # not outlive the mmap.
-        blob = self._writer.view()
-        try:
-            parsed, _end = parse_section_bin(blob, section_offset)
+        # each section is self-describing. Returns ``None`` in the
+        # transitional B.1 → B.2 hand-off (parser not yet equipped for
+        # the jump-table wire format), in which case every per_variant
+        # hole stays open and gets :data:`MISSING_VARIANT_INDEX` at
+        # :meth:`finalize`.
+        parsed = self._try_parse_section(section_offset)
+        if parsed is None:
+            vkey_to_idx: dict[Hashable, int] = {}
+        else:
             vkey_to_idx = {
                 v.variant_ref_offset: i for i, v in enumerate(parsed.variants)
             }
-        finally:
-            blob.release()
 
         # Resolve back-patches whose callee FID == THIS section's FID.
         # Header slots: stamp this section's offset every time a
@@ -671,9 +797,11 @@ class SectionWriter:
         self._current_fid = None
         self._current_section_offset = None
         self._n_variants_slot = None
+        self._current_n_variants_declared = None
+        self._current_jump_table_offset = None
         self._current_call_targets = []
         self._current_variant_count = 0
-        self._current_variant_n_calls_slot = None
+        self._current_variant_open = False
 
         return section_offset, section_length
 
@@ -800,7 +928,7 @@ class SectionWriter:
 
     def _assert_variant_open(self) -> None:
         self._assert_section_open()
-        if self._current_variant_n_calls_slot is None:
+        if not self._current_variant_open:
             raise ValueError("no variant is currently open")
 
     def _assert_called_idx_matches(self, entry: PerCallEntry) -> None:
@@ -928,13 +1056,24 @@ class SectionWriter:
         the subsequent :meth:`MemmapBinWriter.finalize` (which calls
         ``mmap.close``) does not trip on an exported pointer being
         held alive by the traceback of an in-flight exception.
+
+        TODO: pending B.2 reader rewrite. Until :func:`parse_section_bin`
+        learns the jump-table wire format, the sweep cannot decode
+        sections and silently no-ops — the writer's pending-holes book
+        is still consulted at :meth:`_resolve_or_stamp_remaining_holes`
+        so any ``UNRESOLVED`` slot whose hole was correctly registered
+        gets stamped with :data:`MISSING_VARIANT_INDEX`. B.2 restores
+        the belt-and-braces sweep.
         """
         blob = self._writer.view()
         try:
             end = len(blob)
             offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
             while offset < end:
-                section, offset = parse_section_bin(blob, offset)
+                try:
+                    section, offset = parse_section_bin(blob, offset)
+                except NotImplementedError:
+                    return
                 for v_idx, variant in enumerate(section.variants):
                     for called_idx, sv_idx in variant.per_call_entries:
                         if sv_idx == UNRESOLVED_VARIANT_INDEX:
@@ -958,67 +1097,19 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
     Returns ``(Section, end_offset)`` where ``end_offset`` is past the
     section's trailing alignment padding (so the caller can call
     again with the new offset to read the next section).
+
+    Currently raises :class:`NotImplementedError`: pending B.2 reader
+    rewrite. The B.1 wire-format change shrank the variant header to
+    8 bytes and inserted a per-section ``n_variants × u16`` jump table
+    between the section header and the call_target table. Decoding the
+    new layout requires consuming the jump table to compute per-variant
+    payload sizes; that rewrite lands in B.2. Writer-side resolution
+    paths catch this exception and treat the section as "not yet
+    resolvable" (per-variant holes pile up and get stamped with
+    :data:`MISSING_VARIANT_INDEX` at :meth:`SectionWriter.finalize`).
     """
-    cursor = offset
-
-    # Section header.
-    func_line_no, n_call_targets, n_variants = struct.unpack_from(
-        "<IHH", blob, cursor
-    )
-    cursor += SECTION_HEADER_SIZE
-
-    # Call target table.
-    call_targets: list[CallTarget] = []
-    for _ in range(n_call_targets):
-        function_name_ptr, function_section_ptr, flags, _reserved = (
-            struct.unpack_from("<IIHH", blob, cursor)
-        )
-        call_type, is_matched = _unpack_flags(flags)
-        call_targets.append(
-            CallTarget(
-                function_name_ptr=function_name_ptr,
-                function_section_ptr=function_section_ptr,
-                type=call_type,
-                is_matched=is_matched,
-            )
-        )
-        cursor += CALL_TARGET_ENTRY_SIZE
-
-    # Variant blocks.
-    variants: list[VariantBlock] = []
-    for _ in range(n_variants):
-        variant_ref_offset, data_offset_shifted, n_calls = struct.unpack_from(
-            "<IIH", blob, cursor
-        )
-        cursor += VARIANT_HEADER_SIZE
-        per_call_entries: list[tuple[int, int]] = []
-        for _call_idx in range(n_calls):
-            called_idx, section_variant_index = struct.unpack_from(
-                "<HH", blob, cursor
-            )
-            per_call_entries.append((called_idx, section_variant_index))
-            cursor += PER_CALL_ENTRY_SIZE
-        variants.append(
-            VariantBlock(
-                variant_ref_offset=variant_ref_offset,
-                data_offset_shifted=data_offset_shifted,
-                per_call_entries=per_call_entries,
-            )
-        )
-
-    # Section trailer alignment.
-    rem = cursor % SECTION_ALIGNMENT
-    if rem != 0:
-        cursor += SECTION_ALIGNMENT - rem
-
-    return (
-        Section(
-            function_name_ptr=func_line_no,
-            section_offset=offset,
-            call_targets=call_targets,
-            variants=variants,
-        ),
-        cursor,
+    raise NotImplementedError(
+        "pending parse_section_bin rewrite for jump-table format"
     )
 
 
