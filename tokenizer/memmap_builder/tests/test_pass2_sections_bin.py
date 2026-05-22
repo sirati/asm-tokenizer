@@ -456,6 +456,144 @@ def test_unmatched_arm_emits_sections_into_combined_bin(tmp_path: Path) -> None:
     assert ct.is_matched is False
 
 
+def test_per_call_entries_sorted_by_call_target_type(tmp_path: Path) -> None:
+    """Per_call_entries within each variant are emitted in non-decreasing
+    :class:`CallTargetType` order — LOCAL block (type=0) then PLT block
+    (type=1). The fixture interleaves PLT and LOCAL callees in the
+    variant's encounter order so the assertion would fail if the sort
+    were absent. Encounter order within each category is preserved
+    (stable sort).
+    """
+    caller = "caller_fn"
+    local_a = "local_a"
+    local_b = "local_b"
+    plt_a = "plt_a"
+    plt_b = "plt_b"
+    registry = _make_registry(caller, local_a, plt_a, local_b, plt_b)
+    local_a_typed = (local_a, CallTargetType.LOCAL)
+    local_b_typed = (local_b, CallTargetType.LOCAL)
+    plt_a_typed = (plt_a, CallTargetType.PLT)
+    plt_b_typed = (plt_b, CallTargetType.PLT)
+    v0 = ("v", 0)
+
+    # Interleaved encounter order: PLT, LOCAL, PLT, LOCAL. The sort must
+    # regroup these into [LOCAL_a, LOCAL_b, PLT_a, PLT_b].
+    interleaved = [plt_a_typed, local_a_typed, plt_b_typed, local_b_typed]
+
+    entries = [
+        # Callee sections first so caller's per_call_entries resolve
+        # inline (no back-patch needed for this assertion).
+        {
+            "func_name": local_a,
+            "unique_called": [],
+            "extern_libraries": {},
+            "version_data": [
+                {"vkey": v0, "called": set(), "data_offset": 0,
+                 "data_len": 16, "token_len": 4},
+            ],
+        },
+        {
+            "func_name": plt_a,
+            "unique_called": [],
+            "extern_libraries": {},
+            "version_data": [
+                {"vkey": v0, "called": set(), "data_offset": 16,
+                 "data_len": 16, "token_len": 4},
+            ],
+        },
+        {
+            "func_name": local_b,
+            "unique_called": [],
+            "extern_libraries": {},
+            "version_data": [
+                {"vkey": v0, "called": set(), "data_offset": 32,
+                 "data_len": 16, "token_len": 4},
+            ],
+        },
+        {
+            "func_name": plt_b,
+            "unique_called": [],
+            "extern_libraries": {},
+            "version_data": [
+                {"vkey": v0, "called": set(), "data_offset": 48,
+                 "data_len": 16, "token_len": 4},
+            ],
+        },
+        {
+            "func_name": caller,
+            "unique_called": interleaved,
+            "extern_libraries": {},
+            "version_data": [
+                {
+                    "vkey": v0,
+                    "called": interleaved,
+                    "data_offset": 64,
+                    "data_len": 16,
+                    "token_len": 4,
+                },
+            ],
+        },
+    ]
+    function_lookup = {
+        (local_a, v0): (0, 16, 1),
+        (plt_a, v0): (16, 16, 1),
+        (local_b, v0): (32, 16, 1),
+        (plt_b, v0): (48, 16, 1),
+    }
+    sectioned = {caller, local_a, plt_a, local_b, plt_b}
+
+    _, sections, _ = _drive_matched(
+        tmp_path,
+        entries,
+        function_lookup,
+        registry,
+        matched_func_names=sectioned,
+        sectioned_func_names=sectioned,
+    )
+
+    # Caller is the last section.
+    caller_section = sections[-1]
+    assert caller_section.function_name_ptr == registry.line_no(caller)
+    # call_targets table stays in encounter order (PLT, LOCAL, PLT, LOCAL):
+    # the sort only applies to per_call_entries, not to the table.
+    table_types = [ct.type for ct in caller_section.call_targets]
+    assert table_types == [
+        CallTargetType.PLT,
+        CallTargetType.LOCAL,
+        CallTargetType.PLT,
+        CallTargetType.LOCAL,
+    ]
+
+    # Per_call_entries for the single variant must be in non-decreasing
+    # CallTargetType (LOCAL block then PLT block).
+    assert len(caller_section.variants) == 1
+    variant = caller_section.variants[0]
+    entry_types = [
+        caller_section.call_targets[called_idx].type
+        for called_idx, _sv_idx in variant.per_call_entries
+    ]
+    assert entry_types == sorted(entry_types, key=int), (
+        "per_call_entries must be non-decreasing by CallTargetType"
+    )
+    # Stable within each category: LOCAL_a before LOCAL_b, PLT_a before PLT_b.
+    assert entry_types == [
+        CallTargetType.LOCAL,
+        CallTargetType.LOCAL,
+        CallTargetType.PLT,
+        CallTargetType.PLT,
+    ]
+    entry_name_ptrs = [
+        caller_section.call_targets[called_idx].function_name_ptr
+        for called_idx, _sv_idx in variant.per_call_entries
+    ]
+    assert entry_name_ptrs == [
+        registry.line_no(local_a),
+        registry.line_no(local_b),
+        registry.line_no(plt_a),
+        registry.line_no(plt_b),
+    ]
+
+
 def test_unsectioned_local_callee_demoted_to_extern_unknown(
     tmp_path: Path,
 ) -> None:

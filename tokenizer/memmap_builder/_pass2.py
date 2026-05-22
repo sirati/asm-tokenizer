@@ -199,6 +199,7 @@ def _emit_variant_per_call_entries(
     section_writer: SectionWriter,
     variant_called: "list[TypedCallee]",
     unique_called_index_map: "dict[TypedCallee, int]",
+    call_targets: "list[CallTargetSpec]",
     callee_variant_ref_offset: int,
     registry: FunctionNamesRegistry,
     sectioned_func_names: "set[str]",
@@ -230,16 +231,19 @@ def _emit_variant_per_call_entries(
     ``is_matched`` flag still encodes the "this callee is unsectioned"
     fact at the table level.
 
-    Iteration order is the variant's encoder-allocation order
-    (``rec.called_funcs`` order, threaded through pass-1's
-    ``version_data["called"]`` list). Per-call entries are decoupled
-    from the section's ``call_target`` table ordering — each entry
-    carries an explicit ``called_idx`` into the table — so this
-    function's iteration order is purely a determinism + smoke-test
-    legibility choice. The list-position match between
-    ``rec.called_funcs`` and the table (now both encounter-ordered
-    per plan Decisions 20 + 21) keeps per-call emissions adjacent in
-    BIN-position to their table entries.
+    Emit order invariant: per_call_entries within a variant are in
+    non-decreasing :class:`CallTargetType` order — a contiguous LOCAL
+    block (type=0) followed by a contiguous PLT block (type=1). EXTERN
+    (type=2) is skipped above so it never appears. The sort is stable,
+    so within each category the original encoder-allocation order from
+    ``variant_called`` (and from ``rec.called_funcs`` upstream) is
+    preserved. This blocks of-category ordering lets the dataloader
+    address per-category chunks of per_call_entries via cumsum on
+    per-Category callee counts — no per-entry
+    ``call_targets[called_idx].flags`` lookup needed. The
+    list-position match between encoder-allocation order and the
+    section's ``call_target`` table (plan Decisions 20 + 21) is
+    preserved within each category block.
     """
     entries: List[PerCallEntry] = []
     for callee_name, callee_type in variant_called:
@@ -257,6 +261,10 @@ def _emit_variant_per_call_entries(
                 callee_vkey=callee_variant_ref_offset,
             )
         )
+    # Stable sort by call_target category: LOCAL (0) block then PLT (1)
+    # block. EXTERN is filtered out above. Python's ``sorted`` is stable,
+    # so encounter order within each category is preserved.
+    entries.sort(key=lambda entry: call_targets[entry.called_idx].type)
     section_writer.emit_per_call_entries(entries)
 
 
@@ -394,6 +402,7 @@ def write_matched_sections_pass2(
                 section_writer,
                 called,
                 unique_called_index_map,
+                call_targets,
                 callee_variant_ref_offset=callee_variant_ref_offset,
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
@@ -682,6 +691,7 @@ def write_unmatched_sections_pass2(
                 section_writer,
                 called_set,
                 unique_called_index_map,
+                call_targets,
                 callee_variant_ref_offset=callee_variant_ref_offset,
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
