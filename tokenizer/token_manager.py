@@ -240,7 +240,9 @@ class VocabularyManager:
     ) -> int:
         """Add a token to the vocabulary and return its ID, optionally setting platform instruction type."""
         if token in self.token_to_id:
-            return self.token_to_id[token]
+            existing_id = self.token_to_id[token]
+            self._maybe_promote_to_unified_platform(existing_id, platform)
+            return existing_id
 
         assert (not (token.startswith("Block") or token.startswith("OPAQUE_CONST"))) or (
             token[-2] == "_" or "Lit" in token or token == "Block_Def"
@@ -334,6 +336,53 @@ class VocabularyManager:
 
         # Regular tokens don't get added to lit caches at all
         return token_id
+
+    def _maybe_promote_to_unified_platform(
+        self, existing_id: int, incoming_platform: Optional[str]
+    ) -> None:
+        """Upgrade ``token_to_platform[existing_id]`` to ``unified_<family>``
+        when an already-registered token gains a second contributing ISA
+        in the same family.
+
+        The unified-VM family-merge collapses cross-bitness mnemonics
+        (e.g. ``mov`` from x86 and x64) into one token id. Without this
+        promotion the per-token platform entry would silently retain
+        whichever ISA arrived first, indistinguishable downstream from a
+        token only ever seen in that one bitness.
+
+        No-op on per-ISA VMs, on platform-agnostic tokens, on repeat
+        registrations from the same ISA, and on families that aren't in
+        ``PLATFORM_UNIFIED`` (non-canonical platform names — the token
+        prefix already encodes the platform verbatim, so cross-bitness
+        collision doesn't apply).
+        """
+        if self.platform is not None or incoming_platform is None:
+            return
+        existing_pid = int(self.token_to_platform[existing_id])
+        if existing_pid < 0:
+            return
+        existing_platform = self.platform_list[existing_pid]
+        if existing_platform == incoming_platform:
+            return
+        from tokenizer.arch import PLATFORM_FAMILY, PLATFORM_UNIFIED
+        family = PLATFORM_FAMILY.get(incoming_platform)
+        unified_name = PLATFORM_UNIFIED.get(family) if family is not None else None
+        if unified_name is None:
+            return
+        if existing_platform == unified_name:
+            return
+        assert PLATFORM_FAMILY.get(existing_platform) == family, (
+            f"Cross-family token collision: token id {existing_id} "
+            f"registered for platform {existing_platform!r} "
+            f"(family {PLATFORM_FAMILY.get(existing_platform)!r}); "
+            f"incoming platform {incoming_platform!r} (family {family!r})."
+        )
+        unified_pid = self.platform_reverse.get(unified_name, -1)
+        if unified_pid == -1:
+            unified_pid = len(self.platform_list)
+            self.platform_list.append(unified_name)
+            self.platform_reverse[unified_name] = unified_pid
+        self.token_to_platform[existing_id] = unified_pid
 
     @property
     def id_to_token_type(self) -> npt.NDArray[np.int8]:

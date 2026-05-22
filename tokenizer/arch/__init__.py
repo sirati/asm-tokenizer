@@ -34,6 +34,23 @@ PLATFORM_FAMILY: dict[str, str] = {
 }
 
 
+# Platform name registered in the unified vocab when a token has been
+# contributed by more than one ISA in the same family. Distinct from
+# both the family prefix (`PLATFORM_FAMILY` values) and any single ISA
+# name; the consumer sees `unified_x86` and knows the token covers
+# x86+x64 jointly, not x86 alone. The `x` family uses `unified_x86`
+# rather than `unified_x` to keep the bitness-bearing legacy name; the
+# other families have no analogous "unified" connotation on a 32/64
+# token and follow the canonical `unified_<family>` shape.
+PLATFORM_UNIFIED: dict[str, str] = {
+    "x": "unified_x86",
+    "arm": "unified_arm",
+    "mips": "unified_mips",
+    "ppc": "unified_ppc",
+    "riscv": "unified_riscv",
+}
+
+
 def get_provider(platform: Platform, backend: str = "angr") -> ArchitectureProvider:
     if platform in ("x86", "x64"):
         if backend == "ghidra":
