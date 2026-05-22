@@ -54,6 +54,7 @@ from tokenizer.aligned_data.matched_sections_bin import (
     CallTargetSpec,
     PerCallEntry,
     SectionWriter,
+    _padded_jump_table_bytes,
     iter_sections_bin,
 )
 from tokenizer.aligned_data.memmap_format import (
@@ -599,15 +600,15 @@ def test_section_alignment_padding(tmp_path: Path):
     """Each section's offset is 4-byte aligned even when the previous
     section's natural end is not.
 
-    Section header (8) + 1 jump-table slot (2) + 1 call_target (12) +
-    1 variant header (8) + 1 per-call entry (4) = 34 bytes; trailer
-    pad = 2 bytes → next section starts at offset 16+34+2 = 52
-    (4-byte aligned).
+    Section header (8) + padded jump-table region (4 for n_variants=1)
+    + 1 call_target (12) + 1 variant header (8) + 1 per-call entry (4)
+    = 36 bytes; already u32-aligned so trailer pad = 0 → next section
+    starts at offset 16+36 = 52.
     """
     path = tmp_path / "align.bin"
     writer = SectionWriter(path)
 
-    # Section A produces a 34-byte payload before trailer pad. The
+    # Section A produces a 36-byte payload (no trailer pad needed). The
     # per-call entry self-references the same variant_ref_offset=0 so
     # the back-patch resolves cleanly inside the section.
     a_offset = writer.begin_section(function_name_ptr=1, n_variants=1)
@@ -632,7 +633,7 @@ def test_section_alignment_padding(tmp_path: Path):
     expected_b_offset = (
         a_offset
         + SECTION_HEADER_SIZE
-        + 1 * JUMP_TABLE_ENTRY_SIZE
+        + _padded_jump_table_bytes(1)
         + 1 * CALL_TARGET_ENTRY_SIZE
         + 1 * VARIANT_HEADER_SIZE
         + 1 * PER_CALL_ENTRY_SIZE
@@ -699,7 +700,7 @@ def test_finalize_sweep_catches_leaked_sentinel(tmp_path: Path):
     slot_offset = (
         MATCHED_SECTIONS_BIN_PRELUDE_SIZE
         + SECTION_HEADER_SIZE
-        + 1 * JUMP_TABLE_ENTRY_SIZE
+        + _padded_jump_table_bytes(1)
         + CALL_TARGET_ENTRY_SIZE
         + VARIANT_HEADER_SIZE
         + 2  # skip u16 called_idx; section_variant_index is the second field
@@ -871,7 +872,7 @@ def test_section_writer_finalize_closes_on_sweep_error(tmp_path: Path):
     slot_offset = (
         MATCHED_SECTIONS_BIN_PRELUDE_SIZE
         + SECTION_HEADER_SIZE
-        + 1 * JUMP_TABLE_ENTRY_SIZE
+        + _padded_jump_table_bytes(1)
         + CALL_TARGET_ENTRY_SIZE
         + VARIANT_HEADER_SIZE
         + 2
