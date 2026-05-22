@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Iterator, Mapping
 
-from .prefixes import build_axis_strings
+from .prefixes import POSITIONAL_PREFIXES, build_axis_strings
 
 
 class VariantInventory:
@@ -68,6 +68,40 @@ class VariantInventory:
         the same corpus.
         """
         return iter(sorted(self._tokens))
+
+    def iter_tokens_axis_grouped(self) -> Iterator[str]:
+        """Yield tokens grouped by axis: positional axes first in the
+        declared order (``arch`` -> ``comp`` -> ``cver`` -> ``opt``),
+        then sidecar-key axes in alphabetical-by-prefix order. Within
+        each axis, values are alphabetical.
+
+        Same multiset as :meth:`iter_tokens`, different deterministic
+        ordering — the unified vocab wants positional axes packed at
+        the head of the variant block so dataloader-side decode can
+        index by canonical position without a prefix lookup.
+
+        Partitioning is by the substring up to and including the first
+        ``:`` (the prefix grammar guaranteed by ``add()``'s metadata-key
+        invariant); the declared positional ordering lives in
+        :data:`tokenizer.variant_tokens.prefixes.POSITIONAL_PREFIXES`
+        so this iterator does not duplicate the axis sequence.
+        """
+        buckets: dict[str, list[str]] = {}
+        for token in self._tokens:
+            key, sep, _ = token.partition(":")
+            assert sep == ":", (
+                f"variant token {token!r} missing ':' prefix delimiter; "
+                "every token added via add() goes through build_axis_strings "
+                "which always emits a prefix"
+            )
+            buckets.setdefault(key + ":", []).append(token)
+
+        for prefix in POSITIONAL_PREFIXES:
+            if prefix in buckets:
+                yield from sorted(buckets.pop(prefix))
+
+        for prefix in sorted(buckets):
+            yield from sorted(buckets[prefix])
 
     def __len__(self) -> int:
         return len(self._tokens)

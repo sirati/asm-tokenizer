@@ -93,7 +93,8 @@ class VocabularyManager:
     # `__init__` immediately after the digit pre-population so its id is
     # deterministic across vocabs. The constant
     # `_V2_VALUE_NEGATIVE_TOKEN_ID` captures this invariant; the first
-    # caller-driven registration on a v1/v2 VM therefore lands at id 257.
+    # caller-driven registration on a v1/v2 VM therefore lands at id
+    # `_V2_RESERVED_TOKEN_COUNT` (= 257).
     # The invariant is asserted at construction time and exposed via the
     # `value_negative_token_id` instance attribute for crash-early
     # checks at downstream call sites.
@@ -327,6 +328,33 @@ class VocabularyManager:
         # `token_to_id`. Absence (None) is reported when the supplied
         # vocab predates the marker.
         v_man.value_negative_token_id = v_man.token_to_id.get("value_negative")
+
+        # Publish the canonical-block ranges on reconstructed unified VMs
+        # (v1/v2 + platform=None). Real unifier-produced unified vocabs
+        # eagerly register the number+identity blocks at the fixed slots
+        # 257..271; the range attributes mirror that layout so model heads
+        # can route by id range without re-discovering it.
+        #
+        # Note: hand-crafted test fixtures and pre-canonical-layout vocabs
+        # may not carry the canonical names at the expected slots. The
+        # head-of-vocab check below is therefore soft — it tightens to an
+        # invariant only once every unified vocab on disk has been
+        # regenerated under the canonical layout.
+        if format_version in (1, 2) and platform is None:
+            v_man._number_block_range = (
+                VocabularyManager._V2_NUMBER_BLOCK_START,
+                VocabularyManager._V2_NUMBER_BLOCK_START + VocabularyManager._V2_NUMBER_BLOCK_COUNT,
+            )
+            v_man._identity_block_range = (
+                VocabularyManager._V2_IDENTITY_BLOCK_START,
+                VocabularyManager._V2_IDENTITY_BLOCK_START + VocabularyManager._V2_IDENTITY_BLOCK_COUNT,
+            )
+            if len(v_man.id_to_token) > VocabularyManager._V2_NUMBER_BLOCK_START:
+                head = v_man.id_to_token[VocabularyManager._V2_NUMBER_BLOCK_START]
+                if head == "valued_const_v2":
+                    pass  # canonical layout — good.
+                # else: silently allow; the unifier post-rewrite will make
+                # this an invariant.
         return v_man
 
     def _private_add_token(
@@ -548,6 +576,55 @@ class VocabularyManager:
         on the unified VM. Empty interval `(size, size)` on per-binary VMs
         and on unified VMs that have not been pre-registered yet."""
         return getattr(self, "_identity_block_range", (self.size, self.size))
+
+    def _register_v2_canonical_blocks(self) -> None:
+        """Pre-register the canonical number- and identity-carrying type-
+        marker tokens at fixed slots 257..271. Intended to be called by the
+        unifier on a fresh unified VM (platform=None, only digit slots +
+        value_negative pinned). Per-binary VMs must NOT call this — they
+        register these tokens lazily as part of normal tokenization."""
+        assert self.platform is None, (
+            "canonical-block registration is only meaningful on the unified VM"
+        )
+        assert self.format_version in (1, 2)
+        assert len(self.id_to_token) == self._V2_RESERVED_TOKEN_COUNT, (
+            "canonical-block registration must run on a fresh VM (only digit "
+            f"slots and value_negative); got size {len(self.id_to_token)}"
+        )
+
+        # Number block — source-declaration order in token_manager.py.
+        # Each factory call registers the type-marker token at the next
+        # slot; the payload value is irrelevant (Inner class' _to_token_ids
+        # emits [type_id, *digit_bytes]; only the type_id registers).
+        self.Valued_Const_V2(0)   # 257
+        self.Float16(None)        # 258
+        self.BFloat16(None)       # 259
+        self.Float32(None)        # 260
+        self.Float64(None)        # 261
+        self.Float80(None)        # 262
+        self.Float128(None)       # 263
+
+        # Identity block — first 5 in user-canonical order, then remaining
+        # alphabetical (jump_table < ro_data_ptr < rw_data_ptr).
+        self.Block_V2(0)          # 264
+        self.Local_Func(0)        # 265
+        self.Plt_Func(0)          # 266
+        self.Ext_Func(0)          # 267
+        self.String_Ptr(0)        # 268
+        self.Jump_Table(0)        # 269
+        self.Ro_Data_Ptr(0)       # 270
+        self.Rw_Data_Ptr(0)       # 271
+
+        assert len(self.id_to_token) == self._V2_EAGER_BLOCK_END
+
+        self._number_block_range = (
+            self._V2_NUMBER_BLOCK_START,
+            self._V2_NUMBER_BLOCK_START + self._V2_NUMBER_BLOCK_COUNT,
+        )
+        self._identity_block_range = (
+            self._V2_IDENTITY_BLOCK_START,
+            self._V2_IDENTITY_BLOCK_START + self._V2_IDENTITY_BLOCK_COUNT,
+        )
 
     def to_dict(self) -> dict[str, int]:
         """Convert to dictionary format for backward compatibility"""

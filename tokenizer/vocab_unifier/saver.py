@@ -21,9 +21,11 @@ def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) ->
     # format_version=1 (see plan memoized-booping-wren.md §"Format-version
     # coupling"), and the per-binary tokenize worker produces per-binary
     # CSV format_version=2. Both share the wire layout: the first
-    # `_V2_RESERVED_DIGIT_COUNT` IDs are protocol-reserved digit slots,
-    # not written on the wire (the loader reconstitutes them from the
-    # protocol convention based on the trailer integer). Any other value
+    # `_V2_RESERVED_TOKEN_COUNT` (= 257) IDs are protocol-reserved and
+    # never written on the wire — that span covers the 256 inline-digit
+    # slots PLUS the `value_negative` postfix marker pinned at slot 256.
+    # The loader reconstitutes the full reserved prefix from the protocol
+    # convention based on the trailer integer. Any other format_version
     # is a programmer error — the legacy v1-no-trailer and v3 paths were
     # removed in the memoized-booping-wren.md cleanup.
     if vocab_manager.format_version not in _SUPPORTED_FORMAT_VERSIONS:
@@ -35,9 +37,13 @@ def save_vocabulary(vocab_manager: VocabularyManager, csv_writer: csv.writer) ->
         )
 
     token_count = len(vocab_manager.id_to_token)
-    # Strip the protocol-reserved digit slots; no entries are written for
-    # these positions. Both supported versions share this encoding.
-    start = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+    # Strip the protocol-reserved prefix (`_V2_RESERVED_TOKEN_COUNT` = 257
+    # slots: digits 0..255 PLUS `value_negative` at slot 256). Neither the
+    # digit names nor the value_negative marker is written on the wire —
+    # the loader reconstructs both from the protocol convention based on
+    # the trailer integer. Both supported versions (v1 unified, v2 per-
+    # binary) share this encoding and converge on the same strip boundary.
+    start = VocabularyManager._V2_RESERVED_TOKEN_COUNT
 
     row = [
         "vocabulary",

@@ -123,15 +123,19 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
             f"on the per-binary CSVs to regenerate."
         )
 
-    # Protocol-reserved digit slots (IDs 0..255) are stripped by the saver;
-    # reconstitute them so downstream absolute-ID lookups (lit caches,
-    # register_on_vocab_manager, etc.) stay valid.
-    reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
-    digit_names = [f"digit_{i:02X}" for i in range(reserved)]
-    vocabulary = digit_names + vocabulary
+    # Protocol-reserved prefix (IDs 0..256) is stripped by the saver;
+    # reconstitute it so downstream absolute-ID lookups (lit caches,
+    # register_on_vocab_manager, etc.) stay valid. The prefix covers the
+    # 256 inline-digit slots PLUS the `value_negative` postfix marker
+    # pinned at slot 256 — both are protocol invariants under v1/v2.
+    digit_count = VocabularyManager._V2_RESERVED_DIGIT_COUNT      # 256
+    reserved = VocabularyManager._V2_RESERVED_TOKEN_COUNT         # 257
+    digit_names = [f"digit_{i:02X}" for i in range(digit_count)]
+    vocabulary = digit_names + ["value_negative"] + vocabulary
     id_to_token_type = np.concatenate(
         [
-            np.full(reserved, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
+            np.full(digit_count, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
+            np.array([TokenType.VALUE_NEGATIVE], dtype=id_to_token_type.dtype),
             id_to_token_type,
         ]
     )

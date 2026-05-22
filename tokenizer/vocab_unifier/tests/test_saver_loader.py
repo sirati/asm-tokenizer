@@ -37,7 +37,8 @@ from tokenizer.vocab_unifier.loader import (
 from tokenizer.vocab_unifier.saver import save_vocabulary
 
 
-_RESERVED = VocabularyManager._V2_RESERVED_DIGIT_COUNT  # 256
+_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT  # 256
+_RESERVED = VocabularyManager._V2_RESERVED_TOKEN_COUNT  # 257 (digits + value_negative)
 
 
 def _make_vm(
@@ -46,14 +47,20 @@ def _make_vm(
     real_tokens: list[str],
     format_version: int,
 ) -> VocabularyManager:
-    """Build a VocabularyManager with the 256 reserved digit slots up
-    front followed by `real_tokens`. Uses ``from_vocab`` so the call is
-    independent of constructor-side prefill logic."""
-    digit_names = [f"digit_{i:02X}" for i in range(_RESERVED)]
-    vocab_list = digit_names + real_tokens
+    """Build a VocabularyManager with the protocol-reserved prefix
+    (256 digit slots + ``value_negative`` at slot 256) up front,
+    followed by ``real_tokens``. Uses ``from_vocab`` so the call is
+    independent of constructor-side prefill logic — but mirrors the
+    same prefix the constructor pins, matching the wire format the
+    saver/loader contract assumes."""
+    digit_names = [f"digit_{i:02X}" for i in range(_DIGIT_COUNT)]
+    vocab_list = digit_names + ["value_negative"] + real_tokens
     total = len(vocab_list)
 
     id_to_token_type = np.full(total, TokenType.UNRESOLVED, dtype=np.int8)
+    # The `value_negative` marker carries its own token type; the saver/
+    # loader round-trip must preserve it.
+    id_to_token_type[_DIGIT_COUNT] = TokenType.VALUE_NEGATIVE
     # Mark real tokens with a non-reserved type so the round-trip surfaces
     # any normalization bugs in the saver's `- TokenType.UNRESOLVED` step.
     for i in range(_RESERVED, total):
@@ -110,9 +117,9 @@ def _craft_unsupported_row(
     """
     is_unified = platform_label == "unified"
     real_tokens = ["real_token_a"]
-    digit_names = [f"digit_{i:02X}" for i in range(_RESERVED)]
-    vocab_list = digit_names + real_tokens
-    # Saver normally strips digits; we mirror that.
+    digit_names = [f"digit_{i:02X}" for i in range(_DIGIT_COUNT)]
+    vocab_list = digit_names + ["value_negative"] + real_tokens
+    # Saver normally strips the protocol-reserved prefix; mirror that.
     serialized_vocab = ",".join(vocab_list[_RESERVED:])
 
     # Minimal valid base64 payloads (1 entry per array; matches len(real_tokens)).
@@ -167,8 +174,11 @@ def test_unified_v1_round_trip() -> None:
     assert loaded.format_version == 1
     assert len(loaded.id_to_token) == len(vm.id_to_token)
     # Reserved-digit slots reconstituted.
-    for i in range(_RESERVED):
+    for i in range(_DIGIT_COUNT):
         assert loaded.id_to_token[i] == f"digit_{i:02X}"
+    # value_negative marker reconstituted at slot 256 (not serialised on
+    # the wire — protocol-reserved like the digits).
+    assert loaded.id_to_token[_DIGIT_COUNT] == "value_negative"
     # Real tokens round-trip byte-identically.
     assert loaded.id_to_token[_RESERVED:] == vm.id_to_token[_RESERVED:]
     # Token-to-platform array round-trips for the unified layout.
@@ -190,8 +200,10 @@ def test_per_binary_v2_round_trip() -> None:
     assert loaded is not None
     assert loaded.format_version == 2
     assert len(loaded.id_to_token) == len(vm.id_to_token)
-    for i in range(_RESERVED):
+    for i in range(_DIGIT_COUNT):
         assert loaded.id_to_token[i] == f"digit_{i:02X}"
+    # value_negative marker reconstituted at slot 256 on per-binary too.
+    assert loaded.id_to_token[_DIGIT_COUNT] == "value_negative"
     assert loaded.id_to_token[_RESERVED:] == vm.id_to_token[_RESERVED:]
 
 
@@ -288,3 +300,65 @@ def test_saver_rejects_unsupported_format_version() -> None:
     writer = csv.writer(buf, lineterminator='\n')
     with pytest.raises(ValueError, match="got 99"):
         save_vocabulary(vm, writer)
+
+
+# ---------------------------------------------------------------------------
+# value_negative strip + reconstruction
+# ---------------------------------------------------------------------------
+
+
+def _vocab_cell(raw: bytes) -> list[str]:
+    """Extract the comma-separated vocabulary cell from a serialised
+    vocab row. The cell sits at row index 1 (per ``save_vocabulary``)."""
+    row = next(csv.reader(io.StringIO(raw.decode("ascii")), quotechar='"'))
+    return row[1].split(",")
+
+
+def test_saver_strips_value_negative_per_binary() -> None:
+    """``value_negative`` (slot 256) MUST NOT appear in the serialised
+    per-binary vocab cell. The marker is protocol-reserved (same
+    treatment as digit slots 0..255) and reconstituted by the loader."""
+    vm = VocabularyManager(platform="x64", format_version=2)
+    # Register a handful of representative tokens to exercise the strip
+    # boundary — the marker still must not surface in the wire vocab.
+    vm.Block_V2(0)
+    vm.Block_V2(1)
+
+    buf = io.StringIO()
+    save_vocabulary(vm, csv.writer(buf, lineterminator='\n'))
+    raw = buf.getvalue().encode("ascii")
+
+    assert "value_negative" not in _vocab_cell(raw), (
+        "value_negative must not appear in serialised per-binary vocab cell"
+    )
+
+    # Round-trip — reload and assert slot 256 still pins value_negative
+    # with the correct token type.
+    vm2 = load_vocab_manager_csv_row_bytes(raw, "x64")
+    assert vm2 is not None
+    assert vm2.id_to_token[256] == "value_negative"
+    assert vm2.get_token_id("value_negative") == 256
+    assert vm2.id_to_token_type[256] == TokenType.VALUE_NEGATIVE
+
+
+def test_saver_strips_value_negative_unified() -> None:
+    """Same protocol-reserved treatment for the unified-vocab format
+    (``format_version=1``, ``platform=None``)."""
+    vm = VocabularyManager(platform=None, format_version=1)
+    # Register one Variant_Axis token so the wire vocab is non-empty;
+    # the strip boundary is what's under test, not the cell contents.
+    vm.Variant_Axis("arch:x64")
+
+    buf = io.StringIO()
+    save_vocabulary(vm, csv.writer(buf, lineterminator='\n'))
+    raw = buf.getvalue().encode("ascii")
+
+    assert "value_negative" not in _vocab_cell(raw), (
+        "value_negative must not appear in serialised unified vocab cell"
+    )
+
+    vm2 = load_vocab_manager_csv_row_bytes(raw, "unified")
+    assert vm2 is not None
+    assert vm2.id_to_token[256] == "value_negative"
+    assert vm2.get_token_id("value_negative") == 256
+    assert vm2.id_to_token_type[256] == TokenType.VALUE_NEGATIVE
