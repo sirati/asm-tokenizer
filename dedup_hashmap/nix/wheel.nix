@@ -37,7 +37,7 @@ buildPythonPackage {
   doCheck = false;
 
   meta = with lib; {
-    description = "u64 -> u32 hashmap exposed to Python for asm-tokenizer content-addressed dedup.";
+    description = "u64 -> u32 and u32 -> u32 hashmaps exposed to Python for asm-tokenizer dedup + writer state.";
     license = licenses.asl20;
     platforms = platforms.unix;
   };

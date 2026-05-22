@@ -64,6 +64,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Hashable, Iterator, Optional, TextIO
 
+from dedup_hashmap import HashMapU32U32
+
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_MAGIC,
@@ -335,8 +337,12 @@ class SectionWriter:
         # offset`` lookup for resolving call_target ``function_section_ptr``
         # on the spot. Sibling sections that share a FID overwrite
         # (last-write-wins); the loader resolves the ambiguity by
-        # walking via per-call ``callee_vkey``.
-        self._known_sections: dict[int, int] = {}
+        # walking via per-call ``callee_vkey``. Both key (u32
+        # function_name_ptr) and value (u32 section offset, by the
+        # bin's wire layout) fit in u32, so the map is backed by the
+        # ``dedup_hashmap`` crate's :class:`HashMapU32U32` for a
+        # halved per-entry footprint at corpus scale.
+        self._known_sections = HashMapU32U32()
         # ``_pending_holes`` keyed on ``(callee_FID,
         # referencing_section_offset)``: at most one record per
         # (referencing section, callee) pair. The key shape is what
@@ -425,7 +431,7 @@ class SectionWriter:
         self._pad_to_alignment()
         section_offset = self._writer.cursor
 
-        self._known_sections[function_name_ptr] = section_offset
+        self._known_sections.set(function_name_ptr, section_offset)
 
         self._current_fid = function_name_ptr
         self._current_section_offset = section_offset
