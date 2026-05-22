@@ -253,21 +253,29 @@ def splice_corpus_caller_callee(tmp_path: Path) -> Dict[str, Any]:
     AND the spliced callee's reference shares ONE compacted id --
     that's the FID-unification invariant the new design buys.
     """
+    # All three functions share a single compile-flavor vkey, matching the
+    # real-corpus invariant: the BIN writer keys ``known_section_variants``
+    # on ``(callee_FID, caller_vkey)`` and the callee section registers
+    # its variants under the same vkey, so resolution succeeds. Per-
+    # function vkeys would stamp MISSING_VARIANT_INDEX for every per_call
+    # entry and the splice walker would correctly treat the callees as
+    # not-spliceable (see ``test_splice_skips_missing_variant_sentinel``).
+    _shared_vkey = ("flavorA",)
     other_spec = MatchedFunctionSpec(
         func_name="other",
-        variants=(_variant_spec(("other", 0)),),
+        variants=(_variant_spec(_shared_vkey),),
         called=(),
     )
     callee_spec = MatchedFunctionSpec(
         func_name="callee",
-        variants=(_variant_spec(("callee", 0), local_func_identities=(0,)),),
+        variants=(_variant_spec(_shared_vkey, local_func_identities=(0,)),),
         called=("other",),
     )
     caller_spec = MatchedFunctionSpec(
         func_name="caller",
         variants=(
             _variant_spec(
-                ("caller", 0), local_func_identities=(0, 1)
+                _shared_vkey, local_func_identities=(0, 1)
             ),
         ),
         called=("callee", "other"),
@@ -661,10 +669,11 @@ def test_splice_max_variants_clamps_when_exceeds_total(splice_corpus_multi_varia
             0, arm="matched", max_depth=0, max_variants=99
         )
         assert len(result) == 5
-        # Each variant has a distinct block_count, so each real_tokens
-        # array has a distinct length spanning [1, 5].
+        # Each decoded variant prepends the 4 variant-axis tokens
+        # (arch / comp / cver / opt), then ``block_count`` BLOCK_V2
+        # tokens. So lengths span [4+1 .. 4+5] = [5..9] across variants.
         lengths = sorted(int(df.real_tokens.shape[0]) for df in result)
-        assert lengths == [1, 2, 3, 4, 5]
+        assert lengths == [5, 6, 7, 8, 9]
 
 
 def test_splice_seeded_rng_is_deterministic(splice_corpus_multi_variant):
@@ -782,6 +791,60 @@ def test_splice_inlining_flag_on_skips_universally_called_targets(
             arm="matched",
             max_depth=1,
             inlined_equivalent_call_targets_only=True,
+        )[0]
+    assert depth1.real_tokens.shape[0] == depth0.real_tokens.shape[0]
+    assert np.array_equal(depth1.real_tokens, depth0.real_tokens)
+
+
+@pytest.fixture
+def splice_corpus_caller_missing_callee_vkey(tmp_path: Path) -> Dict[str, Any]:
+    """Caller and callee have DIFFERENT vkeys ("flavorA" vs "flavorB").
+
+    Mirrors the corpus-scale case where pass-1 dropped the callee's
+    variant at the caller's compile flavor (encoder skip, dedup-collapse,
+    or tokenizer content-dedup). The BIN writer stamps
+    :data:`MISSING_VARIANT_INDEX` (0xFFFE) for the per-call entry, and
+    the splice walker must treat the slot as not-spliceable (skip K,
+    same as cycle / missing callee) per the
+    :mod:`tokenizer.aligned_data.matched_sections_bin` spec
+    ("no inlined callee body for this vkey").
+    """
+    callee_spec = MatchedFunctionSpec(
+        func_name="callee",
+        variants=(_variant_spec(("flavorB",)),),
+        called=(),
+    )
+    caller_spec = MatchedFunctionSpec(
+        func_name="caller",
+        variants=(
+            _variant_spec(("flavorA",), local_func_identities=(0,)),
+        ),
+        called=("callee",),
+    )
+    return _build_splice_corpus(tmp_path, (callee_spec, caller_spec))
+
+
+def test_splice_skips_missing_variant_sentinel(
+    splice_corpus_caller_missing_callee_vkey,
+):
+    """``MISSING_VARIANT_INDEX`` -> walker skips the call_target.
+
+    With caller_vkey != callee_vkey the BIN's per_call_entry slot holds
+    ``0xFFFE``. The walker's J-lookup returns ``None`` and the call site
+    is treated like cycle / missing callee: the placeholder tokens stay
+    in the caller's stream, no body is spliced. depth=0 and depth=1
+    therefore produce the same length.
+    """
+    fb = splice_corpus_caller_missing_callee_vkey
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        caller_idx: int = fb["matched_arm"].func_names.index("caller")
+        depth0 = sess.splice_with_callees(
+            caller_idx, arm="matched", max_depth=0
+        )[0]
+        depth1 = sess.splice_with_callees(
+            caller_idx, arm="matched", max_depth=1
         )[0]
     assert depth1.real_tokens.shape[0] == depth0.real_tokens.shape[0]
     assert np.array_equal(depth1.real_tokens, depth0.real_tokens)

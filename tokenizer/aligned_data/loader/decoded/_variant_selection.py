@@ -15,6 +15,8 @@ the public splice API.
 
 from __future__ import annotations
 
+from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
+
 
 def selection_v_idxs_in_section(
     section, selection_vkeys: frozenset
@@ -64,12 +66,26 @@ def lookup_callee_variant_for(
     return None
 
 
+def _usable(J: "int | None") -> bool:
+    """A J is usable iff it exists and isn't the missing-vkey sentinel.
+
+    ``MISSING_VARIANT_INDEX`` (0xFFFE) is stamped by the BIN writer when
+    a per-call entry records "this call existed" but the callee's
+    variant set doesn't include the caller's vkey (cross-arm vkey
+    mismatch after pass-1 drop rules). Such a J cannot resolve to a
+    real callee variant, so the walker must treat the slot the same as
+    a missing/extern callee -- leave the call-site tokens, do not
+    splice a body.
+    """
+    return J is not None and J != MISSING_VARIANT_INDEX
+
+
 def choose_callee_variant(
     section,
     primary_variant_idx: int,
     called_by: frozenset,
     called_idx: int,
-) -> int:
+) -> "int | None":
     """Pick the callee variant index ``J`` to pass to the decode callback.
 
     Three-level fallback chain (canonical plan extension; design
@@ -91,32 +107,29 @@ def choose_callee_variant(
        the section that called ``called_idx``. By construction of
        ``section.call_targets`` (union of every variant's
        per_call_entries), at least one variant called K → this level
-       is total.
+       is total for non-sentinel J.
 
-    Raises ``AssertionError`` if no variant in the section called
-    ``called_idx`` -- a structural invariant of the BIN format
-    (``call_targets`` only carries entries that some variant referenced).
+    Each level skips sentinel-J entries (``MISSING_VARIANT_INDEX``);
+    returns ``None`` if no variant in the section offers a usable J.
+    The walker treats ``None`` as not-spliceable (same as a missing
+    callee), per the BIN format spec for vkey-mismatch slots.
     """
     primary_J = lookup_callee_variant_for(
         section.variants[primary_variant_idx], called_idx
     )
-    if primary_J is not None:
+    if _usable(primary_J):
         return primary_J
     for v in sorted(called_by):
         J = lookup_callee_variant_for(section.variants[v], called_idx)
-        if J is not None:
+        if _usable(J):
             return J
     # Final fallback: scan ALL variants in the section for the lowest
-    # v_idx that called this target. Only reachable under flag OFF
-    # (flag ON returns early on empty called_by).
+    # v_idx that called this target with a non-sentinel J.
     for v_idx in range(len(section.variants)):
         J = lookup_callee_variant_for(section.variants[v_idx], called_idx)
-        if J is not None:
+        if _usable(J):
             return J
-    raise AssertionError(
-        f"section has call_target at called_idx={called_idx} but no "
-        "variant calls it -- BIN format invariant violated"
-    )
+    return None
 
 
 def narrow_selection_vkeys(
@@ -136,9 +149,10 @@ def narrow_selection_vkeys(
     new_vkeys: set = set()
     for v in called_by:
         J_v = lookup_callee_variant_for(section.variants[v], called_idx)
-        if J_v is None:
-            # Defensive: called_by includes v iff v called the target,
-            # so the lookup must succeed.
+        if not _usable(J_v):
+            # ``called_by`` includes v iff v called the target, but the
+            # per_call_entry may carry MISSING_VARIANT_INDEX (vkey
+            # mismatch) -- such a v contributes no faithful callee vkey.
             continue
         new_vkeys.add(callee_section.variants[J_v].variant_ref_offset)
     return frozenset(new_vkeys)

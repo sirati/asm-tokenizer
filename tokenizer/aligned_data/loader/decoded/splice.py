@@ -394,6 +394,11 @@ def _decode_then_splice(
             called_by_sel,
             called_idx,
         )
+        if callee_variant_idx is None:
+            # No faithful callee variant for this vkey (per_call_entry
+            # carries MISSING_VARIANT_INDEX at every fallback level) --
+            # treat as not-spliceable, same as cycle / missing callee.
+            continue
 
         visited.add(cycle_key)
         try:
