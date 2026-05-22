@@ -51,14 +51,19 @@ def tokenize_operand_memory_base_disp(
     if has_disp:
         # For the resolved-target case the displayed value IS the
         # resolved address (the original tiny disp is folded into the
-        # provider-side analysis). Sign tracking follows the chosen
-        # value.
+        # provider-side analysis).
         classified_value = resolved_target if has_resolved else disp
-        if classified_value < 0:
-            tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
-        elif has_base:
+        if has_base:
+            # MEM_PLUS is the addressing-operator separator inside
+            # ``mem[ ]mem`` regardless of disp sign. Sign of the disp is
+            # owned downstream by ``constant_handler.process_constant_v2``
+            # (postfix ``value_negative`` metatoken on the
+            # ``valued_const_v2`` token).
             tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.PLUS))
 
+        # ``abs_value`` drives width / range / section-membership tests
+        # only (sign-agnostic by construction); the value handed to the
+        # constant-handler stays signed so the emitter owns sign.
         abs_value = abs(classified_value)
         # Memory operand → an FP load against the resolved address gets a
         # postfix ``floatXX`` annotation (precedence.md "Postfix FP"). The
@@ -68,17 +73,24 @@ def tokenize_operand_memory_base_disp(
         # decode time.
         fp_postfix = op.fp_type
         if abs_value <= 0xFF and not has_resolved:
-            # Short-circuit only applies to small literal disps; a
-            # resolved-target address can never collapse to a bare
-            # valued_const without losing the classification.
-            tokens.append(vocab_manager.ValuedConst(abs_value))
+            # Small literal disps are pure arithmetic; skip the
+            # address-classifier walk via ``is_arithmetic=True`` so the
+            # emitter lands directly at step 11 (``valued_const_v2``).
+            # A resolved-target address can never collapse to a bare
+            # valued_const without losing the classification, hence the
+            # ``not has_resolved`` gate.
+            disp_tokens = constant_handler.process_constant_v2(
+                classified_value,
+                is_arithmetic=True,
+            )
+            tokens.extend(disp_tokens)
         else:
             force_opaque = not has_base
-            meta = lookup.lookup(abs_value)
+            meta = lookup.lookup(classified_value)
 
             if force_opaque or (abs_value > (1 << 18)) or has_resolved:
                 disp_tokens = constant_handler.process_constant_v2(
-                    abs_value,
+                    classified_value,
                     meta=meta,
                     is_arithmetic=False,
                     fp_postfix_type=fp_postfix,
@@ -87,7 +99,7 @@ def tokenize_operand_memory_base_disp(
             else:
                 if (text_start <= abs_value < text_end) or (abs_value < func_min_addr or abs_value > func_max_addr):
                     disp_tokens = constant_handler.process_constant_v2(
-                        abs_value,
+                        classified_value,
                         meta=meta,
                         is_arithmetic=False,
                         fp_postfix_type=fp_postfix,
@@ -95,7 +107,7 @@ def tokenize_operand_memory_base_disp(
                     tokens.extend(disp_tokens)
                 else:
                     disp_tokens = constant_handler.process_constant_v2(
-                        abs_value,
+                        classified_value,
                         is_arithmetic=True,
                     )
                     tokens.extend(disp_tokens)
@@ -120,17 +132,17 @@ def tokenize_operand_immediate_generic(
     tokens = []
 
     raw_imm = op.imm
-    imm_val = abs(raw_imm)
-    imm_val_hex_len = num_hex_digits(imm_val)
+    # Width-only computation: hex-digit count is sign-agnostic and
+    # selects the encoding-size branch, distinct from the value handed
+    # to the constant-handler.
+    imm_val_hex_len = num_hex_digits(abs(raw_imm))
 
-    # Negative immediates: valued_const is a typeless byte-stream token
-    # (no size, no signedness embedded in the token), so we surface the
-    # sign as a leading MEM_MINUS token OUTSIDE any mem[ ]mem context.
-    # Float immediates take a separate path (FP-postfix annotation on
-    # the constant); only integer-immediate negatives need this branch.
-    if raw_imm < 0:
-        tokens.append(vocab_manager.MemoryOperand(MemoryOperandSymbol.MINUS))
-
+    # Sign of ``raw_imm`` is owned downstream by
+    # ``constant_handler.process_constant_v2`` (postfix ``value_negative``
+    # metatoken on the ``valued_const_v2`` token). This call site does
+    # NOT inspect sign — the value flows through to the emitter
+    # unmodified.
+    #
     # Immediate operand → an FP-tagged immediate (precedence.md step 1) is
     # an inline ``floatXX`` whose value is the IEEE bit pattern. Only the
     # Ghidra path stamps a non-None ``fp_type`` on the operand at decode
@@ -141,7 +153,7 @@ def tokenize_operand_immediate_generic(
 
     if imm_val_hex_len <= 2:
         imm_token = constant_handler.process_constant_v2(
-            imm_val,
+            raw_imm,
             fp_immediate_type=fp_immediate,
         )
         tokens.extend(imm_token)
@@ -156,43 +168,50 @@ def tokenize_operand_immediate_generic(
         base_mnemonic = insn.mnemonic
         if base_mnemonic in arithmetic_instructions:
             imm_token = constant_handler.process_constant_v2(
-                imm_val,
+                raw_imm,
                 is_arithmetic=True,
                 fp_immediate_type=fp_immediate,
             )
             tokens.extend(imm_token)
         elif base_mnemonic in addressing_control_flow_instructions:
-            meta = lookup.lookup(imm_val)
+            meta = lookup.lookup(raw_imm)
             # Internal-jump heuristic: a control-flow target inside the
             # current function body (and not at the function entry) is
             # treated as a raw arithmetic value rather than a typed
-            # ``block`` token. Function entries (``start_addr == imm_val``)
+            # ``block`` token. Function entries (``start_addr == raw_imm``)
             # — including recursive calls — fall through to the typed
             # path so the ``local_func`` precedence rule fires.
+            #
+            # Negative ``raw_imm`` never matches a function entry
+            # (Ghidra-reported function addresses are non-negative) and
+            # never falls within ``[func_min_addr, func_max_addr)``
+            # (both bounds non-negative), so the heuristic safely
+            # short-circuits on negative arithmetic immediates that
+            # share a control-flow mnemonic.
             if (
                 meta.kind == AddressKind.LOCAL_FUNCTION
                 and meta.start_addr is not None
-                and meta.start_addr != imm_val
-                and func_min_addr <= imm_val < func_max_addr
+                and meta.start_addr != raw_imm
+                and func_min_addr <= raw_imm < func_max_addr
             ):
                 imm_token = constant_handler.process_constant_v2(
-                    imm_val,
+                    raw_imm,
                     is_arithmetic=True,
                     fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
             else:
                 imm_token = constant_handler.process_constant_v2(
-                    imm_val,
+                    raw_imm,
                     meta=meta,
                     is_arithmetic=False,
                     fp_immediate_type=fp_immediate,
                 )
                 tokens.extend(imm_token)
         else:
-            meta = lookup.lookup(imm_val)
+            meta = lookup.lookup(raw_imm)
             imm_token = constant_handler.process_constant_v2(
-                imm_val,
+                raw_imm,
                 meta=meta,
                 is_arithmetic=False,
                 fp_immediate_type=fp_immediate,
