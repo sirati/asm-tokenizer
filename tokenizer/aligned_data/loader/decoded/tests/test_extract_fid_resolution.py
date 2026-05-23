@@ -66,6 +66,8 @@ def test_fid_resolution_indexes_into_lookup():
         id_token_ids=_id_token_ids(),
         number_token_ids=_number_token_ids(),
         fids_per_category=fids,
+        value_negative_token_id=256,
+        format_version=1,
     )
     arr = staging.identities[Category.LOCAL_FUNC]
     assert arr.dtype == np.uint32
@@ -92,6 +94,8 @@ def test_fid_resolution_out_of_range_emits_u32_sentinel():
         id_token_ids=_id_token_ids(),
         number_token_ids=_number_token_ids(),
         fids_per_category=fids,
+        value_negative_token_id=256,
+        format_version=1,
     )
     arr = staging.identities[Category.LOCAL_FUNC]
     assert arr.dtype == np.uint32
@@ -112,6 +116,8 @@ def test_fid_resolution_legacy_fallback_when_kwarg_absent():
         id_token_ids=_id_token_ids(),
         number_token_ids=_number_token_ids(),
         fids_per_category=None,
+        value_negative_token_id=256,
+        format_version=1,
     )
     arr = staging.identities[Category.LOCAL_FUNC]
     assert arr.dtype == np.uint16
@@ -137,6 +143,8 @@ def test_non_fid_keyed_category_unaffected_by_kwarg():
         id_token_ids=_id_token_ids(),
         number_token_ids=_number_token_ids(),
         fids_per_category=fids,
+        value_negative_token_id=256,
+        format_version=1,
     )
     block = staging.identities[Category.BLOCK]
     assert block.dtype == np.uint16

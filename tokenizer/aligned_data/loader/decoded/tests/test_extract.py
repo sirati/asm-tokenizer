@@ -33,24 +33,36 @@ from tokenizer.tokens import Category, TokenType
 
 
 def _make_id_maps() -> Tuple[Dict[Category, int], Dict[TokenType, int]]:
+    """Synthetic id maps pinned to the unified-vocab canonical layout.
+
+    The vectorized decode path filters number-source positions through
+    ``state.carries_inline_mask & np.isin(raw_tokens, number_type_ids)``,
+    where ``carries_inline_mask`` is True iff
+    ``_V2_RESERVED_TOKEN_COUNT <= id < _V2_EAGER_BLOCK_END`` (= [257,
+    272)). So number / identity ids in these fixtures must sit inside
+    that carrier band; arbitrary ids above the band (e.g. 400+) would
+    decode as "unknown real-tokens" and the side-array sanity check
+    would trip. The values below mirror
+    :meth:`VocabularyManager._register_v2_canonical_blocks`.
+    """
     id_token_ids: Dict[Category, int] = {
-        Category.BLOCK: 300,
-        Category.LOCAL_FUNC: 301,
-        Category.PLT_FUNC: 302,
-        Category.EXT_FUNC: 303,
-        Category.RO_DATA_PTR: 304,
-        Category.RW_DATA_PTR: 305,
-        Category.STRING_PTR: 306,
-        Category.JUMP_TABLE: 307,
+        Category.BLOCK: 264,
+        Category.LOCAL_FUNC: 265,
+        Category.PLT_FUNC: 266,
+        Category.EXT_FUNC: 267,
+        Category.STRING_PTR: 268,
+        Category.JUMP_TABLE: 269,
+        Category.RO_DATA_PTR: 270,
+        Category.RW_DATA_PTR: 271,
     }
     number_token_ids: Dict[TokenType, int] = {
-        TokenType.VALUED_CONST_V2: 400,
-        TokenType.FLOAT16: 401,
-        TokenType.BFLOAT16: 402,
-        TokenType.FLOAT32: 403,
-        TokenType.FLOAT64: 404,
-        TokenType.FLOAT80: 405,
-        TokenType.FLOAT128: 406,
+        TokenType.VALUED_CONST_V2: 257,
+        TokenType.FLOAT16: 258,
+        TokenType.BFLOAT16: 259,
+        TokenType.FLOAT32: 260,
+        TokenType.FLOAT64: 261,
+        TokenType.FLOAT80: 262,
+        TokenType.FLOAT128: 263,
     }
     return id_token_ids, number_token_ids
 
@@ -59,11 +71,27 @@ def _u16(*tokens: int) -> np.ndarray:
     return np.array(tokens, dtype=np.uint16)
 
 
+def _real(*ids: int) -> np.ndarray:
+    """Build an expected ``real_tokens`` array under the D6 shift.
+
+    Every surviving real-token id in ``raw_tokens`` is shifted down by
+    256 so the post-strip vocab compacts; tests build their expected
+    streams via the original (unshifted) ids for readability and this
+    helper applies the shift in one place.
+    """
+    return np.array([int(t) - 256 for t in ids], dtype=np.uint16)
+
+
+_VALUE_NEGATIVE_ID = 256
+
+
 def _decode(raw, **overrides) -> "decode_raw_tokens":
     id_token_ids, number_token_ids = _make_id_maps()
     kwargs = dict(
         id_token_ids=id_token_ids,
         number_token_ids=number_token_ids,
+        value_negative_token_id=_VALUE_NEGATIVE_ID,
+        format_version=1,
         func_name="t",
     )
     kwargs.update(overrides)
@@ -88,7 +116,7 @@ def test_empty_stream_returns_all_empty_arrays():
 
 
 def test_first_position_inline_byte_raises():
-    raw = _u16(42, 300)  # 42 is in the digit-slot range -> illegal stream
+    raw = _u16(42, 264)  # 42 is in the digit-slot range -> illegal stream
     with pytest.raises(AssertionError):
         _decode(raw)
 
@@ -102,9 +130,9 @@ def test_single_real_token_no_inline_yields_identity_zero():
     """A BLOCK_V2 token alone at position 0 has 0 trailing inline bytes;
     plan decision 7 + identity decoder treat empty payload as identity=0
     (sentinel only fires on > 0xFFFE, not on empty)."""
-    raw = _u16(300)  # Category.BLOCK type-id
+    raw = _u16(264)  # Category.BLOCK type-id
     out = _decode(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(300))
+    np.testing.assert_array_equal(out.real_tokens, _real(264))
     np.testing.assert_array_equal(out.identities[Category.BLOCK], _u16(0))
     for c in Category:
         if c is Category.BLOCK:
@@ -114,16 +142,16 @@ def test_single_real_token_no_inline_yields_identity_zero():
 
 
 def test_single_identity_inline_value_42():
-    raw = _u16(301, 42)  # LOCAL_FUNC, inline-byte 42
+    raw = _u16(265, 42)  # LOCAL_FUNC, inline-byte 42
     out = _decode(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(301))
+    np.testing.assert_array_equal(out.real_tokens, _real(265))
     np.testing.assert_array_equal(out.identities[Category.LOCAL_FUNC], _u16(42))
     assert out.numbers_significant.shape == (0,)
 
 
 def test_identity_overflow_clips_to_0xFFFF_sentinel():
     # value 0x10000 (3 bytes: 0x01 0x00 0x00) exceeds 0xFFFE -> sentinel.
-    raw = _u16(301, 0x01, 0x00, 0x00)
+    raw = _u16(265, 0x01, 0x00, 0x00)
     out = _decode(raw)
     np.testing.assert_array_equal(
         out.identities[Category.LOCAL_FUNC], _u16(0xFFFF)
@@ -132,7 +160,7 @@ def test_identity_overflow_clips_to_0xFFFF_sentinel():
 
 def test_identity_at_max_non_sentinel_stays_intact():
     # value 0xFFFE -> stored as-is; only > 0xFFFE clips.
-    raw = _u16(301, 0xFF, 0xFE)
+    raw = _u16(265, 0xFF, 0xFE)
     out = _decode(raw)
     np.testing.assert_array_equal(
         out.identities[Category.LOCAL_FUNC], _u16(0xFFFE)
@@ -142,23 +170,23 @@ def test_identity_at_max_non_sentinel_stays_intact():
 def test_multiple_same_category_identities_in_stream_order():
     # Three LOCAL_FUNC tokens with identities 5, 100, 0x100.
     raw = _u16(
-        301, 5,
-        301, 100,
-        301, 0x01, 0x00,
+        265, 5,
+        265, 100,
+        265, 0x01, 0x00,
     )
     out = _decode(raw)
     np.testing.assert_array_equal(
         out.identities[Category.LOCAL_FUNC], _u16(5, 100, 0x100)
     )
     # Real-token stream keeps three real tokens; inline bytes stripped.
-    np.testing.assert_array_equal(out.real_tokens, _u16(301, 301, 301))
+    np.testing.assert_array_equal(out.real_tokens, _real(265, 265, 265))
 
 
 def test_two_different_categories_interleaved():
     raw = _u16(
-        301, 7,   # LOCAL_FUNC = 7
-        304, 9,   # RO_DATA_PTR = 9
-        301, 8,   # LOCAL_FUNC = 8
+        265, 7,   # LOCAL_FUNC = 7
+        270, 9,   # RO_DATA_PTR = 9
+        265, 8,   # LOCAL_FUNC = 8
     )
     out = _decode(raw)
     np.testing.assert_array_equal(
@@ -185,6 +213,8 @@ def test_all_eight_categories_present_each_with_one_occurrence():
         raw,
         id_token_ids=id_token_ids,
         number_token_ids=number_token_ids,
+        value_negative_token_id=_VALUE_NEGATIVE_ID,
+        format_version=1,
         func_name="t",
     )
     for category in Category:
@@ -202,9 +232,9 @@ def test_single_float32_inline_value_matches_from_float32():
     # Pick the bit pattern for the float 3.14: 0x4048f5c3.
     bits = struct.unpack(">I", struct.pack(">f", 3.14))[0]
     payload_bytes = bits.to_bytes(4, byteorder="big", signed=False)
-    raw = _u16(403, *payload_bytes)  # FLOAT32 = 403
+    raw = _u16(260, *payload_bytes)  # FLOAT32 = 260
     out = _decode(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(403))
+    np.testing.assert_array_equal(out.real_tokens, _real(260))
     expected_chunks = from_float32(bits)
     assert out.numbers_significant.shape == (len(expected_chunks),)
     for idx, (sig, sign_exp) in enumerate(expected_chunks):
@@ -226,13 +256,15 @@ def test_valued_const_u128_multi_chunk_promotion_and_alignment():
     inline_len = len(payload_bytes)
     # ceil(inline_len / 8) chunks expected.
     expected_chunk_count = (inline_len + 7) // 8
-    raw = _u16(400, *payload_bytes)  # VALUED_CONST_V2 = 400
+    raw = _u16(257, *payload_bytes)  # VALUED_CONST_V2 = 257
     out = _decode(raw)
     assert expected_chunk_count >= 2  # sanity for the test design
     # Strip-and-promote: real_tokens has chunk_count consecutive VALUED_CONST_V2
-    # tokens; all inline bytes are stripped.
+    # tokens; all inline bytes are stripped. Surviving real-token ids
+    # are shifted down by 256 per the D6 compact-vocab step.
     np.testing.assert_array_equal(
-        out.real_tokens, np.full(expected_chunk_count, 400, dtype=np.uint16)
+        out.real_tokens,
+        np.full(expected_chunk_count, 257 - 256, dtype=np.uint16),
     )
     expected = from_int(value, sign=+1)
     assert len(expected) == expected_chunk_count
@@ -254,11 +286,11 @@ def test_float128_finite_two_chunk_lossless_promotion():
     sign = 0
     bits = (sign << 127) | (biased_exp << 112) | mantissa
     payload_bytes = bits.to_bytes(16, byteorder="big", signed=False)
-    raw = _u16(406, *payload_bytes)  # FLOAT128 = 406
+    raw = _u16(263, *payload_bytes)  # FLOAT128 = 263
     out = _decode(raw)
     # 2 chunks per plan decision 15.
     np.testing.assert_array_equal(
-        out.real_tokens, _u16(406, 406)
+        out.real_tokens, _real(263, 263)
     )
     expected = from_float128(bits)
     assert len(expected) == 2
@@ -274,11 +306,11 @@ def test_float128_positive_infinity_single_chunk():
     biased_exp = (1 << 15) - 1  # 0x7FFF
     bits = (biased_exp << 112)
     payload_bytes = bits.to_bytes(16, byteorder="big", signed=False)
-    raw = _u16(406, *payload_bytes)
+    raw = _u16(263, *payload_bytes)
     out = _decode(raw)
     # Plan decision 14: NaN/Inf always single chunk regardless of source
     # width; promotion path bypassed.  Real_tokens has ONE FLOAT128 token.
-    np.testing.assert_array_equal(out.real_tokens, _u16(406))
+    np.testing.assert_array_equal(out.real_tokens, _real(263))
     expected = from_float128(bits)
     assert len(expected) == 1
     assert int(out.numbers_significant[0]) == int(expected[0][0])
@@ -300,13 +332,13 @@ def test_mixed_identity_and_number_streams():
     f64_bits = struct.unpack(">Q", struct.pack(">d", 1.5))[0]
     f64_bytes = tuple(f64_bits.to_bytes(8, byteorder="big", signed=False))
     raw = _u16(
-        300, *block_inline,    # BLOCK = 1
-        400, *vc_bytes,        # VALUED_CONST_V2 = 0x42
-        301, *lf_inline,       # LOCAL_FUNC = 5
-        404, *f64_bytes,       # FLOAT64 = 1.5
+        264, *block_inline,    # BLOCK = 1
+        257, *vc_bytes,        # VALUED_CONST_V2 = 0x42
+        265, *lf_inline,       # LOCAL_FUNC = 5
+        261, *f64_bytes,       # FLOAT64 = 1.5
     )
     out = _decode(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(300, 400, 301, 404))
+    np.testing.assert_array_equal(out.real_tokens, _real(264, 257, 265, 261))
     np.testing.assert_array_equal(out.identities[Category.BLOCK], _u16(1))
     np.testing.assert_array_equal(out.identities[Category.LOCAL_FUNC], _u16(5))
     expected_vc = from_int(vc_value, sign=+1)
@@ -330,12 +362,12 @@ def test_number_entries_in_stream_position_order_not_clustered_by_type():
     d_bytes = tuple(bits_d.to_bytes(8, byteorder="big", signed=False))
     vc_value = 9
     raw = _u16(
-        404, *b_bytes,    # FLOAT64
-        400, vc_value,    # VALUED_CONST_V2
-        404, *d_bytes,    # FLOAT64
+        261, *b_bytes,    # FLOAT64
+        257, vc_value,    # VALUED_CONST_V2
+        261, *d_bytes,    # FLOAT64
     )
     out = _decode(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(404, 400, 404))
+    np.testing.assert_array_equal(out.real_tokens, _real(261, 257, 261))
     expected = (
         from_float64(bits_b)
         + from_int(vc_value, sign=+1)
@@ -360,7 +392,7 @@ def test_caller_raw_tokens_unchanged_after_decode():
     payload_bytes = value.to_bytes(
         (value.bit_length() + 7) // 8, byteorder="big", signed=False
     )
-    raw = _u16(400, *payload_bytes)
+    raw = _u16(257, *payload_bytes)
     snapshot = raw.copy()
     _decode(raw)
     np.testing.assert_array_equal(raw, snapshot)
@@ -389,9 +421,9 @@ def test_interleaved_multi_chunk_sources_preserve_per_source_chunk_contiguity():
     f64_bits = struct.unpack(">Q", struct.pack(">d", 1.0))[0]
     f64_bytes = f64_bits.to_bytes(8, byteorder="big", signed=False)
     raw = _u16(
-        400, *a_bytes,    # VALUED_CONST_V2 = u128_a -> 2 chunks
-        404, *f64_bytes,  # FLOAT64 = 1.0 -> 1 chunk
-        400, *b_bytes,    # VALUED_CONST_V2 = u128_b -> 2 chunks
+        257, *a_bytes,    # VALUED_CONST_V2 = u128_a -> 2 chunks
+        261, *f64_bytes,  # FLOAT64 = 1.0 -> 1 chunk
+        257, *b_bytes,    # VALUED_CONST_V2 = u128_b -> 2 chunks
     )
     out = _decode(raw)
 
@@ -403,7 +435,7 @@ def test_interleaved_multi_chunk_sources_preserve_per_source_chunk_contiguity():
     # VALUED_CONST_V2 slots; FLOAT64 is single-token; u128_b paints two
     # VALUED_CONST_V2 slots.  Order: [VC, VC, F64, VC, VC].
     np.testing.assert_array_equal(
-        out.real_tokens, _u16(400, 400, 404, 400, 400)
+        out.real_tokens, _real(257, 257, 261, 257, 257)
     )
 
     # Reconstruct each source from its chunk range and compare against
@@ -447,9 +479,9 @@ def test_partial_vocab_decode_succeeds_with_empty_identity_arrays_for_missing_ty
     - emit number side-array entries ONLY for FLOAT64 (the only
       number-token type the partial vocab advertises).
 
-    Crucially the stream contains a real-token id (303) that the partial
+    Crucially the stream contains a real-token id (266) that the partial
     vocab does NOT recognise.  Because nothing in the partial map points
-    at 303, that token is preserved verbatim in the real-token stream
+    at 266, that token is preserved verbatim in the real-token stream
     but never appears in any identity / number side array — vocab
     incompleteness leaves stream content untouched, only the side-
     channel decoding is partial.
@@ -458,25 +490,27 @@ def test_partial_vocab_decode_succeeds_with_empty_identity_arrays_for_missing_ty
     # this test isolates ``decode_raw_tokens``'s handling of partial maps
     # from the resolver's "absent TokenType -> omitted key" behaviour
     # (which is covered in test_category_tokens.py).
-    id_token_ids = {Category.LOCAL_FUNC: 301}
-    number_token_ids = {TokenType.FLOAT64: 404}
+    id_token_ids = {Category.LOCAL_FUNC: 265}
+    number_token_ids = {TokenType.FLOAT64: 261}
 
-    # Stream: LOCAL_FUNC(5), <unknown real-token 303>, FLOAT64(2.5), FLOAT64(4.5).
+    # Stream: LOCAL_FUNC(5), <unknown real-token 266>, FLOAT64(2.5), FLOAT64(4.5).
     bits_a = struct.unpack(">Q", struct.pack(">d", 2.5))[0]
     bits_b = struct.unpack(">Q", struct.pack(">d", 4.5))[0]
     a_bytes = tuple(bits_a.to_bytes(8, byteorder="big", signed=False))
     b_bytes = tuple(bits_b.to_bytes(8, byteorder="big", signed=False))
     raw = _u16(
-        301, 5,               # LOCAL_FUNC = 5
-        303,                  # unknown real-token (id 303 — partial vocab ignores it)
-        404, *a_bytes,        # FLOAT64 = 2.5
-        404, *b_bytes,        # FLOAT64 = 4.5
+        265, 5,               # LOCAL_FUNC = 5
+        266,                  # unknown real-token (id 266 — partial vocab ignores it)
+        261, *a_bytes,        # FLOAT64 = 2.5
+        261, *b_bytes,        # FLOAT64 = 4.5
     )
 
     out = decode_raw_tokens(
         raw,
         id_token_ids=id_token_ids,
         number_token_ids=number_token_ids,
+        value_negative_token_id=_VALUE_NEGATIVE_ID,
+        format_version=1,
         func_name="t",
     )
 
@@ -505,6 +539,7 @@ def test_partial_vocab_decode_succeeds_with_empty_identity_arrays_for_missing_ty
         assert int(out.numbers_significant[idx]) == int(sig)
         assert int(out.numbers_sign_exponent[idx]) == int(sign_exp)
 
-    # Real-token stream preserves the unknown id 303 verbatim alongside
-    # LOCAL_FUNC + the two FLOAT64 occurrences.
-    np.testing.assert_array_equal(out.real_tokens, _u16(301, 303, 404, 404))
+    # Real-token stream preserves the unknown id 266 verbatim alongside
+    # LOCAL_FUNC + the two FLOAT64 occurrences. Ids are shifted down
+    # by 256 per the D6 compact-vocab step.
+    np.testing.assert_array_equal(out.real_tokens, _real(265, 266, 261, 261))

@@ -373,11 +373,12 @@ def _collect_number_sources(
     per-source ``_decode_number_payload`` dispatch (variable-length
     ``int.from_bytes`` -> chunks) runs in a Python loop. The sign
     array's ``is_negative_per_position`` is precomputed by the state
-    builder via a runlength diff so FP types whose ``is_negative_per_position``
-    is False simply get ``sign=+1`` -- the contract pinned by
-    :func:`_assert_value_negative_postfix_invariant`'s replacement (an
-    FP carrier with the sign flag set is a stream-shape bug, already
-    caught at the entry of :func:`_decode_to_staging`).
+    builder via a runlength diff so FP types whose
+    ``is_negative_per_position`` is False simply get ``sign=+1`` --
+    the postfix-invariant check at the entry of
+    :func:`_decode_to_staging` already rejects streams where a non-VC2
+    carrier has a sign marker glued to its tail, so this loop never
+    sees ``sign=-1`` on an FP source.
     """
     raw_tokens = state.raw_tokens
     n = int(raw_tokens.shape[0])

@@ -50,63 +50,76 @@ from ._session_fixture import (
 # ---------------------------------------------------------------------------
 
 
-# Slots 256..259 are reserved for the variant-record strings
-# (arch:x64, comp:gcc, cver:gcc:13.2.0, opt:O2 in order). Slots 260+
-# carry the 15 v2 type-tokens in the order below.
+# Canonical unified-vocab layout: v2 type-tokens are pinned at ids
+# 257..271 (NUMBER block at 257..263, IDENTITY block at 264..271).
+# Variant-decoder strings live ABOVE the carrier band at ids 272+ so
+# they are real-tokens but NOT carriers (the runlength-form decoder
+# would mis-treat them as number sources otherwise).
 _BASE_VOCAB_STRINGS = (
     "arch:x64",
     "comp:gcc",
     "cver:gcc:13.2.0",
     "opt:O2",
 )
+_BASE_VOCAB_FIRST_ID = 272
 
-# (TokenType, in-vocab id) -- offsets from 260.
-_V2_TYPE_TOKENS = (
-    TokenType.BLOCK_V2,
-    TokenType.LOCAL_FUNC,
-    TokenType.PLT_FUNC,
-    TokenType.EXT_FUNC,
-    TokenType.RO_DATA_PTR,
-    TokenType.RW_DATA_PTR,
-    TokenType.STRING_PTR,
-    TokenType.JUMP_TABLE,
-    TokenType.VALUED_CONST_V2,
-    TokenType.FLOAT16,
-    TokenType.BFLOAT16,
-    TokenType.FLOAT32,
-    TokenType.FLOAT64,
-    TokenType.FLOAT80,
-    TokenType.FLOAT128,
-)
+
+# Canonical block layout pinned by
+# ``VocabularyManager._register_v2_canonical_blocks``. Keep this map as
+# the single source of truth for the splice-test wire ids.
+_V2_TYPE_ID_MAP: Dict[TokenType, int] = {
+    TokenType.VALUED_CONST_V2: 257,
+    TokenType.FLOAT16: 258,
+    TokenType.BFLOAT16: 259,
+    TokenType.FLOAT32: 260,
+    TokenType.FLOAT64: 261,
+    TokenType.FLOAT80: 262,
+    TokenType.FLOAT128: 263,
+    TokenType.BLOCK_V2: 264,
+    TokenType.LOCAL_FUNC: 265,
+    TokenType.PLT_FUNC: 266,
+    TokenType.EXT_FUNC: 267,
+    TokenType.STRING_PTR: 268,
+    TokenType.JUMP_TABLE: 269,
+    TokenType.RO_DATA_PTR: 270,
+    TokenType.RW_DATA_PTR: 271,
+}
 
 
 def _v2_id(token_type: TokenType) -> int:
     """Vocab id of ``token_type`` in the splice-test layout."""
-    return 260 + _V2_TYPE_TOKENS.index(token_type)
+    return _V2_TYPE_ID_MAP[token_type]
 
 
 class _SpliceFakeVocab(_FakeVocab):
     """``_FakeVocab`` extended with an ``id_to_token_type`` ndarray.
 
-    Variant-decoder strings stay at ids 256-259 (tagged UNRESOLVED so
-    the decoder rounds-trips them as bare strings); v2 type-tokens
-    occupy ids 260..274 with their matching TokenType. The array
-    capacity is sized to ``max(id)+1`` so the resolver's ``np.where``
-    finds each tag at exactly one id.
+    V2 type-tokens occupy ids 257..271 per the unified-vocab canonical
+    layout (so the vectorized decoder's carrier-band lookup picks
+    them up correctly); variant-decoder strings live at 272+ above
+    the carrier band so they survive the strip pass as plain real
+    tokens. ``value_negative`` is pinned at id 256 (between the
+    inline-digit band and the carrier block) to match the canonical
+    layout the decoder asserts on.
 
-    Pins ``value_negative_token_id`` to 256 to match the canonical
-    unified-vocab layout the decoder asserts on; the v2 type-tokens
-    in this fake live above the carrier band, so the streams below
-    never actually emit a ``value_negative`` postfix, but the decoder
-    still requires the id at construction time.
+    The string id-map is rebuilt here (rather than inherited from
+    ``_FakeVocab``'s default 256+i layout) so the variant strings do
+    NOT collide with the ``value_negative`` or carrier-band slots.
     """
 
     def __init__(self) -> None:
         super().__init__(list(_BASE_VOCAB_STRINGS))
-        capacity = 260 + len(_V2_TYPE_TOKENS) + 8
+        # Override _FakeVocab's 256+i string layout: shift variant
+        # strings above the canonical carrier band.
+        self._s2i = {
+            s: _BASE_VOCAB_FIRST_ID + i
+            for i, s in enumerate(_BASE_VOCAB_STRINGS)
+        }
+        self._i2s = {v: k for k, v in self._s2i.items()}
+        capacity = _BASE_VOCAB_FIRST_ID + len(_BASE_VOCAB_STRINGS) + 8
         arr = np.full(capacity, TokenType.UNRESOLVED, dtype=np.int8)
-        for offset, token_type in enumerate(_V2_TYPE_TOKENS):
-            arr[260 + offset] = int(token_type)
+        for token_type, vocab_id in _V2_TYPE_ID_MAP.items():
+            arr[vocab_id] = int(token_type)
         self.id_to_token_type = arr
         self.value_negative_token_id = 256
 
@@ -538,6 +551,7 @@ def test_splice_depth_zero_matched_equals_decode_only(splice_corpus_single):
             number_token_ids=num_ids,
             fids_per_category=fids,
             value_negative_token_id=vneg_id,
+            format_version=int(sess._vocab_manager.format_version),
             func_name=matched.func_name,
             metadata=matched.variants[0].metadata,
         )
@@ -658,6 +672,7 @@ def test_splice_unmatched_arm_supported(tmp_path):
             id_token_ids=cat_ids,
             number_token_ids=num_ids,
             value_negative_token_id=vneg_id,
+            format_version=int(sess._vocab_manager.format_version),
             func_name=fd.func_name,
             metadata=fd.metadata,
         )
