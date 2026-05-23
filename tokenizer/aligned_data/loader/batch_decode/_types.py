@@ -438,6 +438,13 @@ class Stage3Batch:
     (chunk_index_within_source) for the VC2 multi-chunk byte
     layout (ALG-8)."""
 
+    f128_is_nan_or_inf: np.ndarray
+    """``bool[n_f128_sources]`` -- per-F128-SOURCE NaN/Inf flag from
+    ALG-2's high-u16 exponent check. Length = number of F128 sources
+    in the batch (NOT chunks); 3d's normalization branches into
+    ``_encode_infnan`` for True entries and the finite-source path
+    for False entries. Produced by 3c (``_number_decode.py``)."""
+
 
 # ---------------------------------------------------------------------------
 # Stage 4 -- final tensor + remap + variant padding (plan section D9)

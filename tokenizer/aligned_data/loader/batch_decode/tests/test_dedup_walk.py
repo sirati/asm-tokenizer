@@ -312,6 +312,7 @@ def _wrap_variant_into_batch(
         identity_idx_2d=np.zeros((0, 2), dtype=np.uint32),
         number_idx_2d_per_TokenType={},
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
+        f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
     )
 
 
@@ -741,6 +742,7 @@ def test_dedup_maps_clean_between_rows():
         identity_idx_2d=np.zeros((0, 2), dtype=np.uint32),
         number_idx_2d_per_TokenType={},
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
+        f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
     )
 
     apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
@@ -937,6 +939,7 @@ def test_padding_row_skipped():
         identity_idx_2d=np.zeros((0, 2), dtype=np.uint32),
         number_idx_2d_per_TokenType={},
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
+        f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
     )
 
     _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
