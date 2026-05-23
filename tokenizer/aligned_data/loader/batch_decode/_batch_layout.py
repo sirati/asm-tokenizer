@@ -54,7 +54,6 @@ policies yield a dense mapping.
 
 
 __all__ = [
-    "ResolvedSection",
     "UINT32_MAX",
     "compute_batch_idx_mapping",
 ]

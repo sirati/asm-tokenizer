@@ -14,8 +14,10 @@ import pytest
 from tokenizer.aligned_data.loader.batch_decode import VariantPadding
 from tokenizer.aligned_data.loader.batch_decode._batch_layout import (
     UINT32_MAX,
-    ResolvedSection,
     compute_batch_idx_mapping,
+)
+from tokenizer.aligned_data.loader.batch_decode._resolve_pointers import (
+    ResolvedSection,
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import Section
