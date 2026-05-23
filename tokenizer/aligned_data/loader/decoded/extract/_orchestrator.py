@@ -224,9 +224,14 @@ def _decode_to_staging(
 
     # ---- Strip + shift: drop value_negative (id 256) AND every inline
     # byte; shift surviving real-token ids down by 256 so the
-    # model-facing vocab compacts (slot 0 corresponds to the stripped
-    # sign marker and is reserved / unused). The mask is recomputed
-    # AFTER promotion so promoted slots survive the strip. ----
+    # model-facing vocab compacts. Slot 0 in the shifted layout is the
+    # reserved "null-content" id — it is the position the stripped
+    # value_negative sign marker would have collapsed to, and it never
+    # appears in a valid post-strip stream. Downstream consumers (model
+    # embedding tables, special-token handlers) MAY use id 0 as a pad /
+    # null / mask slot because the decoder guarantees it is never
+    # emitted from real source content. The mask is recomputed AFTER
+    # promotion so promoted slots survive the strip. ----
     keep_mask = working_tokens > _V2_VALUE_NEGATIVE_TOKEN_ID
     real_tokens = (
         working_tokens[keep_mask].astype(np.int32) - _V2_VALUE_NEGATIVE_TOKEN_ID
@@ -321,6 +326,15 @@ def decode_raw_tokens(
         and the shared ``(numbers_significant, numbers_sign_exponent)``
         pair carrying ordered chunks for every number-token occurrence
         in the final stream.
+
+        ``real_tokens`` ids are SHIFTED — every surviving vocab id has
+        ``_V2_VALUE_NEGATIVE_TOKEN_ID`` (= 256) subtracted, so the
+        model-facing vocab starts at slot 1 (originally id 257 =
+        ``valued_const_v2``). Slot 0 is reserved as a "null-content" id:
+        it would have held the stripped ``value_negative`` sign marker
+        if it survived, but the strip drops every such occurrence, so
+        id 0 NEVER appears in a valid post-strip stream. Downstream
+        consumers may treat id 0 as pad / null / mask.
     """
     staging = _decode_to_staging(
         raw_tokens,
