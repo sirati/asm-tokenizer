@@ -1,38 +1,34 @@
-"""Per-arm load + token-id-cache bridge for :class:`BinarySession`.
+"""Per-arm load helpers + variant sampler for :class:`BinarySession`.
 
 Single concern of this module: provide the session helpers the
 batch-decode pipeline consumes -- the per-arm
 ``(idx, variant_index) -> (FunctionData, Section, section_offset)``
-load methods, the inverse ``section_offset -> idx`` lookup, the lazy
-v2 token-id cache resolver, and the RNG-driven variant-index sampler.
-The actual decode + splice walk lives in
-:mod:`tokenizer.aligned_data.loader.batch_decode`; this module owns
-only the I/O shape that surrounds it.
+load methods, the inverse ``section_offset -> idx`` lookup, and the
+RNG-driven variant-index sampler. The actual decode + splice walk
+lives in :mod:`tokenizer.aligned_data.loader.batch_decode`; this
+module owns only the I/O shape that surrounds it.
 
 Exposed as a mixin :class:`_BinarySessionSpliceMixin` so the helpers
 stay on :class:`BinarySession` itself -- callers do not need to know
 about the split. Mixin inheritance is purely additive: every attribute
-it reads (``_vocab_manager``, ``_meta_get``,
-``_load_matched_section_and_variants``,
+it reads (``_meta_get``, ``_load_matched_section_and_variants``,
 ``_load_unmatched_record_and_section``,
-``_unmatched_record_slot_base``, ``_category_token_ids``,
-``_number_token_ids``) is owned by :class:`BinarySession` itself.
+``_unmatched_record_slot_base``) is owned by :class:`BinarySession`
+itself.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
-
-from tokenizer.tokens import Category, TokenType
 
 from ..matched_sections_bin import Section
 from .function_data import FunctionData
 
 
 class _BinarySessionSpliceMixin:
-    """Mixin providing the per-arm load + token-id-cache helpers.
+    """Mixin providing the per-arm load + inverse-lookup helpers.
 
     Every method reads attributes / methods that :class:`BinarySession`
     owns; this class deliberately holds no state of its own. The
@@ -45,43 +41,6 @@ class _BinarySessionSpliceMixin:
     # inside the bodies because the concrete attributes live on the
     # subclass; declaring them here would duplicate the source of truth
     # and risk drift.
-
-    # --- token-id cache ----------------------------------------------
-
-    def _get_token_id_caches(  # type: ignore[no-untyped-def]
-        self,
-    ) -> Tuple[Dict[Category, int], Dict[TokenType, int], Optional[int]]:
-        """Lazily resolve + cache the v2 Category + number-TokenType ids
-        plus the ``value_negative`` postfix-metatoken id.
-
-        All three are derived from ``self._vocab_manager`` via the
-        :mod:`decoded.category_tokens` resolvers; the result is cached
-        per session (cleared in ``BinarySession.__exit__``). The
-        ``value_negative`` id may legitimately resolve to ``None`` when
-        the vocab predates the postfix shape; the decoder treats the
-        ``None`` case as "skip sign-handling" so the legacy-decode path
-        stays exercised by such vocabs.
-        """
-        if self._category_token_ids is None or self._number_token_ids is None:
-            from .decoded.category_tokens import (
-                resolve_category_token_ids,
-                resolve_number_token_ids,
-                resolve_value_negative_token_id,
-            )
-            self._category_token_ids = resolve_category_token_ids(
-                self._vocab_manager
-            )
-            self._number_token_ids = resolve_number_token_ids(
-                self._vocab_manager
-            )
-            self._value_negative_token_id = resolve_value_negative_token_id(
-                self._vocab_manager
-            )
-        return (
-            self._category_token_ids,
-            self._number_token_ids,
-            self._value_negative_token_id,
-        )
 
     # --- inverse section lookup --------------------------------------
 

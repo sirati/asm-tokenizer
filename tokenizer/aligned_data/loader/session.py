@@ -34,8 +34,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from tokenizer.tokens import Category, TokenType
-
 from ..binary_format import (
     MAX_HEADER_BYTES,
     extract_arrays_from_data,
@@ -112,24 +110,6 @@ class BinarySession(_BinarySessionSpliceMixin):
         self._data_kind: Optional[str] = None
         self._variants_mmap: Optional[np.ndarray] = None
 
-        # Per-session token-id caches for the decoded splice path
-        # (Category / TokenType -> uint16 vocab id). Lazily resolved
-        # via ``_get_token_id_caches`` on the first ``splice_with_callees``
-        # call so sessions that never splice pay nothing. Reset on
-        # ``__exit__`` -- the cache is single-session-scoped because the
-        # vocab handle could in principle change between session opens
-        # on the same instance. The ``value_negative`` sentinel id (or
-        # ``None`` for vocabs without the postfix metatoken) is cached
-        # alongside the two dicts so the splice path resolves all three
-        # in one round through ``_get_token_id_caches``.
-        self._category_token_ids: Optional[Dict[Category, int]] = None
-        self._number_token_ids: Optional[Dict[TokenType, int]] = None
-        # Sentinel for "not yet resolved" must differ from the legitimate
-        # ``None`` (= vocab lacks ``value_negative``) outcome; we encode
-        # the "not yet resolved" state via the two dict caches being
-        # ``None`` together with the value_negative cache field below.
-        self._value_negative_token_id: Optional[int] = None
-
         self._stack: Optional[ExitStack] = None
         self._closed: bool = False
 
@@ -139,13 +119,6 @@ class BinarySession(_BinarySessionSpliceMixin):
         assert_main_process()
         self._stack = ExitStack()
         self._closed = False
-        # Token-id caches stay ``None`` here; ``_get_token_id_caches``
-        # resolves them on first decoded-splice use. Reset explicitly
-        # in case the same session instance is re-entered after a
-        # prior ``__exit__`` cleared them (see ``__exit__``).
-        self._category_token_ids = None
-        self._number_token_ids = None
-        self._value_negative_token_id = None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -162,12 +135,6 @@ class BinarySession(_BinarySessionSpliceMixin):
         self._data_mmap = None
         self._data_kind = None
         self._variants_mmap = None
-        # Drop the token-id caches -- they were resolved against
-        # ``self._vocab_manager`` and the vocab could be swapped before
-        # the next ``__enter__``. Plain dicts so GC handles the rest.
-        self._category_token_ids = None
-        self._number_token_ids = None
-        self._value_negative_token_id = None
         if view is not None:
             # memoryview.release() drops the export so the underlying
             # bytes object can be GC'd without warning.
