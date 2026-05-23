@@ -21,18 +21,13 @@ from .aligned_data_loader import AlignedDataLoader
 from .binary_dataset import BinaryDataset
 from .decoded import (
     Category,
-    DecodedFunction,
-    FID_KEYED_CATEGORIES,
-    IDENTITY_SENTINEL,
     INFNAN_EXPONENT_UNBIASED,
     TARGET_EXPONENT_BIAS,
     TARGET_EXPONENT_BITS,
     TARGET_SIGNIFICAND_BITS,
-    decode_raw_tokens,
     resolve_category_token_ids,
     resolve_number_token_ids,
     resolve_value_negative_token_id,
-    splice_with_callees,
 )
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
@@ -42,19 +37,14 @@ __all__ = [
     "AlignedDataLoader",
     "BinaryDataset",
     "Category",
-    "DecodedFunction",
-    "FID_KEYED_CATEGORIES",
     "FunctionData",
-    "IDENTITY_SENTINEL",
     "INFNAN_EXPONENT_UNBIASED",
     "MatchedFunction",
     "TARGET_EXPONENT_BIAS",
     "TARGET_EXPONENT_BITS",
     "TARGET_SIGNIFICAND_BITS",
-    "decode_raw_tokens",
     "load_single_matched_function",
     "resolve_category_token_ids",
     "resolve_number_token_ids",
     "resolve_value_negative_token_id",
-    "splice_with_callees",
 ]
