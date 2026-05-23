@@ -2,8 +2,15 @@
 
 Single concern: pin the behavioural contract for the stage-3a inline-
 byte concatenation: leading-zero pad at index 0, per-call-target slices
-abutting in DFS encounter order, and the cut-aware LSB-end tail-keep
-rule for multi-chunk sources (per plan D2 + ALG-8).
+abutting in DFS encounter order, and the cut-aware "full payload of
+every consumed carrier" buffer-layout rule (per plan D2 + ALG-8 +
+test_number_decode.py:622-624 docstring).
+
+For multi-chunk sources at the cut boundary, 3a keeps the FULL ``L``
+bytes of the last consumed carrier even when only some of its chunks
+survived the visible-stream prefix; 3c (``_number_decode.py``) drops
+``idx_2d`` rows for the dropped chunks but its per-chunk offset formula
+addresses the canonical full-payload byte layout.
 
 Fixtures construct synthetic :class:`Stage2Batch` objects directly --
 ``build_inline_bytes`` reads only the surviving-state fields off the
@@ -383,57 +390,58 @@ def test_cut_drops_trailing_call_targets_with_zero_slices():
 
 
 # ---------------------------------------------------------------------------
-# Test 5 -- Multi-chunk VC2 with mid-cut: LSB-end bytes only.
+# Test 5 -- Multi-chunk VC2 with mid-cut: FULL L bytes retained.
+#
+# New contract (post-HD-2 fix): 3a keeps the FULL ``L``-byte payload of
+# the last consumed carrier even when some of its chunks were dropped
+# past the cut. The byte layout is independent of which chunks survived;
+# 3c is the layer that skips emitting ``idx_2d`` rows for dropped chunks
+# (via ``K_visible``). This keeps ALG-8's per-chunk offset formula
+# ``[p_carrier_byte + L - 8*(c+1), p_carrier_byte + L - 8*c)`` valid
+# without an L vs 8*j_last off-by-N correction in 3c.
 # ---------------------------------------------------------------------------
 
 
-def test_vc2_mid_cut_keeps_lsb_end_bytes():
-    """VC2 L=17 (K=3 chunks) cut at j=2 visible chunks -> LSB 16 bytes.
+def test_vc2_mid_cut_keeps_full_payload():
+    """VC2 L=17 (K=3 chunks) cut at j=2 visible chunks -> FULL 17 bytes.
 
-    Per ALG-8 chunks are emitted low-to-high; chunk 0 = LSB = trailing
-    8 bytes of the big-endian payload. With j=2 surviving chunks we
-    keep chunks 0+1 = LAST 16 payload bytes (raw positions p+2..p+18).
-
-    expanded_token_ids structure (no prior carriers in this fixture):
-    [prepend, VC2_carrier, painted_chunk_1, painted_chunk_2, ...]
-    Cut at partial_cut_length=3 -> visible slots = [prepend, carrier,
-    painted_1]; the carrier emits 2 chunks (LSB + next). Surviving
-    bytes = LAST 16 of 17.
+    expanded_token_ids structure: [prepend, VC2_carrier, painted_chunk_1,
+    painted_chunk_2]. Cut at partial_cut_length=3 -> visible slots =
+    [prepend, carrier, painted_1] (j=2 chunks visible). 3a's buffer
+    retains all 17 inline bytes; 3c emits only 2 idx_2d rows.
     """
     # Build a synthetic VC2 source with L=17.
     payload = list(range(1, 18))  # 17 bytes 0x01..0x11; raw values stay < 256
     raw = _u16(_VC2_VOCAB_ID, *payload)
     # Full expansion would be [prepend, VC2_carrier, painted_1, painted_2]
     # (3 chunks emitted -> K=3 -> 3 expanded slots beyond the prepend).
-    # Cut at 3 -> 2 chunks visible.
+    # Cut at 3 -> 2 chunks visible, but byte buffer still holds all L=17.
     ct = _make_stage2_ct(raw, partial_cut_length=3)
     batch = _make_batch([[ct]])
 
     inline_bytes, slices = build_inline_bytes(batch)
-    # Surviving = LAST 16 bytes of payload (raw positions p+2..p+18 -> bytes
-    # 0x02..0x11).
-    expected = list(range(2, 18))
-    assert len(expected) == 16
-    assert inline_bytes.shape == (1 + 16,)
-    assert slices == [slice(1, 17)]
-    np.testing.assert_array_equal(inline_bytes[slices[0]], expected)
+    assert inline_bytes.shape == (1 + 17,)
+    assert slices == [slice(1, 18)]
+    np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
 
-def test_vc2_mid_cut_keeps_single_lsb_chunk():
-    """VC2 L=17 cut at j=1 visible chunk -> LSB 8 bytes only."""
+def test_vc2_mid_cut_single_visible_chunk_still_keeps_full_payload():
+    """VC2 L=17 cut at j=1 visible chunk -> FULL 17 bytes in buffer.
+
+    Even though only 1 chunk survives the visible-stream prefix, the
+    byte layout retains all L=17 bytes so 3c's ALG-8 formula computes
+    correct LSB-chunk offsets without a payload-truncation correction.
+    """
     payload = list(range(1, 18))
     raw = _u16(_VC2_VOCAB_ID, *payload)
-    # Cut at 2 (prepend + carrier slot only) -> j=1 chunk.
+    # Cut at 2 (prepend + carrier slot only) -> j=1 chunk visible.
     ct = _make_stage2_ct(raw, partial_cut_length=2)
     batch = _make_batch([[ct]])
 
     inline_bytes, slices = build_inline_bytes(batch)
-    # Surviving = LAST 8 bytes = positions 9..16 of the payload (0x0A..0x11).
-    expected = list(range(10, 18))
-    assert len(expected) == 8
-    assert inline_bytes.shape == (1 + 8,)
-    assert slices == [slice(1, 9)]
-    np.testing.assert_array_equal(inline_bytes[slices[0]], expected)
+    assert inline_bytes.shape == (1 + 17,)
+    assert slices == [slice(1, 18)]
+    np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
 
 # ---------------------------------------------------------------------------
@@ -457,20 +465,23 @@ def test_f128_finite_full_contributes_16_bytes():
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
 
-def test_f128_finite_mid_cut_keeps_lsb_chunk():
-    """F128 finite cut at j=1 -> LSB chunk = LAST 8 payload bytes."""
+def test_f128_finite_mid_cut_keeps_full_payload():
+    """F128 finite cut at j=1 -> buffer still holds all 16 payload bytes.
+
+    Per the post-HD-2 contract the byte layout is independent of which
+    F128 chunk survived; 3c reads ALG-7's per-chunk offsets against the
+    full 16-byte payload and skips the dropped chunk's idx_2d row.
+    """
     payload = [0x40, 0x00] + list(range(2, 16))
     raw = _u16(_FLOAT128_VOCAB_ID, *payload)
     # Full expansion = [prepend, F128_carrier, painted_chunk]. Cut at 2
-    # = prepend + carrier slot only -> j=1.
+    # = prepend + carrier slot only -> j=1, but buffer holds all 16.
     ct = _make_stage2_ct(raw, partial_cut_length=2)
     batch = _make_batch([[ct]])
 
     inline_bytes, slices = build_inline_bytes(batch)
-    # LSB 8 = LAST 8 bytes of the 16-byte payload.
-    expected = payload[-8:]
-    assert inline_bytes.shape == (1 + 8,)
-    np.testing.assert_array_equal(inline_bytes[slices[0]], expected)
+    assert inline_bytes.shape == (1 + 16,)
+    np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
 
 # ---------------------------------------------------------------------------
@@ -631,18 +642,20 @@ def test_vc2_three_chunks_fully_included_keeps_all_bytes():
 
 def test_cut_inside_second_call_target_keeps_first_fully():
     """A 2-call_target row where the cut lands inside ct_b -> ct_a is
-    fully included, ct_b contributes a partial.
+    fully included, ct_b's last consumed carrier contributes its FULL
+    ``L``-byte payload (per the post-HD-2 contract).
     """
     raw_a = _u16(_F16_VOCAB_ID, 0x01, 0x02)                # K=1, L=2
     raw_b = _u16(_VC2_VOCAB_ID, *range(1, 18))             # K=3, L=17
     ct_a = _make_stage2_ct(raw_a)
-    # ct_b: cut at j=1 -> LSB 8 bytes of ct_b's payload.
+    # ct_b: cut at j=1 visible chunk -> buffer still holds the full
+    # L=17-byte payload; 3c emits 1 idx_2d row (the LSB chunk).
     ct_b = _make_stage2_ct(raw_b, partial_cut_length=2)
     batch = _make_batch([[ct_a, ct_b]])
     inline_bytes, slices = build_inline_bytes(batch)
     expected_a = [0x01, 0x02]
-    expected_b = list(range(10, 18))  # last 8 of the 17-byte payload
-    assert inline_bytes.shape == (1 + 2 + 8,)
+    expected_b = list(range(1, 18))  # full 17-byte payload of the VC2
+    assert inline_bytes.shape == (1 + 2 + 17,)
     np.testing.assert_array_equal(inline_bytes[slices[0]], expected_a)
     np.testing.assert_array_equal(inline_bytes[slices[1]], expected_b)
 

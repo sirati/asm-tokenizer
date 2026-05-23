@@ -18,10 +18,14 @@ Cut-aware semantics (plan D2 + Stage 2 step 4)
 The stage-2 cutoff is *on the post-promotion expanded stream*, not the
 raw stream. A multi-chunk source (3-chunk VC2, 2-chunk F128) at expanded
 position ``e_start`` whose row's cut falls at ``e_start + j`` with
-``j < chunk_count`` contributes only the LSB-end ``j`` chunks per ALG-8.
-The chunks are emitted low-to-high (chunk 0 = LSB = trailing bytes of
-the big-endian payload), so the surviving bytes are the LAST ``8 * j``
-bytes of the source's L-byte payload.
+``j < chunk_count`` contributes ``j`` visible chunks per ALG-8 -- but
+the BYTE layout retains the FULL ``L`` bytes of every consumed carrier
+in the buffer. 3c (``_number_decode.py``) uses the canonical ALG-8
+``[p_carrier_byte + L - 8*(c+1), p_carrier_byte + L - 8*c)`` offset
+formula and simply skips emitting ``idx_2d`` rows for dropped chunks
+(via ``K_visible``). Keeping the full payload here means 3c's offset
+arithmetic is independent of which chunks survived; the only cost is
+a few extra bytes in the buffer per cut multi-chunk source.
 
 For non-multi-chunk carriers (F16 / BF16 / F32 / F64 / F80 + single-
 chunk VC2 + IDENTITY-band carriers + instruction reps) ``K = 1``, so
@@ -36,15 +40,14 @@ survive, i.e. ``raw_tokens[number_mask]`` (in raw stream order, MSB-
 first big-endian within each payload).
 
 ``is_cut == True``: walk the expanded-stream extra masks to identify
-the last consumed raw carrier and how many of its chunks are visible.
-Every raw carrier BEFORE the last consumed one is fully visible (its
-full payload survives). The last consumed carrier contributes its
-LSB-end ``8 * j`` bytes when ``0 < j < K``, or its full ``L`` bytes
-when ``j == K``.
+the last consumed raw carrier. Every consumed raw carrier (including
+the last one, even when some of its chunks were dropped past the cut)
+contributes its FULL ``L``-byte payload. Carriers AFTER the last
+consumed one contribute nothing.
 
 Output layout
 -------------
-``inline_bytes`` is ``u8[1 + total_surviving_bytes]``. Index 0 is the
+``inline_bytes`` is ``u8[1 + total_buffered_bytes]``. Index 0 is the
 leading-zero pad consumed by short-payload ``idx_2d`` gathers (plan D9
 + Stage 3 step 1). Each per-call-target slice starts at
 ``previous.stop`` (or ``1`` for the first call_target) so that the
@@ -60,8 +63,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from tokenizer.token_manager import VocabularyManager
-
 
 if TYPE_CHECKING:
     from ._types import Stage2Batch, Stage2CallTarget
@@ -71,93 +72,23 @@ __all__ = ["build_inline_bytes"]
 
 
 # ---------------------------------------------------------------------------
-# Module-level aliases for the unified-vocab carrier ids.
-#
-# ALG-1 + ALG-2 + ALG-8 only need the VC2 + F128 vocab ids (the two
-# multi-chunk sources) plus the digit-boundary constant for sanity
-# guards. Reading them at import time keeps the per-call-target hot
-# path free of attribute lookups.
-# ---------------------------------------------------------------------------
-_V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
-_V2_NUMBER_BLOCK_START = VocabularyManager._V2_NUMBER_BLOCK_START
-_V2_NUMBER_BLOCK_COUNT = VocabularyManager._V2_NUMBER_BLOCK_COUNT
-
-# VC2 is the first NUMBER carrier; F128 is the LAST NUMBER carrier.
-# Per plan vocab table the order is VC2, F16, BF16, F32, F64, F80, F128.
-_VC2_VOCAB_ID = _V2_NUMBER_BLOCK_START
-_FLOAT128_VOCAB_ID = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT - 1
-
-# F128 fixed payload size + IEEE-754 binary128 exponent mask. ALG-2's
-# detection masks the high u16 of the payload with ``0x7FFF`` -- this
-# strips the sign bit at the top of byte 0 and leaves exactly the 15-
-# bit exponent for the all-ones comparison.
-_F128_PAYLOAD_BYTES = 16
-_F128_EXPONENT_MASK = np.uint16(0x7FFF)
-
-
-# ---------------------------------------------------------------------------
-# Per-carrier chunk-count helpers (single concern: emitted-chunk count
-# for a raw carrier at position ``p``).
-# ---------------------------------------------------------------------------
-
-
-def _f128_is_nan_or_inf(raw_tokens: np.ndarray, p: int) -> bool:
-    """ALG-2: detect NaN/Inf via the high u16 of the F128 payload.
-
-    The 15-bit binary128 exponent occupies byte 0's low 7 bits (after
-    the sign) PLUS all 8 bits of byte 1. The codec stores the payload
-    as 16 consecutive inline-digit slots at ``p+1..p+16`` (each slot
-    holds one big-endian byte in its low 8 bits, high 8 bits zero). The
-    detection reads positions ``p+1`` (byte 0) and ``p+2`` (byte 1).
-    """
-    if p + 2 >= raw_tokens.shape[0]:
-        raise AssertionError(
-            f"F128 carrier at position {p} within 2 slots of stream "
-            "tail -- malformed v2 stream (ALG-2 needs the high u16 at "
-            "p+1, p+2)."
-        )
-    high_byte = np.uint16(raw_tokens[p + 1]) << np.uint16(8)
-    low_byte = np.uint16(raw_tokens[p + 2])
-    high_u16 = high_byte | low_byte
-    return bool((high_u16 & _F128_EXPONENT_MASK) == _F128_EXPONENT_MASK)
-
-
-def _chunk_count_for_carrier(
-    raw_tokens: np.ndarray, p: int, payload_length: int
-) -> int:
-    """Emitted chunk count for the carrier at raw position ``p``.
-
-    * VC2: ``max(1, ceil(L / 8))`` -- matches ``_promote_vc2`` exactly.
-    * F128: ``1`` for NaN/Inf (per ALG-2), ``2`` for finite.
-    * Everything else: ``1`` (single-chunk sources + identity carriers
-      + instruction reps).
-
-    ``payload_length`` is the inline-digit run-length immediately
-    following the carrier (``runlen_number[p + 1]``); supplied by the
-    caller so this function stays branch-on-vocab-id only.
-    """
-    carrier_id = int(raw_tokens[p])
-    if carrier_id == _VC2_VOCAB_ID:
-        # ceil(L / 8) == (L + 7) // 8; max(1, ...) guards the empty-
-        # payload edge case (an isolated VC2 with no following digits
-        # is still a 1-chunk source -- the carrier itself).
-        return max(1, (int(payload_length) + 7) // 8)
-    if carrier_id == _FLOAT128_VOCAB_ID:
-        return 1 if _f128_is_nan_or_inf(raw_tokens, p) else 2
-    return 1
-
-
-# ---------------------------------------------------------------------------
-# Per-call-target surviving-byte extraction.
+# Per-call-target surviving-byte extraction. Buffer layout retains every
+# consumed carrier's FULL payload so 3c's ALG-8 offset formula stays
+# independent of which chunks survived the cut; the chunk-count branch
+# (VC2 ceil(L/8), F128 NaN/Inf detection) is 3c's concern.
 # ---------------------------------------------------------------------------
 
 
 def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
-    """Surviving inline bytes for one call_target as a ``u8`` array.
+    """Buffered inline bytes for one call_target as a ``u8`` array.
 
     Returns the raw inline-digit values (already truncated to ``u8``)
-    in raw-stream order, modulo the LSB-end tail-keep rule for the
-    cut call_target's last consumed multi-chunk source.
+    in raw-stream order. Every consumed raw carrier contributes its
+    FULL ``L``-byte payload -- including the last consumed carrier
+    when only some of its chunks survived the cut. 3c chooses which
+    chunks to emit ``idx_2d`` rows for; the buffer always carries the
+    full per-source payload so ALG-8's per-chunk offset formula stays
+    valid.
 
     Parameters
     ----------
@@ -170,8 +101,9 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
     Returns
     -------
     ``np.ndarray[np.uint8]``
-        Length equals the contributed byte count for this call_target.
-        Zero for fully-dropped call_targets.
+        Length equals the contributed byte count for this call_target
+        (full payload per consumed carrier). Zero for fully-dropped
+        call_targets.
 
     Notes
     -----
@@ -231,58 +163,33 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
     # The last raw carrier consumed by the visible body.
     p_last = int(carrier_positions[n_carriers_consumed - 1])
 
-    # Visible-body offset (0-based within [1, partial_cut_length)) of
-    # the last real-carrier slot tells us how many expanded slots that
-    # last carrier spans within the cut window: every slot from that
-    # offset up to ``partial_cut_length - 1`` (exclusive end in
-    # expanded coords) belongs to this carrier (the trailing ones are
-    # painted continuations).
-    real_carrier_offsets = np.nonzero(visible_is_real_carrier)[0]
-    last_carrier_visible_offset = int(real_carrier_offsets[-1])
-    j_last = partial_cut_length - 1 - last_carrier_visible_offset
-
     # Payload length L = inline-digit run-length immediately following
     # the last carrier. ``runlen_number`` stores run-start lengths;
     # ``runlen_number[p+1]`` is exactly the per-source payload length.
+    # The last consumed carrier contributes its FULL ``L`` bytes -- 3c
+    # will skip emitting ``idx_2d`` rows for dropped chunks, but the
+    # ALG-8 per-chunk offset formula assumes the full payload is
+    # addressable in the buffer regardless of which chunks survived.
     runlen_number = state.runlen_number
     if p_last + 1 < runlen_number.shape[0]:
         L_last = int(runlen_number[p_last + 1])
     else:
         L_last = 0
 
-    # Full chunk count for the last carrier -- needed to decide between
-    # "full inclusion" (j == K -> all L bytes) and "mid-cut" (j < K ->
-    # LSB-end 8 * j bytes).
-    K_last = _chunk_count_for_carrier(raw_tokens, p_last, L_last)
+    # ---- bytes from all consumed carriers (full per-source payload) ----------
+    # Inline-digit positions are owned by their preceding
+    # ``carries_inline_mask`` carrier in raw-stream order (the v2 codec
+    # emits the payload IMMEDIATELY after its owning carrier, never
+    # orphan bytes). To pick up every consumed carrier's FULL payload
+    # we slice ``number_mask`` up to ``p_last + 1 + L_last`` -- this
+    # captures all inline bytes belonging to carriers strictly before
+    # ``p_last`` (their payloads precede ``p_last``) plus the entire
+    # ``L_last``-byte payload of the last consumed carrier.
+    number_mask_keep = number_mask.copy()
+    number_mask_keep[p_last + 1 + L_last :] = False
+    bytes_kept = raw_tokens[number_mask_keep]
 
-    # ---- bytes from carriers BEFORE the last consumed one --------------------
-    # Carriers before ``p_last`` are fully consumed (j == K each), so
-    # all their inline-digit payload bytes survive. Inline-digit
-    # positions are owned by their preceding ``carries_inline_mask``
-    # carrier in raw-stream order; positions strictly before ``p_last``
-    # belong to those earlier carriers (the v2 codec emits the payload
-    # IMMEDIATELY after its owning carrier, never orphan bytes).
-    number_mask_before = number_mask.copy()
-    number_mask_before[p_last:] = False
-    bytes_before = raw_tokens[number_mask_before]
-
-    # ---- bytes from the last consumed carrier --------------------------------
-    if j_last >= K_last:
-        # Full inclusion: keep all L bytes of this carrier's payload.
-        bytes_from_last = raw_tokens[p_last + 1 : p_last + 1 + L_last]
-    else:
-        # Mid-cut: per ALG-8 the surviving LSB ``j`` chunks correspond
-        # to the LAST ``8 * j`` bytes of the big-endian payload. Clamp
-        # to ``L_last`` defensively; for VC2/F128 finite the chunk-byte
-        # arithmetic guarantees ``8 * j <= L`` whenever ``j < K``, but
-        # the clamp makes the function total even for hypothetical
-        # malformed inputs.
-        n_bytes_from_last = min(8 * j_last, L_last)
-        start = p_last + 1 + (L_last - n_bytes_from_last)
-        stop = p_last + 1 + L_last
-        bytes_from_last = raw_tokens[start:stop]
-
-    return np.concatenate([bytes_before, bytes_from_last]).astype(np.uint8)
+    return bytes_kept.astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
