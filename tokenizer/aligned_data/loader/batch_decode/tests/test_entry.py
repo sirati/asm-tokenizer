@@ -14,10 +14,9 @@ file focuses on:
    defaults).
 2. Linear composition order -- each stage receives the previous
    stage's output verbatim, plus the relevant kwargs.
-3. End-to-end smoke against a synthetic :class:`BinarySession`,
-   GATED on :func:`build_bulk_bytes` having a real implementation.
-   Phase 3 is concurrent with this stage 4 wiring; until 3e lands a
-   real body, the e2e smoke skips.
+3. End-to-end smoke against a synthetic :class:`BinarySession` built
+   from the shared :mod:`_session_fixture` corpus -- exercises the
+   real stage-1 -> stage-4 wiring against a tiny on-disk binary.
 """
 
 from __future__ import annotations
@@ -34,33 +33,11 @@ from tokenizer.aligned_data.loader.batch_decode import (
     VariantPadding,
     batch_decode,
 )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_bulk_bytes_is_implemented() -> bool:
-    """Return True iff :func:`build_bulk_bytes` has a real body.
-
-    Stage 3 wiring (subagent 3e) is concurrent with this stage 4 work;
-    the e2e smoke gates on this flag and skips when the stub still
-    raises ``NotImplementedError``."""
-
-    from tokenizer.aligned_data.loader.batch_decode._bulk_bytes import (
-        build_bulk_bytes,
-    )
-
-    try:
-        build_bulk_bytes(stage2=None)  # type: ignore[arg-type]
-    except NotImplementedError:
-        return False
-    except Exception:
-        # Any other exception means the body executed (and ran into a
-        # real-input precondition); treat that as "implemented".
-        return True
-    return True
+from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.aligned_data.loader.session import BinarySession
+from tokenizer.aligned_data.loader.tests._session_fixture import (
+    build_synthetic_binary,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -285,38 +262,96 @@ def test_batch_decode_returns_assemble_batch_output(
 
 
 # ---------------------------------------------------------------------------
-# End-to-end smoke (gated on stage 3 readiness)
+# End-to-end smoke against a real BinarySession
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not _build_bulk_bytes_is_implemented(),
-    reason="build_bulk_bytes (stage 3e) is still a stub; run after Phase 3 wiring",
-)
-def test_batch_decode_end_to_end_synthetic() -> None:
-    """Sanity smoke against a tiny synthetic :class:`BinarySession`.
+def test_batch_decode_end_to_end_synthetic(tmp_path) -> None:
+    """End-to-end smoke against a tiny synthetic :class:`BinarySession`.
 
-    The session need not be production-realistic; it just needs to
-    expose the per-arm loaders that stage 1 uses
-    (:meth:`BinarySession._load_matched_for_splice`, etc.). Building
-    one here would duplicate considerable scaffolding -- and would
-    drift if upstream stages refactor their session contract -- so
-    this smoke is gated on :func:`build_bulk_bytes` having a real
-    body, after which the upstream test infrastructure (stage 1/2/3
-    integration tests) should already cover a session fixture we can
-    pull in.
+    Builds the shared on-disk corpus from :mod:`_session_fixture`,
+    targets the matched section twice (so the variant-padding policy
+    has both real and null-content slots to lay out), runs the full
+    :func:`batch_decode` pipeline (stage 1 -> 4) through the real
+    session API, and asserts the cross-array invariants on the
+    resulting :class:`BatchDecodeResult`:
 
-    Until then, this test is a placeholder marker for "Phase 3
-    wiring has landed; e2e smoke should be promoted to a real
-    BinarySession-backed test here". The skip-condition above keeps
-    CI green during the phase 3+4 concurrent rollout."""
+    * ``tokens`` shape + ``uint16`` dtype.
+    * ``identity_row_offsets`` / ``number_row_offsets`` length =
+      ``batch_size + 1``, monotone non-decreasing, terminal value
+      equals the corresponding flat-array length.
+    * ``batch_idx_to_section_variant`` shape + ``uint32`` dtype.
+    * Some ``tokens`` cells are non-zero (real content is present).
+    * The first row's identity slice is ``uint16``.
+    """
 
-    # When promoted, this test should:
-    #   1. Build a tiny BinarySession with a handful of matched
-    #      sections + variants (typically via a fixtures module).
-    #   2. Call batch_decode with PAD_NULL / a deterministic RNG.
-    #   3. Assert the result has the expected shape contract
-    #      (BatchDecodeResult dataclass + dtypes + row-offsets).
-    # We deliberately keep the body as a guarded ``assert True`` so
-    # the test exists but is non-load-bearing until stage 3 is wired.
-    assert True
+    fb = build_synthetic_binary(tmp_path)
+
+    # Two pointers at the matched section (idx=0, 2 variants each).
+    # ``BinarySession`` opens one data arm per session by design, so a
+    # single ``batch_decode`` call only spans one ``SectionKind``;
+    # cross-arm batching is a higher-level orchestration concern.
+    # With PAD_NULL + ``num_variants_per_section=3``, each pointer
+    # fills 2 real slots + 1 null-content padding slot, so
+    # ``batch_size = 2 * 3 = 6``.
+    section_pointers = [
+        SectionPointerSpec(arm=SectionKind.MATCHED, idx=0),
+        SectionPointerSpec(arm=SectionKind.MATCHED, idx=0),
+    ]
+    num_variants_per_section = 3
+    context_len = 64
+    batch_size = len(section_pointers) * num_variants_per_section
+
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as session:
+        result = batch_decode(
+            session,
+            section_pointers=section_pointers,
+            num_variants_per_section=num_variants_per_section,
+            context_len=context_len,
+            max_depth=2,
+            variant_padding=VariantPadding.PAD_NULL,
+            rng=np.random.default_rng(seed=42),
+        )
+
+    assert isinstance(result, BatchDecodeResult)
+
+    # tokens: shape + dtype.
+    assert result.tokens.shape == (batch_size, context_len)
+    assert result.tokens.dtype == np.uint16
+
+    # Identity / number row offsets: length, monotone, terminal-equals-length.
+    assert result.identity_row_offsets.shape == (batch_size + 1,)
+    assert np.all(np.diff(result.identity_row_offsets) >= 0)
+    assert int(result.identity_row_offsets[-1]) == result.identities.shape[0]
+
+    assert result.number_row_offsets.shape == (batch_size + 1,)
+    assert np.all(np.diff(result.number_row_offsets) >= 0)
+    assert (
+        int(result.number_row_offsets[-1])
+        == result.numbers_significant.shape[0]
+    )
+    # The two number arrays are parallel.
+    assert (
+        result.numbers_sign_exponent.shape == result.numbers_significant.shape
+    )
+
+    # batch_idx_to_section_variant shape + dtype.
+    assert result.batch_idx_to_section_variant.shape == (batch_size, 2)
+    assert result.batch_idx_to_section_variant.dtype == np.uint32
+
+    # Cells in ``tokens`` are either 0 (null-content padding) or >= 1
+    # (the post-shift smallest id). u16 is unsigned so the lower bound
+    # is trivial; the meaningful check is that real content is present
+    # somewhere in the batch -- the synthetic corpus has 2 real
+    # variants per matched section pointer, so some cells must be
+    # non-padding.
+    assert int((result.tokens >= 1).sum()) > 0
+
+    # First batch row exists and its identity slice (possibly empty)
+    # is uint16.
+    row0_start = int(result.identity_row_offsets[0])
+    row0_stop = int(result.identity_row_offsets[1])
+    row0_identities = result.identities[row0_start:row0_stop]
+    assert row0_identities.dtype == np.uint16

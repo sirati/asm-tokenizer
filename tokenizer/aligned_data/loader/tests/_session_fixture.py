@@ -75,10 +75,19 @@ class _FakeArm:
 
 
 class _FakeVocab:
-    """Vocab stub: just enough for the variant decoder + axis builder."""
+    """Vocab stub: just enough for the variant decoder + axis builder.
+
+    Token IDs start at the v2 eager-block end (272) so axis tokens land
+    in the metadata-variant band, matching the canonical layout (digits
+    0..255, value_negative 256, NUMBER+IDENTITY 257..271, instruction
+    reps + tail metadata variants >= 272). Starting at 256 would alias
+    the value_negative sign marker, which breaks any test that walks
+    ``full_token_stream`` through :func:`build_inline_decode_state`
+    (which asserts the leading position is not in the value band).
+    """
 
     def __init__(self, items: List[str]) -> None:
-        self._s2i = {s: i + 256 for i, s in enumerate(items)}
+        self._s2i = {s: i + 272 for i, s in enumerate(items)}
         self._i2s = {v: k for k, v in self._s2i.items()}
         # The splice-session resolver reads `value_negative_token_id`
         # directly. ``None`` mirrors the pre-Phase-4 default that real
