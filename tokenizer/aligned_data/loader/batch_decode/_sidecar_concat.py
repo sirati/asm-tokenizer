@@ -1,34 +1,26 @@
 """Stage 4 helper -- per-row sidecar concatenation.
 
 Single concern of this module: take a finalised :class:`Stage3Batch` and
-produce the two flat sidecar pairs the model consumer wants:
+produce the flat numbers sidecar pair the model consumer wants:
 
-1. Numbers sidecar: ``(numbers_significant: u64[total_chunks],
-   numbers_sign_exponent: u32[total_chunks])`` indexed by
-   :attr:`Stage2Batch.number_row_offsets`. Chunks are concatenated in
-   row-major stream order -- the per-:class:`TokenType`
-   ``(significand, sign_exp)`` chunk pairs that stage 3 staged in
-   ``Stage3Batch.numbers_per_TokenType`` are interleaved exactly as the
-   surviving ``expanded_token_ids[:partial_cut_length]`` stream
-   discovers them.
-
-2. Optional FID sidecar: ``(fid_sidecar: u32[total_function_counters],
-   fid_row_offsets: u32[batch_size + 1])`` built from the per-row
-   dedup state surfaced by subagent 4a's walk
-   (:func:`tokenizer.aligned_data.loader.batch_decode._dedup_walk`).
+Numbers sidecar: ``(numbers_significant: u64[total_chunks],
+numbers_sign_exponent: u32[total_chunks])`` indexed by
+:attr:`Stage2Batch.number_row_offsets`. Chunks are concatenated in
+row-major stream order -- the per-:class:`TokenType`
+``(significand, sign_exp)`` chunk pairs that stage 3 staged in
+``Stage3Batch.numbers_per_TokenType`` are interleaved exactly as the
+surviving ``expanded_token_ids[:partial_cut_length]`` stream
+discovers them.
 
 What this module is NOT:
 
-- It does not run the per-row dedup walk -- callers feed the
-  ``fid_lookup_per_row`` mapping in.
 - It does not write into the token tensor or the identity sidecar --
   those concerns live in subagents 4a/4c.
 - It does not renormalise floats -- the ``(significand, sign_exp)``
   arrays come pre-normalised from stage 3 (ALG-7).
 
-Plan reference: ``batch_decode_plan.md`` Stage 4 step 4 + step 5; D5
-declares the two output sidecars; D8 pins the row-offset sizing
-contract.
+Plan reference: ``batch_decode_plan.md`` Stage 4 step 4; D8 pins the
+row-offset sizing contract.
 
 Multi-row mapping note (RESAMPLE_WITHIN_SECTION / REDISTRIBUTE): when
 one :class:`Stage1Variant` is referenced by multiple batch rows,
@@ -45,7 +37,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from tokenizer.tokens import Category, TokenType
+from tokenizer.tokens import TokenType
 
 from ._batch_layout import UINT32_MAX
 
@@ -54,7 +46,6 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "assemble_fid_sidecar",
     "assemble_number_sidecars",
 ]
 
@@ -82,16 +73,6 @@ _SHIFTED_ID_TO_TOKEN_TYPE: dict[int, TokenType] = {
     6: TokenType.FLOAT80,
     7: TokenType.FLOAT128,
 }
-
-
-# Canonical FUNCTION-category emission order for the FID sidecar
-# (plan D5 sentence "(LOCAL/PLT/EXT_FUNC, counter_id=K)" -- ordering of
-# the three FUNCTION Categories within a row).
-_FID_CATEGORY_ORDER: tuple[Category, ...] = (
-    Category.LOCAL_FUNC,
-    Category.PLT_FUNC,
-    Category.EXT_FUNC,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -235,101 +216,3 @@ def assemble_number_sidecars(
             )
 
     return out_sig, out_sex
-
-
-# ---------------------------------------------------------------------------
-# FID sidecar
-# ---------------------------------------------------------------------------
-
-
-def assemble_fid_sidecar(
-    stage3_batch: "Stage3Batch",
-    *,
-    fid_lookup_per_row: list[dict[Category, dict[int, int]]],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten the per-row FID dedup state into the optional FID sidecar.
-
-    Per plan D5: the sidecar maps ``(FUNCTION_Category, counter_id=K)``
-    -> original ``function_name_ptr`` for the row. For each batch row,
-    emit each FUNCTION Category's counters in counter-id order; concat
-    across Categories in canonical order
-    (``LOCAL_FUNC``, ``PLT_FUNC``, ``EXT_FUNC``).
-
-    Counter-id density is enforced (plan D4 "Remap-table holes are
-    forbidden") -- the per-row map for a Category must have keys
-    ``{0, 1, ..., K-1}`` exactly. Non-FUNCTION Category keys present
-    in the input map are ignored (COUNTER categories renumber per
-    ALG-4 with no surfaced sidecar -- D5 explicitly says "Only
-    function categories contribute").
-
-    Padding rows (per
-    :attr:`Stage1Batch.batch_idx_to_section_variant`) contribute zero
-    entries; the caller's ``fid_lookup_per_row`` entry for a padding
-    row must be either an empty dict or a dict whose Category values
-    are empty.
-
-    Returns ``(fid_sidecar: u32[total_function_counters],
-    fid_row_offsets: u32[batch_size + 1])``.
-    """
-
-    stage1_batch = stage3_batch.stage2.stage1
-    batch_size = stage1_batch.batch_size
-    if len(fid_lookup_per_row) != batch_size:
-        raise AssertionError(
-            f"fid_lookup_per_row has {len(fid_lookup_per_row)} entries "
-            f"but batch_size is {batch_size}"
-        )
-
-    mapping = stage1_batch.batch_idx_to_section_variant
-    fid_row_offsets = np.zeros(batch_size + 1, dtype=np.uint32)
-    # Build the per-row contribution lists; concat once at the end so
-    # we don't repeatedly grow a numpy buffer.
-    per_row_chunks: list[np.ndarray] = []
-    running_offset = 0
-
-    for batch_idx in range(batch_size):
-        section_idx, _variant_idx = mapping[batch_idx]
-        row_map = fid_lookup_per_row[batch_idx]
-        if section_idx == UINT32_MAX:
-            # Padding row -- nothing to emit. (The caller's map for a
-            # padding row should be empty; an unexpected non-empty map
-            # is a contract violation upstream.)
-            for category, counters in row_map.items():
-                if counters:
-                    raise AssertionError(
-                        f"padding row {batch_idx} carries dedup counters "
-                        f"for Category={category!r}"
-                    )
-            fid_row_offsets[batch_idx + 1] = np.uint32(running_offset)
-            continue
-
-        row_total = 0
-        for category in _FID_CATEGORY_ORDER:
-            counters = row_map.get(category)
-            if not counters:
-                continue
-            n = len(counters)
-            # D4 dense-counter contract: keys are 0..n-1 exactly. We
-            # gather in counter-id order so the sidecar's index IS the
-            # counter id (within this row, within this Category, after
-            # the running offset).
-            row_chunk = np.empty(n, dtype=np.uint32)
-            for counter_id, function_name_ptr in counters.items():
-                if not (0 <= counter_id < n):
-                    raise AssertionError(
-                        f"row {batch_idx} Category={category!r} carries "
-                        f"counter_id={counter_id} outside dense range "
-                        f"[0, {n}) -- D4 hole-free contract violated"
-                    )
-                row_chunk[counter_id] = np.uint32(function_name_ptr)
-            per_row_chunks.append(row_chunk)
-            row_total += n
-
-        running_offset += row_total
-        fid_row_offsets[batch_idx + 1] = np.uint32(running_offset)
-
-    if per_row_chunks:
-        fid_sidecar = np.concatenate(per_row_chunks)
-    else:
-        fid_sidecar = np.empty(0, dtype=np.uint32)
-    return fid_sidecar, fid_row_offsets

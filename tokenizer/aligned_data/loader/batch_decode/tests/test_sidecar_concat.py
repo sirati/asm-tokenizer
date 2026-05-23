@@ -1,12 +1,13 @@
-"""Tests for :func:`assemble_number_sidecars` + :func:`assemble_fid_sidecar`.
+"""Tests for :func:`assemble_number_sidecars`.
 
-Single concern of this file: pin the per-row sidecar concat contract
-in isolation. Stage 1/2/3 builders construct minimum-viable hierarchies
-(real upstream stages are stubs at the time this module ships) so the
-sidecar logic is exercised on hand-crafted ``Stage3Batch`` instances.
+Single concern of this file: pin the per-row numbers sidecar concat
+contract in isolation. Stage 1/2/3 builders construct minimum-viable
+hierarchies (real upstream stages are stubs at the time this module
+ships) so the sidecar logic is exercised on hand-crafted
+``Stage3Batch`` instances.
 
-Plan reference: ``batch_decode_plan.md`` Stage 4 step 4 + step 5; D5
-sidecar contract; D8 row-offset sizing rule.
+Plan reference: ``batch_decode_plan.md`` Stage 4 step 4; D8 row-offset
+sizing rule.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import pytest
 
 from tokenizer.aligned_data.loader.batch_decode._batch_layout import UINT32_MAX
 from tokenizer.aligned_data.loader.batch_decode._sidecar_concat import (
-    assemble_fid_sidecar,
     assemble_number_sidecars,
 )
 from tokenizer.aligned_data.loader.batch_decode._types import (
@@ -624,186 +624,3 @@ def test_empty_batch_returns_empty_arrays():
     assert sex.shape == (0,)
     assert sig.dtype == np.uint64
     assert sex.dtype == np.uint32
-
-
-# ---------------------------------------------------------------------------
-# FID sidecar tests
-# ---------------------------------------------------------------------------
-
-
-def _make_minimal_stage3_for_fid(batch_size: int) -> Stage3Batch:
-    """Build a stage3 wrapper whose only role is to carry
-    ``batch_idx_to_section_variant`` + ``batch_size`` for the FID sidecar
-    tests (no number content). One section with ``batch_size`` empty
-    variants -- the FID assembler only reads the mapping + batch_size.
-    """
-    variants = [[] for _ in range(batch_size)] if batch_size else []
-    mapping = np.array(
-        [[0, i] for i in range(batch_size)], dtype=np.uint32
-    ).reshape(batch_size if batch_size else 0, 2)
-    return _wrap_stage3_batch(
-        variants_per_section=[variants] if batch_size else [],
-        batch_idx_to_section_variant=mapping,
-        number_row_offsets=np.zeros(batch_size + 1, dtype=np.uint32),
-        numbers_per_TokenType={},
-    )
-
-
-def test_fid_sidecar_single_row_local_only():
-    """One row, LOCAL_FUNC only -- counter ids 0..K-1 map to
-    function_name_ptrs in counter-id order."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=1)
-    fid_lookup = [
-        {
-            Category.LOCAL_FUNC: {0: 100, 1: 200, 2: 300},
-        },
-    ]
-    sidecar, offsets = assemble_fid_sidecar(
-        stage3, fid_lookup_per_row=fid_lookup
-    )
-    assert sidecar.dtype == np.uint32
-    assert offsets.dtype == np.uint32
-    np.testing.assert_array_equal(sidecar, [100, 200, 300])
-    np.testing.assert_array_equal(offsets, [0, 3])
-
-
-def test_fid_sidecar_category_order_local_plt_ext():
-    """Within a row, categories emit in canonical order
-    (LOCAL_FUNC, PLT_FUNC, EXT_FUNC)."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=1)
-    fid_lookup = [
-        {
-            Category.EXT_FUNC: {0: 30},
-            Category.LOCAL_FUNC: {0: 10, 1: 11},
-            Category.PLT_FUNC: {0: 20},
-        },
-    ]
-    sidecar, offsets = assemble_fid_sidecar(
-        stage3, fid_lookup_per_row=fid_lookup
-    )
-    # LOCAL (10, 11), then PLT (20), then EXT (30).
-    np.testing.assert_array_equal(sidecar, [10, 11, 20, 30])
-    np.testing.assert_array_equal(offsets, [0, 4])
-
-
-def test_fid_sidecar_counter_id_order_within_category():
-    """Within a Category, function_name_ptrs are placed at the index
-    given by their counter id -- dict insertion order is irrelevant."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=1)
-    # Insert keys in reverse counter-id order; output must still be
-    # counter-id-indexed.
-    fid_lookup = [
-        {
-            Category.LOCAL_FUNC: {2: 999, 0: 111, 1: 555},
-        },
-    ]
-    sidecar, offsets = assemble_fid_sidecar(
-        stage3, fid_lookup_per_row=fid_lookup
-    )
-    np.testing.assert_array_equal(sidecar, [111, 555, 999])
-    np.testing.assert_array_equal(offsets, [0, 3])
-
-
-def test_fid_sidecar_multi_row():
-    """Multi-row offsets bracket each row's contribution."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=2)
-    fid_lookup = [
-        {Category.LOCAL_FUNC: {0: 1, 1: 2}},
-        {
-            Category.LOCAL_FUNC: {0: 7},
-            Category.PLT_FUNC: {0: 8, 1: 9},
-        },
-    ]
-    sidecar, offsets = assemble_fid_sidecar(
-        stage3, fid_lookup_per_row=fid_lookup
-    )
-    np.testing.assert_array_equal(sidecar, [1, 2, 7, 8, 9])
-    np.testing.assert_array_equal(offsets, [0, 2, 5])
-
-
-def test_fid_sidecar_padding_row_zero_contribution():
-    """Padding rows (UINT32_MAX sentinel) contribute zero entries; the
-    offset stays constant across the padding row."""
-    # batch_size=2; row 1 is padding.
-    stage3 = _wrap_stage3_batch(
-        variants_per_section=[[[]]],
-        batch_idx_to_section_variant=np.array(
-            [
-                [0, 0],
-                [UINT32_MAX, UINT32_MAX],
-            ],
-            dtype=np.uint32,
-        ),
-        number_row_offsets=np.zeros(3, dtype=np.uint32),
-        numbers_per_TokenType={},
-    )
-    fid_lookup = [
-        {Category.LOCAL_FUNC: {0: 42}},
-        {},  # padding row -- empty
-    ]
-    sidecar, offsets = assemble_fid_sidecar(
-        stage3, fid_lookup_per_row=fid_lookup
-    )
-    np.testing.assert_array_equal(sidecar, [42])
-    np.testing.assert_array_equal(offsets, [0, 1, 1])
-
-
-def test_fid_sidecar_padding_row_with_unexpected_counters_raises():
-    """A padding row whose dedup map carries counters is an upstream
-    contract violation -- surface it."""
-    stage3 = _wrap_stage3_batch(
-        variants_per_section=[[[]]],
-        batch_idx_to_section_variant=np.array(
-            [
-                [0, 0],
-                [UINT32_MAX, UINT32_MAX],
-            ],
-            dtype=np.uint32,
-        ),
-        number_row_offsets=np.zeros(3, dtype=np.uint32),
-        numbers_per_TokenType={},
-    )
-    fid_lookup = [
-        {Category.LOCAL_FUNC: {0: 42}},
-        {Category.LOCAL_FUNC: {0: 99}},  # padding row -- but non-empty!
-    ]
-    with pytest.raises(AssertionError, match="padding row"):
-        assemble_fid_sidecar(stage3, fid_lookup_per_row=fid_lookup)
-
-
-def test_fid_sidecar_non_dense_counter_raises():
-    """D4: counter ids are dense (0..K-1) within a row+Category. A hole
-    or out-of-range key is a contract violation."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=1)
-    fid_lookup = [
-        # Counter id 5 with n=2 -- out of range.
-        {Category.LOCAL_FUNC: {0: 100, 5: 999}},
-    ]
-    with pytest.raises(AssertionError, match="hole-free"):
-        assemble_fid_sidecar(stage3, fid_lookup_per_row=fid_lookup)
-
-
-def test_fid_sidecar_length_mismatch_raises():
-    """``fid_lookup_per_row`` length must equal ``batch_size``."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=2)
-    with pytest.raises(AssertionError, match="fid_lookup_per_row"):
-        assemble_fid_sidecar(stage3, fid_lookup_per_row=[{}])
-
-
-def test_fid_sidecar_include_fid_path_end_to_end():
-    """End-to-end shape check: combined row content + offsets + dtypes
-    along the documented ``include_fid_sidecar=True`` path."""
-    stage3 = _make_minimal_stage3_for_fid(batch_size=3)
-    fid_lookup = [
-        {Category.LOCAL_FUNC: {0: 11, 1: 22}, Category.PLT_FUNC: {0: 33}},
-        {Category.LOCAL_FUNC: {0: 44}},
-        {Category.EXT_FUNC: {0: 55, 1: 66}},
-    ]
-    sidecar, offsets = assemble_fid_sidecar(
-        stage3, fid_lookup_per_row=fid_lookup
-    )
-    assert sidecar.dtype == np.uint32
-    assert offsets.dtype == np.uint32
-    assert offsets.shape == (4,)
-    np.testing.assert_array_equal(sidecar, [11, 22, 33, 44, 55, 66])
-    np.testing.assert_array_equal(offsets, [0, 3, 4, 6])
