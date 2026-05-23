@@ -17,7 +17,7 @@ flat output + counter remap + variant padding") interleaves four
 side-effects per row: token write, identity-sidecar concat, number-chunk
 concat, and FID sidecar build. Each of those is an independent concern
 crossing a clean module boundary. This module owns concern #1 only;
-sibling modules (``_dedup_walk``, ``_prepend``, ``_sidecar_concat``,
+sibling modules (``_dedup_walk``, ``_sidecar_concat``,
 ``_variant_padding``) own the rest. The four are composed by
 ``_assemble.py`` -- nothing here knows about the identity arm, number
 arm, or sidecar offsets.
@@ -31,7 +31,7 @@ expanded_real])`` per ``ALG-9``. The self-token sits at
 full slice ``expanded_token_ids[:partial_cut_length]`` verbatim --
 position 0 (the prepend) is copied alongside everything else. The
 prepend's IDENTITY-sidecar **counter id** is written by the sibling
-prepend module (``_prepend.py``) into
+dedup walk (see :mod:`._dedup_walk`) into
 ``stage3.identities_flat_caller_local[identity_slice.start]``, a
 *disjoint* destination. The two writes are therefore order-independent:
 either may run first.
@@ -146,7 +146,7 @@ def assemble_tokens(
       self-token at ``expanded_token_ids[0]``; this module writes it
       alongside every other token. The prepend's
       ``identities_flat_caller_local`` counter is written by a sibling
-      (``_prepend.py``).
+      (the dedup walk in :mod:`._dedup_walk`).
     * **Null-content tail**: trailing positions are id 0 from the
       zero-allocation -- per plan D5 ``id == 0`` is the null-content
       padding slot.
