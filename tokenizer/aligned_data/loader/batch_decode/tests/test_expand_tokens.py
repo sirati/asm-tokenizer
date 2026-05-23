@@ -538,3 +538,62 @@ def test_predicted_full_length_invariant(raw_stream):
     # walk relies on -- it indexes into them with the same prefix).
     assert result.extra_value_v2_mask.shape[0] == result.predicted_full_length
     assert result.extra_f128_mask.shape[0] == result.predicted_full_length
+
+
+# ---------------------------------------------------------------------------
+# Test 12: multi-VC2 byte-equivalence -- many VC2 sources of varying
+# chunk counts in a single stream. Pins the np.repeat-driven flat-index
+# paint against the per-source scalar reference. The previous
+# mixed-stream test only exercises one VC2 source; this one stacks
+# several so an off-by-one in the cumulative-sum/repeat indexing
+# surfaces immediately.
+# ---------------------------------------------------------------------------
+
+
+def test_multi_vc2_sources_match_python_reference():
+    BLOCK_V2 = _V2_IDENTITY_BLOCK_START
+
+    def vc2_with_payload(byte_count: int) -> list[int]:
+        # VC2 carrier followed by ``byte_count`` inline-digit bytes
+        # (each < 256 so it lives in the inline-digit band and is read
+        # by ``runlen_number`` as part of a single contiguous number
+        # run). The payload bytes are arbitrary; pick a varying nonzero
+        # value so the resulting raw stream is also visually distinct.
+        return [_VC2_VOCAB_ID] + [(i & 0x7F) | 0x01 for i in range(byte_count)]
+
+    # Stack a deliberately varied set of payload lengths so the
+    # resulting per-source chunk_counts span 1, 2, 3, and 4:
+    #   L=0  -> 1 chunk  (no continuation slots painted)
+    #   L=1  -> 1 chunk  (no continuation slots painted)
+    #   L=8  -> 1 chunk  (no continuation slots painted)
+    #   L=9  -> 2 chunks (1 continuation)
+    #   L=16 -> 2 chunks (1 continuation)
+    #   L=17 -> 3 chunks (2 continuations)
+    #   L=24 -> 3 chunks (2 continuations)
+    #   L=25 -> 4 chunks (3 continuations)
+    #
+    # Separate every VC2 group with a BLOCK_V2 identity sentinel so the
+    # inline-digit run boundaries are unambiguous (a non-inline-digit
+    # token closes the preceding number run -- see ``run_lengths``
+    # semantics).
+    stream: list[int] = [BLOCK_V2]
+    for payload_len in (0, 1, 8, 9, 16, 17, 24, 25):
+        stream.extend(vc2_with_payload(payload_len))
+        stream.append(BLOCK_V2)
+
+    raw = _u16(*stream)
+    ct = _make_call_target(raw, encounter_category=Category.LOCAL_FUNC)
+
+    actual = expand_tokens(ct)
+    reference = _reference_expand(ct)
+
+    np.testing.assert_array_equal(
+        actual.expanded_token_ids, reference.expanded_token_ids
+    )
+    np.testing.assert_array_equal(
+        actual.extra_value_v2_mask, reference.extra_value_v2_mask
+    )
+    np.testing.assert_array_equal(
+        actual.extra_f128_mask, reference.extra_f128_mask
+    )
+    assert actual.predicted_full_length == reference.predicted_full_length
