@@ -309,34 +309,55 @@ def _collect_call_target_signs(
     surviving = int(ct.surviving_token_count)
     is_negative_per_position = state.is_negative_per_position
 
+    if surviving <= 1:
+        return
+
     real_positions = np.nonzero(state.real_mask)[0]
 
-    real_idx = 0
-    for ei in range(1, surviving):
-        is_painted = bool(
-            extra_value_v2_mask[ei] or extra_f128_mask[ei]
-        )
-        if is_painted:
-            # A painted continuation slot shares its carrier's raw
-            # position; it does NOT consume a fresh real_positions entry
-            # AND it is never a source-level carrier (the dispatch
-            # treats it as a chunk continuation of the prior source).
+    # Walk in expanded[1:surviving] space via boolean-mask gather.  A
+    # painted slot (either VC2 or F128 continuation) borrows its
+    # carrier's raw position and contributes no fresh sign entry; the
+    # remaining real-token slots consume ``real_positions`` 1:1 in
+    # encounter order.
+    expanded_slice = expanded_token_ids[1:surviving]
+    is_painted = (
+        extra_value_v2_mask[1:surviving] | extra_f128_mask[1:surviving]
+    )
+    is_real = ~is_painted
+
+    # Restrict to NUMBER-band non-painted carriers; the painted-slot
+    # exclusion + band predicate together mirror the scalar walk's
+    # filter.
+    in_number_band = (
+        (expanded_slice >= _NUMBER_BAND_LO_SHIFTED)
+        & (expanded_slice < _NUMBER_BAND_HI_SHIFTED)
+    )
+    carrier_mask = in_number_band & is_real
+    if not carrier_mask.any():
+        return
+
+    # Raw position per non-painted slot = ``real_positions[k]`` where
+    # ``k`` = count of non-painted slots at or before this slot, minus
+    # one.  ``cumsum(is_real) - 1`` gives that index per slot in
+    # encounter order; restricting to ``carrier_mask`` picks the
+    # NUMBER-band entries.
+    real_idx_inclusive = (np.cumsum(is_real) - 1).astype(np.intp)
+    carrier_raw_positions = real_positions[real_idx_inclusive[carrier_mask]]
+    carrier_signs = is_negative_per_position[carrier_raw_positions]
+    carrier_shifted_ids = expanded_slice[carrier_mask]
+    carrier_block_idx = (
+        carrier_shifted_ids - _NUMBER_BAND_LO_SHIFTED
+    ).astype(np.int64)
+
+    # Group per TokenType.  np.nonzero ordering is ascending, so the
+    # per-type lists pick up signs in stream-encounter order -- matches
+    # the per-type idx_2d row order built by :mod:`._number_decode`.
+    for block_idx, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
+        type_mask = carrier_block_idx == block_idx
+        if not type_mask.any():
             continue
-
-        # Non-painted real-token slot -- always consumes one
-        # real_positions entry, regardless of band.
-        p_carrier = int(real_positions[real_idx])
-        real_idx += 1
-
-        tok_id = int(expanded_token_ids[ei])
-        if not (_NUMBER_BAND_LO_SHIFTED <= tok_id < _NUMBER_BAND_HI_SHIFTED):
-            continue
-
-        token_type = _NUMBER_BLOCK_TOKEN_TYPES[
-            tok_id - _NUMBER_BAND_LO_SHIFTED
-        ]
-        out_lists[token_type].append(
-            bool(is_negative_per_position[p_carrier])
+        out_lists[token_type].extend(
+            carrier_signs[type_mask].astype(bool).tolist()
         )
 
 
