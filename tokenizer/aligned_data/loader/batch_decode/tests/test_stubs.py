@@ -41,21 +41,6 @@ def test_stub_module_imports_cleanly(modname: str) -> None:
     assert mod is not None
 
 
-def test_walk_sections_raises_not_implemented() -> None:
-    from tokenizer.aligned_data.loader.batch_decode._section_walk import walk_sections
-
-    with pytest.raises(NotImplementedError):
-        walk_sections(
-            session=None,  # type: ignore[arg-type]
-            section_pointers=[],
-            num_variants_per_section=1,
-            max_depth=0,
-            variant_padding=None,  # type: ignore[arg-type]
-            inlined_equivalent_call_targets_only=False,
-            rng=None,  # type: ignore[arg-type]
-        )
-
-
 def test_predict_lengths_raises_not_implemented() -> None:
     from tokenizer.aligned_data.loader.batch_decode._length_predict import predict_lengths
 
