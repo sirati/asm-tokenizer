@@ -15,6 +15,7 @@ import numpy as np
 
 from ..matched_sections_bin import Section
 from ..metadata import extract_metadata_from_variant_block
+from .category_counts import compute_category_counts
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
 
@@ -101,6 +102,11 @@ def parse_matched_section(
             for k, v in variant_row.items():
                 metadata.setdefault(k, v)
         insn_rl, block_rl, tokens = data_slice(metadata["data_offset"])
+        # Per-function COUNTER-Category unique-id counts feed Stage 4a's
+        # ALG-4 offset bump. The loader is the single source of truth
+        # for this metadata; downstream stages read it from
+        # ``FunctionData.metadata["category_counts"]`` without re-decoding.
+        metadata["category_counts"] = compute_category_counts(tokens)
         variants.append(
             FunctionData(
                 func_name, metadata, tokens, insn_rl, block_rl,
@@ -172,6 +178,11 @@ def build_unmatched_function_data(
         "called": called,
         "call_targets": call_targets,
         "data_offset": start,
+        # Per-function COUNTER-Category unique-id counts feed Stage 4a's
+        # ALG-4 offset bump. Loader-side single source of truth; the
+        # unmatched arm shares the same metadata contract as the matched
+        # arm so downstream stages remain arm-agnostic.
+        "category_counts": compute_category_counts(tokens),
     }
     # Unmatched functions span multiple variants; ``FunctionData.variant_tokens``
     # carries the first resolved variant's prefix (deterministic by section-row

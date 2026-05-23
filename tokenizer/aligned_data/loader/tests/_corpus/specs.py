@@ -76,10 +76,16 @@ def make_simple_variant(
     Uniqueness across variants of one function comes from feeding a
     different ``token_seed``; the dedup cache path is unused (writers
     invoked without a cache).
+
+    Token ids sit in the instruction-rep band (``>= _V2_EAGER_BLOCK_END``
+    = 272) so the synthetic stream satisfies the v2 wire-form invariants
+    the loader's :func:`compute_category_counts` step asserts on every
+    matched/unmatched variant body (carrier band > 256; no inline-digit
+    bytes at position 0). The lifecycle tests don't decode the bytes --
+    they just need the loader to accept the stream cleanly.
     """
-    tokens = np.arange(
-        token_seed * 100, token_seed * 100 + n_tokens, dtype=np.uint16
-    )
+    base = 272 + token_seed * 100
+    tokens = np.arange(base, base + n_tokens, dtype=np.uint16)
     block_rl = np.array([n_tokens], dtype=np.uint8)
     insn_rl = np.array([2, n_tokens - 2 if n_tokens > 2 else 1], dtype=np.uint8)
     return VariantSpec(vkey=vkey, tokens=tokens, block_rl=block_rl, insn_rl=insn_rl)
