@@ -82,7 +82,6 @@ from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
 from tokenizer.aligned_data.loader.decoded._variant_selection import (
     called_by_in_selection,
     choose_callee_variant,
-    selection_v_idxs_in_section,
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import CallTarget, Section
