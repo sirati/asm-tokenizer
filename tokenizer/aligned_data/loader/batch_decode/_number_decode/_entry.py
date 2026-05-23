@@ -15,14 +15,20 @@ Byte layouts (ALG-7)
 * F80        -- 1 row of 10 bytes (3d reshapes into 5 big-endian u16
   limbs for the explicit-leading-bit reassembly path).
 * F128       -- ``(chunk_count, 8)`` rows. Finite sources (ALG-2)
-  emit 2 chunks: LSB limb (bytes 8..15) then MSB limb (bytes 0..7).
-  NaN/Inf sources emit 1 chunk = MSB limb (bytes 0..7); 3d uses the
-  ``f128_is_nan_or_inf`` sidecar to branch into the
-  ``_encode_infnan(sign, mantissa_is_zero)`` path that needs only the
-  high limb's sign + exponent + high-mantissa bits. The dataloader's
-  ".rodata-robustness" policy (custom_float.py:336) sanctions this
-  approximation -- canonical NaN/Inf is fully determined by the high 8
-  bytes.
+  emit 2 chunks INDEPENDENT of the per-row cutoff: LSB limb (bytes
+  8..15) then MSB limb (bytes 0..7). NaN/Inf sources emit 1 chunk =
+  MSB limb (bytes 0..7); 3d uses the ``f128_is_nan_or_inf`` sidecar
+  to branch into the ``_encode_infnan(sign, mantissa_is_zero)`` path
+  that needs only the high limb's sign + exponent + high-mantissa
+  bits. The dataloader's ".rodata-robustness" policy
+  (custom_float.py:336) sanctions this approximation -- canonical
+  NaN/Inf is fully determined by the high 8 bytes. The MSB chunk is
+  emitted even when the painted MSB slot is past
+  ``partial_cut_length`` so 3d can read ``actual_exp`` from the high
+  limb (LSB chunk's exponent base = actual_exp - 112); stage 4's
+  per-row sidecar concat drops the invisible MSB chunk via the
+  stream-walk's surviving-prefix count, not via chunk-emission
+  suppression here.
 * VC2 -- variable-length payload per ALG-8; ``(K_visible, 8)`` rows.
   ``K_full = max(1, ceil(L / 8))`` and ``K_visible`` is the count of
   chunks whose expanded-stream slot survived the cut. The MSB chunk
@@ -93,7 +99,6 @@ def build_number_idx_2d(
     dict[TokenType, list[slice]],
     np.ndarray,
     np.ndarray,
-    np.ndarray,
 ]:
     """Build per-:class:`TokenType` ``idx_2d`` arrays per ALG-7 + ALG-8.
 
@@ -127,21 +132,17 @@ def build_number_idx_2d(
         slice into ``idx_2d_per_type[T]`` owned by call_target ``i``.
     f128_is_nan_or_inf
         ``bool[n_f128_sources]``. One entry per F128 SOURCE (not
-        chunk); routes 3d's per-chunk dispatch (NaN/Inf path vs finite
-        path) but does NOT determine the chunk count (the mid-cut
-        finite case has 1 visible chunk while staying on the finite
-        dispatch). The chunk count comes from ``f128_visible_chunks``.
+        chunk); routes 3d's per-chunk dispatch (NaN/Inf path vs
+        finite path) AND drives ``chunks_per_source = where(
+        is_nan_or_inf, 1, 2)``. 3c always emits the full ALG-2 chunk
+        set per finite source (2 chunks: LSB + MSB) so 3d can read
+        ``actual_exp`` from the MSB limb. Stage 4's per-row sidecar
+        concat drops the trailing invisible MSB chunk for a mid-cut
+        finite source via the stream-walk's surviving-prefix count.
     vc2_chunk_exponent_sidecar
         ``u32[total_vc2_chunks]``. Per-chunk index within source
         (``0 = LSB``, ``K-1 = MSB``); stage 4 multiplies by 64 for
         ``exponent_base``.
-    f128_visible_chunks
-        ``u8[n_f128_sources]`` with values ``{1, 2}``. Per-source row
-        count emitted into ``idx_2d_per_type[FLOAT128]``: NaN/Inf = 1
-        (MSB only), finite full = 2 (LSB + MSB), finite mid-cut = 1
-        (LSB only -- the painted MSB slot is past the cut). 3d uses
-        this to derive ``chunks_per_source`` so the row-count
-        assertion stays consistent in the mid-cut case.
     """
 
     # Output accumulators. Every NUMBER-block TokenType key is always
@@ -156,7 +157,6 @@ def build_number_idx_2d(
         T: 0 for T in _NUMBER_BLOCK_TOKEN_TYPES
     }
     f128_nan_or_inf_flags: list[bool] = []
-    f128_visible_chunk_counts: list[int] = []
     vc2_chunk_indices: list[int] = []
 
     # DFS encounter order matches 3a's ``inline_byte_slices`` so a
@@ -178,7 +178,6 @@ def build_number_idx_2d(
                         row_lists_per_type=row_lists_per_type,
                         running_counts=running_counts,
                         f128_nan_or_inf_flags=f128_nan_or_inf_flags,
-                        f128_visible_chunks=f128_visible_chunk_counts,
                         vc2_chunk_indices=vc2_chunk_indices,
                     )
 
@@ -201,9 +200,6 @@ def build_number_idx_2d(
             )
 
     f128_is_nan_or_inf = np.asarray(f128_nan_or_inf_flags, dtype=np.bool_)
-    f128_visible_chunks = np.asarray(
-        f128_visible_chunk_counts, dtype=np.uint8
-    )
     vc2_chunk_exponent_sidecar = np.asarray(
         vc2_chunk_indices, dtype=np.uint32
     )
@@ -213,5 +209,4 @@ def build_number_idx_2d(
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
-        f128_visible_chunks,
     )

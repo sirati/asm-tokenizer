@@ -98,6 +98,17 @@ def _emit_call_target_chunks(
     ``numbers_per_TokenType[token_type]`` via the call_target's
     per-:class:`TokenType` slice. Chunks land in the output in stream
     order (not grouped by :class:`TokenType`).
+
+    F128 mid-cut handling: 3c emits ALG-2 chunks INDEPENDENT of the
+    cut (2 per finite source, 1 per NaN/Inf) so 3d can read
+    ``actual_exp`` from the MSB limb. The stream-visible F128 count
+    (``n_for_type``) is smaller than the per-CT FLOAT128 chunk slice
+    only when a mid-cut finite source's painted MSB slot is past
+    ``partial_cut_length``. That MSB chunk lives at the TAIL of the
+    per-CT slice (3c emits chunks in stream emission order; LSB then
+    MSB per finite source; the mid-cut source is by construction the
+    LAST F128 in the CT), so taking the first ``n_for_type`` chunks
+    naturally drops it.
     """
 
     stage2_ct = call_target.stage2

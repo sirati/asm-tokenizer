@@ -2,9 +2,14 @@
 
 Single concern: per-chunk 8-byte big-endian payload -> f96-shape
 normalization for binary128. Consumes the per-chunk layout 3c emits
-(``(n_chunks_total, 8)`` u8 -- 2 chunks per finite source, 1 chunk per
-NaN/Inf source) and pairs it with the per-source ``f128_is_nan_or_inf``
-sidecar to split chunks back into their source roles.
+(``(n_chunks_total, 8)`` u8 -- 2 chunks per finite source INDEPENDENT
+of the cut, 1 chunk per NaN/Inf source) and pairs it with the per-
+source ``f128_is_nan_or_inf`` sidecar to split chunks back into their
+source roles. ``chunks_per_source = where(is_nan_or_inf, 1, 2)`` so
+the MSB bytes are always available for the LSB chunk's exponent base
+derivation -- mid-cut finite sources still contribute 2 chunks here;
+stage 4's per-row sidecar walk drops the invisible MSB at concat
+time.
 
 Per-chunk emission formula matches :func:`custom_float._emit_chunk` on
 the corresponding ``chunk_value`` -- so for F128 *normals* (whose
@@ -41,6 +46,7 @@ Per-source chunk-position layout in the input ``raw_bytes_2d``:
 * Finite source (``f128_is_nan_or_inf[s] == False``): 2 rows --
   ``out_offsets[s] + 0`` = LSB limb (bytes 8..15 of the original 16-
   byte payload), ``out_offsets[s] + 1`` = MSB limb (bytes 0..7).
+  Always 2 rows, even for mid-cut finite sources.
 * NaN/Inf source (``f128_is_nan_or_inf[s] == True``): 1 row at
   ``out_offsets[s]`` = MSB limb (bytes 0..7).
 
@@ -60,28 +66,22 @@ __all__ = ["normalize_f128"]
 def normalize_f128(
     raw_bytes_2d: np.ndarray,
     f128_is_nan_or_inf: np.ndarray,
-    f128_visible_chunks: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Vectorized F128 encoder.
 
     ``raw_bytes_2d``: ``u8[n_chunks_total, 8]`` -- one row per CHUNK (not
-    per source). Layout per source: finite full sources contribute 2 rows
-    (LSB then MSB limb); NaN/Inf sources contribute 1 row (MSB limb);
-    mid-cut finite sources contribute 1 row (LSB limb only -- the painted
-    MSB slot was past ``partial_cut_length``). Rows appear in source
-    order, with each source's chunks consecutive and in LSB-first order
-    for finite sources.
+    per source). Layout per source: finite sources contribute 2 rows
+    (LSB then MSB limb) INDEPENDENT of the per-row cutoff; NaN/Inf
+    sources contribute 1 row (MSB limb). Rows appear in source order,
+    with each source's chunks consecutive and in LSB-first order for
+    finite sources.
 
     ``f128_is_nan_or_inf``: ``bool[n_sources]`` -- routes the per-source
-    dispatch (NaN/Inf path vs finite path). Does NOT determine chunk
-    count: a mid-cut finite source stays on the finite path but
-    contributes only 1 chunk.
-
-    ``f128_visible_chunks``: ``u8[n_sources]`` with values ``{1, 2}`` --
-    per-source visible row count emitted by 3c. Drives
-    ``chunks_per_source`` so the row-count assertion stays consistent
-    in the mid-cut finite case. ``n_chunks_total == f128_visible_chunks
-    .sum()``.
+    dispatch (NaN/Inf path vs finite path) AND drives
+    ``chunks_per_source = where(is_nan_or_inf, 1, 2)``. 3c emits the
+    full ALG-2 chunk set for every finite source so 3d can read
+    ``actual_exp`` from the MSB limb; stage 4's per-row sidecar concat
+    drops the trailing invisible MSB chunk for a mid-cut finite source.
 
     Returns ``(significand, sign_exp)`` arrays of length
     ``n_chunks_total``, in input row order.
@@ -100,13 +100,13 @@ def normalize_f128(
 
     # ---- Per-source chunk-layout map ----
     #
-    # chunks_per_source[s]: from 3c's per-source visible-chunk count
-    # sidecar. Values are {1, 2}: NaN/Inf = 1, finite full = 2, finite
-    # mid-cut = 1.
+    # chunks_per_source[s] = where(is_nan_or_inf, 1, 2): finite sources
+    # contribute 2 chunks (LSB + MSB) INDEPENDENT of the cut; NaN/Inf
+    # sources contribute 1 chunk (MSB only).
     # out_offsets[s]: index of source s's first chunk in the per-chunk
     # arrays. out_offsets[n_sources] = total chunk count.
     nan_inf_mask = f128_is_nan_or_inf.astype(bool)
-    chunks_per_source = f128_visible_chunks.astype(np.int64)
+    chunks_per_source = np.where(nan_inf_mask, 1, 2).astype(np.int64)
     out_offsets = np.empty(n_sources + 1, dtype=np.int64)
     out_offsets[0] = 0
     np.cumsum(chunks_per_source, out=out_offsets[1:])
@@ -114,7 +114,7 @@ def normalize_f128(
     if expected_chunks_total != n_chunks_total:
         raise AssertionError(
             f"raw_bytes_2d row count {n_chunks_total} does not match "
-            f"f128_visible_chunks-derived chunk count "
+            f"is_nan_or_inf-derived chunk count "
             f"{expected_chunks_total}; stage-3c / stage-3d layout drift"
         )
 
@@ -123,14 +123,10 @@ def normalize_f128(
     chunk_u64 = bytes_c.view(">u8").reshape(-1)  # u64[n_chunks_total]
 
     # Per-source MSB chunk position = source's LAST chunk row:
-    #   NaN/Inf source       (chunks=1): source_starts (the only chunk).
-    #   Finite full source   (chunks=2): source_starts + 1 (the 2nd chunk).
-    #   Finite mid-cut source(chunks=1): source_starts (the LSB chunk
-    #     -- the painted MSB slot was past the cut, so the MSB bytes
-    #     are NOT in raw_bytes_2d). The fallback "read LSB bytes as
-    #     MSB" keeps the index in range; the resulting normalized
-    #     chunk is semantically incomplete for mid-cut sources, but
-    #     the row-count + index-safety contract holds.
+    #   NaN/Inf source (chunks=1): source_starts (the only chunk).
+    #   Finite source  (chunks=2): source_starts + 1 (the 2nd chunk).
+    # 3c always emits both finite chunks (mid-cut finite sources still
+    # contribute 2 chunks here), so the MSB position is unambiguous.
     source_starts = out_offsets[:n_sources]
     msb_chunk_pos = source_starts + (chunks_per_source - np.int64(1))
     msb_u64 = chunk_u64[msb_chunk_pos]
@@ -211,25 +207,15 @@ def normalize_f128(
     out_sig = np.empty(n_chunks_total, dtype=np.uint64)
     out_sign_exp = np.empty(n_chunks_total, dtype=np.uint32)
 
-    # Finite sources: chunk 0 (LSB) at source_starts always; chunk 1
-    # (MSB) at source_starts + 1 ONLY for sources with chunks=2 (the
-    # mid-cut finite case has chunks=1 -- only the LSB chunk row
-    # exists, so writing chunk-1 would index past the source's
-    # allocation and overwrite the next source's slot).
+    # Finite sources: chunk 0 (LSB) at source_starts and chunk 1
+    # (MSB) at source_starts + 1.
     finite_idx = np.nonzero(~nan_inf_mask)[0]
     if finite_idx.size > 0:
         finite_starts = source_starts[finite_idx]
         out_sig[finite_starts] = finite_chunk0_sig[finite_idx]
         out_sign_exp[finite_starts] = finite_chunk0_sign_exp[finite_idx]
-        finite_full_idx = finite_idx[chunks_per_source[finite_idx] == 2]
-        if finite_full_idx.size > 0:
-            finite_full_starts = source_starts[finite_full_idx]
-            out_sig[finite_full_starts + 1] = finite_chunk1_sig[
-                finite_full_idx
-            ]
-            out_sign_exp[finite_full_starts + 1] = finite_chunk1_sign_exp[
-                finite_full_idx
-            ]
+        out_sig[finite_starts + 1] = finite_chunk1_sig[finite_idx]
+        out_sign_exp[finite_starts + 1] = finite_chunk1_sign_exp[finite_idx]
 
     nan_inf_idx = np.nonzero(nan_inf_mask)[0]
     if nan_inf_idx.size > 0:

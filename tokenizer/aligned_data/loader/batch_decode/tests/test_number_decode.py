@@ -264,7 +264,6 @@ def test_empty_batch_emits_all_empty_arrays() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [slice(1, 1)])
 
     # All TokenType keys are present, all empty.
@@ -273,7 +272,6 @@ def test_empty_batch_emits_all_empty_arrays() -> None:
         assert chunk_slices_per_type[T] == [slice(0, 0)]
     assert f128_is_nan_or_inf.shape == (0,)
     assert vc2_sidecar.shape == (0,)
-    assert f128_visible_chunks.shape == (0,)
 
 
 def test_f32_single_source_one_row_four_bytes() -> None:
@@ -304,7 +302,6 @@ def test_f32_single_source_one_row_four_bytes() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -356,7 +353,6 @@ def test_fixed_width_fp_single_source(
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -408,7 +404,6 @@ def test_f128_finite_single_source_two_chunks() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -425,10 +420,68 @@ def test_f128_finite_single_source_two_chunks() -> None:
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([False], dtype=np.bool_)
     )
-    np.testing.assert_array_equal(
-        f128_visible_chunks, np.array([2], dtype=np.uint8)
-    )
     assert vc2_sidecar.shape == (0,)
+
+
+def test_f128_finite_mid_cut_still_emits_both_chunks() -> None:
+    """F128 finite source whose painted MSB slot is past
+    ``partial_cut_length``: 3c MUST emit BOTH chunks anyway.
+
+    3d's per-source layout reads ``actual_exp`` from the MSB limb to
+    derive the LSB chunk's exponent base; suppressing the MSB chunk
+    here would either break 3d's chunk-count contract (chunks_per_
+    source = 2 for finite) OR force 3d to read LSB bytes as if they
+    were MSB bytes -- both broken. Stage 4's per-row sidecar walk is
+    the layer that drops the trailing invisible MSB chunk via the
+    stream-visible count; this layer keeps the full ALG-2 chunk set
+    in 3c's output.
+    """
+    payload = np.arange(0x10, 0x20, dtype=np.uint16)
+    raw_tokens = np.concatenate(
+        [np.array([_F128_RAW], dtype=np.uint16), payload]
+    )
+    expanded = np.array(
+        [_LOCAL_FUNC_SHIFTED, _F128_SHIFTED, _F128_SHIFTED], dtype=np.uint16
+    )
+    extra_vc2 = np.array([False, False, False], dtype=bool)
+    extra_f128 = np.array([False, False, True], dtype=bool)
+    # Cut between the carrier (expanded[1]) and the painted MSB
+    # (expanded[2]) -- only the carrier survives in the visible stream.
+    stage2_ct = _make_call_target(
+        raw_tokens,
+        expanded,
+        extra_vc2,
+        extra_f128,
+        surviving_token_count=2,
+    )
+    stage2_batch = _wrap_single_call_target(stage2_ct)
+    inline_bytes, ct_slice = _build_inline_bytes_from_raw(raw_tokens)
+
+    (
+        idx_2d_per_type,
+        chunk_slices_per_type,
+        f128_is_nan_or_inf,
+        vc2_sidecar,
+    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+
+    # Both chunks present. LSB row first (bytes 9..16), then MSB row
+    # (bytes 1..8) -- matches the LSB-first stream emission order.
+    np.testing.assert_array_equal(
+        idx_2d_per_type[TokenType.FLOAT128],
+        np.array(
+            [
+                [9, 10, 11, 12, 13, 14, 15, 16],   # LSB chunk
+                [1, 2, 3, 4, 5, 6, 7, 8],          # MSB chunk
+            ],
+            dtype=np.uint32,
+        ),
+    )
+    assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 2)]
+    # Source is finite; the painted slot is the ALG-2 finite signal
+    # (read against the FULL mask, not the surviving prefix).
+    np.testing.assert_array_equal(
+        f128_is_nan_or_inf, np.array([False], dtype=np.bool_)
+    )
 
 
 def test_f128_nan_or_inf_single_source_one_chunk() -> None:
@@ -456,7 +509,6 @@ def test_f128_nan_or_inf_single_source_one_chunk() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -466,9 +518,6 @@ def test_f128_nan_or_inf_single_source_one_chunk() -> None:
     assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 1)]
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([True], dtype=np.bool_)
-    )
-    np.testing.assert_array_equal(
-        f128_visible_chunks, np.array([1], dtype=np.uint8)
     )
     assert vc2_sidecar.shape == (0,)
 
@@ -520,7 +569,6 @@ def test_vc2_L17_three_chunks_with_msb_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     expected_rows = np.array(
@@ -565,7 +613,6 @@ def test_vc2_L8_one_chunk_no_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     expected_rows = np.array(
@@ -609,7 +656,6 @@ def test_vc2_L0_one_chunk_all_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     # VC2 chunk: all 8 pad zeros.
@@ -666,7 +712,6 @@ def test_vc2_mid_cut_drops_msb_chunk() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     expected_rows = np.array(
@@ -783,7 +828,6 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct0_slice, ct1_slice])
 
     # CT0's F32 row.
@@ -826,8 +870,7 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
 
 
 def test_dtypes_and_sidecar_widths() -> None:
-    """Test 10: idx_2d arrays are u32; vc2 sidecar u32; f128 flag bool;
-    f128_visible_chunks u8."""
+    """Test 10: idx_2d arrays are u32; vc2 sidecar u32; f128 flag bool."""
     raw_tokens = np.array(
         [_F128_RAW] + list(range(0x10, 0x20)), dtype=np.uint16
     )
@@ -845,14 +888,12 @@ def test_dtypes_and_sidecar_widths() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     for T, arr in idx_2d_per_type.items():
         assert arr.dtype == np.uint32, f"{T} idx_2d dtype = {arr.dtype}"
     assert vc2_sidecar.dtype == np.uint32
     assert f128_is_nan_or_inf.dtype == np.bool_
-    assert f128_visible_chunks.dtype == np.uint8
 
 
 def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
@@ -888,7 +929,6 @@ def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     # Only F16 emits; everything else empty.

@@ -141,14 +141,12 @@ def build_bulk_bytes(
 
     # 4. number idx_2d (3c): per-TokenType u32[n_chunks_of_T, payload_T]
     #    arrays + per-call-target chunk slices + sidecars (NaN/Inf
-    #    dispatch flag + per-source visible-chunk count + VC2 chunk-
-    #    exponent indices).
+    #    dispatch flag + VC2 chunk-exponent indices).
     (
         idx_2d_per_type,
         number_chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2, inline_bytes, inline_byte_slices)
 
     # 5. Per-source signs grouped by TokenType, in the same stream-source
@@ -167,7 +165,6 @@ def build_bulk_bytes(
         idx_2d_per_type=idx_2d_per_type,
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
-        f128_visible_chunks=f128_visible_chunks,
         vc2_chunk_exponent_sidecar=vc2_chunk_exponent_sidecar,
         is_negative_per_source_per_type=is_negative_per_source_per_type,
     )
@@ -236,7 +233,6 @@ def build_bulk_bytes(
         number_idx_2d_per_TokenType=idx_2d_per_type,
         vc2_chunk_exponent_sidecar=vc2_chunk_exponent_sidecar,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
-        f128_visible_chunks=f128_visible_chunks,
     )
 
 

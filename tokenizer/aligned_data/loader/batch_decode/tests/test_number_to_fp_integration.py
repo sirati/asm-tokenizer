@@ -175,8 +175,15 @@ def _make_call_target(
     expanded_token_ids: np.ndarray,
     extra_value_v2_mask: np.ndarray,
     extra_f128_mask: np.ndarray,
+    *,
+    surviving_token_count: int | None = None,
 ) -> Stage2CallTarget:
-    """Build a Stage2CallTarget around hand-crafted expanded stream."""
+    """Build a Stage2CallTarget around hand-crafted expanded stream.
+
+    ``surviving_token_count`` defaults to ``predicted_full_length`` --
+    pass a smaller value to model a mid-cut row (the cut hits this CT
+    at position ``surviving_token_count``).
+    """
     stage1_ct = Stage1CallTarget(
         function_data=_empty_function_data(),
         state=_build_state(raw_tokens),
@@ -186,19 +193,22 @@ def _make_call_target(
         function_name_ptr=0,
     )
     predicted_full_length = int(expanded_token_ids.shape[0])
-    identity_band_mask = (expanded_token_ids >= 8) & (expanded_token_ids < 16)
-    number_band_mask = (expanded_token_ids >= 1) & (expanded_token_ids < 8)
+    if surviving_token_count is None:
+        surviving_token_count = predicted_full_length
+    surviving_prefix = expanded_token_ids[:surviving_token_count]
+    identity_band_mask = (surviving_prefix >= 8) & (surviving_prefix < 16)
+    number_band_mask = (surviving_prefix >= 1) & (surviving_prefix < 8)
     return Stage2CallTarget(
         stage1=stage1_ct,
         expanded_token_ids=expanded_token_ids,
         extra_value_v2_mask=extra_value_v2_mask,
         extra_f128_mask=extra_f128_mask,
         predicted_full_length=predicted_full_length,
-        surviving_token_count=predicted_full_length,
+        surviving_token_count=surviving_token_count,
         surviving_identity_count=int(identity_band_mask.sum()),
         surviving_number_chunk_count=int(number_band_mask.sum()),
-        is_cut=False,
-        partial_cut_length=predicted_full_length,
+        is_cut=surviving_token_count < predicted_full_length,
+        partial_cut_length=surviving_token_count,
     )
 
 
@@ -362,7 +372,6 @@ def test_f128_3c_to_3d_chain_byte_equivalent(
         _,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(
         stage2_batch, inline_bytes, [ct_slice]
     )
@@ -380,7 +389,6 @@ def test_f128_3c_to_3d_chain_byte_equivalent(
         idx_2d_per_type=idx_2d_per_type,
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
-        f128_visible_chunks=f128_visible_chunks,
         vc2_chunk_exponent_sidecar=vc2_sidecar,
         is_negative_per_source_per_type={
             TokenType.FLOAT128: np.zeros(n_sources, dtype=bool),
@@ -468,7 +476,6 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
         _,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(
         stage2_batch, inline_bytes, [ct_slice]
     )
@@ -478,7 +485,6 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
         idx_2d_per_type=idx_2d_per_type,
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
-        f128_visible_chunks=f128_visible_chunks,
         vc2_chunk_exponent_sidecar=vc2_sidecar,
         is_negative_per_source_per_type={
             T: np.zeros(idx_2d_per_type[T].shape[0], dtype=bool)
@@ -514,36 +520,31 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_f128_mid_cut_finite_emits_one_chunk_without_assertion() -> None:
-    """A mid-cut finite F128 source emits 1 row (LSB only) and the 3d
-    F128 normalizer accepts it without the row-count assertion firing.
+def test_f128_mid_cut_finite_emits_both_chunks_without_assertion() -> None:
+    """A mid-cut finite F128 source emits BOTH ALG-2 chunks (LSB + MSB)
+    and the 3d F128 normalizer accepts the full per-source layout
+    without the row-count assertion firing.
 
     Cross-phase contract: when ``partial_cut_length`` lands between a
-    finite F128 carrier and its painted MSB continuation slot, 3c emits
-    only the LSB chunk (1 row) and the per-source
-    ``f128_visible_chunks`` sidecar records 1 for that source. 3d's
-    F128 normalizer reads ``f128_visible_chunks`` (NOT
-    ``f128_is_nan_or_inf``) for ``chunks_per_source`` so the row-count
-    consistency check stays green; ``f128_is_nan_or_inf`` only routes
-    per-chunk dispatch.
+    finite F128 carrier and its painted MSB continuation slot, 3c
+    still emits both chunks (2 rows per finite source) because 3d
+    reads ``actual_exp`` from the MSB limb to derive the LSB chunk's
+    exponent base (chunk0_base = actual_exp - 112). Suppressing the
+    MSB at 3c would force 3d to read LSB bytes as if they were the
+    MSB bytes -- producing a corrupt biased_exp + sign and a silently
+    mis-normalized LSB chunk. Stage 4's per-row sidecar concat drops
+    the trailing invisible MSB chunk at concat time via the
+    stream-walk's surviving-prefix count.
 
     Fixture: two finite F128 sources packed back-to-back where the
-    FIRST is fully visible (2 chunks) and the SECOND is mid-cut (1
-    LSB chunk only -- the painted MSB slot is past the cut). The full
-    source's MSB row is the predecessor that keeps the F128
-    normalizer's MSB-position read for the mid-cut source defensively
-    in-range. Bit-pattern sanity passes because the full source's MSB
-    is a valid finite F128 (biased_exp != 0x7FFF).
-
-    The mid-cut source's normalized output is semantically incomplete
-    (no MSB bytes were transmitted, so the encoded chunk uses the
-    fallback "read LSB as MSB" path -- which yields a finite-looking
-    biased_exp = 0 here because ``F128_ONE``'s low limb is zero) --
-    the test pins the row-count + assertion-free flow, NOT the byte
-    content of the mid-cut chunk.
+    FIRST is fully visible (2 chunks) and the SECOND is mid-cut (the
+    painted MSB slot is past the cut). 3c emits 2 + 2 = 4 chunks
+    regardless of the cut. ``f128_is_nan_or_inf`` is [False, False];
+    ``chunks_per_source = where(is_nan_or_inf, 1, 2) = [2, 2]``.
     """
     # S0 (full, finite): F128_NEG_ONE -- contributes 2 chunks.
-    # S1 (mid-cut, finite): F128_ONE -- contributes 1 chunk (LSB only).
+    # S1 (mid-cut, finite): F128_ONE -- still contributes 2 chunks
+    # (LSB + MSB) per the always-emit-both rule.
     bits_s0 = F128_NEG_ONE
     bits_s1 = F128_ONE
 
@@ -561,7 +562,9 @@ def test_f128_mid_cut_finite_emits_one_chunk_without_assertion() -> None:
     # expanded: [prepend, S0_carrier, S0_painted_msb,
     #            S1_carrier, S1_painted_msb]
     # surviving_token_count = 4 cuts AT expanded[4] (S1's painted MSB).
-    # S0 is fully visible (2 chunks); S1 is mid-cut (1 LSB chunk only).
+    # S0 is fully visible in the stream; S1's MSB slot is past the cut.
+    # 3c still emits all 4 chunks (2 per finite source); stage 4's
+    # sidecar concat drops the invisible MSB chunk at concat time.
     expanded = np.array(
         [
             _LOCAL_FUNC_SHIFTED,
@@ -585,7 +588,10 @@ def test_f128_mid_cut_finite_emits_one_chunk_without_assertion() -> None:
     stage2_ct = replace(
         stage2_ct,
         surviving_token_count=4,
-        surviving_number_chunk_count=3,  # S0 contributes 2 + S1 contributes 1
+        # 3c emits both chunks per finite source regardless of the cut;
+        # stream-visible F128 carriers count = 2 (S0 carrier + S0 MSB
+        # painted + S1 carrier in expanded[:4]).
+        surviving_number_chunk_count=3,
         is_cut=True,
         partial_cut_length=4,
     )
@@ -598,26 +604,22 @@ def test_f128_mid_cut_finite_emits_one_chunk_without_assertion() -> None:
         _,
         f128_is_nan_or_inf,
         vc2_sidecar,
-        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
-    # 3c contract: 2 visible F128 sources (S0 full, S1 mid-cut). Total
-    # rows = 2 + 1 = 3.
-    assert idx_2d_per_type[TokenType.FLOAT128].shape == (3, 8)
+    # 3c contract: 2 finite F128 sources, each contributes 2 chunks
+    # (LSB + MSB) INDEPENDENT of the cut. Total rows = 2 + 2 = 4.
+    assert idx_2d_per_type[TokenType.FLOAT128].shape == (4, 8)
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([False, False], dtype=np.bool_)
     )
-    np.testing.assert_array_equal(
-        f128_visible_chunks, np.array([2, 1], dtype=np.uint8)
-    )
 
-    # 3d contract: normalizing must NOT raise the
-    # row-count-vs-chunks_per_source assertion (the fix's whole point).
+    # 3d contract: normalizing must NOT raise the row-count
+    # assertion. chunks_per_source = where(is_nan_or_inf, 1, 2) =
+    # [2, 2]; expected row count = 4 = actual row count.
     out = normalize_per_token_type(
         idx_2d_per_type=idx_2d_per_type,
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
-        f128_visible_chunks=f128_visible_chunks,
         vc2_chunk_exponent_sidecar=vc2_sidecar,
         is_negative_per_source_per_type={
             T: np.zeros(idx_2d_per_type[T].shape[0], dtype=bool)
@@ -629,6 +631,219 @@ def test_f128_mid_cut_finite_emits_one_chunk_without_assertion() -> None:
         },
     )
     got_sig, got_sign_exp = out[TokenType.FLOAT128]
-    # 3 chunks in, 3 chunks out -- 3d preserves the per-chunk row count.
-    assert got_sig.shape == (3,)
-    assert got_sign_exp.shape == (3,)
+    # 4 chunks in, 4 chunks out -- 3d preserves the per-chunk row count.
+    assert got_sig.shape == (4,)
+    assert got_sign_exp.shape == (4,)
+
+
+# ---------------------------------------------------------------------------
+# Mid-cut finite F128 -- the painted MSB slot is past the cut. 3c MUST
+# emit both ALG-2 chunks (so 3d can read ``actual_exp`` from the MSB
+# limb); 3d MUST normalize both byte-equivalently to the oracle; stage
+# 4's sidecar concat then drops the trailing MSB chunk because the
+# stream-visible F128 count is 1.
+# ---------------------------------------------------------------------------
+
+
+# A finite F128 with NON-ZERO low mantissa bits. The pre-fix code, when
+# mid-cut, only emitted the LSB chunk and 3d's MSB-position fallback
+# would have read the LSB bytes as if they were the MSB bytes (wrong
+# sign / wrong biased_exp). With non-zero low mantissa the LSB-as-MSB
+# misread produces a corrupt biased_exp ``!= 0x7FFF`` AND non-zero
+# sign / mantissa nibbles -- byte-equivalence to the oracle catches it.
+#
+# Layout: sign=0, biased_exp=16383 (so actual_exp=0), raw_mantissa with
+# every low-limb byte non-zero AND the LSB-as-MSB interpretation's
+# would-be exp = bits[48..62] of low_u64 = 0x7777 != 0x7FFF (not a
+# NaN/Inf escape that would be silently absorbed by 3d).
+F128_MIDCUT_PROBE = _f128_finite_bits(
+    sign=0,
+    biased_exp=16383,
+    # raw_mantissa is 112 bits. Low 64 bits = 0x7777_8888_9999_AAAA
+    # (every byte non-zero, sign bit of LSB chunk = 0 if read as MSB).
+    # High 48 bits = 0x1234_5678_9ABC.
+    raw_mantissa=(0x1234_5678_9ABC << 64) | 0x7777_8888_9999_AAAA,
+)
+
+
+def _build_f128_midcut_stream(
+    bits: int,
+) -> tuple[Stage2Batch, np.ndarray, slice]:
+    """Build a stream for one finite F128 with the cut between the
+    carrier slot and the painted MSB slot.
+
+    raw_tokens: [F128_RAW, b0, ..., b15]  -- full payload in inline
+                                              bytes (3a keeps it).
+    expanded  : [prepend, F128_carrier, F128_painted_MSB]
+    cut       : surviving_token_count = 2 -> only the carrier survives
+                in the visible stream.
+    """
+    biased_exp = (bits >> 112) & 0x7FFF
+    assert biased_exp != 0x7FFF, (
+        "mid-cut test must use a finite F128 (NaN/Inf has no painted slot)"
+    )
+    payload = _f128_bytes(bits)
+    raw_tokens = np.concatenate(
+        [
+            np.array([_F128_RAW], dtype=np.uint16),
+            np.frombuffer(payload, dtype=np.uint8).astype(np.uint16),
+        ]
+    )
+    expanded = np.array(
+        [_LOCAL_FUNC_SHIFTED, _F128_SHIFTED, _F128_SHIFTED], dtype=np.uint16
+    )
+    extra_vc2 = np.array([False, False, False], dtype=bool)
+    extra_f128 = np.array([False, False, True], dtype=bool)
+    stage2_ct = _make_call_target(
+        raw_tokens,
+        expanded,
+        extra_vc2,
+        extra_f128,
+        surviving_token_count=2,
+    )
+    stage2_batch = _wrap_single_call_target(stage2_ct)
+    inline_bytes, ct_slice = _build_inline_bytes_from_raw(raw_tokens)
+    return stage2_batch, inline_bytes, ct_slice
+
+
+def test_f128_midcut_finite_3d_emits_both_chunks_byte_equivalent() -> None:
+    """Mid-cut finite F128: 3c emits both ALG-2 chunks; 3d normalizes
+    both byte-equivalently to the per-source oracle.
+
+    This is the correctness contract the bug broke. The painted MSB
+    slot is past ``partial_cut_length`` but its BYTES still drive 3d's
+    ``actual_exp`` extraction for the LSB chunk's exponent base
+    (``chunk0_base = actual_exp - 112``). If 3c suppressed the MSB
+    chunk to "match" the stream-visible count, 3d would either fail an
+    internal layout assertion or (in a fallback path) read the LSB
+    bytes as if they were the MSB bytes -- producing a corrupt
+    ``actual_exp`` and silently mis-normalizing the LSB chunk.
+    """
+    stage2_batch, inline_bytes, ct_slice = _build_f128_midcut_stream(
+        F128_MIDCUT_PROBE
+    )
+
+    idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
+        stage2_batch, inline_bytes, [ct_slice]
+    )
+
+    # 3c emits BOTH chunks even though only the LSB chunk is stream-
+    # visible -- the MSB chunk's bytes are required for 3d's
+    # actual_exp extraction.
+    assert idx_2d_per_type[TokenType.FLOAT128].shape == (2, 8)
+    assert f128_is_nan_or_inf.shape == (1,)
+    assert not bool(f128_is_nan_or_inf[0])
+
+    out = normalize_per_token_type(
+        idx_2d_per_type=idx_2d_per_type,
+        inline_bytes=inline_bytes,
+        f128_is_nan_or_inf=f128_is_nan_or_inf,
+        vc2_chunk_exponent_sidecar=vc2_sidecar,
+        is_negative_per_source_per_type={
+            TokenType.FLOAT128: np.zeros(1, dtype=bool),
+        },
+    )
+    got_sig, got_sign_exp = out[TokenType.FLOAT128]
+
+    # Both chunks must match the oracle. The LSB chunk in particular
+    # carries the correctness load -- its byte-equivalence proves
+    # that 3d read ``actual_exp`` from the MSB limb (not from the LSB
+    # bytes via a fallback).
+    expected_sig, expected_sign_exp = _oracle_pairs_to_arrays(
+        [_f128_batch_expected_chunks(F128_MIDCUT_PROBE)]
+    )
+    assert expected_sig.shape == (2,)
+    np.testing.assert_array_equal(got_sig, expected_sig)
+    np.testing.assert_array_equal(got_sign_exp, expected_sign_exp)
+
+
+def test_f128_midcut_finite_nonzero_lsb_lsb_chunk_is_correctly_normalized() -> None:
+    """Targeted regression: the LSB chunk alone must be byte-equivalent
+    to the oracle even when the LSB low mantissa bytes are non-zero.
+
+    Pre-fix path: 3c emitted only the LSB row for mid-cut finite
+    sources, breaking 3d's per-source layout contract. Either the
+    layout assertion in :func:`normalize_f128` would have fired (3d
+    expects 2 rows per finite source), OR -- under any "lenient"
+    layout that swallowed the missing row by aliasing it back to the
+    LSB chunk -- 3d would have read ``biased_exp = (low_u64 >> 48) &
+    0x7FFF = 0x7777`` and a spurious sign bit derived from the LSB's
+    top byte, then silently propagated the wrong ``actual_exp``
+    through ``_emit_chunk``. The non-zero LSB low mantissa fixture
+    ensures byte-equivalence here catches BOTH failure modes.
+    """
+    bits = F128_MIDCUT_PROBE
+    # Sanity-check the test fixture: low 64 bits MUST be non-zero AND
+    # MUST produce a different ``biased_exp`` than the true MSB's
+    # biased_exp when interpreted as the high limb.
+    low_u64 = bits & ((1 << 64) - 1)
+    fake_biased_exp_from_lsb = (low_u64 >> 48) & 0x7FFF
+    true_biased_exp = (bits >> 112) & 0x7FFF
+    assert low_u64 != 0
+    assert fake_biased_exp_from_lsb != true_biased_exp
+
+    stage2_batch, inline_bytes, ct_slice = _build_f128_midcut_stream(bits)
+    idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
+        stage2_batch, inline_bytes, [ct_slice]
+    )
+    out = normalize_per_token_type(
+        idx_2d_per_type=idx_2d_per_type,
+        inline_bytes=inline_bytes,
+        f128_is_nan_or_inf=f128_is_nan_or_inf,
+        vc2_chunk_exponent_sidecar=vc2_sidecar,
+        is_negative_per_source_per_type={
+            TokenType.FLOAT128: np.zeros(1, dtype=bool),
+        },
+    )
+    got_sig, got_sign_exp = out[TokenType.FLOAT128]
+
+    # Only assert the LSB chunk (the one whose normalization the bug
+    # would have corrupted); MSB chunk equivalence is covered by the
+    # other test.
+    expected_lsb_sig, expected_lsb_sign_exp = _f128_batch_expected_chunks(bits)[0]
+    assert got_sig[0] == expected_lsb_sig
+    assert got_sign_exp[0] == expected_lsb_sign_exp
+
+
+def test_f128_midcut_finite_stage4_drops_msb_chunk_from_sidecar() -> None:
+    """End-to-end: stage 4's number sidecar emits only the LSB chunk
+    for a mid-cut finite F128.
+
+    The stream-visible F128 count in
+    ``expanded_token_ids[:partial_cut_length]`` is 1 (just the
+    carrier); 3c emits 2 chunks per finite source (LSB then MSB) in
+    stream emission order, so taking the first 1 chunk in
+    :func:`assemble_number_sidecars` naturally drops the trailing
+    invisible MSB -- the per-row sidecar output then matches the
+    oracle's LSB chunk byte-for-byte.
+    """
+    from tokenizer.aligned_data.loader.batch_decode._bulk_bytes import (
+        build_bulk_bytes,
+    )
+    from tokenizer.aligned_data.loader.batch_decode._sidecar_concat import (
+        assemble_number_sidecars,
+    )
+    from tokenizer.aligned_data.loader.batch_decode._types import Stage2Batch
+
+    stage2_batch, _, _ = _build_f128_midcut_stream(F128_MIDCUT_PROBE)
+
+    # Update the row-offsets to match the single mid-cut F128 (1
+    # visible chunk in the row).
+    stage2_batch_with_offsets = Stage2Batch(
+        stage1=stage2_batch.stage1,
+        sections=stage2_batch.sections,
+        identity_row_offsets=np.array([0, 0], dtype=np.uint32),
+        number_row_offsets=np.array([0, 1], dtype=np.uint32),
+    )
+
+    stage3 = build_bulk_bytes(stage2_batch_with_offsets)
+    sig, sex = assemble_number_sidecars(stage3)
+
+    # Single visible chunk = the oracle's LSB chunk.
+    expected_lsb_sig, expected_lsb_sign_exp = _f128_batch_expected_chunks(
+        F128_MIDCUT_PROBE
+    )[0]
+    assert sig.shape == (1,)
+    assert sex.shape == (1,)
+    assert sig[0] == expected_lsb_sig
+    assert sex[0] == expected_lsb_sign_exp

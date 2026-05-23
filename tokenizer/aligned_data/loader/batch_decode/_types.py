@@ -443,15 +443,15 @@ class Stage3Batch:
     ALG-2's high-u16 exponent check. Length = number of F128 sources
     in the batch (NOT chunks); 3d's normalization branches into
     ``_encode_infnan`` for True entries and the finite-source path
-    for False entries. Produced by 3c (``_number_decode``)."""
+    for False entries. Produced by 3c (``_number_decode``).
 
-    f128_visible_chunks: np.ndarray
-    """``u8[n_f128_sources]`` -- per-F128-SOURCE visible-chunk count
-    in ``{1, 2}``. NaN/Inf = 1, finite full = 2, finite mid-cut = 1
-    (the painted MSB slot was past ``partial_cut_length``). 3d's
-    F128 normalizer reads this to derive ``chunks_per_source`` so the
-    row-count assertion stays consistent in the mid-cut case.
-    Produced by 3c (``_number_decode``)."""
+    3c always emits the FULL ALG-2 chunk set (2 per finite source,
+    1 per NaN/Inf) so 3d can read ``actual_exp`` from the MSB limb;
+    the stream-walk in stage 4's sidecar concat naturally drops the
+    trailing invisible MSB chunk for mid-cut finite sources (3c
+    emits LSB-then-MSB in stream-emission order, and the mid-cut
+    source is by construction the last F128 in the last surviving
+    CT)."""
 
 
 # ---------------------------------------------------------------------------

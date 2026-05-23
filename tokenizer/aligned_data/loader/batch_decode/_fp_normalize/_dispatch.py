@@ -28,7 +28,6 @@ def normalize_per_token_type(
     idx_2d_per_type: dict[TokenType, np.ndarray],
     inline_bytes: np.ndarray,
     f128_is_nan_or_inf: np.ndarray,
-    f128_visible_chunks: np.ndarray,
     vc2_chunk_exponent_sidecar: np.ndarray,
     is_negative_per_source_per_type: dict[TokenType, np.ndarray],
 ) -> dict[TokenType, tuple[np.ndarray, np.ndarray]]:
@@ -43,22 +42,22 @@ def normalize_per_token_type(
       ``payload_size_T`` per type: F16=2, BF16=2, F32=4, F64=8, F80=10,
       F128=8, VC2=8.
         - F16, BF16, F32, F64, F80: one row per source.
-        - F128: one row per CHUNK. Finite full sources emit 2 rows
-          (LSB + MSB limb), NaN/Inf sources emit 1 row (MSB limb),
-          and mid-cut finite sources emit 1 row (LSB limb only --
-          the painted MSB slot was past ``partial_cut_length``).
-          ``f128_is_nan_or_inf`` routes per-source dispatch (finite
-          vs NaN/Inf path); ``f128_visible_chunks`` carries the
-          per-source row count.
+        - F128: one row per CHUNK. Finite sources emit 2 rows
+          (LSB + MSB limb) -- INDEPENDENT of the per-row cutoff so
+          3d can read ``actual_exp`` from the MSB limb. NaN/Inf
+          sources emit 1 row (MSB limb). ``f128_is_nan_or_inf``
+          routes per-source dispatch (finite vs NaN/Inf path); the
+          chunk count per source is ``where(is_nan_or_inf, 1, 2)``.
+          Stage 4's sidecar concat drops the trailing invisible
+          MSB chunk for a mid-cut finite source via the stream-walk's
+          surviving-prefix count, not via chunk-emission suppression
+          here.
         - VC2: one row per CHUNK (multi-chunk sources contribute K rows).
     * ``inline_bytes``: u8 array. The 2D indexers gather bytes from here.
     * ``f128_is_nan_or_inf``: ``bool[n_f128_sources]``; one entry per
       F128 SOURCE (not per chunk). Routes the per-chunk dispatch
-      (NaN/Inf vs finite path) but does NOT determine chunk count.
-    * ``f128_visible_chunks``: ``u8[n_f128_sources]`` with values
-      ``{1, 2}``. Per-source row count emitted into the F128 idx_2d.
-      Drives ``chunks_per_source`` so the row-count assertion stays
-      consistent in the mid-cut finite case.
+      (NaN/Inf vs finite path) AND drives ``chunks_per_source`` via
+      ``where(is_nan_or_inf, 1, 2)``.
     * ``vc2_chunk_exponent_sidecar``: ``u32[n_vc2_chunks]``; per-chunk
       ``chunk_index_within_source``.
     * ``is_negative_per_source_per_type[T]``: ``bool[n_T_sources]``; per
@@ -112,7 +111,7 @@ def normalize_per_token_type(
             out[token_type] = normalize_f80(gathered)
         elif token_type is TokenType.FLOAT128:
             out[token_type] = normalize_f128(
-                gathered, f128_is_nan_or_inf, f128_visible_chunks
+                gathered, f128_is_nan_or_inf
             )
         elif token_type is TokenType.VALUED_CONST_V2:
             chunk_u64 = gathered.view(">u8").reshape(-1).astype(np.uint64)

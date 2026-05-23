@@ -180,7 +180,6 @@ def _make_stage3_chain(stage2_batch: Stage2Batch) -> Stage3Batch:
         number_idx_2d_per_TokenType={},
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
         f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
-        f128_visible_chunks=np.zeros(0, dtype=np.uint8),
     )
 
 
