@@ -31,55 +31,12 @@ via ``sampled_variant_indices[section_idx][slot_v]``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
+from ._resolve_pointers import ResolvedSection
 from ._types import VariantPadding
-
-if TYPE_CHECKING:
-    from ..metadata_loader import SectionKind
-    from ..matched_sections_bin import Section
-
-
-# ---------------------------------------------------------------------------
-# Forward-reference for sibling 1a's ``ResolvedSection`` dataclass.
-#
-# The CANONICAL declaration of ``ResolvedSection`` lives in
-# ``_resolve_pointers.py`` (sibling 1a's module). Until that module lands, we
-# define the same shape here so this module can be implemented + tested
-# standalone. Post-1a-merge, the canonical declaration becomes the import:
-#
-#     from ._resolve_pointers import ResolvedSection
-#
-# and this local definition becomes dead. The dataclass fields here MUST match
-# the contract from the dataloader plan exactly:
-#
-#   arm: SectionKind
-#   idx: int
-#   section: Section
-#   sampled_variant_indices: list[int]
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ResolvedSection:
-    """One section pointer, resolved through the session + with sampled
-    variant slot indices already chosen.
-
-    Forward-reference for sibling 1a's module
-    (``_resolve_pointers.ResolvedSection``); see this module's docstring for
-    the migration plan. ``sampled_variant_indices`` is a list of original
-    variant indices into ``section.variants``; the layout mapping stores SLOT
-    indices into this list (i.e. positions ``0 .. len(sampled) - 1``), not the
-    underlying original variant indices.
-    """
-
-    arm: "SectionKind"
-    idx: int
-    section: "Section"
-    sampled_variant_indices: List[int]
 
 
 # ---------------------------------------------------------------------------
