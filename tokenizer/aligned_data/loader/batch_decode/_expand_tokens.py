@@ -210,31 +210,50 @@ def _promote_vc2(
     # ceil(L / 8) == (L + 7) // 8; max(1, ...) guards the empty-run case.
     chunk_counts = np.maximum(np.int64(1), (payload_lengths + 7) // 8)
 
-    # Paint per-source. The number of VC2 sources per function is
-    # typically small (single-digit to low-hundreds even on pathological
-    # inputs) so the per-source Python loop here is not a hot-path
-    # concern -- the vectorized strip+shift below dominates the cost.
-    # Each iteration is a fixed-stride numpy slice fill.
-    for source_idx in range(vc2_positions.size):
-        p = int(vc2_positions[source_idx])
-        chunk_count = int(chunk_counts[source_idx])
-        if chunk_count <= 1:
-            continue
-        # Slots p+1 .. p+chunk_count-1 are continuations. The codec
-        # precondition is that the same number of inline-digit slots
-        # follow the carrier; this is asserted by the existing
-        # InlineDecodeState build (which would have flagged a malformed
-        # stream upstream). We still bounds-check here to avoid silently
-        # writing past the array end on a corrupt input.
-        end = p + chunk_count
-        if end > n:
-            raise AssertionError(
-                f"VC2 carrier at position {p} declares {chunk_count} "
-                f"chunks but only {n - p} raw-stream slots remain -- "
-                "malformed v2 stream."
-            )
-        working_tokens[p + 1 : end] = _VC2_VOCAB_ID
-        raw_promoted_mask[p + 1 : end] = True
+    # Bounds check across ALL sources at once: each carrier paints slots
+    # ``p+1 .. p+chunk_count-1`` (so the last touched index is
+    # ``p + chunk_count - 1``, which must be < n; equivalently
+    # ``p + chunk_count <= n``). The codec precondition is that the same
+    # number of inline-digit slots follow each carrier; this is asserted
+    # by the existing InlineDecodeState build (which would have flagged a
+    # malformed stream upstream). We still bounds-check here to avoid
+    # silently writing past the array end on a corrupt input.
+    ends = vc2_positions.astype(np.int64) + chunk_counts
+    over = ends > n
+    if bool(over.any()):
+        bad = int(np.nonzero(over)[0][0])
+        p = int(vc2_positions[bad])
+        chunk_count = int(chunk_counts[bad])
+        raise AssertionError(
+            f"VC2 carrier at position {p} declares {chunk_count} "
+            f"chunks but only {n - p} raw-stream slots remain -- "
+            "malformed v2 stream."
+        )
+
+    # Vectorized multi-source paint via np.repeat-driven flat indices.
+    # Per source, we paint ``chunk_count - 1`` continuation slots
+    # starting at ``p + 1``. Build a single flat index array covering
+    # every painted slot across every source, then do one boolean +
+    # token-id assignment.
+    paint_lens = chunk_counts - np.int64(1)  # >= 0 by construction
+    total_paint = int(paint_lens.sum())
+    if total_paint > 0:
+        # ``base_positions[k]`` is the (p + 1) for the source that owns
+        # the k-th painted slot (one entry per painted slot, repeated
+        # ``paint_lens[i]`` times for source i).
+        base_positions = np.repeat(
+            vc2_positions.astype(np.int64) + np.int64(1), paint_lens
+        )
+        # ``within_source_offset[k]`` is the 0-based offset of the
+        # painted slot within its source's continuation range:
+        # 0, 1, ..., paint_lens[i] - 1 for source i.
+        cum = np.cumsum(paint_lens)
+        within_source_offset = np.arange(total_paint, dtype=np.int64) - np.repeat(
+            cum - paint_lens, paint_lens
+        )
+        flat_indices = base_positions + within_source_offset
+        working_tokens[flat_indices] = _VC2_VOCAB_ID
+        raw_promoted_mask[flat_indices] = True
 
     return raw_promoted_mask
 
