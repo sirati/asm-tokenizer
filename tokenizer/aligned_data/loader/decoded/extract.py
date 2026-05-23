@@ -71,6 +71,11 @@ import numpy as np
 
 from tokenizer.tokens import Category, TokenType
 
+from ._inline_decode_state import (
+    InlineDecodeState,
+    _V2_VALUE_NEGATIVE_TOKEN_ID,
+    build_inline_decode_state,
+)
 from .category_tokens import FID_KEYED_CATEGORIES
 from .custom_float import (
     from_bfloat16,
@@ -82,7 +87,6 @@ from .custom_float import (
     from_int,
 )
 from .decoded_function import DecodedFunction
-from .run_lengths import run_lengths
 
 __all__ = ["decode_raw_tokens"]
 
@@ -279,8 +283,7 @@ def _resolve_fid_payload(
 
 
 def _extract_identities(
-    raw_tokens: np.ndarray,
-    runlen: np.ndarray,
+    state: InlineDecodeState,
     id_token_ids: Dict[Category, int],
     *,
     fids_per_category: "Optional[Dict[Category, np.ndarray]]" = None,
@@ -330,7 +333,7 @@ def _extract_identities(
         )
         values_list: List[int] = []
         for _position, payload in _iter_token_occurrences(
-            raw_tokens, runlen, type_token_id
+            state.raw_tokens, state.runlen_number, type_token_id
         ):
             if fid_lookup is not None:
                 values_list.append(
@@ -351,148 +354,81 @@ def _extract_identities(
 
 
 def _collect_number_sources(
-    raw_tokens: np.ndarray,
-    runlen: np.ndarray,
+    state: InlineDecodeState,
     number_token_ids: Dict[TokenType, int],
-    *,
-    value_negative_token_id: Optional[int] = None,
 ) -> List[Tuple[int, int, List[Tuple[np.uint64, np.uint32]]]]:
     """Collect (position, type_token_id, chunks) for every number-source.
 
-    Returns the flat list SORTED by raw-stream position.  Stream-position
-    order is what the final ``real_tokens`` stream sees once the strip
-    pass runs (positions are absolute in ``raw_tokens``; the strip
-    preserves their relative order).  This guarantees the side-array
-    entry order matches the order of number-token real-tokens in
-    ``real_tokens``, which is the invariant Phase 3 splicing relies on.
+    Returns the flat list IN STREAM-POSITION ORDER. ``np.nonzero``
+    returns sorted ascending indices over the carrier-band positions
+    so no explicit sort is needed -- stream-position order is what the
+    final ``real_tokens`` stream sees once the strip pass runs
+    (positions are absolute in ``raw_tokens``; the strip preserves
+    their relative order). This guarantees the side-array entry order
+    matches the order of number-token real-tokens in ``real_tokens``,
+    which is the invariant Phase 3 splicing relies on.
 
-    Postfix-sign handling: when ``value_negative_token_id`` is supplied,
-    each ``VALUED_CONST_V2`` source's next real-token slot
-    (``position + 1 + inline_len``) is peeked; if it holds the
-    ``value_negative`` metatoken id, the source's chunk list is decoded
-    with ``sign=-1`` (i.e. ``from_int(magnitude, sign=-1)``). FP source
-    types ignore the postfix; FP sign rides in the IEEE-754 bit pattern
-    rather than in a stream-level annotation (the encoder enforces
-    this; see :func:`_emit_valued_const`). Passing
-    ``value_negative_token_id=None`` is the legacy path used by
-    consumers that do not need sign reconstruction (e.g. early tests
-    written before the postfix shape existed).
+    The per-source filtering, sign lookup, and inline-length read are
+    fully vectorized via :class:`InlineDecodeState`; only the
+    per-source ``_decode_number_payload`` dispatch (variable-length
+    ``int.from_bytes`` -> chunks) runs in a Python loop. The sign
+    array's ``is_negative_per_position`` is precomputed by the state
+    builder via a runlength diff so FP types whose ``is_negative_per_position``
+    is False simply get ``sign=+1`` -- the contract pinned by
+    :func:`_assert_value_negative_postfix_invariant`'s replacement (an
+    FP carrier with the sign flag set is a stream-shape bug, already
+    caught at the entry of :func:`_decode_to_staging`).
     """
+    raw_tokens = state.raw_tokens
     n = int(raw_tokens.shape[0])
-    sources: List[Tuple[int, int, List[Tuple[np.uint64, np.uint32]]]] = []
-    for token_type, type_token_id in number_token_ids.items():
-        is_valued_const_v2 = token_type is TokenType.VALUED_CONST_V2
-        for position, payload in _iter_token_occurrences(
-            raw_tokens, runlen, type_token_id
-        ):
-            # Sign is precomputed at the source's stream position so the
-            # per-TokenType decoder stays sign-agnostic for FP types
-            # and the only place the postfix-peek rule lives is here.
-            sign = +1
-            if (
-                is_valued_const_v2
-                and value_negative_token_id is not None
-            ):
-                next_slot = position + 1 + len(payload)
-                if (
-                    next_slot < n
-                    and int(raw_tokens[next_slot])
-                    == value_negative_token_id
-                ):
-                    sign = -1
-            chunks = _decode_number_payload(
-                payload, token_type=token_type, sign=sign
-            )
-            sources.append((position, type_token_id, chunks))
+    if n == 0 or not number_token_ids:
+        return []
 
-    sources.sort(key=lambda triple: triple[0])
-    return sources
-
-
-def _assert_value_negative_postfix_invariant(
-    raw_tokens: np.ndarray,
-    real_mask: np.ndarray,
-    *,
-    value_negative_token_id: int,
-    valued_const_v2_id: Optional[int],
-) -> None:
-    """Soft assertion: every ``value_negative`` occurrence is a postfix.
-
-    A ``value_negative`` metatoken at raw_tokens position ``p`` is only
-    legitimate when the preceding source in the stream is a
-    ``valued_const_v2`` token whose inline-byte run ends at ``p - 1``
-    (i.e. position ``p`` is the slot immediately after a
-    ``valued_const_v2`` source's payload). Any other context -- a
-    ``value_negative`` following an FP token, an identity token, or
-    another ``value_negative``, or worse, leading the stream --
-    indicates an encoder bug that would cause the chunk-sign of an
-    unrelated number-source to be silently misinterpreted; this
-    assertion surfaces the bug at decode time.
-
-    Pure read pass over ``raw_tokens``. The cost is O(N) in the stream
-    length (a single ``np.maximum.accumulate`` to map every position to
-    its most-recent real-token, plus O(K) constant-time lookups for
-    the K ``value_negative`` occurrences). The cumulative-maximum
-    sidesteps the per-position ``runlen`` walk-back that misreads
-    multi-byte inline runs whose ``runlen`` entries are zero at every
-    position except the run-start.
-    """
-    if valued_const_v2_id is None:
-        # No VALUED_CONST_V2 in this vocab -> any value_negative
-        # occurrence is automatically a bug. Surface them all.
-        positions = np.nonzero(raw_tokens == value_negative_token_id)[0]
-        if positions.size > 0:
-            raise AssertionError(
-                f"v2 stream contains {positions.size} value_negative "
-                f"token(s) at positions {positions.tolist()[:5]} but the "
-                "vocab has no VALUED_CONST_V2 type-token to bind them to "
-                "-- the encoder emitted a sign marker without a magnitude."
-            )
-        return
-
-    positions = np.nonzero(raw_tokens == value_negative_token_id)[0]
+    # Number-type ids as a u16 array -- the single source of truth
+    # for "is this carrier a number-source we care about".
+    number_type_id_array = np.array(
+        list(number_token_ids.values()), dtype=np.uint16
+    )
+    source_mask = state.carries_inline_mask & np.isin(
+        raw_tokens, number_type_id_array
+    )
+    positions = np.nonzero(source_mask)[0]
     if positions.size == 0:
-        return
+        return []
 
-    n = int(raw_tokens.shape[0])
-    # For each stream position i, ``last_real_at[i]`` is the index of the
-    # most-recent real-token at position <= i. -1 marks "no real-token
-    # at or before i" (impossible under the leading-real-token codec
-    # precondition, but the sentinel keeps the trip path defensive
-    # against malformed callers).
-    indices = np.arange(n)
-    real_positions = np.where(real_mask, indices, -1)
-    last_real_at = np.maximum.accumulate(real_positions)
+    type_ids = raw_tokens[positions]
+    # Inline length at p+1; positions == N-1 (carrier at the tail) have
+    # no p+1 slot, so their length defaults to 0 (zero-pad). Build the
+    # array bounds-aware: for positions < N-1, read runlen_number[p+1];
+    # for the lone tail-position case, pad to 0.
+    inline_lens = np.zeros(positions.shape[0], dtype=np.uint16)
+    non_tail = positions < (n - 1)
+    inline_lens[non_tail] = state.runlen_number[positions[non_tail] + 1]
+    signs = np.where(state.is_negative_per_position[positions], -1, +1)
 
-    for position in positions:
-        position_int = int(position)
-        if position_int == 0:
-            raise AssertionError(
-                "v2 stream leads with value_negative at position 0; "
-                "this metatoken may only appear as a postfix after a "
-                "valued_const_v2 source -- no source precedes it."
-            )
-        # The owning real-token of position ``p`` (i.e. of any
-        # ``value_negative`` postfix candidate) is the most-recent
-        # real-token at position < p. ``last_real_at[p - 1]`` is that
-        # index; if it is -1 the stream had no preceding real-token
-        # (malformed) and we surface the bug.
-        owner_slot = int(last_real_at[position_int - 1])
-        if owner_slot < 0:
-            raise AssertionError(
-                f"value_negative at position {position_int} has no "
-                "preceding real-token in the stream -- the v2 codec "
-                "requires every metatoken to land after a real source."
-            )
-        owner_value = int(raw_tokens[owner_slot])
-        if owner_value != valued_const_v2_id:
-            raise AssertionError(
-                f"value_negative at position {position_int} is preceded "
-                f"by real-token id {owner_value} at position {owner_slot} "
-                f"(expected valued_const_v2 id {valued_const_v2_id}); "
-                "the v2 emitter only emits value_negative as a postfix "
-                "sign marker for valued_const_v2."
-            )
+    # Reverse map: type_token_id -> TokenType, so the dispatch table
+    # in ``_decode_number_payload`` does not need a per-source lookup
+    # through ``number_token_ids``. Built once per call.
+    id_to_type: Dict[int, TokenType] = {
+        type_id: tt for tt, type_id in number_token_ids.items()
+    }
+
+    sources: List[Tuple[int, int, List[Tuple[np.uint64, np.uint32]]]] = []
+    for position, type_id, inline_len, sign in zip(
+        positions.tolist(),
+        type_ids.tolist(),
+        inline_lens.tolist(),
+        signs.tolist(),
+    ):
+        payload_end = position + 1 + int(inline_len)
+        payload = bytes(raw_tokens[position + 1 : payload_end].tolist())
+        token_type = id_to_type[int(type_id)]
+        chunks = _decode_number_payload(
+            payload, token_type=token_type, sign=int(sign)
+        )
+        sources.append((position, int(type_id), chunks))
+
+    return sources
 
 
 def _promote_inline_slots(
@@ -545,15 +481,16 @@ def _decode_to_staging(
     *,
     id_token_ids: Dict[Category, int],
     number_token_ids: Dict[TokenType, int],
+    value_negative_token_id: int,
+    format_version: int,
     fids_per_category: "Optional[Dict[Category, np.ndarray]]" = None,
-    value_negative_token_id: Optional[int] = None,
     func_name: str = "decoded",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> _StagingDecoded:
     """Decode one v2 raw-token stream into a :class:`_StagingDecoded`.
 
-    Plan reference: ``## Algorithm changes`` -- this is the entry the
-    splice walker calls per-callee (passes a section-derived
+    Plan reference: ``polished-greeting-moler.md`` -- this is the entry
+    the splice walker calls per-callee (passes a section-derived
     ``fids_per_category``); the public :func:`decode_raw_tokens` is
     the u16-only standalone wrapper that delegates here with
     ``fids_per_category=None``.
@@ -562,14 +499,24 @@ def _decode_to_staging(
     never mutated -- a working copy is allocated internally and the
     multi-chunk promotion writes back into that copy only.
 
-    ``value_negative_token_id``: when provided, the stream walker
-    detects the postfix ``value_negative`` metatoken after a
-    ``valued_const_v2`` source and flips the source's chunk sign
-    (``from_int(..., sign=-1)``). The ``value_negative`` token itself
-    stays in the post-strip ``real_tokens`` stream -- consistent with
-    how the FP postfix annotation token survives the strip. ``None``
-    skips the postfix-sign path (legacy callers; tests that don't
-    exercise sign handling).
+    The vectorized :class:`InlineDecodeState` is built once per stream
+    here (after the empty-stream short-circuit + leading-real
+    precondition) and threaded into both the identity arm and the
+    number arm so neither recomputes its own runlength / carrier mask.
+    The postfix-sign invariant check is inlined against that same
+    state (no separate ``np.maximum.accumulate`` pass).
+
+    ``value_negative_token_id``: the uint16 vocab id of the v2 postfix
+    ``value_negative`` metatoken (resolved via
+    :func:`resolve_value_negative_token_id`). REQUIRED -- the unified
+    vocab pins it at id 256 and the strip-and-shift path expects it
+    out of the post-strip ``real_tokens`` (D5/D6 in the plan). The
+    ``value_negative`` token is STRIPPED from ``real_tokens`` because
+    its meaning is already captured in ``numbers_sign_exponent``.
+
+    ``format_version``: REQUIRED -- the vectorized carrier-band lookup
+    is only valid under the unified vocab (``format_version=1``). The
+    state builder asserts on any other value.
     """
     n = int(raw_tokens.shape[0])
 
@@ -592,64 +539,98 @@ def _decode_to_staging(
             metadata=dict(metadata) if metadata else {},
         )
 
-    # ---- Codec precondition (also enforced by run_lengths) ----
-    if int(raw_tokens[0]) < 256:
+    # ---- Codec precondition: stream must lead with a real-token carrier.
+    # Strict ``> _V2_VALUE_NEGATIVE_TOKEN_ID`` (= 256) rejects BOTH an
+    # inline-digit byte AND a leading ``value_negative`` (which has no
+    # preceding source to sign-mark). ----
+    if int(raw_tokens[0]) <= _V2_VALUE_NEGATIVE_TOKEN_ID:
         raise AssertionError(
-            "raw_tokens[0] must be a real-token (id >= 256); inline-data "
-            "runs never lead the v2 wire stream"
+            "raw_tokens[0] must be a carrier real-token (id > 256); "
+            "inline-digit runs at position 0 and the value_negative "
+            "sign marker at position 0 are both invalid v2 wire shapes "
+            "-- a leading value_negative has no preceding source to "
+            "bind to."
         )
 
-    # ---- Working buffer + run-length state (shared by both arms) ----
-    working_tokens = raw_tokens.copy()
-    real_mask = raw_tokens >= 256
-    inline_mask = ~real_mask
-    runlen = run_lengths(inline_mask)
+    # ---- Vectorized per-stream pre-compute: every downstream consumer
+    # (identity arm, number arm, postfix-invariant check, strip/shift)
+    # reads from ``state``; nothing rebuilds a mask another consumer
+    # already produced. ----
+    state = build_inline_decode_state(raw_tokens, format_version=format_version)
 
-    # ---- Postfix-sign invariant check: every ``value_negative`` token
-    # in the stream must sit immediately after a ``valued_const_v2``
-    # source. Skipped when the caller hasn't supplied the metatoken id
-    # (legacy / sign-agnostic decode path). ----
-    if value_negative_token_id is not None:
-        _assert_value_negative_postfix_invariant(
-            raw_tokens,
-            real_mask,
-            value_negative_token_id=value_negative_token_id,
-            valued_const_v2_id=number_token_ids.get(TokenType.VALUED_CONST_V2),
-        )
+    # ---- Postfix-sign invariant: any non-VC2 carrier whose
+    # ``is_negative_per_position`` flag is True is a bug (an FP /
+    # identity carrier has a sign marker glued to its tail). When the
+    # vocab carries no VALUED_CONST_V2 id at all, ANY positive sign
+    # flag is a bug because there is no magnitude to bind the sign to.
+    # The runlength-form state already encodes "which carriers are
+    # postfix-signed", so this reduces to a single boolean op. ----
+    valued_const_v2_id = number_token_ids.get(TokenType.VALUED_CONST_V2)
+    negative_positions = np.nonzero(state.is_negative_per_position)[0]
+    if negative_positions.size > 0:
+        if valued_const_v2_id is None:
+            raise AssertionError(
+                f"v2 stream contains {negative_positions.size} value_negative "
+                f"postfix marker(s) at positions "
+                f"{negative_positions.tolist()[:5]} but the vocab has no "
+                "VALUED_CONST_V2 type-token to bind them to -- the encoder "
+                "emitted a sign marker without a magnitude."
+            )
+        owner_ids = raw_tokens[negative_positions]
+        bad = owner_ids != valued_const_v2_id
+        if bool(bad.any()):
+            bad_idx = int(np.nonzero(bad)[0][0])
+            owner_position = int(negative_positions[bad_idx])
+            owner_value = int(owner_ids[bad_idx])
+            raise AssertionError(
+                f"value_negative postfix marker is bound to real-token id "
+                f"{owner_value} at position {owner_position} (expected "
+                f"valued_const_v2 id {valued_const_v2_id}); the v2 emitter "
+                "only emits value_negative as a postfix sign marker for "
+                "valued_const_v2."
+            )
 
     # ---- Identity arm: pure read pass over the ORIGINAL raw_tokens ----
     identities = _extract_identities(
-        raw_tokens,
-        runlen,
+        state,
         id_token_ids,
         fids_per_category=fids_per_category,
     )
 
-    # ---- Number arm: collect chunks per source in stream order, then
-    # promote inline slots, then flatten to the side-array pair. ----
-    sources = _collect_number_sources(
-        raw_tokens,
-        runlen,
-        number_token_ids,
-        value_negative_token_id=value_negative_token_id,
-    )
+    # ---- Number arm: collect chunks per source in stream order (the
+    # vectorized filtering uses ``state``), then promote inline slots,
+    # then flatten to the side-array pair. ----
+    sources = _collect_number_sources(state, number_token_ids)
+    working_tokens = raw_tokens.copy()
     _promote_inline_slots(working_tokens, sources)
     numbers_significant, numbers_sign_exponent = _flatten_number_chunks(sources)
 
-    # ---- Strip pass: recompute the mask AFTER promotion so promoted
-    # slots survive. ----
-    keep_mask = working_tokens >= 256
-    real_tokens = working_tokens[keep_mask]
+    # ---- Strip + shift: drop value_negative (id 256) AND every inline
+    # byte; shift surviving real-token ids down by 256 so the
+    # model-facing vocab compacts (slot 0 corresponds to the stripped
+    # sign marker and is reserved / unused). The mask is recomputed
+    # AFTER promotion so promoted slots survive the strip. ----
+    keep_mask = working_tokens > _V2_VALUE_NEGATIVE_TOKEN_ID
+    real_tokens = (
+        working_tokens[keep_mask].astype(np.int32) - _V2_VALUE_NEGATIVE_TOKEN_ID
+    ).astype(np.uint16)
 
     # ---- Sanity invariant: the side-array length equals the count of
     # number-tokens in the final real-token stream.  Cheap O(K) check
     # over the number-type set; flags any internal bug in the
     # promotion / chunk-count arithmetic before the consumer trips on
-    # it. ----
+    # it. The number-id array is shifted into the post-strip id space
+    # (D6 in the plan) so the ``np.isin`` comparison matches the new
+    # ``real_tokens`` layout. ----
     number_token_id_array = np.array(
         list(number_token_ids.values()), dtype=np.uint16
     )
-    final_number_count = int(np.isin(real_tokens, number_token_id_array).sum())
+    shifted_number_id_array = (
+        number_token_id_array.astype(np.int32) - _V2_VALUE_NEGATIVE_TOKEN_ID
+    ).astype(np.uint16)
+    final_number_count = int(
+        np.isin(real_tokens, shifted_number_id_array).sum()
+    )
     if final_number_count != numbers_significant.shape[0]:
         raise AssertionError(
             "number side-array length mismatch: real_tokens contains "
@@ -673,7 +654,8 @@ def decode_raw_tokens(
     *,
     id_token_ids: Dict[Category, int],
     number_token_ids: Dict[TokenType, int],
-    value_negative_token_id: Optional[int] = None,
+    value_negative_token_id: int,
+    format_version: int,
     func_name: str = "decoded",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> DecodedFunction:
@@ -701,16 +683,17 @@ def decode_raw_tokens(
         number_token_ids: ``dict[TokenType, int]`` of size 7 from
             ``resolve_number_token_ids``.  One entry per number-
             carrying TokenType (VALUED_CONST_V2 + 6 FLOAT* variants).
-        value_negative_token_id: optional uint16 vocab id of the v2
+        value_negative_token_id: REQUIRED uint16 vocab id of the v2
             postfix ``value_negative`` metatoken (typically resolved
-            via :func:`resolve_value_negative_token_id`). When
-            supplied, the stream walker detects the postfix after a
-            ``valued_const_v2`` source and decodes the source's chunks
-            with ``sign=-1``; the ``value_negative`` token itself
-            stays in the post-strip ``real_tokens`` stream. ``None``
-            (default) skips the sign-handling path -- the legacy
-            shape used by tests that don't exercise sign
-            reconstruction.
+            via :func:`resolve_value_negative_token_id`; pinned at 256
+            under the unified vocab). The stream walker detects the
+            postfix after a ``valued_const_v2`` source and decodes the
+            source's chunks with ``sign=-1``; the ``value_negative``
+            token itself is STRIPPED from ``real_tokens`` (its meaning
+            is captured in ``numbers_sign_exponent``).
+        format_version: REQUIRED unified-vocab format version (must be
+            ``1``). The vectorized carrier-band lookup that drives
+            sign + number-arm decode is only valid under that layout.
         func_name: human-readable root function name.  Defaults to
             ``"decoded"``; callers that have a real name should pass it.
         metadata: optional free-form dict attached to the result.
@@ -728,6 +711,7 @@ def decode_raw_tokens(
         number_token_ids=number_token_ids,
         fids_per_category=None,
         value_negative_token_id=value_negative_token_id,
+        format_version=format_version,
         func_name=func_name,
         metadata=metadata,
     )
