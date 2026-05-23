@@ -8,7 +8,7 @@ RNG-driven variant-index sampler. The actual decode + splice walk
 lives in :mod:`tokenizer.aligned_data.loader.batch_decode`; this
 module owns only the I/O shape that surrounds it.
 
-Exposed as a mixin :class:`_BinarySessionSpliceMixin` so the helpers
+Exposed as a mixin :class:`_BinarySessionHelpersMixin` so the helpers
 stay on :class:`BinarySession` itself -- callers do not need to know
 about the split. Mixin inheritance is purely additive: every attribute
 it reads (``_meta_get``, ``_load_matched_section_and_variants``,
@@ -27,7 +27,7 @@ from ..matched_sections_bin import Section
 from .function_data import FunctionData
 
 
-class _BinarySessionSpliceMixin:
+class _BinarySessionHelpersMixin:
     """Mixin providing the per-arm load + inverse-lookup helpers.
 
     Every method reads attributes / methods that :class:`BinarySession`

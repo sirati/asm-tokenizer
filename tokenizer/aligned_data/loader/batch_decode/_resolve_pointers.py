@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, List
 import numpy as np
 
 from ..metadata_loader import SectionKind
-from .._session_splice import _select_variant_indices
+from .._session_helpers import _select_variant_indices
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     from ..function_data import FunctionData
@@ -125,9 +125,8 @@ def resolve_section_pointers(
       entry.
 
     Variant index sampling uses
-    :func:`_session_splice._select_variant_indices` (the same helper
-    the decoded splicer uses), guaranteeing the legacy + new pipelines
-    select identically given the same rng state.
+    :func:`_session_helpers._select_variant_indices` -- one source of
+    truth for the rng-driven without-replacement sampling rule.
 
     Args:
         session: The :class:`BinarySession` holding the open binary.

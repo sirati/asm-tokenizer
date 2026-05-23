@@ -113,7 +113,7 @@ def test_group_unmatched_cross_category_is_local_plt_extern_grouped():
     """Mixed-category single-version callee list (LOCAL + PLT + EXTERN
     in a non-grouped order). The grouper enforces LOCAL → PLT → EXTERN
     grouping (``Section.call_targets[]`` invariant asserted at
-    ``loader/_session_splice.py``); intra-category encounter order is
+    ``loader/_session_helpers.py``); intra-category encounter order is
     preserved via a stable sort."""
     LOCAL = CallTargetType.LOCAL
     PLT = CallTargetType.PLT
@@ -323,7 +323,7 @@ def test_bin_call_targets_local_plt_extern_grouped(tmp_path: Path) -> None:
     PLT → EXTERN), and intra-category encounter order is preserved.
 
     The invariant is asserted at
-    ``tokenizer/aligned_data/loader/_session_splice.py:66-72``; this
+    ``tokenizer/aligned_data/loader/_session_helpers.py``; this
     test pins it on the actual BIN bytes a freshly-built section
     carries.
 

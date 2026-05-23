@@ -10,7 +10,7 @@ list feeds :func:`_pass2._build_call_targets_spec`, which emits one
 table.
 
 The loader-side docstring at
-:mod:`tokenizer.aligned_data.loader._session_splice` asserts that
+:mod:`tokenizer.aligned_data.loader._session_helpers` asserts that
 ``Section.call_targets[]`` is encounter-ordered within each
 :class:`CallTargetType` and concatenated LOCAL → PLT → EXT. The
 per-row :attr:`ParsedRecord.called_funcs` already satisfies the

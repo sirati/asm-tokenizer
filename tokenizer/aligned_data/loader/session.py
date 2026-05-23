@@ -48,7 +48,7 @@ from ._session_parsers import (
     build_unmatched_function_data,
     parse_matched_section,
 )
-from ._session_splice import _BinarySessionSpliceMixin
+from ._session_helpers import _BinarySessionHelpersMixin
 from ._worker_guard import assert_main_process
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
@@ -65,7 +65,7 @@ def _close_memmap(mmap_obj) -> None:
             pass
 
 
-class BinarySession(_BinarySessionSpliceMixin):
+class BinarySession(_BinarySessionHelpersMixin):
     """Context manager bundling the three per-binary handles.
 
     ``metadata`` is a pre-loaded bag (built by ``metadata_loader``).

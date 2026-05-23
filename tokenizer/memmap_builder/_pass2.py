@@ -168,7 +168,7 @@ def _build_call_targets_spec(
     Output ordering: the emitted ``specs`` are stable-sorted by
     :attr:`CallTargetSpec.type` so the BIN's ``Section.call_targets[]``
     is concatenated LOCAL → PLT → EXTERN (the invariant asserted at
-    :mod:`tokenizer.aligned_data.loader._session_splice`). The upstream
+    :mod:`tokenizer.aligned_data.loader._session_helpers`). The upstream
     parsed-record contract already groups by *declared* type
     (see :func:`_typed_called_union.category_grouped_first_seen_union`);
     this seam additionally re-shuffles any LOCAL/PLT row demoted to

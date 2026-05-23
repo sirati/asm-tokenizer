@@ -147,7 +147,7 @@ def test_unique_called_cross_category_is_local_plt_extern_grouped(tmp_path):
     contributes ``[(c, EXTERN), (b, PLT), (e, PLT)]``. The section-level
     union enforces LOCAL → PLT → EXTERN grouping
     (``Section.call_targets[]`` invariant asserted at
-    ``loader/_session_splice.py``); intra-category order preserves
+    ``loader/_session_helpers.py``); intra-category order preserves
     first-seen encounter order across variants (stable sort).
 
     Expected:
