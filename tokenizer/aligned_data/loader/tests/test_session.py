@@ -63,6 +63,47 @@ def test_session_load_unmatched(synthetic_binary):
     assert variants[0].get("arch") == "x64"
 
 
+def test_loader_populates_category_counts_on_both_arms(synthetic_binary):
+    """``FunctionData.metadata["category_counts"]`` is loader-populated.
+
+    Stage 4a's ALG-4 dedup walk reads per-function COUNTER-Category
+    unique-id counts via the metadata key on every matched and
+    unmatched function. The loader is the single source of truth -- a
+    missing key would surface as a ``KeyError`` deep inside the dedup
+    walk under production loads. Asserting the key is populated at
+    load time keeps that contract close to the wiring site.
+    """
+    from tokenizer.aligned_data.loader.category_counts import (
+        COUNTER_CATEGORIES,
+    )
+
+    fb = synthetic_binary
+    # BinarySession opens one data arm per session, so the two arms get
+    # one session each. Metadata dicts survive close (plain Python objects)
+    # so the asserts can read them outside the ``with``.
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        matched = sess.load_matched(0)
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        unmatched = sess.load_unmatched(0)
+
+    # Matched arm: each variant carries the dense {Category: int} dict.
+    for variant in matched.variants:
+        counts = variant.metadata.get("category_counts")
+        assert counts is not None, "matched variant missing category_counts"
+        assert set(counts.keys()) == set(COUNTER_CATEGORIES)
+        assert all(isinstance(v, int) and v >= 0 for v in counts.values())
+
+    # Unmatched arm: same metadata contract.
+    counts = unmatched.metadata.get("category_counts")
+    assert counts is not None, "unmatched function missing category_counts"
+    assert set(counts.keys()) == set(COUNTER_CATEGORIES)
+    assert all(isinstance(v, int) and v >= 0 for v in counts.values())
+
+
 def test_session_fd_no_leak(synthetic_binary):
     """Open + close N sessions; fd count must be stable."""
     fb = synthetic_binary
