@@ -38,12 +38,13 @@ diagnosability):
    could equally well run first.
 
 The two prepend writes that the stage-4 plan calls out (``tokens[row,
-column]`` + ``identities_flat[identity_slice.start]``) are NOT performed
-via :func:`._prepend.write_prepend_slot` -- they are produced as a
-SIDE-EFFECT of (1) and (2) respectively. The prepend module remains as a
-single-concern helper for callers who do not want to take the dedup walk
-(e.g. unit tests pinning the ALG-9 vocab-id contract); the orchestrator
-does not need it.
+column]`` + ``identities_flat[identity_slice.start]``) are produced as a
+SIDE-EFFECT of (1) and (2) respectively. The token id lands via
+``expanded_token_ids[0]`` during :func:`assemble_tokens`; the identity
+counter is written by :func:`apply_per_row_remap` using the dedup map
+that already holds the call_target's self-counter. There is no separate
+prepend-write helper -- both writes live with the concern that owns the
+target array.
 
 See ``batch_decode_plan.md`` ``## Stages -- algorithm sketch`` Stage 4.
 """
