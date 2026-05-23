@@ -1,11 +1,10 @@
 """Vocab introspection: TokenType -> uint16 vocab-id resolution.
 
 Single source of truth for the "which vocab id corresponds to which v2
-TokenType?" question. The decoded / splice pipeline consults these
-resolvers once per session (the wiring layer caches the dicts on the
-``BinarySession``) and from then on works purely in terms of integer
-ids — no further string lookups, no hardcoded ids leaking into the
-extract / splice passes.
+TokenType?" question. Callers consult these resolvers once per
+session and from then on work purely in terms of integer ids — no
+further string lookups, no hardcoded ids leaking into downstream
+consumers.
 
 The resolver consults ``vocab_manager.id_to_token_type`` — the int8
 ndarray indexed by vocab id, holding ``TokenType`` values. A requested
@@ -39,8 +38,8 @@ from tokenizer.tokens import Category, TokenType
 # ---------------------------------------------------------------------------
 # Static maps — the single place that knows "which TokenType backs each
 # v2 Category" and "which TokenTypes carry numbers". Every other consumer
-# in the decoded / splice pipeline goes through the resolvers below, so
-# there is exactly one TokenType-literal site per logical mapping.
+# goes through the resolvers below, so there is exactly one
+# TokenType-literal site per logical mapping.
 # ---------------------------------------------------------------------------
 
 # Category -> TokenType. Seven map straight through to the same-named

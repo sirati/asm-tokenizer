@@ -159,7 +159,7 @@ class BinarySession(_BinarySessionHelpersMixin):
     # --- internal load + section helpers ---------------------------
     #
     # The matched + unmatched ``load_*`` paths share a need with the
-    # decoded splicer: BOTH want the parsed :class:`Section` (for
+    # batch-decode pipeline: BOTH want the parsed :class:`Section` (for
     # call_target walking) and the BIN section offset (for cycle keys)
     # alongside the per-function data. Factoring those reads into
     # dedicated private helpers keeps ``load_matched`` /
@@ -176,7 +176,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         ``Section`` is the parsed BIN catalog entry (call_targets +
         variant blocks); ``section_offset`` is the BIN byte offset
         from ``bin_starts[idx]``. Shared by :py:meth:`load_matched`
-        and the decoded splicer.
+        and the batch-decode pipeline.
         """
         arm = self._meta_get("matched_arm")
         bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
@@ -208,7 +208,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         Returns ``(section, section_offset, FunctionData)`` where
         ``section_offset`` is the BIN byte offset of the owning section
         (NOT the per-record ``_unmatched_data.bin`` offset). Shared by
-        :py:meth:`load_unmatched` and the decoded splicer.
+        :py:meth:`load_unmatched` and the batch-decode pipeline.
         """
         arm = self._meta_get("unmatched_arm")
         starts = arm_arrays(arm, "unmatched", self._binary_name)
@@ -370,7 +370,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         triggers.
 
         Returns ``(section, section_offset)`` -- the parsed section and
-        its BIN byte offset, so callers (notably the decoded splicer)
+        its BIN byte offset, so callers (notably the batch-decode pipeline)
         can use the offset as a cycle key without re-deriving it.
 
         Sanity-checks the section's variant at the matching slot:

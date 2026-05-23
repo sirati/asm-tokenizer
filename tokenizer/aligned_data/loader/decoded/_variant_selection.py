@@ -1,7 +1,7 @@
-"""Variant-selection helpers for the splice walker.
+"""Variant-selection helpers for the batch-decode callee walk.
 
 Single concern: translate between the three flavors of variant index
-the walker juggles --
+the walk juggles --
 
 * vkey == ``variant_ref_offset`` (the FID-keyed cross-section variant
   identity).
@@ -9,8 +9,8 @@ the walker juggles --
 * ``section_variant_index`` carried in a ``per_call_entry`` (the
   callee section's v_idx for that call site).
 
-Used by ``tokenizer.aligned_data.loader.decoded.splice``. Not part of
-the public splice API.
+Used by ``tokenizer.aligned_data.loader.batch_decode``'s stage-1 callee
+walk. Internal helper -- not part of the public batch-decode API.
 """
 
 from __future__ import annotations

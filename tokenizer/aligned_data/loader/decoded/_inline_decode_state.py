@@ -61,16 +61,18 @@ class InlineDecodeState:
     the sign-handling code, and the postfix-invariant check.
 
     Single pre-compute per stream at the entry of
-    :func:`_decode_to_staging`; every consumer reads from these fields
-    rather than rebuilding masks.  All arrays are length ``N`` where
+    :func:`build_inline_decode_state`; every consumer (the batch
+    decode pipeline's expand + bulk-bytes + identity-decode stages)
+    reads from these fields rather than rebuilding masks.  All arrays are length ``N`` where
     ``N = raw_tokens.shape[0]`` and are aligned position-by-position
     with the input stream.
 
     Field semantics:
 
     * ``raw_tokens``: the original uint16 stream (NOT a copy -- consumers
-      MUST NOT mutate it; the working buffer in :func:`_decode_to_staging`
-      is the only place mutation is allowed).
+      MUST NOT mutate it; the working buffer in the batch decode
+      pipeline's :mod:`batch_decode._expand_tokens` is the only place
+      mutation is allowed).
     * ``real_mask``: ``raw_tokens > 256`` (strict).  At id 256 the slot
       is the postfix sign marker, which is neither inline nor a real
       token in the carrier sense -- the strict inequality treats it as

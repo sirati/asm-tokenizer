@@ -89,16 +89,14 @@ class _FakeVocab:
     def __init__(self, items: List[str]) -> None:
         self._s2i = {s: i + 272 for i, s in enumerate(items)}
         self._i2s = {v: k for k, v in self._s2i.items()}
-        # The splice-session resolver reads `value_negative_token_id`
-        # directly. ``None`` mirrors the pre-Phase-4 default that real
-        # fakes inherited via the old scan-based resolver — splice
-        # tests that need value_negative-aware decoding can override
-        # this on the instance.
+        # Real vocabs publish ``value_negative_token_id`` directly. ``None``
+        # mirrors the pre-Phase-4 default that real fakes inherited via the
+        # old scan-based resolver — tests that need value_negative-aware
+        # decoding can override this on the instance.
         self.value_negative_token_id: int | None = None
-        # Splice decode threads ``format_version`` from the vocab
-        # manager into ``_decode_to_staging``; the unified-vocab gate
-        # is the only one the v2 decode contract supports. Tests that
-        # need a different value can override on the instance.
+        # The unified-vocab gate (format_version=1) is the only one the
+        # v2 decode contract supports. Tests that need a different value
+        # can override on the instance.
         self.format_version: int = 1
 
     def get_token_id(self, token: str) -> int:
