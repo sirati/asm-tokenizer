@@ -33,6 +33,16 @@ from .function_data import FunctionData
 from .matched_function import MatchedFunction
 from .utils import load_single_matched_function
 
+# Intentionally NOT re-exporting the batch_decode subpackage's entries
+# from this namespace -- `from .batch_decode import batch_decode` would
+# shadow the ``batch_decode`` submodule attribute with the function of
+# the same name, breaking ``import loader.batch_decode.<submodule>``
+# for consumers. Consumers import the public batch entry via the
+# subpackage path:
+#   from tokenizer.aligned_data.loader.batch_decode import (
+#       BatchDecodeResult, SectionPointerSpec, VariantPadding, batch_decode,
+#   )
+
 __all__ = [
     "AlignedDataLoader",
     "BinaryDataset",
