@@ -224,6 +224,12 @@ def test_validate_memmap_output_rejects_v2_unified_vocab(tmp_path: Path) -> None
     # the bin / slim CSV / sections / data files exist; the validator's
     # vocab-load is what we want to fail.
     vm_v2 = VocabularyManager(platform=None, format_version=2)
+    # Mirror the canonical NUMBER+IDENTITY block prefix every real
+    # unified vocab carries — the head-of-vocab invariant in
+    # ``VocabularyManager.from_vocab`` rejects unified VMs without it,
+    # and what's under test here is the format_version=2 gate, not the
+    # head-of-vocab assert.
+    vm_v2._register_v2_canonical_blocks()
     with open(output_dir / "unified_vocab.csv", "w", newline="", encoding="ascii") as fh:
         writer = csv.writer(fh, lineterminator='\n')
         save_vocabulary(vm_v2, writer)

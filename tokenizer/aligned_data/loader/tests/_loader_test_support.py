@@ -47,21 +47,34 @@ def _write_unified_csv(vm: VocabularyManager, csv_path: Path) -> None:
 
 
 def stage_v2_unified_vocab(tmp_path: Path) -> Path:
-    """Write a v2-shaped ``unified_vocab.csv`` into ``tmp_path``."""
+    """Write a v2-shaped ``unified_vocab.csv`` into ``tmp_path``.
+
+    Real unified vocabs produced by the post-canonical-layout unifier
+    carry the canonical NUMBER+IDENTITY blocks at slots 257..271; we
+    mirror that prefix here so the head-of-vocab invariant
+    ``VocabularyManager.from_vocab`` asserts on every unified VM holds.
+    The ``format_version`` mismatch is what's under test — not a
+    secondary fixture artefact like ``slot 257 != valued_const_v2``.
+    """
     vm = VocabularyManager(platform=None, format_version=2)
-    vm.Block_V2(0)
-    vm.Block_V2(1)
+    vm._register_v2_canonical_blocks()
     csv_path = tmp_path / "unified_vocab.csv"
     _write_unified_csv(vm, csv_path)
     return csv_path
 
 
 def stage_v1_unified_vocab(tmp_path: Path) -> Path:
-    """Write a v1-shaped ``unified_vocab.csv`` into ``tmp_path``."""
+    """Write a v1-shaped ``unified_vocab.csv`` into ``tmp_path``.
+
+    Pre-registers the canonical NUMBER+IDENTITY blocks at slots
+    257..271 so the head-of-vocab invariant asserted by ``from_vocab``
+    holds — matches the wire shape every post-canonical-layout
+    ``unify_vocab`` run produces.
+    """
     vm = VocabularyManager(platform=None, format_version=1)
+    vm._register_v2_canonical_blocks()
     vm.Variant_Axis("arch:x64")
     vm.Variant_Axis("opt:O2")
-    vm.Block_V2(0)
     csv_path = tmp_path / "unified_vocab.csv"
     _write_unified_csv(vm, csv_path)
     return csv_path
