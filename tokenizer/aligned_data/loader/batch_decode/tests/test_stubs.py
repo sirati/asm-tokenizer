@@ -56,13 +56,6 @@ def test_walk_sections_raises_not_implemented() -> None:
         )
 
 
-def test_predict_lengths_raises_not_implemented() -> None:
-    from tokenizer.aligned_data.loader.batch_decode._length_predict import predict_lengths
-
-    with pytest.raises(NotImplementedError):
-        predict_lengths(stage1=None, context_len=0)  # type: ignore[arg-type]
-
-
 def test_build_bulk_bytes_raises_not_implemented() -> None:
     from tokenizer.aligned_data.loader.batch_decode._bulk_bytes import build_bulk_bytes
 
