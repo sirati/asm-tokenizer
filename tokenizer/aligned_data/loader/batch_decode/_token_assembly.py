@@ -17,10 +17,11 @@ flat output + counter remap + variant padding") interleaves four
 side-effects per row: token write, identity-sidecar concat, number-chunk
 concat, and FID sidecar build. Each of those is an independent concern
 crossing a clean module boundary. This module owns concern #1 only;
-sibling modules (``_dedup_walk``, ``_prepend``, ``_sidecar_concat``,
-``_variant_padding``) own the rest. The four are composed by
-``_assemble.py`` -- nothing here knows about the identity arm, number
-arm, or sidecar offsets.
+sibling modules (``_dedup_walk``, ``_prepend``, ``_sidecar_concat``)
+own the rest. Variant-padding sentinel checks are inlined at each
+consumer site rather than living in a dedicated helper module. The
+four are composed by ``_assemble.py`` -- nothing here knows about the
+identity arm, number arm, or sidecar offsets.
 
 Prepend self-token ordering
 ---------------------------
