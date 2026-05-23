@@ -37,6 +37,7 @@ from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
     InlineDecodeState,
 )
 from tokenizer.aligned_data.loader.function_data import FunctionData
+from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import Section
 from tokenizer.tokens import Category, TokenType
 
@@ -100,10 +101,9 @@ def _make_stage1_chain() -> Stage1Batch:
         call_targets=[ct],
     )
     section = Stage1Section(
-        arm="matched",
+        arm=SectionKind.MATCHED,
         idx=0,
         section=_make_section(),
-        section_offset=0,
         variants=[variant],
     )
     return Stage1Batch(
@@ -191,7 +191,7 @@ def _make_stage3_chain(stage2_batch: Stage2Batch) -> Stage3Batch:
     [
         (_make_stage1_call_target, "function_name_ptr", 999),
         # SectionPointerSpec
-        (lambda: SectionPointerSpec(arm="matched", idx=0), "idx", 5),
+        (lambda: SectionPointerSpec(arm=SectionKind.MATCHED, idx=0), "idx", 5),
     ],
 )
 def test_frozen_enforcement_simple(factory, field, value):
@@ -317,9 +317,9 @@ def test_variant_padding_members():
 
 def test_section_pointer_spec_shape():
     """Plan section 'Module layout' + the consumer signatures on
-    ``BinarySession``: ``(arm: str, idx: int)``."""
-    spec = SectionPointerSpec(arm="matched", idx=7)
-    assert spec.arm == "matched"
+    ``BinarySession``: ``(arm: SectionKind, idx: int)``."""
+    spec = SectionPointerSpec(arm=SectionKind.MATCHED, idx=7)
+    assert spec.arm is SectionKind.MATCHED
     assert spec.idx == 7
 
 

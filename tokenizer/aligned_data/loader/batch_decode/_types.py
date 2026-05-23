@@ -60,6 +60,7 @@ from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
     InlineDecodeState,
 )
 from tokenizer.aligned_data.loader.function_data import FunctionData
+from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.tokens import Category, TokenType
 
 
@@ -119,17 +120,17 @@ class VariantPadding(Enum):
 class SectionPointerSpec:
     """One section pointer in a :func:`batch_decode` request.
 
-    Identifies a single section in the binary. ``arm`` is ``"matched"``
-    or ``"unmatched"``; ``idx`` is the per-arm function/section index.
-    The pair matches the inputs of
-    :meth:`BinarySession._load_matched_for_splice` (which takes
-    ``idx`` + a variant index) and
+    Identifies a single section in the binary. ``arm`` is
+    :attr:`SectionKind.MATCHED` or :attr:`SectionKind.UNMATCHED`;
+    ``idx`` is the per-arm function/section index. The pair matches
+    the inputs of :meth:`BinarySession._load_matched_for_splice`
+    (which takes ``idx`` + a variant index) and
     :meth:`BinarySession._load_unmatched_for_splice` (which takes
     ``idx``) -- i.e. the same ``(arm, idx)`` keying every per-arm
     loader already uses.
     """
 
-    arm: str  # "matched" or "unmatched"
+    arm: SectionKind
     idx: int  # per-arm function/section idx
 
 
@@ -201,9 +202,9 @@ class Stage1Variant:
 class Stage1Section:
     """Level 2. Per-section-pointer context."""
 
-    arm: str
-    """``"matched"`` or ``"unmatched"`` -- mirrors
-    :class:`SectionPointerSpec.arm`."""
+    arm: SectionKind
+    """:attr:`SectionKind.MATCHED` or :attr:`SectionKind.UNMATCHED` --
+    mirrors :class:`SectionPointerSpec.arm`."""
 
     idx: int
     """Per-arm function/section idx -- mirrors
@@ -211,10 +212,8 @@ class Stage1Section:
 
     section: Section
     """The BIN's parsed :class:`Section` (call_targets table + variant
-    blocks)."""
-
-    section_offset: int
-    """Section's byte offset in ``matched_sections.bin``."""
+    blocks). Read ``section.section_offset`` for the BIN-side byte
+    offset."""
 
     variants: list[Stage1Variant]
     """One :class:`Stage1Variant` per sampled variant for this

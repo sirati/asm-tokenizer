@@ -14,8 +14,8 @@ This module is the Phase-1 entry point of the batch-decode pipeline. Its job:
 4. DFS into ``call_targets_section`` up to ``max_depth``; load each reachable
    inlined callee, recording its ``encounter_category`` (LOCAL_FUNC for root +
    LOCAL-inlined; PLT_FUNC for PLT-inlined; EXT_FUNC is never inlined). DAG
-   semantics — visited set keyed on ``(arm, section_offset)``, popped on
-   backtrack.
+   semantics — visited set keyed on ``(arm, section.section_offset)`` (the
+   BIN-side authoritative offset), popped on backtrack.
 5. Apply ``inlined_equivalent_call_targets_only`` filter when ``True``: skip
    callees where ALL or NONE of the parent's variants called this target (only
    inline when SOME but not ALL did).
