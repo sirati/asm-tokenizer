@@ -81,6 +81,10 @@ What stage 1 reads from existing code (re-using; don't reimplement):
 
 The stage-1 walk MUST pass `format_version=1` when building each `InlineDecodeState`.
 
+### Amendment (Phase 0 audit)
+
+Stage1Section + SectionPointerSpec carry `arm: SectionKind` (not `str`); Stage1Section reads `section_offset` from `section.section_offset` rather than carrying a mirror field.
+
 ## Locked-in decisions
 
 **D1.** Replace `splice_with_callees` entirely. The new batch entry is the only production path. Synthetic per-function tests rewrite against the batch entry with a 1-section, 1-variant input.
@@ -166,10 +170,9 @@ class Stage1Variant:
 @dataclass(frozen=True)
 class Stage1Section:
     """Level 2. Per-section-pointer context."""
-    arm: str                                # "matched" or "unmatched"
+    arm: SectionKind                        # SectionKind.MATCHED or SectionKind.UNMATCHED
     idx: int                                # per-arm function/section idx
-    section: Section                        # the BIN's parsed Section
-    section_offset: int                     # section's byte offset in matched_sections.bin
+    section: Section                        # the BIN's parsed Section; `section.section_offset` is the authoritative BIN-side offset
     variants: list[Stage1Variant]           # one per sampled variant
 
 @dataclass(frozen=True)
@@ -711,7 +714,7 @@ Input: a list of `(arm, idx)` section pointers + `num_variants_per_section`, `ma
 4. **Per recursive call target (level 4)**:
    - Recurse DFS up to `max_depth`:
      - For each `call_target` in the parent's `call_targets_section` (encounter order): if `function_section_ptr` resolves AND not in active visited set, load FunctionData + build InlineDecodeState + append as a new `Stage1CallTarget` to this variant's level-4 list.
-     - Visited set on `(arm, section_offset)`; remove on backtrack (DAG semantics).
+     - Visited set on `(arm, section.section_offset)`; remove on backtrack (DAG semantics).
      - Apply `inlined_equivalent_call_targets_only` filter when true: skip callees where ALL or NONE of the parent's variants called this target (only inline when SOME but not ALL did).
    - Each level-4 entry records `parent_call_target_index` (the parent's call_targets_section row index that pointed here; `None` for the root) and `encounter_category` (`LOCAL_FUNC` for root + LOCAL-inlined; `PLT_FUNC` for PLT-inlined; EXT_FUNC NOT inlined per D3).
 
