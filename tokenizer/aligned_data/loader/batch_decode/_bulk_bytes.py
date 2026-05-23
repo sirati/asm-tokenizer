@@ -231,6 +231,7 @@ def build_bulk_bytes(
         identity_idx_2d=identity_idx_2d,
         number_idx_2d_per_TokenType=idx_2d_per_type,
         vc2_chunk_exponent_sidecar=vc2_chunk_exponent_sidecar,
+        f128_is_nan_or_inf=f128_is_nan_or_inf,
     )
 
 
