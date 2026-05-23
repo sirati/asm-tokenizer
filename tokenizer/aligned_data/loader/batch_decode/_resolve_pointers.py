@@ -4,15 +4,18 @@ Single concern of this module: walk a request's
 ``list[SectionPointerSpec]``, dispatch each pointer through
 :class:`BinarySession`'s per-arm load helpers, and pick the variant
 indices that the downstream stage-1 wiring will load FunctionData /
-InlineDecodeState for.
+InlineDecodeState for. Per the call-chain design the resolver also
+harvests the per-sampled-variant :class:`FunctionData` from the same
+load it issues for the :class:`Section`, so the wiring (1d) does NOT
+re-parse the same section/record a second time.
 
 What this module owns (the boundary):
 
 * Input: a session + the request's section-pointer list + RNG knobs.
 * Output: a parallel ``list[ResolvedSection]`` -- one entry per
   pointer, in the same order. Each entry carries the parsed
-  :class:`Section` plus the RNG-sampled variant indices in
-  encounter order.
+  :class:`Section`, the RNG-sampled variant indices in encounter order,
+  and the parallel per-sampled-variant :class:`FunctionData` list.
 
 What this module does NOT own:
 
@@ -41,6 +44,7 @@ from ..metadata_loader import SectionKind
 from .._session_splice import _select_variant_indices
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+    from ..function_data import FunctionData
     from ..session import BinarySession
 
 from ...matched_sections_bin import Section
@@ -55,7 +59,8 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ResolvedSection:
-    """1a output: section identity + parsed Section + RNG-sampled variant indices.
+    """1a output: section identity + parsed Section + RNG-sampled variant indices
+    + per-sampled-variant FunctionData.
 
     The downstream wiring (1d / Phase 4) constructs
     :class:`Stage1Section` from this plus 1b's per-variant callee walk
@@ -78,12 +83,19 @@ class ResolvedSection:
             request covers every variant). For unmatched sections the
             list has at most 1 entry by the matched_sections_bin
             invariant.
+        function_data_per_sampled_variant: Parallel to
+            ``sampled_variant_indices`` -- entry ``v`` is the
+            :class:`FunctionData` for the variant body identified by
+            ``sampled_variant_indices[v]``. Harvested from the same
+            per-arm load that produced :attr:`section`, so the wiring
+            does NOT re-parse the section to pick up the variant body.
     """
 
     arm: SectionKind
     idx: int
     section: Section
     sampled_variant_indices: List[int]
+    function_data_per_sampled_variant: List["FunctionData"]
 
 
 def resolve_section_pointers(
@@ -100,18 +112,17 @@ def resolve_section_pointers(
     * :attr:`SectionKind.MATCHED` -- delegate to
       :py:meth:`BinarySession._load_matched_section_and_variants(idx)`
       which returns ``(Section, section_offset, MatchedFunction)``.
-      The ``section_offset`` is read off ``section.section_offset``
-      downstream; we discard the redundant tuple element.
+      The full :class:`MatchedFunction.variants` list (one
+      :class:`FunctionData` per variant) is held alongside the parsed
+      :class:`Section` so the sampled-variant-body lookup downstream is
+      a plain list index -- no second per-arm load.
     * :attr:`SectionKind.UNMATCHED` -- delegate to
       :py:meth:`BinarySession._load_unmatched_record_and_section(idx)`
       which returns ``(Section, section_offset, FunctionData)``. The
-      :class:`FunctionData` is the single root-body load already done
-      by the session; the 1d wiring step will reuse it via the same
-      load helper. (Re-loading from the session is idempotent on the
-      session's caches; we choose NOT to plumb the ``FunctionData``
-      through here because that would couple the variant-sampling
-      concern to the per-variant function-data load, which is 1d's
-      job.)
+      matched_sections_bin invariant guarantees exactly one variant per
+      unmatched section, so the returned :class:`FunctionData` IS the
+      variant body and the per-sampled-variant list has at most one
+      entry.
 
     Variant index sampling uses
     :func:`_session_splice._select_variant_indices` (the same helper
@@ -136,7 +147,9 @@ def resolve_section_pointers(
         ``list[ResolvedSection]`` parallel to ``section_pointers``.
         For each entry the ``sampled_variant_indices`` list holds
         Python ``int`` (not ``numpy.int64``) so downstream consumers
-        can use the values as plain list indices.
+        can use the values as plain list indices, and the
+        ``function_data_per_sampled_variant`` list is the parallel
+        per-variant body list.
 
     Raises:
         ValueError: If a pointer's ``arm`` is not a known
@@ -147,7 +160,9 @@ def resolve_section_pointers(
 
     resolved: List[ResolvedSection] = []
     for pointer in section_pointers:
-        section = _load_section_for_arm(session, pointer)
+        section, variant_bodies = _load_section_and_variant_bodies(
+            session, pointer
+        )
         sampled = _select_variant_indices(
             n_variants=len(section.variants),
             max_variants=num_variants_per_section,
@@ -158,42 +173,53 @@ def resolve_section_pointers(
         # 1d wiring can use the indices as plain list indices without
         # numpy-typing surprises (e.g. ``MatchedFunction.variants`` is
         # a plain Python list).
+        sampled_ints = [int(v) for v in sampled]
         resolved.append(
             ResolvedSection(
                 arm=pointer.arm,
                 idx=pointer.idx,
                 section=section,
-                sampled_variant_indices=[int(v) for v in sampled],
+                sampled_variant_indices=sampled_ints,
+                function_data_per_sampled_variant=[
+                    variant_bodies[v] for v in sampled_ints
+                ],
             )
         )
     return resolved
 
 
-def _load_section_for_arm(
+def _load_section_and_variant_bodies(
     session: "BinarySession", pointer: SectionPointerSpec
-) -> Section:
-    """Dispatch a single pointer through the right per-arm loader.
+) -> "tuple[Section, list[FunctionData]]":
+    """Dispatch a single pointer through the right per-arm loader and
+    return the parsed :class:`Section` plus the per-variant
+    :class:`FunctionData` list, indexed by the section's native variant
+    index.
 
     Kept module-private + arm-dispatch-only so
     :func:`resolve_section_pointers` is a clean walk over the input
     list. The two loader return tuples differ on their third element
-    (``MatchedFunction`` vs ``FunctionData``); both are discarded here
-    because variant sampling needs only the parsed :class:`Section`
-    (its ``variants`` list length is the sampling input). The 1d
-    wiring step re-issues the same load to harvest the variant
-    function-data; the session caches make this cheap.
+    (``MatchedFunction`` vs ``FunctionData``); this helper hides that
+    asymmetry behind a uniform ``(section, variant_bodies)`` shape so
+    the resolver's sampling step can index ``variant_bodies[v]``
+    regardless of arm.
+
+    Unmatched sections have exactly one variant by the
+    matched_sections_bin invariant; the loader's single
+    :class:`FunctionData` becomes a 1-element list whose only valid
+    index is 0.
 
     Raises:
         ValueError: On an unknown :class:`SectionKind` member.
     """
     if pointer.arm is SectionKind.MATCHED:
-        section, _section_offset, _matched = (
+        section, _section_offset, matched = (
             session._load_matched_section_and_variants(pointer.idx)
         )
-        return section
+        return section, list(matched.variants)
     if pointer.arm is SectionKind.UNMATCHED:
-        section, _section_offset, _fd = (
+        section, _section_offset, fd = (
             session._load_unmatched_record_and_section(pointer.idx)
         )
-        return section
+        return section, [fd]
     raise ValueError(f"unknown SectionKind: {pointer.arm!r}")

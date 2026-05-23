@@ -33,6 +33,7 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     VariantPadding,
 )
 from tokenizer.aligned_data.loader.function_data import FunctionData
+from tokenizer.aligned_data.loader.matched_function import MatchedFunction
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import (
     CallTarget,
@@ -113,17 +114,16 @@ class _FakeSession:
 
     * 1a path: ``_load_matched_section_and_variants(idx)``,
       ``_load_unmatched_record_and_section(idx)`` -- the variant-sampling
-      step parses the section but discards the loader's FunctionData /
-      MatchedFunction.
+      + body-harvesting step returns the parsed section along with the
+      per-arm body container (``MatchedFunction`` for matched, single
+      ``FunctionData`` for unmatched), so the wiring does NOT re-issue
+      the per-arm load to pick up the root variant body.
     * 1b path: ``_idx_for_section_offset(byte_offset, arm_str)``,
       ``_load_matched_for_splice(idx, variant_index)``,
       ``_load_unmatched_for_splice(idx)`` -- the DFS callee walk
       resolves each call_target row and loads the callee body via these
-      helpers.
-    * 1d path: same as 1b -- 1d re-loads the root variant body through
-      ``_load_matched_for_splice`` / ``_load_unmatched_for_splice`` per
-      sampled variant slot (mirrors today's
-      :meth:`splice_with_callees` semantics).
+      helpers. The root body is no longer re-loaded here; 1d reads it
+      from :attr:`ResolvedSection.function_data_per_sampled_variant`.
 
     The fake uses each section's own ``section_offset`` as its idx so
     ``_idx_for_section_offset`` is a trivial round-trip; the per-section
@@ -159,18 +159,26 @@ class _FakeSession:
 
     def _load_matched_section_and_variants(
         self, idx: int
-    ) -> Tuple[Section, int, object]:
+    ) -> Tuple[Section, int, MatchedFunction]:
         section = self.matched_sections[idx]
-        # 1a discards the third tuple element; ``None`` is fine.
-        return section, section.section_offset, None
+        # Build the variant list in the section's native variant-index
+        # order, matching the real loader's contract
+        # (``MatchedFunction.variants[v]`` is the v-th variant body).
+        variants = [
+            self.matched_function_data[(idx, v)]
+            for v in range(len(section.variants))
+        ]
+        matched = MatchedFunction(func_name=f"m{idx}", variants=variants)
+        return section, section.section_offset, matched
 
     def _load_unmatched_record_and_section(
         self, idx: int
-    ) -> Tuple[Section, int, object]:
+    ) -> Tuple[Section, int, FunctionData]:
         section = self.unmatched_sections[idx]
-        return section, section.section_offset, None
+        fd = self.unmatched_function_data[idx]
+        return section, section.section_offset, fd
 
-    # ---- 1b + 1d path -------------------------------------------------
+    # ---- 1b path ------------------------------------------------------
 
     def _idx_for_section_offset(
         self, section_offset: int, arm: str

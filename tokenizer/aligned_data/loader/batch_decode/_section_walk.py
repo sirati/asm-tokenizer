@@ -26,17 +26,13 @@ downstream stages must walk
 other rows for the same variant slot. Documented inline at the
 :func:`_first_batch_row_for_slot` helper below.
 
-Re-loading the variant body's :class:`FunctionData`: the 1a step
-(:func:`resolve_section_pointers`) deliberately DISCARDS the loader's
-:class:`FunctionData` because the variant-sampling concern doesn't
-need it. This wiring re-issues the per-arm load via
-:meth:`BinarySession._load_matched_for_splice` (matched) or
-:meth:`BinarySession._load_unmatched_for_splice` (unmatched). The
-session caches the underlying memmap segments so the second load is
-idempotent and cheap. We chose this path over a 1a API extension to
-keep the variant-sampling concern free of per-variant function-data
-load coupling -- the 1a module's job is "what variants?" and this
-module's job is "load the bodies + walk the trees".
+Variant bodies are NOT re-parsed here: the 1a step
+(:func:`resolve_section_pointers`) harvests the per-sampled-variant
+:class:`FunctionData` from the same per-arm load it already issues for
+the parsed :class:`Section`, and threads them through on
+:attr:`ResolvedSection.function_data_per_sampled_variant`. This wiring
+indexes into that parallel list to pick up the root body for each
+sampled slot -- no second per-arm load.
 
 See ``batch_decode_plan.md`` section ``## Stages -- algorithm sketch``
 -> ``Stage 1: section walk + raw-data load`` for the full algorithm.
@@ -44,11 +40,10 @@ See ``batch_decode_plan.md`` section ``## Stages -- algorithm sketch``
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 
-from ..metadata_loader import SectionKind
 from ._batch_layout import UINT32_MAX, compute_batch_idx_mapping
 from ._callee_walk import walk_callees
 from ._resolve_pointers import ResolvedSection, resolve_section_pointers
@@ -62,7 +57,6 @@ from ._types import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
-    from ..function_data import FunctionData
     from ..session import BinarySession
 
 
@@ -86,13 +80,14 @@ def walk_sections(
     1. Resolve each :class:`SectionPointerSpec` via
        :func:`resolve_section_pointers`, producing one
        :class:`ResolvedSection` per pointer (with RNG-sampled variant
-       indices).
+       indices and the parallel per-variant :class:`FunctionData`).
     2. Compute ``batch_idx_to_section_variant`` via
        :func:`compute_batch_idx_mapping` per the :class:`VariantPadding`
        policy (plan ALG-10).
-    3. Per resolved section + per sampled variant slot, re-load the
-       variant body's :class:`FunctionData` through the per-arm loader,
-       then call :func:`walk_callees` to DFS the splice tree.
+    3. Per resolved section + per sampled variant slot, read the
+       pre-loaded variant body from
+       :attr:`ResolvedSection.function_data_per_sampled_variant`, then
+       call :func:`walk_callees` to DFS the splice tree.
     4. Wire ``batch_idx`` onto each :class:`Stage1Variant` (FIRST batch
        row matching its ``(section_idx, slot_v)``; ``None`` when no row
        maps to that slot).
@@ -155,8 +150,9 @@ def _build_stage1_section(
 ) -> Stage1Section:
     """Build one :class:`Stage1Section` from a resolved pointer.
 
-    Per slot ``v`` in ``resolved.sampled_variant_indices``: re-load the
-    body's :class:`FunctionData` through the per-arm loader, walk the
+    Per slot ``v`` in ``resolved.sampled_variant_indices``: read the
+    body's :class:`FunctionData` from
+    :attr:`ResolvedSection.function_data_per_sampled_variant`, walk the
     splice tree via :func:`walk_callees`, and assemble the
     :class:`Stage1Variant`.
     """
@@ -198,15 +194,10 @@ def _build_stage1_variant(
     max_depth: int,
     inlined_equivalent_call_targets_only: bool,
 ) -> Stage1Variant:
-    """Build one :class:`Stage1Variant`: re-load body + DFS callees +
-    pick :attr:`Stage1Variant.batch_idx`.
+    """Build one :class:`Stage1Variant`: read pre-loaded body + DFS
+    callees + pick :attr:`Stage1Variant.batch_idx`.
     """
-    root_function_data, _root_section, _root_section_offset = _load_variant_body(
-        session=session,
-        arm=resolved.arm,
-        idx=resolved.idx,
-        variant_idx_in_section=variant_idx_in_section,
-    )
+    root_function_data = resolved.function_data_per_sampled_variant[slot_v]
 
     call_targets: List[Stage1CallTarget] = walk_callees(
         session=session,
@@ -235,33 +226,6 @@ def _build_stage1_variant(
         batch_idx=batch_idx,
         call_targets=call_targets,
     )
-
-
-def _load_variant_body(
-    *,
-    session: "BinarySession",
-    arm: SectionKind,
-    idx: int,
-    variant_idx_in_section: int,
-) -> Tuple["FunctionData", object, int]:
-    """Per-arm re-load of one variant body.
-
-    Matched: :meth:`BinarySession._load_matched_for_splice(idx,
-    variant_index)`. Unmatched:
-    :meth:`BinarySession._load_unmatched_for_splice(idx)` (one variant
-    per unmatched section by the matched_sections_bin invariant; the
-    walker's ``variant_idx_in_section`` is necessarily 0 there).
-
-    Returns the loader's full ``(FunctionData, Section, section_offset)``
-    triple; the caller uses only the :class:`FunctionData` -- the
-    :class:`Section` was already parsed by 1a and lives on
-    :attr:`ResolvedSection.section`.
-    """
-    if arm is SectionKind.MATCHED:
-        return session._load_matched_for_splice(idx, variant_idx_in_section)
-    if arm is SectionKind.UNMATCHED:
-        return session._load_unmatched_for_splice(idx)
-    raise ValueError(f"unknown SectionKind: {arm!r}")
 
 
 def _first_batch_row_for_slot(

@@ -43,11 +43,18 @@ def _make_section_stub(section_offset: int = 0) -> Section:
 def _make_resolved(
     idx: int, sampled: list[int], *, arm: SectionKind = SectionKind.MATCHED
 ) -> ResolvedSection:
+    # The layout function only reads ``sampled_variant_indices`` --
+    # ``function_data_per_sampled_variant`` is opaque to it but must be
+    # populated parallel-shape for the dataclass contract; ``None``
+    # placeholders are fine because this test does not exercise the body
+    # consumer.
+    sampled_list = list(sampled)
     return ResolvedSection(
         arm=arm,
         idx=idx,
         section=_make_section_stub(section_offset=idx),
-        sampled_variant_indices=list(sampled),
+        sampled_variant_indices=sampled_list,
+        function_data_per_sampled_variant=[None] * len(sampled_list),  # type: ignore[list-item]
     )
 
 

@@ -1,20 +1,23 @@
 """Tests for the section-pointer resolution + RNG variant sampling step.
 
 Single concern: assert that :func:`resolve_section_pointers` faithfully
-dispatches per :class:`SectionKind`, preserves input order, and threads
-the rng through :func:`_select_variant_indices` correctly.
+dispatches per :class:`SectionKind`, preserves input order, threads
+the rng through :func:`_select_variant_indices` correctly, and harvests
+the per-sampled-variant :class:`FunctionData` from the same per-arm
+load.
 
 We use a hand-built fake session (not :class:`BinarySession` itself --
 the full session needs a corpus, vocab, and memmaps that are
 out-of-scope for this 1a unit test). The fake provides only the two
 private load helpers the 1a module touches, returning synthetic
-:class:`Section` instances with parameterised variant counts.
+:class:`Section` instances plus a :class:`MatchedFunction` /
+:class:`FunctionData` shaped to match the real loaders' contract.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pytest
@@ -26,6 +29,8 @@ from tokenizer.aligned_data.loader.batch_decode._resolve_pointers import (
 from tokenizer.aligned_data.loader.batch_decode._types import (
     SectionPointerSpec,
 )
+from tokenizer.aligned_data.loader.function_data import FunctionData
+from tokenizer.aligned_data.loader.matched_function import MatchedFunction
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import (
     Section,
@@ -46,6 +51,20 @@ def _make_variant(ref_offset: int) -> VariantBlock:
     )
 
 
+def _make_function_data(name: str) -> FunctionData:
+    """Minimal valid :class:`FunctionData`; the resolver does not
+    introspect the body, it only needs an opaque handle to thread onto
+    :attr:`ResolvedSection.function_data_per_sampled_variant`."""
+    return FunctionData(
+        func_name=name,
+        metadata={"arch": "x86_64", "compiler": "gcc", "opt": "O2"},
+        tokens=np.array([300], dtype=np.uint16),
+        insn_runlength=np.array([1], dtype=np.uint32),
+        block_runlength=np.array([1], dtype=np.uint32),
+        variant_tokens=np.zeros(0, dtype=np.uint16),
+    )
+
+
 def _make_section(n_variants: int, section_offset: int = 0) -> Section:
     return Section(
         function_name_ptr=0,
@@ -62,23 +81,50 @@ class _FakeSession:
     Implements only the two load helpers
     :func:`resolve_section_pointers` calls. Each map keys per-arm
     ``idx`` to the pre-built :class:`Section`. The third tuple element
-    is ``None`` for both arms -- the 1a module discards it.
+    is the per-arm body container the resolver harvests
+    (``MatchedFunction`` for matched, single ``FunctionData`` for
+    unmatched).
     """
 
-    matched_sections: dict
-    unmatched_sections: dict
+    matched_sections: Dict[int, Section] = field(default_factory=dict)
+    matched_functions: Dict[int, MatchedFunction] = field(default_factory=dict)
+    unmatched_sections: Dict[int, Section] = field(default_factory=dict)
+    unmatched_function_data: Dict[int, FunctionData] = field(
+        default_factory=dict
+    )
+
+    # ---- registration -------------------------------------------------
+
+    def add_matched(
+        self,
+        idx: int,
+        section: Section,
+        variant_function_data: List[FunctionData],
+    ) -> None:
+        self.matched_sections[idx] = section
+        self.matched_functions[idx] = MatchedFunction(
+            func_name=f"matched_{idx}", variants=variant_function_data
+        )
+
+    def add_unmatched(
+        self, idx: int, section: Section, fd: FunctionData
+    ) -> None:
+        self.unmatched_sections[idx] = section
+        self.unmatched_function_data[idx] = fd
+
+    # ---- load helpers -------------------------------------------------
 
     def _load_matched_section_and_variants(
         self, idx: int
-    ) -> Tuple[Section, int, object]:
+    ) -> Tuple[Section, int, MatchedFunction]:
         section = self.matched_sections[idx]
-        return section, section.section_offset, None
+        return section, section.section_offset, self.matched_functions[idx]
 
     def _load_unmatched_record_and_section(
         self, idx: int
-    ) -> Tuple[Section, int, object]:
+    ) -> Tuple[Section, int, FunctionData]:
         section = self.unmatched_sections[idx]
-        return section, section.section_offset, None
+        return section, section.section_offset, self.unmatched_function_data[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -86,15 +132,35 @@ class _FakeSession:
 # ---------------------------------------------------------------------------
 
 
+def _register_matched(
+    session: _FakeSession, idx: int, section: Section
+) -> List[FunctionData]:
+    """Register a matched section + one synthetic FunctionData per
+    variant; return the per-variant FunctionData list so individual
+    assertions can match on identity."""
+    fds = [_make_function_data(f"m{idx}_v{v}") for v in range(len(section.variants))]
+    session.add_matched(idx, section, fds)
+    return fds
+
+
+def _register_unmatched(
+    session: _FakeSession, idx: int, section: Section
+) -> FunctionData:
+    """Register an unmatched section + its single root FunctionData;
+    return the FunctionData so assertions can match on identity."""
+    fd = _make_function_data(f"u{idx}")
+    session.add_unmatched(idx, section, fd)
+    return fd
+
+
 def test_resolution_smoke_matched_and_unmatched():
     """One matched + one unmatched pointer round-trip into two
     :class:`ResolvedSection`s with the right arms + indices."""
     matched_section = _make_section(n_variants=3, section_offset=64)
     unmatched_section = _make_section(n_variants=1, section_offset=128)
-    session = _FakeSession(
-        matched_sections={5: matched_section},
-        unmatched_sections={2: unmatched_section},
-    )
+    session = _FakeSession()
+    _register_matched(session, 5, matched_section)
+    _register_unmatched(session, 2, unmatched_section)
     pointers = [
         SectionPointerSpec(arm=SectionKind.MATCHED, idx=5),
         SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=2),
@@ -126,7 +192,8 @@ def test_rng_reproducibility_same_seed_same_samples():
     reproducibility contract; this guards against 1a accidentally
     consuming rng state in a way that breaks downstream stability.)"""
     section = _make_section(n_variants=10)
-    session = _FakeSession(matched_sections={0: section}, unmatched_sections={})
+    session = _FakeSession()
+    _register_matched(session, 0, section)
     pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
 
     result_a = resolve_section_pointers(
@@ -152,7 +219,8 @@ def test_full_coverage_returns_every_index_in_order():
     """When ``num_variants_per_section >= n_variants`` every variant
     index is returned in encounter order -- no oversample, no drop."""
     section = _make_section(n_variants=4)
-    session = _FakeSession(matched_sections={0: section}, unmatched_sections={})
+    session = _FakeSession()
+    _register_matched(session, 0, section)
     pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
 
     # Exact match.
@@ -179,7 +247,8 @@ def test_undersample_returns_distinct_indices_of_requested_count():
     DISTINCT indices are returned (``_select_variant_indices`` samples
     without replacement)."""
     section = _make_section(n_variants=8)
-    session = _FakeSession(matched_sections={0: section}, unmatched_sections={})
+    session = _FakeSession()
+    _register_matched(session, 0, section)
     pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
 
     result = resolve_section_pointers(
@@ -202,10 +271,8 @@ def test_unmatched_arm_has_at_most_one_variant():
     matched_sections_bin invariant; sampling -- regardless of the
     ``num_variants_per_section`` request -- returns a 1-element list."""
     unmatched_section = _make_section(n_variants=1, section_offset=32)
-    session = _FakeSession(
-        matched_sections={},
-        unmatched_sections={0: unmatched_section},
-    )
+    session = _FakeSession()
+    _register_unmatched(session, 0, unmatched_section)
     pointers = [SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=0)]
 
     # Request several variants -- bound clamps to the section's 1.
@@ -234,10 +301,11 @@ def test_order_preservation_across_mixed_arms():
     sec_m1 = _make_section(n_variants=5, section_offset=16)
     sec_u0 = _make_section(n_variants=1, section_offset=24)
     sec_u1 = _make_section(n_variants=1, section_offset=40)
-    session = _FakeSession(
-        matched_sections={3: sec_m0, 7: sec_m1},
-        unmatched_sections={1: sec_u0, 9: sec_u1},
-    )
+    session = _FakeSession()
+    _register_matched(session, 3, sec_m0)
+    _register_matched(session, 7, sec_m1)
+    _register_unmatched(session, 1, sec_u0)
+    _register_unmatched(session, 9, sec_u1)
     pointers = [
         SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=9),
         SectionPointerSpec(arm=SectionKind.MATCHED, idx=7),
@@ -270,7 +338,8 @@ def test_sampled_indices_are_python_ints():
     module must hand them out as Python ints -- not ``numpy.int64`` --
     so callers do not silently fall through to numpy-typed semantics."""
     section = _make_section(n_variants=6)
-    session = _FakeSession(matched_sections={0: section}, unmatched_sections={})
+    session = _FakeSession()
+    _register_matched(session, 0, section)
     pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
 
     result = resolve_section_pointers(
@@ -283,6 +352,51 @@ def test_sampled_indices_are_python_ints():
         assert type(v) is int
 
 
+def test_function_data_parallel_to_sampled_variants_matched():
+    """``function_data_per_sampled_variant`` is parallel to
+    ``sampled_variant_indices``: entry ``v`` is the FunctionData for
+    ``MatchedFunction.variants[sampled_variant_indices[v]]`` -- no
+    re-load of the underlying section is required downstream."""
+    section = _make_section(n_variants=5, section_offset=64)
+    session = _FakeSession()
+    fds = _register_matched(session, 0, section)
+    pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
+
+    result = resolve_section_pointers(
+        session,  # type: ignore[arg-type]
+        pointers,
+        num_variants_per_section=3,
+        rng=np.random.default_rng(7),
+    )
+    rs = result[0]
+    assert len(rs.function_data_per_sampled_variant) == len(
+        rs.sampled_variant_indices
+    )
+    for slot, original_idx in enumerate(rs.sampled_variant_indices):
+        assert rs.function_data_per_sampled_variant[slot] is fds[original_idx]
+
+
+def test_function_data_parallel_to_sampled_variants_unmatched():
+    """For unmatched the 1-element FunctionData list is the loader's
+    single returned :class:`FunctionData` (matched_sections_bin
+    invariant: 1 variant per unmatched section)."""
+    unmatched_section = _make_section(n_variants=1, section_offset=32)
+    session = _FakeSession()
+    expected_fd = _register_unmatched(session, 0, unmatched_section)
+    pointers = [SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=0)]
+
+    result = resolve_section_pointers(
+        session,  # type: ignore[arg-type]
+        pointers,
+        num_variants_per_section=1,
+        rng=np.random.default_rng(0),
+    )
+    rs = result[0]
+    assert rs.sampled_variant_indices == [0]
+    assert rs.function_data_per_sampled_variant == [expected_fd]
+    assert rs.function_data_per_sampled_variant[0] is expected_fd
+
+
 def test_resolved_section_is_frozen():
     """The handoff dataclass must be immutable -- consistent with the
     rest of the batch_decode dataclass backbone."""
@@ -292,6 +406,7 @@ def test_resolved_section_is_frozen():
         idx=0,
         section=section,
         sampled_variant_indices=[0],
+        function_data_per_sampled_variant=[_make_function_data("only")],
     )
     with pytest.raises(Exception):
         # ``FrozenInstanceError`` is a subclass of ``AttributeError``;
