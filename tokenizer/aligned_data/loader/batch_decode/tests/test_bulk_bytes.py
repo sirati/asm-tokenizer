@@ -500,20 +500,6 @@ def test_fully_dropped_trailing_call_target_zero_length_slices() -> None:
         assert sl.stop - sl.start == 0
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Stage-3 internal contract mismatch between _number_decode "
-        "(3c) and _fp_normalize._f128 (3d): 3c emits idx_2d as "
-        "u32[n_chunks, 8] (per-chunk LSB/MSB limb rows) while "
-        "normalize_f128 expects u8[n_sources, 16] (per-source full "
-        "16-byte payload rows). 3c's per-chunk layout produces an 8-"
-        "column gather that the dispatch passes verbatim to "
-        "normalize_f128, where the view-cast + reshape(-1, 2) "
-        "either fails outright (NaN/Inf sources) or silently swaps "
-        "the limb interpretation (finite sources)."
-    ),
-    strict=True,
-)
 def test_f128_nan_emits_single_chunk_finite_emits_two() -> None:
     """F128 NaN/Inf -> 1 chunk per source; F128 finite -> 2 chunks per
     source. Verified via two single-source fixtures in one batch.
