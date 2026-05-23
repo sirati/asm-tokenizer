@@ -46,23 +46,3 @@ def test_build_bulk_bytes_raises_not_implemented() -> None:
 
     with pytest.raises(NotImplementedError):
         build_bulk_bytes(stage2=None)  # type: ignore[arg-type]
-
-
-def test_assemble_batch_raises_not_implemented() -> None:
-    from tokenizer.aligned_data.loader.batch_decode._assemble import assemble_batch
-
-    with pytest.raises(NotImplementedError):
-        assemble_batch(stage3=None, context_len=0)  # type: ignore[arg-type]
-
-
-def test_batch_decode_entry_raises_not_implemented() -> None:
-    from tokenizer.aligned_data.loader.batch_decode._entry import batch_decode
-
-    with pytest.raises(NotImplementedError):
-        batch_decode(
-            session=None,  # type: ignore[arg-type]
-            section_pointers=[],
-            num_variants_per_section=1,
-            context_len=0,
-            max_depth=0,
-        )
