@@ -17,10 +17,10 @@ Downstream consumers handle the absent-key case by treating the
 identity / number side-array as empty for that TokenType.
 
 Anything that IS in the vocab but in a malformed state — multiple
-matches for the same TokenType, or a match in the reserved [0, 256)
-digit-slot range — is a real vocab bug and still raises a typed
-``ValueError`` immediately rather than silently producing a wrong
-decode.
+matches for the same TokenType, or a match in the reserved
+``[0, _V2_RESERVED_TOKEN_COUNT)`` digit + ``value_negative`` prefix —
+is a real vocab bug and still raises a typed ``ValueError``
+immediately rather than silently producing a wrong decode.
 
 Plan reference: `## Module layout` row "decoded/category_tokens.py" +
 `## Locked-in decisions` item 10 (opt-in decode path, no hardcoded ids).
@@ -28,14 +28,12 @@ Plan reference: `## Module layout` row "decoded/category_tokens.py" +
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import Iterable, Mapping
 
 import numpy as np
 
+from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Category, TokenType
-
-if TYPE_CHECKING:  # pragma: no cover - import only for type checking
-    from tokenizer.token_manager import VocabularyManager
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +96,7 @@ FID_KEYED_CATEGORIES: frozenset[Category] = frozenset(
 
 
 def _resolve_token_type_ids(
-    vocab_manager: "VocabularyManager",
+    vocab_manager: VocabularyManager,
     token_types: Iterable[TokenType],
 ) -> dict[TokenType, int]:
     """Map each present TokenType to its unique uint16 vocab id.
@@ -107,8 +105,9 @@ def _resolve_token_type_ids(
     once. A requested TokenType with **zero matches** is silently
     omitted from the returned dict (vocabs derived from corpora that
     never encountered that TokenType legitimately lack it). A TokenType
-    with **multiple matches** or a match in the reserved [0, 256)
-    digit-slot range is a malformed vocab and raises ``ValueError``.
+    with **multiple matches** or a match in the reserved
+    ``[0, _V2_RESERVED_TOKEN_COUNT)`` digit + ``value_negative`` prefix
+    is a malformed vocab and raises ``ValueError``.
     """
     type_array = np.asarray(vocab_manager.id_to_token_type)
 
@@ -127,11 +126,12 @@ def _resolve_token_type_ids(
                 f"Conflicting ids: {positions.tolist()}."
             )
         token_id = int(positions[0])
-        if token_id < 256:
+        if token_id < VocabularyManager._V2_RESERVED_TOKEN_COUNT:
             raise ValueError(
                 f"vocab returned id {token_id} for {token_type.name} but "
-                "v2 type-tokens must live above the reserved digit-slot "
-                "range (id >= 256). The vocab is mis-tagged."
+                "v2 type-tokens must live above the reserved digit+marker "
+                f"prefix (id >= {VocabularyManager._V2_RESERVED_TOKEN_COUNT}). "
+                "The vocab is mis-tagged."
             )
         resolved[token_type] = token_id
     return resolved
@@ -143,7 +143,7 @@ def _resolve_token_type_ids(
 
 
 def resolve_category_token_ids(
-    vocab_manager: "VocabularyManager",
+    vocab_manager: VocabularyManager,
 ) -> dict[Category, int]:
     """Map every present v2 identity ``Category`` to its uint16 vocab id.
 
@@ -151,8 +151,8 @@ def resolve_category_token_ids(
     present in the vocab. A Category whose TokenType has zero matches
     in ``vocab_manager.id_to_token_type`` is silently omitted from the
     returned dict — the result may be a proper subset of ``Category``.
-    Raises ``ValueError`` only when a TokenType is malformed
-    (duplicate ids, or an id in the reserved [0, 256) range).
+    Raises ``ValueError`` only when a TokenType is malformed (duplicate
+    ids, or an id in the reserved ``[0, _V2_RESERVED_TOKEN_COUNT)`` range).
     """
     type_to_id = _resolve_token_type_ids(
         vocab_manager, _CATEGORY_TO_TOKEN_TYPE.values()
@@ -165,7 +165,7 @@ def resolve_category_token_ids(
 
 
 def resolve_number_token_ids(
-    vocab_manager: "VocabularyManager",
+    vocab_manager: VocabularyManager,
 ) -> dict[TokenType, int]:
     """Map every present number-carrying v2 ``TokenType`` to its uint16 vocab id.
 
@@ -179,29 +179,19 @@ def resolve_number_token_ids(
 
 
 def resolve_value_negative_token_id(
-    vocab_manager: "VocabularyManager",
+    vocab_manager: VocabularyManager,
 ) -> int | None:
     """Resolve the uint16 vocab id of the ``value_negative`` postfix metatoken.
 
     The v2 emitter writes ``[Valued_Const_V2(|value|), Value_Negative()]``
     for negative integer immediates / displacements; the decoder needs
     the metatoken's vocab id to detect the postfix and flip the chunk
-    sign for the preceding ``valued_const_v2`` source. Reservation pins
-    the id at ``256`` (see ``VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID``),
-    but the decoder consults this resolver rather than the literal so a
-    future invariant break surfaces as a vocab-side raise instead of a
-    silently-wrong decode.
-
-    Returns ``None`` when the vocab has no ``value_negative`` token --
-    legacy / non-v2 vocabs and the (single source of truth) "no entry
-    tagged with TokenType.VALUE_NEGATIVE" branch from the underlying
-    resolver share that absent-key path. Raises ``ValueError`` only on
-    a malformed vocab (duplicate tagging). Slot 256 passes the shared
-    resolver's ``id >= 256`` range check, so the pinned reservation
-    does not collide with the digit-slot-protection invariant the
-    Category / Number resolvers share.
+    sign for the preceding ``valued_const_v2`` source. For ``format_version``
+    in (1, 2) the id is invariantly pinned at slot
+    ``_V2_VALUE_NEGATIVE_TOKEN_ID`` (= 256) — both the constructor and
+    ``from_vocab`` re-publish that slot via the ``value_negative_token_id``
+    instance attribute. Returns ``None`` for vocabs whose
+    ``format_version`` lies outside (1, 2); the decoder treats ``None``
+    as "skip sign-handling" so legacy / non-v2 vocabs stay decodable.
     """
-    resolved = _resolve_token_type_ids(
-        vocab_manager, (TokenType.VALUE_NEGATIVE,)
-    )
-    return resolved.get(TokenType.VALUE_NEGATIVE)
+    return vocab_manager.value_negative_token_id

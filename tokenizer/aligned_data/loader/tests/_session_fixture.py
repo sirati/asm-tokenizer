@@ -80,6 +80,12 @@ class _FakeVocab:
     def __init__(self, items: List[str]) -> None:
         self._s2i = {s: i + 256 for i, s in enumerate(items)}
         self._i2s = {v: k for k, v in self._s2i.items()}
+        # The splice-session resolver reads `value_negative_token_id`
+        # directly. ``None`` mirrors the pre-Phase-4 default that real
+        # fakes inherited via the old scan-based resolver — splice
+        # tests that need value_negative-aware decoding can override
+        # this on the instance.
+        self.value_negative_token_id: int | None = None
 
     def get_token_id(self, token: str) -> int:
         return self._s2i.get(token, -1)

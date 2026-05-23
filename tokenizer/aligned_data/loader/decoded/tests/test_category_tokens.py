@@ -60,19 +60,22 @@ def _build_stub_vocab(
     duplicate: TokenType | None = None,
     misplace_low: TokenType | None = None,
 ) -> SimpleNamespace:
-    """Build a stub vocab carrying the 8 + 7 v2 type-tokens at 256+.
+    """Build a stub vocab carrying the 8 + 7 v2 type-tokens at 257+.
 
     ``omit`` removes one type-token entirely (its id stays UNRESOLVED).
     ``duplicate`` adds a second id with the same TokenType tag.
-    ``misplace_low`` overwrites a reserved-digit slot (<256) with the
-    requested TokenType — exercises the "id below 256" guard.
+    ``misplace_low`` overwrites a reserved-prefix slot (<257) with the
+    requested TokenType — exercises the "id below the reserved prefix"
+    guard.
     """
     capacity = 512
     arr = np.full(capacity, TokenType.UNRESOLVED, dtype=np.int8)
 
-    # Slots 0..255 are reserved-digit slots: TokenType.UNRESOLVED.
-    # Place the 15 v2 type-tokens at sequential ids starting at 256.
-    next_id = 256
+    # Slots 0..255 are reserved-digit slots; slot 256 is the
+    # `value_negative` postfix marker. Both are protocol-reserved and
+    # never carry a type-tagged token. Place the 15 v2 type-tokens at
+    # sequential ids starting at 257 (= ``_V2_RESERVED_TOKEN_COUNT``).
+    next_id = 257
     for token_type in (*_CATEGORY_TOKEN_TYPES, *_NUMBER_TOKEN_TYPES):
         if token_type == omit:
             continue
@@ -85,7 +88,7 @@ def _build_stub_vocab(
 
     if misplace_low is not None:
         # Plant the tag at id 100 — should be rejected by the
-        # "id >= 256" check.
+        # "id >= _V2_RESERVED_TOKEN_COUNT" check.
         arr[100] = int(misplace_low)
 
     if extra_tagged_ids:
@@ -107,7 +110,7 @@ def test_category_resolver_returns_eight_entries() -> None:
 
     assert set(result.keys()) == set(Category)
     assert len(result) == 8
-    assert all(v >= 256 for v in result.values())
+    assert all(v >= 257 for v in result.values())
 
 
 def test_category_resolver_block_maps_to_block_v2() -> None:
@@ -141,7 +144,7 @@ def test_number_resolver_returns_seven_entries() -> None:
     }
     assert set(result.keys()) == expected_keys
     assert len(result) == 7
-    assert all(v >= 256 for v in result.values())
+    assert all(v >= 257 for v in result.values())
 
 
 def test_resolvers_return_consistent_ids_with_vocab_layout() -> None:
@@ -203,7 +206,7 @@ def test_missing_category_silently_omitted() -> None:
         if category is Category.JUMP_TABLE:
             continue
         assert category in result
-        assert result[category] >= 256
+        assert result[category] >= 257
 
 
 def test_missing_number_type_silently_omitted() -> None:
@@ -220,11 +223,11 @@ def test_missing_number_type_silently_omitted() -> None:
         if token_type is TokenType.FLOAT128:
             continue
         assert token_type in result
-        assert result[token_type] >= 256
+        assert result[token_type] >= 257
 
 
 def test_resolvers_return_empty_when_vocab_has_no_v2_type_tokens() -> None:
-    """A vocab carrying ONLY digit tokens (no v2 type-token at >=256)
+    """A vocab carrying ONLY digit tokens (no v2 type-token at >=257)
     returns an empty dict from both resolvers — every TokenType is
     absent, every TokenType is silently omitted, no raise."""
     capacity = 512
@@ -260,4 +263,4 @@ def test_low_id_tag_raises() -> None:
 
     message = str(excinfo.value)
     assert "FLOAT32" in message
-    assert "256" in message or "digit-slot" in message
+    assert "257" in message or "digit+marker" in message
