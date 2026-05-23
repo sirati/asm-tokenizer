@@ -86,6 +86,11 @@ class _FakeVocab:
         # tests that need value_negative-aware decoding can override
         # this on the instance.
         self.value_negative_token_id: int | None = None
+        # Splice decode threads ``format_version`` from the vocab
+        # manager into ``_decode_to_staging``; the unified-vocab gate
+        # is the only one the v2 decode contract supports. Tests that
+        # need a different value can override on the instance.
+        self.format_version: int = 1
 
     def get_token_id(self, token: str) -> int:
         return self._s2i.get(token, -1)

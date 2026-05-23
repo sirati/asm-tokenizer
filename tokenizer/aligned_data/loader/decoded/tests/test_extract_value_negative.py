@@ -10,24 +10,20 @@ Round-trip suite (encoder -> token stream -> decoder) covers the
 representative signed-integer range pinned by the Phase 3 plan:
 ``[-128, -1, 0, 1, 127, 255, INT32_MAX, INT32_MIN, INT64_MAX, INT64_MIN]``.
 
-Three additional tests target the postfix invariant + the FP coexistence
+Two additional tests target the postfix invariant + the FP coexistence
 contract:
 
-* ``test_value_negative_in_isolation_trips_assertion`` — a
-  ``value_negative`` token following an FP source (instead of a
-  ``valued_const_v2``) trips the soft assertion in
-  :func:`_assert_value_negative_postfix_invariant`. Catches encoder
-  bugs that misplace the postfix marker.
+* ``test_value_negative_after_*`` — a ``value_negative`` token glued to
+  the tail of a non-VC2 carrier (FP source, identity carrier) trips
+  the inline postfix-invariant assertion in
+  :func:`_decode_to_staging`. Catches encoder bugs that misplace the
+  postfix marker.
 * ``test_value_negative_with_fp_postfix_negates_chunks_and_keeps_fp_marker`` —
   the ``-magnitude + value_negative + floatXX_postfix`` shape (per the
   emitter's order) decodes such that the chunk side-array carries
   ``sign=-1`` for the magnitude AND ``real_tokens`` retains the FP
-  postfix marker so downstream consumers still see the FP annotation.
-* ``test_legacy_decode_path_ignores_value_negative_in_stream`` — when
-  the caller omits ``value_negative_token_id`` the decoder runs the
-  legacy sign-agnostic path; ``value_negative`` tokens survive the
-  strip into ``real_tokens`` but the chunk sign stays ``+1``. Pins the
-  optional-arg contract.
+  postfix marker so downstream consumers still see the FP annotation
+  (the ``value_negative`` token itself is stripped per D5).
 """
 
 from __future__ import annotations
@@ -57,30 +53,32 @@ _VALUE_NEGATIVE_ID = 256
 
 
 def _make_id_maps() -> Tuple[Dict[Category, int], Dict[TokenType, int]]:
-    """Synthetic id maps with VALUED_CONST_V2 + FLOAT32 + LOCAL_FUNC.
+    """Synthetic id maps pinned to the unified-vocab canonical layout.
 
-    Ids chosen so the stream-position-order arm is exercised across
-    Category + number-TokenType + the ``value_negative`` postfix marker
-    without colliding.
+    The vectorized number-arm filtering uses the carrier mask
+    ``[_V2_RESERVED_TOKEN_COUNT, _V2_EAGER_BLOCK_END)`` (= [257, 272)),
+    so number + identity ids must live inside that band. Values below
+    mirror :meth:`VocabularyManager._register_v2_canonical_blocks` —
+    VALUED_CONST_V2 at 257, FLOAT16 at 258, ..., BLOCK at 264, etc.
     """
     id_token_ids: Dict[Category, int] = {
-        Category.BLOCK: 300,
-        Category.LOCAL_FUNC: 301,
-        Category.PLT_FUNC: 302,
-        Category.EXT_FUNC: 303,
-        Category.RO_DATA_PTR: 304,
-        Category.RW_DATA_PTR: 305,
-        Category.STRING_PTR: 306,
-        Category.JUMP_TABLE: 307,
+        Category.BLOCK: 264,
+        Category.LOCAL_FUNC: 265,
+        Category.PLT_FUNC: 266,
+        Category.EXT_FUNC: 267,
+        Category.STRING_PTR: 268,
+        Category.JUMP_TABLE: 269,
+        Category.RO_DATA_PTR: 270,
+        Category.RW_DATA_PTR: 271,
     }
     number_token_ids: Dict[TokenType, int] = {
-        TokenType.VALUED_CONST_V2: 400,
-        TokenType.FLOAT16: 401,
-        TokenType.BFLOAT16: 402,
-        TokenType.FLOAT32: 403,
-        TokenType.FLOAT64: 404,
-        TokenType.FLOAT80: 405,
-        TokenType.FLOAT128: 406,
+        TokenType.VALUED_CONST_V2: 257,
+        TokenType.FLOAT16: 258,
+        TokenType.BFLOAT16: 259,
+        TokenType.FLOAT32: 260,
+        TokenType.FLOAT64: 261,
+        TokenType.FLOAT80: 262,
+        TokenType.FLOAT128: 263,
     }
     return id_token_ids, number_token_ids
 
@@ -97,17 +95,7 @@ def _decode_signed(raw: np.ndarray):
         id_token_ids=id_token_ids,
         number_token_ids=number_token_ids,
         value_negative_token_id=_VALUE_NEGATIVE_ID,
-        func_name="t",
-    )
-
-
-def _decode_legacy(raw: np.ndarray):
-    """Decode without supplying value_negative_token_id (legacy path)."""
-    id_token_ids, number_token_ids = _make_id_maps()
-    return decode_raw_tokens(
-        raw,
-        id_token_ids=id_token_ids,
-        number_token_ids=number_token_ids,
+        format_version=1,
         func_name="t",
     )
 
@@ -132,7 +120,7 @@ def _emit_valued_const_stream(value: int) -> Tuple[np.ndarray, List[Tuple[np.uin
     # respected.
     width = max(1, (magnitude.bit_length() + 7) // 8)
     payload_bytes = magnitude.to_bytes(width, byteorder="big", signed=False)
-    tokens: List[int] = [400, *payload_bytes]
+    tokens: List[int] = [257, *payload_bytes]
     if value < 0:
         tokens.append(_VALUE_NEGATIVE_ID)
     raw = np.array(tokens, dtype=np.uint16)
@@ -188,26 +176,29 @@ def test_round_trip_through_decoder_recovers_signed_chunks(value: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_value_negative_token_appears_in_real_tokens_for_negative_value() -> None:
-    """A negative valued_const_v2 source produces ``real_tokens`` of
-    ``[valued_const_v2_id, value_negative_id]``.
+def test_value_negative_token_does_not_appear_in_real_tokens_for_negative_value() -> None:
+    """A negative valued_const_v2 source's ``real_tokens`` is just the
+    shifted VC2 id; the ``value_negative`` postfix is STRIPPED.
 
-    Mirrors the FP-postfix-annotation precedent: postfix metatokens
-    are real-tokens (id >= 256) that survive the strip pass; the
-    decoder consumes the postfix's MEANING into the chunk sign but
-    leaves the token in the stream so downstream consumers (model
-    training, variant analysis) still see the signal.
+    Per the D5/D6 strip-and-shift step the decoder drops
+    ``value_negative`` (id 256) from the model-facing stream because
+    its sign meaning is already captured in ``numbers_sign_exponent``;
+    surviving real-token ids are shifted down by 256 so the post-strip
+    vocab compacts.
     """
     raw, _ = _emit_valued_const_stream(-42)
     out = _decode_signed(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(400, _VALUE_NEGATIVE_ID))
+    np.testing.assert_array_equal(out.real_tokens, _u16(257 - 256))
+    # Sanity: the value_negative id never reaches real_tokens under
+    # the strip-and-shift contract.
+    assert _VALUE_NEGATIVE_ID not in out.real_tokens.tolist()
 
 
 def test_positive_value_has_no_value_negative_in_real_tokens() -> None:
     """A non-negative source's ``real_tokens`` carries no value_negative."""
     raw, _ = _emit_valued_const_stream(42)
     out = _decode_signed(raw)
-    np.testing.assert_array_equal(out.real_tokens, _u16(400))
+    np.testing.assert_array_equal(out.real_tokens, _u16(257 - 256))
     assert _VALUE_NEGATIVE_ID not in out.real_tokens.tolist()
 
 
@@ -229,7 +220,7 @@ def test_value_negative_after_float_token_trips_assertion() -> None:
     """
     bits = 0x40490FDA  # arbitrary f32 bit pattern (~3.14)
     payload = bits.to_bytes(4, byteorder="big", signed=False)
-    raw = _u16(403, *payload, _VALUE_NEGATIVE_ID)
+    raw = _u16(260, *payload, _VALUE_NEGATIVE_ID)
     with pytest.raises(AssertionError, match="value_negative"):
         _decode_signed(raw)
 
@@ -238,8 +229,8 @@ def test_value_negative_after_identity_token_trips_assertion() -> None:
     """A ``value_negative`` token after a ``LOCAL_FUNC`` identity token
     is also malformed; the decoder must surface the bug at decode time
     rather than silently negating an unrelated subsequent number-source."""
-    # LOCAL_FUNC (id 301) with inline id 5, then a stray value_negative.
-    raw = _u16(301, 5, _VALUE_NEGATIVE_ID)
+    # LOCAL_FUNC (id 265) with inline id 5, then a stray value_negative.
+    raw = _u16(265, 5, _VALUE_NEGATIVE_ID)
     with pytest.raises(AssertionError, match="value_negative"):
         _decode_signed(raw)
 
@@ -253,7 +244,7 @@ def test_value_negative_leading_stream_trips_assertion() -> None:
     BEFORE the postfix-invariant check runs, so this stream passes the
     first gate (256 is real-token) and then trips the second gate
     (value_negative has no predecessor)."""
-    raw = _u16(_VALUE_NEGATIVE_ID, 300)
+    raw = _u16(_VALUE_NEGATIVE_ID, 264)
     with pytest.raises(AssertionError, match="position 0"):
         _decode_signed(raw)
 
@@ -283,11 +274,13 @@ def test_value_negative_with_fp_postfix_negates_chunks_and_keeps_fp_marker() -> 
     magnitude = 255
     payload_bytes = magnitude.to_bytes(1, byteorder="big", signed=False)
     # Stream: VALUED_CONST_V2 + 1 magnitude byte + value_negative + FLOAT32 (postfix, no inline).
-    raw = _u16(400, *payload_bytes, _VALUE_NEGATIVE_ID, 403)
+    raw = _u16(257, *payload_bytes, _VALUE_NEGATIVE_ID, 260)
     out = _decode_signed(raw)
-    # real_tokens preserves all three real tokens in stream-position order.
+    # real_tokens preserves the VC2 + FLOAT32 postfix in stream-position
+    # order; value_negative is STRIPPED (D5) and surviving ids are
+    # shifted down by 256 (D6).
     np.testing.assert_array_equal(
-        out.real_tokens, _u16(400, _VALUE_NEGATIVE_ID, 403)
+        out.real_tokens, _u16(257 - 256, 260 - 256)
     )
     expected_vc = from_int(magnitude, sign=-1)
     expected_fp = from_float32(0)
@@ -324,7 +317,7 @@ def _emit_real(value: int) -> np.ndarray:
     from tokenizer.constant_handler.ctx import _Ctx
     from tokenizer.token_manager import VocabularyManager
 
-    vm = VocabularyManager(platform=None, format_version=2)
+    vm = VocabularyManager(platform=None, format_version=1)
     handler = ConstantHandler.__new__(ConstantHandler)
     handler.vocab_manager = vm
     ctx = _Ctx(is_arithmetic=False, fp_immediate_type=None, fp_postfix_type=None)
@@ -372,6 +365,7 @@ def test_end_to_end_emitter_to_decoder_round_trip(value: int) -> None:
         id_token_ids=cat_ids,
         number_token_ids=num_ids,
         value_negative_token_id=vneg_id,
+        format_version=int(vm.format_version),
         func_name="t",
     )
 
@@ -390,28 +384,3 @@ def test_end_to_end_emitter_to_decoder_round_trip(value: int) -> None:
         )
 
 
-def test_legacy_decode_path_ignores_value_negative_in_stream() -> None:
-    """When the caller omits ``value_negative_token_id``, the decoder
-    runs the legacy sign-agnostic path.
-
-    This is the pre-Phase-3.1 behavior. The ``value_negative`` token
-    still has id 256 so it survives the strip into ``real_tokens``,
-    but the decoder treats the preceding ``valued_const_v2`` chunk as
-    ``sign=+1`` because no postfix-sign hint reached it. Tests that
-    don't exercise sign handling (e.g. existing test_extract.py
-    fixtures) keep working unchanged through this code path.
-
-    Pins the optional-arg contract -- a future refactor that quietly
-    starts requiring ``value_negative_token_id`` would break legacy
-    test fixtures, and this test would surface that drift.
-    """
-    raw, _ = _emit_valued_const_stream(-42)
-    out = _decode_legacy(raw)
-    # Legacy path: chunk sign stays positive (sign_exp's MSB clear).
-    expected = from_int(42, sign=+1)
-    assert out.numbers_significant.shape == (len(expected),)
-    for idx, (sig, sign_exp) in enumerate(expected):
-        assert int(out.numbers_significant[idx]) == int(sig)
-        assert int(out.numbers_sign_exponent[idx]) == int(sign_exp)
-    # But the value_negative token is still in the post-strip stream.
-    assert _VALUE_NEGATIVE_ID in out.real_tokens.tolist()
