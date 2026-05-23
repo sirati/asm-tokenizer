@@ -93,6 +93,12 @@ class _SpliceFakeVocab(_FakeVocab):
     occupy ids 260..274 with their matching TokenType. The array
     capacity is sized to ``max(id)+1`` so the resolver's ``np.where``
     finds each tag at exactly one id.
+
+    Pins ``value_negative_token_id`` to 256 to match the canonical
+    unified-vocab layout the decoder asserts on; the v2 type-tokens
+    in this fake live above the carrier band, so the streams below
+    never actually emit a ``value_negative`` postfix, but the decoder
+    still requires the id at construction time.
     """
 
     def __init__(self) -> None:
@@ -102,6 +108,7 @@ class _SpliceFakeVocab(_FakeVocab):
         for offset, token_type in enumerate(_V2_TYPE_TOKENS):
             arr[260 + offset] = int(token_type)
         self.id_to_token_type = arr
+        self.value_negative_token_id = 256
 
 
 def _craft_v2_tokens(

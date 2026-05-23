@@ -304,6 +304,7 @@ class _BinarySessionSpliceMixin:
         from .decoded.splice import splice_with_callees as _splice_walker
 
         cat_ids, num_ids, vneg_id = self._get_token_id_caches()
+        format_version = int(self._vocab_manager.format_version)
 
         # Resolve the root section + each selected variant's FunctionData
         # exactly once -- the per-stream loop body parses tokens but does
@@ -356,6 +357,7 @@ class _BinarySessionSpliceMixin:
                 number_token_ids=num_ids,
                 fids_per_category=callee_fids,
                 value_negative_token_id=vneg_id,
+                format_version=format_version,
                 func_name=fd.func_name,
                 metadata=fd.metadata,
             )
@@ -377,6 +379,7 @@ class _BinarySessionSpliceMixin:
                 number_token_ids=num_ids,
                 fids_per_category=root_fids,
                 value_negative_token_id=vneg_id,
+                format_version=format_version,
                 func_name=root_fd.func_name,
                 metadata=root_fd.metadata,
             )
