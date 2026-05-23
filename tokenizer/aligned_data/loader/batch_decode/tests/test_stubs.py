@@ -41,13 +41,6 @@ def test_stub_module_imports_cleanly(modname: str) -> None:
     assert mod is not None
 
 
-def test_build_bulk_bytes_raises_not_implemented() -> None:
-    from tokenizer.aligned_data.loader.batch_decode._bulk_bytes import build_bulk_bytes
-
-    with pytest.raises(NotImplementedError):
-        build_bulk_bytes(stage2=None)  # type: ignore[arg-type]
-
-
 def test_assemble_batch_raises_not_implemented() -> None:
     from tokenizer.aligned_data.loader.batch_decode._assemble import assemble_batch
 
