@@ -259,6 +259,7 @@ def _make_batch(
         identity_idx_2d=np.zeros((0, 2), dtype=np.uint32),
         number_idx_2d_per_TokenType={},
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
+        f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
     )
 
 
