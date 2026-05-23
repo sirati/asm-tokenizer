@@ -1,26 +1,32 @@
 """Vectorized IEEE-754 binary128 (F128) encoder.
 
-Single concern: 16-byte big-endian payload -> f96-shape normalization for
-binary128. Emits **2 chunks per finite source** (low + high u64 limb of the
-113-bit effective mantissa) and **1 chunk per NaN/Inf source** -- this is
-the **fixed-layout rule** committed by the batch pipeline's stage 2 (ALG-2
-``f128_chunk_counts``).
+Single concern: per-chunk 8-byte big-endian payload -> f96-shape
+normalization for binary128. Consumes the per-chunk layout 3c emits
+(``(n_chunks_total, 8)`` u8 -- 2 chunks per finite source, 1 chunk per
+NaN/Inf source) and pairs it with the per-source ``f128_is_nan_or_inf``
+sidecar to split chunks back into their source roles.
 
-Per-chunk normalization formula is identical to :func:`custom_float._emit_chunk`
-on the corresponding ``chunk_value`` -- so for F128 *normals* (whose
+Per-chunk emission formula matches :func:`custom_float._emit_chunk` on
+the corresponding ``chunk_value`` -- so for F128 *normals* (whose
 effective mantissa has bit 112 set) the per-chunk emission is **byte-
 identical** to :func:`custom_float.from_float128`. The divergence is only
 on F128 ``+/-0`` and denormals whose ``effective_mantissa.bit_length() <=
 64``: the oracle's ``_split_to_chunks`` short-circuits those to 1 chunk,
-while the batch path emits 2 (with the high chunk being a signed zero).
+while the batch path always emits 2 (the high chunk being a signed
+zero). This is the **fixed-layout rule** committed by stage 2's ALG-2
+``f128_chunk_counts`` -- 3c emits 2 chunks for every finite source.
 
 Branches:
 
-* **NaN / Inf** (``biased_exp == 0x7FFF``, per ``f128_is_nan_or_inf[k] ==
-  True``): single-chunk sentinel via :func:`encode_infnan_vec`. Inf detected
-  by ``high_mantissa == 0 AND low_u64 == 0``.
-* **Denormal** (``biased_exp == 0``): ``effective_mantissa = raw_mantissa``;
-  ``actual_exp = -16382``. Both u64 chunks emitted; either may be zero.
+* **NaN / Inf** (``f128_is_nan_or_inf[s] == True``): single chunk per
+  source = MSB u64 limb (bytes 0..7). Inf/NaN distinction uses ONLY the
+  high mantissa (bits [0, 48) of the MSB limb) -- the ``.rodata-
+  robustness`` policy (``custom_float.py:336`` + ``_number_decode.py:
+  21-25``): canonical NaN/Inf encoding is fully determined by the
+  high 8 bytes, so 3c can safely drop the low limb.
+* **Denormal** (``biased_exp == 0``): ``effective_mantissa =
+  raw_mantissa``; ``actual_exp = -16382``. Both u64 chunks emitted;
+  either may be zero.
 * **Normal**: ``effective_mantissa = (1 << 112) | raw_mantissa``;
   ``actual_exp = biased_exp - 16383``. Low chunk = low 64 bits of raw
   mantissa; high chunk = ``(1 << 48) | (top 48 bits of raw mantissa)``.
@@ -29,6 +35,17 @@ Per-chunk exponent base (matching the oracle's ``_split_to_chunks`` path):
 
 * chunk 0 (low) base = ``actual_exp - 112``
 * chunk 1 (high) base = ``actual_exp - 48``  (= base + 64)
+
+Per-source chunk-position layout in the input ``raw_bytes_2d``:
+
+* Finite source (``f128_is_nan_or_inf[s] == False``): 2 rows --
+  ``out_offsets[s] + 0`` = LSB limb (bytes 8..15 of the original 16-
+  byte payload), ``out_offsets[s] + 1`` = MSB limb (bytes 0..7).
+* NaN/Inf source (``f128_is_nan_or_inf[s] == True``): 1 row at
+  ``out_offsets[s]`` = MSB limb (bytes 0..7).
+
+where ``out_offsets`` is the cumsum of ``chunks_per_source = where(
+is_nan_or_inf, 1, 2)``.
 """
 
 from __future__ import annotations
@@ -46,58 +63,96 @@ def normalize_f128(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Vectorized F128 encoder.
 
-    ``raw_bytes_2d``: ``u8[n_sources, 16]`` -- one row per source, 16 big-
-    endian bytes per row.
+    ``raw_bytes_2d``: ``u8[n_chunks_total, 8]`` -- one row per CHUNK (not
+    per source). Layout per source: finite sources contribute 2 rows
+    (LSB then MSB limb); NaN/Inf sources contribute 1 row (MSB limb).
+    Rows appear in source order, with each source's chunks consecutive
+    and in LSB-first order for finite sources.
 
-    ``f128_is_nan_or_inf``: ``bool[n_sources]`` -- aligned with the rows of
-    ``raw_bytes_2d``. Per stage 2's ALG-2 -- determines whether each source
-    contributes 1 chunk (NaN/Inf) or 2 chunks (finite).
+    ``f128_is_nan_or_inf``: ``bool[n_sources]`` -- per stage 2's ALG-2
+    determines whether each source contributes 1 chunk (NaN/Inf) or 2
+    chunks (finite). ``n_chunks_total == 2 * (~is_nan_or_inf).sum() +
+    is_nan_or_inf.sum()``.
 
-    Returns ``(significand, sign_exp)`` arrays of total length =
-    ``2 * (~is_nan_or_inf).sum() + is_nan_or_inf.sum()``, ordered per source
-    in input order with finite sources contributing ``[chunk0, chunk1]``
-    consecutively and NaN/Inf sources contributing ``[infnan]``.
+    Returns ``(significand, sign_exp)`` arrays of length
+    ``n_chunks_total``, in input row order.
     """
-    n_sources = raw_bytes_2d.shape[0]
+    n_sources = int(f128_is_nan_or_inf.shape[0])
+    n_chunks_total = int(raw_bytes_2d.shape[0])
     if n_sources == 0:
+        if n_chunks_total != 0:
+            raise AssertionError(
+                "raw_bytes_2d has rows but f128_is_nan_or_inf is empty"
+            )
         return (
             np.zeros(0, dtype=np.uint64),
             np.zeros(0, dtype=np.uint32),
         )
 
-    bytes_c = np.ascontiguousarray(raw_bytes_2d)
-    # u64[n_sources, 2]; limb 0 = HIGH (bytes 0..7), limb 1 = LOW (bytes 8..15).
-    u64_limbs = bytes_c.view(">u8").reshape(-1, 2)
-    high_u64 = u64_limbs[:, 0]
-    low_u64 = u64_limbs[:, 1]
+    # ---- Per-source chunk-layout map ----
+    #
+    # chunks_per_source[s]: 1 if NaN/Inf, 2 if finite.
+    # out_offsets[s]: index of source s's first chunk in the per-chunk
+    # arrays. out_offsets[n_sources] = total chunk count.
+    nan_inf_mask = f128_is_nan_or_inf.astype(bool)
+    chunks_per_source = np.where(nan_inf_mask, np.int64(1), np.int64(2))
+    out_offsets = np.empty(n_sources + 1, dtype=np.int64)
+    out_offsets[0] = 0
+    np.cumsum(chunks_per_source, out=out_offsets[1:])
+    expected_chunks_total = int(out_offsets[-1])
+    if expected_chunks_total != n_chunks_total:
+        raise AssertionError(
+            f"raw_bytes_2d row count {n_chunks_total} does not match "
+            f"f128_is_nan_or_inf-derived chunk count "
+            f"{expected_chunks_total}; stage-3c / stage-3d layout drift"
+        )
 
-    # Field extraction from the high u64:
+    # Per-chunk view: each row's 8 big-endian bytes -> 1 u64.
+    bytes_c = np.ascontiguousarray(raw_bytes_2d)
+    chunk_u64 = bytes_c.view(">u8").reshape(-1)  # u64[n_chunks_total]
+
+    # Per-source MSB chunk position:
+    #   NaN/Inf source: only chunk = source-start offset.
+    #   Finite source: source-start + 1 (chunk 0 is LSB, chunk 1 is MSB).
+    source_starts = out_offsets[:n_sources]
+    msb_chunk_pos = source_starts + np.where(nan_inf_mask, np.int64(0), np.int64(1))
+    msb_u64 = chunk_u64[msb_chunk_pos]
+
+    # Field extraction from the MSB u64 (per source):
     #   sign at bit 63
     #   biased_exp at bits 48..62 (15 bits)
     #   high-mantissa at bits 0..47 (48 bits)
-    sign_bit = (high_u64 >> np.uint64(63)) & np.uint64(1)
+    sign_bit = (msb_u64 >> np.uint64(63)) & np.uint64(1)
     is_negative = sign_bit.astype(bool)
-    biased_exp = (high_u64 >> np.uint64(48)) & np.uint64(0x7FFF)
-    high_mantissa = high_u64 & np.uint64((1 << 48) - 1)
+    biased_exp = (msb_u64 >> np.uint64(48)) & np.uint64(0x7FFF)
+    high_mantissa = msb_u64 & np.uint64((1 << 48) - 1)
 
     # Sanity: f128_is_nan_or_inf must agree with the bit pattern.
     expected_nan_or_inf = biased_exp == np.uint64(0x7FFF)
-    if (expected_nan_or_inf != f128_is_nan_or_inf).any():
+    if (expected_nan_or_inf != nan_inf_mask).any():
         raise AssertionError(
             "f128_is_nan_or_inf disagrees with bit-pattern detection; "
             "stage-2 sidecar drift from the actual payload"
         )
 
     # ---- NaN/Inf branch (per source -- emit 1 chunk each) ----
-    nan_inf_mask = f128_is_nan_or_inf.astype(bool)
-    # Inf is "all mantissa bits zero" (after stripping sign+exp); NaN is
-    # anything else.
-    is_inf = (high_mantissa == np.uint64(0)) & (low_u64 == np.uint64(0))
-    infnan_sig_all, infnan_sign_exp_all = encode_infnan_vec(
+    # .rodata-robustness policy: classify Inf vs NaN using only the high
+    # mantissa (3c does not transmit the low limb for NaN/Inf sources).
+    # See module docstring + _number_decode.py:21-25 for the contract.
+    is_inf = high_mantissa == np.uint64(0)
+    infnan_sig_per_source, infnan_sign_exp_per_source = encode_infnan_vec(
         is_negative, is_inf
     )
 
     # ---- Finite branch (per source -- emit 2 chunks each) ----
+    # Per-source LSB u64 lives at the source-start offset for finite
+    # sources. For NaN/Inf sources the LSB position is undefined (the
+    # row doesn't exist); we still index safely by clamping to the MSB
+    # position (the value is gathered but discarded by the finite-mask
+    # write below).
+    lsb_chunk_pos = np.where(nan_inf_mask, msb_chunk_pos, source_starts)
+    low_u64 = chunk_u64[lsb_chunk_pos]
+
     # Effective mantissa: bit 112 set for normals; absent for denormals.
     is_denormal = biased_exp == np.uint64(0)
     bias = 16383
@@ -135,31 +190,24 @@ def normalize_f128(
         high_chunk, is_negative, chunk1_base
     )
 
-    # ---- Assemble output in per-source chunk order ----
-    chunks_per_source = np.where(
-        nan_inf_mask, np.int64(1), np.int64(2)
-    )
-    out_offsets = np.empty(n_sources + 1, dtype=np.int64)
-    out_offsets[0] = 0
-    np.cumsum(chunks_per_source, out=out_offsets[1:])
-    total_chunks = int(out_offsets[-1])
+    # ---- Scatter per-source results back to per-chunk output ----
+    out_sig = np.empty(n_chunks_total, dtype=np.uint64)
+    out_sign_exp = np.empty(n_chunks_total, dtype=np.uint32)
 
-    out_sig = np.empty(total_chunks, dtype=np.uint64)
-    out_sign_exp = np.empty(total_chunks, dtype=np.uint32)
-
-    # Finite-source rows: place chunk0 at out_offsets[k] + 0, chunk1 at + 1.
+    # Finite sources: chunk 0 (LSB) at source_starts, chunk 1 (MSB) at
+    # source_starts + 1.
     finite_idx = np.nonzero(~nan_inf_mask)[0]
     if finite_idx.size > 0:
-        starts_finite = out_offsets[finite_idx]
-        out_sig[starts_finite] = finite_chunk0_sig[finite_idx]
-        out_sign_exp[starts_finite] = finite_chunk0_sign_exp[finite_idx]
-        out_sig[starts_finite + 1] = finite_chunk1_sig[finite_idx]
-        out_sign_exp[starts_finite + 1] = finite_chunk1_sign_exp[finite_idx]
+        finite_starts = source_starts[finite_idx]
+        out_sig[finite_starts] = finite_chunk0_sig[finite_idx]
+        out_sign_exp[finite_starts] = finite_chunk0_sign_exp[finite_idx]
+        out_sig[finite_starts + 1] = finite_chunk1_sig[finite_idx]
+        out_sign_exp[finite_starts + 1] = finite_chunk1_sign_exp[finite_idx]
 
     nan_inf_idx = np.nonzero(nan_inf_mask)[0]
     if nan_inf_idx.size > 0:
-        starts_nan = out_offsets[nan_inf_idx]
-        out_sig[starts_nan] = infnan_sig_all[nan_inf_idx]
-        out_sign_exp[starts_nan] = infnan_sign_exp_all[nan_inf_idx]
+        nan_inf_starts = source_starts[nan_inf_idx]
+        out_sig[nan_inf_starts] = infnan_sig_per_source[nan_inf_idx]
+        out_sign_exp[nan_inf_starts] = infnan_sign_exp_per_source[nan_inf_idx]
 
     return out_sig, out_sign_exp
