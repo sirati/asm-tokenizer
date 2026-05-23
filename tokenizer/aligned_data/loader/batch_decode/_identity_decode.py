@@ -245,20 +245,18 @@ def build_identity_idx_2d(
                 #     Add inline_byte_slice.start for the absolute
                 #     offset in inline_bytes.
                 #
-                # Per-call-target cumsum is O(n) for the function; we
-                # do it once and then index it by the K carrier
-                # positions.
+                # The exclusive-prefix ``state.digit_cumsum`` (computed
+                # once per stream in ``build_inline_decode_state``)
+                # supplies the per-position digit count via
+                # ``state.digit_cumsum[p + 1]`` -- equivalent to the
+                # ``cum_number[p]`` read the prior local cumsum
+                # produced (the values agree at identity carriers,
+                # where ``number_mask[p] == False``).  See
+                # ``InlineDecodeState.digit_cumsum`` for the shape
+                # contract.
                 # ----------------------------------------------------------
                 runlen_number = state.runlen_number
-                number_mask = state.number_mask
                 n = raw_tokens.shape[0]
-
-                # cum_number[i] = sum(number_mask[0:i+1]) = count of
-                # number_mask=True in raw_tokens[0..i] inclusive. We
-                # need count strictly before p+1 for an identity
-                # carrier at p; since number_mask[p] is False, that
-                # count equals cum_number[p].
-                cum_number = number_mask.cumsum(dtype=np.int64)
 
                 # Payload length per carrier. p+1 is in-bounds when
                 # p < n - 1; the carrier at position n-1 (if any) has
@@ -275,10 +273,11 @@ def build_identity_idx_2d(
                 L = np.where(has_p1, L_raw, np.int64(0))
 
                 # First payload byte offset within the call_target's
-                # inline-byte region (0-based) = cum_number[p].
+                # inline-byte region (0-based) = digit_cumsum[p + 1].
                 # Absolute offset in inline_bytes adds inline_byte_slice.start.
                 first_payload_offset = (
-                    cum_number[p] + np.int64(inline_byte_slice.start)
+                    state.digit_cumsum[p + 1].astype(np.int64)
+                    + np.int64(inline_byte_slice.start)
                 )
 
                 # idx_2d rows per ALG-5 payload-width table.

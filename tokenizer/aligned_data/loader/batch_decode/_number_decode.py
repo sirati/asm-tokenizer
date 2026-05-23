@@ -57,8 +57,10 @@ and emit per-source rows in stream order. The per-call-target
 ALG-8 reads ``L = state.runlen_number[p_carrier + 1]``, so we still
 need the raw-stream carrier position. The expanded stream alone
 doesn't tell us ``L`` (only ``K``); two distinct ``L`` values can map
-to the same ``K``. We rebuild the expanded->raw position map locally
-per call_target.
+to the same ``K``. We recover the expanded->raw position map per
+call_target via the shared
+:func:`tokenizer.aligned_data.loader.decoded._inline_decode_state.expanded_to_raw_position_map`
+helper (vectorised prefix-paint mask + cumsum -- no Python loop).
 
 Plan refs: ``batch_decode_plan.md`` ALG-7 + ALG-8 + Stage 3 step 4.
 """
@@ -69,6 +71,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
+    expanded_to_raw_position_map,
+)
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
@@ -284,28 +289,27 @@ def _emit_call_target_rows(
     """
 
     state = ct.stage1.state
-    raw_tokens = state.raw_tokens
-    number_mask = state.number_mask
     runlen_number = state.runlen_number
 
-    # Rebuild the expanded->raw position map. ``state.raw_tokens`` /
-    # ``state.real_mask`` reflect the pre-promotion stream; the painted
-    # continuation slots are NOT in real_mask but ARE in the kept set
-    # from ``expand_tokens``'s strip step. The map walks real_positions
-    # while injecting painted slots after each carrier when the
-    # extra_*_mask is True.
-    keep_raw_positions = _expanded_to_raw_position_map(
+    # Recover the expanded->raw position map.  Painted VC2 / F128
+    # continuation slots are NOT in ``state.real_mask`` but ARE in the
+    # kept set from ``expand_tokens``'s strip step.  The shared helper
+    # vectorises the prior per-call-target Python walk and reads only
+    # ``state.real_mask`` plus the two extra masks.
+    n_expanded_real = int(ct.extra_value_v2_mask.shape[0]) - 1
+    keep_raw_positions = expanded_to_raw_position_map(
         state=state,
+        n_expanded_real=n_expanded_real,
         extra_value_v2_mask=ct.extra_value_v2_mask,
         extra_f128_mask=ct.extra_f128_mask,
     )
 
-    # Cumulative count of inline-digit positions up to (but not
-    # including) each raw-stream position. Used to compute
-    # ``p_carrier_byte`` for each surviving carrier without a per-source
-    # search.  Length ``n_raw + 1`` so ``inline_cumsum[p] = number of
-    # inline-digit bytes at raw positions [0, p)``.
-    inline_cumsum = _build_inline_cumsum(number_mask)
+    # Exclusive-prefix inline-digit count per raw position lives on the
+    # shared ``InlineDecodeState`` (``digit_cumsum[p + 1]`` = inline
+    # byte count strictly before raw position ``p + 1``).  Reading the
+    # per-stream cumsum here keeps the per-call-target Python work to
+    # the carrier-emission loop only.
+    inline_cumsum = state.digit_cumsum
 
     inline_slice_start = int(inline_byte_slice.start)
 
@@ -533,71 +537,3 @@ def _emit_vc2_source(
     return K_visible
 
 
-# ---------------------------------------------------------------------------
-# Cross-call-target helpers.
-# ---------------------------------------------------------------------------
-
-
-def _expanded_to_raw_position_map(
-    *,
-    state,
-    extra_value_v2_mask: np.ndarray,
-    extra_f128_mask: np.ndarray,
-) -> np.ndarray:
-    """Recover the raw-stream position for each expanded[1:] slot.
-
-    Painted VC2 / F128 continuation slots in 2a are contiguous in
-    raw-space immediately after their carrier. We walk
-    ``state.real_mask``'s nonzero positions for carriers (and other
-    non-promoted real tokens); when the extra_*_mask flags a painted
-    continuation, the painted slot's raw position is the prior slot's
-    raw position + 1.
-
-    Returns ``u32[predicted_full_length - 1]`` (i.e. one entry per
-    expanded[1:] slot; expanded[0] = synthetic prepend has no raw
-    counterpart).
-    """
-    real_positions = np.nonzero(state.real_mask)[0].astype(np.uint32)
-    n_expanded_real = int(extra_value_v2_mask.shape[0]) - 1  # subtract prepend
-
-    if n_expanded_real == 0:
-        return np.empty(0, dtype=np.uint32)
-
-    out = np.empty(n_expanded_real, dtype=np.uint32)
-
-    # ``real_idx`` cursors over real_positions (raw-stream carriers +
-    # other non-painted real tokens). When an extra_*_mask is True at
-    # the current expanded slot, the painted continuation's raw
-    # position = prior expanded slot's raw position + 1 (painted slots
-    # are contiguous after their carrier).
-    real_idx = 0
-    for expanded_real_idx in range(n_expanded_real):
-        is_extra = bool(
-            extra_value_v2_mask[expanded_real_idx + 1]
-            | extra_f128_mask[expanded_real_idx + 1]
-        )
-        if is_extra:
-            out[expanded_real_idx] = out[expanded_real_idx - 1] + 1
-        else:
-            out[expanded_real_idx] = real_positions[real_idx]
-            real_idx += 1
-
-    return out
-
-
-def _build_inline_cumsum(number_mask: np.ndarray) -> np.ndarray:
-    """Cumulative inline-digit count: ``cumsum[p] = #digits in raw[0..p)``.
-
-    Length ``len(number_mask) + 1``. The caller reads ``cumsum[p + 1]``
-    to get the count of inline-digit bytes preceding raw position
-    ``p + 1`` -- which is exactly the offset of the inline-digit byte
-    at ``p + 1`` within the call_target's slice of ``inline_bytes``
-    (3a guarantees no per-byte cut inside the slice; chunk-granularity
-    cuts are handled by the caller).
-    """
-    n = int(number_mask.shape[0])
-    cumsum = np.empty(n + 1, dtype=np.uint32)
-    cumsum[0] = 0
-    if n > 0:
-        np.cumsum(number_mask.astype(np.uint32), out=cumsum[1:])
-    return cumsum

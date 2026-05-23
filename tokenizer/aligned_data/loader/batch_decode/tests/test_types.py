@@ -69,6 +69,7 @@ def _make_inline_decode_state() -> InlineDecodeState:
         runlen_value=np.zeros(n, dtype=np.uint32),
         carries_inline_mask=np.zeros(n, dtype=bool),
         is_negative_per_position=np.zeros(n, dtype=bool),
+        digit_cumsum=np.zeros(n + 1, dtype=np.uint32),
     )
 
 

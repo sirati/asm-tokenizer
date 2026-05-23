@@ -113,6 +113,9 @@ def _build_state(raw_tokens: np.ndarray) -> InlineDecodeState:
     # whole carrier band; vocab IDs in [257, 272)).
     carries_inline_mask = real_mask & (raw_tokens < _V2_IDENTITY_BLOCK_START + 8)
     is_negative_per_position = np.zeros(raw_tokens.shape[0], dtype=bool)
+    digit_cumsum = np.zeros(raw_tokens.shape[0] + 1, dtype=np.uint32)
+    if raw_tokens.shape[0] > 0:
+        np.cumsum(number_mask.view(np.uint8), out=digit_cumsum[1:])
     return InlineDecodeState(
         raw_tokens=raw_tokens,
         real_mask=real_mask,
@@ -121,6 +124,7 @@ def _build_state(raw_tokens: np.ndarray) -> InlineDecodeState:
         runlen_value=runlen_value,
         carries_inline_mask=carries_inline_mask,
         is_negative_per_position=is_negative_per_position,
+        digit_cumsum=digit_cumsum,
     )
 
 

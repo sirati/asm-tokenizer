@@ -38,7 +38,11 @@ from tokenizer.token_manager import VocabularyManager
 from .run_lengths import run_lengths
 
 
-__all__ = ["InlineDecodeState", "build_inline_decode_state"]
+__all__ = [
+    "InlineDecodeState",
+    "build_inline_decode_state",
+    "expanded_to_raw_position_map",
+]
 
 
 # Local aliases of the wire-stream layout constants pinned on
@@ -87,6 +91,14 @@ class InlineDecodeState:
       postfix slot is a sign marker; False elsewhere (including
       non-carrier positions).  Pre-computed via the runlength-diff so
       the number arm reads off the sign in O(1) per source.
+    * ``digit_cumsum``: ``u32[N + 1]`` -- exclusive-prefix cumsum over
+      ``number_mask``; ``digit_cumsum[k] = sum(number_mask[0:k])``.
+      ``digit_cumsum[0] = 0``. Consumers read ``digit_cumsum[p + 1]``
+      to obtain the count of inline-digit bytes preceding raw position
+      ``p + 1`` -- exactly the per-source first-payload-byte offset
+      within the call_target's inline-byte slice.  Lifted onto the
+      state so the per-call-target cumsum is computed ONCE per source
+      stream rather than once per stage-3 consumer arm.
     """
 
     raw_tokens: np.ndarray
@@ -96,6 +108,7 @@ class InlineDecodeState:
     runlen_value: np.ndarray
     carries_inline_mask: np.ndarray
     is_negative_per_position: np.ndarray
+    digit_cumsum: np.ndarray
 
 
 def build_inline_decode_state(
@@ -142,6 +155,14 @@ def build_inline_decode_state(
             runlen_val_at_p1 != runlen_num_at_p1
         )
 
+    # Exclusive-prefix cumsum of ``number_mask``.  ``digit_cumsum[0] = 0``
+    # by construction; ``digit_cumsum[k] = sum(number_mask[0:k])`` for
+    # ``k >= 1``.  Viewed as ``uint8`` for the cumsum operand keeps the
+    # working dtype small and matches the ``np.uint32`` accumulator.
+    digit_cumsum = np.zeros(n + 1, dtype=np.uint32)
+    if n > 0:
+        np.cumsum(number_mask.view(np.uint8), out=digit_cumsum[1:])
+
     return InlineDecodeState(
         raw_tokens=raw_tokens,
         real_mask=real_mask,
@@ -150,4 +171,103 @@ def build_inline_decode_state(
         runlen_value=runlen_value,
         carries_inline_mask=carries_inline_mask,
         is_negative_per_position=is_negative_per_position,
+        digit_cumsum=digit_cumsum,
     )
+
+
+def expanded_to_raw_position_map(
+    state: InlineDecodeState,
+    n_expanded_real: int,
+    extra_value_v2_mask: np.ndarray,
+    extra_f128_mask: np.ndarray,
+) -> np.ndarray:
+    """Recover the raw-stream position for each ``expanded[1:]`` slot.
+
+    Stage-2a painting (VC2 ceil(L/8) chunks past the carrier; F128
+    finite-source continuation) inserts "painted" continuation slots in
+    the post-promotion expanded stream that have no ``state.real_mask``
+    counterpart.  Painted slots are contiguous in raw-space immediately
+    after their carrier, so the painted slot's raw position equals the
+    prior expanded[1:] slot's raw position + 1.
+
+    Parameters
+    ----------
+    state
+        The per-source-stream :class:`InlineDecodeState` (only
+        ``state.real_mask`` is read here).
+    n_expanded_real
+        Number of expanded[1:] slots to populate.  The caller computes
+        this from ``extra_*_mask.shape[0] - 1`` (the leading slot is
+        the synthetic prepend, which has no raw counterpart).
+    extra_value_v2_mask, extra_f128_mask
+        ``bool[predicted_full_length]`` masks; the ``[1:]`` body
+        positions identify painted VC2 / F128 continuation slots.
+
+    Returns
+    -------
+    np.ndarray
+        ``u32[n_expanded_real]``.  Index ``i`` holds the raw-stream
+        position for ``expanded[i + 1]``.  At painted slots the value
+        is the prior slot's value + 1; at real (carrier or non-promoted
+        real) slots the value comes from ``real_mask.nonzero()`` in
+        encounter order.
+
+    Notes
+    -----
+    Vectorised "prefix-paint mask + cumsum" implementation:
+
+    * ``is_extra[i] = extra_value_v2_mask[i + 1] | extra_f128_mask[i + 1]``
+      flags painted continuation slots.
+    * ``carrier_idx_per_slot = cumsum(~is_extra) - 1`` -- at a real slot
+      this advances; at a painted slot it stays put (since ``~is_extra``
+      contributes 0), so ``carrier_idx_per_slot[i]`` always points to
+      the most recent real slot at or before ``i``.
+    * ``base = real_positions[carrier_idx_per_slot]`` -- the latest
+      carrier's raw position at every slot.
+    * Per-extra-run offset = "how far into a consecutive True run am
+      I" (0 at non-extra, 1, 2, ... at consecutive painted slots),
+      computed via ``arange - cummax(where(is_extra, -1, arange))``.
+      At real slots the cummax catches up to ``arange`` (offset = 0);
+      at painted slots the cummax stays anchored at the last real
+      slot's index (offset = run position).  Adding ``base + offset``
+      reproduces the per-source python loop's ``out[i - 1] + 1``
+      recurrence without a Python-level walk.
+
+    Caller invariant: position 0 of the expanded body (i.e.
+    ``is_extra[0]``) is always False -- the first slot past the
+    synthetic prepend is the body's first real carrier.  The cummax
+    trick still handles ``is_extra[0] == True`` gracefully (initial
+    cummax sentinel = -1, so offset at slot 0 = 1), but the caller's
+    contract makes that path unreachable in practice.
+    """
+    if n_expanded_real == 0:
+        return np.empty(0, dtype=np.uint32)
+
+    real_positions = np.nonzero(state.real_mask)[0].astype(np.uint32)
+
+    is_extra = (
+        extra_value_v2_mask[1 : n_expanded_real + 1]
+        | extra_f128_mask[1 : n_expanded_real + 1]
+    )
+
+    # ``carrier_idx_per_slot[i] = number of real slots in is_extra[:i + 1] - 1``.
+    # Painted slots inherit the prior real slot's carrier index because
+    # ``~is_extra`` contributes 0 to the cumsum at painted positions.
+    not_extra = (~is_extra).view(np.uint8)
+    carrier_idx_per_slot = np.cumsum(not_extra, dtype=np.int64) - 1
+
+    base = real_positions[carrier_idx_per_slot]
+
+    # Per-slot offset within the current painted run:
+    #   * 0 at a real (non-painted) slot
+    #   * 1, 2, ... at the 1st, 2nd, ... consecutive painted slot
+    # ``arange - cummax(arange_or_minus_one_at_painted)`` produces this:
+    # at real slots the cummax catches up to ``arange``, so offset = 0;
+    # at painted slots the cummax stays at the last real position, so
+    # offset = (slot index) - (last real slot index) = run position.
+    arange_n = np.arange(n_expanded_real, dtype=np.int64)
+    real_anchor = np.where(is_extra, np.int64(-1), arange_n)
+    last_real_pos = np.maximum.accumulate(real_anchor)
+    extra_run_offset = arange_n - last_real_pos
+
+    return (base.astype(np.int64) + extra_run_offset).astype(np.uint32)
