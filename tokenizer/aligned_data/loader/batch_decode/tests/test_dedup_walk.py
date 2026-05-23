@@ -998,3 +998,212 @@ def test_counter_offset_skipped_when_zero():
 
     # Callee's in-stream BLOCK ids [0, 1] -> offset 5 -> [5, 6].
     assert identities[slices[1].start + 1 : slices[1].stop].tolist() == [5, 6]
+
+
+# ---------------------------------------------------------------------------
+# Multi-row mapping (RESAMPLE / REDISTRIBUTE) — one variant referenced by
+# multiple batch rows. Each row must get a full FID sidecar slice with the
+# same counter_id -> function_name_ptr mapping.
+# ---------------------------------------------------------------------------
+
+
+def _wrap_variant_into_multi_row_batch(
+    stage3_variant: Stage3Variant,
+    identities_flat: np.ndarray,
+    *,
+    mapping: np.ndarray,
+) -> Stage3Batch:
+    """Wrap a single Stage3Variant in a batch whose mapping points
+    multiple rows at the same ``(section_idx=0, slot_idx=0)``.
+
+    Mirrors :func:`_wrap_variant_into_batch` but lets the caller supply
+    ``batch_idx_to_section_variant`` directly so the test can express
+    RESAMPLE / REDISTRIBUTE multi-mapped layouts.
+    """
+    stage1_variant = stage3_variant.stage2.stage1
+    section_obj = Section(
+        function_name_ptr=stage1_variant.call_targets[0].function_name_ptr,
+        section_offset=0,
+        call_targets=stage1_variant.call_targets[0].call_targets_section,
+        variants=[],
+    )
+    stage1_section_obj = Stage1Section(
+        arm=SectionKind.MATCHED,
+        idx=0,
+        section=section_obj,
+        variants=[stage1_variant],
+    )
+    batch_size = int(mapping.shape[0])
+    stage1_batch = Stage1Batch(
+        sections=[stage1_section_obj],
+        batch_idx_to_section_variant=mapping.astype(np.uint32),
+        batch_size=batch_size,
+    )
+    stage2_section_obj = Stage2Section(
+        stage1=stage1_section_obj,
+        variants=[stage3_variant.stage2],
+    )
+    stage2_batch = Stage2Batch(
+        stage1=stage1_batch,
+        sections=[stage2_section_obj],
+        identity_row_offsets=np.zeros(batch_size + 1, dtype=np.uint32),
+        number_row_offsets=np.zeros(batch_size + 1, dtype=np.uint32),
+    )
+    stage3_section = Stage3Section(
+        stage2=stage2_section_obj,
+        variants=[stage3_variant],
+    )
+    return Stage3Batch(
+        stage2=stage2_batch,
+        sections=[stage3_section],
+        inline_bytes=np.zeros(1, dtype=np.uint8),
+        identities_flat_caller_local=identities_flat,
+        numbers_per_TokenType={},
+        identity_idx_2d=np.zeros((0, 2), dtype=np.uint32),
+        number_idx_2d_per_TokenType={},
+        vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
+        f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
+    )
+
+
+def test_resample_multi_mapped_rows_both_get_fid_sidecar():
+    """RESAMPLE: one variant referenced by TWO batch rows. Both rows
+    must receive a non-zero FID sidecar slice with the same counter_id
+    -> function_name_ptr mapping (per plan D5).
+
+    Prior to the row-keyed FID emission fix the second row got a
+    zero-length slice because ``Stage1Variant.batch_idx`` records only
+    the FIRST referencing row (per ``_section_walk`` module docstring),
+    so the variant-keyed walk emitted exactly one row's contribution.
+    This test pins the regression.
+    """
+
+    root = _CallTargetBuild(
+        fid=100,
+        encounter_category=Category.LOCAL_FUNC,
+        in_stream_caller_local_ids=[0, 0],
+        in_stream_categories=[Category.LOCAL_FUNC, Category.PLT_FUNC],
+        section_call_targets=[
+            (200, CallTargetType.LOCAL),  # caller-local LOCAL 0
+            (300, CallTargetType.PLT),  # caller-local PLT 0
+        ],
+        counter_counts={},
+    )
+    stage3_variant, identities, _ = _make_stage3_variant_from_calls(
+        [root], batch_idx=0
+    )
+    # Two rows BOTH pointing at (section=0, slot=0). Per the
+    # _section_walk contract Stage1Variant.batch_idx is the FIRST
+    # referencing row (= 0); the second row reaches the same variant
+    # only via batch_idx_to_section_variant.
+    mapping = np.asarray([[0, 0], [0, 0]], dtype=np.uint32)
+    stage3_batch = _wrap_variant_into_multi_row_batch(
+        stage3_variant, identities, mapping=mapping
+    )
+
+    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+        stage3_batch,
+        dedup_maps=_make_dedup_maps(),
+        collect_fid_sidecar=True,
+    )
+
+    assert fid_sidecar is not None
+    assert fid_row_offsets is not None
+    # Per-row sidecar: LOCAL_FUNC counters 0/1 -> FIDs 100 (root seed)
+    # + 200 (minted by root's ALG-3); PLT_FUNC counter 0 -> FID 300;
+    # EXT_FUNC empty. Layout: [LOCAL_inverse, PLT_inverse, EXT_inverse]
+    # per row.
+    per_row_expected = [100, 200, 300]
+    assert fid_row_offsets.tolist() == [0, 3, 6]
+    # Both rows must hold the same per-row sidecar content.
+    assert fid_sidecar.tolist() == per_row_expected + per_row_expected
+
+
+def test_resample_multi_mapped_rows_with_padding_and_real_mix():
+    """RESAMPLE with a mix of mapped + sentinel rows: ensure the
+    per-row sidecar offsets account for padding rows (zero
+    contribution) AND multi-mapped rows (full per-row contribution).
+    """
+
+    root = _CallTargetBuild(
+        fid=100,
+        encounter_category=Category.LOCAL_FUNC,
+        in_stream_caller_local_ids=[0],
+        in_stream_categories=[Category.LOCAL_FUNC],
+        section_call_targets=[
+            (200, CallTargetType.LOCAL),
+        ],
+        counter_counts={},
+    )
+    stage3_variant, identities, _ = _make_stage3_variant_from_calls(
+        [root], batch_idx=0
+    )
+    # 4 rows: row 0 + row 2 point at variant (0, 0); rows 1 + 3 are
+    # padding sentinels.
+    mapping = np.asarray(
+        [
+            [0, 0],
+            [0xFFFFFFFF, 0xFFFFFFFF],
+            [0, 0],
+            [0xFFFFFFFF, 0xFFFFFFFF],
+        ],
+        dtype=np.uint32,
+    )
+    stage3_batch = _wrap_variant_into_multi_row_batch(
+        stage3_variant, identities, mapping=mapping
+    )
+
+    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+        stage3_batch,
+        dedup_maps=_make_dedup_maps(),
+        collect_fid_sidecar=True,
+    )
+
+    assert fid_sidecar is not None
+    assert fid_row_offsets is not None
+    # Each real row contributes 2 entries (LOCAL_FUNC counters 0 + 1).
+    # Padding rows contribute 0.
+    # Cumulative offsets: row0=0->2, row1=2->2, row2=2->4, row3=4->4.
+    assert fid_row_offsets.tolist() == [0, 2, 2, 4, 4]
+    # Layout: row 0's sidecar = [100, 200]; row 2's sidecar = [100, 200].
+    assert fid_sidecar.tolist() == [100, 200, 100, 200]
+
+
+def test_redistribute_three_rows_same_variant_get_identical_sidecar():
+    """REDISTRIBUTE: three batch rows all referencing one variant.
+    All three rows get identical FID sidecar slices."""
+
+    # Variant references one LOCAL callee + one EXTERN callee.
+    root = _CallTargetBuild(
+        fid=100,
+        encounter_category=Category.LOCAL_FUNC,
+        in_stream_caller_local_ids=[0, 0],
+        in_stream_categories=[Category.LOCAL_FUNC, Category.EXT_FUNC],
+        section_call_targets=[
+            (200, CallTargetType.LOCAL),  # LOCAL caller-local 0
+            (500, CallTargetType.EXTERN),  # EXTERN caller-local 0
+        ],
+        counter_counts={},
+    )
+    stage3_variant, identities, _ = _make_stage3_variant_from_calls(
+        [root], batch_idx=0
+    )
+    mapping = np.asarray(
+        [[0, 0], [0, 0], [0, 0]], dtype=np.uint32
+    )
+    stage3_batch = _wrap_variant_into_multi_row_batch(
+        stage3_variant, identities, mapping=mapping
+    )
+
+    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+        stage3_batch,
+        dedup_maps=_make_dedup_maps(),
+        collect_fid_sidecar=True,
+    )
+
+    assert fid_sidecar is not None
+    assert fid_row_offsets is not None
+    # Per-row layout: LOCAL[100, 200], PLT[], EXT[500].
+    per_row = [100, 200, 500]
+    assert fid_row_offsets.tolist() == [0, 3, 6, 9]
+    assert fid_sidecar.tolist() == per_row + per_row + per_row
