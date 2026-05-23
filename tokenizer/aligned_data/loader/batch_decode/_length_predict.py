@@ -41,9 +41,12 @@ from typing import TYPE_CHECKING, List
 
 import numpy as np
 
-from ._batch_layout import UINT32_MAX
 from ._cutoff_walk import walk_cutoff
 from ._expand_tokens import ExpandedTokens, expand_tokens
+from ._row_expand import (
+    build_per_row_variant_lookup,
+    row_offsets_from_per_variant_lengths,
+)
 from ._surviving_counts import count_surviving
 from ._types import (
     Stage1Batch,
@@ -144,33 +147,43 @@ def _build_row_offsets(
     same :class:`Stage2Variant` totals. Padding rows
     (``UINT32_MAX`` sentinel) contribute 0.
 
+    Vectorized via :mod:`._row_expand` -- the per-variant scalar totals
+    are gathered into flat arrays (one entry per unique variant in
+    section -> slot order), then expanded to per-row via the shared
+    lookup + cumsum primitive. No Python loop over ``batch_size``.
+
     Returns ``(identity_row_offsets, number_row_offsets)``; both have
     shape ``(batch_size + 1,)`` and dtype ``u32``. ``offsets[0]`` is
     always 0; ``offsets[i+1] = offsets[i] + row_sum_at_i``.
     """
 
-    batch_size = stage1.batch_size
-    identity_row_offsets = np.zeros(batch_size + 1, dtype=np.uint32)
-    number_row_offsets = np.zeros(batch_size + 1, dtype=np.uint32)
+    # Per-unique-variant flat arrays of surviving counts; section ->
+    # slot order matches ``build_per_row_variant_lookup``'s flat index.
+    per_variant_identity: List[int] = []
+    per_variant_number: List[int] = []
+    variants_per_section: List[int] = []
+    for stage2_section in stage2_sections:
+        variants_per_section.append(len(stage2_section.variants))
+        for stage2_variant in stage2_section.variants:
+            per_variant_identity.append(
+                stage2_variant.total_surviving_identity_count
+            )
+            per_variant_number.append(
+                stage2_variant.total_surviving_number_chunk_count
+            )
 
-    mapping = stage1.batch_idx_to_section_variant
-    for row in range(batch_size):
-        section_idx = int(mapping[row, 0])
-        slot_v = int(mapping[row, 1])
-        if section_idx == int(UINT32_MAX) or slot_v == int(UINT32_MAX):
-            row_identity = 0
-            row_number = 0
-        else:
-            stage2_variant = stage2_sections[section_idx].variants[slot_v]
-            row_identity = stage2_variant.total_surviving_identity_count
-            row_number = stage2_variant.total_surviving_number_chunk_count
-        identity_row_offsets[row + 1] = (
-            identity_row_offsets[row] + row_identity
-        )
-        number_row_offsets[row + 1] = (
-            number_row_offsets[row] + row_number
-        )
+    per_row_variant_idx, is_padding = build_per_row_variant_lookup(
+        stage1.batch_idx_to_section_variant, variants_per_section
+    )
 
+    identity_lengths = np.array(per_variant_identity, dtype=np.uint32)
+    number_lengths = np.array(per_variant_number, dtype=np.uint32)
+    identity_row_offsets = row_offsets_from_per_variant_lengths(
+        identity_lengths, per_row_variant_idx, is_padding
+    )
+    number_row_offsets = row_offsets_from_per_variant_lengths(
+        number_lengths, per_row_variant_idx, is_padding
+    )
     return identity_row_offsets, number_row_offsets
 
 

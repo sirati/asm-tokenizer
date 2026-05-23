@@ -69,7 +69,7 @@ from dedup_hashmap import HashMapU32U16
 
 from tokenizer.tokens import Category
 
-from .._batch_layout import UINT32_MAX
+from .._row_expand import build_per_row_variant_lookup, concat_per_row
 from ._constants import (
     COUNTER_CATEGORIES,
     FUNCTION_CATEGORIES,
@@ -165,7 +165,6 @@ def apply_per_row_remap(
 
     identities_flat = stage3_batch.identities_flat_caller_local
     stage1_batch = stage3_batch.stage2.stage1
-    batch_size = stage1_batch.batch_size
 
     # Per-variant FID inverse cache keyed on (section_idx, slot_idx).
     # Populated in pass 1 ONLY when the sidecar is requested — pass 1
@@ -199,53 +198,40 @@ def apply_per_row_remap(
 
     # ----- Pass 2: row-keyed FID sidecar emission. -----
     assert fid_inverse_per_variant is not None  # for type-checker
-    mapping = stage1_batch.batch_idx_to_section_variant
-    sentinel = int(UINT32_MAX)
 
-    fid_chunks: list[np.ndarray] = [
-        np.zeros(0, dtype=np.uint32) for _ in range(batch_size)
-    ]
-    fid_row_lengths = np.zeros(batch_size, dtype=np.uint32)
+    # Build per-unique-variant flat sidecar arrays in section -> slot
+    # order. Variants that pass 1 skipped (``batch_idx is None``) get
+    # an empty u32 array -- they cannot be referenced by any batch row,
+    # but keeping the slot in the flat index preserves the helper's
+    # ``(section_idx, slot_idx) -> flat_variant_idx`` lookup contract.
+    per_variant_sidecar: list[np.ndarray] = []
+    variants_per_section: list[int] = []
+    for section_idx, stage3_section in enumerate(stage3_batch.sections):
+        variants_per_section.append(len(stage3_section.variants))
+        for slot_idx in range(len(stage3_section.variants)):
+            per_variant = fid_inverse_per_variant.get(
+                (section_idx, slot_idx)
+            )
+            if per_variant is None:
+                per_variant_sidecar.append(np.zeros(0, dtype=np.uint32))
+                continue
+            pieces = [per_variant[cat] for cat in FUNCTION_CATEGORIES]
+            row_sidecar = (
+                np.concatenate(pieces).astype(np.uint32)
+                if any(p.size > 0 for p in pieces)
+                else np.zeros(0, dtype=np.uint32)
+            )
+            per_variant_sidecar.append(row_sidecar)
 
-    for batch_idx in range(batch_size):
-        section_idx_u = int(mapping[batch_idx, 0])
-        slot_idx_u = int(mapping[batch_idx, 1])
-        # Padding sentinel -> zero-length sidecar contribution. ALG-10
-        # always sets both columns to the sentinel together, but the
-        # OR-check is the defensible reading of "is this a real
-        # mapping entry".
-        if section_idx_u == sentinel or slot_idx_u == sentinel:
-            continue
-
-        key = (section_idx_u, slot_idx_u)
-        # If the mapping points at a variant whose ``batch_idx is
-        # None``, pass 1 skipped it — defensive guard mirrors the
-        # variant-skip in pass 1.
-        per_variant = fid_inverse_per_variant.get(key)
-        if per_variant is None:
-            continue
-
-        # Per-row sidecar: concatenate LOCAL_FUNC, PLT_FUNC, EXT_FUNC
-        # inverse maps in their dense counter-id order (the order
-        # ``_walk_one_variant`` built them in, which matches counter-id
-        # order because fresh ids are minted densely).
-        pieces = [per_variant[cat] for cat in FUNCTION_CATEGORIES]
-        row_sidecar = (
-            np.concatenate(pieces).astype(np.uint32)
-            if any(p.size > 0 for p in pieces)
-            else np.zeros(0, dtype=np.uint32)
-        )
-        fid_chunks[batch_idx] = row_sidecar
-        fid_row_lengths[batch_idx] = row_sidecar.size
-
-    fid_sidecar = (
-        np.concatenate(fid_chunks).astype(np.uint32)
-        if any(c.size > 0 for c in fid_chunks)
-        else np.zeros(0, dtype=np.uint32)
+    per_row_variant_idx, is_padding = build_per_row_variant_lookup(
+        stage1_batch.batch_idx_to_section_variant, variants_per_section
     )
-    fid_row_offsets = np.empty(batch_size + 1, dtype=np.uint32)
-    fid_row_offsets[0] = 0
-    np.cumsum(fid_row_lengths, out=fid_row_offsets[1:])
+    fid_sidecar, fid_row_offsets = concat_per_row(
+        per_variant_sidecar,
+        per_row_variant_idx,
+        is_padding,
+        dtype=np.dtype(np.uint32),
+    )
     return identities_flat, fid_sidecar, fid_row_offsets
 
 

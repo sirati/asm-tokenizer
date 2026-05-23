@@ -72,13 +72,75 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ._batch_layout import UINT32_MAX
+from ._row_expand import build_per_row_variant_lookup
 
 if TYPE_CHECKING:
-    from ._types import Stage3Batch
+    from ._types import Stage3Batch, Stage3Variant
 
 
 __all__ = ["assemble_tokens"]
+
+
+def _build_variant_row(
+    stage3_variant: "Stage3Variant",
+    *,
+    context_len: int,
+) -> np.ndarray:
+    """Build the ``u16[context_len]`` token row for ONE unique variant.
+
+    Concatenates the variant's call_targets' surviving prefixes
+    (``expanded_token_ids[:partial_cut_length]``) in encounter order,
+    capping at ``context_len`` total columns. Trailing positions stay
+    at id 0 (the null-content slot per plan D5) via the zero-allocation.
+
+    Returns a fresh ``u16`` array; callers scatter it into the per-row
+    rows of the batch tokens tensor by fancy-indexing.
+    """
+
+    row = np.zeros(context_len, dtype=np.uint16)
+    if context_len == 0:
+        return row
+
+    # ``Stage1Variant.batch_idx is None`` marks a "padding out" slot
+    # (RAGGED post-cutoff drop). Such variants must not contribute
+    # content even though the mapping entry isn't the sentinel.
+    if stage3_variant.stage2.stage1.batch_idx is None:
+        return row
+
+    col = 0
+    for stage3_ct in stage3_variant.call_targets:
+        if col >= context_len:
+            break
+        stage2_ct = stage3_ct.stage2
+        partial_cut_length = stage2_ct.partial_cut_length
+        if partial_cut_length <= 0:
+            # Dropped (post-cut) or empty call_target -- no write.
+            continue
+
+        # Defensive cap: never exceed the remaining column budget.
+        # Per the plan's ``partial_cut_length`` accounting (Stage 2
+        # step 4), the *sum* of ``partial_cut_length`` across this
+        # variant's surviving call_targets is exactly the row's
+        # ``surviving_token_count``, which is ``<= context_len``. The
+        # cap here is a belt-and-braces guard against any upstream
+        # accounting drift; it costs one ``min()`` per call_target.
+        remaining = context_len - col
+        write_count = (
+            partial_cut_length
+            if partial_cut_length <= remaining
+            else remaining
+        )
+
+        src = stage2_ct.expanded_token_ids[:write_count]
+        assert src.shape[0] == write_count, (
+            f"expanded_token_ids shorter than partial_cut_length: "
+            f"got {src.shape[0]}, expected {write_count} "
+            f"(predicted_full_length={stage2_ct.predicted_full_length}, "
+            f"partial_cut_length={partial_cut_length})"
+        )
+        row[col : col + write_count] = src
+        col += write_count
+    return row
 
 
 def assemble_tokens(
@@ -160,97 +222,44 @@ def assemble_tokens(
     stage2_batch = stage3_batch.stage2
     stage1_batch = stage2_batch.stage1
     batch_size = stage1_batch.batch_size
-    mapping = stage1_batch.batch_idx_to_section_variant
-    sections = stage1_batch.sections  # parallel to stage3_batch.sections
 
     tokens = np.zeros((batch_size, context_len), dtype=np.uint16)
 
     # Fast-path: ``context_len == 0`` means no column budget; nothing
     # can ever be written. The zero-allocation already matches the
-    # contract -- exit early to avoid spinning the per-row loop. Same
-    # logic when there are no rows.
+    # contract -- exit early to avoid spinning the per-variant build.
+    # Same logic when there are no rows.
     if batch_size == 0 or context_len == 0:
         return tokens
 
-    sentinel = int(UINT32_MAX)
-
-    for row in range(batch_size):
-        section_idx = int(mapping[row, 0])
-        slot_idx = int(mapping[row, 1])
-        # Padding sentinel -> row stays at id 0 (zero-allocation).
-        # Either column being the sentinel is treated as "padding";
-        # ALG-10 always sets both columns to the sentinel together, but
-        # the OR-check is the defensible reading of "is this a real
-        # mapping entry".
-        if section_idx == sentinel or slot_idx == sentinel:
-            continue
-
-        stage1_section = sections[section_idx]
-        stage1_variant = stage1_section.variants[slot_idx]
-
-        # ``Stage1Variant.batch_idx is None`` marks a "padding out" slot
-        # per the field's docstring (RAGGED post-cutoff drop). Such
-        # variants must not contribute content even though the mapping
-        # entry isn't the sentinel.
-        if stage1_variant.batch_idx is None:
-            continue
-
-        # Resolve the matching stage-3 variant via the parallel
-        # ``sections[*].variants[*]`` hierarchy. The 4 stages share
-        # identical (section, variant, call_target) indexing per the
-        # plan's D9 contract -- ``stage3.sections[section_idx].variants
-        # [slot_idx]`` mirrors ``stage1.sections[section_idx].variants
-        # [slot_idx]``.
-        stage3_variant = stage3_batch.sections[section_idx].variants[slot_idx]
-
-        # Per-row write head; advances by partial_cut_length per
-        # call_target. Capped at context_len from the get-go so the
-        # secondary defensive cap (slice stop = min(remaining, ...))
-        # never accidentally overruns.
-        col = 0
-
-        for stage3_ct in stage3_variant.call_targets:
-            if col >= context_len:
-                break
-            stage2_ct = stage3_ct.stage2
-            partial_cut_length = stage2_ct.partial_cut_length
-            if partial_cut_length <= 0:
-                # Dropped (post-cut) or empty call_target -- no write.
-                continue
-
-            # Defensive cap: never exceed the remaining column budget.
-            # Per the plan's ``partial_cut_length`` accounting (Stage 2
-            # step 4), the *sum* of ``partial_cut_length`` across this
-            # variant's surviving call_targets is exactly the row's
-            # ``surviving_token_count``, which is ``<= context_len``.
-            # The cap here is a belt-and-braces guard against any
-            # upstream accounting drift; it costs one ``min()`` per
-            # call_target.
-            remaining = context_len - col
-            write_count = (
-                partial_cut_length
-                if partial_cut_length <= remaining
-                else remaining
+    # Per-unique-variant row content in section -> slot flat order. The
+    # outer loop iterates UNIQUE variants (NOT batch rows): multi-mapped
+    # variants are built once and scattered to every referencing row.
+    # Variants with ``batch_idx is None`` (RAGGED post-cutoff drop) and
+    # variants outside the referenced set produce an all-zero row, which
+    # has no effect on the scatter.
+    per_variant_rows: list[np.ndarray] = []
+    variants_per_section: list[int] = []
+    for stage3_section in stage3_batch.sections:
+        variants_per_section.append(len(stage3_section.variants))
+        for stage3_variant in stage3_section.variants:
+            per_variant_rows.append(
+                _build_variant_row(stage3_variant, context_len=context_len)
             )
 
-            # Slice into ``expanded_token_ids`` -- numpy's slice
-            # semantics clamp ``stop`` to the array length, so a
-            # ``write_count`` that exceeds the array length (impossible
-            # under the plan's contract but cheap to defend against)
-            # would still copy at most ``len(expanded_token_ids)``
-            # tokens. The assignment shape-check fires if the slice
-            # and destination disagree -- the assertion below pins the
-            # contract explicitly so a mismatch surfaces here rather
-            # than as a NumPy traceback.
-            src = stage2_ct.expanded_token_ids[:write_count]
-            assert src.shape[0] == write_count, (
-                f"expanded_token_ids shorter than partial_cut_length: "
-                f"got {src.shape[0]}, expected {write_count} "
-                f"(predicted_full_length={stage2_ct.predicted_full_length}, "
-                f"partial_cut_length={partial_cut_length})"
-            )
+    per_row_variant_idx, is_padding = build_per_row_variant_lookup(
+        stage1_batch.batch_idx_to_section_variant, variants_per_section
+    )
 
-            tokens[row, col : col + write_count] = src
-            col += write_count
+    if not per_variant_rows:
+        # No variants exist in the hierarchy. Every row is padding (or
+        # the batch is empty); the zero-allocation already matches.
+        return tokens
 
+    per_variant_arr = np.stack(per_variant_rows, axis=0)
+    # Scatter per-variant rows to batch rows, skipping padding rows
+    # whose tokens row stays at id 0 from the zero-allocation.
+    real_mask = ~is_padding
+    if real_mask.any():
+        tokens[real_mask] = per_variant_arr[per_row_variant_idx[real_mask]]
     return tokens

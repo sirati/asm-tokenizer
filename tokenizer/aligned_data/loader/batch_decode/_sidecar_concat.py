@@ -39,10 +39,10 @@ import numpy as np
 
 from tokenizer.tokens import TokenType
 
-from ._batch_layout import UINT32_MAX
+from ._row_expand import build_per_row_variant_lookup, concat_per_row
 
 if TYPE_CHECKING:
-    from ._types import Stage3Batch, Stage3CallTarget
+    from ._types import Stage3Batch, Stage3CallTarget, Stage3Variant
 
 
 __all__ = [
@@ -156,22 +156,65 @@ def _emit_call_target_chunks(
     return write_offset + n_chunks
 
 
+def _emit_variant_chunks(
+    stage3_variant: "Stage3Variant",
+    numbers_per_TokenType: dict[TokenType, tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build per-variant ``(sig, sex)`` arrays in stream-emission order.
+
+    Single concern: walk one :class:`Stage3Variant`'s call_targets in
+    encounter order and emit the surviving chunks into a fresh
+    per-variant buffer pair. The buffer size is the variant's
+    ``total_surviving_number_chunk_count`` (i.e. the per-variant cumsum
+    expected by stage 2's row_offsets sizing). Each call_target's
+    contribution lands at the right offset via the same
+    :func:`_emit_call_target_chunks` kernel used pre-vectorization --
+    the kernel writes per-:class:`TokenType` chunks into a row segment
+    scattered by ``type_mask``, which is identical whether the row
+    segment is a true per-row slice or a per-variant temporary buffer.
+    """
+
+    n_chunks = stage3_variant.stage2.total_surviving_number_chunk_count
+    sig = np.empty(n_chunks, dtype=np.uint64)
+    sex = np.empty(n_chunks, dtype=np.uint32)
+    if n_chunks == 0:
+        return sig, sex
+
+    write_offset = 0
+    for call_target in stage3_variant.call_targets:
+        write_offset = _emit_call_target_chunks(
+            call_target,
+            numbers_per_TokenType,
+            sig,
+            sex,
+            write_offset,
+        )
+    if write_offset != n_chunks:
+        raise AssertionError(
+            f"variant emitted {write_offset} chunks but stage 2 sized "
+            f"the per-variant buffer at {n_chunks}; stage 2 / stage 3 "
+            "sizing mismatch"
+        )
+    return sig, sex
+
+
 def assemble_number_sidecars(
     stage3_batch: "Stage3Batch",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Concatenate per-:class:`TokenType` ``(significand, sign_exp)``
     chunks into the global row-major number sidecars.
 
-    Iterates the ``batch_size`` rows of
-    :attr:`Stage1Batch.batch_idx_to_section_variant`. Padding rows
-    (sentinel ``(UINT32_MAX, UINT32_MAX)``) contribute zero chunks;
-    real rows walk their referenced :class:`Stage3Variant` in
-    encounter order across the level-4 call_targets and emit
-    surviving chunks in stream order.
+    Vectorized via :mod:`._row_expand`: per-variant ``(sig, sex)``
+    buffers are built once per unique variant (no Python loop over
+    ``batch_size``), then scattered to batch rows by the shared
+    lookup + concat primitive. Padding rows (sentinel
+    ``(UINT32_MAX, UINT32_MAX)``) contribute zero chunks; their
+    expected ``number_row_offsets`` delta is checked against zero by
+    the helper.
 
     Multi-row mapping: when one :class:`Stage1Variant` is referenced
-    by multiple batch rows (RESAMPLE / REDISTRIBUTE), each row
-    re-emits the same chunks -- stage 2's
+    by multiple batch rows (RESAMPLE / REDISTRIBUTE), the variant's
+    chunks are emitted once per referencing row -- stage 2's
     :attr:`Stage2Batch.number_row_offsets` already accounts for the
     duplication when sizing the output.
 
@@ -183,47 +226,38 @@ def assemble_number_sidecars(
     stage2_batch = stage3_batch.stage2
     stage1_batch = stage2_batch.stage1
     number_row_offsets = stage2_batch.number_row_offsets
-    total_chunks = int(number_row_offsets[-1])
 
-    out_sig = np.empty(total_chunks, dtype=np.uint64)
-    out_sex = np.empty(total_chunks, dtype=np.uint32)
-    if total_chunks == 0:
-        return out_sig, out_sex
-
-    mapping = stage1_batch.batch_idx_to_section_variant
     numbers_per_TokenType = stage3_batch.numbers_per_TokenType
 
-    for batch_idx in range(stage1_batch.batch_size):
-        section_idx, variant_idx = mapping[batch_idx]
-        row_start = int(number_row_offsets[batch_idx])
-        row_stop = int(number_row_offsets[batch_idx + 1])
-        if section_idx == UINT32_MAX:
-            # Padding row -- per ALG-10 the sentinel is paired on both
-            # columns; row_offsets must already encode zero contribution.
-            if row_stop != row_start:
-                raise AssertionError(
-                    f"padding row {batch_idx} has non-zero "
-                    f"number_row_offsets delta {row_stop - row_start}"
-                )
-            continue
-
-        stage3_variant = stage3_batch.sections[int(section_idx)].variants[
-            int(variant_idx)
-        ]
-        write_offset = row_start
-        for call_target in stage3_variant.call_targets:
-            write_offset = _emit_call_target_chunks(
-                call_target,
-                numbers_per_TokenType,
-                out_sig,
-                out_sex,
-                write_offset,
+    # Per-variant ``(sig, sex)`` arrays in flat ``section -> slot`` order.
+    per_variant_sig: list[np.ndarray] = []
+    per_variant_sex: list[np.ndarray] = []
+    variants_per_section: list[int] = []
+    for stage3_section in stage3_batch.sections:
+        variants_per_section.append(len(stage3_section.variants))
+        for stage3_variant in stage3_section.variants:
+            sig, sex = _emit_variant_chunks(
+                stage3_variant, numbers_per_TokenType
             )
-        if write_offset != row_stop:
-            raise AssertionError(
-                f"row {batch_idx}: emitted {write_offset - row_start} "
-                f"chunks but number_row_offsets expects "
-                f"{row_stop - row_start}"
-            )
+            per_variant_sig.append(sig)
+            per_variant_sex.append(sex)
 
-    return out_sig, out_sex
+    per_row_variant_idx, is_padding = build_per_row_variant_lookup(
+        stage1_batch.batch_idx_to_section_variant, variants_per_section
+    )
+
+    sig_flat, _ = concat_per_row(
+        per_variant_sig,
+        per_row_variant_idx,
+        is_padding,
+        dtype=np.dtype(np.uint64),
+        expected_row_offsets=number_row_offsets,
+    )
+    sex_flat, _ = concat_per_row(
+        per_variant_sex,
+        per_row_variant_idx,
+        is_padding,
+        dtype=np.dtype(np.uint32),
+        expected_row_offsets=number_row_offsets,
+    )
+    return sig_flat, sex_flat
