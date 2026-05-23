@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name            = "dedup-hashmap"
-version         = "0.1.0"
-description     = "u64 -> u32 and u32 -> u32 hashmaps exposed to Python for asm-tokenizer dedup + writer state."
+version         = "0.2.0"
+description     = "Macro-generated PyO3 hashmaps over the Cartesian product of integer key types and integer/float value types, with numpy-batched lookup and insert."
 requires-python = ">=3.12"
 license         = { text = "Apache-2.0" }
 authors         = [{ name = "sirati" }]

@@ -18,14 +18,14 @@
 
 buildPythonPackage {
   pname = "dedup-hashmap";
-  version = "0.1.0";
+  version = "0.2.0";
   pyproject = true;
 
   src = lib.cleanSource ./..;
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     src = lib.cleanSource ./..;
-    hash = "sha256-9AOzi/OUiySETZ8xIJ5Ljj7WSflLpjg3UxpsYHLBPdc=";
+    hash = "sha256-MbZr1StYKqHZkm+lyDU069cl+wDd2J2uAV58gTNtDiY=";
   };
 
   nativeBuildInputs = [
@@ -37,7 +37,7 @@ buildPythonPackage {
   doCheck = false;
 
   meta = with lib; {
-    description = "u64 -> u32 and u32 -> u32 hashmaps exposed to Python for asm-tokenizer dedup + writer state.";
+    description = "Macro-generated PyO3 hashmaps over the Cartesian product of integer key types and integer/float value types, with numpy-batched lookup and insert.";
     license = licenses.asl20;
     platforms = platforms.unix;
   };
