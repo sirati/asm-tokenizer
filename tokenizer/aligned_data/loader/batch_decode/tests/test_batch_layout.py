@@ -2,8 +2,8 @@
 :class:`VariantPadding` policies.
 
 Synthetic ``ResolvedSection`` instances are built directly: the function under
-test is pure (no session / no I/O), and 1a's canonical declaration is
-shape-compatible with this module's local forward-reference.
+test is pure (no session / no I/O), so the test can populate the dataclass
+declared by ``_resolve_pointers`` (1a) without going through a session.
 """
 
 from __future__ import annotations
