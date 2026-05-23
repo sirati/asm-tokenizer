@@ -5,27 +5,30 @@ Public surface for the staged batch-decode pipeline (see
 stages (load -> length-predict -> bulk-bytes -> assemble) whose
 hierarchical handoff types live in :mod:`._types`.
 
-Re-exports are added by their owning phase. Phase 0b contributed the
-staged dataclasses, the :class:`VariantPadding` policy enum, and the
-:class:`SectionPointerSpec` request type. Subsequent phases (1-4) wire
-up the per-stage implementations; phase 4 adds the ``batch_decode``
-entry-point.
+Re-exports:
+
+- :class:`BatchDecodeResult` -- user-facing flat-tensor result.
+- :func:`batch_decode` -- end-to-end pipeline entry. Currently a stub
+  raising ``NotImplementedError`` until the stage implementations are
+  wired together.
+- :class:`VariantPadding` -- runtime enum controlling how short sections
+  pad into the linear batch layout.
+- :class:`SectionPointerSpec` -- typed ``(arm, idx)`` section pointer
+  request type.
 """
 
 from __future__ import annotations
 
+from ._entry import batch_decode
 from ._types import (
     BatchDecodeResult,
     SectionPointerSpec,
     VariantPadding,
 )
 
-# TODO(phase 4): re-export the ``batch_decode`` entry-point once
-# Phase 4 lands. It is intentionally absent from this package until
-# then -- importing it from outside is expected to fail.
-
 __all__ = [
     "BatchDecodeResult",
     "SectionPointerSpec",
     "VariantPadding",
+    "batch_decode",
 ]
