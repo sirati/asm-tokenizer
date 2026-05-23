@@ -6,8 +6,6 @@ Module layout (one concern per file):
 
 * :mod:`._band_constants` -- vocab anchors + canonical NUMBER-block
   TokenType ordering + per-type row widths.
-* :mod:`._position_map` -- expanded->raw position map +
-  inline-digit cumsum builders.
 * :mod:`._emit_fixed_fp` -- per-source row emission for F16 / BF16 /
   F32 / F64 / F80.
 * :mod:`._emit_f128` -- per-source row emission for FLOAT128 (1- and

@@ -1,16 +1,20 @@
 """Per-call-target expanded-stream walk and per-source dispatch.
 
-Single concern: walk one call_target's surviving expanded prefix, build
-the expanded->raw position map + inline-digit cumsum, and dispatch each
-surviving NUMBER-band carrier to the right per-:class:`TokenType`
-emitter. The emitters are owned by ``_emit_*`` siblings -- this module
-only does the routing.
+Single concern: walk one call_target's surviving expanded prefix,
+recover the expanded->raw position map via the shared
+:func:`tokenizer.aligned_data.loader.decoded._inline_decode_state.expanded_to_raw_position_map`
+helper, and dispatch each surviving NUMBER-band carrier to the right
+per-:class:`TokenType` emitter. The emitters are owned by ``_emit_*``
+siblings -- this module only does the routing.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
+    expanded_to_raw_position_map,
+)
 from tokenizer.tokens import TokenType
 
 from ._band_constants import (
@@ -21,10 +25,6 @@ from ._band_constants import (
 from ._emit_f128 import _emit_f128_source
 from ._emit_fixed_fp import _emit_fixed_fp_source
 from ._emit_vc2 import _emit_vc2_source
-from ._position_map import (
-    _build_inline_cumsum,
-    _expanded_to_raw_position_map,
-)
 
 
 __all__ = ["_emit_call_target_rows"]
@@ -54,27 +54,27 @@ def _emit_call_target_rows(
     """
 
     state = ct.stage1.state
-    number_mask = state.number_mask
     runlen_number = state.runlen_number
 
-    # Rebuild the expanded->raw position map. ``state.raw_tokens`` /
-    # ``state.real_mask`` reflect the pre-promotion stream; the painted
-    # continuation slots are NOT in real_mask but ARE in the kept set
-    # from ``expand_tokens``'s strip step. The map walks real_positions
-    # while injecting painted slots after each carrier when the
-    # extra_*_mask is True.
-    keep_raw_positions = _expanded_to_raw_position_map(
+    # Recover the expanded->raw position map.  Painted VC2 / F128
+    # continuation slots are NOT in ``state.real_mask`` but ARE in the
+    # kept set from ``expand_tokens``'s strip step.  The shared helper
+    # vectorises the prior per-call-target Python walk and reads only
+    # ``state.real_mask`` plus the two extra masks.
+    n_expanded_real = int(ct.extra_value_v2_mask.shape[0]) - 1
+    keep_raw_positions = expanded_to_raw_position_map(
         state=state,
+        n_expanded_real=n_expanded_real,
         extra_value_v2_mask=ct.extra_value_v2_mask,
         extra_f128_mask=ct.extra_f128_mask,
     )
 
-    # Cumulative count of inline-digit positions up to (but not
-    # including) each raw-stream position. Used to compute
-    # ``p_carrier_byte`` for each surviving carrier without a per-source
-    # search.  Length ``n_raw + 1`` so ``inline_cumsum[p] = number of
-    # inline-digit bytes at raw positions [0, p)``.
-    inline_cumsum = _build_inline_cumsum(number_mask)
+    # Exclusive-prefix inline-digit count per raw position lives on the
+    # shared ``InlineDecodeState`` (``digit_cumsum[p + 1]`` = inline
+    # byte count strictly before raw position ``p + 1``).  Reading the
+    # per-stream cumsum here keeps the per-call-target Python work to
+    # the carrier-emission loop only.
+    inline_cumsum = state.digit_cumsum
 
     inline_slice_start = int(inline_byte_slice.start)
 
