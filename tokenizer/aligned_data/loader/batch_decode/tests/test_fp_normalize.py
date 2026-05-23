@@ -496,7 +496,10 @@ def _f128_batch_expected_chunks(
     sign + the per-chunk normalization is identical to the oracle's
     ``_emit_chunk`` formula.
 
-    NaN/Inf: 1 chunk via the same ``_encode_infnan`` formula as the oracle.
+    NaN/Inf: 1 chunk; Inf vs NaN classification uses ONLY the high-
+    mantissa bits (.rodata-robustness policy -- 3c drops the low limb
+    for NaN/Inf sources so 3d can't see it). This mirrors the new
+    per-chunk normalize_f128 contract.
     """
     from tokenizer.aligned_data.loader.decoded.custom_float import (
         _emit_chunk,
@@ -509,7 +512,9 @@ def _f128_batch_expected_chunks(
     sign = -1 if sign_bit else +1
     if biased_exp == 0x7FFF:
         # NaN/Inf: 1 chunk via _encode_infnan(sign, mantissa_is_zero).
-        is_inf = raw_mantissa == 0
+        # High mantissa = bits [64, 112) of raw_mantissa = top 48 bits.
+        high_mantissa = (raw_mantissa >> 64) & ((1 << 48) - 1)
+        is_inf = high_mantissa == 0
         return [_encode_infnan(sign=sign, mantissa_is_zero=is_inf)]
     # Finite path: ALWAYS 2 chunks (low + high).
     bias = 16383
@@ -528,12 +533,64 @@ def _f128_batch_expected_chunks(
     ]
 
 
-def _run_f128(bits_list: list[int]) -> tuple[np.ndarray, np.ndarray]:
-    payloads = [_f128_to_be_bytes(b) for b in bits_list]
-    inline_bytes, idx_2d = _build_inline_bytes(payloads)
-    nan_or_inf = np.array(
-        [_f128_is_nan_or_inf_from_bits(b) for b in bits_list], dtype=bool
+def _build_f128_per_chunk_fixture(
+    bits_list: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build ``inline_bytes`` + per-chunk ``idx_2d`` for the F128 layout.
+
+    Per-source layout in ``idx_2d`` (matches 3c's emission contract):
+
+    * Finite source (``biased_exp != 0x7FFF``): 2 rows -- row 0 = LSB
+      limb (bytes 8..15 of the original 16-byte payload), row 1 = MSB
+      limb (bytes 0..7).
+    * NaN/Inf source (``biased_exp == 0x7FFF``): 1 row = MSB limb
+      (bytes 0..7).
+
+    Returns ``(inline_bytes, idx_2d, f128_is_nan_or_inf)``.
+    """
+    # Lay out each source's 16 bytes contiguously in inline_bytes after
+    # the leading pad. idx_2d's per-chunk rows then point into that
+    # contiguous region at the right 8-byte windows.
+    total_payload_bytes = 16 * len(bits_list)
+    inline_bytes = np.zeros(1 + total_payload_bytes, dtype=np.uint8)
+    rows: list[np.ndarray] = []
+    is_nan_or_inf_per_source: list[bool] = []
+    offset = 1  # index 0 = leading zero pad
+    for bits in bits_list:
+        payload = _f128_to_be_bytes(bits)
+        assert len(payload) == 16
+        inline_bytes[offset : offset + 16] = np.frombuffer(payload, dtype=np.uint8)
+        msb_byte_offset = offset  # bytes 0..7 of the payload
+        lsb_byte_offset = offset + 8  # bytes 8..15
+        nan_or_inf = _f128_is_nan_or_inf_from_bits(bits)
+        is_nan_or_inf_per_source.append(nan_or_inf)
+        if nan_or_inf:
+            # NaN/Inf source: 1 row = MSB limb.
+            rows.append(
+                np.arange(msb_byte_offset, msb_byte_offset + 8, dtype=np.uint32)
+            )
+        else:
+            # Finite source: 2 rows, LSB then MSB.
+            rows.append(
+                np.arange(lsb_byte_offset, lsb_byte_offset + 8, dtype=np.uint32)
+            )
+            rows.append(
+                np.arange(msb_byte_offset, msb_byte_offset + 8, dtype=np.uint32)
+            )
+        offset += 16
+    if rows:
+        idx_2d = np.stack(rows, axis=0)
+    else:
+        idx_2d = np.zeros((0, 8), dtype=np.uint32)
+    return (
+        inline_bytes,
+        idx_2d,
+        np.array(is_nan_or_inf_per_source, dtype=bool),
     )
+
+
+def _run_f128(bits_list: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    inline_bytes, idx_2d, nan_or_inf = _build_f128_per_chunk_fixture(bits_list)
     is_neg = np.zeros(len(bits_list), dtype=bool)  # F128 sign in bit pattern
     out = normalize_per_token_type(
         idx_2d_per_type={TokenType.FLOAT128: idx_2d},
@@ -635,10 +692,18 @@ def test_f128_random_sample_vs_batch_layout() -> None:
 
 def test_f128_sidecar_mismatch_raises() -> None:
     """Defensive check: f128_is_nan_or_inf sidecar must agree with the bit
-    pattern. A wrong sidecar value is a stage-2 invariant violation."""
-    payloads = [_f128_to_be_bytes(F128_ONE)]
-    inline_bytes, idx_2d = _build_inline_bytes(payloads)
-    # F128_ONE is finite, but we claim it's NaN/Inf.
+    pattern. A wrong sidecar value is a stage-2 invariant violation.
+
+    We hand-build a fixture where the sidecar says NaN/Inf (so 3c would
+    have emitted only the MSB row) but we instead supply the MSB row of
+    a FINITE F128 value. The normalizer's bit-pattern check should fire.
+    """
+    payload = _f128_to_be_bytes(F128_ONE)
+    # 3c-style fixture: claim NaN/Inf -> 1 chunk = MSB limb (bytes 0..7).
+    inline_bytes = np.zeros(1 + 8, dtype=np.uint8)
+    inline_bytes[1:9] = np.frombuffer(payload[:8], dtype=np.uint8)
+    idx_2d = np.arange(1, 9, dtype=np.uint32)[np.newaxis, :]
+    # F128_ONE is finite (biased_exp == 16383), but we claim NaN/Inf.
     nan_or_inf = np.array([True], dtype=bool)
     with pytest.raises(AssertionError, match="f128_is_nan_or_inf"):
         normalize_per_token_type(

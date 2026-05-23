@@ -40,14 +40,17 @@ def normalize_per_token_type(
     * ``idx_2d_per_type[T]``: ``u32[n_T_payload_units,
       payload_size_T]`` -- 2D indexer into ``inline_bytes``.
       ``payload_size_T`` per type: F16=2, BF16=2, F32=4, F64=8, F80=10,
-      F128=16, VC2=8.
+      F128=8, VC2=8.
         - F16, BF16, F32, F64, F80: one row per source.
-        - F128: one row per source (1 or 2 chunks per source emitted
-          internally based on ``f128_is_nan_or_inf``).
+        - F128: one row per CHUNK (2 rows per finite source -- LSB
+          then MSB limb -- and 1 row per NaN/Inf source = MSB limb).
+          ``f128_is_nan_or_inf`` carries the per-source role; the F128
+          normalizer rebuilds the per-source mapping from it.
         - VC2: one row per CHUNK (multi-chunk sources contribute K rows).
     * ``inline_bytes``: u8 array. The 2D indexers gather bytes from here.
-    * ``f128_is_nan_or_inf``: ``bool[n_f128_sources]``; aligned with the
-      F128 idx_2d rows.
+    * ``f128_is_nan_or_inf``: ``bool[n_f128_sources]``; one entry per
+      F128 SOURCE (not per chunk). Drives the per-source 1-vs-2 chunk
+      split when interpreting the F128 idx_2d rows.
     * ``vc2_chunk_exponent_sidecar``: ``u32[n_vc2_chunks]``; per-chunk
       ``chunk_index_within_source``.
     * ``is_negative_per_source_per_type[T]``: ``bool[n_T_sources]``; per
