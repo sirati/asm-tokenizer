@@ -98,6 +98,7 @@ def _run_normalize_simple(
         idx_2d_per_type={token_type: idx_2d},
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=np.zeros(0, dtype=bool),
+        f128_visible_chunks=np.zeros(0, dtype=np.uint8),
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
         is_negative_per_source_per_type={token_type: is_neg},
     )
@@ -204,6 +205,7 @@ def test_f16_empty_input() -> None:
         idx_2d_per_type={TokenType.FLOAT16: idx_2d},
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=np.zeros(0, dtype=bool),
+        f128_visible_chunks=np.zeros(0, dtype=np.uint8),
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
         is_negative_per_source_per_type={
             TokenType.FLOAT16: np.zeros(0, dtype=bool)
@@ -592,10 +594,15 @@ def _build_f128_per_chunk_fixture(
 def _run_f128(bits_list: list[int]) -> tuple[np.ndarray, np.ndarray]:
     inline_bytes, idx_2d, nan_or_inf = _build_f128_per_chunk_fixture(bits_list)
     is_neg = np.zeros(len(bits_list), dtype=bool)  # F128 sign in bit pattern
+    # No mid-cut here -- finite full sources contribute 2 chunks, NaN/Inf 1.
+    visible_chunks = np.where(nan_or_inf, np.uint8(1), np.uint8(2)).astype(
+        np.uint8
+    )
     out = normalize_per_token_type(
         idx_2d_per_type={TokenType.FLOAT128: idx_2d},
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=nan_or_inf,
+        f128_visible_chunks=visible_chunks,
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
         is_negative_per_source_per_type={TokenType.FLOAT128: is_neg},
     )
@@ -705,11 +712,15 @@ def test_f128_sidecar_mismatch_raises() -> None:
     idx_2d = np.arange(1, 9, dtype=np.uint32)[np.newaxis, :]
     # F128_ONE is finite (biased_exp == 16383), but we claim NaN/Inf.
     nan_or_inf = np.array([True], dtype=bool)
+    # Visible chunks must match the claim (NaN/Inf -> 1) so the row-count
+    # assertion lets us reach the bit-pattern sanity check.
+    visible_chunks = np.array([1], dtype=np.uint8)
     with pytest.raises(AssertionError, match="f128_is_nan_or_inf"):
         normalize_per_token_type(
             idx_2d_per_type={TokenType.FLOAT128: idx_2d},
             inline_bytes=inline_bytes,
             f128_is_nan_or_inf=nan_or_inf,
+            f128_visible_chunks=visible_chunks,
             vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
             is_negative_per_source_per_type={
                 TokenType.FLOAT128: np.zeros(1, dtype=bool)
@@ -776,6 +787,7 @@ def _run_vc2(
         idx_2d_per_type={TokenType.VALUED_CONST_V2: idx_2d},
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=np.zeros(0, dtype=bool),
+        f128_visible_chunks=np.zeros(0, dtype=np.uint8),
         vc2_chunk_exponent_sidecar=sidecar,
         is_negative_per_source_per_type={
             TokenType.VALUED_CONST_V2: is_neg,
@@ -889,6 +901,7 @@ def test_normalize_rejects_non_number_token_type() -> None:
             idx_2d_per_type={TokenType.BLOCK_V2: idx_2d},
             inline_bytes=inline_bytes,
             f128_is_nan_or_inf=np.zeros(0, dtype=bool),
+            f128_visible_chunks=np.zeros(0, dtype=np.uint8),
             vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
             is_negative_per_source_per_type={
                 TokenType.BLOCK_V2: np.zeros(1, dtype=bool)
@@ -926,6 +939,7 @@ def test_normalize_handles_multiple_token_types_in_one_call() -> None:
         },
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=np.zeros(0, dtype=bool),
+        f128_visible_chunks=np.zeros(0, dtype=np.uint8),
         vc2_chunk_exponent_sidecar=np.zeros(0, dtype=np.uint32),
         is_negative_per_source_per_type={
             TokenType.FLOAT16: np.zeros(2, dtype=bool),

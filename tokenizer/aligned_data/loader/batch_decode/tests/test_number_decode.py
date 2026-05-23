@@ -260,6 +260,7 @@ def test_empty_batch_emits_all_empty_arrays() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [slice(1, 1)])
 
     # All TokenType keys are present, all empty.
@@ -268,6 +269,7 @@ def test_empty_batch_emits_all_empty_arrays() -> None:
         assert chunk_slices_per_type[T] == [slice(0, 0)]
     assert f128_is_nan_or_inf.shape == (0,)
     assert vc2_sidecar.shape == (0,)
+    assert f128_visible_chunks.shape == (0,)
 
 
 def test_f32_single_source_one_row_four_bytes() -> None:
@@ -298,6 +300,7 @@ def test_f32_single_source_one_row_four_bytes() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -349,6 +352,7 @@ def test_fixed_width_fp_single_source(
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -400,6 +404,7 @@ def test_f128_finite_single_source_two_chunks() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -415,6 +420,9 @@ def test_f128_finite_single_source_two_chunks() -> None:
     assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 2)]
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([False], dtype=np.bool_)
+    )
+    np.testing.assert_array_equal(
+        f128_visible_chunks, np.array([2], dtype=np.uint8)
     )
     assert vc2_sidecar.shape == (0,)
 
@@ -444,6 +452,7 @@ def test_f128_nan_or_inf_single_source_one_chunk() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
@@ -453,6 +462,9 @@ def test_f128_nan_or_inf_single_source_one_chunk() -> None:
     assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 1)]
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([True], dtype=np.bool_)
+    )
+    np.testing.assert_array_equal(
+        f128_visible_chunks, np.array([1], dtype=np.uint8)
     )
     assert vc2_sidecar.shape == (0,)
 
@@ -504,6 +516,7 @@ def test_vc2_L17_three_chunks_with_msb_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     expected_rows = np.array(
@@ -548,6 +561,7 @@ def test_vc2_L8_one_chunk_no_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     expected_rows = np.array(
@@ -591,6 +605,7 @@ def test_vc2_L0_one_chunk_all_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     # VC2 chunk: all 8 pad zeros.
@@ -647,6 +662,7 @@ def test_vc2_mid_cut_drops_msb_chunk() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     expected_rows = np.array(
@@ -763,6 +779,7 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct0_slice, ct1_slice])
 
     # CT0's F32 row.
@@ -805,7 +822,8 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
 
 
 def test_dtypes_and_sidecar_widths() -> None:
-    """Test 10: idx_2d arrays are u32; vc2 sidecar u32; f128 flag bool."""
+    """Test 10: idx_2d arrays are u32; vc2 sidecar u32; f128 flag bool;
+    f128_visible_chunks u8."""
     raw_tokens = np.array(
         [_F128_RAW] + list(range(0x10, 0x20)), dtype=np.uint16
     )
@@ -823,12 +841,14 @@ def test_dtypes_and_sidecar_widths() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     for T, arr in idx_2d_per_type.items():
         assert arr.dtype == np.uint32, f"{T} idx_2d dtype = {arr.dtype}"
     assert vc2_sidecar.dtype == np.uint32
     assert f128_is_nan_or_inf.dtype == np.bool_
+    assert f128_visible_chunks.dtype == np.uint8
 
 
 def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
@@ -864,6 +884,7 @@ def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
+        f128_visible_chunks,
     ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
 
     # Only F16 emits; everything else empty.

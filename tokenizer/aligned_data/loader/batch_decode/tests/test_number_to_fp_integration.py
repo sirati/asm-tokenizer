@@ -353,7 +353,13 @@ def test_f128_3c_to_3d_chain_byte_equivalent(
     """
     stage2_batch, inline_bytes, ct_slice = _build_f128_stream(bits_list)
 
-    idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
+    (
+        idx_2d_per_type,
+        _,
+        f128_is_nan_or_inf,
+        vc2_sidecar,
+        f128_visible_chunks,
+    ) = build_number_idx_2d(
         stage2_batch, inline_bytes, [ct_slice]
     )
 
@@ -370,6 +376,7 @@ def test_f128_3c_to_3d_chain_byte_equivalent(
         idx_2d_per_type=idx_2d_per_type,
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
+        f128_visible_chunks=f128_visible_chunks,
         vc2_chunk_exponent_sidecar=vc2_sidecar,
         is_negative_per_source_per_type={
             TokenType.FLOAT128: np.zeros(n_sources, dtype=bool),
@@ -452,7 +459,13 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
     stage2_batch = _wrap_single_call_target(stage2_ct)
     inline_bytes, ct_slice = _build_inline_bytes_from_raw(raw_tokens)
 
-    idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
+    (
+        idx_2d_per_type,
+        _,
+        f128_is_nan_or_inf,
+        vc2_sidecar,
+        f128_visible_chunks,
+    ) = build_number_idx_2d(
         stage2_batch, inline_bytes, [ct_slice]
     )
 
@@ -461,6 +474,7 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
         idx_2d_per_type=idx_2d_per_type,
         inline_bytes=inline_bytes,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
+        f128_visible_chunks=f128_visible_chunks,
         vc2_chunk_exponent_sidecar=vc2_sidecar,
         is_negative_per_source_per_type={
             T: np.zeros(idx_2d_per_type[T].shape[0], dtype=bool)
@@ -489,3 +503,128 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
     got_f128_sig, got_f128_sign_exp = out[TokenType.FLOAT128]
     np.testing.assert_array_equal(got_f128_sig, expected_f128_sig)
     np.testing.assert_array_equal(got_f128_sign_exp, expected_f128_sign_exp)
+
+
+# ---------------------------------------------------------------------------
+# Mid-cut F128 finite source (cross-phase 2 <-> 3 row-count contract).
+# ---------------------------------------------------------------------------
+
+
+def test_f128_mid_cut_finite_emits_one_chunk_without_assertion() -> None:
+    """A mid-cut finite F128 source emits 1 row (LSB only) and the 3d
+    F128 normalizer accepts it without the row-count assertion firing.
+
+    Cross-phase contract: when ``partial_cut_length`` lands between a
+    finite F128 carrier and its painted MSB continuation slot, 3c emits
+    only the LSB chunk (1 row) and the per-source
+    ``f128_visible_chunks`` sidecar records 1 for that source. 3d's
+    F128 normalizer reads ``f128_visible_chunks`` (NOT
+    ``f128_is_nan_or_inf``) for ``chunks_per_source`` so the row-count
+    consistency check stays green; ``f128_is_nan_or_inf`` only routes
+    per-chunk dispatch.
+
+    Fixture: two finite F128 sources packed back-to-back where the
+    FIRST is fully visible (2 chunks) and the SECOND is mid-cut (1
+    LSB chunk only -- the painted MSB slot is past the cut). The full
+    source's MSB row is the predecessor that keeps the F128
+    normalizer's MSB-position read for the mid-cut source defensively
+    in-range. Bit-pattern sanity passes because the full source's MSB
+    is a valid finite F128 (biased_exp != 0x7FFF).
+
+    The mid-cut source's normalized output is semantically incomplete
+    (no MSB bytes were transmitted, so the encoded chunk uses the
+    fallback "read LSB as MSB" path -- which yields a finite-looking
+    biased_exp = 0 here because ``F128_ONE``'s low limb is zero) --
+    the test pins the row-count + assertion-free flow, NOT the byte
+    content of the mid-cut chunk.
+    """
+    # S0 (full, finite): F128_NEG_ONE -- contributes 2 chunks.
+    # S1 (mid-cut, finite): F128_ONE -- contributes 1 chunk (LSB only).
+    bits_s0 = F128_NEG_ONE
+    bits_s1 = F128_ONE
+
+    payload_s0 = _f128_bytes(bits_s0)
+    payload_s1 = _f128_bytes(bits_s1)
+
+    raw_tokens = np.concatenate(
+        [
+            np.array([_F128_RAW], dtype=np.uint16),
+            np.frombuffer(payload_s0, dtype=np.uint8).astype(np.uint16),
+            np.array([_F128_RAW], dtype=np.uint16),
+            np.frombuffer(payload_s1, dtype=np.uint8).astype(np.uint16),
+        ]
+    )
+    # expanded: [prepend, S0_carrier, S0_painted_msb,
+    #            S1_carrier, S1_painted_msb]
+    # surviving_token_count = 4 cuts AT expanded[4] (S1's painted MSB).
+    # S0 is fully visible (2 chunks); S1 is mid-cut (1 LSB chunk only).
+    expanded = np.array(
+        [
+            _LOCAL_FUNC_SHIFTED,
+            _F128_SHIFTED,  # S0 carrier (survives)
+            _F128_SHIFTED,  # S0 painted MSB (survives)
+            _F128_SHIFTED,  # S1 carrier (survives -- mid-cut)
+            _F128_SHIFTED,  # S1 painted MSB (past cut)
+        ],
+        dtype=np.uint16,
+    )
+    extra_f128 = np.array(
+        [False, False, True, False, True], dtype=bool
+    )
+    extra_vc2 = np.zeros_like(extra_f128, dtype=bool)
+
+    stage2_ct = _make_call_target(
+        raw_tokens, expanded, extra_vc2, extra_f128
+    )
+    from dataclasses import replace
+
+    stage2_ct = replace(
+        stage2_ct,
+        surviving_token_count=4,
+        surviving_number_chunk_count=3,  # S0 contributes 2 + S1 contributes 1
+        is_cut=True,
+        partial_cut_length=4,
+    )
+
+    stage2_batch = _wrap_single_call_target(stage2_ct)
+    inline_bytes, ct_slice = _build_inline_bytes_from_raw(raw_tokens)
+
+    (
+        idx_2d_per_type,
+        _,
+        f128_is_nan_or_inf,
+        vc2_sidecar,
+        f128_visible_chunks,
+    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+
+    # 3c contract: 2 visible F128 sources (S0 full, S1 mid-cut). Total
+    # rows = 2 + 1 = 3.
+    assert idx_2d_per_type[TokenType.FLOAT128].shape == (3, 8)
+    np.testing.assert_array_equal(
+        f128_is_nan_or_inf, np.array([False, False], dtype=np.bool_)
+    )
+    np.testing.assert_array_equal(
+        f128_visible_chunks, np.array([2, 1], dtype=np.uint8)
+    )
+
+    # 3d contract: normalizing must NOT raise the
+    # row-count-vs-chunks_per_source assertion (the fix's whole point).
+    out = normalize_per_token_type(
+        idx_2d_per_type=idx_2d_per_type,
+        inline_bytes=inline_bytes,
+        f128_is_nan_or_inf=f128_is_nan_or_inf,
+        f128_visible_chunks=f128_visible_chunks,
+        vc2_chunk_exponent_sidecar=vc2_sidecar,
+        is_negative_per_source_per_type={
+            T: np.zeros(idx_2d_per_type[T].shape[0], dtype=bool)
+            for T in idx_2d_per_type
+            if T is not TokenType.FLOAT128
+        }
+        | {
+            TokenType.FLOAT128: np.zeros(2, dtype=bool),
+        },
+    )
+    got_sig, got_sign_exp = out[TokenType.FLOAT128]
+    # 3 chunks in, 3 chunks out -- 3d preserves the per-chunk row count.
+    assert got_sig.shape == (3,)
+    assert got_sign_exp.shape == (3,)
