@@ -3,13 +3,22 @@
 Single concern: emit 1 or 2 rows for one F128 source per ALG-2 + ALG-7.
 
 * Finite source (ALG-2 painted continuation): 2 chunks (LSB then MSB
-  limb).
+  limb) when the continuation slot survives the cut; 1 chunk (LSB
+  only) when the painted MSB slot is past ``partial_cut_length``.
 * NaN/Inf source (no continuation): 1 chunk = MSB limb (bytes 0..7);
   3d branches on ``f128_is_nan_or_inf`` to call ``_encode_infnan``.
 
-The emitter populates ``f128_nan_or_inf_flags`` in lockstep with each
-source it visits: 3d uses the per-source flag to route per-chunk
-dispatch (NaN/Inf path vs finite path).
+The emitter populates two side outputs in lockstep with each source it
+visits:
+
+* ``f128_nan_or_inf_flags`` -- per-source NaN/Inf flag from the ALG-2
+  painted-continuation signal. Used by 3d to route per-chunk dispatch
+  (NaN/Inf path vs finite path).
+* ``f128_visible_chunks`` -- per-source visible-chunk count
+  (``{1, 2}``). 3d's :func:`normalize_f128` uses this -- NOT the
+  NaN/Inf flag -- to compute ``chunks_per_source`` so the row-count
+  assertion stays consistent in the mid-cut case (the painted MSB
+  slot dropped at the cut while the LSB slot survived).
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ def _emit_f128_source(
     row_lists_per_type: dict[TokenType, list[np.ndarray]],
     running_counts: dict[TokenType, int],
     f128_nan_or_inf_flags: list[bool],
+    f128_visible_chunks: list[int],
 ) -> int:
     """Emit 1 or 2 rows for one F128 source.
 
@@ -42,7 +52,9 @@ def _emit_f128_source(
     Mid-cut: if a finite source's chunk-1 slot is past the cut, emit
     only chunk 0 (LSB). The ``f128_is_nan_or_inf`` flag stays False
     (the source's nature is from ALG-2, not from how many chunks
-    survived).
+    survived). ``f128_visible_chunks`` records the count -- 1 for the
+    mid-cut finite -- so 3d's chunks_per_source matches the actual
+    row count.
 
     Returns the number of expanded positions consumed (1 or 2).
     """
@@ -74,7 +86,10 @@ def _emit_f128_source(
             )[np.newaxis, :]
             row_lists_per_type[TokenType.FLOAT128].append(row_msb)
             running_counts[TokenType.FLOAT128] += 1
+            f128_visible_chunks.append(2)
             return 2
+        # Mid-cut finite: only the LSB chunk survives in the row stream.
+        f128_visible_chunks.append(1)
         return 1
 
     # NaN/Inf source: 1 row (MSB limb, bytes 0..7).
@@ -84,4 +99,5 @@ def _emit_f128_source(
     )[np.newaxis, :]
     row_lists_per_type[TokenType.FLOAT128].append(row_msb)
     running_counts[TokenType.FLOAT128] += 1
+    f128_visible_chunks.append(1)
     return 1

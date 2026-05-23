@@ -37,6 +37,7 @@ def _emit_call_target_rows(
     row_lists_per_type: dict[TokenType, list[np.ndarray]],
     running_counts: dict[TokenType, int],
     f128_nan_or_inf_flags: list[bool],
+    f128_visible_chunks: list[int],
     vc2_chunk_indices: list[int],
 ) -> None:
     """Walk one call_target's surviving expanded stream and emit rows.
@@ -129,6 +130,7 @@ def _emit_call_target_rows(
                 row_lists_per_type=row_lists_per_type,
                 running_counts=running_counts,
                 f128_nan_or_inf_flags=f128_nan_or_inf_flags,
+                f128_visible_chunks=f128_visible_chunks,
             )
         else:
             # Fixed-width FP types (F16 / BF16 / F32 / F64 / F80).

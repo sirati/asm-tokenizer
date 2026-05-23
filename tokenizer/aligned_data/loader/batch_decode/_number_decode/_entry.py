@@ -93,6 +93,7 @@ def build_number_idx_2d(
     dict[TokenType, list[slice]],
     np.ndarray,
     np.ndarray,
+    np.ndarray,
 ]:
     """Build per-:class:`TokenType` ``idx_2d`` arrays per ALG-7 + ALG-8.
 
@@ -126,11 +127,21 @@ def build_number_idx_2d(
         slice into ``idx_2d_per_type[T]`` owned by call_target ``i``.
     f128_is_nan_or_inf
         ``bool[n_f128_sources]``. One entry per F128 SOURCE (not
-        chunk); NaN/Inf sources contribute 1 row, finite contribute 2.
+        chunk); routes 3d's per-chunk dispatch (NaN/Inf path vs finite
+        path) but does NOT determine the chunk count (the mid-cut
+        finite case has 1 visible chunk while staying on the finite
+        dispatch). The chunk count comes from ``f128_visible_chunks``.
     vc2_chunk_exponent_sidecar
         ``u32[total_vc2_chunks]``. Per-chunk index within source
         (``0 = LSB``, ``K-1 = MSB``); stage 4 multiplies by 64 for
         ``exponent_base``.
+    f128_visible_chunks
+        ``u8[n_f128_sources]`` with values ``{1, 2}``. Per-source row
+        count emitted into ``idx_2d_per_type[FLOAT128]``: NaN/Inf = 1
+        (MSB only), finite full = 2 (LSB + MSB), finite mid-cut = 1
+        (LSB only -- the painted MSB slot is past the cut). 3d uses
+        this to derive ``chunks_per_source`` so the row-count
+        assertion stays consistent in the mid-cut case.
     """
 
     # Output accumulators. Every NUMBER-block TokenType key is always
@@ -145,6 +156,7 @@ def build_number_idx_2d(
         T: 0 for T in _NUMBER_BLOCK_TOKEN_TYPES
     }
     f128_nan_or_inf_flags: list[bool] = []
+    f128_visible_chunk_counts: list[int] = []
     vc2_chunk_indices: list[int] = []
 
     # DFS encounter order matches 3a's ``inline_byte_slices`` so a
@@ -166,6 +178,7 @@ def build_number_idx_2d(
                         row_lists_per_type=row_lists_per_type,
                         running_counts=running_counts,
                         f128_nan_or_inf_flags=f128_nan_or_inf_flags,
+                        f128_visible_chunks=f128_visible_chunk_counts,
                         vc2_chunk_indices=vc2_chunk_indices,
                     )
 
@@ -188,6 +201,9 @@ def build_number_idx_2d(
             )
 
     f128_is_nan_or_inf = np.asarray(f128_nan_or_inf_flags, dtype=np.bool_)
+    f128_visible_chunks = np.asarray(
+        f128_visible_chunk_counts, dtype=np.uint8
+    )
     vc2_chunk_exponent_sidecar = np.asarray(
         vc2_chunk_indices, dtype=np.uint32
     )
@@ -197,4 +213,5 @@ def build_number_idx_2d(
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
+        f128_visible_chunks,
     )
