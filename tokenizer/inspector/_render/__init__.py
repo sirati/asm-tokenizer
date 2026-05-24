@@ -25,6 +25,13 @@ the package -- callers' ``isinstance`` checks agree across both
 import paths.
 """
 
+from tokenizer.inspector._render._protocol import (
+    BackendFactory,
+    FunctionHandle,
+    RenderBackend,
+    RenderedBlock,
+    RenderedVariant,
+)
 from tokenizer.inspector._render._render_block import (
     AsmLine,
     InlineCallEntry,
@@ -36,8 +43,13 @@ from tokenizer.inspector._render._render_block import (
 
 __all__ = [
     "AsmLine",
+    "BackendFactory",
+    "FunctionHandle",
     "InlineCallEntry",
     "InlineJumpEntry",
     "LineItem",
+    "RenderBackend",
+    "RenderedBlock",
+    "RenderedVariant",
     "render_block",
 ]
