@@ -14,9 +14,6 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from tokenizer.aligned_data.loader.session import BinarySession
-    from tokenizer.token_manager import VocabularyManager
-
     from ._nodes_variant import VariantNode
 
 
@@ -34,12 +31,7 @@ class AsmLeaf:
     can_expand: bool = field(default=False, init=False)
     is_failed: bool = False
 
-    def expand(
-        self,
-        session: "BinarySession",
-        *,
-        vocab_manager: "VocabularyManager | None" = None,
-    ) -> list:
+    def expand(self) -> list:
         """Terminal node -- callers must gate on ``can_expand``."""
         raise NotImplementedError(
             "AsmLeaf is terminal; gate expansion on can_expand"
@@ -59,10 +51,5 @@ class ShowAllVariantsNode:
     can_expand: bool = field(default=True, init=False)
     is_failed: bool = False
 
-    def expand(
-        self,
-        session: "BinarySession",
-        *,
-        vocab_manager: "VocabularyManager | None" = None,
-    ) -> list:
+    def expand(self) -> list:
         return list(self.other_variants)

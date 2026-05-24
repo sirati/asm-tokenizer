@@ -23,7 +23,6 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
 from textual.widgets._tree import TOGGLE_STYLE, TreeNode
 
-from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.inspector._horizontal_scroll import (
     apply_truncation_marker,
     assemble_failed_glyph,
@@ -43,11 +42,22 @@ from tokenizer.inspector._tree_model import (
     ShowAllVariantsNode,
     VariantNode,
 )
+from tokenizer.variant_tokens.prefixes import (
+    ARCH_PREFIX,
+    COMP_PREFIX,
+    CVER_PREFIX,
+    OPT_PREFIX,
+    POSITIONAL_PREFIXES,
+)
 
 
 if TYPE_CHECKING:
-    from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
-    from tokenizer.aligned_data.loader.session import BinarySession
+    from typing import Mapping, Optional
+
+    from tokenizer.inspector._render._protocol import (
+        BackendFactory,
+        FunctionHandle,
+    )
 
 
 __all__ = ["InspectorApp", "run_inspector"]
@@ -60,6 +70,44 @@ _ERR_STYLE = Style(color="red", dim=True)
 # the asm-tokenizer's existing logging config don't fight over
 # handlers. The file handler is attached in ``_setup_inspector_log``.
 _LOGGER_NAME = "tokenizer.inspector"
+
+
+# Per-axis label prefix used to format the variant row text from
+# :attr:`RenderedVariant.label_axes`. Mirrors the per-axis policy in
+# :func:`tokenizer.inspector._label.variant_label` (``v`` for cver,
+# ``-`` for opt; bare value for arch + compiler) but operates on the
+# typed prefix-keyed Mapping instead of the legacy ``function_data.
+# metadata`` shape. Anchored on POSITIONAL_PREFIXES so adding a new
+# axis trips the assert below in lockstep with :mod:`_label`.
+_AXIS_LABEL_PREFIX: dict[str, str] = {
+    ARCH_PREFIX: "",
+    COMP_PREFIX: "",
+    CVER_PREFIX: "v",
+    OPT_PREFIX: "-",
+}
+assert set(_AXIS_LABEL_PREFIX) == set(POSITIONAL_PREFIXES), (
+    "_AXIS_LABEL_PREFIX must mirror POSITIONAL_PREFIXES"
+)
+
+
+def _variant_label_from_axes(
+    label_axes: "Mapping[str, Optional[str]]",
+) -> str:
+    """Format the variant row label from the typed ``label_axes``.
+
+    Both backends pre-flatten ``label_axes`` over
+    :data:`POSITIONAL_PREFIXES` (plan decision 1); reading the Mapping
+    in that canonical order yields a stable axis ordering. ``None``
+    values render as ``"?"`` to match
+    :func:`tokenizer.inspector._label.variant_label`'s legacy policy
+    without re-deriving the unrelated ``metadata`` key shape.
+    """
+    parts: list[str] = []
+    for prefix in POSITIONAL_PREFIXES:
+        value = label_axes.get(prefix)
+        value_str = "?" if value is None else str(value)
+        parts.append(f"{_AXIS_LABEL_PREFIX[prefix]}{value_str}")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +128,7 @@ def _compose_label(node: Node) -> Text:
     if isinstance(node, FunctionNode):
         return Text(function_label(node.name))
     if isinstance(node, VariantNode):
-        return Text(node.label)
+        return Text(_variant_label_from_axes(node.label_axes))
     if isinstance(node, BlockNode):
         return Text(f"Block: {node.block_idx}   {node.preview}")
     if isinstance(node, InlineCallNode):
@@ -152,6 +200,10 @@ class InspectorApp(App[None]):
     Vertical layout: tree (a ``ScrollView`` by inheritance) + a one-
     line search input hidden by default, revealed on ``/``. Horizontal-
     scroll actions delegate to the tree's built-in ``scroll_*`` methods.
+
+    The app holds ONE :class:`BackendFactory` reference; every root
+    :class:`FunctionNode` is constructed against that factory + the
+    typed :class:`FunctionHandle` published in ``factory.handles``.
     """
 
     CSS: ClassVar[str] = """
@@ -174,25 +226,21 @@ class InspectorApp(App[None]):
     def __init__(
         self,
         *,
-        dataset: "BinaryDataset",
-        session: "BinarySession",
+        factory: "BackendFactory",
         log_path: Path,
     ) -> None:
         super().__init__()
-        self._dataset = dataset
-        self._session = session
+        self._factory = factory
         self._log = _setup_inspector_log(log_path)
 
     # --- compose ---------------------------------------------------
 
     def compose(self) -> ComposeResult:
         tree: _InspectorTree = _InspectorTree("inspector", id="tree")
-        # Seed the root with one matched-arm function per FID (plan D3).
-        # ``matched_count`` is the published count; FID ordering equals
-        # encounter order from the disassembler so iterating ``range(N)``
-        # is the canonical seed walk.
-        for idx in range(self._dataset.matched_count):
-            fn_node = self._build_root_function_node(idx)
+        # Seed the root with one FunctionNode per handle the factory
+        # published. The factory owns discovery; the UI just iterates.
+        for handle in self._factory.handles:
+            fn_node = self._build_root_function_node(handle)
             tree.root.add(
                 _compose_label(fn_node),
                 data=fn_node,
@@ -202,28 +250,28 @@ class InspectorApp(App[None]):
         yield tree
         yield Input(placeholder="/ search function name", id="search")
 
-    def _build_root_function_node(self, idx: int) -> FunctionNode:
-        """Construct one root :class:`FunctionNode` for a matched idx.
+    def _build_root_function_node(
+        self, handle: "FunctionHandle"
+    ) -> FunctionNode:
+        """Construct one root :class:`FunctionNode` for a handle.
 
-        Reads the function name from the dataset's published
-        ``matched_func_names`` array (one entry per matched FID,
-        ordered with ``range(matched_count)``); arm is fixed to
-        ``SectionKind.MATCHED`` since the top-level tree only seeds
-        matched functions.
+        The typed handle carries the display ``name``, the per-arm
+        ``idx``, and the canonical ``arm`` :class:`SectionKind`; the
+        factory's ``make(handle)`` opens the matching backend on
+        first :meth:`FunctionNode.expand` call.
         """
-        func_names = self._dataset.matched_func_names
-        name = func_names[idx] if idx < len(func_names) else "?"
-        return FunctionNode(arm=SectionKind.MATCHED, idx=idx, name=name)
+        return FunctionNode(factory=self._factory, handle=handle)
 
-    # --- expand dispatcher (plan D8) -------------------------------
+    # --- expand dispatcher -----------------------------------------
 
     @on(Tree.NodeExpanded)
     def _on_node_expanded(self, event: Tree.NodeExpanded[Node]) -> None:
-        """Central expand dispatcher (the ONE try/except per plan D8).
+        """Central expand dispatcher (the ONE try/except wrapping model
+        ``expand``).
 
         Flow: clear prior children + reset ``is_failed`` (collapse-
         then-expand retries the decode), wrap ONLY the model
-        ``expand`` call in ``try/except Exception``, on failure log
+        ``expand()`` call in ``try/except Exception``, on failure log
         the traceback + attach a dim-red error-child carrying
         ``repr(exc)`` + flip ``is_failed`` + refresh so the prefix
         paints as ``[*]``. On success: attach one child per returned
@@ -243,10 +291,7 @@ class InspectorApp(App[None]):
             node.refresh()
 
         try:
-            children = model.expand(
-                self._session,
-                vocab_manager=self._dataset.vocab_manager,
-            )
+            children = model.expand()
         except Exception as exc:
             self._log.error(
                 "expand failed for %r: %s",
@@ -359,17 +404,15 @@ def _setup_inspector_log(log_path: Path) -> logging.Logger:
 
 def run_inspector(
     *,
-    dataset: "BinaryDataset",
-    session: "BinarySession",
+    factory: "BackendFactory",
     log_path: Path,
 ) -> int:
     """Construct + run the app; return ``0`` on clean quit.
 
-    The session's ``__enter__`` MUST already have run -- every
-    ``FunctionNode.expand`` calls :meth:`BinarySession.load_matched`,
-    which requires an open session. :mod:`tokenizer.inspector.__main__`
-    owns the ``with session:`` wrap.
+    Every backend the factory mints is opened lazily on first
+    ``FunctionNode.expand`` call; the caller (``__main__``) owns the
+    factory + any session it wraps via ``with stack:``.
     """
-    app = InspectorApp(dataset=dataset, session=session, log_path=log_path)
+    app = InspectorApp(factory=factory, log_path=log_path)
     app.run()
     return 0

@@ -14,10 +14,6 @@ The file is gated on ``pytest.importorskip("textual")`` so the default
 ``nix develop`` shell (textual-free) shows it as SKIPPED rather than as
 an import failure. It runs green under the ``tui-inspector`` flake-app
 python env where textual is installed.
-
-Sync wrappers (``asyncio.run``) are used in lieu of ``@pytest.mark.asyncio``
-because pytest-asyncio is not in the tui-inspector env either; the plan
-does not require it.
 """
 
 from __future__ import annotations
@@ -29,7 +25,6 @@ pytest.importorskip("textual")
 import asyncio
 import tempfile
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock
 
 from rich.style import Style
@@ -37,6 +32,11 @@ from rich.text import Text
 
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.inspector._app import InspectorApp
+from tokenizer.inspector._render._protocol import (
+    BackendFactory,
+    FunctionHandle,
+    RenderBackend,
+)
 from tokenizer.inspector._tree_model import FunctionNode
 
 
@@ -45,26 +45,32 @@ from tokenizer.inspector._tree_model import FunctionNode
 # ---------------------------------------------------------------------------
 
 
-def _make_dataset(*, matched_count: int, names: list[str]) -> Any:
-    """Build a minimal mock ``BinaryDataset`` that drives ``compose``.
+def _make_factory(names: list[str]) -> MagicMock:
+    """Build a minimal mock :class:`BackendFactory`.
 
-    Only the attributes the inspector's ``compose`` + dispatcher touch
-    are populated: ``matched_count``, ``matched_func_names``,
-    ``vocab_manager``. Everything else routes through the (un-called)
-    expand path.
+    Only ``.handles`` + ``.make`` + ``.close`` are spec'd; ``make``
+    returns a RenderBackend-spec'd mock with no variants so any
+    accidental expand path produces an empty (but valid) tree row.
     """
-    dataset = MagicMock()
-    dataset.matched_count = matched_count
-    dataset.matched_func_names = names
-    dataset.vocab_manager = MagicMock(name="vocab_manager")
-    return dataset
+    handles = [
+        FunctionHandle(arm=SectionKind.MATCHED, idx=i, name=name)
+        for i, name in enumerate(names)
+    ]
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = handles
+    backend = MagicMock(spec=RenderBackend)
+    backend.handle = handles[0] if handles else None
+    backend.closed = False
+    backend.variants.return_value = []
+    backend.blocks.return_value = []
+    backend.render_block.return_value = ()
+    factory.make.return_value = backend
+    return factory
 
 
-def _build_app(matched_count: int, names: list[str], log_path: Path) -> InspectorApp:
-    """Construct an ``InspectorApp`` for tests with a mock dataset + session."""
-    dataset = _make_dataset(matched_count=matched_count, names=names)
-    session = MagicMock(name="session")
-    return InspectorApp(dataset=dataset, session=session, log_path=log_path)
+def _build_app(names: list[str], log_path: Path) -> InspectorApp:
+    """Construct an :class:`InspectorApp` for tests against a mock factory."""
+    return InspectorApp(factory=_make_factory(names), log_path=log_path)
 
 
 def _root_tree_node(app: InspectorApp):
@@ -87,14 +93,14 @@ def _make_raising_expand(exc: Exception):
 
 
 def test_expand_raises_marks_node_failed():
-    """Audit-mandated case (a): expand raises → node flips is_failed=True."""
+    """Audit-mandated case (a): expand raises -> node flips is_failed=True."""
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
-            app = _build_app(1, ["main"], log_path)
+            app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                tree, fn_tree_node = _root_tree_node(app)
+                _tree, fn_tree_node = _root_tree_node(app)
                 fn_model: FunctionNode = fn_tree_node.data
                 # Force this node's bound expand to raise.
                 fn_model.expand = _make_raising_expand(RuntimeError("boom"))
@@ -121,7 +127,7 @@ def test_failed_node_paints_marker_glyph():
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
-            app = _build_app(1, ["main"], log_path)
+            app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
                 tree, fn_tree_node = _root_tree_node(app)
                 fn_model: FunctionNode = fn_tree_node.data
@@ -146,9 +152,9 @@ def test_collapse_expand_retries_after_failure():
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
-            app = _build_app(1, ["main"], log_path)
+            app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                tree, fn_tree_node = _root_tree_node(app)
+                _tree, fn_tree_node = _root_tree_node(app)
                 fn_model: FunctionNode = fn_tree_node.data
 
                 # Step 1: fail.
@@ -171,11 +177,10 @@ def test_collapse_expand_retries_after_failure():
                 assert fn_model.is_failed is False
                 assert len(fn_tree_node.children) == 0
                 retry_spy.assert_called_once()
-                # The dispatcher passes session positionally + vocab_manager
-                # as a keyword (see InspectorApp._on_node_expanded).
+                # The dispatcher calls expand() arg-less.
                 call = retry_spy.call_args
-                assert call.args == (app._session,)
-                assert call.kwargs == {"vocab_manager": app._dataset.vocab_manager}
+                assert call.args == ()
+                assert call.kwargs == {}
 
     asyncio.run(runner())
 
@@ -186,17 +191,16 @@ def test_log_file_carries_traceback():
     async def runner() -> Path:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "nested" / "tui.log"
-            app = _build_app(1, ["main"], log_path)
+            app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                tree, fn_tree_node = _root_tree_node(app)
+                _tree, fn_tree_node = _root_tree_node(app)
                 fn_model: FunctionNode = fn_tree_node.data
                 fn_model.expand = _make_raising_expand(RuntimeError("boom"))
                 fn_tree_node.expand()
                 await pilot.pause()
 
                 # Flush handlers so the file content is on disk by the
-                # time we read it. The logger is dedicated, so iterating
-                # ``app._log.handlers`` is sufficient.
+                # time we read it.
                 for handler in app._log.handlers:
                     handler.flush()
 
@@ -220,7 +224,7 @@ def test_quit_binding_returns_cleanly():
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
-            app = _build_app(0, [], log_path)
+            app = _build_app([], log_path)
             async with app.run_test() as pilot:
                 await pilot.press("q")
                 await pilot.pause()
@@ -236,7 +240,7 @@ def test_search_input_focus_and_clear():
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
-            app = _build_app(1, ["main"], log_path)
+            app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
                 from textual.widgets import Input
 
