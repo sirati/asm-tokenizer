@@ -54,6 +54,29 @@ from ._sections_bin_walk import (
 )
 
 
+def _assert_matched_data_bin_consistency(
+    data_bin: Path, starts: np.ndarray
+) -> None:
+    """Load-time per-arm sweep for the matched arm's ``_data.bin``.
+
+    Mirrors the unmatched arm's load-time check (``entry_idx == i``
+    over the arm's flat per-variant ``starts``) via the shared
+    chokepoint in :mod:`metadata_loader`. Skipped when the data file
+    is absent (matched-empty corpus) or starts is empty.
+    """
+    if not data_bin.exists() or len(starts) == 0:
+        return
+    # Local import: ``metadata_loader`` imports ``load_matched_arm``
+    # from this module, so a top-level import would cycle.
+    from .metadata_loader import assert_entry_idx_sequence
+
+    data_memmap = np.memmap(str(data_bin), dtype=np.uint8, mode="r")
+    try:
+        assert_entry_idx_sequence(data_memmap, starts, data_bin)
+    finally:
+        del data_memmap
+
+
 def _walk_matched_sections(
     sections_bin: Path,
     bin_starts: np.ndarray,
@@ -105,6 +128,8 @@ def load_matched_arm(
     sections_bin: Path,
     matched_index: Path,
     line_to_name: Dict[int, str],
+    *,
+    data_bin: Path,
 ):
     """Build the matched ``SectionArm`` from ``matched_index.bin`` + BIN catalog.
 
@@ -115,6 +140,10 @@ def load_matched_arm(
     4-byte boundary). Per-variant data-bin positions are 16-byte
     aligned and recovered from each variant block's
     ``data_offset_shifted`` field.
+
+    ``data_bin`` feeds the load-time per-arm sweep that asserts each
+    record's on-wire ``entry_idx`` equals its flat-starts index; the
+    sweep is a single chokepoint shared with the unmatched arm.
     """
     # Local import to break the import cycle between this module and
     # the orchestrator (``metadata_loader`` imports ``load_matched_arm``).
@@ -138,6 +167,8 @@ def load_matched_arm(
     # No length or overlong flag -- the record at each offset is
     # self-describing.
     starts = _flat_variant_starts(sections)
+
+    _assert_matched_data_bin_consistency(data_bin, starts)
 
     # ``select_random_function_by_length`` is a NotImplementedError
     # stub for the matched arm, so the length-band lookup tables have
