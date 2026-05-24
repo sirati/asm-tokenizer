@@ -51,9 +51,11 @@ def _write_synthetic_data_bin(path: Path):
     ]
     written = []
     with open(path, "wb") as f:
-        for n_tok, n_blk, n_ins in record_specs:
+        for i, (n_tok, n_blk, n_ins) in enumerate(record_specs):
             tokens, block_rl, insn_rl = _make_record(rng, n_tok, n_blk, n_ins)
-            off, _total = write_function_binary_data(f, tokens, block_rl, insn_rl)
+            off, _total = write_function_binary_data(
+                f, tokens, block_rl, insn_rl, entry_idx=i
+            )
             written.append((off, tokens, block_rl, insn_rl))
     return written
 

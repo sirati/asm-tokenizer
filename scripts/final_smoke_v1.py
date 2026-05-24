@@ -59,7 +59,10 @@ from tokenizer.aligned_data.index_format import (  # noqa: E402
 from tokenizer.aligned_data.loader.aligned_data_loader import (  # noqa: E402
     AlignedDataLoader,
 )
-from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION  # noqa: E402
+from tokenizer.aligned_data.memmap_format import (  # noqa: E402
+    MEMMAP_FORMAT_VERSION,
+    read_data_bin_trailer,
+)
 from tokenizer.compact_base64_utils import ndarray_to_base64  # noqa: E402
 from tokenizer.memmap_builder.builder import (  # noqa: E402
     BinaryVersionInfo,
@@ -84,6 +87,30 @@ increase_csv_field_size_limit()
 
 
 _EXPECTED_PRELUDE_LINE = f"# format={MEMMAP_FORMAT_VERSION}\n"
+
+
+def assert_trailer_present_and_matches_record_count(
+    data_path: Path, index_path: Path, label: str
+) -> None:
+    """The bin's trailing ``total_entries`` u32 must equal the per-arm
+    index entry count.
+
+    Reads the trailer through the chokepoint
+    :func:`read_data_bin_trailer` (so the smoke uses the same accessor
+    the loader does) and compares against ``(len(index) - prelude) / 4``
+    -- the index file's wire format is a 16-byte prelude followed by
+    one u32 per entry, so subtracting the prelude and dividing by 4
+    yields the entry count without needing the index parser.
+    """
+    data_bytes = data_path.read_bytes()
+    total_entries = read_data_bin_trailer(memoryview(data_bytes))
+    index_bytes = index_path.read_bytes()
+    expected = (len(index_bytes) - INDEX_HEADER_SIZE) // 4
+    record(
+        f"step2.{label}_data trailer total_entries matches index count",
+        total_entries == expected,
+        f"trailer={total_entries} expected={expected}",
+    )
 
 
 # Function specs we want each per-binary CSV to emit. Names are sorted
@@ -332,6 +359,15 @@ def assert_build_artifacts(output_dir: Path, binary_name: str) -> None:
             size % 4 == 0,
             f"size={size}",
         )
+
+    # Both data.bin files end with a u32-aligned ``total_entries``
+    # trailer that matches the per-arm index entry count.
+    assert_trailer_present_and_matches_record_count(
+        matched_data, matched_index, "matched"
+    )
+    assert_trailer_present_and_matches_record_count(
+        unmatched_data, unmatched_index, "unmatched"
+    )
 
     # Every sections/variants CSV starts with ``# format=1``.
     for label, path in (

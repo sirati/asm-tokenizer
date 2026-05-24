@@ -126,6 +126,65 @@ def assert_data_bin_prelude(prelude: bytes, *, path: str = "") -> None:
     assert_bin_prelude(prelude, expected_magic=DATA_BIN_PRELUDE_MAGIC, path=path)
 
 
+# Trailing ``total_entries`` field stamped at the end of every
+# ``_data.bin`` / ``_unmatched_data.bin``. Holds the count of entries
+# (records) that the file contains; paired with each record's
+# per-header ``entry_idx`` (see
+# :mod:`tokenizer.aligned_data.binary_format._header`) it gives the
+# loader a cross-check (``entry_idx < total_entries`` per lookup,
+# ``entry_idx == i`` on the load-time per-arm sweep).
+#
+# Written u32-aligned: writers pad the prior content's tail up to a
+# 4-byte boundary with zero bytes before stamping the trailer. The
+# pad is at most 3 bytes (record bodies are already 16-byte-aligned
+# in the production writer; the manual-fixture path however appends
+# bytes without record alignment).
+DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE: int = 4
+
+
+def _trailer_pad_for_cursor(cursor: int) -> int:
+    """Return the zero-pad byte count needed to u32-align ``cursor``."""
+    return (-cursor) % DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE
+
+
+def encode_data_bin_trailer(total_entries: int, *, cursor: int) -> bytes:
+    """Return the trailer bytes (zero-pad + ``u32 total_entries``).
+
+    ``cursor`` is the writer's current byte position immediately
+    before the trailer is written; we use it to derive a 0..3-byte
+    zero pad so the ``u32 total_entries`` lands u32-aligned. Callers
+    pass the trailer to the writer's append-at-cursor primitive.
+    """
+    if total_entries < 0:
+        raise ValueError(
+            f"total_entries must be non-negative, got {total_entries}"
+        )
+    pad = _trailer_pad_for_cursor(cursor)
+    return b"\x00" * pad + struct.pack("<I", total_entries)
+
+
+def read_data_bin_trailer(data_mmap) -> int:
+    """Read the trailing ``total_entries`` u32 from a ``_data.bin`` mmap.
+
+    The trailer is always the last 4 bytes of the file (the pad that
+    u32-aligns it is BEFORE the trailer, so the trailer itself ends
+    on the file's last byte). Returns the ``total_entries`` count.
+    Raises :class:`ValueError` when the file is too short to hold a
+    trailer (i.e. shorter than 4 bytes past the prelude).
+    """
+    file_size = len(data_mmap)
+    if file_size < DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE:
+        raise ValueError(
+            f"_data.bin too short to hold a {DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE}"
+            f"-byte total_entries trailer: file_size={file_size}"
+        )
+    trailer_start = file_size - DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE
+    (total_entries,) = struct.unpack(
+        "<I", bytes(data_mmap[trailer_start:file_size])
+    )
+    return total_entries
+
+
 # 16-byte file-level prelude written at the start of every
 # ``<binary>_sections.bin``. Layout (little-endian):
 #

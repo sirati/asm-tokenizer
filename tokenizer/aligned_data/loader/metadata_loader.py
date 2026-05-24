@@ -28,9 +28,16 @@ from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.binary_format import record_token_count_from_memmap
+from tokenizer.aligned_data.binary_format import (
+    MAX_HEADER_BYTES,
+    parse_binary_header,
+    record_token_count_from_memmap,
+)
 from tokenizer.aligned_data.index_format import read_index_arrays
-from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+from tokenizer.aligned_data.memmap_format import (
+    MEMMAP_FORMAT_VERSION,
+    read_data_bin_trailer,
+)
 
 from ._matched_arm_loader import load_matched_arm
 
@@ -221,17 +228,53 @@ def load_unmatched_lengths(
     Delegates per-record decoding to
     :func:`record_token_count_from_memmap`, which owns the header
     parse + width-tag dispatch in one place.
+
+    Also performs the load-time per-arm sweep that pins the cross-file
+    invariant ``entry_idx == i`` over the arm's known per-record
+    ``starts``; a single mismatch fails with the canonical corrupt-file
+    error so a corrupted index / data-bin pair is rejected at session
+    open instead of returning garbage on first lookup.
     """
     if not paths.data_bin.exists() or len(starts) == 0:
         return np.array([], dtype=np.int32)
 
     data_memmap = np.memmap(str(paths.data_bin), dtype=np.uint8, mode="r")
+    assert_entry_idx_sequence(data_memmap, starts, paths.data_bin)
     token_counts = [
         record_token_count_from_memmap(data_memmap, int(starts[i]))
         for i in range(len(starts))
     ]
     del data_memmap
     return np.array(token_counts, dtype=np.int32)
+
+
+def assert_entry_idx_sequence(
+    data_memmap: np.ndarray, starts: np.ndarray, data_bin_path: Path
+) -> None:
+    """Sweep ``starts`` and assert each parsed header's ``entry_idx == i``.
+
+    Single chokepoint for the load-time per-arm sweep. The sweep also
+    re-reads the trailing ``total_entries`` to cross-check ``len(starts)
+    == total_entries`` so a corrupt index that drops the last record
+    surfaces here instead of leaking into the per-lookup hot path.
+    A failure raises :class:`ValueError` with the literal wording
+    ``corrupt file: <filename> did not pass validation``.
+    """
+    if len(starts) == 0:
+        return
+    total_entries = read_data_bin_trailer(data_memmap)
+    if total_entries != len(starts):
+        raise ValueError(
+            f"corrupt file: {data_bin_path.name} did not pass validation"
+        )
+    for i in range(len(starts)):
+        start = int(starts[i])
+        end = min(start + MAX_HEADER_BYTES, len(data_memmap))
+        header, _ = parse_binary_header(data_memmap[start:end])
+        if header.entry_idx != i:
+            raise ValueError(
+                f"corrupt file: {data_bin_path.name} did not pass validation"
+            )
 
 
 # --- Per-arm loader dispatch ----------------------------------------------
@@ -251,7 +294,12 @@ def _load_matched(
 ) -> SectionArm:
     # ``matched_index`` is always ``paths.index_bin`` on the matched
     # arm; accepting it via kw keeps the dispatch signature uniform.
-    return load_matched_arm(paths.sections_bin, paths.index_bin, line_to_name)
+    return load_matched_arm(
+        paths.sections_bin,
+        paths.index_bin,
+        line_to_name,
+        data_bin=paths.data_bin,
+    )
 
 
 def _load_unmatched(

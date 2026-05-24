@@ -196,11 +196,18 @@ def _emit_record(
     cap overflow logs into ``error_log`` and returns ``None`` so the
     caller drops the variant; on success the dedup helper's return is
     passed through.
+
+    The record's ``entry_idx`` is sourced from
+    ``arm_state.n_entries_emitted`` — the next available encounter-order
+    ordinal. Dedup hits do NOT advance the counter (the existing
+    record's idx is the one that matters); ``_dedup.dedup_and_write``
+    owns that bookkeeping on the actual-write branches.
     """
     record_bytes = assemble_function_record(
         rec.tokens,
         rec.block_runlength,
         rec.insn_runlength,
+        entry_idx=arm_state.n_entries_emitted,
         func_name=func_name,
         error_log=error_log,
     )

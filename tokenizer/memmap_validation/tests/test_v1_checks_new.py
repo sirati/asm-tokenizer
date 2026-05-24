@@ -71,7 +71,7 @@ def _write_one_record_corpus(data_path: Path, index_path: Path) -> Tuple[int, in
     block = np.zeros(0, dtype=np.uint8)
     tokens = np.arange(4, dtype=np.uint16)
     with open(data_path, "wb") as fh:
-        result = write_function_binary_data(fh, tokens, block, insn)
+        result = write_function_binary_data(fh, tokens, block, insn, entry_idx=0)
     assert result is not None
     start, total = result
 

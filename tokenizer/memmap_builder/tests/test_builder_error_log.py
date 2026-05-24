@@ -56,6 +56,7 @@ def test_insn_len_overflow_logs_and_skips_index_entry() -> None:
         tokens,
         block,
         insn,
+        entry_idx=0,
         func_name="overflow_fn",
         error_log=error_log,
     )

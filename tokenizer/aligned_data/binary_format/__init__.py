@@ -16,6 +16,7 @@ from __future__ import annotations
 from ._body import extract_arrays_from_data
 from ._header import (
     BLOCK_WORD_SIZE,
+    ENTRY_IDX_SIZE,
     MAX_HEADER_BYTES,
     NORMAL_BLOCK_WORD_CAP,
     NORMAL_INSN_CAP,
@@ -59,6 +60,7 @@ def record_token_count_from_memmap(data_mmap, offset: int) -> int:
 __all__ = [
     # Constants
     "BLOCK_WORD_SIZE",
+    "ENTRY_IDX_SIZE",
     "MAX_HEADER_BYTES",
     "NORMAL_BLOCK_WORD_CAP",
     "NORMAL_INSN_CAP",
