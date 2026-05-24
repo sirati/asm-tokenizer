@@ -217,6 +217,13 @@ _TYPE_GETTER_TABLE: tuple[tuple[str, tuple[GetterSpec, ...]], ...] = (
 _MAX_DEPTH: int = 5
 
 
+# Sentinel signalling ``_to_python_native_scalar`` saw a non-scalar
+# value (Java handle, collection, dict, opaque object). Using a unique
+# module-level object lets the caller branch on identity rather than
+# on ``None`` (which is itself a legitimate scalar payload).
+_NOT_A_SCALAR: Any = object()
+
+
 # ---------------------------------------------------------------------------
 # Snapshot driver
 # ---------------------------------------------------------------------------
@@ -251,8 +258,14 @@ def _snapshot(obj: Any, depth: int) -> Any:
         return str(repr(obj))
     if obj is None:
         return None
-    if isinstance(obj, (bool, int, float, str, bytes)):
-        return obj
+    # Primitive scalars (Python-native OR JPype proxy that subclasses a
+    # Python primitive) must be cast to a strict-native Python value
+    # before being stored - otherwise the pickle carries a
+    # ``jpype.types.JLong`` / ``JInt`` / ``JFloat`` / ... reference and
+    # loading the dump requires a live JVM.
+    native = _to_python_native_scalar(obj)
+    if native is not _NOT_A_SCALAR:
+        return native
     # Collections (Java arrays / Iterables surface as Python tuples/lists
     # in pyghidra; explicit ``list(obj)`` works for any iterable).
     java_class = _java_class_name(obj)
@@ -363,3 +376,42 @@ def _strip_get(name: str) -> str:
     if name.startswith("get") and len(name) > 3 and name[3].isupper():
         return name[3:]
     return name
+
+
+# Scalar-cast dispatch table: ``(isinstance-predicate, constructor)``
+# pairs evaluated in order. ``bool`` is intentionally first - JBoolean
+# subclasses ``int`` in JPype, and so does Python's ``bool``; without
+# the bool-before-int order a Java boolean would be cast to ``int``
+# and lose its type identity. Constructors always return a strict
+# Python-native instance (``type(int(JLong(42))) is int``), which is
+# the property that lets the pickle round-trip without a JVM.
+_NATIVE_SCALAR_CASTS: tuple[tuple[type, Any], ...] = (
+    (bool, bool),
+    (int, int),
+    (float, float),
+    (bytes, bytes),
+    (str, str),
+)
+
+
+def _to_python_native_scalar(value: Any) -> Any:
+    """Return a strict-native Python copy of ``value`` if it is a scalar.
+
+    Returns the module-level ``_NOT_A_SCALAR`` sentinel when ``value``
+    is not one of bool / int / float / bytes / str (including any
+    JPype proxy that subclasses one of those types - JLong, JInt,
+    JFloat, JDouble, JBoolean, JChar, JByte, JShort all subclass a
+    Python primitive). The caller then routes the value through the
+    collection / curated-getter / summary path instead.
+
+    Why ``isinstance`` + constructor (not ``type() is``): the latter
+    would let Python-native subclasses (``IntEnum``, ``namedtuple``
+    indices, etc.) escape; the former + constructor-cast guarantees
+    the output's exact type matches one of the five primitive types,
+    which is precisely the property pickle relies on for JVM-free
+    loading.
+    """
+    for predicate_type, constructor in _NATIVE_SCALAR_CASTS:
+        if isinstance(value, predicate_type):
+            return constructor(value)
+    return _NOT_A_SCALAR

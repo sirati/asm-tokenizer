@@ -215,3 +215,182 @@ def test_snapshot_collects_collection_returning_getter() -> None:
     assert snap["Parameters"][0]["Name"] == "argc"
     assert snap["Parameters"][0]["Ordinal"] == 0
     assert snap["Parameters"][1]["Name"] == "argv"
+
+
+# ---------------------------------------------------------------------------
+# JPype-proxy primitive normalisation
+#
+# Real JLong / JInt / JFloat / JDouble / JBoolean / JChar instances
+# subclass Python's int / float / bool / str respectively (see JPype
+# 1.x's type-hierarchy docs); ``isinstance(JLong(42), int)`` is True
+# but ``type(JLong(42)) is int`` is False. Pickle records the proxy's
+# concrete class, so a JLong leaf forces a live JVM to unpickle. The
+# snapshot driver MUST cast every primitive leaf through a Python
+# constructor (``int(v)``, ``float(v)``, ...) so the dump is loadable
+# without pyghidra / JPype.
+#
+# The local proxy classes below subclass the matching Python primitive
+# to mirror JPype's hierarchy without needing a JVM at test time.
+# ---------------------------------------------------------------------------
+
+
+class _ProxyLong(int):
+    """Mimic JPype's ``JLong`` (subclasses ``int`` but ``type() is not int``)."""
+
+
+class _ProxyDouble(float):
+    """Mimic JPype's ``JDouble`` / ``JFloat`` (subclasses ``float``)."""
+
+
+class _ProxyString(str):
+    """Mimic JPype's ``JString`` (subclasses ``str``)."""
+
+
+class _ProxyBytes(bytes):
+    """Mimic JPype's ``JArray[byte]`` decoded form (subclasses ``bytes``)."""
+
+
+def _walk_all_leaves(obj: Any) -> list[Any]:
+    """Yield every scalar leaf from a nested dict/list/tuple structure."""
+    out: list[Any] = []
+    if isinstance(obj, dict):
+        for v in obj.values():
+            out.extend(_walk_all_leaves(v))
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            out.extend(_walk_all_leaves(v))
+    else:
+        out.append(obj)
+    return out
+
+
+def test_snapshot_casts_jpype_int_proxy_to_native_int() -> None:
+    """A getter returning a JLong-proxy must store a strict ``int`` in
+    the snapshot (type-identity, not isinstance).
+    """
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={"getName": "foo", "getEntryPoint": _ProxyLong(0x401000)},
+    )
+    snap = snapshot_function(func)
+    # The proxy isinstance-matches int but its concrete type isn't int.
+    # The snapshot must hand back a strict ``int``.
+    assert type(snap["EntryPoint"]) is int
+    assert snap["EntryPoint"] == 0x401000
+
+
+def test_snapshot_casts_jpype_float_proxy_to_native_float() -> None:
+    """JFloat/JDouble proxies must surface as strict Python ``float``."""
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={"getName": "foo", "getEntryPoint": _ProxyDouble(3.14)},
+    )
+    snap = snapshot_function(func)
+    assert type(snap["EntryPoint"]) is float
+    assert snap["EntryPoint"] == 3.14
+
+
+def test_snapshot_casts_jpype_string_proxy_to_native_str() -> None:
+    """JString proxy must surface as strict Python ``str`` (not the proxy)."""
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={"getName": _ProxyString("foo")},
+    )
+    snap = snapshot_function(func)
+    assert type(snap["Name"]) is str
+    assert snap["Name"] == "foo"
+
+
+def test_snapshot_preserves_native_bool_type_identity() -> None:
+    """A real Python ``bool`` must remain ``bool`` (not collapse to ``int``).
+
+    The bool-before-int dispatch order in ``_to_python_native_scalar``
+    is the property under test: Python's ``bool`` subclasses ``int``,
+    so a naive ``isinstance(v, int)`` check that ran first would route
+    bool through ``int(v)`` and drop the boolean identity. The snapshot
+    output for ``hasNoReturn`` must be ``True``/``False`` with
+    ``type() is bool``.
+    """
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={"getName": "foo", "hasNoReturn": True, "isInline": False},
+    )
+    snap = snapshot_function(func)
+    assert type(snap["hasNoReturn"]) is bool
+    assert snap["hasNoReturn"] is True
+    assert type(snap["isInline"]) is bool
+    assert snap["isInline"] is False
+
+
+def test_snapshot_casts_jpype_bytes_proxy_to_native_bytes() -> None:
+    """A ``bytes`` subclass (e.g. JPype byte-array view) surfaces as strict ``bytes``."""
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={"getName": "foo", "getComment": _ProxyBytes(b"hello")},
+    )
+    snap = snapshot_function(func)
+    assert type(snap["Comment"]) is bytes
+    assert snap["Comment"] == b"hello"
+
+
+def test_snapshot_casts_proxies_in_nested_collections() -> None:
+    """JPype proxies inside collection-returning getters are normalised too.
+
+    The recursion routes each element through ``_snapshot`` again so the
+    primitive-cast applies at every depth; this pins that property by
+    seeding a ``getLocalVariables``-style list with mixed proxy types
+    and asserting every emitted leaf has a strict-Python type identity.
+    """
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={
+            "getName": _ProxyString("foo"),
+            "getLocalVariables": [
+                _ProxyLong(1),
+                _ProxyDouble(2.5),
+                _ProxyString("local"),
+            ],
+        },
+    )
+    snap = snapshot_function(func)
+    locals_list = snap["LocalVariables"]
+    assert isinstance(locals_list, list)
+    # Each element's concrete type is the native one.
+    assert type(locals_list[0]) is int
+    assert type(locals_list[1]) is float
+    assert type(locals_list[2]) is str
+    assert locals_list == [1, 2.5, "local"]
+
+
+def test_snapshot_output_is_pickle_safe_without_proxy_classes() -> None:
+    """Top-down: every leaf in the snapshot output has a strict native type.
+
+    The whole point of normalising primitives is so the dump pickle is
+    loadable in a vanilla Python with no JVM and no JPype-proxy classes
+    registered. This test seeds proxies at every layer and walks all
+    leaves, asserting each has ``type(leaf) in {int, float, str, bool,
+    bytes, NoneType}`` (or is itself a dict/list still being walked).
+    """
+    symbol = MockJavaObject(
+        java_class="ghidra.program.model.symbol.SymbolDB",
+        getters={
+            "getName": _ProxyString("foo"),
+            "getID": _ProxyLong(42),
+            "isPrimary": True,
+        },
+    )
+    func = MockJavaObject(
+        java_class="ghidra.program.model.listing.FunctionDB",
+        getters={
+            "getName": _ProxyString("foo"),
+            "getEntryPoint": _ProxyLong(0x401000),
+            "isInline": False,
+            "getSymbol": symbol,
+        },
+    )
+    snap = snapshot_function(func)
+    native_types = (int, float, str, bool, bytes, type(None))
+    for leaf in _walk_all_leaves(snap):
+        assert type(leaf) in native_types, (
+            f"non-native leaf type {type(leaf)!r} (value={leaf!r})"
+        )
