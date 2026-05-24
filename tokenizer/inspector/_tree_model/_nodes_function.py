@@ -13,7 +13,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from tokenizer.aligned_data.loader.batch_decode import batch_decode
+from tokenizer.aligned_data.loader.batch_decode import (
+    batch_decode,
+    compute_auto_sizes,
+)
 from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 
@@ -34,16 +37,6 @@ __all__ = [
     "FunctionNode",
     "build_variants_from_result",
 ]
-
-
-def _context_len_for_variants(variants_lengths: list[int]) -> int:
-    """``context_len`` sized to the longest variant + headroom (plan D2).
-
-    Headroom (64) covers the variant-axis prefix + per-call prepend slot
-    budget so no variant is mid-cut by the inspector's batch_decode.
-    """
-    longest = max(variants_lengths) if variants_lengths else 0
-    return max(longest + 64, 64)
 
 
 def _build_callee_arm_resolver(
@@ -150,29 +143,17 @@ class FunctionNode:
         Returns one :class:`VariantNode` per surviving variant. Raises
         on failure -- the UI dispatcher wraps the call.
         """
-        # Peek the section via the public load_* APIs to size
-        # ``num_variants_per_section`` (real variant count, plan D2)
-        # and ``context_len`` (longest variant body's token count).
-        if self.arm is SectionKind.MATCHED:
-            matched = session.load_matched(self.idx)
-            variant_lengths = [len(v.tokens) for v in matched.variants]
-            n_variants = len(matched.variants)
-        else:
-            fd = session.load_unmatched(self.idx)
-            variant_lengths = [len(fd.tokens)]
-            n_variants = 1
-
-        if n_variants == 0:
+        spec = SectionPointerSpec(arm=self.arm, idx=self.idx)
+        sizing = compute_auto_sizes(session, [spec])
+        if sizing.num_variants_per_section == 0:
             raise RuntimeError(
                 f"function arm={self.arm.name} idx={self.idx} has no variants"
             )
-
-        spec = SectionPointerSpec(arm=self.arm, idx=self.idx)
         result = batch_decode(
             session,
             [spec],
-            num_variants_per_section=n_variants,
-            context_len=_context_len_for_variants(variant_lengths),
+            num_variants_per_section=sizing.num_variants_per_section,
+            context_len=sizing.context_len,
             max_depth=0,
             include_fid_sidecar=True,
             keep_intermediate=True,

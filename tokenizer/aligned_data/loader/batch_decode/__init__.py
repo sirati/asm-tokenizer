@@ -19,6 +19,7 @@ Re-exports:
 
 from __future__ import annotations
 
+from ._auto_size import SizingSpec, auto_size_from_resolved, compute_auto_sizes
 from ._entry import PendingBatchDecode, batch_decode
 from ._types import (
     BatchDecodeResult,
@@ -30,6 +31,9 @@ __all__ = [
     "BatchDecodeResult",
     "PendingBatchDecode",
     "SectionPointerSpec",
+    "SizingSpec",
     "VariantPadding",
+    "auto_size_from_resolved",
     "batch_decode",
+    "compute_auto_sizes",
 ]

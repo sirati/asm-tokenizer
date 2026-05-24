@@ -40,11 +40,13 @@ def _make_function_data(tokens_len: int = 8) -> SimpleNamespace:
     """Minimal :class:`FunctionData` stand-in for label rendering +
     token-len peeking.
 
-    The tree model only touches ``.tokens`` (for ``len(...)``) and
-    ``.metadata`` (read by :func:`variant_label`).
+    The tree model touches ``.tokens`` (for ``len(...)``) and
+    ``.metadata`` (read by :func:`variant_label`); the auto-size helper
+    additionally reads ``.variant_tokens.shape[0]``.
     """
     return SimpleNamespace(
         tokens=np.zeros(tokens_len, dtype=np.uint16),
+        variant_tokens=np.zeros(0, dtype=np.uint16),
         metadata={"arch": "x86", "compiler": "clang", "compilerversion": "8", "opt": "O3"},
     )
 
@@ -112,13 +114,20 @@ def synthetic_section(n_variants):
 @pytest.fixture
 def fake_session(synthetic_section):
     """Session with the bare-minimum API the model touches:
-    ``load_matched``, ``get_metadata``, ``_idx_for_section_offset``."""
+    ``_load_matched_section_and_variants`` (the private helper that
+    :func:`compute_auto_sizes` + :func:`resolve_section_pointers`
+    delegate to), ``get_metadata``, ``_idx_for_section_offset``."""
     session = MagicMock(name="BinarySession")
     matched = SimpleNamespace(
         func_name="main",
         variants=[_make_function_data() for _ in synthetic_section.variants],
     )
-    session.load_matched.return_value = matched
+    section_offset = synthetic_section.section_offset
+    session._load_matched_section_and_variants.return_value = (
+        synthetic_section,
+        section_offset,
+        matched,
+    )
     session.get_metadata.return_value = {}  # empty line_to_name / line_to_provider
     session._idx_for_section_offset.return_value = None
     return session
