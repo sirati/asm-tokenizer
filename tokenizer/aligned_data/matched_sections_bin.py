@@ -76,6 +76,7 @@ import numpy as np
 
 from dedup_hashmap import HashMapU32U32
 
+from tokenizer.aligned_data._matched_sections_variant_buffer import VariantBuffer
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_MAGIC,
@@ -279,26 +280,37 @@ class SectionWriter:
        zero bytes for the jump table, then writes the call_target
        table. The header's ``n_variants`` is patched at
        :meth:`end_section`.
-    3. Per variant:
-        a. :meth:`begin_variant` — stamps the 8-byte variant header
-           (``u32 variant_ref_offset | u32 data_offset_shifted``);
-           ``n_calls`` lives in the section's jump table, not the
-           variant header.
-        b. :meth:`emit_per_call_entries` — writes the per-call slots.
-           Backward references re-parse the callee section pointed at
-           by ``_known_sections[callee_fid]`` and stamp the resolved
-           variant idx directly on a vkey hit; misses (and forward
-           references) defer to a back-patch hole. Stamps this
-           variant's jump-table slot afterwards.
+    3. Per variant — buffered into :class:`VariantBuffer` so the
+       section's variant blocks land on disk in
+       ``variant_ref_offset``-ascending order rather than the caller's
+       declared-emit order. The reader is agnostic to this ordering;
+       sibling-close back-patches re-derive variant indices from the
+       on-disk variant table, so sorting at write time keeps the
+       per-section variant block list scannable in
+       ``variant_ref_offset`` order without changing the wire format.
+        a. :meth:`begin_variant` — packs the 8-byte variant header
+           (``u32 variant_ref_offset | u32 data_offset_shifted``) into
+           the buffer; ``n_calls`` lives in the section's jump table,
+           not the variant header.
+        b. :meth:`emit_per_call_entries` — appends per-call slots to
+           the buffer. Backward references re-parse the callee section
+           pointed at by ``_known_sections[callee_fid]`` and stamp the
+           resolved variant idx directly on a vkey hit (the callee's
+           on-disk variants are already sorted, so the resolved idx is
+           the post-sort idx the loader will read); misses (and
+           forward references) defer to a back-patch hole.
         c. :meth:`end_variant` — increments the section's variant
            count.
-    4. :meth:`end_section` — back-patches ``n_variants``, pads to a
-       4-byte boundary, parses the just-closed section's bytes to
-       recover its variant table, resolves any self-references the
-       just-closed section made into itself (the "callee_fid ==
-       my_fid" case that ``emit_per_call_entries`` deferred), then
-       walks every caller section in ``_pending_holes[my_fid]`` and
-       re-parses each caller's own bytes to stamp the call_target's
+    4. :meth:`end_section` — flushes the variant buffer in
+       ``variant_ref_offset``-ascending order, stamps the jump table
+       from the sorted variants' ``n_calls``, back-patches
+       ``n_variants``, pads to a 4-byte boundary, parses the
+       just-closed section's bytes to recover its variant table,
+       resolves any self-references the just-closed section made into
+       itself (the "callee_fid == my_fid" case that
+       ``emit_per_call_entries`` deferred), then walks every caller
+       section in ``_pending_holes[my_fid]`` and re-parses each
+       caller's own bytes to stamp the call_target's
        ``function_section_ptr`` AND any per-call entry whose owning
        caller variant's ``variant_ref_offset`` matches a variant in
        THIS section's local table.
@@ -310,9 +322,23 @@ class SectionWriter:
        mismatch — one warn-log line per stamp). Then runs a
        belt-and-braces sweep for any leaked ``0xFFFF`` and closes
        the underlying memmap.
+
+    Debug flag ``verify_holes_unfilled``: when ``True``, every
+    hole-fill operation reads the target slot's current u16 BEFORE
+    writing and asserts it equals :data:`UNRESOLVED_VARIANT_INDEX`
+    (``0xFFFF``); on mismatch, raises ``AssertionError`` with a full
+    byte-offset + value diagnostic. Use to catch double-write or
+    wrong-byte-target writer bugs. Default ``False``; zero overhead
+    when ``False`` (a single not-taken branch at each hole-fill site).
     """
 
-    def __init__(self, path: Path, warn_log: Optional[TextIO] = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        warn_log: Optional[TextIO] = None,
+        *,
+        verify_holes_unfilled: bool = False,
+    ) -> None:
         # Prelude is the natural identity of the bin: stamped at open
         # so the first section starts at byte 16. The writer keeps a
         # direct reference to MemmapBinWriter; the public API never
@@ -325,6 +351,12 @@ class SectionWriter:
         # :data:`MISSING_VARIANT_INDEX` stamped at finalize. ``None``
         # silences the writer (test-fixture default).
         self._warn_log: Optional[TextIO] = warn_log
+
+        # Diagnostic flag: when True, every hole-fill site reads the
+        # target slot's current u16 before writing and asserts it
+        # equals :data:`UNRESOLVED_VARIANT_INDEX`. Off by default;
+        # gated branch at each site has zero work-cost when False.
+        self.verify_holes_unfilled: bool = verify_holes_unfilled
 
         # Cross-section state.
         #
@@ -366,13 +398,14 @@ class SectionWriter:
         # called_idx points at the call_target whose FID the entry
         # declares.
         self._current_call_targets: list[CallTargetSpec] = []
-        # variant_idx → variant_count assigned so far in this section.
-        self._current_variant_count: int = 0
-        # Whether a variant is currently open (between :meth:`begin_variant`
-        # and the corresponding :meth:`end_variant`). Per-call counts now
-        # live in the section's jump table, not the variant header, so the
-        # writer no longer tracks a per-variant slot offset.
-        self._current_variant_open: bool = False
+        # Per-section variant accumulator. Variants are buffered between
+        # :meth:`begin_section` and :meth:`end_section` so the flush at
+        # :meth:`end_section` can write them in
+        # ``variant_ref_offset``-ascending order regardless of caller
+        # emit order. ``None`` outside a section; the buffer itself
+        # answers ``variant_open`` / ``n_variants`` while a section is
+        # live.
+        self._variant_buffer: Optional[VariantBuffer] = None
 
     # ------------------------------------------------------------------
     # Section lifecycle
@@ -440,11 +473,11 @@ class SectionWriter:
         # The jump table starts immediately after the section header. It is
         # written by emit_call_targets (which knows its own header_offset),
         # but the offset is deterministic so we cache it here for
-        # emit_per_call_entries to stamp into.
+        # :meth:`end_section` to stamp into once the variant buffer is
+        # flushed in sorted order.
         self._current_jump_table_offset = section_offset + SECTION_HEADER_SIZE
         self._current_call_targets = []
-        self._current_variant_count = 0
-        self._current_variant_open = False
+        self._variant_buffer = VariantBuffer()
         return section_offset
 
     def emit_call_targets(self, call_targets: list[CallTargetSpec]) -> None:
@@ -509,13 +542,15 @@ class SectionWriter:
     def begin_variant(
         self, variant_ref_offset: int, data_offset_shifted: int
     ) -> None:
-        """Stamp the variant header.
+        """Pack the variant header into the section's variant buffer.
 
         The variant header is an 8-byte
         ``u32 variant_ref_offset | u32 data_offset_shifted``; the
-        per-variant ``n_calls`` lives in the section's jump table and is
-        stamped by :meth:`emit_per_call_entries` once the entries are
-        written. Cursor is left at the start of the per-call entries.
+        per-variant ``n_calls`` lives in the section's jump table and
+        is stamped by :meth:`end_section` when the buffer is flushed in
+        ``variant_ref_offset``-ascending order. The bytes are NOT
+        written through to the underlying writer yet — they are
+        accumulated in :attr:`_variant_buffer` and reordered at flush.
         """
         self._assert_section_open()
         if self._n_variants_slot is None:
@@ -523,18 +558,18 @@ class SectionWriter:
                 "begin_variant called before emit_call_targets; the "
                 "section header must be stamped first"
             )
-        if self._current_variant_open:
+        if self._variant_buffer.variant_open:
             raise ValueError(
                 "begin_variant called while a previous variant is still "
                 "open; call emit_per_call_entries + end_variant first"
             )
-        if self._current_variant_count >= self._current_n_variants_declared:
+        if self._variant_buffer.n_variants >= self._current_n_variants_declared:
             raise ValueError(
                 f"section for function_name_ptr={self._current_fid} declared "
                 f"n_variants={self._current_n_variants_declared} at "
                 f"begin_section but begin_variant was called a "
-                f"{self._current_variant_count + 1}-th time; the jump-table "
-                f"reservation has no slot for this variant"
+                f"{self._variant_buffer.n_variants + 1}-th time; the "
+                f"jump-table reservation has no slot for this variant"
             )
 
         variant_header = struct.pack(
@@ -542,11 +577,10 @@ class SectionWriter:
             variant_ref_offset,
             data_offset_shifted,
         )
-        self._writer.write(variant_header)
-        self._current_variant_open = True
+        self._variant_buffer.begin_variant(variant_ref_offset, variant_header)
 
     def emit_per_call_entries(self, entries: list[PerCallEntry]) -> None:
-        """Write the variant's per-call entries + stamp its jump-table slot.
+        """Append the variant's per-call entries to the variant buffer.
 
         Backward references (``callee_fid in _known_sections``) re-parse
         the callee section pointed at by ``_known_sections[callee_fid]``
@@ -555,30 +589,44 @@ class SectionWriter:
         last-write-wins. The just-parsed section's local
         ``variant_ref_offset -> variant_idx`` map is consulted for the
         entry's ``callee_vkey``: a hit stamps the resolved index
-        directly. A miss — or a forward reference whose callee section
-        has not been opened yet, or a self-reference whose section is
-        still in flight — stamps :data:`UNRESOLVED_VARIANT_INDEX` and
-        records THIS section's offset in
-        ``_pending_holes[callee_fid]``. The marker is the only thing
-        the writer needs: at the callee's :meth:`end_section` the
-        writer re-parses both that section AND every caller it has
-        marked, and re-derives the slot byte offsets from the bin's
-        self-describing bytes (jump table + variants region).
-        Self-references skip the marker: the slot is resolved by
-        :meth:`end_section`'s "step 2" self-resolve pass on the
-        just-closed section's own bytes, keeping the self-call path
-        disjoint from the sibling-close path so the two never
+        directly. The callee's on-disk variants are already
+        ``variant_ref_offset``-sorted (flushed by :meth:`end_section`
+        when the callee closed), so the resolved index IS the post-sort
+        idx the loader will read.
+
+        A miss — or a forward reference whose callee section has not
+        been opened yet, or a self-reference whose section is still in
+        flight — stamps :data:`UNRESOLVED_VARIANT_INDEX` and records
+        THIS section's offset in ``_pending_holes[callee_fid]``. The
+        marker is the only thing the writer needs: at the callee's
+        :meth:`end_section` the writer re-parses both that section AND
+        every caller it has marked, and re-derives the slot byte
+        offsets from the bin's self-describing bytes (jump table +
+        variants region). Self-references skip the marker: the slot is
+        resolved by :meth:`end_section`'s "step 2" self-resolve pass
+        on the just-closed section's own bytes, keeping the self-call
+        path disjoint from the sibling-close path so the two never
         double-patch the same slot.
 
         Anything still unresolved at :meth:`finalize` (cross-arm vkey
         mismatch) gets :data:`MISSING_VARIANT_INDEX` + a warn-log
         line.
 
-        After the entries are written the section's jump table receives
-        ``jump_table[current_variant_idx] = len(entries)`` so the reader
-        can address variant_i in O(1).
+        The buffered per-call bytes are not yet on disk — they are
+        flushed in sorted order by :meth:`end_section`, which also
+        stamps the per-section jump table from the sorted variants'
+        per-call counts.
         """
         self._assert_variant_open()
+
+        n_calls = len(entries)
+        if n_calls > 0xFFFF:
+            raise ValueError(
+                f"section for function_name_ptr={self._current_fid} "
+                f"variant_idx={self._variant_buffer.n_variants} has "
+                f"{n_calls} per-call entries; max is {0xFFFF} (u16 "
+                f"jump-table slot)"
+            )
 
         for entry in entries:
             self._assert_called_idx_matches(entry)
@@ -604,25 +652,9 @@ class SectionWriter:
                     self._pending_holes.setdefault(
                         entry.callee_function_name_ptr, set()
                     ).add(self._current_section_offset)
-            self._writer.write(
+            self._variant_buffer.append_per_call_entry(
                 struct.pack("<HH", entry.called_idx, section_variant_index)
             )
-
-        # Stamp the jump-table slot for THIS variant. ``_current_variant_count``
-        # is the 0-based index of the currently-open variant (incremented at
-        # :meth:`end_variant`), which is exactly the slot we want.
-        n_calls = len(entries)
-        if n_calls > 0xFFFF:
-            raise ValueError(
-                f"section for function_name_ptr={self._current_fid} "
-                f"variant_idx={self._current_variant_count} has {n_calls} "
-                f"per-call entries; max is {0xFFFF} (u16 jump-table slot)"
-            )
-        jump_table_slot = (
-            self._current_jump_table_offset
-            + self._current_variant_count * JUMP_TABLE_ENTRY_SIZE
-        )
-        self._writer.patch(jump_table_slot, struct.pack("<H", n_calls))
 
     def _resolve_backward_variant_index(
         self, *, callee_fid: int, callee_vkey: Hashable
@@ -667,16 +699,19 @@ class SectionWriter:
         return None
 
     def end_variant(self, vkey: Hashable) -> int:
-        """Finalise the currently-open variant.
+        """Finalise the currently-open variant in the variant buffer.
 
-        Returns the variant's 0-based index in the section's variant
-        block list. The vkey itself was already stamped into the
-        variant header's ``variant_ref_offset`` field (via
+        Returns the variant's 0-based **declared-emit-order** index.
+        Variants are reordered by ``variant_ref_offset`` ascending at
+        :meth:`end_section`-flush time, so the returned index does NOT
+        in general match the variant's on-disk position; the value is
+        documentary (callers that need the on-disk index recover it by
+        parsing the closed section). The vkey itself was already stamped
+        into the variant header's ``variant_ref_offset`` field (via
         :meth:`begin_variant`'s caller-supplied byte offset), so the
         writer does NOT need a cross-section map of
-        ``(FID, vkey) → variant_idx``: :meth:`end_section` recovers
-        it by parsing the just-closed section back from its own
-        bytes.
+        ``(FID, vkey) → variant_idx``: :meth:`end_section` recovers it
+        by parsing the just-closed section back from its own bytes.
 
         Multiple sections sharing a ``function_name_ptr`` (see the
         :meth:`begin_section` docstring) can emit overlapping vkeys
@@ -684,7 +719,7 @@ class SectionWriter:
         ``callee_vkey`` matches its own local variant table.
         """
         self._assert_variant_open()
-        variant_idx = self._current_variant_count
+        variant_idx = self._variant_buffer.n_variants
         if variant_idx > UNRESOLVED_VARIANT_INDEX - 1:
             raise ValueError(
                 f"section for function_name_ptr={self._current_fid} has "
@@ -692,18 +727,23 @@ class SectionWriter:
                 f"{UNRESOLVED_VARIANT_INDEX} per section (u16 slot reserves "
                 f"0xFFFF as the unresolved-hole sentinel)"
             )
-        self._current_variant_count += 1
-        self._current_variant_open = False
-        return variant_idx
+        return self._variant_buffer.end_variant()
 
     def end_section(self) -> tuple[int, int]:
         """Close the current section.
 
-        Patches ``n_variants``, pads to a 4-byte boundary, then parses
-        the just-closed section back from its own bytes to recover
-        the variant table. Resolves back-patches in two disjoint
-        sweeps, each parsing on-wire bytes (no writer-side slot-offset
-        cache):
+        Flushes the variant buffer in ``variant_ref_offset``-ascending
+        order (stable: equal vrefs keep their declared sub-order so the
+        ``searchsorted(side="right") - 1`` last-write-wins tie-break
+        still reproduces the legacy semantic). Each flushed variant
+        contributes its 8-byte header + per-call entry bytes to the
+        underlying writer at section-trailer-time, and its ``n_calls``
+        slots into the section's pre-reserved jump table at the
+        post-sort position. Then patches ``n_variants``, pads to a
+        4-byte boundary, parses the just-closed section back from its
+        own bytes to recover the variant table. Resolves back-patches
+        in two disjoint sweeps, each parsing on-wire bytes (no
+        writer-side slot-offset cache):
 
         * **Step 2 — self-resolve.** Iterate the just-closed
           section's own call_targets; any row whose ``name_ptr`` is
@@ -742,24 +782,44 @@ class SectionWriter:
         the length is a multiple of :data:`SECTION_ALIGNMENT`).
         """
         self._assert_section_open()
-        if self._current_variant_open:
+        if self._variant_buffer.variant_open:
             raise ValueError(
                 "end_section called while a variant is still open; "
                 "call end_variant first"
             )
-        if self._current_variant_count != self._current_n_variants_declared:
+        n_variants = self._variant_buffer.n_variants
+        if n_variants != self._current_n_variants_declared:
             raise ValueError(
                 f"section for function_name_ptr={self._current_fid} declared "
                 f"n_variants={self._current_n_variants_declared} at "
-                f"begin_section but emitted {self._current_variant_count}; "
-                f"the jump-table reservation cannot be retroactively resized "
-                f"because the call_targets block sits at a fixed offset past it"
+                f"begin_section but emitted {n_variants}; the jump-table "
+                f"reservation cannot be retroactively resized because the "
+                f"call_targets block sits at a fixed offset past it"
             )
+
+        # Flush the variant buffer in ``variant_ref_offset``-ascending
+        # order. Each variant contributes its header + per-call bytes
+        # at the current cursor; the jump-table slot at the variant's
+        # post-sort position is stamped from its ``n_calls``. The order
+        # in which slots are stamped is the sort order so slot ``i`` of
+        # the jump table aligns with the ``i``-th flushed variant —
+        # exactly what the reader scans.
+        for sort_idx, (header, per_call_bytes, n_calls) in enumerate(
+            self._variant_buffer.flush_sorted()
+        ):
+            self._writer.write(header)
+            if per_call_bytes:
+                self._writer.write(per_call_bytes)
+            jump_table_slot = (
+                self._current_jump_table_offset
+                + sort_idx * JUMP_TABLE_ENTRY_SIZE
+            )
+            self._writer.patch(jump_table_slot, struct.pack("<H", n_calls))
 
         # Patch n_variants.
         self._writer.patch(
             self._n_variants_slot,
-            struct.pack("<H", self._current_variant_count),
+            struct.pack("<H", n_variants),
         )
         # Align section trailer.
         self._pad_to_alignment()
@@ -775,7 +835,19 @@ class SectionWriter:
         # ``my_sorted_vrefs`` is the section's variant_ref_offsets in
         # ascending order for a single ``np.searchsorted``;
         # ``my_sort_order`` maps each sorted position back to the
-        # variant's declared index (== on-wire ``section_variant_index``).
+        # variant's on-wire ``section_variant_index``.
+        #
+        # The variant buffer flushed variants in
+        # ``variant_ref_offset``-ascending order, so ``my_vrefs`` is
+        # already sorted and ``argsort`` collapses to ``arange(n)``.
+        # The two-array dance is preserved verbatim because (a) it is
+        # the same shape ``_resolve_caller_section`` expects from the
+        # step-3 sibling-close path (where caller order is unrelated
+        # to callee order) and (b) the ``kind="stable"`` argsort
+        # together with the buffer's stable flush keeps the
+        # ``searchsorted(side="right") - 1`` last-write-wins tie-break
+        # consistent across both step-2 and step-3 paths when a
+        # section legitimately repeats the same ``variant_ref_offset``.
         blob = self._writer.view()
         try:
             parsed_self, _end = parse_section_bin(blob, section_offset)
@@ -786,11 +858,6 @@ class SectionWriter:
             dtype=np.uint32,
             count=len(parsed_self.variants),
         )
-        # ``kind="stable"`` preserves declared-order among equal vrefs so
-        # the resolver below can pick the LAST declared variant by
-        # taking ``searchsorted(side="right") - 1`` — preserving the
-        # legacy ``vkey_to_idx`` dict's last-write-wins semantics when a
-        # section legitimately repeats the same ``variant_ref_offset``.
         my_sort_order = np.argsort(my_vrefs, kind="stable").astype(np.int64)
         my_sorted_vrefs = my_vrefs[my_sort_order]
 
@@ -807,6 +874,7 @@ class SectionWriter:
             callee_section_offset=section_offset,
             callee_sorted_vrefs=my_sorted_vrefs,
             callee_sort_order=my_sort_order,
+            context="Step2-self-resolve",
         )
 
         # Step 3: sibling-close patches. Walk every caller section
@@ -820,6 +888,7 @@ class SectionWriter:
                 callee_section_offset=section_offset,
                 callee_sorted_vrefs=my_sorted_vrefs,
                 callee_sort_order=my_sort_order,
+                context="Step3-sibling-close",
             )
 
         # Clear per-section state.
@@ -829,8 +898,7 @@ class SectionWriter:
         self._current_n_variants_declared = None
         self._current_jump_table_offset = None
         self._current_call_targets = []
-        self._current_variant_count = 0
-        self._current_variant_open = False
+        self._variant_buffer = None
 
         return section_offset, section_length
 
@@ -954,6 +1022,14 @@ class SectionWriter:
                     continue
                 if sv_idx != UNRESOLVED_VARIANT_INDEX:
                     continue
+                if self.verify_holes_unfilled:
+                    self._assert_slot_unresolved(
+                        slot_offset,
+                        MISSING_VARIANT_INDEX,
+                        context="finalize-MISSING",
+                        caller_section_offset=caller_section_offset,
+                        callee_fid=callee_fid,
+                    )
                 self._writer.patch(
                     slot_offset, struct.pack("<H", MISSING_VARIANT_INDEX)
                 )
@@ -1002,7 +1078,7 @@ class SectionWriter:
 
     def _assert_variant_open(self) -> None:
         self._assert_section_open()
-        if not self._current_variant_open:
+        if not self._variant_buffer.variant_open:
             raise ValueError("no variant is currently open")
 
     def _assert_called_idx_matches(self, entry: PerCallEntry) -> None:
@@ -1065,6 +1141,48 @@ class SectionWriter:
         ).add(self._current_section_offset)
         return 0  # placeholder; patched in end_section of the callee.
 
+    def _assert_slots_unresolved_vec(
+        self, variants_u16, slot_positions, intended_vec, *,
+        context, caller_section_offset, callee_fid, variants_region_start,
+    ) -> None:
+        """Vectorised pre-write check: every ``slot_positions`` entry
+        (u16 index into ``variants_u16``) must hold
+        :data:`UNRESOLVED_VARIANT_INDEX`. Reads u16, compares to
+        ``0xFFFF``; diagnostic context passed in.
+        """
+        actual = variants_u16[slot_positions]
+        bad = actual != np.uint16(UNRESOLVED_VARIANT_INDEX)
+        if not bad.any():
+            return
+        i = int(np.nonzero(bad)[0][0])
+        raise AssertionError(
+            f"SectionWriter.verify_holes_unfilled[{context}]: caller_section_offset="
+            f"{caller_section_offset} callee_fid={callee_fid} byte_offset="
+            f"{variants_region_start + int(slot_positions[i]) * 2} current=0x"
+            f"{int(actual[i]):04x} intended=0x{int(intended_vec[i]):04x} "
+            f"bad_total={int(bad.sum())}"
+        )
+
+    def _assert_slot_unresolved(
+        self, byte_offset: int, intended_value: int, *,
+        context: str, caller_section_offset: int, callee_fid: int,
+    ) -> None:
+        """Scalar pre-write check for one ``_writer.patch`` u16."""
+        blob = self._writer.view()
+        try:
+            actual = int.from_bytes(
+                bytes(blob[byte_offset : byte_offset + 2]), "little"
+            )
+        finally:
+            blob.release()
+        if actual == UNRESOLVED_VARIANT_INDEX:
+            return
+        raise AssertionError(
+            f"SectionWriter.verify_holes_unfilled[{context}]: caller_section_offset="
+            f"{caller_section_offset} callee_fid={callee_fid} byte_offset="
+            f"{byte_offset} current=0x{actual:04x} intended=0x{intended_value:04x}"
+        )
+
     def _resolve_caller_section(
         self,
         *,
@@ -1073,6 +1191,7 @@ class SectionWriter:
         callee_section_offset: int,
         callee_sorted_vrefs: "np.ndarray",
         callee_sort_order: "np.ndarray",
+        context: str = "Step3-sibling-close",
     ) -> None:
         """Re-derive caller's slot positions; write Cases A + B in place
         through the live mmap.
@@ -1191,9 +1310,19 @@ class SectionWriter:
             return
 
         # In-place writes through the live mmap.
-        variants_u16[sv_idx_pos[hole_indices[matches]]] = (
-            callee_sort_order[ss[matches]].astype(np.uint16)
-        )
+        target_slots = sv_idx_pos[hole_indices[matches]]
+        target_values = callee_sort_order[ss[matches]].astype(np.uint16)
+        if self.verify_holes_unfilled:
+            self._assert_slots_unresolved_vec(
+                variants_u16,
+                target_slots,
+                target_values,
+                context=context,
+                caller_section_offset=caller_section_offset,
+                callee_fid=callee_fid,
+                variants_region_start=variants_region_start,
+            )
+        variants_u16[target_slots] = target_values
 
     def _sweep_for_unresolved_sentinels(self) -> None:
         """Walk the bin sections; assert no ``0xFFFF`` slot leaked.

@@ -28,9 +28,16 @@ from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.binary_format import record_token_count_from_memmap
+from tokenizer.aligned_data.binary_format import (
+    MAX_HEADER_BYTES,
+    parse_binary_header,
+    record_token_count_from_memmap,
+)
 from tokenizer.aligned_data.index_format import read_index_arrays
-from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+from tokenizer.aligned_data.memmap_format import (
+    MEMMAP_FORMAT_VERSION,
+    read_data_bin_trailer,
+)
 
 from ._matched_arm_loader import load_matched_arm
 
@@ -221,6 +228,12 @@ def load_unmatched_lengths(
     Delegates per-record decoding to
     :func:`record_token_count_from_memmap`, which owns the header
     parse + width-tag dispatch in one place.
+
+    Also performs the load-time per-arm sweep that pins the cross-file
+    invariant ``entry_idx == i`` over the arm's known per-record
+    ``starts``; a single mismatch fails with the canonical corrupt-file
+    error so a corrupted index / data-bin pair is rejected at session
+    open instead of returning garbage on first lookup.
     """
     if not paths.data_bin.exists() or len(starts) == 0:
         return np.array([], dtype=np.int32)
@@ -251,7 +264,12 @@ def _load_matched(
 ) -> SectionArm:
     # ``matched_index`` is always ``paths.index_bin`` on the matched
     # arm; accepting it via kw keeps the dispatch signature uniform.
-    return load_matched_arm(paths.sections_bin, paths.index_bin, line_to_name)
+    return load_matched_arm(
+        paths.sections_bin,
+        paths.index_bin,
+        line_to_name,
+        data_bin=paths.data_bin,
+    )
 
 
 def _load_unmatched(

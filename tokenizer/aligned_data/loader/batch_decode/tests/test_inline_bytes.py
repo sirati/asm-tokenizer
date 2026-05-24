@@ -219,6 +219,7 @@ def _wrap_stage2_call_targets_as_batch(
             variant_ref_offset=0,
             batch_idx=batch_idx,
             call_targets=stage1_cts,
+            variant_tokens=np.zeros(0, dtype=np.uint16),
         )
         stage1_variants.append(stage1_variant)
 

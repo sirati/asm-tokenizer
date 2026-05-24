@@ -23,16 +23,36 @@ rather than living in a dedicated helper module. The four are composed
 by ``_assemble.py`` -- nothing here knows about the identity arm,
 number arm, or sidecar offsets.
 
-Prepend self-token ordering
----------------------------
-Stage 2a ("`_expand_tokens.py`") already builds ``expanded_token_ids``
-as ``np.concatenate([[calling_category_token_id_shifted],
+Row layout + prepend self-token ordering
+----------------------------------------
+Per plan D3 / ALG-9 a batch row's token tensor has the shape::
+
+    [variant_tokens_shifted (row prefix),
+     LOCAL_FUNC self-token + root body,
+     callee_1 self-token + body,
+     ...]
+
+The variant_tokens prefix is a row-level identity prefix (one per
+:class:`Stage1Variant`); every call_target in the variant shares the
+same prefix. Stage 4 emits it once at the head of each batch row before
+any call_target body. variant_tokens are statically encoded raw vocab
+IDs (no inline-digit followers, no promotion / strip dynamics); the
+prefix shift to model-facing IDs is a single elementwise ``- 256``.
+
+Stage 2a ("`_expand_tokens.py`") builds each call_target's
+``expanded_token_ids`` as ``np.concatenate([[calling_category_token_id_shifted],
 expanded_real])`` per ``ALG-9``. The self-token sits at
-``expanded_token_ids[0]`` of every call_target. This module writes the
-full slice ``expanded_token_ids[:partial_cut_length]`` verbatim --
-position 0 (the prepend) is copied alongside everything else. The
-prepend's IDENTITY-sidecar **counter id** is written by the sibling
-dedup walk (see :mod:`._dedup_walk`) into
+``expanded_token_ids[0]`` of every call_target -- INCLUDING the root.
+That means the LOCAL_FUNC self-token lands AT the root body start, not
+before the variant_tokens prefix. The walker (:mod:`._callee_walk`)
+feeds ``function_data.tokens`` (body only) to every call_target, root
+and callee alike -- no special-case path for the root.
+
+This module writes the full slice
+``expanded_token_ids[:partial_cut_length]`` verbatim into the row
+following the variant_tokens prefix. The prepend's IDENTITY-sidecar
+**counter id** is written by the sibling dedup walk (see
+:mod:`._dedup_walk`) into
 ``stage3.identities_flat_caller_local[identity_slice.start]``, a
 *disjoint* destination. The two writes are therefore order-independent:
 either may run first.
@@ -72,10 +92,23 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from tokenizer.token_manager import VocabularyManager
+
 from ._row_expand import build_per_row_variant_lookup
 
 if TYPE_CHECKING:
     from ._types import Stage3Batch, Stage3Variant
+
+
+# variant_tokens are statically encoded raw vocab IDs (>= 257; the
+# unified vocab places them in the metadata-variant tail past the
+# instruction-rep block) with NO inline-digit followers. The model-
+# facing token stream uses post-shift IDs (raw - 256), so emission at
+# the row-assembly seam is a single elementwise subtract. The keep-mask
+# + dynamic strip applied to per-call-target token streams is
+# unnecessary here: variant_tokens carry no value_negative markers and
+# no inline-digit slots; ``raw - 256`` is the canonical shift.
+_V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT
 
 
 __all__ = ["assemble_tokens"]
@@ -101,13 +134,28 @@ def _build_variant_row(
     if context_len == 0:
         return row
 
+    stage1_variant = stage3_variant.stage2.stage1
     # ``Stage1Variant.batch_idx is None`` marks a "padding out" slot
     # (RAGGED post-cutoff drop). Such variants must not contribute
     # content even though the mapping entry isn't the sentinel.
-    if stage3_variant.stage2.stage1.batch_idx is None:
+    if stage1_variant.batch_idx is None:
         return row
 
-    col = 0
+    # Row-level variant_tokens prefix (plan D3 / ALG-9). One per row,
+    # contributed by ``Stage1Variant.variant_tokens`` -- statically
+    # encoded raw vocab IDs, no inline-digit followers, no promotion /
+    # strip dynamics. The model-facing tensor uses post-shift IDs, so
+    # emission is a single elementwise ``- 256``. The slice is capped
+    # by ``context_len`` so a degenerate variant whose prefix alone
+    # exceeds the column budget still produces a well-formed row.
+    variant_tokens = stage1_variant.variant_tokens
+    n_axis = int(variant_tokens.shape[0])
+    col = min(n_axis, context_len)
+    if col > 0:
+        row[:col] = variant_tokens[:col].astype(np.uint16) - np.uint16(
+            _V2_RESERVED_DIGIT_COUNT
+        )
+
     for stage3_ct in stage3_variant.call_targets:
         if col >= context_len:
             break
@@ -163,7 +211,9 @@ def assemble_tokens(
       the column-1 entry, an INDEX into
       :attr:`Stage1Section.variants`, i.e. the slot index *post* variant
       sampling -- not the original variant index inside the section's
-      underlying variants list). For each call_target in
+      underlying variants list). First write the row-level
+      ``variant_tokens`` prefix (one per variant; ``- 256`` shift; capped
+      by ``context_len``). Then for each call_target in
       ``variant.call_targets`` (root first; then callees in stage-1 DFS
       encounter order), copy
       ``call_target.stage2.expanded_token_ids[:call_target.stage2.partial_cut_length]``

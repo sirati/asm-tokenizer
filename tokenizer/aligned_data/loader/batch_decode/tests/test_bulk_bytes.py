@@ -191,6 +191,7 @@ def _wrap_stage2_batch(
         variant_ref_offset=0,
         batch_idx=0,
         call_targets=stage1_cts,
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage1_section = Stage1Section(
         arm=SectionKind.MATCHED,
@@ -589,6 +590,7 @@ def test_end_to_end_predict_lengths_into_build_bulk_bytes() -> None:
         variant_ref_offset=0,
         batch_idx=0,
         call_targets=[stage1_ct],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage1_section = Stage1Section(
         arm=SectionKind.MATCHED,

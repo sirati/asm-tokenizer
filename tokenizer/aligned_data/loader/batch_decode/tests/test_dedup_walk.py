@@ -223,6 +223,7 @@ def _make_stage3_variant_from_calls(
         variant_ref_offset=0,
         batch_idx=batch_idx,
         call_targets=[ct.stage2.stage1 for ct in stage3_call_targets],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage1_section = Stage1Section(
         arm=SectionKind.MATCHED,

@@ -108,6 +108,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         self._sections_bin_view: Optional[memoryview] = None
         self._data_mmap: Optional[np.ndarray] = None
         self._data_kind: Optional[str] = None
+        self._data_total_entries: Optional[int] = None
         self._variants_mmap: Optional[np.ndarray] = None
 
         self._stack: Optional[ExitStack] = None
@@ -134,6 +135,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         self._sections_bin_blob = None
         self._data_mmap = None
         self._data_kind = None
+        self._data_total_entries = None
         self._variants_mmap = None
         if view is not None:
             # memoryview.release() drops the export so the underlying
@@ -241,10 +243,20 @@ class BinarySession(_BinarySessionHelpersMixin):
         :func:`extract_arrays_from_data`. Arrays are copied so they
         outlive the session's ``_data.bin`` memmap (see class docstring
         lifetime contract).
+
+        Per-lookup integrity check: the parsed header's ``entry_idx``
+        must be ``< total_entries`` (the value the trailer of the bin
+        stamps; read once at session-open). A failure raises
+        :class:`ValueError` with the exact wording
+        ``corrupt file: <filename> did not pass validation``.
         """
         header, prefix_bytes = parse_binary_header(
             bytes(data_mmap[offset : offset + MAX_HEADER_BYTES])
         )
+        if header.entry_idx >= (self._data_total_entries or 0):
+            raise ValueError(
+                f"corrupt file: {self._data_filename()} did not pass validation"
+            )
         total = record_total_size(header)
         record_bytes = bytes(data_mmap[offset : offset + total])
         insn_rl, block_rl, tokens = extract_arrays_from_data(
@@ -255,6 +267,20 @@ class BinarySession(_BinarySessionHelpersMixin):
             np.array(block_rl, copy=True),
             np.array(tokens, copy=True),
         )
+
+    def _data_filename(self) -> str:
+        """Return the active arm's ``_data.bin`` filename for error msgs.
+
+        Single chokepoint that derives the path from the cached
+        ``_data_kind`` so corrupt-file errors report the right file
+        (matched vs unmatched arm).
+        """
+        suffix = (
+            "_unmatched_data.bin"
+            if self._data_kind == "unmatched"
+            else "_data.bin"
+        )
+        return f"{self._binary_name}{suffix}"
 
     def get_variant_by_ref(self, ref: str) -> Optional[Dict[str, Any]]:
         # Swallow resolver errors to ``None`` -- parsers want a sentinel
@@ -334,8 +360,13 @@ class BinarySession(_BinarySessionHelpersMixin):
         from tokenizer.aligned_data.memmap_format import (
             DATA_BIN_PRELUDE_SIZE,
             assert_data_bin_prelude,
+            read_data_bin_trailer,
         )
         assert_data_bin_prelude(bytes(mmap[:DATA_BIN_PRELUDE_SIZE]), path=str(path))
+        # The trailing ``total_entries`` u32 is the per-lookup
+        # ``entry_idx < total_entries`` bound; read + cache it once
+        # here so the hot path doesn't re-parse it per slice.
+        self._data_total_entries = read_data_bin_trailer(mmap)
         self._stack.callback(_close_memmap, mmap)
         self._data_mmap = mmap
         self._data_kind = kind

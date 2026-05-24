@@ -133,3 +133,28 @@ def test_variant_by_ref_missing_returns_none(synthetic_binary):
         assert sess.get_variant_by_ref("") is None
         # malformed hex
         assert sess.get_variant_by_ref("not-hex") is None
+
+
+def test_corrupt_trailer_raises_did_not_pass_validation(synthetic_binary):
+    """Flip the trailing ``total_entries`` u32 of ``_data.bin`` and
+    verify the per-lookup integrity check fires.
+
+    The session caches ``total_entries`` at ``_open_data`` time; bumping
+    the on-disk u32 by an offset that makes every parsed record's
+    ``entry_idx < total_entries`` would silently pass, so we flip it to
+    zero (smaller than every real record's idx) instead. Any
+    ``load_matched`` after that must raise the canonical corrupt-file
+    error.
+    """
+    fb = synthetic_binary
+    data_path = fb["base_path"] / f"{fb['binary_name']}_data.bin"
+    raw = bytearray(data_path.read_bytes())
+    # Overwrite the trailing u32 with zero (no record has idx < 0).
+    raw[-4:] = b"\x00\x00\x00\x00"
+    data_path.write_bytes(bytes(raw))
+
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as sess:
+        with pytest.raises(ValueError, match="did not pass validation"):
+            sess.load_matched(0)

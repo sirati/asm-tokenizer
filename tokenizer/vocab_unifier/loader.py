@@ -92,7 +92,32 @@ def read_last_line_of_file(csv_path: Path) -> bytes:
     return last_line_chunk.tobytes()
 
 
-def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> VocabularyManager | None:
+def load_vocab_manager_csv_row_bytes(
+    csv_row: bytes,
+    platform: Platform,
+    *,
+    legacy_no_value_negative: bool = False,
+) -> VocabularyManager | None:
+    """Reconstitute a :class:`VocabularyManager` from a per-binary CSV's
+    vocab-def row.
+
+    ``legacy_no_value_negative`` toggles compatibility with per-binary
+    CSVs generated BEFORE ``value_negative`` was reserved at slot 256:
+
+    * ``False`` (default): the reserved prefix is 257 slots
+      (256 digits + ``value_negative`` at slot 256). The saver stripped
+      this prefix on write; the loader prepends ``value_negative``
+      so absolute-ID lookups stay valid.
+    * ``True``: the saver stripped only the 256-slot digit prefix; the
+      first entry of ``vocabulary`` is a real token at per-binary id
+      256 (typically ``block_v2``). The loader pre-pends digits only and
+      does NOT insert ``value_negative``. The resulting per-binary VM
+      reports ``id_to_token`` length ``256 + n_real_tokens`` so callers
+      (notably :func:`unify_vocab`) must remap legacy ids 256+ via
+      :meth:`register_on_vocab_manager` against a normal-layout unified
+      VM so legacy id 256 lands at unified id 264 (or wherever the
+      canonical IDENTITY block places ``block_v2``).
+    """
     valid, row = is_vocab_def(csv_row, platform)
     if not valid:
         return None
@@ -123,22 +148,40 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
             f"on the per-binary CSVs to regenerate."
         )
 
-    # Protocol-reserved prefix (IDs 0..256) is stripped by the saver;
-    # reconstitute it so downstream absolute-ID lookups (lit caches,
-    # register_on_vocab_manager, etc.) stay valid. The prefix covers the
-    # 256 inline-digit slots PLUS the `value_negative` postfix marker
-    # pinned at slot 256 — both are protocol invariants under v1/v2.
+    # Protocol-reserved prefix is stripped by the saver; reconstitute it
+    # so downstream absolute-ID lookups (lit caches,
+    # register_on_vocab_manager, etc.) stay valid.
+    #
+    # Modern path (``legacy_no_value_negative=False``): prefix is 257
+    # slots — 256 inline-digit slots PLUS ``value_negative`` pinned at
+    # slot 256.
+    #
+    # Legacy path (``legacy_no_value_negative=True``): prefix is 256
+    # slots (digits only). The first entry of ``vocabulary`` is a real
+    # token at per-binary id 256, NOT ``value_negative``.
     digit_count = VocabularyManager._V2_RESERVED_DIGIT_COUNT      # 256
-    reserved = VocabularyManager._V2_RESERVED_TOKEN_COUNT         # 257
-    digit_names = [f"digit_{i:02X}" for i in range(digit_count)]
-    vocabulary = digit_names + ["value_negative"] + vocabulary
-    id_to_token_type = np.concatenate(
-        [
-            np.full(digit_count, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
-            np.array([TokenType.VALUE_NEGATIVE], dtype=id_to_token_type.dtype),
-            id_to_token_type,
-        ]
+    reserved = (
+        digit_count if legacy_no_value_negative
+        else VocabularyManager._V2_RESERVED_TOKEN_COUNT           # 257
     )
+    digit_names = [f"digit_{i:02X}" for i in range(digit_count)]
+    if legacy_no_value_negative:
+        vocabulary = digit_names + vocabulary
+        id_to_token_type = np.concatenate(
+            [
+                np.full(digit_count, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
+                id_to_token_type,
+            ]
+        )
+    else:
+        vocabulary = digit_names + ["value_negative"] + vocabulary
+        id_to_token_type = np.concatenate(
+            [
+                np.full(digit_count, TokenType.UNRESOLVED, dtype=id_to_token_type.dtype),
+                np.array([TokenType.VALUE_NEGATIVE], dtype=id_to_token_type.dtype),
+                id_to_token_type,
+            ]
+        )
     platform_instruction_type_cache = np.concatenate(
         [
             np.full(
@@ -175,7 +218,12 @@ def load_vocab_manager_csv_row_bytes(csv_row: bytes, platform: Platform) -> Voca
     )
 
 
-def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> VocabularyManager | None:
+def load_vocab_manager(
+    csv_path: Path,
+    platform: Platform | None = None,
+    *,
+    legacy_no_value_negative: bool = False,
+) -> VocabularyManager | None:
     if platform is None:
         # Auto-detect the canonical Platform from the filename prefix.
         # Filename prefix may be either a canonical Platform literal
@@ -210,7 +258,11 @@ def load_vocab_manager(csv_path: Path, platform: Platform | None = None) -> Voca
         logger.error(f"Error message: {e}")
         return None
 
-    return load_vocab_manager_csv_row_bytes(last_line, platform)
+    return load_vocab_manager_csv_row_bytes(
+        last_line,
+        platform,
+        legacy_no_value_negative=legacy_no_value_negative,
+    )
 
 
 def load_unified_vocab_manager(csv_path: Path) -> VocabularyManager | None:

@@ -358,28 +358,29 @@ def test_batch_decode_end_to_end_synthetic(tmp_path) -> None:
 
 
 def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
-    """Each row's variant-axis prefix is contributed ONCE, by the root
-    call_target. Inlined callees never re-emit variant_tokens.
+    """Each row's variant-axis prefix is contributed ONCE, at row start,
+    as a row-level identity prefix BEFORE any call_target body.
 
     Every function in a single splice tree shares the same compilation
     variant axis (same binary -> same arch/compiler/opt), so the
     variant-axis prefix is a row-level property, not a per-function one.
-    Stage 1 (:mod:`._callee_walk`) reflects this by feeding the root's
-    :meth:`FunctionData.full_token_stream` (=
-    ``variant_tokens + body_tokens``) into
-    :func:`build_inline_decode_state` for the root and feeding
-    ``FunctionData.tokens`` (body only) for every inlined callee. The
-    root's variant_tokens flow through ``InlineDecodeState`` as real
-    tokens (``raw_tokens > 256``) just like instruction reps; they
-    survive Stage 2's strip + shift (``id - 256``) and land in the
-    expanded stream right after the row's leading encounter-category
-    self-token (plan D3 / ALG-9).
+    Stage 1 (:mod:`._callee_walk`) feeds ``function_data.tokens`` (body
+    only) into :func:`build_inline_decode_state` for every call_target
+    -- root AND inlined callees alike, no special case. The
+    row-level :attr:`Stage1Variant.variant_tokens` carries the prefix
+    separately and Stage 4 emits it at row column 0 before any
+    call_target body, with the per-call-target LOCAL_FUNC self-token
+    landing AT root body start (slot ``n_axis``).
 
-    This test locks in that contract end-to-end at the model-facing
-    token tensor: every row begins with ``[LOCAL_FUNC prepend,
-    variant_tokens shifted, body_tokens shifted, ...]``. The
-    walker-level proof that callees do NOT also carry the variant_tokens
-    prefix lives in :func:`test_variant_tokens_prepended_only_at_root_not_at_callees`
+    Row layout (plan D3 + ALG-9):
+
+        row[0..n_axis]            = variant_tokens, post-shift (id - 256)
+        row[n_axis]               = LOCAL_FUNC self-token at root body start
+        row[n_axis + 1 ..]        = root body tokens, post-shift
+
+    The walker-level proof that callees do NOT also carry the
+    variant_tokens prefix lives in
+    :func:`test_variant_tokens_prepended_only_at_root_not_at_callees`
     in ``test_callee_walk.py``; the synthetic ``BinarySession`` fixture
     here has no real callees in any of its rows.
     """
@@ -391,8 +392,8 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
 
     # One pointer + two real variants exhausts the matched section
     # without padding rows, so EVERY batch row has real content whose
-    # first N+1 tokens are determined: [LOCAL_FUNC prepend] +
-    # [variant_token_0..N-1 shifted].
+    # first n_axis + 1 tokens are determined: variant_tokens then the
+    # LOCAL_FUNC self-token marking root body start.
     section_pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
     num_variants_per_section = 2
     context_len = 32
@@ -426,10 +427,10 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
     for vt in variant_tokens_per_slot[1:]:
         np.testing.assert_array_equal(vt, variant_tokens_per_slot[0])
 
-    # Each row's call_target slice layout (plan D3 + ALG-9 + Stage 2a):
-    #   row[0]      = encounter_category prepend (LOCAL_FUNC -> shifted 9)
-    #   row[1..1+n] = variant_tokens, post-shift (id - 256)
-    #   row[1+n..]  = body tokens, post-shift
+    # Each row's layout (plan D3 + ALG-9 + Stage 4 row assembly):
+    #   row[0..n_axis]      = variant_tokens, post-shift (id - 256)
+    #   row[n_axis]         = LOCAL_FUNC self-token at root body start
+    #   row[n_axis + 1..]   = root body tokens, post-shift
     #
     # ``LOCAL_FUNC`` is at IDENTITY block offset 1 (the matched fixture
     # has only LOCAL call sites; PLT/EXT do not arise here). Computing
@@ -447,15 +448,16 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
     assert result.tokens.shape == (batch_size, context_len)
     for row_idx in range(batch_size):
         row = result.tokens[row_idx]
-        assert int(row[0]) == local_func_shifted, (
-            f"row {row_idx}: expected LOCAL_FUNC prepend "
-            f"({local_func_shifted}) at slot 0, got {int(row[0])}"
-        )
         np.testing.assert_array_equal(
-            row[1 : 1 + n_axis],
+            row[:n_axis],
             expected_axis_shifted,
             err_msg=(
                 f"row {row_idx}: variant_tokens did not land at slots "
-                f"1..{1 + n_axis} of the model-facing token stream"
+                f"0..{n_axis} of the model-facing token stream"
             ),
+        )
+        assert int(row[n_axis]) == local_func_shifted, (
+            f"row {row_idx}: expected LOCAL_FUNC prepend "
+            f"({local_func_shifted}) at slot {n_axis} (root body start), "
+            f"got {int(row[n_axis])}"
         )

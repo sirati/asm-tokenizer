@@ -100,6 +100,7 @@ def _make_stage1_chain() -> Stage1Batch:
         variant_ref_offset=0,
         batch_idx=0,
         call_targets=[ct],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     section = Stage1Section(
         arm=SectionKind.MATCHED,

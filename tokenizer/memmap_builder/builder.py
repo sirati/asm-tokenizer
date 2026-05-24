@@ -15,7 +15,7 @@ from tokenizer.aligned_data.parsed_record_iter import (
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
-from ._dedup import open_arm_dedup_state
+from ._dedup import finalize_arm_dedup_state, open_arm_dedup_state
 from ._output_files import (
     open_matched_section_outputs,
     open_sections_bin_outputs,
@@ -187,8 +187,12 @@ def build_memmap_files(
         logger.info(f"  Creating: {error_log_path}")
         matched_state = open_arm_dedup_state(matched_data_path)
         unmatched_state = open_arm_dedup_state(unmatched_data_path)
-        stack.callback(matched_state.writer.finalize)
-        stack.callback(unmatched_state.writer.finalize)
+        # ``finalize_arm_dedup_state`` stamps the u32-aligned
+        # ``total_entries`` trailer (sourced from the dedup state's
+        # encounter counter, which advances only on actual writes)
+        # and then drives the writer's generic flush+close.
+        stack.callback(lambda: finalize_arm_dedup_state(matched_state))
+        stack.callback(lambda: finalize_arm_dedup_state(unmatched_state))
         error_log = stack.enter_context(open(error_log_path, "w", encoding="ascii"))
 
         wrappers = []

@@ -1152,6 +1152,125 @@ def test_outlined_function_siblings_function_section_ptr_last_write_wins(
 
 
 # ---------------------------------------------------------------------------
+# On-disk variant ordering — variants are flushed in
+# ``variant_ref_offset``-ascending order regardless of caller emit order.
+# ---------------------------------------------------------------------------
+
+
+def test_variants_flushed_in_vref_sorted_order(tmp_path: Path):
+    """The writer buffers variants between begin_section and end_section
+    and flushes them in ``variant_ref_offset``-ascending order at
+    :meth:`end_section`. ``data_offset_shifted`` is paired with each
+    header so the (header, per_call) pairings must survive the reorder.
+    Stable sort: equal vrefs keep their declared sub-order.
+
+    Asserts both halves: on-disk vrefs are sorted AND ``data_offset_shifted``
+    travels with the matching variant_ref_offset across the reorder.
+    """
+    path = tmp_path / "sort_order.bin"
+    writer = SectionWriter(path)
+
+    writer.begin_section(function_name_ptr=1, n_variants=5)
+    writer.emit_call_targets([])
+    # Declared-emit order is intentionally not sorted; ``data_offset_shifted``
+    # is ``vref << 1`` so the pairing is recoverable after reorder.
+    declared = [0x50, 0x10, 0x30, 0x40, 0x20]
+    for vref in declared:
+        writer.begin_variant(variant_ref_offset=vref, data_offset_shifted=vref << 1)
+        writer.emit_per_call_entries([])
+        writer.end_variant(vkey=vref)
+    writer.end_section()
+    writer.finalize()
+
+    section = next(iter_sections_bin(path))
+    on_disk_vrefs = [v.variant_ref_offset for v in section.variants]
+    on_disk_data = [v.data_offset_shifted for v in section.variants]
+    assert on_disk_vrefs == sorted(declared)
+    # Each header's data_offset_shifted travels with its vref under the reorder.
+    assert on_disk_data == [vref << 1 for vref in on_disk_vrefs]
+
+
+def test_variants_sort_is_stable_on_equal_vrefs(tmp_path: Path):
+    """Two variants with the same ``variant_ref_offset`` keep their
+    declared sub-order on disk — the writer's sibling-close
+    back-patch uses ``searchsorted(side="right") - 1`` to pick the
+    LAST equal entry, which only matches the legacy last-write-wins
+    semantic when the on-disk equal-vref run is in declared order.
+    """
+    path = tmp_path / "stable_sort.bin"
+    writer = SectionWriter(path)
+
+    writer.begin_section(function_name_ptr=1, n_variants=4)
+    writer.emit_call_targets([])
+    # vrefs intentionally include a repeated key (0x20). ``data_offset_shifted``
+    # is unique per declared variant so we can tell them apart after reorder.
+    pairs = [(0x20, 0xAA), (0x10, 0xBB), (0x20, 0xCC), (0x30, 0xDD)]
+    for vref, data in pairs:
+        writer.begin_variant(variant_ref_offset=vref, data_offset_shifted=data)
+        writer.emit_per_call_entries([])
+        writer.end_variant(vkey=(vref, data))
+    writer.end_section()
+    writer.finalize()
+
+    section = next(iter_sections_bin(path))
+    on_disk = [(v.variant_ref_offset, v.data_offset_shifted) for v in section.variants]
+    # Sort key = vref ascending; ties broken by declared order.
+    assert on_disk == [(0x10, 0xBB), (0x20, 0xAA), (0x20, 0xCC), (0x30, 0xDD)]
+
+
+def test_per_call_entries_follow_their_variant_under_sort(tmp_path: Path):
+    """Per-call entries are flushed paired with their variant header,
+    so when the writer reorders variants by ``variant_ref_offset``,
+    each variant's per-call entries travel with it (not with the
+    original declared-emit position).
+    """
+    path = tmp_path / "per_call_with_variant.bin"
+    writer = SectionWriter(path)
+
+    # Self-call setup: the section's own call_target points at FID=1,
+    # and each variant's per-call entry references its OWN
+    # ``variant_ref_offset`` so the self-resolve sweep at end_section
+    # stamps each slot with the (post-sort) variant_idx of the
+    # matching local variant. After sort: vrefs are [0x10, 0x20,
+    # 0x30, 0x40], so each per-call slot stamps the SORTED index
+    # of its own vref.
+    writer.begin_section(function_name_ptr=1, n_variants=4)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=1, type=CallTargetType.LOCAL, is_matched=True
+            ),
+        ]
+    )
+    declared = [0x30, 0x10, 0x40, 0x20]
+    for vref in declared:
+        writer.begin_variant(variant_ref_offset=vref, data_offset_shifted=vref << 1)
+        writer.emit_per_call_entries(
+            [
+                PerCallEntry(
+                    called_idx=0, callee_function_name_ptr=1, callee_vkey=vref
+                )
+            ]
+        )
+        writer.end_variant(vkey=vref)
+    writer.end_section()
+    writer.finalize()
+
+    section = next(iter_sections_bin(path))
+    on_disk_vrefs = [v.variant_ref_offset for v in section.variants]
+    assert on_disk_vrefs == sorted(declared)
+    # The self-call per-call slot for variant @ sorted_idx i references
+    # its own vref, which lives at sorted_idx i — so every slot stamps i.
+    for sorted_idx, variant in enumerate(section.variants):
+        (called_idx, sv_idx), = variant.per_call_entries
+        assert called_idx == 0
+        assert sv_idx == sorted_idx, (
+            f"per-call entry at sorted_idx={sorted_idx} should point at the "
+            f"same variant (self-call to own vref), got sv_idx={sv_idx}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # np.view() write-through proof
 # ---------------------------------------------------------------------------
 
@@ -1274,6 +1393,7 @@ def _reference_resolve_caller_section(
     callee_section_offset: int,
     callee_sorted_vrefs: "np.ndarray",
     callee_sort_order: "np.ndarray",
+    context: str = "Step3-sibling-close",
 ) -> None:
     """Python-loop reference implementation of ``_resolve_caller_section``.
 

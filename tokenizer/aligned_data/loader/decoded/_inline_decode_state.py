@@ -41,6 +41,7 @@ from .run_lengths import run_lengths
 __all__ = [
     "InlineDecodeState",
     "build_inline_decode_state",
+    "compute_is_negative_per_position",
     "expanded_to_raw_position_map",
 ]
 
@@ -113,6 +114,48 @@ class InlineDecodeState:
     digit_cumsum: np.ndarray
 
 
+def compute_is_negative_per_position(
+    *,
+    runlen_number: np.ndarray,
+    runlen_value: np.ndarray,
+    carries_inline_mask: np.ndarray,
+) -> np.ndarray:
+    """Detect carriers whose immediate postfix slot is a sign marker.
+
+    Single concern: given the per-position run-length arrays + carrier
+    mask for one stream, return ``bool[N]`` where True marks a carrier
+    at position ``p`` whose ``p+1`` slot is the value-negative marker
+    (id 256). False at every non-carrier position and at the LAST
+    position (which has no ``p+1`` slot).
+
+    The runlength-diff sign detection works because of the v2 layout
+    invariant: sign marker id 256 sits strictly between the inline-digit
+    band (``[0, 256)``) and the carrier band (``[257, 272)``). A sign
+    marker adjacent to an inline-digit run extends the ``value_mask``
+    run by exactly 1 over the ``number_mask`` run; the diff at ``p+1``
+    is the sign flag.
+
+    Factored out of :func:`build_inline_decode_state` so the batched
+    section-walk path can reuse the formula on collector-resolved
+    run-lengths without reconstructing a full :class:`InlineDecodeState`
+    twice per call_target.
+    """
+    n = int(runlen_number.shape[0])
+    is_negative_per_position = np.zeros(n, dtype=bool)
+    if n > 1:
+        # Carriers in [0, N-1) only -- a carrier at the LAST position
+        # has no ``p+1`` slot to read so its sign defaults to False.
+        # Filtering to carriers FIRST then comparing keeps the work to
+        # K' comparisons (one per non-tail carrier) instead of N-1.
+        carriers_excl_last = carries_inline_mask[:-1]
+        runlen_num_at_p1 = runlen_number[1:][carriers_excl_last]
+        runlen_val_at_p1 = runlen_value[1:][carriers_excl_last]
+        is_negative_per_position[:-1][carriers_excl_last] = (
+            runlen_val_at_p1 != runlen_num_at_p1
+        )
+    return is_negative_per_position
+
+
 def build_inline_decode_state(
     raw_tokens: np.ndarray, *, format_version: int
 ) -> InlineDecodeState:
@@ -144,18 +187,11 @@ def build_inline_decode_state(
     runlen_value = run_lengths(value_mask)
     carries_inline_mask = real_mask & (raw_tokens < _V2_EAGER_BLOCK_END)
 
-    is_negative_per_position = np.zeros(n, dtype=bool)
-    if n > 1:
-        # Carriers in [0, N-1) only -- a carrier at the LAST position
-        # has no ``p+1`` slot to read so its sign defaults to False.
-        # Filtering to carriers FIRST then comparing keeps the work to
-        # K' comparisons (one per non-tail carrier) instead of N-1.
-        carriers_excl_last = carries_inline_mask[:-1]
-        runlen_num_at_p1 = runlen_number[1:][carriers_excl_last]
-        runlen_val_at_p1 = runlen_value[1:][carriers_excl_last]
-        is_negative_per_position[:-1][carriers_excl_last] = (
-            runlen_val_at_p1 != runlen_num_at_p1
-        )
+    is_negative_per_position = compute_is_negative_per_position(
+        runlen_number=runlen_number,
+        runlen_value=runlen_value,
+        carries_inline_mask=carries_inline_mask,
+    )
 
     # Exclusive-prefix cumsum of ``number_mask``.  ``digit_cumsum[0] = 0``
     # by construction; ``digit_cumsum[k] = sum(number_mask[0:k])`` for

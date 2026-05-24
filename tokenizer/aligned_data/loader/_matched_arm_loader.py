@@ -105,6 +105,8 @@ def load_matched_arm(
     sections_bin: Path,
     matched_index: Path,
     line_to_name: Dict[int, str],
+    *,
+    data_bin: Path,
 ):
     """Build the matched ``SectionArm`` from ``matched_index.bin`` + BIN catalog.
 
@@ -115,6 +117,10 @@ def load_matched_arm(
     4-byte boundary). Per-variant data-bin positions are 16-byte
     aligned and recovered from each variant block's
     ``data_offset_shifted`` field.
+
+    ``data_bin`` feeds the load-time per-arm sweep that asserts each
+    record's on-wire ``entry_idx`` equals its flat-starts index; the
+    sweep is a single chokepoint shared with the unmatched arm.
     """
     # Local import to break the import cycle between this module and
     # the orchestrator (``metadata_loader`` imports ``load_matched_arm``).

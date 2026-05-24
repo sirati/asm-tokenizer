@@ -252,13 +252,25 @@ def check_record_bounds(
     A truncated ``_data.bin`` or a corrupted index entry pointing past
     the file would otherwise surface as a silent ``IndexError`` later.
     Total size is derived from the parsed header via
-    :func:`record_total_size`.
+    :func:`record_total_size`. ``file_size`` budget reserves space
+    for the u32-aligned trailing ``total_entries`` field so the
+    ``start + total <= effective_size`` bound stays exact.
     """
     if not data_path.exists() or len(starts) == 0:
         return []
     file_size = data_path.stat().st_size
     if file_size == 0:
         return []
+    # The trailer (u32-aligned ``total_entries``) sits at the tail of
+    # the file; record bodies must not extend into it. We don't know
+    # the exact pad-byte count without re-walking, but the trailer +
+    # its pad is at most ``DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE + 3``
+    # bytes, which is the tightest upper bound that doesn't require
+    # parsing the last record's geometry.
+    from tokenizer.aligned_data.memmap_format import (
+        DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE,
+    )
+    effective_size = file_size - DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE
     errors: List[str] = []
     data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
     try:
@@ -267,10 +279,11 @@ def check_record_bounds(
             header, _ = parse_binary_header(_header_window(data, start))
             total = record_total_size(header)
             end = start + total
-            if end > file_size:
+            if end > effective_size:
                 errors.append(
                     f"{label}: record {i} (start={start}, total_size={total}) "
-                    f"extends to {end} but file_size={file_size}"
+                    f"extends to {end} but file_size={file_size} "
+                    f"(effective={effective_size} accounting for trailer)"
                 )
     finally:
         del data

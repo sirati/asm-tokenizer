@@ -155,7 +155,10 @@ class Stage1CallTarget:
 
     state: InlineDecodeState
     """Masks + runlengths + carries_inline + is_negative pre-compute
-    over ``function_data``'s token stream."""
+    over ``function_data.tokens`` (body only -- the row-level
+    variant_tokens prefix lives on :class:`Stage1Variant` and never
+    enters per-call-target state). Root and callees share this contract;
+    no special-case root path."""
 
     call_targets_section: list[CallTarget]
     """THIS function's section's ``call_targets`` table. Used at stage 4
@@ -195,7 +198,26 @@ class Stage1Variant:
 
     call_targets: list[Stage1CallTarget]
     """``[root, callee_1, callee_2, ...]``; index 0 is the variant body
-    per plan D3 + D9."""
+    per plan D3 + D9. Every call_target consumes ``function_data.tokens``
+    (body only) -- variant_tokens are NOT mixed into per-call-target
+    token streams; they are a row-level prefix carried separately on
+    :attr:`variant_tokens` below."""
+
+    variant_tokens: np.ndarray
+    """``u16[n_axis]`` -- the row-level variant-axis identity prefix (raw
+    vocab IDs, statically encoded; no inline-digit followers, no strip /
+    shift treatment beyond the trivial ``- 256`` applied at the row
+    assembly seam in Stage 4). One row per :class:`Stage1Variant`; every
+    call_target in :attr:`call_targets` shares the same prefix (same
+    compilation variant axis). The walker pulls it from
+    ``root_function_data.variant_tokens`` once and threads it here; no
+    call_target ever sees it.
+
+    Statically encoded means: contents come directly from the resolver's
+    decoded ``_variants.bin`` record and are independent of the inline-
+    decode pipeline (no promotion / strip / shift dynamics apply). Stage
+    4 row assembly emits ``(variant_tokens - 256).astype(u16)`` once per
+    batch row before any call_target body."""
 
 
 @dataclass(frozen=True)

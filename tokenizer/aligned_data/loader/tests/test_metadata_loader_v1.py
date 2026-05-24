@@ -99,7 +99,7 @@ def test_open_sections_csv_accepts_crlf_prelude(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _write_normal_record(file_handle, token_count: int):
+def _write_normal_record(file_handle, token_count: int, *, entry_idx: int = 0):
     """Synthesise one well-formed record via the production writer so
     the on-disk geometry stays the single source of truth. Returns the
     writer's ``(offset, total_bytes)`` tuple.
@@ -107,7 +107,9 @@ def _write_normal_record(file_handle, token_count: int):
     insn = np.array([1, 2, 3], dtype=np.uint8)
     block = np.array([4, 5], dtype=np.uint8)
     tokens = np.arange(token_count, dtype=np.uint16)
-    result = write_function_binary_data(file_handle, tokens, block, insn)
+    result = write_function_binary_data(
+        file_handle, tokens, block, insn, entry_idx=entry_idx
+    )
     assert result is not None
     return result
 
@@ -120,9 +122,11 @@ def test_load_unmatched_lengths_reads_token_count_from_header(tmp_path):
     """
     data_path = tmp_path / "u_unmatched_data.bin"
     with open(data_path, "wb") as f:
-        off_a, _ = _write_normal_record(f, token_count=10)
-        off_b, _ = _write_normal_record(f, token_count=42)
-        off_c, _ = _write_normal_record(f, token_count=137)
+        off_a, _ = _write_normal_record(f, token_count=10, entry_idx=0)
+        off_b, _ = _write_normal_record(f, token_count=42, entry_idx=1)
+        off_c, _ = _write_normal_record(f, token_count=137, entry_idx=2)
+        from tokenizer.aligned_data.memmap_format import encode_data_bin_trailer
+        f.write(encode_data_bin_trailer(3, cursor=f.tell()))
 
     starts = np.array([off_a, off_b, off_c], dtype=np.int64)
     paths = BinaryArmPaths(

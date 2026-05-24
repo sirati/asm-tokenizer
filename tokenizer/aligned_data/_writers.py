@@ -42,6 +42,7 @@ def assemble_function_record(
     block_runlength: np.ndarray,
     insn_runlength: np.ndarray,
     *,
+    entry_idx: int,
     func_name: str = "",
     error_log=None,
 ) -> Optional[bytes]:
@@ -50,6 +51,11 @@ def assemble_function_record(
     Layout matches :func:`derive_pad_placement`: self-describing header,
     optional pre-pad, block words, optional post-pad, tokens. Total is
     always a multiple of :data:`RECORD_ALIGNMENT` (= 16).
+
+    ``entry_idx`` is the record's encounter-order ordinal within its
+    containing ``_data.bin`` file (first written record = 0, second = 1,
+    ...). It is stamped into the on-wire header so the loader can later
+    cross-check the per-arm index against the data-bin contents.
 
     Returns the raw record bytes on success.
 
@@ -77,6 +83,7 @@ def assemble_function_record(
         insn_len=insn_len,
         block_word_count=block_word_count,
         token_count=token_count,
+        entry_idx=entry_idx,
     )
 
     try:
@@ -114,6 +121,7 @@ def write_function_binary_data(
     block_runlength: np.ndarray,
     insn_runlength: np.ndarray,
     *,
+    entry_idx: int,
     func_name: str = "",
     error_log=None,
 ):
@@ -125,6 +133,10 @@ def write_function_binary_data(
     this helper — the dedup helper assembles the same record bytes
     and routes them through the content-addressed dedup map.
 
+    ``entry_idx`` is the record's encounter-order ordinal within the
+    file; the caller is responsible for sequencing it (first record
+    written = 0, second = 1, ...).
+
     Returns ``(data_offset, total_record_bytes)`` on success, ``None``
     on an :class:`IndexEntrySkip` cap overflow (logged into
     ``error_log`` when supplied).
@@ -134,6 +146,7 @@ def write_function_binary_data(
         tokens,
         block_runlength,
         insn_runlength,
+        entry_idx=entry_idx,
         func_name=func_name,
         error_log=error_log,
     )

@@ -143,6 +143,9 @@ def _make_batch(
     batch_idx_overrides: Optional[
         List[List[Optional[int]]]
     ] = None,
+    variant_tokens_per_variant: Optional[
+        List[List[np.ndarray]]
+    ] = None,
 ) -> Stage3Batch:
     """Assemble a full 4-level hierarchy from per-section variant
     call_target lists + an explicit ``batch_idx_to_section_variant``
@@ -152,7 +155,9 @@ def _make_batch(
     section ``s``, variant slot ``v``. ``batch_idx_overrides[s][v]``
     (when provided) overrides the otherwise-derived
     ``Stage1Variant.batch_idx`` -- used for the "batch_idx is None"
-    padding-out case.
+    padding-out case. ``variant_tokens_per_variant[s][v]`` (when
+    provided) supplies the per-variant ``Stage1Variant.variant_tokens``
+    row-prefix; defaults to an empty u16 array (no prefix).
     """
 
     num_sections = len(variants_per_section)
@@ -191,12 +196,18 @@ def _make_batch(
         for v, ct_list in enumerate(variant_list):
             stage1_cts = [ct.stage2.stage1 for ct in ct_list]
             stage2_cts = [ct.stage2 for ct in ct_list]
+            vt = (
+                variant_tokens_per_variant[s][v]
+                if variant_tokens_per_variant is not None
+                else np.zeros(0, dtype=np.uint16)
+            )
             stage1_variants.append(
                 Stage1Variant(
                     variant_idx=v,
                     variant_ref_offset=0,
                     batch_idx=derived_batch_idx[s][v],
                     call_targets=stage1_cts,
+                    variant_tokens=vt,
                 )
             )
             stage2_variants.append(
@@ -671,4 +682,93 @@ def test_first_row_is_padding_second_is_real() -> None:
     )
     np.testing.assert_array_equal(
         out[1], np.array([55, 66, 77, 0, 0], dtype=np.uint16)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row-level variant_tokens prefix emission (plan D3 / ALG-9 contract).
+# ---------------------------------------------------------------------------
+
+
+def test_variant_tokens_emitted_at_row_start_before_call_targets() -> None:
+    """The row-level ``variant_tokens`` prefix lands at columns 0..n_axis,
+    BEFORE any call_target body. The first call_target's prepend slot
+    (e.g. LOCAL_FUNC self-token at ``expanded_token_ids[0]``) lands at
+    column ``n_axis`` -- i.e. the function-body-start marker sits AFTER
+    the row-level prefix, not before it.
+
+    variant_tokens are raw vocab IDs >= 257 (metadata-variant tail);
+    the row-assembly seam emits them with a static ``- 256`` shift. The
+    prefix carries no inline-digit followers and no number / identity
+    band content -- only the row token-count budget is consumed by it.
+    """
+    # Use a 1-CT expansion of [9, 100, 101] -- the 9 stands for the
+    # LOCAL_FUNC self-token at ``expanded_token_ids[0]`` per ALG-9; the
+    # 100 / 101 are arbitrary body tokens.
+    ct = _make_call_target(expanded_token_ids=_u16([9, 100, 101]))
+    variant_tokens_raw = np.array([280, 281, 282, 283], dtype=np.uint16)
+    expected_axis_shifted = (
+        variant_tokens_raw.astype(np.int32) - 256
+    ).astype(np.uint16)
+
+    mapping = np.array([[0, 0]], dtype=np.uint32)
+    batch = _make_batch(
+        variants_per_section=[[[ct]]],
+        mapping=mapping,
+        variant_tokens_per_variant=[[variant_tokens_raw]],
+    )
+
+    out = assemble_tokens(batch, context_len=10)
+    expected = np.zeros(10, dtype=np.uint16)
+    expected[:4] = expected_axis_shifted
+    # Slot 4 = LOCAL_FUNC self-token at root body start.
+    expected[4] = 9
+    expected[5] = 100
+    expected[6] = 101
+    np.testing.assert_array_equal(out[0], expected)
+
+
+def test_variant_tokens_prefix_capped_at_context_len() -> None:
+    """When ``len(variant_tokens) > context_len``, the prefix is
+    truncated to fit. No call_target body content is written (no column
+    budget remains). The row stays a well-formed ``u16[context_len]``
+    array.
+    """
+    ct = _make_call_target(expanded_token_ids=_u16([9, 100, 101]))
+    variant_tokens_raw = np.array(
+        [280, 281, 282, 283, 284], dtype=np.uint16
+    )
+    expected_axis_shifted = (
+        variant_tokens_raw[:3].astype(np.int32) - 256
+    ).astype(np.uint16)
+
+    mapping = np.array([[0, 0]], dtype=np.uint32)
+    batch = _make_batch(
+        variants_per_section=[[[ct]]],
+        mapping=mapping,
+        variant_tokens_per_variant=[[variant_tokens_raw]],
+    )
+
+    out = assemble_tokens(batch, context_len=3)
+    np.testing.assert_array_equal(out[0], expected_axis_shifted)
+
+
+def test_variant_tokens_empty_array_leaves_row_at_body_only() -> None:
+    """The zero-length variant_tokens case is the default for all the
+    sibling tests; pin it explicitly so a regression that silently
+    interprets a missing prefix as something other than "no prefix"
+    surfaces here."""
+    ct = _make_call_target(expanded_token_ids=_u16([9, 100, 101]))
+    mapping = np.array([[0, 0]], dtype=np.uint32)
+    batch = _make_batch(
+        variants_per_section=[[[ct]]],
+        mapping=mapping,
+        variant_tokens_per_variant=[
+            [np.zeros(0, dtype=np.uint16)]
+        ],
+    )
+
+    out = assemble_tokens(batch, context_len=5)
+    np.testing.assert_array_equal(
+        out[0], np.array([9, 100, 101, 0, 0], dtype=np.uint16)
     )
