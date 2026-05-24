@@ -252,13 +252,25 @@ def check_record_bounds(
     A truncated ``_data.bin`` or a corrupted index entry pointing past
     the file would otherwise surface as a silent ``IndexError`` later.
     Total size is derived from the parsed header via
-    :func:`record_total_size`.
+    :func:`record_total_size`. ``file_size`` budget reserves space
+    for the u32-aligned trailing ``total_entries`` field so the
+    ``start + total <= effective_size`` bound stays exact.
     """
     if not data_path.exists() or len(starts) == 0:
         return []
     file_size = data_path.stat().st_size
     if file_size == 0:
         return []
+    # The trailer (u32-aligned ``total_entries``) sits at the tail of
+    # the file; record bodies must not extend into it. We don't know
+    # the exact pad-byte count without re-walking, but the trailer +
+    # its pad is at most ``DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE + 3``
+    # bytes, which is the tightest upper bound that doesn't require
+    # parsing the last record's geometry.
+    from tokenizer.aligned_data.memmap_format import (
+        DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE,
+    )
+    effective_size = file_size - DATA_BIN_TRAILER_TOTAL_ENTRIES_SIZE
     errors: List[str] = []
     data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
     try:
@@ -267,10 +279,50 @@ def check_record_bounds(
             header, _ = parse_binary_header(_header_window(data, start))
             total = record_total_size(header)
             end = start + total
-            if end > file_size:
+            if end > effective_size:
                 errors.append(
                     f"{label}: record {i} (start={start}, total_size={total}) "
-                    f"extends to {end} but file_size={file_size}"
+                    f"extends to {end} but file_size={file_size} "
+                    f"(effective={effective_size} accounting for trailer)"
+                )
+    finally:
+        del data
+    return errors
+
+
+def check_entry_idx_sequence(
+    data_path: Path,
+    starts: np.ndarray,
+    label: str,
+) -> List[str]:
+    """Every record's ``entry_idx`` must equal its index in ``starts``.
+
+    The writer stamps ``entry_idx = N`` on the Nth record it appends;
+    a corrupted ``_index.bin`` or misaligned starts array would surface
+    here as an off-by-one mismatch. Also cross-checks the trailing
+    ``total_entries`` against ``len(starts)`` so a truncated index
+    is flagged at the file level.
+    """
+    if not data_path.exists() or len(starts) == 0:
+        return []
+    from tokenizer.aligned_data.memmap_format import read_data_bin_trailer
+
+    errors: List[str] = []
+    data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
+    try:
+        total_entries = read_data_bin_trailer(data)
+        if total_entries != len(starts):
+            errors.append(
+                f"{label}: trailer total_entries={total_entries} disagrees "
+                f"with len(starts)={len(starts)}"
+            )
+        for i in range(len(starts)):
+            start = int(starts[i])
+            header, _ = parse_binary_header(_header_window(data, start))
+            if header.entry_idx != i:
+                errors.append(
+                    f"{label}: record {i} (start={start}) has "
+                    f"entry_idx={header.entry_idx}, expected {i}"
                 )
     finally:
         del data
@@ -302,4 +354,5 @@ def run_v1_post_checks(
         errors.extend(check_pad_bytes_zero(data_path, starts, str(data_path)))
         errors.extend(check_pad_consistency(data_path, starts, str(data_path)))
         errors.extend(check_record_bounds(data_path, starts, str(data_path)))
+        errors.extend(check_entry_idx_sequence(data_path, starts, str(data_path)))
     return errors
