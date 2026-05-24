@@ -355,3 +355,101 @@ def test_batch_decode_end_to_end_synthetic(tmp_path) -> None:
     row0_stop = int(result.identity_row_offsets[1])
     row0_identities = result.identities[row0_start:row0_stop]
     assert row0_identities.dtype == np.uint16
+
+
+def test_batch_decode_prepends_variant_tokens_per_call_target(tmp_path) -> None:
+    """Each call_target's slice starts with its encounter-category self-token
+    immediately followed by that function's variant-axis tokens.
+
+    The unified-vocab v2 wire-form stream per function is
+    conceptually ``variant_tokens + body_tokens``;
+    :meth:`FunctionData.full_token_stream` concatenates them. Stage 1
+    (:mod:`._callee_walk`) feeds ``full_token_stream()`` into
+    :func:`build_inline_decode_state` for the root AND every inlined
+    callee, so variant_tokens flow through ``InlineDecodeState`` as
+    real tokens (``raw_tokens > 256``) just like instruction reps. They
+    survive Stage 2's strip + shift (``id - 256``) and land in the
+    expanded stream right after each call_target's prepended
+    encounter-category self-token (plan D3 / ALG-9).
+
+    This test locks in that contract end-to-end: variant axis IDs land
+    verbatim in the model-facing token tensor, post-shift, immediately
+    after the LOCAL_FUNC prepend, for every call_target -- closing the
+    "did the variant axis make it to the model?" question.
+    """
+    from tokenizer.token_manager import VocabularyManager
+
+    reserved_digit_count = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+
+    fb = build_synthetic_binary(tmp_path)
+
+    # One pointer + two real variants exhausts the matched section
+    # without padding rows, so EVERY batch row has real content whose
+    # first N+1 tokens are determined: [LOCAL_FUNC prepend] +
+    # [variant_token_0..N-1 shifted].
+    section_pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=0)]
+    num_variants_per_section = 2
+    context_len = 32
+    batch_size = len(section_pointers) * num_variants_per_section
+
+    with BinarySession(
+        fb["base_path"], fb["binary_name"], fb["vocab"], fb["metadata"]
+    ) as session:
+        # Snapshot the per-variant variant_tokens BEFORE running
+        # batch_decode so we can compare them against the row tensor
+        # without coupling to internal stage-1 wiring.
+        mf = session.load_matched(0)
+        variant_tokens_per_slot = [v.variant_tokens for v in mf.variants]
+
+        result = batch_decode(
+            session,
+            section_pointers=section_pointers,
+            num_variants_per_section=num_variants_per_section,
+            context_len=context_len,
+            max_depth=1,
+            variant_padding=VariantPadding.PAD_NULL,
+            rng=np.random.default_rng(seed=42),
+        )
+
+    # Sanity: every variant in the fixture resolves the same single
+    # _variants.bin record, so variant_tokens is identical across slots
+    # AND non-empty (the resolver populates it from the encoded record).
+    assert len(variant_tokens_per_slot) == num_variants_per_section
+    n_axis = int(variant_tokens_per_slot[0].shape[0])
+    assert n_axis > 0
+    for vt in variant_tokens_per_slot[1:]:
+        np.testing.assert_array_equal(vt, variant_tokens_per_slot[0])
+
+    # Each row's call_target slice layout (plan D3 + ALG-9 + Stage 2a):
+    #   row[0]      = encounter_category prepend (LOCAL_FUNC -> shifted 9)
+    #   row[1..1+n] = variant_tokens, post-shift (id - 256)
+    #   row[1+n..]  = body tokens, post-shift
+    #
+    # ``LOCAL_FUNC`` is at IDENTITY block offset 1 (the matched fixture
+    # has only LOCAL call sites; PLT/EXT do not arise here). Computing
+    # the shifted id from :class:`VocabularyManager` keeps the test
+    # decoupled from the literal constant 9.
+    local_func_shifted = (
+        VocabularyManager._V2_IDENTITY_BLOCK_START
+        + 1
+        - reserved_digit_count
+    )
+    expected_axis_shifted = (
+        variant_tokens_per_slot[0].astype(np.int32) - reserved_digit_count
+    ).astype(np.uint16)
+
+    assert result.tokens.shape == (batch_size, context_len)
+    for row_idx in range(batch_size):
+        row = result.tokens[row_idx]
+        assert int(row[0]) == local_func_shifted, (
+            f"row {row_idx}: expected LOCAL_FUNC prepend "
+            f"({local_func_shifted}) at slot 0, got {int(row[0])}"
+        )
+        np.testing.assert_array_equal(
+            row[1 : 1 + n_axis],
+            expected_axis_shifted,
+            err_msg=(
+                f"row {row_idx}: variant_tokens did not land at slots "
+                f"1..{1 + n_axis} of the model-facing token stream"
+            ),
+        )
