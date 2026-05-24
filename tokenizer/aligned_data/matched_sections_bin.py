@@ -322,9 +322,23 @@ class SectionWriter:
        mismatch — one warn-log line per stamp). Then runs a
        belt-and-braces sweep for any leaked ``0xFFFF`` and closes
        the underlying memmap.
+
+    Debug flag ``verify_holes_unfilled``: when ``True``, every
+    hole-fill operation reads the target slot's current u16 BEFORE
+    writing and asserts it equals :data:`UNRESOLVED_VARIANT_INDEX`
+    (``0xFFFF``); on mismatch, raises ``AssertionError`` with a full
+    byte-offset + value diagnostic. Use to catch double-write or
+    wrong-byte-target writer bugs. Default ``False``; zero overhead
+    when ``False`` (a single not-taken branch at each hole-fill site).
     """
 
-    def __init__(self, path: Path, warn_log: Optional[TextIO] = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        warn_log: Optional[TextIO] = None,
+        *,
+        verify_holes_unfilled: bool = False,
+    ) -> None:
         # Prelude is the natural identity of the bin: stamped at open
         # so the first section starts at byte 16. The writer keeps a
         # direct reference to MemmapBinWriter; the public API never
@@ -337,6 +351,12 @@ class SectionWriter:
         # :data:`MISSING_VARIANT_INDEX` stamped at finalize. ``None``
         # silences the writer (test-fixture default).
         self._warn_log: Optional[TextIO] = warn_log
+
+        # Diagnostic flag: when True, every hole-fill site reads the
+        # target slot's current u16 before writing and asserts it
+        # equals :data:`UNRESOLVED_VARIANT_INDEX`. Off by default;
+        # gated branch at each site has zero work-cost when False.
+        self.verify_holes_unfilled: bool = verify_holes_unfilled
 
         # Cross-section state.
         #
@@ -854,6 +874,7 @@ class SectionWriter:
             callee_section_offset=section_offset,
             callee_sorted_vrefs=my_sorted_vrefs,
             callee_sort_order=my_sort_order,
+            context="Step2-self-resolve",
         )
 
         # Step 3: sibling-close patches. Walk every caller section
@@ -867,6 +888,7 @@ class SectionWriter:
                 callee_section_offset=section_offset,
                 callee_sorted_vrefs=my_sorted_vrefs,
                 callee_sort_order=my_sort_order,
+                context="Step3-sibling-close",
             )
 
         # Clear per-section state.
@@ -1000,6 +1022,14 @@ class SectionWriter:
                     continue
                 if sv_idx != UNRESOLVED_VARIANT_INDEX:
                     continue
+                if self.verify_holes_unfilled:
+                    self._assert_slot_unresolved(
+                        slot_offset,
+                        MISSING_VARIANT_INDEX,
+                        context="finalize-MISSING",
+                        caller_section_offset=caller_section_offset,
+                        callee_fid=callee_fid,
+                    )
                 self._writer.patch(
                     slot_offset, struct.pack("<H", MISSING_VARIANT_INDEX)
                 )
@@ -1111,6 +1141,48 @@ class SectionWriter:
         ).add(self._current_section_offset)
         return 0  # placeholder; patched in end_section of the callee.
 
+    def _assert_slots_unresolved_vec(
+        self, variants_u16, slot_positions, intended_vec, *,
+        context, caller_section_offset, callee_fid, variants_region_start,
+    ) -> None:
+        """Vectorised pre-write check: every ``slot_positions`` entry
+        (u16 index into ``variants_u16``) must hold
+        :data:`UNRESOLVED_VARIANT_INDEX`. Reads u16, compares to
+        ``0xFFFF``; diagnostic context passed in.
+        """
+        actual = variants_u16[slot_positions]
+        bad = actual != np.uint16(UNRESOLVED_VARIANT_INDEX)
+        if not bad.any():
+            return
+        i = int(np.nonzero(bad)[0][0])
+        raise AssertionError(
+            f"SectionWriter.verify_holes_unfilled[{context}]: caller_section_offset="
+            f"{caller_section_offset} callee_fid={callee_fid} byte_offset="
+            f"{variants_region_start + int(slot_positions[i]) * 2} current=0x"
+            f"{int(actual[i]):04x} intended=0x{int(intended_vec[i]):04x} "
+            f"bad_total={int(bad.sum())}"
+        )
+
+    def _assert_slot_unresolved(
+        self, byte_offset: int, intended_value: int, *,
+        context: str, caller_section_offset: int, callee_fid: int,
+    ) -> None:
+        """Scalar pre-write check for one ``_writer.patch`` u16."""
+        blob = self._writer.view()
+        try:
+            actual = int.from_bytes(
+                bytes(blob[byte_offset : byte_offset + 2]), "little"
+            )
+        finally:
+            blob.release()
+        if actual == UNRESOLVED_VARIANT_INDEX:
+            return
+        raise AssertionError(
+            f"SectionWriter.verify_holes_unfilled[{context}]: caller_section_offset="
+            f"{caller_section_offset} callee_fid={callee_fid} byte_offset="
+            f"{byte_offset} current=0x{actual:04x} intended=0x{intended_value:04x}"
+        )
+
     def _resolve_caller_section(
         self,
         *,
@@ -1119,6 +1191,7 @@ class SectionWriter:
         callee_section_offset: int,
         callee_sorted_vrefs: "np.ndarray",
         callee_sort_order: "np.ndarray",
+        context: str = "Step3-sibling-close",
     ) -> None:
         """Re-derive caller's slot positions; write Cases A + B in place
         through the live mmap.
@@ -1237,9 +1310,19 @@ class SectionWriter:
             return
 
         # In-place writes through the live mmap.
-        variants_u16[sv_idx_pos[hole_indices[matches]]] = (
-            callee_sort_order[ss[matches]].astype(np.uint16)
-        )
+        target_slots = sv_idx_pos[hole_indices[matches]]
+        target_values = callee_sort_order[ss[matches]].astype(np.uint16)
+        if self.verify_holes_unfilled:
+            self._assert_slots_unresolved_vec(
+                variants_u16,
+                target_slots,
+                target_values,
+                context=context,
+                caller_section_offset=caller_section_offset,
+                callee_fid=callee_fid,
+                variants_region_start=variants_region_start,
+            )
+        variants_u16[target_slots] = target_values
 
     def _sweep_for_unresolved_sentinels(self) -> None:
         """Walk the bin sections; assert no ``0xFFFF`` slot leaked.
