@@ -78,6 +78,7 @@ def _pack_record(
         insn_len=insn_len,
         block_word_count=block_word_count,
         token_count=token_count,
+        entry_idx=0,
     )
     header_bytes = encode_binary_header(header)
     pre, post = derive_pad_placement(header)
@@ -166,7 +167,7 @@ def test_ultrashort_record_round_trip():
     header, prefix = parse_binary_header(record)
     assert header.format is BinaryHeaderFormat.UltraShort
     assert header.block_enc == 0
-    assert prefix == 3
+    assert prefix == 7
 
     arrays = extract_arrays_from_data(record, header, prefix)
     _expect_arrays_equal(arrays, insn, block, tokens)
@@ -220,7 +221,7 @@ def test_extract_arrays_via_memmap_mixed_records(tmp_path):
 
     mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
     for (insn, block, tokens, _), off in zip(payloads, offsets):
-        header, prefix = parse_binary_header(mmap[off:off + 10])
+        header, prefix = parse_binary_header(mmap[off:off + 14])
         # Slice to record_total_size so the extractor stays in bounds.
         end = off + record_total_size(header)
         arrays = extract_arrays_from_data(mmap[off:end], header, prefix)
@@ -243,7 +244,7 @@ def test_extract_arrays_views_share_memory_with_memmap(tmp_path):
     bin_path.write_bytes(record)
     mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
 
-    header, prefix = parse_binary_header(mmap[:10])
+    header, prefix = parse_binary_header(mmap[:14])
     end = record_total_size(header)
     insn_view, block_view, tokens_view = extract_arrays_from_data(
         mmap[:end], header, prefix

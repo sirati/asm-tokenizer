@@ -266,23 +266,32 @@ def _emit_matched_data(
     inputs (``matched_data_entries``, ``function_lookup``).
 
     Stays a pure rearrangement of the production pipeline's pass-1
-    outputs -- no parallel encoding logic.
+    outputs -- no parallel encoding logic. The fixture is dedup-free
+    (every variant gets a fresh write), so the per-record ``entry_idx``
+    is a simple monotonic counter mirroring the file's encounter order;
+    the trailer stamps that final count.
     """
     matched_data_entries: List[dict] = []
     lookup: dict = {}
+    n_entries = 0
     with open(data_path, "wb") as data_file:
         # Match the production builder's file-level prelude so the
         # loader's prelude-magic assertion fires successfully on test
         # fixtures too.
-        from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
+        from tokenizer.aligned_data.memmap_format import (
+            encode_data_bin_prelude,
+            encode_data_bin_trailer,
+        )
         data_file.write(encode_data_bin_prelude())
         for spec in matched:
             typed_called = _project_called_typed(spec.called)
             version_data = []
             for variant in spec.variants:
                 offset, length = write_function_binary_data(
-                    data_file, variant.tokens, variant.block_rl, variant.insn_rl
+                    data_file, variant.tokens, variant.block_rl, variant.insn_rl,
+                    entry_idx=n_entries,
                 )
+                n_entries += 1
                 version_data.append(
                     {
                         "vkey": variant.vkey,
@@ -304,6 +313,9 @@ def _emit_matched_data(
             registry.add(spec.func_name)
             for callee in spec.called:
                 registry.add(callee)
+        data_file.write(
+            encode_data_bin_trailer(n_entries, cursor=data_file.tell())
+        )
     return matched_data_entries, lookup
 
 
@@ -312,14 +324,22 @@ def _emit_unmatched_data(
     data_path: Path,
     registry: FunctionNamesRegistry,
 ) -> Tuple[List[dict], dict]:
-    """Write unmatched-arm ``_data.bin`` records via the production writer."""
+    """Write unmatched-arm ``_data.bin`` records via the production writer.
+
+    Same dedup-free encounter-order ``entry_idx`` policy as
+    :func:`_emit_matched_data`; the trailer stamps the final count.
+    """
     unmatched_data_entries: List[dict] = []
     lookup: dict = {}
+    n_entries = 0
     with open(data_path, "wb") as data_file:
         # Match the production builder's file-level prelude so the
         # loader's prelude-magic assertion fires successfully on test
         # fixtures too.
-        from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
+        from tokenizer.aligned_data.memmap_format import (
+            encode_data_bin_prelude,
+            encode_data_bin_trailer,
+        )
         data_file.write(encode_data_bin_prelude())
         for spec in unmatched:
             typed_called = _project_called_typed(spec.called)
@@ -328,8 +348,10 @@ def _emit_unmatched_data(
                 registry.add(callee)
             for version in spec.versions:
                 offset, length = write_function_binary_data(
-                    data_file, version.tokens, version.block_rl, version.insn_rl
+                    data_file, version.tokens, version.block_rl, version.insn_rl,
+                    entry_idx=n_entries,
                 )
+                n_entries += 1
                 unmatched_data_entries.append(
                     {
                         "func_name": spec.func_name,
@@ -342,4 +364,7 @@ def _emit_unmatched_data(
                     }
                 )
                 lookup[(spec.func_name, version.vkey)] = (offset, length, 0)
+        data_file.write(
+            encode_data_bin_trailer(n_entries, cursor=data_file.tell())
+        )
     return unmatched_data_entries, lookup

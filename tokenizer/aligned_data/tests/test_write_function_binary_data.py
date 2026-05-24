@@ -66,7 +66,7 @@ def _round_trip(insn, block, tokens):
     :func:`extract_arrays_from_data` so the test can compare element-wise.
     """
     buf = stdio.BytesIO()
-    offset, total = write_function_binary_data(buf, tokens, block, insn)
+    offset, total = write_function_binary_data(buf, tokens, block, insn, entry_idx=0)
     assert offset == 0  # first write lands at offset 0
     raw = buf.getvalue()
     assert total == len(raw)
@@ -220,12 +220,14 @@ def test_writer_appends_one_record_per_call():
     rng = random.Random(0xBEEF)
     buf = stdio.BytesIO()
     offsets = []
-    for insn_len, block_enc, block_count, token_count in _shape_iter(rng, 25):
+    for i, (insn_len, block_enc, block_count, token_count) in enumerate(_shape_iter(rng, 25)):
         insn, block, tokens = _make_inputs(
             insn_len, block_enc, block_count, token_count, rng
         )
         before = buf.tell()
-        offset, total = write_function_binary_data(buf, tokens, block, insn)
+        offset, total = write_function_binary_data(
+            buf, tokens, block, insn, entry_idx=i
+        )
         assert offset == before
         assert buf.tell() == before + total
         assert buf.tell() % RECORD_ALIGNMENT == 0
@@ -253,7 +255,7 @@ def test_insn_len_cap_logs_and_truncates():
     log = stdio.StringIO()
 
     result = write_function_binary_data(
-        buf, tokens, block, insn, func_name="big_insn", error_log=log
+        buf, tokens, block, insn, entry_idx=0, func_name="big_insn", error_log=log
     )
     assert result is None
     assert buf.tell() == pre_offset
@@ -275,7 +277,7 @@ def test_block_word_count_cap_logs_and_truncates():
     log = stdio.StringIO()
 
     result = write_function_binary_data(
-        buf, tokens, block, insn, func_name="big_block", error_log=log
+        buf, tokens, block, insn, entry_idx=0, func_name="big_block", error_log=log
     )
     assert result is None
     assert buf.tell() == pre_offset
@@ -292,7 +294,7 @@ def test_no_error_log_propagates_skip():
     buf.write(b"\xaa" * 8)
     pre_offset = buf.tell()
     with pytest.raises(IndexEntrySkip) as info:
-        write_function_binary_data(buf, tokens, block, insn)
+        write_function_binary_data(buf, tokens, block, insn, entry_idx=0)
     assert info.value.reason == "insn_len_overflow"
     assert buf.tell() == pre_offset
     assert len(buf.getvalue()) == pre_offset
@@ -310,7 +312,7 @@ def test_tiny_record_picks_ultrashort_form():
     block = np.zeros(3, dtype=np.uint8)  # block_enc=0
     tokens = np.zeros(4, dtype=np.uint16)
     buf = stdio.BytesIO()
-    write_function_binary_data(buf, tokens, block, insn)
+    write_function_binary_data(buf, tokens, block, insn, entry_idx=0)
     header, _ = parse_binary_header(buf.getvalue())
     assert header.format is BinaryHeaderFormat.UltraShort
 
@@ -322,7 +324,7 @@ def test_block_enc_one_forces_normal_form():
     block = np.zeros(3, dtype=np.uint16)  # block_enc=1
     tokens = np.zeros(4, dtype=np.uint16)
     buf = stdio.BytesIO()
-    write_function_binary_data(buf, tokens, block, insn)
+    write_function_binary_data(buf, tokens, block, insn, entry_idx=0)
     header, _ = parse_binary_header(buf.getvalue())
     assert header.format is BinaryHeaderFormat.Normal
     assert header.block_enc == 1

@@ -65,30 +65,34 @@ def test_ultrashort_round_trip(insn_len, block_word_count, token_count):
         insn_len=insn_len,
         block_word_count=block_word_count,
         token_count=token_count,
+        entry_idx=0,
     )
     enc = encode_binary_header(h)
-    assert len(enc) == ULTRASHORT_PREFIX_BYTES == 3
+    assert len(enc) == ULTRASHORT_PREFIX_BYTES == 7
     assert enc[0] & 0b11 == BinaryHeaderFormat.UltraShort
 
     parsed, prefix = parse_binary_header(enc)
-    assert prefix == 3
+    assert prefix == 7
     assert parsed == h
 
 
 def test_ultrashort_control_byte_wire_layout():
-    """Wire layout: byte0[bits 0-1]=0, byte0[bits 2-7]=insn, byte1=block, byte2=tokens."""
+    """Wire layout: byte0[bits 0-1]=0, byte0[bits 2-7]=insn, byte1=block,
+    byte2=tokens, bytes 3..6=entry_idx (u32 LE)."""
     h = BinaryHeader(
         format=BinaryHeaderFormat.UltraShort,
         block_enc=0,
         insn_len=0b101010,
         block_word_count=0xA5,
         token_count=0x5A,
+        entry_idx=0x12345678,
     )
     enc = encode_binary_header(h)
     # bits 0-1 = 00 (ultrashort), bits 2-7 = 0b101010
     assert enc[0] == (0b101010 << 2)
     assert enc[1] == 0xA5
     assert enc[2] == 0x5A
+    assert enc[3:7] == b"\x78\x56\x34\x12"
 
 
 def test_encoder_canonicalises_normal_to_ultrashort_when_eligible():
@@ -106,6 +110,7 @@ def test_encoder_canonicalises_normal_to_ultrashort_when_eligible():
         insn_len=10,
         block_word_count=5,
         token_count=7,
+        entry_idx=0,
     )
     enc = encode_binary_header(h_normal)
     assert len(enc) == ULTRASHORT_PREFIX_BYTES
@@ -145,6 +150,7 @@ def test_normal_round_trip_per_width_tag(width_tag, block_enc):
         insn_len=insn_len,
         block_word_count=block_word_count,
         token_count=token_count,
+        entry_idx=0,
     )
     enc = encode_binary_header(h)
     expected_prefix = NORMAL_PREFIX_BYTES[width_tag]
@@ -169,6 +175,7 @@ def test_normal_format_dispatch_picks_smallest_width_tag():
             insn_len=NORMAL_INSN_CAP - 1,
             block_word_count=NORMAL_BLOCK_WORD_CAP - 1,
             token_count=n_tokens,
+            entry_idx=0,
         )
         enc = encode_binary_header(h)
         assert len(enc) == NORMAL_PREFIX_BYTES[expected_tag], (
@@ -186,10 +193,11 @@ def test_normal_wire_layout_byte_for_byte():
         insn_len=0x010203,               # u24 = bytes 03 02 01
         block_word_count=0x0405,         # u16 = bytes 05 04
         token_count=0x000A_BCDE,         # 20 bits set: hi4 = 0xA, low16 = 0xBCDE
+        entry_idx=0xDEADBEEF,            # u32 LE -> EF BE AD DE
     )
     enc = encode_binary_header(h)
-    # tag = 1 (u20) -> prefix = 8 bytes
-    assert len(enc) == 8
+    # tag = 1 (u20) -> prefix = 8 + 4 (entry_idx) = 12 bytes
+    assert len(enc) == 12
     # byte 0: fmt=3, tag=1, hi4=0xA  ->  0b1010_01_11 = 0xA7
     assert enc[0] == 0xA7
     # bytes 1-2: low16 of token_count (LE)
@@ -198,6 +206,8 @@ def test_normal_wire_layout_byte_for_byte():
     assert enc[3:6] == b"\x03\x02\x01"
     # bytes 6-7: u16 block_word_count (LE)
     assert enc[6:8] == b"\x05\x04"
+    # bytes 8-11: u32 entry_idx (LE)
+    assert enc[8:12] == b"\xEF\xBE\xAD\xDE"
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +227,7 @@ def test_record_total_size_is_aligned(block_enc, insn_len_mod, token_count):
         insn_len=insn_len,
         block_word_count=block_word_count,
         token_count=token_count,
+        entry_idx=0,
     )
     total = record_total_size(h)
     assert total % RECORD_ALIGNMENT == 0
@@ -234,6 +245,7 @@ def test_pad_placement_block_aligned_when_b_le_p():
         insn_len=65,        # forces normal (>= 64)
         block_word_count=1, # block_bytes = 4
         token_count=1,
+        entry_idx=0,
     )
     pre, post = derive_pad_placement(h)
     prefix = prefix_bytes_for_header(h)
@@ -266,6 +278,7 @@ def test_pad_placement_fallback_when_b_gt_p():
                     insn_len=insn_len,
                     block_word_count=block_word_count,
                     token_count=token_count,
+                    entry_idx=0,
                 )
                 prefix = prefix_bytes_for_header(h)
                 block_bytes = block_word_count * BLOCK_WORD_SIZE[2]
@@ -303,6 +316,7 @@ def test_record_total_size_random_inputs_aligned():
             insn_len=insn_len,
             block_word_count=block_word_count,
             token_count=token_count,
+            entry_idx=0,
         )
         sz = record_total_size(h)
         assert sz % RECORD_ALIGNMENT == 0, (h, sz)
@@ -320,6 +334,7 @@ def test_insn_len_overflow_raises_index_entry_skip():
         insn_len=NORMAL_INSN_CAP,
         block_word_count=ULTRASHORT_BLOCK_CAP + 1,  # force normal
         token_count=ULTRASHORT_TOKENS_CAP + 1,
+        entry_idx=0,
     )
     with pytest.raises(IndexEntrySkip) as excinfo:
         encode_binary_header(h)
@@ -334,6 +349,7 @@ def test_block_word_count_overflow_raises_index_entry_skip():
         insn_len=100,
         block_word_count=NORMAL_BLOCK_WORD_CAP,
         token_count=10,
+        entry_idx=0,
     )
     with pytest.raises(IndexEntrySkip) as excinfo:
         encode_binary_header(h)
@@ -348,6 +364,7 @@ def test_token_count_overflow_raises_index_entry_skip():
         insn_len=100,
         block_word_count=ULTRASHORT_BLOCK_CAP + 1,  # force normal
         token_count=NORMAL_TOKEN_CAPS[-1],          # = u36 cap
+        entry_idx=0,
     )
     with pytest.raises(IndexEntrySkip) as excinfo:
         encode_binary_header(h)
@@ -367,6 +384,7 @@ def test_bad_block_enc_raises_value_error():
         insn_len=0,
         block_word_count=0,
         token_count=0,
+        entry_idx=0,
     )
     with pytest.raises(ValueError):
         encode_binary_header(h)
@@ -379,6 +397,7 @@ def test_negative_field_raises_value_error():
         insn_len=-1,
         block_word_count=0,
         token_count=0,
+        entry_idx=0,
     )
     with pytest.raises(ValueError):
         encode_binary_header(h)
@@ -412,6 +431,7 @@ def test_record_token_count_returns_header_field():
         insn_len=10,
         block_word_count=5,
         token_count=42,
+        entry_idx=0,
     )
     assert record_token_count(h) == 42
 
@@ -427,6 +447,7 @@ def test_record_token_count_from_memmap_reads_only_header(tmp_path):
             insn_len=3,
             block_word_count=2,
             token_count=11,
+            entry_idx=0,
         ),
         BinaryHeader(
             format=BinaryHeaderFormat.Normal,
@@ -434,6 +455,7 @@ def test_record_token_count_from_memmap_reads_only_header(tmp_path):
             insn_len=200,
             block_word_count=40,
             token_count=3000,                  # u12 tag
+            entry_idx=1,
         ),
         BinaryHeader(
             format=BinaryHeaderFormat.Normal,
@@ -441,6 +463,7 @@ def test_record_token_count_from_memmap_reads_only_header(tmp_path):
             insn_len=500,
             block_word_count=80,
             token_count=NORMAL_TOKEN_CAPS[2] - 1,  # u28 tag
+            entry_idx=2,
         ),
     ]
 
@@ -478,8 +501,9 @@ def test_record_token_count_from_memmap_reads_at_most_max_header_bytes(tmp_path)
         insn_len=2,
         block_word_count=1,
         token_count=99,
+        entry_idx=0,
     )
-    enc = encode_binary_header(h)  # 3 bytes
+    enc = encode_binary_header(h)  # 7 bytes
     bin_path = tmp_path / "tiny.bin"
     # Write the header followed by ONLY zeroes -- if the function ever
     # accessed bytes deeper than the actual header end it would return
@@ -490,5 +514,6 @@ def test_record_token_count_from_memmap_reads_at_most_max_header_bytes(tmp_path)
         fh.write(b"\x00")
     mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
     assert record_token_count_from_memmap(mmap, 0) == 99
-    # MAX_HEADER_BYTES is the encoder's upper bound (= 10).
-    assert MAX_HEADER_BYTES == 10
+    # MAX_HEADER_BYTES is the encoder's upper bound (= 14 after the
+    # 4-byte entry_idx field was appended to every header form).
+    assert MAX_HEADER_BYTES == 14

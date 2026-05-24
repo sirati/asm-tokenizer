@@ -248,7 +248,7 @@ def _write_one_record_with_pad(data_path: Path, index_path: Path) -> tuple[int, 
     block = np.ones(1, dtype=np.uint16)  # u16 -> normal form, block_align=2
     tokens = np.zeros(0, dtype=np.uint16)
     with open(data_path, "wb") as fh:
-        result = write_function_binary_data(fh, tokens, block, insn)
+        result = write_function_binary_data(fh, tokens, block, insn, entry_idx=0)
     assert result is not None
     start, total = result
     assert total % RECORD_ALIGNMENT == 0
