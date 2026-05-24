@@ -1274,6 +1274,7 @@ def _reference_resolve_caller_section(
     callee_section_offset: int,
     callee_sorted_vrefs: "np.ndarray",
     callee_sort_order: "np.ndarray",
+    context: str = "Step3-sibling-close",
 ) -> None:
     """Python-loop reference implementation of ``_resolve_caller_section``.
 
