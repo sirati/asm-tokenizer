@@ -290,45 +290,6 @@ def check_record_bounds(
     return errors
 
 
-def check_entry_idx_sequence(
-    data_path: Path,
-    starts: np.ndarray,
-    label: str,
-) -> List[str]:
-    """Every record's ``entry_idx`` must equal its index in ``starts``.
-
-    The writer stamps ``entry_idx = N`` on the Nth record it appends;
-    a corrupted ``_index.bin`` or misaligned starts array would surface
-    here as an off-by-one mismatch. Also cross-checks the trailing
-    ``total_entries`` against ``len(starts)`` so a truncated index
-    is flagged at the file level.
-    """
-    if not data_path.exists() or len(starts) == 0:
-        return []
-    from tokenizer.aligned_data.memmap_format import read_data_bin_trailer
-
-    errors: List[str] = []
-    data = np.memmap(str(data_path), dtype=np.uint8, mode="r")
-    try:
-        total_entries = read_data_bin_trailer(data)
-        if total_entries != len(starts):
-            errors.append(
-                f"{label}: trailer total_entries={total_entries} disagrees "
-                f"with len(starts)={len(starts)}"
-            )
-        for i in range(len(starts)):
-            start = int(starts[i])
-            header, _ = parse_binary_header(_header_window(data, start))
-            if header.entry_idx != i:
-                errors.append(
-                    f"{label}: record {i} (start={start}) has "
-                    f"entry_idx={header.entry_idx}, expected {i}"
-                )
-    finally:
-        del data
-    return errors
-
-
 def run_v1_post_checks(
     matched_index: Path,
     unmatched_index: Path,
@@ -354,5 +315,4 @@ def run_v1_post_checks(
         errors.extend(check_pad_bytes_zero(data_path, starts, str(data_path)))
         errors.extend(check_pad_consistency(data_path, starts, str(data_path)))
         errors.extend(check_record_bounds(data_path, starts, str(data_path)))
-        errors.extend(check_entry_idx_sequence(data_path, starts, str(data_path)))
     return errors

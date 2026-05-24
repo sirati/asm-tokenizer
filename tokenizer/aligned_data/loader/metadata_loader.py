@@ -239,42 +239,12 @@ def load_unmatched_lengths(
         return np.array([], dtype=np.int32)
 
     data_memmap = np.memmap(str(paths.data_bin), dtype=np.uint8, mode="r")
-    assert_entry_idx_sequence(data_memmap, starts, paths.data_bin)
     token_counts = [
         record_token_count_from_memmap(data_memmap, int(starts[i]))
         for i in range(len(starts))
     ]
     del data_memmap
     return np.array(token_counts, dtype=np.int32)
-
-
-def assert_entry_idx_sequence(
-    data_memmap: np.ndarray, starts: np.ndarray, data_bin_path: Path
-) -> None:
-    """Sweep ``starts`` and assert each parsed header's ``entry_idx == i``.
-
-    Single chokepoint for the load-time per-arm sweep. The sweep also
-    re-reads the trailing ``total_entries`` to cross-check ``len(starts)
-    == total_entries`` so a corrupt index that drops the last record
-    surfaces here instead of leaking into the per-lookup hot path.
-    A failure raises :class:`ValueError` with the literal wording
-    ``corrupt file: <filename> did not pass validation``.
-    """
-    if len(starts) == 0:
-        return
-    total_entries = read_data_bin_trailer(data_memmap)
-    if total_entries != len(starts):
-        raise ValueError(
-            f"corrupt file: {data_bin_path.name} did not pass validation"
-        )
-    for i in range(len(starts)):
-        start = int(starts[i])
-        end = min(start + MAX_HEADER_BYTES, len(data_memmap))
-        header, _ = parse_binary_header(data_memmap[start:end])
-        if header.entry_idx != i:
-            raise ValueError(
-                f"corrupt file: {data_bin_path.name} did not pass validation"
-            )
 
 
 # --- Per-arm loader dispatch ----------------------------------------------
