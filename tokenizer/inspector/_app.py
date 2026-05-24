@@ -131,7 +131,8 @@ class _InspectorTree(Tree[Node]):
             node.data, "is_failed", False
         )
         if failed:
-            prefix = assemble_failed_glyph()
+            glyph_text, glyph_style = assemble_failed_glyph(base_style)
+            prefix = Text(glyph_text, style=glyph_style)
         elif node._allow_expand:
             prefix = Text(
                 self.ICON_NODE_EXPANDED if node.is_expanded else self.ICON_NODE,
