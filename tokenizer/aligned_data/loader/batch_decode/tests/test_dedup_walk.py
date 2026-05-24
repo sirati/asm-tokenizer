@@ -356,7 +356,7 @@ def test_single_call_target_function_dedup_three_distinct_fids():
         stage3_variant, identities, batch_size=1
     )
 
-    remapped, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    remapped, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch, dedup_maps=_make_dedup_maps()
     )
 
@@ -799,7 +799,7 @@ def test_fid_sidecar_collects_counter_to_fid_mapping():
         stage3_variant, identities, batch_size=1
     )
 
-    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
         dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
@@ -833,7 +833,7 @@ def test_fid_sidecar_default_off_returns_none():
         stage3_variant, identities, batch_size=1
     )
 
-    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch, dedup_maps=_make_dedup_maps()
     )
 
@@ -944,7 +944,7 @@ def test_padding_row_skipped():
         f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
     )
 
-    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
         dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
@@ -1103,7 +1103,7 @@ def test_resample_multi_mapped_rows_both_get_fid_sidecar():
         stage3_variant, identities, mapping=mapping
     )
 
-    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
         dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
@@ -1155,7 +1155,7 @@ def test_resample_multi_mapped_rows_with_padding_and_real_mix():
         stage3_variant, identities, mapping=mapping
     )
 
-    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
         dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
@@ -1197,7 +1197,7 @@ def test_redistribute_three_rows_same_variant_get_identical_sidecar():
         stage3_variant, identities, mapping=mapping
     )
 
-    _, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
         dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
