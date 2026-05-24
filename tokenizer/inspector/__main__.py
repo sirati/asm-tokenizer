@@ -4,10 +4,13 @@ Single concern: parse CLI args via :mod:`._args`, build the per-binary
 loader state (which owns the unified vocab + metadata loading via the
 public :class:`BinaryDataset`), open a :class:`BinarySession` for that
 binary inside a ``with`` block so its ExitStack-driven cleanup runs
-even on mid-render exceptions, and (for now) print a placeholder line
-to stdout. The Textual UI lands in a later phase under ``_app.py``;
-this entry deliberately runs WITHOUT textual installed so the default
-``nix develop`` shell stays free of that dependency.
+even on mid-render exceptions, and hand the live session off to the
+Textual app entry (:func:`tokenizer.inspector._app.run_inspector`).
+
+``_app`` is the only module that imports :mod:`textual`; this file
+imports it lazily inside :func:`main` so unit tests that import
+:mod:`tokenizer.inspector.__main__` (e.g. to exercise argparse) don't
+trip the textual-free default shell rule.
 """
 
 from __future__ import annotations
@@ -38,14 +41,6 @@ def _open_session(memmap_dir: Path, binary_name: str) -> tuple[BinaryDataset, Bi
     return dataset, dataset.open_session()
 
 
-def _matched_count(dataset: BinaryDataset) -> int:
-    """Number of matched functions in the binary (placeholder copy)."""
-    # ``BinaryDataset`` publishes the per-arm function count under the
-    # legacy ``<prefix>_count`` attribute (see ``_publish_arm``); the
-    # inspector seeds its tree from this number per plan D3.
-    return dataset.matched_count
-
-
 def main(argv: list[str] | None = None) -> int:
     ns = parse_args(argv)
     memmap_dir: Path = ns.memmap_dir
@@ -57,14 +52,18 @@ def main(argv: list[str] | None = None) -> int:
         memmap_dir,
     )
 
+    # Lazy import: ``_app`` pulls in :mod:`textual`. Importing it at
+    # module-level would block ``python -m tokenizer.inspector --help``
+    # in any environment without textual installed (e.g. the default
+    # ``nix develop`` shell), which the plan explicitly forbids.
+    from ._app import run_inspector
+
     dataset, session = _open_session(memmap_dir, binary_name)
     with session:
-        count = _matched_count(dataset)
-        print(
-            f"tree would go here — {count} matched functions in "
-            f"{binary_name}"
+        log_path = memmap_dir / ".tui-inspector.log"
+        return run_inspector(
+            dataset=dataset, session=session, log_path=log_path
         )
-    return 0
 
 
 if __name__ == "__main__":

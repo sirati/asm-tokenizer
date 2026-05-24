@@ -14,9 +14,10 @@ consume data already in hand. PLT / EXT call sites are non-expandable
 leaves (only ``can_expand`` for local-matched calls).
 
 The :class:`DecodeContext` bundles the per-FunctionNode
-``fid_sidecar`` / ``fid_row_offsets`` / ``line_to_name`` / vocab
-references and the session-bound :attr:`callee_arm_resolver` closure
-so every descendant carries ONE shared reference instead of five.
+``fid_sidecar`` / ``fid_row_offsets`` / ``line_to_name`` /
+``line_to_provider`` / vocab references and the session-bound
+:attr:`callee_arm_resolver` closure so every descendant carries ONE
+shared reference instead of six.
 
 The package is split BY CONCERN (one node family per submodule):
 
