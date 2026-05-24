@@ -8,7 +8,7 @@ import numpy as np
 from typing import Any, Hashable, Iterator, Tuple, Optional, Dict, List
 from dataclasses import dataclass
 
-from .function_deduper import FunctionDeduper
+from .function_deduper import FunctionDeduper, canonical_function_name
 from .function_token_list import FunctionTokenList
 
 _logger = logging.getLogger(__name__)
@@ -90,15 +90,19 @@ class FunctionDataManager:
 
         The deduper folds same-(name, comment, identity_key, body)
         calls into a single record (no new slot consumed; the first
-        record's ``final_func_name`` is returned). When any of the four
-        axes diverges the manager allocates a new slot with the legacy
-        ``_N``-suffix disambiguator on ``func_name``.
+        record's ``final_func_name`` is returned). When any of the
+        identity axes diverges the manager allocates a fresh slot and
+        derives the final name via
+        :func:`tokenizer.function_deduper.canonical_function_name`
+        (cross-ISA-stable for the comment / identity_key branches;
+        positional ``_N``-suffix fallback only when both axes are
+        absent — that case is genuinely per-binary).
 
         Returns:
-            Final function name. New records use the legacy
-            occurrence-suffix scheme (``name``, ``name_1``,
-            ``name_2``, ...); folded duplicates re-return the existing
-            record's final name.
+            Final function name. Cross-ISA-stable when ``comment`` or
+            ``identity_key`` are populated; positional
+            (``name``/``name_1``/``name_2``/...) otherwise. Folded
+            duplicates re-return the existing record's final name.
         """
         resolution = self._deduper.resolve(
             func_name,
@@ -120,18 +124,27 @@ class FunctionDataManager:
         if self.current_index >= self.total_functions:
             raise IndexError(f"Cannot add more functions: array is full ({self.total_functions})")
 
-        # Handle duplicate function names (legacy ``_N`` allocator;
-        # same encounter-order semantics as the pre-deduper world).
-        if func_name in self.func_name_occurrences:
-            occurrence_index = self.func_name_occurrences[func_name]
-            final_func_name = f"{func_name}_{occurrence_index}"
-            self.func_name_occurrences[func_name] = occurrence_index + 1
+        # Final-name derivation: the helper handles the three branches
+        # (comment / identity_key / both-None) uniformly. Whether we
+        # actually need a positional disambiguator depends on whether
+        # the helper already produced a unique-among-prior-slots string;
+        # that's the case for the comment / identity_key branches by
+        # construction, so the positional ``_N`` allocator is consulted
+        # ONLY on the both-None branch. The body-divergence diagnostic
+        # path (same canonical name, different body) is also routed
+        # through the same positional allocator so a second slot gets a
+        # distinct downstream label.
+        canonical = canonical_function_name(func_name, comment, identity_key)
+        if canonical in self.func_name_occurrences:
+            occurrence_index = self.func_name_occurrences[canonical]
+            final_func_name = f"{canonical}_{occurrence_index}"
+            self.func_name_occurrences[canonical] = occurrence_index + 1
         else:
-            final_func_name = func_name
-            self.func_name_occurrences[func_name] = 1
+            final_func_name = canonical
+            self.func_name_occurrences[canonical] = 1
             occurrence_index = 0
 
-        self.access_map[(func_name, occurrence_index)] = self.current_index
+        self.access_map[(canonical, occurrence_index)] = self.current_index
         self._slot_to_final_name[resolution.slot_id] = final_func_name
 
         # Store data in arrays

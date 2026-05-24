@@ -17,7 +17,11 @@ Two concerns under test, separated cleanly:
 from __future__ import annotations
 
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
-from tokenizer.function_deduper import DedupResolution, FunctionDeduper
+from tokenizer.function_deduper import (
+    DedupResolution,
+    FunctionDeduper,
+    canonical_function_name,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +187,9 @@ def test_empty_comment_normalises_to_none() -> None:
 
 def test_fdm_same_name_same_key_same_body_folds() -> None:
     """The merge condition holds: the second call is folded (no new
-    slot consumed, the first record's final name is returned)."""
+    slot consumed, the first record's final name is returned). With
+    ``identity_key=0xDEAD`` the canonical name is the thunk-keyed
+    form; both calls return the same canonical."""
     mgr = FunctionDataManager(total_functions=4)
     final_a = mgr.add_function_data(
         "strcmp", 0x1000, "disas_a", "tok_a", _fd("AAAA"), identity_key=0xDEAD
@@ -191,16 +197,18 @@ def test_fdm_same_name_same_key_same_body_folds() -> None:
     final_b = mgr.add_function_data(
         "strcmp", 0x2000, "disas_b", "tok_b", _fd("AAAA"), identity_key=0xDEAD
     )
-    assert final_a == "strcmp"
-    assert final_b == "strcmp"
+    canonical = canonical_function_name("strcmp", None, 0xDEAD)
+    assert final_a == canonical
+    assert final_b == canonical
     assert mgr.get_used_count() == 1
 
 
 def test_fdm_different_comment_keeps_distinct_records() -> None:
     """C++ overload disambiguation: same name + different comment ⇒
-    two distinct FDM records via the legacy ``_N`` suffix on
-    ``func_name`` (the deduper's slot_id allocation is the merge
-    decision; FDM owns the user-visible name)."""
+    two distinct FDM records under DISTINCT canonical names (the
+    canonical-name helper produces the cross-ISA-stable suffix from
+    the demangled comment, so two genuine overloads never collide on
+    the on-disk name)."""
     mgr = FunctionDataManager(total_functions=4)
     final_a = mgr.add_function_data(
         "reset", 0x1000, "disas_a", "tok_a", _fd("AAAA"),
@@ -210,14 +218,19 @@ def test_fdm_different_comment_keeps_distinct_records() -> None:
         "reset", 0x2000, "disas_b", "tok_b", _fd("BBBB"),
         comment="EthernetHeader::reset(void)",
     )
-    assert final_a == "reset"
-    assert final_b == "reset_1"
+    assert final_a == canonical_function_name(
+        "reset", "ARPHeader::reset(void)", None
+    )
+    assert final_b == canonical_function_name(
+        "reset", "EthernetHeader::reset(void)", None
+    )
+    assert final_a != final_b
     assert mgr.get_used_count() == 2
 
 
 def test_fdm_same_name_different_identity_key_distinct() -> None:
     """Different identity_key (genuine collision) preserves two
-    distinct records under the legacy ``_N`` suffix."""
+    distinct records under DISTINCT thunk-keyed canonical names."""
     mgr = FunctionDataManager(total_functions=4)
     final_a = mgr.add_function_data(
         "strcmp", 0x1000, "disas_a", "tok_a", _fd("AAAA"), identity_key=0xDEAD
@@ -225,15 +238,18 @@ def test_fdm_same_name_different_identity_key_distinct() -> None:
     final_b = mgr.add_function_data(
         "strcmp", 0x2000, "disas_b", "tok_b", _fd("AAAA"), identity_key=0xBEEF
     )
-    assert final_a == "strcmp"
-    assert final_b == "strcmp_1"
+    assert final_a == canonical_function_name("strcmp", None, 0xDEAD)
+    assert final_b == canonical_function_name("strcmp", None, 0xBEEF)
+    assert final_a != final_b
     assert mgr.get_used_count() == 2
 
 
 def test_fdm_body_divergence_keeps_distinct_records() -> None:
     """Same (name, comment, identity_key) but different body: NOT
     folded (regression-guards the body-equality condition); the
-    second slot consumes a ``_N``-suffix fallback name."""
+    second slot consumes a ``_N``-suffix fallback on the SHARED
+    canonical name (body-divergence diagnostic — same canonical name
+    two distinct bodies)."""
     mgr = FunctionDataManager(total_functions=4)
     final_a = mgr.add_function_data(
         "strcmp", 0x1000, "disas_a", "tok_a", _fd("AAAA"), identity_key=0xDEAD
@@ -241,8 +257,9 @@ def test_fdm_body_divergence_keeps_distinct_records() -> None:
     final_b = mgr.add_function_data(
         "strcmp", 0x2000, "disas_b", "tok_b", _fd("BBBB"), identity_key=0xDEAD
     )
-    assert final_a == "strcmp"
-    assert final_b == "strcmp_1"
+    canonical = canonical_function_name("strcmp", None, 0xDEAD)
+    assert final_a == canonical
+    assert final_b == f"{canonical}_1"
     assert mgr.get_used_count() == 2
 
 
@@ -282,7 +299,9 @@ def test_fdm_fold_returns_existing_address_through_lookup() -> None:
     """A folded second call leaves the first record's address as the
     canonical mapping for that name (the second slot's address is
     intentionally dropped; both call sites that reference either
-    address resolve to the same logical function)."""
+    address resolve to the same logical function). The lookup key is
+    the CANONICAL name (the on-disk form), not the raw provider
+    name."""
     mgr = FunctionDataManager(total_functions=4)
     mgr.add_function_data(
         "strcmp", 0x1000, "disas_a", "tok_a", _fd("AAAA"), identity_key=0xDEAD
@@ -290,4 +309,101 @@ def test_fdm_fold_returns_existing_address_through_lookup() -> None:
     mgr.add_function_data(
         "strcmp", 0x2000, "disas_b", "tok_b", _fd("AAAA"), identity_key=0xDEAD
     )
-    assert mgr.get_function_addr("strcmp", 0) == 0x1000
+    canonical = canonical_function_name("strcmp", None, 0xDEAD)
+    assert mgr.get_function_addr(canonical, 0) == 0x1000
+
+
+# ---------------------------------------------------------------------------
+# canonical_function_name - the cross-ISA-stable name derivation helper
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_name_no_comment_no_identity_returns_raw() -> None:
+    """The both-axes-None branch returns the raw name unchanged so
+    legacy callers (and the FDM positional-fallback path) keep the
+    identical semantics."""
+    assert canonical_function_name("foo", None, None) == "foo"
+
+
+def test_canonical_name_empty_comment_treated_as_none() -> None:
+    """An empty-string comment behaves identically to ``None`` so
+    providers that surface ``getComment() == ""`` for noise don't
+    accidentally produce ``foo@``-style suffixes."""
+    assert canonical_function_name("foo", "", None) == "foo"
+
+
+def test_canonical_name_comment_populated_appends_sanitised_suffix() -> None:
+    """A populated comment becomes the cross-ISA-stable suffix; the
+    output is human-readable (allow-listed chars survive verbatim)."""
+    result = canonical_function_name(
+        "reset", "ARPHeader::reset(void)", None
+    )
+    assert result == "reset@ARPHeader::reset(void)"
+
+
+def test_canonical_name_comment_with_whitespace_collapses() -> None:
+    """Whitespace runs in the comment collapse to a single ``_`` so
+    the suffix stays one record (no CSV-cell-corrupting characters).
+    Adjacent unsafe-char runs (e.g. comma + space) also collapse to a
+    single ``_`` rather than producing decorative ``__`` clusters."""
+    result = canonical_function_name(
+        "store",
+        "ARPHeader::storeRecvData(unsigned char const*, unsigned int)",
+        None,
+    )
+    # spaces between argument-list tokens collapse; the structural
+    # ``::``, ``(``, ``)``, ``*`` survive. The ``,`` + space pair
+    # collapses to a single ``_`` (both chars are non-allow-listed).
+    assert result == (
+        "store@ARPHeader::storeRecvData(unsigned_char_const*_unsigned_int)"
+    )
+
+
+def test_canonical_name_comment_with_unsafe_chars_replaced() -> None:
+    """Characters outside the allow-list (commas, slashes, quotes,
+    newlines) get replaced with ``_`` so the suffix is safe in CSV
+    cells, sidecar lines, and filesystem paths."""
+    result = canonical_function_name("f", 'name "quoted",\nx/y', None)
+    # ``"`` and ``,`` and ``\n`` and ``/`` -> ``_``; whitespace runs
+    # collapse; leading/trailing ``_`` stripped.
+    assert result == "f@name_quoted_x_y"
+
+
+def test_canonical_name_thunk_identity_key_branch() -> None:
+    """The comment=None + identity_key=populated branch produces the
+    thunk-keyed suffix (cross-ISA-stable: the resolved-external entry
+    offset is identical across thunks AND across ISA variants)."""
+    assert canonical_function_name("strcmp", None, 0xDEAD) == "strcmp@thunk:57005"
+
+
+def test_canonical_name_comment_takes_precedence_over_identity_key() -> None:
+    """When both axes are populated the comment wins (the demangled
+    signature is the strictly stronger disambiguator; identity_key
+    only helps when the demangler is silent)."""
+    result = canonical_function_name(
+        "f", "C::m()", 0xDEAD
+    )
+    assert result == "f@C::m()"
+
+
+def test_canonical_name_long_comment_truncated_with_hash_suffix() -> None:
+    """A pathologically long comment gets truncated with a ``~<sha1>``
+    suffix so the canonical name fits in CSV cells / filesystem path
+    components. The truncation is deterministic (same input -> same
+    suffix) so the cross-ISA-stable property survives the cap."""
+    long_comment = "A::" + "x" * 500
+    r1 = canonical_function_name("f", long_comment, None)
+    r2 = canonical_function_name("f", long_comment, None)
+    assert r1 == r2  # deterministic
+    assert "~" in r1
+    # 200-char cap: prefix (192) + ``~`` + 7-char hex digest = 200; +
+    # ``f@`` prefix = 202.
+    assert len(r1) <= 1 + len("f@") + 200
+
+
+def test_canonical_name_is_deterministic() -> None:
+    """Same inputs -> same output, always (cross-ISA-stable requires
+    this)."""
+    a = canonical_function_name("foo", "C::m()", 0xDEAD)
+    b = canonical_function_name("foo", "C::m()", 0xDEAD)
+    assert a == b

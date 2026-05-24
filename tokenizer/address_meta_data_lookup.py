@@ -16,6 +16,7 @@ from tokenizer.disasm.metadata import (
     encoding_from_string,
     section_kind_from_type_string,
 )
+from tokenizer.function_deduper import canonical_function_name
 
 # ASCII printable run of length >=4 terminated by NUL byte.
 # Mirrors the heuristic in tokenizer/disasm/angr_provider.py:parse_data_sections;
@@ -407,9 +408,16 @@ class AngrMetadataLookup:
         else:
             library = str(raw_lib)
 
-        # Numeric / name fields: pass through, normalizing types.
+        # Numeric / name fields: pass through, normalizing types. The
+        # name is funnelled through ``canonical_function_name`` for
+        # cross-provider parity with the Ghidra path (the helper
+        # short-circuits to the raw name when both axes are None, which
+        # is always the case on the angr path -- no demangler hook, no
+        # thunk-identity surface, see ``angr_limitations.md``).
         raw_name = index_meta.get("name")
-        name: Optional[str] = None if raw_name is None else str(raw_name)
+        name: Optional[str] = None if raw_name is None else canonical_function_name(
+            str(raw_name), None, None
+        )
 
         raw_size = index_meta.get("size")
         size: Optional[int] = None if raw_size is None else int(raw_size)

@@ -14,7 +14,7 @@ from dynrunner.tokenize import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
-from tokenizer.function_deduper import FunctionDeduper
+from tokenizer.function_deduper import FunctionDeduper, canonical_function_name
 from tokenizer.function_filter import FunctionFilter
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.opaque_remapping import (
@@ -334,7 +334,20 @@ def main_loop(
                     tokens_base64 = ndarray_to_base64(tokenized_instructions)
                     block_base64 = ndarray_to_base64(block_run_lengths)
                     insn_base64 = ndarray_to_base64(insn_run_lengths)
-                    if prev_func_name == func_name:
+                    # Canonical-name derivation (cross-ISA-stable): the
+                    # CSV column 0, the occurrence sentinel, and the
+                    # function-names sidecar all consume the canonical
+                    # name produced from the same three identity axes
+                    # the deduper consults. ``func_name`` (the raw
+                    # provider name) is preserved only for log /
+                    # diagnostic call sites below; never written to the
+                    # output.
+                    identity_key = getattr(func, "identity_key", None)
+                    comment = getattr(func, "comment", None)
+                    canonical_name = canonical_function_name(
+                        func_name, comment, identity_key
+                    )
+                    if prev_func_name == canonical_name:
                         occurence += 1
                     else:
                         occurence = 0
@@ -350,11 +363,13 @@ def main_loop(
                     # ``is_duplicate=True`` ⇒ this function was already
                     # written (fold: no CSV row, no FDM record, no
                     # occurrence bump). Otherwise the row is written
-                    # with the raw ``func_name`` as column 0, with the
-                    # legacy ``occurrence`` column disambiguating
-                    # same-name distinct functions within one binary.
-                    identity_key = getattr(func, "identity_key", None)
-                    comment = getattr(func, "comment", None)
+                    # with the CANONICAL name as column 0 (so caller-side
+                    # metadata.name and callee-side function-definition
+                    # name are byte-identical for the downstream
+                    # function_lookup[(name, vkey)] resolver). The
+                    # legacy ``occurrence`` column still disambiguates
+                    # the body-divergence diagnostic case (same canonical
+                    # name + different body).
                     resolution = function_deduper.resolve(
                         func_name, comment, identity_key, tokens_base64
                     )
@@ -367,7 +382,7 @@ def main_loop(
                         # entries). When ``occurence`` was reset to 0
                         # for a first-seen name, the rollback restores
                         # the prev_func_name sentinel.
-                        if prev_func_name == func_name:
+                        if prev_func_name == canonical_name:
                             occurence -= 1
                         continue
                     if resolution.body_divergence_warning:
@@ -393,7 +408,7 @@ def main_loop(
                         metadata_cell = str(repr(meta_result))
 
                     row = [
-                        func_name,
+                        canonical_name,
                         occurence,
                         tokens_base64,
                         block_base64,
@@ -402,7 +417,7 @@ def main_loop(
                     ]
 
                     writer.writerow(row)
-                    prev_func_name = func_name
+                    prev_func_name = canonical_name
 
                     if i & 16383 == 16383:
                         save_vocabulary(vocab_manager, writer)

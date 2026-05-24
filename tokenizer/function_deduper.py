@@ -61,8 +61,125 @@ correctly.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Hashable, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Canonical name derivation
+# ---------------------------------------------------------------------------
+# The deduper's three identity axes (``name``, ``comment``, ``identity_key``)
+# are the SAME inputs from which the final on-disk function name must be
+# derived. The helper below collapses them into one deterministic string,
+# so EVERY caller that needs a final function name (the FDM, the metadata
+# lookup, any inspector) calls one function and gets one answer.
+#
+# Cross-ISA stability follows directly: the demangled C++ comment and the
+# thunked-entry-offset identity_key are ISA-invariant by construction
+# (the demangler emits the same signature for the same source-level symbol
+# regardless of ISA; the thunked-function entry offset is the resolved
+# external's address, identical across all trampoline slots that resolve
+# to it AND identical across ISA-variant re-disassemblies of the same
+# external).
+#
+# Sanitisation rule:
+# - The comment is the C++ signature in human-readable form (e.g.
+#   ``ARPHeader::storeRecvData(unsigned char const*, unsigned int)``).
+#   We KEEP it readable; opaque hashes are awful to debug.
+# - Whitespace runs collapse to a single ``_``.
+# - Characters outside ``[A-Za-z0-9_.:<>()*&]`` get replaced with ``_``
+#   (so commas, slashes, quotes, newlines can never end up in a CSV cell
+#   or a sidecar line that callers expect to be one record).
+# - Pathologically long suffixes (>200 chars after sanitisation) get
+#   truncated to a 192-char prefix + ``~<sha1[:7]>`` so they still fit
+#   in CSV cells and filesystem path components.
+_CANONICAL_SUFFIX_LEN_CAP = 200
+_CANONICAL_SUFFIX_TRUNC_PREFIX = 192
+_ALLOWED_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "_.:<>()*&"
+)
+
+
+def _sanitize_comment_suffix(comment: str) -> str:
+    """Convert a comment string to a CSV/filename-safe suffix.
+
+    The sanitisation rule is intentionally permissive on characters that
+    appear naturally in C++ signatures (``::``, ``<>``, ``()``, ``*``,
+    ``&``) so the suffix stays readable. Whitespace runs collapse to a
+    single ``_``; everything else outside the allow-list also becomes
+    ``_``. The result never contains characters that would corrupt a
+    CSV cell, a sidecar line, or a filesystem path component (no
+    commas, no newlines, no slashes, no quotes).
+    """
+    # Per-char replacement: allow-listed survives, everything else
+    # (whitespace, punctuation, commas, quotes, slashes) maps to ``_``.
+    # Runs of replacement underscores then collapse to a single ``_`` so
+    # the suffix doesn't carry decorative ``__`` clusters from common
+    # ``, `` (comma-space) shapes in demangled signatures.
+    collapsed_chars: list[str] = []
+    in_underscore_run = False
+    for ch in comment:
+        if ch in _ALLOWED_CHARS:
+            collapsed_chars.append(ch)
+            in_underscore_run = False
+        else:
+            if not in_underscore_run:
+                collapsed_chars.append("_")
+                in_underscore_run = True
+    suffix = "".join(collapsed_chars)
+    # Strip leading/trailing underscores so the suffix doesn't end with a
+    # placeholder character; the demangled signature usually starts with
+    # the qualified scope (``Class::method``) so this is rarely needed,
+    # but it keeps the output tidy when the comment had leading whitespace.
+    suffix = suffix.strip("_")
+    if len(suffix) > _CANONICAL_SUFFIX_LEN_CAP:
+        digest = hashlib.sha1(comment.encode("utf-8", errors="replace")).hexdigest()[:7]
+        suffix = f"{suffix[:_CANONICAL_SUFFIX_TRUNC_PREFIX]}~{digest}"
+    return suffix
+
+
+def canonical_function_name(
+    name: str,
+    comment: Optional[str],
+    identity_key: Optional[Hashable],
+) -> str:
+    """Produce the final on-disk function name from the three identity axes.
+
+    Deterministic + cross-ISA-stable:
+
+    * ``comment`` populated -> ``f"{name}@{sanitised_comment}"``. C++
+      demangled signatures collide on unqualified ``name`` (e.g.
+      ``ARPHeader::reset`` vs ``EthernetHeader::reset`` both surface as
+      Ghidra ``Function``s with ``name=='reset'``); the demangled
+      signature is the natural cross-ISA-stable disambiguator.
+    * ``comment`` is None AND ``identity_key`` populated ->
+      ``f"{name}@thunk:{identity_key}"``. PLT thunks share the resolved
+      external's name; the resolved-entry-offset
+      (``Function.getThunkedFunction(True).getEntryPoint().getOffset()``)
+      is the cross-ISA-stable identity.
+    * Both None -> ``name`` verbatim. The deduper's body-divergence
+      diagnostic and the FDM's positional ``_N`` allocator are the only
+      callers that touch this branch's downstream disambiguation (which
+      is genuinely positional / per-binary, NOT cross-ISA-stable; the
+      provider had no axes to assert otherwise).
+
+    The output is safe for CSV cells, file paths, and the function-names
+    sidecar (no commas, no newlines, no slashes, no quotes). Empty
+    ``comment`` strings are treated as ``None`` so providers can pass
+    ``""`` interchangeably with ``None``.
+    """
+    if comment == "":
+        comment = None
+    if comment is not None:
+        suffix = _sanitize_comment_suffix(comment)
+        return f"{name}@{suffix}"
+    if identity_key is not None:
+        return f"{name}@thunk:{identity_key}"
+    return name
 
 
 @dataclass(frozen=True)
@@ -179,4 +296,4 @@ class FunctionDeduper:
         )
 
 
-__all__ = ("DedupResolution", "FunctionDeduper")
+__all__ = ("DedupResolution", "FunctionDeduper", "canonical_function_name")
