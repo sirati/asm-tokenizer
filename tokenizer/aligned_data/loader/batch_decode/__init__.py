@@ -19,7 +19,7 @@ Re-exports:
 
 from __future__ import annotations
 
-from ._entry import batch_decode
+from ._entry import PendingBatchDecode, batch_decode
 from ._types import (
     BatchDecodeResult,
     SectionPointerSpec,
@@ -28,6 +28,7 @@ from ._types import (
 
 __all__ = [
     "BatchDecodeResult",
+    "PendingBatchDecode",
     "SectionPointerSpec",
     "VariantPadding",
     "batch_decode",
