@@ -12,6 +12,11 @@ from __future__ import annotations
 
 from ._length_compute import compute_reduced_lengths
 from ._modes import parse_reduction
+from ._reader import SortedIndexReader, discover_indices
+from ._sampler import (
+    MultiBinarySortedIndexSampler,
+    open_length_bucketed_batch,
+)
 from ._types import (
     LengthReduction,
     MultiBinaryBatchDecodeResult,
@@ -24,9 +29,13 @@ __all__ = [
     "LengthReduction",
     "MultiBinaryBatchDecodeResult",
     "MultiBinarySectionPointer",
+    "MultiBinarySortedIndexSampler",
     "ReductionKind",
+    "SortedIndexReader",
     "compute_reduced_lengths",
+    "discover_indices",
     "encode_sorted_index",
+    "open_length_bucketed_batch",
     "parse_header",
     "parse_reduction",
 ]
