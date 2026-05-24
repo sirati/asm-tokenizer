@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from .extern_providers_loader import load_extern_providers
 from .function_data import FunctionData
 from .function_names_loader import load_function_names
 from .matched_function import MatchedFunction
@@ -85,12 +86,18 @@ class BinaryDataset:
         # pointing message via ``load_function_names``. The all-arms-
         # empty path skips it to keep the loader usable on a brand-
         # new (empty) output dir.
+        #
+        # Extern-providers sidecar is loaded under the same condition:
+        # memmap_builder writes both sidecars in lockstep, so either-
+        # arm-exists implies both files exist (or both raise).
         if self.matched_index.exists() or self.unmatched_index.exists():
             self.name_to_line, self.line_to_name = load_function_names(
                 self.function_names_sidecar
             )
+            self.line_to_provider = load_extern_providers(self.extern_providers)
         else:
             self.name_to_line, self.line_to_name = {}, {}
+            self.line_to_provider = {}
 
         # Build both section arms via the shared dispatch (single
         # implementation in ``metadata_loader``). The matched-arm
@@ -187,6 +194,7 @@ class BinaryDataset:
                 "offset_to_filename": self._offset_to_filename,
                 "line_to_name": self.line_to_name,
                 "name_to_line": self.name_to_line,
+                "line_to_provider": self.line_to_provider,
             },
         )
 
