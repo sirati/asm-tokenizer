@@ -1,24 +1,37 @@
 """Argparse spec + binary auto-detection.
 
 Single concern: produce a fully-resolved :class:`argparse.Namespace`
-ready for the runner. The only filesystem touch is the per-binary
-sidecar glob backing ``--binary`` auto-detection — every other concern
-(opening files, building the session, rendering) lives elsewhere.
+ready for the runner. The only filesystem touch is the per-source
+discovery glob backing ``--binary`` auto-detection -- every other
+concern (opening files, building the session, rendering) lives
+elsewhere.
 
-The auto-detect anchor is ``<binary>_function_names.txt``: every binary
-in a memmap directory has exactly one such sidecar (the function-names
-registry), so ``glob('*_function_names.txt')`` yields one entry per
-binary in the directory. Anchoring on this file rather than e.g.
-``_sections.bin`` keeps the detection robust against the empty-arm
-edge case where one of the data bins might be absent.
+Two mutually exclusive input sources are supported:
+
+* ``--memmap-dir`` -- per-binary memmap artefacts (sections.bin,
+  data.bin, ...). The auto-detect anchor is
+  ``<binary>_function_names.txt``: every binary in a memmap directory
+  has exactly one such sidecar (the function-names registry).
+* ``--csv-dir`` -- per-variant ``<base>_output.csv`` files. The
+  auto-detect anchor is :func:`VariantInfo.from_csv`'s ``pkg`` field:
+  every CSV's filename encodes the binary name as the ``pkg`` axis.
+
+Anchoring on those files rather than e.g. ``_sections.bin`` keeps
+detection robust against the empty-arm edge case where one of the data
+bins might be absent (memmap mode), and against accidental cross-binary
+CSV mixing (csv mode).
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import List
 
-# Sidecar suffix carried by every binary; see
+from tokenizer.variant_info import VariantInfo
+
+
+# Sidecar suffix carried by every binary in memmap mode; see
 # :mod:`tokenizer.aligned_data.loader.function_names_loader`.
 _FUNCTION_NAMES_SUFFIX = "_function_names.txt"
 
@@ -34,20 +47,31 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m tokenizer.inspector",
         description=(
             "Interactive inspector for batch_decode results: opens a "
-            "BinarySession against a memmap directory and (in later "
-            "phases) renders a navigable tree of matched functions, "
-            "their variants, blocks, and inline calls."
+            "per-binary backend (memmap or FTL-CSV) and renders a "
+            "navigable tree of matched functions, their variants, "
+            "blocks, and inline calls."
         ),
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--memmap-dir",
-        required=True,
         type=Path,
         metavar="PATH",
         help=(
             "Directory containing the per-binary memmap artefacts "
             "(*_sections.bin, *_data.bin, *_variants.bin, "
-            "*_function_names.txt, unified_vocab.csv)."
+            "*_function_names.txt, unified_vocab.csv). Mutually "
+            "exclusive with --csv-dir."
+        ),
+    )
+    source.add_argument(
+        "--csv-dir",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Directory containing per-variant <base>_output.csv "
+            "files (flat or nested layout). Mutually exclusive with "
+            "--memmap-dir."
         ),
     )
     parser.add_argument(
@@ -55,17 +79,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="NAME",
         help=(
-            "Name of the binary to inspect (the prefix used in the "
-            "per-binary sidecars, e.g. 'nmap' for 'nmap_sections.bin'). "
-            "Omit to auto-detect when exactly one binary lives in "
-            "--memmap-dir."
+            "Name of the binary to inspect. In memmap mode this is "
+            "the prefix used in per-binary sidecars (e.g. 'nmap' for "
+            "'nmap_sections.bin'). In csv mode it is the ``pkg`` "
+            "field of each variant CSV. Omit to auto-detect when "
+            "exactly one binary lives in the chosen source directory."
         ),
     )
     return parser
 
 
-def discover_binaries(memmap_dir: Path) -> list[str]:
-    """List binary names present in ``memmap_dir``.
+# ---------------------------------------------------------------------------
+# Discovery helpers
+# ---------------------------------------------------------------------------
+
+
+def discover_binaries(memmap_dir: Path) -> List[str]:
+    """List binary names present in a memmap ``memmap_dir``.
 
     The anchor is the function-names sidecar (one per binary); names
     are the prefix before ``_function_names.txt`` in sorted order so
@@ -82,16 +112,45 @@ def discover_binaries(memmap_dir: Path) -> list[str]:
     return names
 
 
-def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
-    """Return the binary name to open.
+def discover_binaries_csv(csv_dir: Path) -> List[str]:
+    """List binary names present in a CSV ``csv_dir``.
 
-    Validates both user-facing flags at the CLI boundary: the
-    ``memmap_dir`` must exist, and when ``requested`` is given its
-    function-names sidecar must exist (otherwise the loader silently
-    yields a zero-match session, masking typos). When ``requested``
-    is omitted, scan ``memmap_dir`` for binaries and require exactly
-    one; zero or multiple is a user error reported via
-    :class:`SystemExit` with a candidate list.
+    Recursively globs ``*_output.csv`` so both the flat (memmap-builder
+    input) and nested (tokenize-worker output) layouts are covered;
+    derives the ``pkg`` field via :func:`VariantInfo.from_csv` per
+    audit F-MED-13 (no parallel filename parser). CSVs whose
+    ``VariantInfo`` cannot be derived (malformed filename, missing
+    sidecar fallback) are silently skipped so a single malformed file
+    does not poison auto-detect; if no usable CSV survives the caller
+    surfaces a fail-loud error.
+    """
+    if not csv_dir.is_dir():
+        return []
+    names: set[str] = set()
+    for path in csv_dir.rglob("*_output.csv"):
+        if not path.is_file():
+            continue
+        try:
+            info = VariantInfo.from_csv(path)
+        except ValueError:
+            continue
+        names.add(info.pkg)
+    return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# Per-source binary resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_binary_memmap(memmap_dir: Path, requested: str | None) -> str:
+    """Memmap-side ``--binary`` resolution.
+
+    Validates the directory exists and -- when ``requested`` is given
+    -- that its function-names sidecar is on disk (otherwise the
+    loader silently yields a zero-match session, masking typos). When
+    ``requested`` is omitted, requires exactly one binary; zero or
+    multiple is a user error with a candidate list.
     """
     if not memmap_dir.is_dir():
         raise SystemExit(f"memmap directory not found: {memmap_dir}")
@@ -121,9 +180,60 @@ def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
     )
 
 
+def _resolve_binary_csv(csv_dir: Path, requested: str | None) -> str:
+    """CSV-side ``--binary`` resolution.
+
+    Mirrors :func:`_resolve_binary_memmap`: directory must exist;
+    when ``requested`` is given, at least one CSV must report a
+    matching ``pkg``; when omitted, exactly one distinct ``pkg``
+    must be present.
+    """
+    if not csv_dir.is_dir():
+        raise SystemExit(f"csv directory not found: {csv_dir}")
+    candidates = discover_binaries_csv(csv_dir)
+    if requested:
+        if requested not in candidates:
+            raise SystemExit(
+                f"binary {requested!r} not found in {csv_dir}; "
+                f"available (from VariantInfo.pkg): {candidates}."
+            )
+        return requested
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise SystemExit(
+            f"--binary not given and no binaries detected in "
+            f"{csv_dir} (looked for *_output.csv recursively)."
+        )
+    listing = ", ".join(candidates)
+    raise SystemExit(
+        f"--binary not given and {csv_dir} contains multiple "
+        f"binaries; pass --binary <name> to pick one. "
+        f"Candidates: {listing}."
+    )
+
+
+# Public name kept for backwards compat (used by tests + older callers).
+def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
+    """Memmap-side resolver (backwards-compat alias)."""
+    return _resolve_binary_memmap(memmap_dir, requested)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse + resolve. Returns a namespace whose ``binary`` is set."""
+    """Parse + resolve. Returns a namespace whose ``binary`` is set.
+
+    The mutex group guarantees exactly one of ``ns.memmap_dir`` /
+    ``ns.csv_dir`` is non-``None``; the per-source resolver is
+    selected off whichever one is set.
+    """
     parser = build_parser()
     ns = parser.parse_args(argv)
-    ns.binary = resolve_binary(ns.memmap_dir, ns.binary)
+    if ns.memmap_dir is not None:
+        ns.binary = _resolve_binary_memmap(ns.memmap_dir, ns.binary)
+    else:
+        assert ns.csv_dir is not None, (
+            "argparse mutex group should guarantee csv_dir is set when "
+            "memmap_dir is not"
+        )
+        ns.binary = _resolve_binary_csv(ns.csv_dir, ns.binary)
     return ns
