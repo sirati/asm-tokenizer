@@ -37,7 +37,6 @@ these line items is :mod:`tokenizer.inspector._tree_model`'s job.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 
 import numpy as np
@@ -62,7 +61,6 @@ __all__ = [
     "AsmLine",
     "InlineCallEntry",
     "InlineJumpEntry",
-    "KindLabel",
     "LineItem",
     "render_block",
 ]
@@ -71,40 +69,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Typed line items (public API consumed by ``_tree_model``)
 # ---------------------------------------------------------------------------
-
-
-class KindLabel(Enum):
-    """Rendering-label discriminator for inline call entries.
-
-    The values mirror the literal strings used in the plan's mockup
-    (``call local function K`` / ``call plt function K`` /
-    ``call ext function K``); :func:`from_call_target_type` is the
-    sole bridge between the codebase's typed
-    :class:`CallTargetType` (LOCAL/PLT/EXTERN) and this rendering
-    label. Distinct from :class:`CallTargetType` because the latter
-    is wire-format with fixed integer values; this enum is a
-    presentation concern.
-    """
-
-    LOCAL = "local"
-    PLT = "plt"
-    EXT = "ext"
-
-    @classmethod
-    def from_call_target_type(cls, call_type: CallTargetType) -> "KindLabel":
-        """Translate the codebase's typed ``CallTargetType`` to the label.
-
-        Closed enum dispatch -- new ``CallTargetType`` members fail
-        loud here rather than silently rendering as the default.
-        """
-        return _CALL_TARGET_TYPE_TO_KIND[call_type]
-
-
-_CALL_TARGET_TYPE_TO_KIND: dict[CallTargetType, KindLabel] = {
-    CallTargetType.LOCAL: KindLabel.LOCAL,
-    CallTargetType.PLT: KindLabel.PLT,
-    CallTargetType.EXTERN: KindLabel.EXT,
-}
 
 
 @dataclass(frozen=True)
@@ -130,13 +94,23 @@ class InlineCallEntry:
     :data:`MISSING_VARIANT_INDEX` when no per_call_entry exists
     (EXTERN) or when the callee section is reachable but lacks a
     variant matching the caller's vkey.
+
+    ``kind`` is the canonical wire-format
+    :class:`~tokenizer.aligned_data.call_target_type.CallTargetType`
+    enum (LOCAL/PLT/EXTERN); the rendering layer
+    (:mod:`tokenizer.inspector._label`) routes its per-kind label
+    word off this same enum so no string-typed discriminator crosses
+    this boundary. ``provider`` is the library / sidecar name
+    appended after ``@`` for EXTERN rows; ``None`` for LOCAL/PLT
+    and for EXTERN rows whose provider is unknown.
     """
 
-    kind: KindLabel
+    kind: CallTargetType
     counter_id: int
     callee_name: str
     callee_section_pointer: Optional[tuple[SectionKind, int]]
     variant_idx: int
+    provider: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -154,7 +128,7 @@ LineItem = Union[AsmLine, InlineCallEntry, InlineJumpEntry]
 # ---------------------------------------------------------------------------
 
 
-def _kind_to_called_idx(section: Section) -> dict[KindLabel, list[int]]:
+def _kind_to_called_idx(section: Section) -> dict[CallTargetType, list[int]]:
     """Per-kind index lists into ``section.call_targets``.
 
     The matched-sections writer concatenates call_targets in
@@ -167,9 +141,11 @@ def _kind_to_called_idx(section: Section) -> dict[KindLabel, list[int]]:
     ``counter_id`` from a LOCAL/PLT/EXT_FUNC token maps directly to
     ``section.call_targets[kind_to_idx[kind][counter_id]]``.
     """
-    kind_to_idx: dict[KindLabel, list[int]] = {k: [] for k in KindLabel}
+    kind_to_idx: dict[CallTargetType, list[int]] = {
+        k: [] for k in CallTargetType
+    }
     for called_idx, ct in enumerate(section.call_targets):
-        kind_to_idx[KindLabel.from_call_target_type(ct.type)].append(called_idx)
+        kind_to_idx[ct.type].append(called_idx)
     return kind_to_idx
 
 
@@ -195,10 +171,10 @@ def _variant_index_for_called_idx(variant_block: VariantBlock) -> dict[int, int]
 # ---------------------------------------------------------------------------
 
 
-_CALL_TOKEN_TYPES: dict[TokenType, KindLabel] = {
-    TokenType.LOCAL_FUNC: KindLabel.LOCAL,
-    TokenType.PLT_FUNC: KindLabel.PLT,
-    TokenType.EXT_FUNC: KindLabel.EXT,
+_CALL_TOKEN_TYPES: dict[TokenType, CallTargetType] = {
+    TokenType.LOCAL_FUNC: CallTargetType.LOCAL,
+    TokenType.PLT_FUNC: CallTargetType.PLT,
+    TokenType.EXT_FUNC: CallTargetType.EXTERN,
 }
 
 
@@ -207,10 +183,10 @@ _JUMP_TOKEN_TYPES: frozenset[TokenType] = frozenset({TokenType.BLOCK_V2})
 
 def _emit_call_entry(
     *,
-    kind: KindLabel,
+    kind: CallTargetType,
     counter_id: int,
     section: Section,
-    kind_to_called_idx: Mapping[KindLabel, list[int]],
+    kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     arm: SectionKind,
     callee_arm_resolver,
@@ -219,11 +195,18 @@ def _emit_call_entry(
     """Build one :class:`InlineCallEntry` from a call-site token.
 
     All branches go through ONE typed dispatch: ``kind`` (a
-    :class:`KindLabel`) drives lookups via dicts (``kind_to_called_idx``
-    + ``variant_pins``) -- no per-kind ``if/elif`` chains. EXT vs
-    LOCAL/PLT pointer-resolution differs ONLY in whether the
-    arm resolver yields a section; that single ``Optional`` flows
-    straight into ``callee_section_pointer``.
+    :class:`CallTargetType`) drives lookups via dicts
+    (``kind_to_called_idx`` + ``variant_pins``) -- no per-kind
+    ``if/elif`` chains. EXT vs LOCAL/PLT pointer-resolution differs
+    ONLY in whether the arm resolver yields a section; that single
+    ``Optional`` flows straight into ``callee_section_pointer``.
+
+    ``provider`` is left ``None`` here: for EXTERN call_targets the
+    library name is keyed by ``CallTarget.function_section_ptr`` into
+    the per-binary ``<binary>_extern_providers.txt`` sidecar, which is
+    not currently threaded into the render layer. The label layer
+    falls back to ``"?"`` on a ``None`` provider so the EXTERN row's
+    ``@?`` suffix shape is preserved until the sidecar is wired in.
     """
     called_idxs = kind_to_called_idx[kind]
     if 0 <= counter_id < len(called_idxs):
@@ -247,6 +230,7 @@ def _emit_call_entry(
         callee_name=callee_name,
         callee_section_pointer=callee_section_pointer,
         variant_idx=variant_idx,
+        provider=None,
     )
 
 
@@ -277,6 +261,7 @@ def render_block(
     block_idx: int,
     *,
     arm: SectionKind,
+    batch_row_idx: int,
     vocab_manager: "VocabularyManager",
     fid_sidecar: Optional[np.ndarray],
     fid_row_offsets: Optional[np.ndarray],
@@ -301,11 +286,12 @@ def render_block(
     :meth:`FunctionTokenList.reconstruct_func_from_raw_bytes` is
     non-functional without one (the spec omits it from the signature
     but the caller threads it from the session anyway).
-    ``fid_sidecar`` / ``fid_row_offsets`` are accepted per the spec
-    but unused here -- the per-function pre-remap path via
+    ``batch_row_idx`` / ``fid_sidecar`` / ``fid_row_offsets`` are
+    threaded in for forward-compatibility with the FID-sidecar-based
+    name-resolution path; currently unused here because the per-
+    function pre-remap path via
     ``section.call_targets[i].function_name_ptr -> line_to_name``
-    resolves callee names; the sidecar is the batch-row post-remap
-    path used by the tree model.
+    resolves callee names directly.
     """
     # Stage 1: build the FunctionTokenList view over the raw FunctionData.
     # ``reconstruct_func_from_raw_bytes`` is the existing single-place
@@ -366,7 +352,7 @@ def _walk_block_instructions(
     *,
     arm: SectionKind,
     section: Section,
-    kind_to_called_idx: Mapping[KindLabel, list[int]],
+    kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
     callee_arm_resolver,
@@ -391,7 +377,7 @@ def _emit_inline_entries(
     *,
     arm: SectionKind,
     section: Section,
-    kind_to_called_idx: Mapping[KindLabel, list[int]],
+    kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
     callee_arm_resolver,

@@ -30,15 +30,16 @@ from typing import TYPE_CHECKING, Mapping, Optional, Tuple
 
 import numpy as np
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode import batch_decode
-from tokenizer.aligned_data.loader.batch_decode._types import (
-    BatchDecodeResult,
-    SectionPointerSpec,
-)
+from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 
 
 if TYPE_CHECKING:
+    from tokenizer.aligned_data.loader.batch_decode._types import (
+        BatchDecodeResult,
+    )
     from tokenizer.aligned_data.loader.function_data import FunctionData
     from tokenizer.aligned_data.loader.session import BinarySession
     from tokenizer.aligned_data.matched_sections_bin import Section, VariantBlock
@@ -68,9 +69,13 @@ class DecodeContext:
     """Per-FunctionNode batch-decode context threaded to descendants.
 
     Lifetime equals the parent FunctionNode's ``BatchDecodeResult``;
-    holds only plain references to numpy views + mappings.
+    holds only plain references to numpy views + mappings, plus the
+    section-arm tag (:class:`SectionKind`) so descendant render calls
+    that consult ``callee_arm_resolver(call_target, arm)`` have the
+    parent's arm without re-deriving it.
     """
 
+    arm: SectionKind
     fid_sidecar: Optional[np.ndarray]
     fid_row_offsets: Optional[np.ndarray]
     line_to_name: Mapping[int, str]
@@ -139,15 +144,6 @@ def _context_len_for_variants(variants_lengths: list[int]) -> int:
     return max(longest + 64, 64)
 
 
-def _arm_to_section_kind(arm: str) -> SectionKind:
-    """Translate the inspector's string arm tag to the loader enum."""
-    if arm == "matched":
-        return SectionKind.MATCHED
-    if arm == "unmatched":
-        return SectionKind.UNMATCHED
-    raise ValueError(f"unknown arm: {arm!r}")
-
-
 def _build_variants_from_result(
     result: BatchDecodeResult,
     section_index_in_result: int,
@@ -199,32 +195,26 @@ def _build_variants_from_result(
 def _session_line_to_name(
     session: Optional["BinarySession"],
 ) -> Mapping[int, str]:
-    """Extract ``line_to_name`` from a session's metadata bag (attr-
-    or dict-shaped). Empty mapping when absent — name resolution then
-    falls back to ``"?"`` per plan D4.
+    """Extract ``line_to_name`` from a session via its public metadata
+    accessor. Empty mapping when absent — name resolution then falls
+    back to ``"?"`` per plan D4.
     """
     if session is None:
         return {}
-    meta = getattr(session, "_metadata", None)
-    if meta is None:
-        return {}
-    if hasattr(meta, "line_to_name"):
-        return getattr(meta, "line_to_name") or {}
-    if isinstance(meta, dict):
-        return meta.get("line_to_name") or {}
-    return {}
+    return session.get_metadata("line_to_name") or {}
 
 
 @dataclass(frozen=True)
 class FunctionNode:
     """Top-level node: one per matched function (plan D3).
 
-    ``arm`` carries the forward-compat tag ("matched" / "unmatched");
-    only matched is currently seeded by the UI but unmatched works the
-    same way once D3 relaxes.
+    ``arm`` is the canonical
+    :class:`~tokenizer.aligned_data.loader.metadata_loader.SectionKind`
+    enum (MATCHED / UNMATCHED); only MATCHED is currently seeded by
+    the UI but UNMATCHED works the same way once D3 relaxes.
     """
 
-    arm: str  # "matched" or "unmatched"
+    arm: SectionKind
     idx: int
     name: str  # resolved by caller via line_to_name
     is_failed: bool = False
@@ -244,8 +234,7 @@ class FunctionNode:
         # Peek the section via the public load_* APIs to size
         # ``num_variants_per_section`` (real variant count, plan D2)
         # and ``context_len`` (longest variant body's token count).
-        kind = _arm_to_section_kind(self.arm)
-        if kind is SectionKind.MATCHED:
+        if self.arm is SectionKind.MATCHED:
             matched = session.load_matched(self.idx)
             variant_lengths = [len(v.tokens) for v in matched.variants]
             n_variants = len(matched.variants)
@@ -256,10 +245,10 @@ class FunctionNode:
 
         if n_variants == 0:
             raise RuntimeError(
-                f"function arm={self.arm!r} idx={self.idx} has no variants"
+                f"function arm={self.arm.name} idx={self.idx} has no variants"
             )
 
-        spec = SectionPointerSpec(arm=kind, idx=self.idx)
+        spec = SectionPointerSpec(arm=self.arm, idx=self.idx)
         result = batch_decode(
             session,
             [spec],
@@ -270,6 +259,7 @@ class FunctionNode:
             keep_intermediate=True,
         )
         decode_context = DecodeContext(
+            arm=self.arm,
             fid_sidecar=result.fid_sidecar,
             fid_row_offsets=result.fid_row_offsets,
             line_to_name=_session_line_to_name(session),
@@ -391,6 +381,7 @@ def _expand_block_body(block: "BlockNode") -> list["Node"]:
         block.section,
         block.variant_block,
         block.block_idx,
+        arm=block.decode_context.arm,
         fid_sidecar=block.decode_context.fid_sidecar,
         fid_row_offsets=block.decode_context.fid_row_offsets,
         line_to_name=block.decode_context.line_to_name,
@@ -410,6 +401,7 @@ def _expand_block_body(block: "BlockNode") -> list["Node"]:
                     callee_name=item.callee_name,
                     callee_section_pointer=item.callee_section_pointer,
                     variant_idx=item.variant_idx,
+                    provider=item.provider,
                     decode_context=block.decode_context,
                 )
             )
@@ -437,17 +429,26 @@ class InlineCallNode:
     """Inline call from a block to another function.
 
     Expandable only when the callee is a local matched function with
-    an addressable section pointer; PLT / EXT have no body to inline.
-    Expansion fires a fresh ``batch_decode`` for the callee per plan
-    D2 and surfaces the variant matching the caller's per-call entry,
-    plus a :class:`ShowAllVariantsNode` sibling for the others.
+    an addressable section pointer; PLT / EXTERN have no body to
+    inline. Expansion fires a fresh ``batch_decode`` for the callee
+    per plan D2 and surfaces the variant matching the caller's
+    per-call entry, plus a :class:`ShowAllVariantsNode` sibling for
+    the others.
+
+    ``kind`` is the canonical
+    :class:`~tokenizer.aligned_data.call_target_type.CallTargetType`
+    enum (LOCAL / PLT / EXTERN). ``provider`` is the library /
+    sidecar name for the ``@<provider>`` suffix on EXTERN rows;
+    ``None`` for LOCAL / PLT and for EXTERN rows whose provider is
+    unknown.
     """
 
-    kind: str  # "local" | "plt" | "ext"
+    kind: CallTargetType
     counter_id: int
     callee_name: str
-    callee_section_pointer: Optional[Tuple[str, int]]
+    callee_section_pointer: Optional[Tuple[SectionKind, int]]
     variant_idx: int
+    provider: Optional[str]
     decode_context: DecodeContext
     is_failed: bool = False
 
@@ -455,7 +456,8 @@ class InlineCallNode:
     def can_expand(self) -> bool:
         # Single dispatch point; the UI gates the expand call on this.
         return (
-            self.kind == "local" and self.callee_section_pointer is not None
+            self.kind is CallTargetType.LOCAL
+            and self.callee_section_pointer is not None
         )
 
     def expand(
@@ -469,7 +471,7 @@ class InlineCallNode:
         if self.callee_section_pointer is None:
             raise RuntimeError(
                 "InlineCallNode.expand called on a non-expandable node "
-                f"(kind={self.kind!r}); UI should gate on can_expand."
+                f"(kind={self.kind.name}); UI should gate on can_expand."
             )
         arm, callee_idx = self.callee_section_pointer
         # Reuse FunctionNode.expand — the callee is inspected via the
@@ -519,15 +521,18 @@ def _find_matching_variant_index(
 def _variant_slot_in_section(variant: "VariantNode") -> int:
     """Slot index of ``variant.variant_block`` inside its section.
 
-    Linear scan; n_variants per section is small. Falls back to
-    ``variant_ref_offset`` equality when object identity fails (e.g.
-    rebuilt VariantBlock from a re-parse).
+    Object-identity scan; n_variants per section is small. The Phase 2
+    design has a single
+    :meth:`tokenizer.aligned_data.loader.session.BinarySession._parse_section_at`
+    parse per section per session, so every :class:`VariantBlock` in
+    play is the same object stored on ``section.variants`` -- identity
+    holds by construction. Returning ``-1`` on identity miss surfaces
+    as ``None`` from :func:`_find_matching_variant_index`, which
+    legitimately means "this variant_block doesn't belong to this
+    section" rather than a callable contract violation.
     """
     for i, vb in enumerate(variant.section.variants):
         if vb is variant.variant_block:
-            return i
-    for i, vb in enumerate(variant.section.variants):
-        if vb.variant_ref_offset == variant.variant_block.variant_ref_offset:
             return i
     return -1
 

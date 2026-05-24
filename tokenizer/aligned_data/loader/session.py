@@ -69,7 +69,8 @@ class BinarySession(_BinarySessionHelpersMixin):
     """Context manager bundling the three per-binary handles.
 
     ``metadata`` is a pre-loaded bag (built by ``metadata_loader``).
-    Accessed attribute-first, dict-fallback. Expected keys/attrs:
+    Accessed attribute-first, dict-fallback via :meth:`get_metadata`
+    (public accessor wrapping ``_meta_get``). Expected keys/attrs:
 
       * ``matched_arm``        -- SectionArm: ``.starts`` (per-variant
                                   data-bin offsets), ``.bin_starts`` /
@@ -481,3 +482,19 @@ class BinarySession(_BinarySessionHelpersMixin):
         if isinstance(self._metadata, dict):
             return self._metadata.get(key)
         return None
+
+    def get_metadata(self, key: str) -> Any:
+        """Public accessor for the session's metadata bag.
+
+        Returns the value stored at ``key`` -- attribute-first, with
+        ``dict`` fallback for the legacy dict-shaped metadata --
+        mirroring :meth:`_meta_get`. ``None`` when the key is absent
+        from both shapes, so callers needing a default substitute
+        ``session.get_metadata(k) or <default>``.
+
+        This is the single supported boundary for inspector / tooling
+        layers that need to read sidecar artefacts (``line_to_name``,
+        ``offset_to_filename``, etc.) without reaching into
+        ``self._metadata`` directly.
+        """
+        return self._meta_get(key)
