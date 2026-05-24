@@ -48,6 +48,11 @@ class TestApplyTruncationMarkerNoSpill:
             # 5. unmounted / zero-size viewport short-circuits to the
             #    identity passthrough even on a long label.
             ("x" * 200, 0, 0),
+            # 6. exact-boundary identity: cell-len == viewport_width +
+            #    scroll_x (100 == 80 + 20). The helper's check is ``<=``
+            #    so this case MUST stay marker-free; a regression to
+            #    ``<`` would flip it into a spill.
+            ("x" * 100, 80, 20),
         ],
     )
     def test_label_returned_unchanged(
@@ -72,6 +77,11 @@ class TestApplyTruncationMarkerSpill:
             # 4. scroll_x widens to cols 19..99; col 100 (the label's
             #    last char) is still off-screen, so the marker fires.
             ("x" * 100, 80, 19),
+            # 6. one cell past the exact boundary: cell-len ==
+            #    viewport_width + scroll_x + 1 (101 == 80 + 20 + 1).
+            #    Pins the inclusive-vs-exclusive edge of the ``<=``
+            #    check from the other side.
+            ("x" * 101, 80, 20),
         ],
     )
     def test_marker_appended(

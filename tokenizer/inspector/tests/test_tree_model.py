@@ -45,7 +45,7 @@ def _make_function_data(tokens_len: int = 8) -> SimpleNamespace:
     """
     return SimpleNamespace(
         tokens=np.zeros(tokens_len, dtype=np.uint16),
-        metadata={"arch": "x86", "compiler": "clang", "compiler_version": "8", "opt": "O3"},
+        metadata={"arch": "x86", "compiler": "clang", "compilerversion": "8", "opt": "O3"},
     )
 
 
