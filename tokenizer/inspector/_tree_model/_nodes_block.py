@@ -121,6 +121,7 @@ def _expand_block_body(
         kind_to_called_idx=variant_context.kind_to_called_idx,
         variant_pins=variant_context.variant_pins,
         line_to_name=decode_context.line_to_name,
+        line_to_provider=decode_context.line_to_provider,
         callee_arm_resolver=decode_context.callee_arm_resolver,
     )
 

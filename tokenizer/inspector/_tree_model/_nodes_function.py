@@ -17,7 +17,7 @@ from tokenizer.aligned_data.loader.batch_decode import batch_decode
 from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 
-from ._context import DecodeContext, session_line_to_name
+from ._context import DecodeContext, session_line_to_name, session_line_to_provider
 
 
 if TYPE_CHECKING:
@@ -182,6 +182,7 @@ class FunctionNode:
             fid_sidecar=result.fid_sidecar,
             fid_row_offsets=result.fid_row_offsets,
             line_to_name=session_line_to_name(session),
+            line_to_provider=session_line_to_provider(session),
             vocab_manager=vocab_manager,
             callee_arm_resolver=_build_callee_arm_resolver(session, self.arm),
         )

@@ -7,10 +7,10 @@ FunctionNode's :class:`BatchDecodeResult`; the dataclass holds only
 plain references to numpy views + mappings + a typed resolver
 callable.
 
-Also owns the session-side helper that fetches ``line_to_name`` off
-the public :class:`BinarySession.get_metadata` accessor -- a thin
-shim so the rest of the tree model never reaches into session
-internals.
+Also owns the session-side helpers that fetch ``line_to_name`` and
+``line_to_provider`` off the public
+:class:`BinarySession.get_metadata` accessor -- thin shims so the
+rest of the tree model never reaches into session internals.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DecodeContext",
     "session_line_to_name",
+    "session_line_to_provider",
 ]
 
 
@@ -54,6 +55,7 @@ class DecodeContext:
     fid_sidecar: np.ndarray | None
     fid_row_offsets: np.ndarray | None
     line_to_name: Mapping[int, str]
+    line_to_provider: Mapping[int, str]
     vocab_manager: "VocabularyManager"
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None]
 
@@ -67,3 +69,12 @@ def session_line_to_name(session: "BinarySession") -> Mapping[int, str]:
     contract violation rather than handle a real case.
     """
     return session.get_metadata("line_to_name") or {}
+
+
+def session_line_to_provider(session: "BinarySession") -> Mapping[int, str]:
+    """Extract ``line_to_provider`` from a session via its public
+    metadata accessor. Empty mapping when absent -- EXTERN rows then
+    fall back to ``@?`` per the inline-call label contract. Same
+    live-session UI contract as :func:`session_line_to_name`.
+    """
+    return session.get_metadata("line_to_provider") or {}

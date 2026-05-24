@@ -34,6 +34,11 @@ The caller threads in:
   ``<binary>_function_names.txt`` mapping, used to resolve the
   callee FID -> display name. Lives in
   :mod:`tokenizer.aligned_data.loader.function_names_loader`.
+* ``line_to_provider`` -- the per-binary
+  ``<binary>_extern_providers.txt`` mapping (1-indexed line ->
+  library / sidecar name), used to resolve an EXTERN call_target's
+  ``function_section_ptr`` to the ``@libname`` suffix. Lives in
+  :mod:`tokenizer.aligned_data.loader.extern_providers_loader`.
 * ``callee_arm_resolver`` -- closure that maps a section byte offset
   (``CallTarget.function_section_ptr``) to a
   :class:`SectionPointerSpec` or ``None`` when the offset doesn't
@@ -198,6 +203,29 @@ _CALL_TOKEN_TYPES: dict[TokenType, CallTargetType] = {
 _JUMP_TOKEN_TYPES: frozenset[TokenType] = frozenset({TokenType.BLOCK_V2})
 
 
+_EMPTY_PROVIDER_MAP: Mapping[int, str] = {}
+
+
+def _provider_sources(
+    line_to_provider: Mapping[int, str],
+) -> Mapping[CallTargetType, Mapping[int, str]]:
+    """Per-kind provider-mapping dispatch table.
+
+    EXTERN call_targets key into ``line_to_provider`` via
+    ``CallTarget.function_section_ptr`` (a 1-indexed line into the
+    extern-providers sidecar). LOCAL/PLT call_targets use that same
+    field as a section byte offset and have no library/provider, so
+    they map to an empty dict whose ``.get`` always yields ``None``.
+    Threading the empty dict instead of branching keeps the
+    ``_emit_call_entry`` body free of per-kind ``if`` chains.
+    """
+    return {
+        CallTargetType.LOCAL: _EMPTY_PROVIDER_MAP,
+        CallTargetType.PLT: _EMPTY_PROVIDER_MAP,
+        CallTargetType.EXTERN: line_to_provider,
+    }
+
+
 def _emit_call_entry(
     *,
     kind: CallTargetType,
@@ -207,28 +235,26 @@ def _emit_call_entry(
     variant_pins: Mapping[int, int],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
     line_to_name: Mapping[int, str],
+    kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
 ) -> InlineCallEntry:
     """Build one :class:`InlineCallEntry` from a call-site token.
 
     All branches go through ONE typed dispatch: ``kind`` (a
     :class:`CallTargetType`) drives lookups via dicts
-    (``kind_to_called_idx`` + ``variant_pins``) -- no per-kind
-    ``if/elif`` chains. EXT vs LOCAL/PLT pointer-resolution differs
-    ONLY in whether the arm resolver yields a section; that single
-    ``Optional`` flows straight into ``callee_section_pointer``.
+    (``kind_to_called_idx`` + ``variant_pins`` +
+    ``kind_to_provider_source``) -- no per-kind ``if/elif`` chains.
+    EXT vs LOCAL/PLT pointer-resolution differs ONLY in whether the
+    arm resolver yields a section; that single ``Optional`` flows
+    straight into ``callee_section_pointer``. EXT vs LOCAL/PLT
+    provider lookup differs ONLY in which mapping
+    ``kind_to_provider_source`` routes to (real sidecar mapping for
+    EXTERN, empty dict for LOCAL/PLT).
 
     An out-of-range ``counter_id`` for the kind raises
     :class:`IndexError` naturally from the list lookup -- the
     inspector is a diagnostic tool, surfacing a corrupt counter as a
     crash points at the encoder bug rather than papering over it with
     a ``"?"`` placeholder.
-
-    ``provider`` is left ``None`` here: for EXTERN call_targets the
-    library name is keyed by ``CallTarget.function_section_ptr`` into
-    the per-binary ``<binary>_extern_providers.txt`` sidecar, which is
-    not currently threaded into the render layer. The label layer
-    falls back to ``"?"`` on a ``None`` provider so the EXTERN row's
-    ``@?`` suffix shape is preserved until the sidecar is wired in.
     """
     called_idx = kind_to_called_idx[kind][counter_id]
     call_target = section.call_targets[called_idx]
@@ -237,6 +263,9 @@ def _emit_call_entry(
     )
     variant_idx = variant_pins.get(called_idx, MISSING_VARIANT_INDEX)
     callee_name = line_to_name.get(call_target.function_name_ptr, "?")
+    provider = kind_to_provider_source[kind].get(
+        int(call_target.function_section_ptr)
+    )
 
     return InlineCallEntry(
         kind=kind,
@@ -244,7 +273,7 @@ def _emit_call_entry(
         callee_name=callee_name,
         callee_section_pointer=callee_section_pointer,
         variant_idx=variant_idx,
-        provider=None,
+        provider=provider,
     )
 
 
@@ -260,6 +289,7 @@ def render_block(
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
+    line_to_provider: Mapping[int, str],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
 ) -> list[LineItem]:
     """Walk one block's instructions and emit typed line items.
@@ -285,6 +315,7 @@ def render_block(
             kind_to_called_idx=kind_to_called_idx,
             variant_pins=variant_pins,
             line_to_name=line_to_name,
+            kind_to_provider_source=_provider_sources(line_to_provider),
             callee_arm_resolver=callee_arm_resolver,
         )
     )
@@ -297,6 +328,7 @@ def _walk_block_instructions(
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
+    kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
 ) -> Iterable[LineItem]:
     """Per-instruction generator: one :class:`AsmLine` then any inline
@@ -309,6 +341,7 @@ def _walk_block_instructions(
             kind_to_called_idx=kind_to_called_idx,
             variant_pins=variant_pins,
             line_to_name=line_to_name,
+            kind_to_provider_source=kind_to_provider_source,
             callee_arm_resolver=callee_arm_resolver,
         )
 
@@ -320,6 +353,7 @@ def _emit_inline_entries(
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
+    kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
 ) -> Iterable[LineItem]:
     """Inline call/jump items for ONE instruction.
@@ -341,6 +375,7 @@ def _emit_inline_entries(
                 variant_pins=variant_pins,
                 callee_arm_resolver=callee_arm_resolver,
                 line_to_name=line_to_name,
+                kind_to_provider_source=kind_to_provider_source,
             )
             continue
         if token_type in _JUMP_TOKEN_TYPES:
