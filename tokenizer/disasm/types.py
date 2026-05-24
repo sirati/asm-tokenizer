@@ -476,6 +476,20 @@ class FunctionView(Protocol):
     # surface and returns ``None`` unconditionally (no merge, legacy
     # disambiguation).
 
+    @property
+    def comment(self) -> Optional[str]: ...
+    # Provider-supplied "context" string disambiguating same-named
+    # functions. For C++ symbols Ghidra surfaces the demangled scoped
+    # signature here (e.g. ``ARPHeader::reset(...)`` vs
+    # ``EthernetHeader::reset(...)`` — both ``name=="reset"`` Ghidra
+    # ``Function``s but distinct logical methods). Two functions are
+    # the SAME logical function only when ``name`` AND ``comment`` AND
+    # ``identity_key`` AND the emitted token body all match; the
+    # deduper consults this property as the second axis of identity.
+    # Returns ``None`` when no plate comment exists (the common case
+    # for C/asm symbols). The angr/Capstone path lacks the demangler
+    # hook and returns ``None`` unconditionally.
+
     def __deepcopy__(self, memo) -> "FunctionView": ...
 
 

@@ -712,6 +712,15 @@ class _AngrFunctionView:
         # contract in ``tokenizer/disasm/types.py``).
         return None
 
+    @property
+    def comment(self) -> Optional[str]:
+        # angr/Capstone has no demangler hook surfacing a per-function
+        # plate-comment context the way Ghidra's analysis does. The
+        # angr-backed view returns ``None`` unconditionally (see
+        # ``FunctionView.comment`` contract in
+        # ``tokenizer/disasm/types.py``).
+        return None
+
     def __deepcopy__(self, memo) -> "_AngrFunctionView":
         clone = _AngrFunctionView(self._arch)
         clone._set(self._func)

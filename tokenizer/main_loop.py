@@ -344,19 +344,21 @@ def main_loop(
                         filtered_count += 1
                         continue
 
-                    # Semantic-merge gate: same name + same provider-
-                    # supplied identity_key + same emitted token body
-                    # ⇒ this function is a duplicate of one already
-                    # written; fold it (no CSV row, no FDM record, no
-                    # occurrence bump). The legacy ``_N``-suffix /
-                    # ``occurrence`` disambiguator path still runs for
-                    # functions whose provider declines an identity
-                    # (``identity_key is None``) and for genuine
-                    # collisions where one of the three keys diverges.
+                    # Semantic-merge gate: the deduper consumes the
+                    # four-axis identity tuple ``(name, comment,
+                    # identity_key, body)`` and returns
+                    # ``is_duplicate=True`` ⇒ this function was already
+                    # written (fold: no CSV row, no FDM record, no
+                    # occurrence bump). Otherwise the row is written
+                    # with the raw ``func_name`` as column 0, with the
+                    # legacy ``occurrence`` column disambiguating
+                    # same-name distinct functions within one binary.
                     identity_key = getattr(func, "identity_key", None)
-                    if function_deduper.is_duplicate(
-                        func_name, identity_key, tokens_base64
-                    ):
+                    comment = getattr(func, "comment", None)
+                    resolution = function_deduper.resolve(
+                        func_name, comment, identity_key, tokens_base64
+                    )
+                    if resolution.is_duplicate:
                         # Roll back the occurrence bump performed above:
                         # the duplicate never reaches the writer, so the
                         # next same-name function should land at the
@@ -368,6 +370,15 @@ def main_loop(
                         if prev_func_name == func_name:
                             occurence -= 1
                         continue
+                    if resolution.body_divergence_warning:
+                        logger.warning(
+                            "Body-divergence under same identity tuple for "
+                            "%r (comment=%r, identity_key=%r); allocating "
+                            "fresh slot",
+                            func_name,
+                            comment,
+                            identity_key,
+                        )
 
                     if is_v2:
                         # v2 metadata column: JSON-serialized per-category
@@ -424,19 +435,20 @@ def main_loop(
                             # field is just the cell's content.
                             metadata_cell=metadata_cell,
                         )
-                        final_func_name = function_manager.add_function_data(
+                        fdm_final_name = function_manager.add_function_data(
                             func_name,
                             func_addr,
                             temp_bbs,
                             func_tokens,
                             function_data,
                             identity_key=identity_key,
+                            comment=comment,
                         )
 
-                        func_name_addr[final_func_name] = func_addr
-                        func_disas[final_func_name] = temp_bbs
-                        func_disas_token[final_func_name] = func_tokens
-                        func_names.append(final_func_name)
+                        func_name_addr[fdm_final_name] = func_addr
+                        func_disas[fdm_final_name] = temp_bbs
+                        func_disas_token[fdm_final_name] = func_tokens
+                        func_names.append(fdm_final_name)
                 except Exception as e:
                     logger.warning(
                         f"Error saving {func_name}: {e}.\n"
