@@ -58,6 +58,9 @@ class _GhidraFunctionView:
         "_name",
         "_block_count",
         "_identity_key",
+        "_identity_key_resolved",
+        "_comment",
+        "_comment_resolved",
         "_block_view",
         "_blocks_view",
     )
@@ -84,6 +87,9 @@ class _GhidraFunctionView:
         self._name: str = ""
         self._block_count: int = 0
         self._identity_key: Optional[Hashable] = None
+        self._identity_key_resolved: bool = False
+        self._comment: Optional[str] = None
+        self._comment_resolved: bool = False
         self._block_view = _GhidraBlockView(arch, program, listing, reg_map, decode, self)
         self._blocks_view = _GhidraBlocksView(self)
 
@@ -97,7 +103,13 @@ class _GhidraFunctionView:
         self._entry = int(ghidra_function.getEntryPoint().getOffset())
         self._name = str(ghidra_function.getName())
         self._block_count = block_count
-        self._identity_key = _ghidra_identity_key(ghidra_function)
+        # Lazy fields: compute on first property access. Reset the cache
+        # flags so the next access reruns _ghidra_identity_key /
+        # _ghidra_function_comment against the new backing function.
+        self._identity_key = None
+        self._identity_key_resolved = False
+        self._comment = None
+        self._comment_resolved = False
 
     def _iter_blocks(self) -> Iterator[_GhidraBlockView]:
         if self._ghidra_function is None:
@@ -132,7 +144,17 @@ class _GhidraFunctionView:
 
     @property
     def identity_key(self) -> Optional[Hashable]:
+        if not self._identity_key_resolved:
+            self._identity_key = _ghidra_identity_key(self._ghidra_function)
+            self._identity_key_resolved = True
         return self._identity_key
+
+    @property
+    def comment(self) -> Optional[str]:
+        if not self._comment_resolved:
+            self._comment = _ghidra_function_comment(self._ghidra_function)
+            self._comment_resolved = True
+        return self._comment
 
     def __deepcopy__(self, memo) -> "_GhidraFunctionView":
         clone = _GhidraFunctionView(
@@ -149,6 +171,9 @@ class _GhidraFunctionView:
         clone._name = self._name
         clone._block_count = self._block_count
         clone._identity_key = self._identity_key
+        clone._identity_key_resolved = self._identity_key_resolved
+        clone._comment = self._comment
+        clone._comment_resolved = self._comment_resolved
         return clone
 
 
@@ -187,5 +212,42 @@ def _ghidra_identity_key(ghidra_function: Any) -> Optional[Hashable]:
         return None
     try:
         return int(thunked.getEntryPoint().getOffset())
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Comment (plate-comment) extraction
+# ---------------------------------------------------------------------------
+def _ghidra_function_comment(ghidra_function: Any) -> Optional[str]:
+    """Return the function's plate comment (when set) or ``None``.
+
+    Implements the ``FunctionView.comment`` contract (see
+    ``tokenizer/disasm/types.py``): for C++ symbols Ghidra's demangler
+    populates the plate comment with the demangled scoped signature
+    (e.g. ``ARPHeader::storeRecvData(unsigned char const*, unsigned int)``).
+    That string is the natural context disambiguator when two distinct
+    methods share an unqualified name (``ARPHeader::reset`` vs
+    ``EthernetHeader::reset``). Returns ``None`` when no plate comment
+    is set (the common case for C / asm symbols and for any function
+    whose demangler entry the analysis did not run).
+
+    Resilient to partially-populated Ghidra programs: any exception
+    from the Java side is swallowed and the function falls back to
+    ``None``, preserving the legacy behaviour rather than crashing
+    the iter loop (matches the defensive pattern in
+    :func:`_ghidra_identity_key`).
+    """
+    get_comment = getattr(ghidra_function, "getComment", None)
+    if get_comment is None:
+        return None
+    try:
+        raw = get_comment()
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return str(raw)
     except Exception:
         return None

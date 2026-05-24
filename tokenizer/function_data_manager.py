@@ -2,12 +2,16 @@
 Optimized function data storage using fixed-size arrays for better performance.
 """
 
+import logging
+
 import numpy as np
 from typing import Any, Hashable, Iterator, Tuple, Optional, Dict, List
 from dataclasses import dataclass
 
 from .function_deduper import FunctionDeduper
 from .function_token_list import FunctionTokenList
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,23 +41,20 @@ class FunctionDataManager:
         self.total_functions = total_functions
         self.current_index = 0
 
-        # Hash map to track function name occurrences
+        # Hash map to track function name occurrences (legacy ``_N``
+        # suffix allocator).
         self.func_name_occurrences: Dict[str, int] = {}
 
-        # Access map: (func_name, occurrence_index) -> array_index
+        # Access map: (func_name, occurrence_index) -> array_index.
         self.access_map: Dict[Tuple[str, int], int] = {}
 
-        # Reverse lookup: (func_name, identity_key) -> final_func_name
-        # of the FIRST accepted record with that identity. A later call
-        # with the SAME (name, identity_key) AND matching content folds
-        # into that record and re-returns its final name.
-        self._identity_to_final: Dict[Tuple[str, Hashable], str] = {}
-
         # Semantic-merge gate (see :mod:`tokenizer.function_deduper`).
-        # When the gate reports a duplicate, ``add_function_data`` skips
-        # the allocation, leaves arrays + occurrence counters untouched,
-        # and returns the existing record's final name.
+        # The deduper exposes the four-axis fold decision via
+        # ``slot_id``; this side-table maps each ``slot_id`` to the
+        # canonical record's ``final_func_name`` so a folded duplicate
+        # re-returns the existing slot's name.
         self._deduper = FunctionDeduper()
+        self._slot_to_final_name: Dict[int, str] = {}
 
         # Pre-allocated arrays using numpy object arrays for complex types
         self.func_name_addr_array = np.empty(total_functions, dtype=object)
@@ -69,47 +70,58 @@ class FunctionDataManager:
         func_disas_token: Any,
         function_data: FunctionData,
         identity_key: Optional[Hashable] = None,
+        comment: Optional[str] = None,
     ) -> str:
         """
         Add all function data in one operation.
 
         Args:
-            func_name: Original function name
-            func_addr: Function address
-            func_disas: Function disassembly data
-            func_disas_token: Function token data
-            function_data: FunctionData instance
-            identity_key: Optional provider-supplied "stronger-than-name"
-                identity. When two calls share the same ``func_name``,
-                the same ``identity_key``, AND the same emitted token
-                body (``function_data.tokens_base64``), the second call
-                is a semantic duplicate of the first: no new record is
-                allocated, the occurrence counter is not bumped, and
-                the first record's final name is returned. When
-                ``identity_key`` is ``None`` (or the three-way check
-                fails) the legacy ``_N``-suffix path runs unchanged.
-                See ``FunctionView.identity_key`` in
-                ``tokenizer/disasm/types.py`` for the provider contract.
+            func_name: Original function name (the raw provider name).
+            func_addr: Function address.
+            func_disas: Function disassembly data.
+            func_disas_token: Function token data.
+            function_data: FunctionData instance.
+            identity_key: Optional provider-supplied "stronger-than-
+                name" identity (see ``FunctionView.identity_key`` in
+                ``tokenizer/disasm/types.py``).
+            comment: Optional provider-supplied "context" string (see
+                ``FunctionView.comment`` in
+                ``tokenizer/disasm/types.py``).
+
+        The deduper folds same-(name, comment, identity_key, body)
+        calls into a single record (no new slot consumed; the first
+        record's ``final_func_name`` is returned). When any of the four
+        axes diverges the manager allocates a new slot with the legacy
+        ``_N``-suffix disambiguator on ``func_name``.
 
         Returns:
             Final function name. New records use the legacy
-            occurrence-suffix scheme (``name``, ``name_1``, ``name_2``,
-            ...); folded duplicates re-return the existing record's
-            final name.
+            occurrence-suffix scheme (``name``, ``name_1``,
+            ``name_2``, ...); folded duplicates re-return the existing
+            record's final name.
         """
-        # Semantic-merge fast path: if this is a duplicate of a record
-        # already in the manager (same name + identity_key + content),
-        # fold into the existing record and return its final name. No
-        # new slot is consumed; the occurrence counter is untouched.
-        if self._deduper.is_duplicate(
-            func_name, identity_key, function_data.tokens_base64
-        ):
-            return self._identity_to_final[(func_name, identity_key)]
+        resolution = self._deduper.resolve(
+            func_name,
+            comment,
+            identity_key,
+            function_data.tokens_base64,
+        )
+        if resolution.is_duplicate:
+            return self._slot_to_final_name[resolution.slot_id]
+        if resolution.body_divergence_warning:
+            _logger.warning(
+                "FunctionDataManager: body-divergence under same identity tuple "
+                "for %r (comment=%r, identity_key=%r); allocating fresh slot",
+                func_name,
+                comment,
+                identity_key,
+            )
 
         if self.current_index >= self.total_functions:
             raise IndexError(f"Cannot add more functions: array is full ({self.total_functions})")
 
-        # Handle duplicate function names
+        # Handle duplicate function names (legacy ``_N`` allocator;
+        # same encounter-order semantics as the pre-deduper world).
         if func_name in self.func_name_occurrences:
             occurrence_index = self.func_name_occurrences[func_name]
             final_func_name = f"{func_name}_{occurrence_index}"
@@ -119,17 +131,8 @@ class FunctionDataManager:
             self.func_name_occurrences[func_name] = 1
             occurrence_index = 0
 
-        # Store the access mapping
         self.access_map[(func_name, occurrence_index)] = self.current_index
-
-        # Record the identity-key reverse lookup for future fold checks.
-        # ``identity_key=None`` is never recorded (the deduper's
-        # ``is_duplicate`` short-circuits to False on None, so the
-        # reverse-lookup entry would never be consulted).
-        if identity_key is not None:
-            self._identity_to_final.setdefault(
-                (func_name, identity_key), final_func_name
-            )
+        self._slot_to_final_name[resolution.slot_id] = final_func_name
 
         # Store data in arrays
         self.func_name_addr_array[self.current_index] = func_addr
