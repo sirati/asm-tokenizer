@@ -1,74 +1,26 @@
-"""Stage 1 DFS callee walk + cycle detection.
+"""DFS recursion + cycle detection for the callee walk.
 
-Single concern of this module: take ONE already-resolved root variant
-and flatten its inline-call tree into a DFS encounter-order
-``list[Stage1CallTarget]``.
+Single concern: walk a resolved root variant's splice tree in
+DFS-encounter order, gating each step on the EXTERN / unresolved /
+active-cycle / inlining-filter rules, and emit one
+:class:`PendingCallTarget` per included call_target (root first, then
+inlined callees).
 
-The walk's contract -- one-sentence, per the design-first rule:
+The per-row mask construction + :class:`InlineDecodeState` building
+are NOT this module's concern: :mod:`_pending` owns those. The walker
+asks :func:`build_pending_call_target` for each row, which stages the
+two ``run_lengths`` passes on the shared
+:class:`BucketedRunLengthCollector`.
 
-  *Given a resolved root function body, produce the level-4 list for
-  the owning variant by depth-capped DFS over each call_target row that
-  resolves to a non-extern callee in the same arm and isn't already on
-  the active recursion path.*
+Two public entry points:
 
-That is the entire concern. Section pointer resolution + RNG variant
-sampling at level 2 / 3 is task 1a's module; the
-``batch_idx_to_section_variant`` mapping is task 1c's module; the
-outer wiring that drives this walker per (section, variant) is task
-1d's ``_section_walk.walk_sections``. None of that lives here.
-
-Algorithm (from ``batch_decode_plan.md`` section ``## Stages --
-algorithm sketch`` -> ``Stage 1: section walk + raw-data load``):
-
-1. The root function is appended at index 0 with
-   ``encounter_category=Category.LOCAL_FUNC`` (root is always a LOCAL
-   entity by D3) and ``parent_call_target_index=None``.
-2. DFS into the root's ``call_targets`` in encounter order:
-   - Skip rows with ``function_section_ptr == 0`` (unresolved -- extern
-     or missing callee section).
-   - Skip rows whose ``type`` is :attr:`CallTargetType.EXTERN`:
-     EXT_FUNC bodies are NOT inlined (plan D3).
-   - Skip rows whose callee key ``(arm, section_byte_offset)`` is
-     already in the ACTIVE visited set -- this is the cycle guard.
-   - Resolve the callee through the session (``_idx_for_section_offset``
-     + per-arm load). If the inverse lookup fails (cross-arm pointer,
-     missing section) skip the row, matching the existing splice
-     walker's ``is_callee_present`` gate.
-   - Choose the callee variant index via
-     :func:`choose_callee_variant` (data-driven, deterministic).
-   - Append a new :class:`Stage1CallTarget` whose
-     :attr:`encounter_category` is :attr:`Category.LOCAL_FUNC` for a
-     LOCAL call site and :attr:`Category.PLT_FUNC` for a PLT call site
-     (plan D3 + D4).
-   - Recurse with ``current_depth + 1``; bail when
-     ``current_depth >= max_depth``.
-3. The visited set is keyed on ``(arm, section.section_offset)``. Popped
-   on backtrack so DAG semantics hold: a callee reachable through two
-   *different* recursion paths appears TWICE in the output (once per
-   path). Only an *active* recursion-path cycle blocks further descent.
-4. ``inlined_equivalent_call_targets_only`` filter (plan D5 stage 1
-   step 4): when ``True``, skip a call_target whose ``called_idx`` was
-   called by EITHER no variants OR every variant of the PARENT's
-   section. Only rows where SOME but not ALL variants called the
-   target carry "inlining variation" signal worth threading through to
-   the model. The "variants" here are the parent variant's siblings
-   within the same section -- NOT a globally-narrowed selection (the
-   plan deliberately scopes the check to the immediate parent).
-
-Why ``walk_callees`` does NOT take an ``rng``: callee variant choice
-is driven by the parent variant's ``per_call_entries`` (data, not a
-sampling decision) via :func:`choose_callee_variant`. The only sampling
-in the stage-1 pipeline is the top-level per-section variant sampling
-in task 1a -- the recursion is purely deterministic given a root
-variant.
-
-Why the entry point takes ``root_section`` and ``root_function_data``
-already resolved: task 1a (section pointer resolution) is the single
-owner of the level-2 section load + level-3 root variant load; this
-module is task 1b and consumes those handles. The clean split lets
-task 1d's outer walker call task 1a + task 1b in sequence per
-``(section_pointer, sampled_variant)`` pair without either module
-knowing about the other's internals.
+* :func:`walk_callees_pending` is the batched-friendly path: the
+  caller passes in a shared collector, gets back pending rows, and is
+  responsible for flushing + finalising at the right batch boundary.
+* :func:`walk_callees` is the single-variant convenience wrapper: it
+  allocates a fresh collector, walks one variant, flushes, and
+  finalises -- producing the same :class:`Stage1CallTarget` list the
+  pre-bucketed code path produced.
 """
 
 from __future__ import annotations
@@ -76,8 +28,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
-from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
-    build_inline_decode_state,
+from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
+    BucketedRunLengthCollector,
 )
 from tokenizer.aligned_data.loader.decoded._variant_selection import (
     called_by_in_selection,
@@ -87,7 +39,12 @@ from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import CallTarget, Section
 from tokenizer.tokens import Category
 
-from ._types import Stage1CallTarget
+from .._types import Stage1CallTarget
+from ._pending import (
+    PendingCallTarget,
+    build_pending_call_target,
+    finalise_pending_call_targets,
+)
 
 if TYPE_CHECKING:  # pragma: no cover -- type-only
     from tokenizer.aligned_data.loader.function_data import FunctionData
@@ -104,7 +61,7 @@ _CALL_TARGET_TYPE_TO_ENCOUNTER_CATEGORY = {
 }
 
 
-__all__ = ["walk_callees"]
+__all__ = ["walk_callees", "walk_callees_pending"]
 
 
 def walk_callees(
@@ -133,23 +90,71 @@ def walk_callees(
     callees; ``k`` returns the root + every callee whose DFS depth from
     the root is ``<= k``. ``max_depth < 0`` is rejected -- the caller
     should not be invoking the walker at all in that case.
+
+    This is the single-variant convenience entry point: it allocates a
+    fresh :class:`BucketedRunLengthCollector`, runs
+    :func:`walk_callees_pending`, flushes the collector, and finalises
+    the pending rows into :class:`Stage1CallTarget` instances. The
+    batched section-walk path calls :func:`walk_callees_pending`
+    directly with a SHARED collector across many variants, then
+    flushes + finalises once at the end of the batch.
+    """
+    collector = BucketedRunLengthCollector()
+    pending = walk_callees_pending(
+        session=session,
+        root_arm=root_arm,
+        root_section=root_section,
+        root_variant_idx=root_variant_idx,
+        root_function_data=root_function_data,
+        root_function_name_ptr=root_function_name_ptr,
+        max_depth=max_depth,
+        inlined_equivalent_call_targets_only=(
+            inlined_equivalent_call_targets_only
+        ),
+        collector=collector,
+    )
+    results = collector.flush()
+    return finalise_pending_call_targets(pending, results)
+
+
+def walk_callees_pending(
+    session: "BinarySession",
+    *,
+    root_arm: SectionKind,
+    root_section: Section,
+    root_variant_idx: int,
+    root_function_data: "FunctionData",
+    root_function_name_ptr: int,
+    max_depth: int,
+    inlined_equivalent_call_targets_only: bool,
+    collector: BucketedRunLengthCollector,
+) -> List[PendingCallTarget]:
+    """DFS encounter-order :class:`PendingCallTarget` rows.
+
+    Same algorithm as :func:`walk_callees`; differs only in that each
+    emitted row carries collector handles instead of a constructed
+    :class:`InlineDecodeState`. The caller is responsible for calling
+    :meth:`BucketedRunLengthCollector.flush` + passing the result to
+    :func:`finalise_pending_call_targets`.
+
+    The collector is passed in so a section-walk batch can SHARE one
+    collector across many (section, variant) pairs and pay the
+    ``run_lengths`` dispatch cost once per pow2 bucket.
     """
     if max_depth < 0:
         raise ValueError(f"max_depth must be >= 0; got {max_depth}")
 
-    root_state = build_inline_decode_state(
-        root_function_data.full_token_stream(), format_version=1
-    )
-    root_entry = Stage1CallTarget(
+    root_pending = build_pending_call_target(
         function_data=root_function_data,
-        state=root_state,
+        raw_tokens=root_function_data.full_token_stream(),
         call_targets_section=list(root_section.call_targets),
         encounter_category=Category.LOCAL_FUNC,
         parent_call_target_index=None,
         function_name_ptr=root_function_name_ptr,
+        collector=collector,
     )
 
-    out: List[Stage1CallTarget] = [root_entry]
+    out: List[PendingCallTarget] = [root_pending]
     visited: Set[Tuple[SectionKind, int]] = {
         (root_arm, root_section.section_offset)
     }
@@ -164,6 +169,7 @@ def walk_callees(
         visited=visited,
         out=out,
         inlining_flag=inlined_equivalent_call_targets_only,
+        collector=collector,
     )
 
     return out
@@ -183,8 +189,9 @@ def _walk_recursive(
     current_depth: int,
     max_depth: int,
     visited: Set[Tuple[SectionKind, int]],
-    out: List[Stage1CallTarget],
+    out: List[PendingCallTarget],
     inlining_flag: bool,
+    collector: BucketedRunLengthCollector,
 ) -> None:
     """Depth-capped DFS body. Mutates ``out`` + ``visited`` in place.
 
@@ -218,12 +225,13 @@ def _walk_recursive(
             ct=ct,
             visited=visited,
             inlining_flag=inlining_flag,
+            collector=collector,
         )
         if callee_entry is None:
             continue
 
-        callee_st1, callee_section, callee_variant_idx = callee_entry
-        out.append(callee_st1)
+        callee_pending, callee_section, callee_variant_idx = callee_entry
+        out.append(callee_pending)
         cycle_key = (arm, callee_section.section_offset)
         visited.add(cycle_key)
         try:
@@ -237,6 +245,7 @@ def _walk_recursive(
                 visited=visited,
                 out=out,
                 inlining_flag=inlining_flag,
+                collector=collector,
             )
         finally:
             # DAG-active-path semantics (plan D3): a callee reachable
@@ -256,8 +265,9 @@ def _try_resolve_callee(
     ct: CallTarget,
     visited: Set[Tuple[SectionKind, int]],
     inlining_flag: bool,
-) -> Optional[Tuple[Stage1CallTarget, Section, int]]:
-    """Resolve one call_target row to a (callee Stage1CT, callee Section,
+    collector: BucketedRunLengthCollector,
+) -> Optional[Tuple[PendingCallTarget, Section, int]]:
+    """Resolve one call_target row to a (PendingCT, callee Section,
     callee variant idx) triple, or ``None`` if the row should be skipped.
 
     Skip reasons (matched against the existing splice walker's gates):
@@ -319,15 +329,13 @@ def _try_resolve_callee(
     # Variant tokens are prepended once per ROW (only the root carries
     # them); inlined callees feed body-only into the decode state so
     # the row never repeats the variant-axis prefix at each splice.
-    callee_state = build_inline_decode_state(
-        callee_fd.tokens, format_version=1
-    )
-    callee_st1 = Stage1CallTarget(
+    callee_pending = build_pending_call_target(
         function_data=callee_fd,
-        state=callee_state,
+        raw_tokens=callee_fd.tokens,
         call_targets_section=list(callee_section.call_targets),
         encounter_category=_CALL_TARGET_TYPE_TO_ENCOUNTER_CATEGORY[ct.type],
         parent_call_target_index=called_idx,
         function_name_ptr=int(ct.function_name_ptr),
+        collector=collector,
     )
-    return callee_st1, callee_section, callee_variant_idx
+    return callee_pending, callee_section, callee_variant_idx
