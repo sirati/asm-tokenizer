@@ -58,6 +58,7 @@ class _GhidraFunctionView:
         "_name",
         "_block_count",
         "_identity_key",
+        "_comment",
         "_block_view",
         "_blocks_view",
     )
@@ -84,6 +85,7 @@ class _GhidraFunctionView:
         self._name: str = ""
         self._block_count: int = 0
         self._identity_key: Optional[Hashable] = None
+        self._comment: Optional[str] = None
         self._block_view = _GhidraBlockView(arch, program, listing, reg_map, decode, self)
         self._blocks_view = _GhidraBlocksView(self)
 
@@ -98,6 +100,7 @@ class _GhidraFunctionView:
         self._name = str(ghidra_function.getName())
         self._block_count = block_count
         self._identity_key = _ghidra_identity_key(ghidra_function)
+        self._comment = _ghidra_function_comment(ghidra_function)
 
     def _iter_blocks(self) -> Iterator[_GhidraBlockView]:
         if self._ghidra_function is None:
@@ -134,6 +137,10 @@ class _GhidraFunctionView:
     def identity_key(self) -> Optional[Hashable]:
         return self._identity_key
 
+    @property
+    def comment(self) -> Optional[str]:
+        return self._comment
+
     def __deepcopy__(self, memo) -> "_GhidraFunctionView":
         clone = _GhidraFunctionView(
             self._arch,
@@ -149,6 +156,7 @@ class _GhidraFunctionView:
         clone._name = self._name
         clone._block_count = self._block_count
         clone._identity_key = self._identity_key
+        clone._comment = self._comment
         return clone
 
 
@@ -187,5 +195,42 @@ def _ghidra_identity_key(ghidra_function: Any) -> Optional[Hashable]:
         return None
     try:
         return int(thunked.getEntryPoint().getOffset())
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Comment (plate-comment) extraction
+# ---------------------------------------------------------------------------
+def _ghidra_function_comment(ghidra_function: Any) -> Optional[str]:
+    """Return the function's plate comment (when set) or ``None``.
+
+    Implements the ``FunctionView.comment`` contract (see
+    ``tokenizer/disasm/types.py``): for C++ symbols Ghidra's demangler
+    populates the plate comment with the demangled scoped signature
+    (e.g. ``ARPHeader::storeRecvData(unsigned char const*, unsigned int)``).
+    That string is the natural context disambiguator when two distinct
+    methods share an unqualified name (``ARPHeader::reset`` vs
+    ``EthernetHeader::reset``). Returns ``None`` when no plate comment
+    is set (the common case for C / asm symbols and for any function
+    whose demangler entry the analysis did not run).
+
+    Resilient to partially-populated Ghidra programs: any exception
+    from the Java side is swallowed and the function falls back to
+    ``None``, preserving the legacy behaviour rather than crashing
+    the iter loop (matches the defensive pattern in
+    :func:`_ghidra_identity_key`).
+    """
+    get_comment = getattr(ghidra_function, "getComment", None)
+    if get_comment is None:
+        return None
+    try:
+        raw = get_comment()
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return str(raw)
     except Exception:
         return None
