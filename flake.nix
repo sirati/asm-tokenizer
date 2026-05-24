@@ -508,5 +508,29 @@
           default = self.packages.${system}.dockerImage;
         }
       );
+
+      apps = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+          # Dedicated Python env for the TUI inspector. Carries
+          # `textual` ON TOP OF the deployment package set so the
+          # inspector can `import textual` while the default
+          # `nix develop` shell remains textual-free.
+          tuiPython = pkgs.python314.withPackages (
+            python-pkgs: (deploymentPythonPackages python-pkgs) ++ [ python-pkgs.textual ]
+          );
+        in
+        {
+          tui-inspector = {
+            type = "app";
+            program = toString (
+              pkgs.writeShellScript "tui-inspector" ''
+                exec ${tuiPython}/bin/python -m tokenizer.inspector "$@"
+              ''
+            );
+          };
+        }
+      );
     };
 }
