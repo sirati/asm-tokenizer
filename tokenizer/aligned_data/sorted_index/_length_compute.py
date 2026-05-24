@@ -14,12 +14,16 @@ Two pieces live here:
   ``n_variants <= 0`` -- plan audit C1).
 
 * :func:`compute_reduced_lengths` (plan ALG-1) -- the multi-mode shared
-  Stage 1 + Stage 2 walk. Chunks the populated sections, runs ONE
-  ``walk_sections`` + ``predict_lengths`` per chunk under
+  Stage 1 + Stage 2 walk. Chunks the populated sections, stages every
+  chunk's Stage 1 walk onto ONE shared
+  :class:`BucketedRunLengthCollector`, then flushes once before
+  finalising + running ``predict_lengths`` per chunk under
   :attr:`VariantPadding.RAGGED` + ``num_variants_per_section =
-  LARGE_VARIANT_CAP``, then collapses each section's surviving-token
+  LARGE_VARIANT_CAP``. Collapses each section's surviving-token
   counts into the per-mode result arrays via
-  :meth:`LengthReduction.reduce`.
+  :meth:`LengthReduction.reduce`. The single-collector lifecycle
+  amortises every call_target row's ``run_lengths`` across the entire
+  sorted-index build (not just one CHUNK_SIZE-sized chunk).
 
 Boundary contract (the design-first sentence):
 
@@ -36,7 +40,7 @@ Boundary contract (the design-first sentence):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -47,11 +51,16 @@ from tokenizer.aligned_data.loader.batch_decode._length_predict import (
     predict_lengths,
 )
 from tokenizer.aligned_data.loader.batch_decode._section_walk import (
+    PendingStage1Batch,
+    finalise_pending_stage1,
     walk_sections,
 )
 from tokenizer.aligned_data.loader.batch_decode._types import (
     SectionPointerSpec,
     VariantPadding,
+)
+from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
+    BucketedRunLengthCollector,
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.loader.session import BinarySession
@@ -222,6 +231,12 @@ def compute_reduced_lengths(
     # variant is selected without invoking the RNG (plan D3).
     rng = np.random.default_rng(0)
 
+    # One-collector-per-build contract: every chunk's Stage 1 walk
+    # stages onto the same collector; one flush amortises every
+    # call_target row's ``run_lengths`` across the WHOLE sorted-index
+    # build (not just one CHUNK_SIZE-sized chunk).
+    collector = BucketedRunLengthCollector()
+    chunk_pendings: List[Tuple[np.ndarray, PendingStage1Batch]] = []
     for chunk_start in range(0, populated_idx.size, CHUNK_SIZE):
         chunk_end = min(chunk_start + CHUNK_SIZE, populated_idx.size)
         chunk_idxs = populated_idx[chunk_start:chunk_end]
@@ -229,15 +244,26 @@ def compute_reduced_lengths(
             SectionPointerSpec(arm=SectionKind.MATCHED, idx=int(i))
             for i in chunk_idxs
         ]
-        stage1 = walk_sections(
-            session,
-            section_pointers,
-            num_variants_per_section=LARGE_VARIANT_CAP,
-            max_depth=depth,
-            variant_padding=VariantPadding.RAGGED,
-            inlined_equivalent_call_targets_only=False,
-            rng=rng,
-        )
+        chunk_pendings.append((
+            chunk_idxs,
+            walk_sections(
+                session,
+                section_pointers,
+                num_variants_per_section=LARGE_VARIANT_CAP,
+                max_depth=depth,
+                variant_padding=VariantPadding.RAGGED,
+                inlined_equivalent_call_targets_only=False,
+                rng=rng,
+                collector=collector,
+            ),
+        ))
+
+    # ONE flush -- one pow2-bucketed 2D run_lengths dispatch per
+    # bucket across every chunk's call_target rows.
+    runlen_results = collector.flush()
+
+    for chunk_idxs, pending in chunk_pendings:
+        stage1 = finalise_pending_stage1(pending, runlen_results)
         stage2 = predict_lengths(stage1, context_len=LARGE_CONTEXT_LEN)
 
         # ``stage2.sections`` is parallel to ``stage1.sections`` which
