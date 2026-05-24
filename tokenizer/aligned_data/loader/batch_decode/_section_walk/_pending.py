@@ -177,6 +177,15 @@ def _build_stage1_variant(
         slot_v=slot_v,
     )
 
+    # variant_tokens are a ROW-level identity prefix carried once per
+    # variant; they live on Stage1Variant (NOT on any call_target's token
+    # stream). The walker reads them from the same per-sampled-variant
+    # FunctionData that supplied the root body, threading without an
+    # extra load.
+    variant_tokens = (
+        resolved.function_data_per_sampled_variant[slot_v].variant_tokens
+    )
+
     return Stage1Variant(
         variant_idx=int(variant_idx_in_section),
         variant_ref_offset=int(
@@ -184,6 +193,7 @@ def _build_stage1_variant(
         ),
         batch_idx=batch_idx,
         call_targets=call_targets,
+        variant_tokens=variant_tokens,
     )
 
 
