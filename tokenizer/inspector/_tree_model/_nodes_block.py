@@ -28,7 +28,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True)
+@dataclass
 class BlockNode:
     """One per block within a variant body.
 
@@ -61,7 +61,7 @@ class BlockNode:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class InlineJumpNode:
     """Inline jump to another block in the SAME variant.
 

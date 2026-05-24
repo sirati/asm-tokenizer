@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True)
+@dataclass
 class AsmLeaf:
     """One asm-like line inside a block -- terminal."""
 
@@ -46,7 +46,7 @@ class AsmLeaf:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class ShowAllVariantsNode:
     """``[+] show all variants`` sibling under an InlineCallNode.
 

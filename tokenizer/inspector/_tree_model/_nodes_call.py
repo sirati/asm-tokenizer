@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 __all__ = ["InlineCallNode"]
 
 
-@dataclass(frozen=True)
+@dataclass
 class InlineCallNode:
     """Inline call from a block to another function.
 

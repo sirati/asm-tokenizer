@@ -5,11 +5,6 @@ calls and centralise the expand-time error policy. ONLY module in
 :mod:`tokenizer.inspector` that imports :mod:`textual` -- everything
 else is pure model + label/render helpers, keeping the default
 ``nix develop`` shell free of the ``textual`` dep.
-
-The model is fully frozen (every node dataclass uses
-``frozen=True``). The dispatcher uses :func:`object.__setattr__` to
-flip ``is_failed`` -- the canonical pattern for post-init mutation
-on a frozen dataclass without unfreezing the whole model.
 """
 
 from __future__ import annotations
@@ -26,8 +21,9 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
-from textual.widgets._tree import TreeNode
+from textual.widgets._tree import TOGGLE_STYLE, TreeNode
 
+from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.inspector._horizontal_scroll import (
     apply_truncation_marker,
     assemble_failed_glyph,
@@ -127,16 +123,14 @@ class _InspectorTree(Tree[Node]):
         node_label = node._label.copy()
         node_label.stylize(style)
 
-        failed = node.data is not None and getattr(
-            node.data, "is_failed", False
-        )
+        failed = node.data is not None and node.data.is_failed
         if failed:
             glyph_text, glyph_style = assemble_failed_glyph(base_style)
             prefix = Text(glyph_text, style=glyph_style)
         elif node._allow_expand:
             prefix = Text(
                 self.ICON_NODE_EXPANDED if node.is_expanded else self.ICON_NODE,
-                style=base_style,
+                style=base_style + TOGGLE_STYLE,
             )
         else:
             prefix = Text("", style=base_style)
@@ -217,10 +211,6 @@ class InspectorApp(App[None]):
         ``SectionKind.MATCHED`` since the top-level tree only seeds
         matched functions.
         """
-        # Lazy import keeps this module's top-level imports textual-
-        # focused; SectionKind is already in memory via the dataset.
-        from tokenizer.aligned_data.loader.metadata_loader import SectionKind
-
         func_names = self._dataset.matched_func_names
         name = func_names[idx] if idx < len(func_names) else "?"
         return FunctionNode(arm=SectionKind.MATCHED, idx=idx, name=name)
@@ -235,10 +225,9 @@ class InspectorApp(App[None]):
         then-expand retries the decode), wrap ONLY the model
         ``expand`` call in ``try/except Exception``, on failure log
         the traceback + attach a dim-red error-child carrying
-        ``repr(exc)`` + flip ``is_failed`` (via ``object.__setattr__``
-        -- frozen dataclass) + refresh so the prefix paints as
-        ``[*]``. On success: attach one child per returned model node
-        gated on ``can_expand``.
+        ``repr(exc)`` + flip ``is_failed`` + refresh so the prefix
+        paints as ``[*]``. On success: attach one child per returned
+        model node gated on ``can_expand``.
         """
         event.stop()
         node = event.node
@@ -249,10 +238,8 @@ class InspectorApp(App[None]):
             return
 
         node.remove_children()
-        # Reset prior failed state (frozen dataclass -- bypass via
-        # ``object.__setattr__``; canonical post-init mutation pattern).
-        if getattr(model, "is_failed", False):
-            object.__setattr__(model, "is_failed", False)
+        if model.is_failed:
+            model.is_failed = False
             node.refresh()
 
         try:
@@ -266,7 +253,7 @@ class InspectorApp(App[None]):
                 model,
                 traceback.format_exc(),
             )
-            object.__setattr__(model, "is_failed", True)
+            model.is_failed = True
             err_label = Text(repr(exc), style=_ERR_STYLE)
             node.add_leaf(err_label, data=None)
             # Force re-render so the prefix glyph swaps to the [*] form.

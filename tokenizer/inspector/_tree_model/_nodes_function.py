@@ -123,7 +123,7 @@ def build_variants_from_result(
     return variants
 
 
-@dataclass(frozen=True)
+@dataclass
 class FunctionNode:
     """Top-level node: one per matched function (plan D3).
 

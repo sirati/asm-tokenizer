@@ -106,7 +106,7 @@ def _build_variant_context(
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class VariantNode:
     """One per variant of a function -- wraps the per-variant FunctionData.
 
