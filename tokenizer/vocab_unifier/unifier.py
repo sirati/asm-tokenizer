@@ -28,6 +28,8 @@ def unify_vocab(
     unified_vocab_file: Path,
     mapping_output_dir: Path | None = None,
     mapping_source_root: Path | None = None,
+    *,
+    insert_value_negative: bool = False,
 ) -> None:
     """Build a single unified vocabulary across `csv_files` and emit
     one `.mapping.b64c` file per input CSV (the per-binary local-ID →
@@ -49,6 +51,20 @@ def unify_vocab(
     `mapping_source_root`: required when `mapping_output_dir` is set.
     Each `csv_file` must be reachable from this root; the relative
     subdir is preserved when computing the mapping path.
+
+    `insert_value_negative`: legacy-compat flag for per-binary CSVs
+    generated BEFORE ``value_negative`` was reserved at slot 256. When
+    True the per-binary CSVs are loaded with only 256 reserved slots
+    (digits only) — the first entry of each per-binary vocabulary is
+    a real token at per-binary id 256, NOT ``value_negative``. The
+    unified vocab still gets the canonical 257-reserved layout
+    (``value_negative`` pinned at unified slot 256), and the per-binary
+    real tokens 256+ are remapped via :meth:`register_on_vocab_manager`
+    into the unified id space (legacy id 256 = ``block_v2`` typically
+    lands at unified id 264). The emitted mapping.b64c sidecars carry
+    the shifted ids, so downstream consumers (memmap_builder) see
+    canonical-layout unified ids regardless of which legacy era the
+    corpus was tokenized in.
     """
     if mapping_output_dir is not None and mapping_source_root is None:
         raise ValueError(
@@ -100,7 +116,9 @@ def unify_vocab(
     loaded_count = 0
     for csv_file in csv_files:
         print(f"Loading vocabulary from {csv_file}")
-        current_vocab_manager = load_vocab_manager(csv_file)
+        current_vocab_manager = load_vocab_manager(
+            csv_file, legacy_no_value_negative=insert_value_negative,
+        )
         if current_vocab_manager is None:
             logger.error(f"Failed to load vocabulary from {csv_file}. Missing or incomplete (no vocab def in last line).")
             continue
@@ -130,20 +148,26 @@ def unify_vocab(
 
         mappings = np.full_like(current_vocab_manager.id_to_token_type, -1, dtype=np.int32)
 
-        # Under format_version=2, IDs 0..256 are protocol-reserved: the
-        # 256 inline-digit slots plus `value_negative` at slot 256. Both
-        # per-binary VM and unified VM agree on those positions by
-        # construction (the constructor pre-populates the digit slots
-        # and eagerly pins `value_negative` at slot 256), so identity
-        # remap is the correct translation across this whole prefix.
-        # Filling here before the representative loop is idempotent —
-        # the loop only registers caller-driven tokens above slot 256.
-        reserved = VocabularyManager._V2_RESERVED_TOKEN_COUNT
-        mappings[:reserved] = np.arange(reserved, dtype=mappings.dtype)
-        assert (
-            mappings[VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID]
-            == VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID
-        ), "value_negative identity remap mismatch"
+        # Modern path: per-binary IDs 0..256 are protocol-reserved (256
+        # digits + value_negative at slot 256). Both per-binary VM and
+        # unified VM agree by construction, so identity remap is the
+        # correct translation across the prefix.
+        #
+        # Legacy path (``insert_value_negative=True``): per-binary IDs
+        # 0..255 are digits, and slot 256 is the FIRST REAL TOKEN (the
+        # per-binary VM has 256 reserved, not 257). Only the digit
+        # prefix identity-remaps; slot 256+ is filled by
+        # ``register_on_vocab_manager`` below.
+        if insert_value_negative:
+            reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
+            mappings[:reserved] = np.arange(reserved, dtype=mappings.dtype)
+        else:
+            reserved = VocabularyManager._V2_RESERVED_TOKEN_COUNT
+            mappings[:reserved] = np.arange(reserved, dtype=mappings.dtype)
+            assert (
+                mappings[VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID]
+                == VocabularyManager._V2_VALUE_NEGATIVE_TOKEN_ID
+            ), "value_negative identity remap mismatch"
 
         for tokens in current_vocab_manager.iter_representative_tokens():
             original = tokens.get_token_ids()

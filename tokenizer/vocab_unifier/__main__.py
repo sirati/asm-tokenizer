@@ -28,6 +28,20 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--insert-neg-value",
+        action="store_true",
+        help=(
+            "Legacy-compat: per-binary CSVs were generated BEFORE "
+            "value_negative was reserved at slot 256. Load them with only "
+            "256 reserved slots (digits only) and let register_on_vocab_manager "
+            "remap their real tokens (256+) into canonical-layout unified ids. "
+            "Use this for corpora tokenized pre-value_negative-cutover. "
+            "The emitted unified vocab still has the canonical 257-reserved "
+            "layout (value_negative pinned at unified slot 256)."
+        ),
+    )
+
+    parser.add_argument(
         "--raw-logs",
         type=str,
         nargs="?",
@@ -92,7 +106,11 @@ def main() -> None:
     unified_vocab_file = config.output_dir / args.out_unified_vocab
 
     csv_paths = [binary.path for binary in file_names_parsed]
-    unify_vocab(csv_paths, unified_vocab_file)
+    unify_vocab(
+        csv_paths,
+        unified_vocab_file,
+        insert_value_negative=args.insert_neg_value,
+    )
 
     logger.info("Done!")
 
