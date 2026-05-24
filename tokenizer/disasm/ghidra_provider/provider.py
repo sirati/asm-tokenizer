@@ -47,7 +47,11 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             ...
     """
 
-    def __init__(self, binary_path: Path) -> None:
+    def __init__(
+        self,
+        binary_path: Path,
+        duplicate_function_dump_path: Path | None = None,
+    ) -> None:
         import jpype.config
         import pyghidra
 
@@ -58,6 +62,11 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             pyghidra.start()
 
         self.binary_path = binary_path
+        # ``None`` -> dump disabled (zero work in iter_functions). When
+        # set, the path is the absolute destination for the per-binary
+        # duplicate-function-metadata JSON; the orchestrator module
+        # owns the file write + parent-mkdir.
+        self._duplicate_function_dump_path: Path | None = duplicate_function_dump_path
 
         # pyghidra defaults `project_location` to the binary's parent
         # directory, which is the read-only `--source-already-staged`
@@ -248,6 +257,23 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             name = str(func.getName())
             addr = int(func.getEntryPoint().getOffset())
             funcs.append((addr, name, func))
+
+        # Optional debug dump: when the provider was constructed with a
+        # ``duplicate_function_dump_path``, hand the collected funcs
+        # list to the orchestrator before sorting so it can detect
+        # name-collisions and snapshot each colliding function's
+        # 3-layer-deep Ghidra metadata. The hook is gated on the path
+        # being non-None - zero work when off.
+        if self._duplicate_function_dump_path is not None:
+            from tokenizer.disasm.ghidra_provider.duplicate_function_dump import (
+                write_duplicate_function_dump,
+            )
+
+            write_duplicate_function_dump(
+                funcs,
+                binary_name=self.binary_path.name,
+                output_path=self._duplicate_function_dump_path,
+            )
 
         # Reset the entry-point map for this iter call (callers that
         # re-iterate get a fresh map, no stale entries).

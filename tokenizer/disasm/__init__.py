@@ -135,7 +135,23 @@ class DisassemblyProvider(ABC):
         self.close()
 
 
-def get_disassembly_provider(backend: str, binary_path: Path) -> DisassemblyProvider:
+def get_disassembly_provider(
+    backend: str,
+    binary_path: Path,
+    duplicate_function_dump_path: Path | None = None,
+) -> DisassemblyProvider:
+    """Return a ``DisassemblyProvider`` for ``backend`` on ``binary_path``.
+
+    ``duplicate_function_dump_path`` is a Ghidra-only debug knob: when
+    set, the Ghidra provider's ``iter_functions`` walks the function
+    list once, detects name-collisions, and writes a 3-layer-deep
+    JSON metadata snapshot for each colliding function to that path.
+    The angr backend silently ignores the parameter - angr exposes no
+    Java-handle equivalent (the dump is for offline picking of a
+    cross-ISA-stable disambiguator, and Ghidra is the default
+    provider for that pathway per ``ghidra_default_provider`` in
+    project memory).
+    """
     if backend == "angr":
         from tokenizer.disasm.angr_provider import AngrDisassemblyProvider
 
@@ -143,5 +159,8 @@ def get_disassembly_provider(backend: str, binary_path: Path) -> DisassemblyProv
     if backend == "ghidra":
         from tokenizer.disasm.ghidra_provider import GhidraDisassemblyProvider
 
-        return GhidraDisassemblyProvider(binary_path)
+        return GhidraDisassemblyProvider(
+            binary_path,
+            duplicate_function_dump_path=duplicate_function_dump_path,
+        )
     raise ValueError(f"Unsupported disassembly backend: {backend}")

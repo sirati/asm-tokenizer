@@ -35,6 +35,12 @@ DO_PICKLES: bool = True
 _OUTPUT_CSV_SUFFIX = "_output.csv"
 _META_SIDECAR_SUFFIX = "_meta.json"
 
+# Optional debug-dump filename suffix (gated by the
+# ``--dump-duplicate-function-metadata`` CLI flag). Lands next to the
+# CSV under the same ``<base>`` prefix so a human inspecting an output
+# folder can pair the dump with its source binary at a glance.
+_DUPLICATE_FUNCTION_DUMP_SUFFIX = "_duplicate_function_dump.json"
+
 
 def _write_meta_sidecar(
     stage_dir: Path, output_basename: str, variant_info: VariantInfo
@@ -173,6 +179,7 @@ def run_tokenizer(
     variant_info: VariantInfo | None = None,
     source_relative_path: Path | None = None,
     output_basename: str | None = None,
+    dump_duplicate_function_metadata: bool = False,
 ) -> tuple[int, int]:
     """Tokenize one binary; return ``(warnings, filtered)``.
 
@@ -394,7 +401,23 @@ def run_tokenizer(
         csv_path = stage_dir / csv_filename
         try:
             if kvargs is None:
-                provider = get_disassembly_provider(backend, file_path)
+                # When the debug-dump flag is set, the orchestrator
+                # under ``tokenizer.disasm.ghidra_provider.duplicate_function_dump``
+                # writes the per-binary JSON into ``stage_dir`` next to
+                # the CSV; ``staged_publish``'s rglob picks it up and
+                # atomic-publishes alongside the rest of the per-binary
+                # artifacts. ``None`` -> dump disabled (provider sees
+                # no path -> zero work in iter_functions).
+                duplicate_function_dump_path = (
+                    stage_dir / f"{output_basename}{_DUPLICATE_FUNCTION_DUMP_SUFFIX}"
+                    if dump_duplicate_function_metadata
+                    else None
+                )
+                provider = get_disassembly_provider(
+                    backend,
+                    file_path,
+                    duplicate_function_dump_path=duplicate_function_dump_path,
+                )
                 # `_consts.txt` is derived from `csv_path.parent /
                 # f"{stem.replace('_output', '')}_consts.txt"` in both
                 # providers — by passing the staged csv path here, the
