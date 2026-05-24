@@ -3,15 +3,16 @@
 Two on-wire forms live here and the format dispatch happens in ONE
 place (the ``parse_binary_header`` / ``encode_binary_header`` pair):
 
-* **Ultrashort** (3 bytes total). Triggered iff every field fits in a
+* **Ultrashort** (7 bytes total). Triggered iff every field fits in a
   small range AND the block runlength is ``u8``::
 
       byte 0  bits 0-1   = 0           (format tag = ultrashort)
               bits 2-7   = #insn       (u6, cap 63)
       byte 1             = #block_word (u8, cap 255 -- block_enc implicit u8)
       byte 2             = #tokens     (u8, cap 255)
+      bytes 3-6 (u32 LE) = entry_idx   (in-file ordinal, 0-based)
 
-* **Normal** (7-10 bytes). The packed byte's low 2 bits double as
+* **Normal** (11-14 bytes). The packed byte's low 2 bits double as
   block-encoding selector and the next 2 bits select the ``#tokens``
   width tag; the field's high 4 bits live in byte 0 and the remaining
   low bytes follow::
@@ -22,6 +23,15 @@ place (the ``parse_binary_header`` / ``encode_binary_header`` pair):
       next 1-4 bytes     = low bytes of #tokens (per width tag)
       next u24 LE        = #insn        (byte count, cap 16 MiB)
       next u16 LE        = #block_word  (word count, cap 65535)
+      next u32 LE        = entry_idx    (in-file ordinal, 0-based)
+
+The ``entry_idx`` field is the record's encounter-order position in
+its containing ``_data.bin`` file: the first record written has
+``entry_idx == 0``, the second has ``1``, ... the Nth has ``N-1``.
+Paired with the file-level ``total_entries`` trailer (see
+:mod:`tokenizer.aligned_data.memmap_format`) it lets the loader assert
+``entry_idx < total_entries`` per lookup and ``entry_idx == i`` over
+the arm's known per-record starts at session open.
 
 The byte layout has NO reserved bits and NO magic guard -- by user
 direction the trade-off is accepted in exchange for the compact header.
@@ -59,11 +69,21 @@ NORMAL_TOKEN_CAPS: Tuple[int, int, int, int] = (
     1 << 36,   # tag 3  ->  68 719 476 735
 )
 
+# Width of the trailing ``entry_idx`` field present on every header
+# (both ULTRASHORT and NORMAL forms).
+ENTRY_IDX_SIZE = 4
+
 # Maximum header byte counts, indexed by token-width tag for the normal
-# form (1 packed byte + 1..4 low bytes + 3 byte #insn + 2 byte #block).
-NORMAL_PREFIX_BYTES: Tuple[int, int, int, int] = (7, 8, 9, 10)
-ULTRASHORT_PREFIX_BYTES = 3
-MAX_HEADER_BYTES = NORMAL_PREFIX_BYTES[-1]  # 10
+# form (1 packed byte + 1..4 low bytes + 3 byte #insn + 2 byte #block
+# + 4 byte entry_idx).
+NORMAL_PREFIX_BYTES: Tuple[int, int, int, int] = (
+    7 + ENTRY_IDX_SIZE,
+    8 + ENTRY_IDX_SIZE,
+    9 + ENTRY_IDX_SIZE,
+    10 + ENTRY_IDX_SIZE,
+)
+ULTRASHORT_PREFIX_BYTES = 3 + ENTRY_IDX_SIZE
+MAX_HEADER_BYTES = NORMAL_PREFIX_BYTES[-1]  # 14
 
 # block_enc index -> sizeof(block word) in bytes.
 BLOCK_WORD_SIZE: Tuple[int, int, int] = (1, 2, 4)
@@ -116,6 +136,7 @@ class BinaryHeader:
     insn_len: int
     block_word_count: int
     token_count: int
+    entry_idx: int
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +238,14 @@ def parse_binary_header(
         insn_len = (packed >> 2) & 0b111111  # u6
         block_word_count = _byte_at(data, 1)
         token_count = _byte_at(data, 2)
+        entry_idx = _slice_to_int(data, 3, 3 + ENTRY_IDX_SIZE)
         header = BinaryHeader(
             format=BinaryHeaderFormat.UltraShort,
             block_enc=0,
             insn_len=insn_len,
             block_word_count=block_word_count,
             token_count=token_count,
+            entry_idx=entry_idx,
         )
         return header, ULTRASHORT_PREFIX_BYTES
 
@@ -239,6 +262,8 @@ def parse_binary_header(
     cursor += 3
     block_word_count = _slice_to_int(data, cursor, cursor + 2)
     cursor += 2
+    entry_idx = _slice_to_int(data, cursor, cursor + ENTRY_IDX_SIZE)
+    cursor += ENTRY_IDX_SIZE
 
     header = BinaryHeader(
         format=BinaryHeaderFormat.Normal,
@@ -246,6 +271,7 @@ def parse_binary_header(
         insn_len=insn_len,
         block_word_count=block_word_count,
         token_count=token_count,
+        entry_idx=entry_idx,
     )
     return header, cursor
 
@@ -271,13 +297,21 @@ def encode_binary_header(header: BinaryHeader) -> bytes:
         raise ValueError(
             f"block_enc must be 0, 1, or 2; got {header.block_enc}"
         )
-    if header.insn_len < 0 or header.block_word_count < 0 or header.token_count < 0:
+    if (
+        header.insn_len < 0
+        or header.block_word_count < 0
+        or header.token_count < 0
+        or header.entry_idx < 0
+    ):
         raise ValueError(
             "header fields must be non-negative; got "
             f"insn_len={header.insn_len}, "
             f"block_word_count={header.block_word_count}, "
-            f"token_count={header.token_count}"
+            f"token_count={header.token_count}, "
+            f"entry_idx={header.entry_idx}"
         )
+
+    entry_idx_bytes = struct.pack("<I", header.entry_idx)
 
     if _ultrashort_eligible(
         header.block_enc,
@@ -289,7 +323,9 @@ def encode_binary_header(header: BinaryHeader) -> bytes:
             BinaryHeaderFormat.UltraShort
             | ((header.insn_len & 0b111111) << 2)
         )
-        return bytes((packed, header.block_word_count, header.token_count))
+        return bytes(
+            (packed, header.block_word_count, header.token_count)
+        ) + entry_idx_bytes
 
     # Normal form.
     if header.insn_len >= NORMAL_INSN_CAP:
@@ -311,4 +347,5 @@ def encode_binary_header(header: BinaryHeader) -> bytes:
     out.extend(token_low.to_bytes(low_byte_count, "little"))
     out.extend(struct.pack("<I", header.insn_len)[0:3])
     out.extend(struct.pack("<H", header.block_word_count))
+    out.extend(entry_idx_bytes)
     return bytes(out)
