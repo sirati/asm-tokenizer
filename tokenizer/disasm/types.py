@@ -38,7 +38,7 @@ saving the reference does NOT preserve a snapshot of the data.
 
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import Iterator, Optional, Protocol, runtime_checkable
+from typing import Hashable, Iterator, Optional, Protocol, runtime_checkable
 
 
 # ---- ENUMS ----
@@ -454,6 +454,27 @@ class FunctionView(Protocol):
 
     @property
     def blocks(self) -> BlocksView: ...
+
+    @property
+    def identity_key(self) -> Optional[Hashable]: ...
+    # Provider-supplied "stronger-than-name" identity for this function.
+    # When two functions share the same ``name`` AND the same
+    # ``identity_key`` AND emit the same token body, they represent the
+    # SAME logical function and downstream deduplication folds them to
+    # a single entry. When ``identity_key is None`` the provider declines
+    # to assert any identity beyond the name; downstream treats every
+    # same-named function as distinct (the legacy occurrence-suffix
+    # / per-row disambiguator path).
+    #
+    # The canonical use-case is PLT thunks: every ISA variant has N
+    # distinct trampoline slots all resolving to the same external
+    # symbol, and they all surface with the external's name. The Ghidra
+    # provider returns the resolved external's entry-point offset
+    # (``Function.getThunkedFunction(True).getEntryPoint().getOffset()``)
+    # which is identical across the colliding thunks and stable across
+    # ISA variants. The angr/Capstone path lacks the thunk-resolution
+    # surface and returns ``None`` unconditionally (no merge, legacy
+    # disambiguation).
 
     def __deepcopy__(self, memo) -> "FunctionView": ...
 

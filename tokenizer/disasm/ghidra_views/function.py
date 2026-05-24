@@ -7,7 +7,7 @@ Owns:
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional
+from typing import Any, Hashable, Iterator, Optional
 
 from tokenizer.disasm.ghidra_views.block import _GhidraBlockView
 from tokenizer.disasm.types import Architecture, BlocksView
@@ -57,6 +57,7 @@ class _GhidraFunctionView:
         "_entry",
         "_name",
         "_block_count",
+        "_identity_key",
         "_block_view",
         "_blocks_view",
     )
@@ -82,6 +83,7 @@ class _GhidraFunctionView:
         self._entry: int = 0
         self._name: str = ""
         self._block_count: int = 0
+        self._identity_key: Optional[Hashable] = None
         self._block_view = _GhidraBlockView(arch, program, listing, reg_map, decode, self)
         self._blocks_view = _GhidraBlocksView(self)
 
@@ -95,6 +97,7 @@ class _GhidraFunctionView:
         self._entry = int(ghidra_function.getEntryPoint().getOffset())
         self._name = str(ghidra_function.getName())
         self._block_count = block_count
+        self._identity_key = _ghidra_identity_key(ghidra_function)
 
     def _iter_blocks(self) -> Iterator[_GhidraBlockView]:
         if self._ghidra_function is None:
@@ -127,6 +130,10 @@ class _GhidraFunctionView:
     def blocks(self) -> BlocksView:
         return self._blocks_view
 
+    @property
+    def identity_key(self) -> Optional[Hashable]:
+        return self._identity_key
+
     def __deepcopy__(self, memo) -> "_GhidraFunctionView":
         clone = _GhidraFunctionView(
             self._arch,
@@ -141,4 +148,44 @@ class _GhidraFunctionView:
         clone._entry = self._entry
         clone._name = self._name
         clone._block_count = self._block_count
+        clone._identity_key = self._identity_key
         return clone
+
+
+# ---------------------------------------------------------------------------
+# Identity-key extraction
+# ---------------------------------------------------------------------------
+def _ghidra_identity_key(ghidra_function: Any) -> Optional[Hashable]:
+    """Return a stable identity key when Ghidra recognises this function
+    as a thunk, else ``None``.
+
+    Implements the ``FunctionView.identity_key`` contract (see
+    ``tokenizer/disasm/types.py``): for PLT-thunk functions the key is
+    the resolved external's entry-point offset
+    (``Function.getThunkedFunction(True).getEntryPoint().getOffset()``),
+    which is identical across every trampoline slot that resolves to
+    the same external symbol AND stable across ISA variants. For
+    non-thunk functions the provider declines to assert identity beyond
+    name and returns ``None`` (legacy disambiguation path).
+
+    Resilient to partially-populated Ghidra programs: any exception
+    from the Java side is swallowed and the function falls back to
+    ``None`` (= "no merge"), preserving the legacy behaviour rather
+    than crashing the iter loop.
+    """
+    is_thunk = getattr(ghidra_function, "isThunk", None)
+    if is_thunk is None or not bool(is_thunk()):
+        return None
+    get_thunked = getattr(ghidra_function, "getThunkedFunction", None)
+    if get_thunked is None:
+        return None
+    try:
+        thunked = get_thunked(True)
+    except Exception:
+        return None
+    if thunked is None:
+        return None
+    try:
+        return int(thunked.getEntryPoint().getOffset())
+    except Exception:
+        return None
