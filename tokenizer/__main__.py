@@ -254,9 +254,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--dump-duplicate-function-metadata",
         action="store_true",
         help=(
-            "Debug: write a 3-layer-deep JSON snapshot of every Ghidra Function "
+            "Debug: write a 5-layer-deep pickle snapshot of every Ghidra Function "
             "whose name collides with another function in the same disassembly. "
-            "Lands at <output_dir>/.../<base>_duplicate_function_dump.json. "
+            "Lands at <output_dir>/.../<base>_duplicate_function_dump.pkl. "
             "Ghidra backend only (angr ignores). Off by default; zero overhead "
             "when off."
         ),

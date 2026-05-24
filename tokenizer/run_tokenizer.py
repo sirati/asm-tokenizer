@@ -39,7 +39,7 @@ _META_SIDECAR_SUFFIX = "_meta.json"
 # ``--dump-duplicate-function-metadata`` CLI flag). Lands next to the
 # CSV under the same ``<base>`` prefix so a human inspecting an output
 # folder can pair the dump with its source binary at a glance.
-_DUPLICATE_FUNCTION_DUMP_SUFFIX = "_duplicate_function_dump.json"
+_DUPLICATE_FUNCTION_DUMP_SUFFIX = "_duplicate_function_dump.pkl"
 
 
 def _write_meta_sidecar(
@@ -403,7 +403,7 @@ def run_tokenizer(
             if kvargs is None:
                 # When the debug-dump flag is set, the orchestrator
                 # under ``tokenizer.disasm.ghidra_provider.duplicate_function_dump``
-                # writes the per-binary JSON into ``stage_dir`` next to
+                # writes the per-binary pickle into ``stage_dir`` next to
                 # the CSV; ``staged_publish``'s rglob picks it up and
                 # atomic-publishes alongside the rest of the per-binary
                 # artifacts. ``None`` -> dump disabled (provider sees

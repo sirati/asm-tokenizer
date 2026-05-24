@@ -1,8 +1,8 @@
-"""Ghidra ``Function`` Java-handle introspection (3-layer deep snapshot).
+"""Ghidra ``Function`` Java-handle introspection (5-layer deep snapshot).
 
-Concern: produce a serialisable ``dict[str, Any]`` capturing the
-metadata a Ghidra ``Function`` exposes, down to a fixed depth of 3
-nested layers, so a human can decide which fields are both
+Concern: produce a pickle-serialisable ``dict[str, Any]`` capturing
+the metadata a Ghidra ``Function`` exposes, down to a fixed depth of
+5 nested layers, so a human can decide which fields are both
 within-binary-disambiguating AND cross-ISA-stable for the same
 logical C++ function.
 
@@ -12,10 +12,10 @@ Depth semantics (read carefully):
     L2 - direct getter results on each L1 sub-object (Symbol,
          Namespace, FunctionSignature, ParameterImpl, ...).
     L3 - direct getter results on each L2 sub-object.
-
-When recursion would go deeper than L3, the value is summarised as
-``{"_java_class": "<ghidra.program.model....>", "_repr": "<str(obj)>"}``
-rather than recursed further.
+    L4 - direct getter results on each L3 sub-object.
+    L5 - terminal layer: EVERY value is stored as ``str(repr(value))``
+         regardless of its Python/Java type. This is the safety wall;
+         nothing past L5 is recursed into.
 
 The module is BACKEND-SPECIFIC (pyghidra Java handles). It contains
 NO collision-detection / NO file I/O / NO CLI knowledge - it is a
@@ -210,8 +210,11 @@ _TYPE_GETTER_TABLE: tuple[tuple[str, tuple[GetterSpec, ...]], ...] = (
 )
 
 # Max recursion depth (root Function counts as depth 0 - its direct
-# getter results are L1).
-_MAX_DEPTH: int = 3
+# getter results are L1). At ``depth == _MAX_DEPTH`` the snapshot
+# driver emits ``str(repr(value))`` as the terminal leaf regardless
+# of the value's type - this is the universal safety wall that keeps
+# the dump bounded and pickle-safe.
+_MAX_DEPTH: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -220,27 +223,35 @@ _MAX_DEPTH: int = 3
 
 
 def snapshot_function(ghidra_func: Any) -> dict[str, Any]:
-    """Return a 3-layer-deep dict snapshot of the Ghidra Function handle.
+    """Return a 5-layer-deep dict snapshot of the Ghidra Function handle.
 
     The returned dict's top-level keys are camelCase getter names with
     a leading ``get`` stripped (e.g. ``getName`` -> ``Name``,
     ``isInline`` -> ``isInline``); the leading-``get`` strip matches
     how Ghidra's JavaDoc tends to refer to properties.
 
-    Values may themselves be dicts (sub-objects within depth budget),
-    primitive scalars, lists of dicts (for collection-returning
-    getters like ``getParameters``), or summary dicts of the form
-    ``{"_java_class": "<class>", "_repr": "<repr>"}`` when the budget
-    is exhausted.
+    Values at depths 1..4 may be dicts (sub-objects within depth
+    budget), primitive scalars, lists of nested values, or summary
+    dicts of the form ``{"_java_class": "<class>", "_repr": "<repr>"}``
+    for Java types not covered by the curated-getter table. At depth
+    5 (the terminal layer), every value is stored as
+    ``str(repr(value))`` regardless of type - this is the universal
+    safety wall that keeps the dump bounded and pickle-safe.
     """
     return _snapshot(ghidra_func, depth=0)
 
 
 def _snapshot(obj: Any, depth: int) -> Any:
-    """Recurse into ``obj`` up to ``_MAX_DEPTH``; below depth, summarise."""
+    """Recurse into ``obj`` up to ``_MAX_DEPTH``; at depth, repr-string."""
+    # Terminal layer: every L5 value becomes ``str(repr(value))``
+    # regardless of type. Single-point safety wall, evaluated BEFORE
+    # any other shape rule so primitives, dicts, Java handles, and
+    # collections all collapse uniformly here.
+    if depth == _MAX_DEPTH:
+        return str(repr(obj))
     if obj is None:
         return None
-    if isinstance(obj, (bool, int, float, str)):
+    if isinstance(obj, (bool, int, float, str, bytes)):
         return obj
     # Collections (Java arrays / Iterables surface as Python tuples/lists
     # in pyghidra; explicit ``list(obj)`` works for any iterable).
@@ -251,8 +262,6 @@ def _snapshot(obj: Any, depth: int) -> Any:
         except Exception as exc:
             return _summarise(obj, java_class, exc)
         return [_snapshot(elt, depth + 1) for elt in elements]
-    if depth >= _MAX_DEPTH:
-        return _summarise(obj, java_class, None)
     getters = _getters_for(java_class)
     if not getters:
         return _summarise(obj, java_class, None)
@@ -332,7 +341,13 @@ def _is_collection(obj: Any, java_class: str) -> bool:
 
 
 def _summarise(obj: Any, java_class: str, exc: Exception | None) -> dict[str, Any]:
-    """Fallback summary for sub-objects beyond the depth budget."""
+    """Fallback summary for Java types not covered by the curated-getter table.
+
+    Emitted at depths 1..4 when the snapshot driver has no curated
+    introspection list for ``java_class`` (or when iterating a
+    suspected collection raised). At depth 5 the universal repr-string
+    wall fires first and this fallback is never reached.
+    """
     try:
         repr_str = str(obj)
     except Exception:

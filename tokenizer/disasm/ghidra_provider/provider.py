@@ -64,7 +64,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         self.binary_path = binary_path
         # ``None`` -> dump disabled (zero work in iter_functions). When
         # set, the path is the absolute destination for the per-binary
-        # duplicate-function-metadata JSON; the orchestrator module
+        # duplicate-function-metadata pickle; the orchestrator module
         # owns the file write + parent-mkdir.
         self._duplicate_function_dump_path: Path | None = duplicate_function_dump_path
 
@@ -262,7 +262,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # ``duplicate_function_dump_path``, hand the collected funcs
         # list to the orchestrator before sorting so it can detect
         # name-collisions and snapshot each colliding function's
-        # 3-layer-deep Ghidra metadata. The hook is gated on the path
+        # 5-layer-deep Ghidra metadata. The hook is gated on the path
         # being non-None - zero work when off.
         if self._duplicate_function_dump_path is not None:
             from tokenizer.disasm.ghidra_provider.duplicate_function_dump import (

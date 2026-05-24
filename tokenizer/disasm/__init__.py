@@ -144,8 +144,8 @@ def get_disassembly_provider(
 
     ``duplicate_function_dump_path`` is a Ghidra-only debug knob: when
     set, the Ghidra provider's ``iter_functions`` walks the function
-    list once, detects name-collisions, and writes a 3-layer-deep
-    JSON metadata snapshot for each colliding function to that path.
+    list once, detects name-collisions, and writes a 5-layer-deep
+    pickle metadata snapshot for each colliding function to that path.
     The angr backend silently ignores the parameter - angr exposes no
     Java-handle equivalent (the dump is for offline picking of a
     cross-ISA-stable disambiguator, and Ghidra is the default
