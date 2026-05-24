@@ -17,7 +17,7 @@ enums; nothing reads them on the consumer side.
 """
 
 from enum import IntEnum
-from typing import Optional, Protocol, runtime_checkable
+from typing import Hashable, Optional, Protocol, runtime_checkable
 
 
 class Encoding(IntEnum):
@@ -85,7 +85,27 @@ class AddressMetadataView(Protocol):
     def kind(self) -> AddressKind: ...
 
     @property
-    def name(self) -> Optional[str]: ...        # human-readable label
+    def name(self) -> Optional[str]: ...        # canonical human-readable label
+
+    @property
+    def comment(self) -> Optional[str]: ...
+    # Provider-supplied "context" string for this function address (the
+    # demangled C++ scoped signature when available; ``None`` for C / asm
+    # symbols and for any non-function address). The lookup populates
+    # this field alongside ``name`` so consumers / sidecar writers that
+    # already key on ``meta.name`` for cross-ISA-stable identity get the
+    # same answer as the FunctionDataManager's canonical-name path: the
+    # ``name`` is ALREADY the result of
+    # ``canonical_function_name(raw_name, comment, identity_key)``.
+
+    @property
+    def identity_key(self) -> Optional[Hashable]: ...
+    # Provider-supplied "stronger-than-name" identity for this function
+    # address. PLT thunks: the resolved external's entry-point offset
+    # (cross-ISA-stable). Non-thunk functions / non-function addresses:
+    # ``None``. The lookup populates this alongside ``name`` for the
+    # same reason ``comment`` is populated -- so consumers see the same
+    # canonical-name basis the FunctionDataManager uses.
 
     @property
     def section_kind(self) -> SectionKind: ...

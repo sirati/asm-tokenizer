@@ -11,7 +11,7 @@ always return ``None``; ``string_encoding`` is always ASCII or UNKNOWN
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Hashable, Optional
 
 from tokenizer.disasm.metadata import (
     AddressKind,
@@ -87,6 +87,12 @@ class _AngrAddressMetadataView:
         """Replace all slot state in one call. Used by the lookup at
         the start of every ``lookup()`` so the consumer sees a consistent
         view bound to the current address.
+
+        ``name`` is the CANONICAL function name (already passed through
+        :func:`tokenizer.function_deduper.canonical_function_name` by the
+        lookup); on the angr path the helper is a no-op because angr has
+        no demangler hook and no thunk-identity surface (so the two
+        axes ``comment`` / ``identity_key`` are always ``None`` here).
         """
         self._kind = kind
         self._section_kind = section_kind
@@ -149,6 +155,18 @@ class _AngrAddressMetadataView:
     @property
     def tls(self) -> bool:
         return self._tls
+
+    @property
+    def comment(self) -> Optional[str]:
+        # angr has no demangler hook; comment is always None on this
+        # path (and the canonical-name helper trivially short-circuits to
+        # the raw name when both axes are None).
+        return None
+
+    @property
+    def identity_key(self) -> Optional[Hashable]:
+        # angr has no thunk-identity surface (see angr_limitations.md).
+        return None
 
     @property
     def slot_target(self) -> Optional[AddressMetadataView]:

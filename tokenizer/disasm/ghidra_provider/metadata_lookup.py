@@ -13,7 +13,7 @@ builds a fresh standalone view with slot-detection signals suppressed.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Hashable, Optional
 
 from tokenizer.disasm.ghidra_provider.metadata_view import _GhidraAddressMetadataView
 from tokenizer.disasm.ghidra_provider.section_classify import (
@@ -27,6 +27,10 @@ from tokenizer.disasm.ghidra_provider.section_classify import (
     _looks_like_vtable_symbol_name,
     _section_type_from_block,
 )
+from tokenizer.disasm.ghidra_views.function import (
+    _ghidra_function_comment,
+    _ghidra_identity_key,
+)
 from tokenizer.disasm.metadata import (
     AddressKind,
     AddressMetadataView,
@@ -34,6 +38,7 @@ from tokenizer.disasm.metadata import (
     encoding_from_string,
     section_kind_from_type_string,
 )
+from tokenizer.function_deduper import canonical_function_name
 
 
 class GhidraMetadataLookup:
@@ -399,6 +404,25 @@ class GhidraMetadataLookup:
         is_plt_combined = is_plt or is_thunk
         is_extern_synthetic = self._is_extern_synthetic(func, block)
 
+        # Canonical-name derivation: pull the two additional identity axes
+        # (``comment`` from the demangler, ``identity_key`` from the
+        # thunk-target offset) off the resolved Function handle when we
+        # have one, then collapse (raw_name, comment, identity_key) into
+        # a cross-ISA-stable canonical name via the same helper the
+        # FunctionDataManager uses. The two axes are also persisted on
+        # the typed view so consumers (or audits) can re-derive or
+        # inspect the canonical name. For non-function addresses (block
+        # / fallback branches) ``func`` is None; both axes stay None and
+        # ``canonical_function_name`` short-circuits to the raw name.
+        comment: Optional[str] = (
+            _ghidra_function_comment(func) if func is not None else None
+        )
+        identity_key: Optional[Hashable] = (
+            _ghidra_identity_key(func) if func is not None else None
+        )
+        if name is not None:
+            name = canonical_function_name(name, comment, identity_key)
+
         # Translate raw signals into typed slots ONCE here (no per-property
         # work on the read path).
         kind = self._derive_address_kind(
@@ -447,6 +471,8 @@ class GhidraMetadataLookup:
             string_encoding=string_encoding,
             string_bytes=string_bytes,
             name=name,
+            comment=comment,
+            identity_key=identity_key,
             start_addr=start_addr,
             end_addr=end_addr,
             size=size,

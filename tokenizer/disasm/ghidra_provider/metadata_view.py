@@ -9,7 +9,7 @@ The instance is REUSED across ``lookup()`` calls. Use
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Hashable, Optional
 
 from tokenizer.disasm.metadata import (
     AddressKind,
@@ -46,6 +46,8 @@ class _GhidraAddressMetadataView:
         "_string_encoding",
         "_string_bytes",
         "_name",
+        "_comment",
+        "_identity_key",
         "_start_addr",
         "_end_addr",
         "_size",
@@ -65,6 +67,8 @@ class _GhidraAddressMetadataView:
         self._string_encoding: Encoding = Encoding.UNKNOWN
         self._string_bytes: Optional[bytes] = None
         self._name: Optional[str] = None
+        self._comment: Optional[str] = None
+        self._identity_key: Optional[Hashable] = None
         self._start_addr: Optional[int] = None
         self._end_addr: Optional[int] = None
         self._size: Optional[int] = None
@@ -88,6 +92,8 @@ class _GhidraAddressMetadataView:
         string_encoding: Encoding,
         string_bytes: Optional[bytes],
         name: Optional[str],
+        comment: Optional[str],
+        identity_key: Optional[Hashable],
         start_addr: Optional[int],
         end_addr: Optional[int],
         size: Optional[int],
@@ -101,6 +107,13 @@ class _GhidraAddressMetadataView:
         """Replace all typed slot state in one call. Used by the lookup
         at the start of every ``lookup()`` so the consumer sees a
         consistent view bound to the current address.
+
+        ``name`` is the CANONICAL function name (already passed through
+        :func:`tokenizer.function_deduper.canonical_function_name` by the
+        lookup so callers / emitters get a cross-ISA-stable identifier).
+        ``comment`` + ``identity_key`` are the two axes the lookup fed to
+        that helper and are exposed here for consumers that need to
+        re-derive or audit the canonical name.
         """
         self._kind = kind
         self._section_kind = section_kind
@@ -108,6 +121,8 @@ class _GhidraAddressMetadataView:
         self._string_encoding = string_encoding
         self._string_bytes = string_bytes
         self._name = name
+        self._comment = comment
+        self._identity_key = identity_key
         self._start_addr = start_addr
         self._end_addr = end_addr
         self._size = size
@@ -168,6 +183,14 @@ class _GhidraAddressMetadataView:
         return self._tls
 
     @property
+    def comment(self) -> Optional[str]:
+        return self._comment
+
+    @property
+    def identity_key(self) -> Optional[Hashable]:
+        return self._identity_key
+
+    @property
     def slot_target(self) -> Optional[AddressMetadataView]:
         if self._slot_target_addr is None:
             return None
@@ -195,6 +218,8 @@ class _GhidraAddressMetadataView:
         clone._string_encoding = self._string_encoding
         clone._string_bytes = self._string_bytes
         clone._name = self._name
+        clone._comment = self._comment
+        clone._identity_key = self._identity_key
         clone._start_addr = self._start_addr
         clone._end_addr = self._end_addr
         clone._size = self._size
