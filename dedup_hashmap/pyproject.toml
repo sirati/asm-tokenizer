@@ -11,5 +11,9 @@ license         = { text = "Apache-2.0" }
 authors         = [{ name = "sirati" }]
 
 [tool.maturin]
-module-name = "dedup_hashmap"
-features    = ["pyo3/extension-module"]
+# Rust extension lands as ``dedup_hashmap._native``; the pure-Python
+# wrapper layer (typed-IntEnum facade) lives in
+# ``python/dedup_hashmap/__init__.py`` alongside it.
+module-name   = "dedup_hashmap._native"
+python-source = "python"
+features      = ["pyo3/extension-module"]

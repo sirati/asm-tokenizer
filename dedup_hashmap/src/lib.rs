@@ -166,7 +166,7 @@ define_hashmap!(HashMapU64F32, u64, f32, f32::NAN);
 define_hashmap!(HashMapU64F64, u64, f64, f64::NAN);
 
 #[pymodule]
-fn dedup_hashmap(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // bool key
     m.add_class::<HashMapBoolBool>()?;
     m.add_class::<HashMapBoolI8>()?;

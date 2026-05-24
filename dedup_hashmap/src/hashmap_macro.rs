@@ -37,7 +37,7 @@
 /// - `$sentinel` — the value returned by `lookup_ndarray` for misses.
 macro_rules! define_hashmap {
     ($cls_ident:ident, $key_ty:ty, $val_ty:ty, $sentinel:expr) => {
-        #[pyclass(module = "dedup_hashmap")]
+        #[pyclass(module = "dedup_hashmap._native")]
         pub struct $cls_ident {
             inner: ::hashbrown::HashMap<$key_ty, $val_ty>,
         }

@@ -6,7 +6,12 @@ license = "Apache-2.0"
 description = "Macro-generated PyO3 hashmaps over the Cartesian product of integer key types and integer/float value types, with numpy-batched lookup and insert."
 
 [lib]
-name = "dedup_hashmap"
+# Rust extension is shipped as the ``_native`` submodule of the
+# ``dedup_hashmap`` Python package so the pure-Python wrapper layer can
+# live alongside it in ``python/dedup_hashmap/``. See ``pyproject.toml``
+# ``[tool.maturin]`` for the matching ``module-name`` and
+# ``python-source`` settings.
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
