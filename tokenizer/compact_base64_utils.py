@@ -97,7 +97,11 @@ def _pack_bits(
     Packs *prefix* bits (list of `(value, n_bits)` tuples) **followed by**
     `values` (each `bits_per_val` wide) into a byte-aligned buffer.
     """
-    if bits_per_val <= 12:
+    # ``_pack_bits_vec`` has a corruption bug at exactly ``bits_per_val == 11``
+    # (the 11-bit cross-word-boundary path drops the value's high bit before
+    # write; round-trips at bits 2-10 and 12 are clean). Route 11-bit packs
+    # through the scalar path until the vec code can be repaired.
+    if bits_per_val <= 12 and bits_per_val != 11:
         return _pack_bits_vec(values, bits_per_val, prefix)
 
     buf = 0
