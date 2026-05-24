@@ -150,6 +150,7 @@ def _make_variant(
     *,
     slot_v: int,
     categories: list[Category] | None = None,
+    variant_tokens: np.ndarray | None = None,
 ) -> Stage1Variant:
     """Build a Stage1Variant from a list of raw token streams (one per CT).
 
@@ -158,9 +159,17 @@ def _make_variant(
     for the row-offset cumsum; it walks
     ``batch_idx_to_section_variant`` instead. The field is set for
     consumers that DO care about it (e.g. tests that prove the
-    back-pointer chain is intact)."""
+    back-pointer chain is intact).
+
+    ``variant_tokens`` defaults to an empty array -- the row-level
+    variant-axis prefix is irrelevant for most length-predict tests
+    (variant_tokens contribute 0 identity and 0 number positions; only
+    the row-budget capping changes behaviour, which is covered by the
+    dedicated test for the variant_prefix shrink)."""
     if categories is None:
         categories = [Category.LOCAL_FUNC] * len(raw_streams)
+    if variant_tokens is None:
+        variant_tokens = np.zeros(0, dtype=np.uint16)
     cts = [
         _make_call_target(raw, encounter_category=cat)
         for raw, cat in zip(raw_streams, categories)
@@ -170,6 +179,7 @@ def _make_variant(
         variant_ref_offset=slot_v,
         batch_idx=slot_v,
         call_targets=cts,
+        variant_tokens=variant_tokens,
     )
 
 
@@ -879,3 +889,88 @@ def test_row_offsets_monotonic_invariant_across_context_lens(
             stage2.number_row_offsets[i + 1]
             >= stage2.number_row_offsets[i]
         )
+
+
+# ---------------------------------------------------------------------------
+# variant_prefix consumes row budget at the row-level seam.
+# ---------------------------------------------------------------------------
+
+
+def test_variant_prefix_consumes_row_budget() -> None:
+    """The row-level ``variant_tokens`` prefix takes its share of the
+    row's ``context_len`` budget; per-call-target ``walk_cutoff`` sees
+    the REDUCED budget so its surviving counts are computed against
+    ``context_len - n_variant_tokens``, not the raw ``context_len``.
+
+    Setup: one variant with one CT of predicted length 10. The variant
+    carries 4 axis tokens. With ``context_len = 8`` the CT-available
+    budget is ``8 - 4 = 4``, so the CT must cut at length 4 (not 8).
+
+    Per the row-assembly seam: variant_tokens contribute 0 identity and
+    0 number positions to the sidecars (the prefix is pure metadata-
+    tail tokens), so identity/number row offsets are unchanged by the
+    prefix; only the token-count budget shrinks.
+    """
+    BLOCK_V2 = _V2_IDENTITY_BLOCK_START  # 264
+    LOCAL_FUNC = _V2_IDENTITY_BLOCK_START + 1  # 265
+    # raw stream of 9 identity carriers -> 1 prepend + 9 = 10 expanded.
+    raw = _u16(*([BLOCK_V2, LOCAL_FUNC] * 4 + [BLOCK_V2]))
+    assert raw.shape[0] == 9
+
+    # Variant carries 4 axis tokens (single-id metadata-tail entries;
+    # no inline-digit followers, no promotion -- they shift to model-
+    # facing IDs via a static ``- 256`` at the row-assembly seam).
+    # Use IDs >= 280 (well past the eager block end) so they read as
+    # ``real_mask=True`` if they ever entered an InlineDecodeState --
+    # but here they never do; they live ONLY on Stage1Variant.
+    axis = np.array([280, 281, 282, 283], dtype=np.uint16)
+
+    cts = [_make_call_target(raw, encounter_category=Category.LOCAL_FUNC)]
+    variant = Stage1Variant(
+        variant_idx=0,
+        variant_ref_offset=0,
+        batch_idx=0,
+        call_targets=cts,
+        variant_tokens=axis,
+    )
+    section = Stage1Section(
+        arm=SectionKind.MATCHED,
+        idx=0,
+        section=Section(
+            function_name_ptr=0,
+            section_offset=0,
+            call_targets=[],
+            variants=[],
+        ),
+        variants=[variant],
+    )
+    mapping = np.zeros((1, 2), dtype=np.uint32)
+    stage1 = Stage1Batch(
+        sections=[section],
+        batch_idx_to_section_variant=mapping,
+        batch_size=1,
+    )
+
+    stage2 = predict_lengths(stage1, context_len=8)
+    ct = stage2.sections[0].variants[0].call_targets[0]
+
+    assert ct.predicted_full_length == 10
+    # ``context_len - n_axis`` = 8 - 4 = 4 reaches the CT
+    assert ct.surviving_token_count == 4
+    assert ct.is_cut is True
+    assert ct.partial_cut_length == 4
+
+    # When the variant_prefix length EQUALS context_len, the CT gets a
+    # budget of 0 -- fully dropped.
+    stage2_tight = predict_lengths(stage1, context_len=4)
+    ct_tight = stage2_tight.sections[0].variants[0].call_targets[0]
+    assert ct_tight.surviving_token_count == 0
+    assert ct_tight.partial_cut_length == 0
+
+    # And when context_len is SMALLER than the prefix, the CT also gets
+    # a 0 budget -- the row writer caps the prefix emission at
+    # context_len naturally.
+    stage2_overrun = predict_lengths(stage1, context_len=2)
+    ct_overrun = stage2_overrun.sections[0].variants[0].call_targets[0]
+    assert ct_overrun.surviving_token_count == 0
+    assert ct_overrun.partial_cut_length == 0

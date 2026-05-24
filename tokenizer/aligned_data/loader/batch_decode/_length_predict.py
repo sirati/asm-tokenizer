@@ -76,10 +76,27 @@ def _build_variant(
     per-call-target ``predicted_full_length`` feeds the cutoff walk;
     the resulting per-call-target surviving counts (full-included,
     partial, or dropped) feed the surviving-count count.
+
+    The row-level ``variant_tokens`` prefix (one per variant; statically
+    encoded; emitted by Stage 4 before any call_target body) consumes
+    its length share of the row budget. ``walk_cutoff`` sees the
+    reduced budget ``context_len - n_variant_tokens`` so per-call-target
+    cutoff math stays in per-call-target coordinates -- the prefix
+    never enters per-call-target token streams.
     """
 
+    n_variant_tokens = int(stage1_variant.variant_tokens.shape[0])
+    available_for_call_targets = context_len - n_variant_tokens
+    if available_for_call_targets < 0:
+        # Variant prefix alone exceeds the row budget. Every call_target
+        # is fully dropped; surviving prefix is the head of variant_tokens
+        # up to ``context_len`` -- Stage 4's row writer caps the prefix
+        # length naturally via the ``context_len`` column budget.
+        available_for_call_targets = 0
     predicted_lengths = [ex.predicted_full_length for ex in expansions]
-    cutoff = walk_cutoff(predicted_lengths, context_len=context_len)
+    cutoff = walk_cutoff(
+        predicted_lengths, context_len=available_for_call_targets
+    )
 
     call_targets: List[Stage2CallTarget] = []
     total_surviving_token_count = 0

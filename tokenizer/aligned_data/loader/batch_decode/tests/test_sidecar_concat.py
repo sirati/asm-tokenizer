@@ -183,6 +183,7 @@ def _wrap_stage3_batch(
                 variant_ref_offset=0,
                 batch_idx=None,  # not used by sidecar concat
                 call_targets=stage1_cts,
+                variant_tokens=np.zeros(0, dtype=np.uint16),
             )
             stage2_variant = Stage2Variant(
                 stage1=stage1_variant,

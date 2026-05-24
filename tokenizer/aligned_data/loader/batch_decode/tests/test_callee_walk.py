@@ -745,15 +745,24 @@ def test_negative_max_depth_rejected() -> None:
 
 
 def test_variant_tokens_prepended_only_at_root_not_at_callees() -> None:
-    """Per-row variant-axis contract: the root call_target's
-    ``state.raw_tokens`` is ``variant_tokens + body_tokens``
-    (:meth:`FunctionData.full_token_stream`); every inlined callee's
-    ``state.raw_tokens`` is ``body_tokens`` only.
+    """Per-row variant-axis contract: variant_tokens are a ROW-level
+    identity prefix carried on :class:`Stage1Variant`, NOT a per-
+    call-target token stream concern. Every call_target (root + inlined
+    callees) feeds ``function_data.tokens`` (body only) into
+    ``state.raw_tokens`` -- no special-case root path.
 
-    Each splice tree shares one compilation variant axis, so repeating
-    the variant-axis prefix at every callee splice point would waste
-    context. The root carries them once for the whole row; callees
-    contribute body-only token streams.
+    Each splice tree shares one compilation variant axis; the
+    variant_tokens prefix is emitted once at row start by Stage 4
+    (:func:`_token_assembly.assemble_tokens`) before any call_target
+    body. Per-call-target token streams are body-only for every
+    encounter category.
+
+    Locking this in at the walker level guards against a regression of
+    the legacy ``full_token_stream()`` special-case that fed the root's
+    ``variant_tokens + body_tokens`` through ``InlineDecodeState`` --
+    which mis-ordered the row (the LOCAL_FUNC self-token sat BEFORE
+    the variant_tokens prefix when in reality it marks "root body
+    starts here" and belongs AFTER the prefix).
     """
     axis_tokens = np.array([280, 281, 282], dtype=np.uint16)
     callee_section = _make_section(section_offset=200, function_name_ptr=2)
@@ -782,16 +791,15 @@ def test_variant_tokens_prepended_only_at_root_not_at_callees() -> None:
     )
 
     assert len(out) == 2
-    # Root: state.raw_tokens == variant_tokens + body_tokens
-    # (i.e. ``full_token_stream()``).
-    np.testing.assert_array_equal(
-        out[0].state.raw_tokens, root_fd.full_token_stream()
-    )
-    assert int(out[0].state.raw_tokens.shape[0]) == (
-        int(axis_tokens.shape[0]) + int(root_fd.tokens.shape[0])
+    # Root: state.raw_tokens == function_data.tokens (body only) --
+    # variant_tokens do NOT enter the per-call-target token stream.
+    np.testing.assert_array_equal(out[0].state.raw_tokens, root_fd.tokens)
+    assert int(out[0].state.raw_tokens.shape[0]) == int(
+        root_fd.tokens.shape[0]
     )
     # Callee: state.raw_tokens == body_tokens only -- variant_tokens
-    # are NOT prepended again at the splice point.
+    # are NOT prepended at the splice point either; the contract is
+    # uniform across root and callees.
     np.testing.assert_array_equal(out[1].state.raw_tokens, callee_fd.tokens)
     assert int(out[1].state.raw_tokens.shape[0]) == int(
         callee_fd.tokens.shape[0]

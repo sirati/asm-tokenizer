@@ -144,9 +144,18 @@ def walk_callees_pending(
     if max_depth < 0:
         raise ValueError(f"max_depth must be >= 0; got {max_depth}")
 
+    # Root + callees go through the SAME per-call-target encode path.
+    # variant_tokens are a row-level identity prefix (per plan D3 / ALG-9);
+    # they live on :class:`Stage1Variant`, not on any call_target's token
+    # stream. Passing ``function_data.tokens`` here for the root mirrors
+    # the callee path in :func:`_try_resolve_callee` and removes the
+    # legacy ``full_token_stream()`` special-case that prepended the
+    # variant prefix BEFORE the root's LOCAL_FUNC self-token -- which
+    # mis-ordered the row layout (the self-token marks "function body
+    # starts here" and must sit AFTER, not before, the row prefix).
     root_pending = build_pending_call_target(
         function_data=root_function_data,
-        raw_tokens=root_function_data.full_token_stream(),
+        raw_tokens=root_function_data.tokens,
         call_targets_section=list(root_section.call_targets),
         encounter_category=Category.LOCAL_FUNC,
         parent_call_target_index=None,
@@ -326,9 +335,10 @@ def _try_resolve_callee(
             session._load_unmatched_for_splice(callee_idx)
         )
 
-    # Variant tokens are prepended once per ROW (only the root carries
-    # them); inlined callees feed body-only into the decode state so
-    # the row never repeats the variant-axis prefix at each splice.
+    # Every call_target (root + callees) feeds body-only into the
+    # decode state. The variant-axis prefix is row-level (carried on
+    # :class:`Stage1Variant.variant_tokens`); the per-call-target token
+    # stream never contains it.
     callee_pending = build_pending_call_target(
         function_data=callee_fd,
         raw_tokens=callee_fd.tokens,

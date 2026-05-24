@@ -191,6 +191,7 @@ def _wrap_single_call_target(stage2_ct: Stage2CallTarget) -> Stage2Batch:
         variant_ref_offset=0,
         batch_idx=0,
         call_targets=[stage1_ct],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage1_section = Stage1Section(
         arm=SectionKind.MATCHED,
@@ -774,6 +775,7 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
         variant_ref_offset=0,
         batch_idx=0,
         call_targets=[stage2_ct0.stage1, stage2_ct1.stage1],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage1_section = Stage1Section(
         arm=SectionKind.MATCHED,
