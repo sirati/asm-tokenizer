@@ -83,6 +83,16 @@ class MemmapBinWriter:
     def cursor(self) -> int:
         return self._cursor
 
+    @property
+    def is_finalized(self) -> bool:
+        """``True`` once :meth:`finalize` has run (fd is closed).
+
+        Callers that wrap ``finalize`` to append trailer bytes need
+        to gate their pre-finalize work on this so a double call
+        doesn't try to write after the underlying mmap is closed.
+        """
+        return self._fd < 0
+
     def write(self, data: bytes) -> int:
         """Append ``data`` at the current cursor. Return the start offset."""
         needed = self._cursor + len(data)
@@ -169,6 +179,11 @@ class MemmapBinWriter:
 
     def finalize(self) -> None:
         """Flush, unmap, truncate to ``cursor``, close the fd.
+
+        Generic chokepoint: callers that need file-type-specific
+        trailer bytes (e.g. the ``_data.bin`` ``total_entries`` field)
+        append them via :meth:`write` BEFORE calling ``finalize``;
+        this method only handles flush + unmap + truncate.
 
         Idempotent: a second call is a no-op so the builder's
         ``contextlib.ExitStack`` cleanup can safely invoke it even
