@@ -253,6 +253,7 @@ def _assemble_variant(
         variant_ref_offset=0,
         batch_idx=batch_idx,
         call_targets=[ct.stage2.stage1 for ct in rewritten_call_targets],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage2_variant = Stage2Variant(
         stage1=stage1_variant,

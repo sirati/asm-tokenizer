@@ -138,6 +138,7 @@ def _wrap_single_call_target(stage2_ct: Stage2CallTarget) -> Stage2Batch:
         variant_ref_offset=0,
         batch_idx=0,
         call_targets=[stage1_ct],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
     stage1_section = Stage1Section(
         arm=SectionKind.MATCHED,
