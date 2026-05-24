@@ -25,7 +25,7 @@ architecture is process-stable.
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional
+from typing import Any, Hashable, Iterator, Optional
 
 from tokenizer.disasm.angr_provider.op_classify import (
     _CAPSTONE_ARM_SHIFT_TO_KIND,
@@ -702,6 +702,15 @@ class _AngrFunctionView:
     @property
     def blocks(self) -> BlocksView:
         return self._blocks
+
+    @property
+    def identity_key(self) -> Optional[Hashable]:
+        # angr/Capstone does not perform thunk-resolution at decode time;
+        # the angr-backed view never asserts a stronger-than-name
+        # identity. Returning ``None`` puts every angr-path function on
+        # the legacy disambiguation path (see ``FunctionView.identity_key``
+        # contract in ``tokenizer/disasm/types.py``).
+        return None
 
     def __deepcopy__(self, memo) -> "_AngrFunctionView":
         clone = _AngrFunctionView(self._arch)

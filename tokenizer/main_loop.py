@@ -14,6 +14,7 @@ from dynrunner.tokenize import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
+from tokenizer.function_deduper import FunctionDeduper
 from tokenizer.function_filter import FunctionFilter
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.opaque_remapping import (
@@ -188,6 +189,11 @@ def main_loop(
 
     total_functions = provider.function_count()
     function_manager = FunctionDataManager(total_functions) if VERIFICATION else FunctionDataManager(0)
+    # Semantic-merge gate consulted before every CSV row write + every
+    # ``FunctionDataManager.add_function_data`` call (see
+    # ``tokenizer/function_deduper.py``). Per-binary state; instantiated
+    # once here so the same gate covers the whole iter_functions pass.
+    function_deduper = FunctionDeduper()
 
     exceptions = []
     filtered_count = 0
@@ -338,6 +344,31 @@ def main_loop(
                         filtered_count += 1
                         continue
 
+                    # Semantic-merge gate: same name + same provider-
+                    # supplied identity_key + same emitted token body
+                    # ⇒ this function is a duplicate of one already
+                    # written; fold it (no CSV row, no FDM record, no
+                    # occurrence bump). The legacy ``_N``-suffix /
+                    # ``occurrence`` disambiguator path still runs for
+                    # functions whose provider declines an identity
+                    # (``identity_key is None``) and for genuine
+                    # collisions where one of the three keys diverges.
+                    identity_key = getattr(func, "identity_key", None)
+                    if function_deduper.is_duplicate(
+                        func_name, identity_key, tokens_base64
+                    ):
+                        # Roll back the occurrence bump performed above:
+                        # the duplicate never reaches the writer, so the
+                        # next same-name function should land at the
+                        # same occurrence the duplicate would have taken
+                        # (legacy ordering preserved for non-folded
+                        # entries). When ``occurence`` was reset to 0
+                        # for a first-seen name, the rollback restores
+                        # the prev_func_name sentinel.
+                        if prev_func_name == func_name:
+                            occurence -= 1
+                        continue
+
                     if is_v2:
                         # v2 metadata column: JSON-serialized per-category
                         # metadata. ``_build_v2_metadata_json`` is also
@@ -394,7 +425,12 @@ def main_loop(
                             metadata_cell=metadata_cell,
                         )
                         final_func_name = function_manager.add_function_data(
-                            func_name, func_addr, temp_bbs, func_tokens, function_data
+                            func_name,
+                            func_addr,
+                            temp_bbs,
+                            func_tokens,
+                            function_data,
+                            identity_key=identity_key,
                         )
 
                         func_name_addr[final_func_name] = func_addr
