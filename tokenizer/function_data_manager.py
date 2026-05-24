@@ -3,9 +3,10 @@ Optimized function data storage using fixed-size arrays for better performance.
 """
 
 import numpy as np
-from typing import Any, Iterator, Tuple, Optional, Dict, List
+from typing import Any, Hashable, Iterator, Tuple, Optional, Dict, List
 from dataclasses import dataclass
 
+from .function_deduper import FunctionDeduper
 from .function_token_list import FunctionTokenList
 
 
@@ -42,6 +43,18 @@ class FunctionDataManager:
         # Access map: (func_name, occurrence_index) -> array_index
         self.access_map: Dict[Tuple[str, int], int] = {}
 
+        # Reverse lookup: (func_name, identity_key) -> final_func_name
+        # of the FIRST accepted record with that identity. A later call
+        # with the SAME (name, identity_key) AND matching content folds
+        # into that record and re-returns its final name.
+        self._identity_to_final: Dict[Tuple[str, Hashable], str] = {}
+
+        # Semantic-merge gate (see :mod:`tokenizer.function_deduper`).
+        # When the gate reports a duplicate, ``add_function_data`` skips
+        # the allocation, leaves arrays + occurrence counters untouched,
+        # and returns the existing record's final name.
+        self._deduper = FunctionDeduper()
+
         # Pre-allocated arrays using numpy object arrays for complex types
         self.func_name_addr_array = np.empty(total_functions, dtype=object)
         self.func_disas_array = np.empty(total_functions, dtype=object)
@@ -49,7 +62,13 @@ class FunctionDataManager:
         self.function_data_array = np.empty(total_functions, dtype=object)
 
     def add_function_data(
-        self, func_name: str, func_addr: int, func_disas: Any, func_disas_token: Any, function_data: FunctionData
+        self,
+        func_name: str,
+        func_addr: int,
+        func_disas: Any,
+        func_disas_token: Any,
+        function_data: FunctionData,
+        identity_key: Optional[Hashable] = None,
     ) -> str:
         """
         Add all function data in one operation.
@@ -60,10 +79,33 @@ class FunctionDataManager:
             func_disas: Function disassembly data
             func_disas_token: Function token data
             function_data: FunctionData instance
+            identity_key: Optional provider-supplied "stronger-than-name"
+                identity. When two calls share the same ``func_name``,
+                the same ``identity_key``, AND the same emitted token
+                body (``function_data.tokens_base64``), the second call
+                is a semantic duplicate of the first: no new record is
+                allocated, the occurrence counter is not bumped, and
+                the first record's final name is returned. When
+                ``identity_key`` is ``None`` (or the three-way check
+                fails) the legacy ``_N``-suffix path runs unchanged.
+                See ``FunctionView.identity_key`` in
+                ``tokenizer/disasm/types.py`` for the provider contract.
 
         Returns:
-            Final function name (may be modified for duplicates)
+            Final function name. New records use the legacy
+            occurrence-suffix scheme (``name``, ``name_1``, ``name_2``,
+            ...); folded duplicates re-return the existing record's
+            final name.
         """
+        # Semantic-merge fast path: if this is a duplicate of a record
+        # already in the manager (same name + identity_key + content),
+        # fold into the existing record and return its final name. No
+        # new slot is consumed; the occurrence counter is untouched.
+        if self._deduper.is_duplicate(
+            func_name, identity_key, function_data.tokens_base64
+        ):
+            return self._identity_to_final[(func_name, identity_key)]
+
         if self.current_index >= self.total_functions:
             raise IndexError(f"Cannot add more functions: array is full ({self.total_functions})")
 
@@ -79,6 +121,15 @@ class FunctionDataManager:
 
         # Store the access mapping
         self.access_map[(func_name, occurrence_index)] = self.current_index
+
+        # Record the identity-key reverse lookup for future fold checks.
+        # ``identity_key=None`` is never recorded (the deduper's
+        # ``is_duplicate`` short-circuits to False on None, so the
+        # reverse-lookup entry would never be consulted).
+        if identity_key is not None:
+            self._identity_to_final.setdefault(
+                (func_name, identity_key), final_func_name
+            )
 
         # Store data in arrays
         self.func_name_addr_array[self.current_index] = func_addr
