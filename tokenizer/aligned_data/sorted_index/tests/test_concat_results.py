@@ -78,6 +78,7 @@ def _make_result(
 
     fid_sidecar: Optional[np.ndarray] = None
     fid_row_offsets: Optional[np.ndarray] = None
+    fid_per_category_counts: Optional[np.ndarray] = None
     if include_fid:
         fid_total = batch_size * 2
         fid_sidecar = np.arange(fid_total, dtype=np.uint32) + tokens_fill
@@ -86,6 +87,15 @@ def _make_result(
                 [np.uint32(0)],
                 np.cumsum(np.full(batch_size, 2, dtype=np.uint32)),
             ),
+        )
+        # Deterministic per-row per-Category counts that sum to 2 per
+        # row (matching the 2-entry-per-row sidecar). Choosing
+        # ``[1, 1, 0]`` lets the cross-binary concat test verify the
+        # stack-along-axis=0 contract without coupling to the
+        # synthetic sidecar's content semantics.
+        fid_per_category_counts = np.tile(
+            np.array([[1, 1, 0]], dtype=np.uint32),
+            (batch_size, 1),
         )
 
     return BatchDecodeResult(
@@ -98,6 +108,7 @@ def _make_result(
         batch_idx_to_section_variant=btv,
         fid_sidecar=fid_sidecar,
         fid_row_offsets=fid_row_offsets,
+        fid_per_category_counts=fid_per_category_counts,
         intermediate=None,
     )
 
@@ -245,6 +256,14 @@ def test_concat_fid_all_present(tmp_path) -> None:
         inner.fid_row_offsets,
         np.array([0, 2, 4, 6], dtype=np.uint32),
     )
+    # Per-row per-Category counts: stack along axis 0, no rebase.
+    assert inner.fid_per_category_counts is not None
+    np.testing.assert_array_equal(
+        inner.fid_per_category_counts,
+        np.concatenate(
+            [a.fid_per_category_counts, b.fid_per_category_counts], axis=0,
+        ),
+    )
 
 
 def test_concat_fid_all_absent() -> None:
@@ -261,6 +280,7 @@ def test_concat_fid_all_absent() -> None:
     out = _concat_results([("alpha", a), ("beta", b)])
     assert out.inner.fid_sidecar is None
     assert out.inner.fid_row_offsets is None
+    assert out.inner.fid_per_category_counts is None
 
 
 def test_concat_fid_mixed_inputs_raises() -> None:

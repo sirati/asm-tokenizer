@@ -92,7 +92,12 @@ def apply_per_row_remap(
     *,
     dedup_maps: dict[Category, HashMapU32U16],
     collect_fid_sidecar: bool = False,
-) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+) -> tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
     """Apply ALG-3 + ALG-4 + ALG-9 per-row remap IN PLACE.
 
     Two passes:
@@ -145,12 +150,18 @@ def apply_per_row_remap(
     Returns
     -------
     tuple
-        ``(identities_flat_caller_local, fid_sidecar, fid_row_offsets)``.
-        The first element is the same array that lives on
-        ``stage3_batch`` (mutated in place); returned for caller
-        convenience so the parent can pipe it into
-        :class:`BatchDecodeResult` without re-reaching. The latter two
-        are ``None`` when ``collect_fid_sidecar=False``.
+        ``(identities_flat_caller_local, fid_sidecar, fid_row_offsets,
+        fid_per_category_counts)``. The first element is the same
+        array that lives on ``stage3_batch`` (mutated in place);
+        returned for caller convenience so the parent can pipe it into
+        :class:`BatchDecodeResult` without re-reaching. The latter
+        three are ``None`` when ``collect_fid_sidecar=False``.
+        ``fid_per_category_counts`` is ``u32[batch_size, 3]`` whose
+        columns follow :data:`FUNCTION_CATEGORIES` order
+        (``LOCAL_FUNC, PLT_FUNC, EXT_FUNC``) and whose entries are the
+        per-row deduped counter cardinality per Category -- i.e. the
+        number of FID sidecar entries the row contributes to each
+        Category. Padding rows are ``(0, 0, 0)``.
     """
     # Validate the dedup_maps shape: the caller must provide exactly
     # one map per FUNCTION Category. A missing map is a wiring bug;
@@ -194,7 +205,7 @@ def apply_per_row_remap(
                 fid_inverse_per_variant[(section_idx, slot_idx)] = row_chunks
 
     if not collect_fid_sidecar:
-        return identities_flat, None, None
+        return identities_flat, None, None, None
 
     # ----- Pass 2: row-keyed FID sidecar emission. -----
     assert fid_inverse_per_variant is not None  # for type-checker
@@ -204,7 +215,18 @@ def apply_per_row_remap(
     # an empty u32 array -- they cannot be referenced by any batch row,
     # but keeping the slot in the flat index preserves the helper's
     # ``(section_idx, slot_idx) -> flat_variant_idx`` lookup contract.
+    #
+    # ``per_variant_category_counts`` parallels ``per_variant_sidecar``
+    # and records the per-Category deduped counter cardinality for the
+    # variant (``len(per_variant[cat])`` in :data:`FUNCTION_CATEGORIES`
+    # order). It is the per-row segment length consumers need to slice
+    # ``fid_sidecar`` per Category. Reading lengths from the inverse
+    # arrays (rather than re-walking ``state.next_fresh_id``) is sound
+    # because the dedup walk extends each Category's inverse list by
+    # exactly the count of fresh ids minted, so list length equals
+    # ``next_fresh_id`` at the end of the walk.
     per_variant_sidecar: list[np.ndarray] = []
+    per_variant_category_counts: list[tuple[int, int, int]] = []
     variants_per_section: list[int] = []
     for section_idx, stage3_section in enumerate(stage3_batch.sections):
         variants_per_section.append(len(stage3_section.variants))
@@ -214,6 +236,7 @@ def apply_per_row_remap(
             )
             if per_variant is None:
                 per_variant_sidecar.append(np.zeros(0, dtype=np.uint32))
+                per_variant_category_counts.append((0, 0, 0))
                 continue
             pieces = [per_variant[cat] for cat in FUNCTION_CATEGORIES]
             row_sidecar = (
@@ -222,6 +245,9 @@ def apply_per_row_remap(
                 else np.zeros(0, dtype=np.uint32)
             )
             per_variant_sidecar.append(row_sidecar)
+            per_variant_category_counts.append(
+                (int(pieces[0].size), int(pieces[1].size), int(pieces[2].size))
+            )
 
     per_row_variant_idx, is_padding = build_per_row_variant_lookup(
         stage1_batch.batch_idx_to_section_variant, variants_per_section
@@ -232,7 +258,41 @@ def apply_per_row_remap(
         is_padding,
         dtype=np.dtype(np.uint32),
     )
-    return identities_flat, fid_sidecar, fid_row_offsets
+    fid_per_category_counts = _expand_per_category_counts_to_rows(
+        per_variant_category_counts,
+        per_row_variant_idx,
+        is_padding,
+    )
+    return identities_flat, fid_sidecar, fid_row_offsets, fid_per_category_counts
+
+
+def _expand_per_category_counts_to_rows(
+    per_variant_category_counts: list[tuple[int, int, int]],
+    per_row_variant_idx: np.ndarray,
+    is_padding: np.ndarray,
+) -> np.ndarray:
+    """Project per-variant ``(LOCAL, PLT, EXT)`` count tuples onto each
+    batch row via the per-row variant lookup.
+
+    Returns ``u32[batch_size, 3]``; padding rows are zero. Multi-mapped
+    variants naturally replicate their counts across every referencing
+    row (matches the per-row sidecar replication done by
+    :func:`concat_per_row`).
+    """
+    batch_size = int(per_row_variant_idx.shape[0])
+    if not per_variant_category_counts:
+        return np.zeros((batch_size, 3), dtype=np.uint32)
+    per_variant_arr = np.asarray(
+        per_variant_category_counts, dtype=np.uint32
+    )  # shape (num_unique_variants, 3)
+    # ``per_row_variant_idx`` is clamped-safe for padding rows (the
+    # caller's contract); the ``np.where`` masks padding rows below.
+    per_row = per_variant_arr[per_row_variant_idx]
+    return np.where(
+        is_padding[:, None],
+        np.uint32(0),
+        per_row,
+    ).astype(np.uint32, copy=False)
 
 
 def _walk_one_variant(

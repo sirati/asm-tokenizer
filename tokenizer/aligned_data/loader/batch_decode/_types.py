@@ -528,6 +528,22 @@ class BatchDecodeResult:
     """``u32[batch_size + 1]``; only when
     ``include_fid_sidecar=True``."""
 
+    fid_per_category_counts: Optional[np.ndarray]
+    """``u32[batch_size, 3]``; only when ``include_fid_sidecar=True``.
+    Per-row per-FUNCTION-Category **deduped counter cardinality** (the
+    length of each per-Category segment in :attr:`fid_sidecar` for that
+    row). Columns follow the
+    :data:`tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants.FUNCTION_CATEGORIES`
+    order: ``[LOCAL_FUNC, PLT_FUNC, EXT_FUNC]``.
+    Padding rows hold ``[0, 0, 0]``.
+    Consumers that need to index :attr:`fid_sidecar` for an in-stream
+    ``(Category, counter_id=K)`` pair compute the per-row base offset as
+    ``fid_row_offsets[i] + sum(fid_per_category_counts[i, :col]) + K``;
+    this avoids re-deriving the per-Category segmentation from the
+    identity stream (which would over-count under recursive calls --
+    multiple in-stream occurrences of the same counter collapse to ONE
+    sidecar entry)."""
+
     intermediate: Optional[Stage3Batch]
     """The full hierarchical :class:`Stage3Batch`; only when
     ``keep_intermediate=True`` (default ``False``)."""

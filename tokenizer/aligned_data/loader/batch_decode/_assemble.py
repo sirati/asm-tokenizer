@@ -163,7 +163,12 @@ def assemble_batch(
     # under a different field name (``identities`` vs the stage-3
     # ``identities_flat_caller_local``).
     dedup_maps = _build_dedup_maps(stage3)
-    identities, fid_sidecar, fid_row_offsets = apply_per_row_remap(
+    (
+        identities,
+        fid_sidecar,
+        fid_row_offsets,
+        fid_per_category_counts,
+    ) = apply_per_row_remap(
         stage3,
         dedup_maps=dedup_maps,
         collect_fid_sidecar=include_fid_sidecar,
@@ -185,5 +190,6 @@ def assemble_batch(
         batch_idx_to_section_variant=stage1.batch_idx_to_section_variant,
         fid_sidecar=fid_sidecar,
         fid_row_offsets=fid_row_offsets,
+        fid_per_category_counts=fid_per_category_counts,
         intermediate=stage3 if keep_intermediate else None,
     )

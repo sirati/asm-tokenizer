@@ -6,21 +6,26 @@ tables (band classification + per-Category emitters) consumed by the
 ``_render_block`` body.
 
 Phase A2 ships the typed Protocol + dataclasses
-(:mod:`tokenizer.inspector._render._protocol`); the legacy per-block
-walker lives at :mod:`tokenizer.inspector._render._legacy` until
-phase A3 surgical-edits its body into ``_render_block.py`` per plan
-section 3 / decision 27. The re-exports below preserve the
+(:mod:`tokenizer.inspector._render._protocol`); phase A2.5 ships the
+band + per-Category dispatch registries
+(:mod:`tokenizer.inspector._render._band` +
+:mod:`tokenizer.inspector._render._category_dispatch`) the two
+rendering backends register into at module load; phase A2.5 also
+re-homes the FTL per-block walker at
+:mod:`tokenizer.inspector._render._render_block` (the canonical body
+both backends evolve through). The re-exports below preserve the
 pre-Wave-5 import surface (``from tokenizer.inspector._render
 import AsmLine, render_block, ...``) so existing call sites + tests
 keep working across the phase chain.
 
-The legacy ``AsmLine`` / ``InlineCallEntry`` / ``InlineJumpEntry`` /
-``LineItem`` types share the shape declared by ``_protocol``;
-post-A3, ``_legacy``'s exports collapse into the Protocol module's
-definitions and the legacy submodule is deleted.
+``AsmLine`` / ``InlineCallEntry`` / ``InlineJumpEntry`` / ``LineItem``
+canonical definitions live in :mod:`._protocol`; ``_render_block``
+re-exports them so a single in-process object identity flows through
+the package -- callers' ``isinstance`` checks agree across both
+import paths.
 """
 
-from tokenizer.inspector._render._legacy import (
+from tokenizer.inspector._render._render_block import (
     AsmLine,
     InlineCallEntry,
     InlineJumpEntry,

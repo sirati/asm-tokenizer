@@ -24,6 +24,7 @@ __all__ = [
     "NOT_FOUND_U16",
     "_CALL_TARGET_TYPE_TO_CATEGORY",
     "_CATEGORY_TO_SHIFTED_ID",
+    "_SHIFTED_ID_TO_CATEGORY",
 ]
 
 
@@ -98,6 +99,22 @@ _CATEGORY_TO_SHIFTED_ID: dict[Category, int] = {
     Category.RO_DATA_PTR: _shifted(6),
     Category.RW_DATA_PTR: _shifted(7),
 }
+
+
+# Inverse of ``_CATEGORY_TO_SHIFTED_ID``. The IDENTITY-band per-row walker
+# (and the inspector's BatchDecode rendering backend) reads a shifted id off
+# the token stream and needs to dispatch to the owning ``Category``; pinning
+# both directions in the same module keeps the forward + inverse maps
+# automatically consistent (a forward-map change reshapes the inverse on
+# import). Built once at module load; injection-safe via the explicit
+# eight-Category total in the forward map.
+_SHIFTED_ID_TO_CATEGORY: dict[int, Category] = {
+    shifted_id: cat for cat, shifted_id in _CATEGORY_TO_SHIFTED_ID.items()
+}
+assert len(_SHIFTED_ID_TO_CATEGORY) == len(_CATEGORY_TO_SHIFTED_ID), (
+    "_CATEGORY_TO_SHIFTED_ID values must be unique; got a collision while "
+    "building the inverse map"
+)
 
 
 # Map ``CallTargetType`` to the FUNCTION Category it produces. The

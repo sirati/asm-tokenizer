@@ -139,12 +139,18 @@ def _concat_results(
     fid_present = [r.fid_sidecar is not None for _, r in per_binary]
     fid_sidecar: Optional[np.ndarray] = None
     fid_offsets: Optional[np.ndarray] = None
+    fid_per_category_counts: Optional[np.ndarray] = None
     if all(fid_present):
         fid_sidecar = np.concatenate(
             [r.fid_sidecar for _, r in per_binary],
         )
         fid_offsets = _concat_row_offsets(
             [r.fid_row_offsets for _, r in per_binary],
+        )
+        # Per-row per-Category counts are dense per-row (no cumsum
+        # rebase needed); stack along axis 0.
+        fid_per_category_counts = np.concatenate(
+            [r.fid_per_category_counts for _, r in per_binary], axis=0,
         )
     elif any(fid_present):
         raise ValueError(
@@ -161,6 +167,7 @@ def _concat_results(
         batch_idx_to_section_variant=btv,
         fid_sidecar=fid_sidecar,
         fid_row_offsets=fid_offsets,
+        fid_per_category_counts=fid_per_category_counts,
         intermediate=None,
     )
     return MultiBinaryBatchDecodeResult(

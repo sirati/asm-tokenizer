@@ -242,6 +242,7 @@ def test_batch_decode_result_frozen():
         batch_idx_to_section_variant=np.zeros((1, 2), dtype=np.uint32),
         fid_sidecar=None,
         fid_row_offsets=None,
+        fid_per_category_counts=None,
         intermediate=None,
     )
     with pytest.raises(FrozenInstanceError):
