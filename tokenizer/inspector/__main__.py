@@ -21,6 +21,9 @@ from pathlib import Path
 
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.session import BinarySession
+from tokenizer.aligned_data.loader.unified_vocab_gate import (
+    load_and_validate_unified_vocab,
+)
 
 from ._args import parse_args
 
@@ -37,7 +40,8 @@ def _open_session(memmap_dir: Path, binary_name: str) -> tuple[BinaryDataset, Bi
     session is returned un-entered; the caller drives ``__enter__`` /
     ``__exit__`` via ``with``.
     """
-    dataset = BinaryDataset(memmap_dir, binary_name)
+    vocab = load_and_validate_unified_vocab(memmap_dir / "unified_vocab.csv")
+    dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab)
     return dataset, dataset.open_session()
 
 
