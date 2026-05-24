@@ -209,13 +209,18 @@ def build_synthetic_binary(tmp_path: Path) -> Dict[str, Any]:
     from tokenizer.aligned_data.loader.function_names_loader import (
         load_function_names,
     )
+    from tokenizer.aligned_data.loader.extern_providers_loader import (
+        load_extern_providers,
+    )
     _, line_to_name = load_function_names(corpus.function_names_sidecar)
+    line_to_provider = load_extern_providers(corpus.extern_providers_sidecar)
 
     metadata = {
         "matched_arm": matched_arm,
         "unmatched_arm": unmatched_arm,
         "offset_to_filename": {variant_offset: "tinybin-x64-gcc-13.2.0-O2"},
         "line_to_name": line_to_name,
+        "line_to_provider": line_to_provider,
     }
     return {
         "base_path": base,
