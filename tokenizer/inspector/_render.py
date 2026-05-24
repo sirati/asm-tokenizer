@@ -1,13 +1,22 @@
 """Block-renderer for the inspector tree.
 
-Single concern: translate ONE block of a Stage1
-:class:`~tokenizer.aligned_data.loader.function_data.FunctionData`
-into an ordered list of typed :class:`LineItem`s
-(:class:`AsmLine` + :class:`InlineCallEntry` + :class:`InlineJumpEntry`).
+Single concern: translate ONE pre-parsed
+:class:`~tokenizer.token_lists.BlockTokenList` into an ordered list
+of typed :class:`LineItem` s (:class:`AsmLine` +
+:class:`InlineCallEntry` + :class:`InlineJumpEntry`).
 
-The block is identified by ``block_idx`` within the function. The
-caller threads in:
+Parsing of the parent :class:`FunctionTokenList` + the per-section
++ per-variant invariants (``kind_to_called_idx`` /
+``variant_pins``) is the tree-model layer's concern -- this renderer
+receives them already built and walks the block's instruction stream
+once. Decoupling parse-from-render keeps the renderer cheap to call
+per inline-jump expansion and obeys the CLAUDE.md "no re-parsing in
+call chains" rule.
 
+The caller threads in:
+
+* ``block`` -- the parent variant's pre-parsed
+  :class:`~tokenizer.token_lists.BlockTokenList`.
 * ``section`` -- parent :class:`~tokenizer.aligned_data.matched_sections_bin.Section`
   (parsed once at function-open time per plan D2). Its
   ``call_targets`` list is the authority for "what does this call
@@ -15,14 +24,21 @@ caller threads in:
   encoder-allocated per-Category counter that maps DIRECTLY to the
   position of the K-th call_target of that ``CallTargetType`` in
   ``section.call_targets`` (see :func:`_kind_to_called_idx`).
-* ``variant_block`` -- the parent's :class:`VariantBlock` for this
-  variant; its ``per_call_entries`` table pins ONE
-  ``section_variant_index`` per ``called_idx`` (per-variant; EXTERN
-  call_targets carry no per_call_entry).
+* ``kind_to_called_idx`` -- per-kind index lists into
+  ``section.call_targets`` (variant-level invariant; the tree model
+  builds it once per variant).
+* ``variant_pins`` -- this variant's ``called_idx ->
+  section_variant_index`` table (variant-level invariant; built once
+  per variant).
 * ``line_to_name`` -- the per-binary
   ``<binary>_function_names.txt`` mapping, used to resolve the
   callee FID -> display name. Lives in
   :mod:`tokenizer.aligned_data.loader.function_names_loader`.
+* ``callee_arm_resolver`` -- closure that maps a section byte offset
+  (``CallTarget.function_section_ptr``) to a
+  :class:`SectionPointerSpec` or ``None`` when the offset doesn't
+  resolve to a known section. Built once per FunctionNode-open by the
+  tree model; the renderer never reaches into session internals.
 
 No Textual imports, no tree-node construction, no string-parsing of
 ``to_asm_like`` output. The discriminator between asm / call / jump
@@ -37,24 +53,17 @@ these line items is :mod:`tokenizer.inspector._tree_model`'s job.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
-
-import numpy as np
+from typing import Callable, Iterable, Mapping
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
-from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
 from tokenizer.aligned_data.matched_sections_bin import (
     MISSING_VARIANT_INDEX,
-    CallTarget,
     Section,
     VariantBlock,
 )
-from tokenizer.function_token_list import FunctionTokenList
+from tokenizer.token_lists import BlockTokenList
 from tokenizer.tokens import TokenType
-
-if TYPE_CHECKING:
-    from tokenizer.aligned_data.loader.function_data import FunctionData
-    from tokenizer.token_manager import VocabularyManager
 
 
 __all__ = [
@@ -85,7 +94,7 @@ class InlineCallEntry:
     ``counter_id`` is the encoder's per-Category counter (= the
     position of the K-th call_target of ``kind`` in
     ``section.call_targets``). ``callee_section_pointer`` is the
-    ``(arm, idx)`` pair the tree-model layer can hand to
+    :class:`SectionPointerSpec` the tree-model layer can hand to
     :func:`batch_decode` when the user expands this node;
     ``None`` for ext calls or for LOCAL/PLT call_targets whose
     ``function_section_ptr`` could not be resolved to a section.
@@ -108,9 +117,9 @@ class InlineCallEntry:
     kind: CallTargetType
     counter_id: int
     callee_name: str
-    callee_section_pointer: Optional[tuple[SectionKind, int]]
+    callee_section_pointer: SectionPointerSpec | None
     variant_idx: int
-    provider: Optional[str]
+    provider: str | None
 
 
 @dataclass(frozen=True)
@@ -120,11 +129,11 @@ class InlineJumpEntry:
     target_block_idx: int
 
 
-LineItem = Union[AsmLine, InlineCallEntry, InlineJumpEntry]
+LineItem = AsmLine | InlineCallEntry | InlineJumpEntry
 
 
 # ---------------------------------------------------------------------------
-# Section-level indices computed once per render_block call
+# Section-level invariants (built once per variant by the tree model)
 # ---------------------------------------------------------------------------
 
 
@@ -140,6 +149,11 @@ def _kind_to_called_idx(section: Section) -> dict[CallTargetType, list[int]]:
     ORDER THE ENCODER'S PER-CATEGORY COUNTER WALKED THEM -- so
     ``counter_id`` from a LOCAL/PLT/EXT_FUNC token maps directly to
     ``section.call_targets[kind_to_idx[kind][counter_id]]``.
+
+    This is variant-level invariant; the tree model
+    (:mod:`tokenizer.inspector._tree_model._nodes_variant`) builds it
+    once per :class:`VariantNode.expand` and threads the result down
+    to every block render.
     """
     kind_to_idx: dict[CallTargetType, list[int]] = {
         k: [] for k in CallTargetType
@@ -159,6 +173,9 @@ def _variant_index_for_called_idx(variant_block: VariantBlock) -> dict[int, int]
     ``_emit_variant_per_call_entries``). EXTERN call_targets are
     filtered out before emission, so their ``called_idx`` is absent
     from the dict.
+
+    Variant-level invariant -- the tree model builds it once per
+    :class:`VariantNode.expand`.
     """
     return {
         int(called_idx): int(section_variant_index)
@@ -188,8 +205,7 @@ def _emit_call_entry(
     section: Section,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
-    arm: SectionKind,
-    callee_arm_resolver,
+    callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
     line_to_name: Mapping[int, str],
 ) -> InlineCallEntry:
     """Build one :class:`InlineCallEntry` from a call-site token.
@@ -201,6 +217,12 @@ def _emit_call_entry(
     ONLY in whether the arm resolver yields a section; that single
     ``Optional`` flows straight into ``callee_section_pointer``.
 
+    An out-of-range ``counter_id`` for the kind raises
+    :class:`IndexError` naturally from the list lookup -- the
+    inspector is a diagnostic tool, surfacing a corrupt counter as a
+    crash points at the encoder bug rather than papering over it with
+    a ``"?"`` placeholder.
+
     ``provider`` is left ``None`` here: for EXTERN call_targets the
     library name is keyed by ``CallTarget.function_section_ptr`` into
     the per-binary ``<binary>_extern_providers.txt`` sidecar, which is
@@ -208,21 +230,13 @@ def _emit_call_entry(
     falls back to ``"?"`` on a ``None`` provider so the EXTERN row's
     ``@?`` suffix shape is preserved until the sidecar is wired in.
     """
-    called_idxs = kind_to_called_idx[kind]
-    if 0 <= counter_id < len(called_idxs):
-        called_idx = called_idxs[counter_id]
-        call_target = section.call_targets[called_idx]
-        callee_section_pointer = callee_arm_resolver(call_target, arm)
-        variant_idx = variant_pins.get(called_idx, MISSING_VARIANT_INDEX)
-        callee_name = line_to_name.get(call_target.function_name_ptr, "?")
-    else:
-        # Counter id has no matching call_target -- the token's id
-        # outran the section's per-kind block. Surface as unresolved
-        # rather than silently swallowing; the inspector is a
-        # diagnostic tool, "?" is the legitimate display.
-        callee_section_pointer = None
-        variant_idx = MISSING_VARIANT_INDEX
-        callee_name = "?"
+    called_idx = kind_to_called_idx[kind][counter_id]
+    call_target = section.call_targets[called_idx]
+    callee_section_pointer = callee_arm_resolver(
+        int(call_target.function_section_ptr)
+    )
+    variant_idx = variant_pins.get(called_idx, MISSING_VARIANT_INDEX)
+    callee_name = line_to_name.get(call_target.function_name_ptr, "?")
 
     return InlineCallEntry(
         kind=kind,
@@ -234,110 +248,39 @@ def _emit_call_entry(
     )
 
 
-def _default_callee_arm_resolver(
-    call_target: CallTarget, arm: SectionKind
-) -> Optional[tuple[SectionKind, int]]:
-    """Stub resolver used when the caller does not supply a session.
-
-    Without a :class:`BinarySession` the inspector cannot map a BIN
-    section byte-offset back to a per-arm idx (only the session's
-    ``_idx_for_section_offset`` knows the per-arm starts arrays).
-    Return ``None`` so downstream nodes render as non-expandable
-    leaves; the real path threads a session-backed resolver in via
-    the ``callee_arm_resolver`` parameter of :func:`render_block`.
-    """
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 
 def render_block(
-    function_data: "FunctionData",
-    section: Section,
-    variant_block: VariantBlock,
-    block_idx: int,
     *,
-    arm: SectionKind,
-    batch_row_idx: int,
-    vocab_manager: "VocabularyManager",
-    fid_sidecar: Optional[np.ndarray],
-    fid_row_offsets: Optional[np.ndarray],
+    block: BlockTokenList,
+    section: Section,
+    kind_to_called_idx: Mapping[CallTargetType, list[int]],
+    variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
-    callee_arm_resolver=_default_callee_arm_resolver,
+    callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
 ) -> list[LineItem]:
     """Walk one block's instructions and emit typed line items.
 
-    Reconstructs the :class:`FunctionTokenList` once, iterates to
-    ``block_idx``, then per instruction yields one :class:`AsmLine`
-    plus -- in token-stream order WITHIN the instruction -- one
-    :class:`InlineCallEntry` per LOCAL_FUNC/PLT_FUNC/EXT_FUNC
-    metatoken and one :class:`InlineJumpEntry` per BLOCK_V2 metatoken.
-    Token-type discrimination is via the structured
-    :class:`TokenType` enum (no string parsing of asm).
+    Iterates ``block.iter_insn`` and per instruction yields one
+    :class:`AsmLine` plus -- in token-stream order WITHIN the
+    instruction -- one :class:`InlineCallEntry` per
+    LOCAL_FUNC/PLT_FUNC/EXT_FUNC metatoken and one
+    :class:`InlineJumpEntry` per BLOCK_V2 metatoken. Token-type
+    discrimination is via the structured :class:`TokenType` enum (no
+    string parsing of asm).
 
-    ``arm`` identifies the section's arm and is passed to
-    ``callee_arm_resolver`` (default: stub returning ``None``; the
-    tree model injects a session-backed resolver wrapping
-    :meth:`BinarySession._idx_for_section_offset` so inline calls
-    can be expanded). ``vocab_manager`` is required because
-    :meth:`FunctionTokenList.reconstruct_func_from_raw_bytes` is
-    non-functional without one (the spec omits it from the signature
-    but the caller threads it from the session anyway).
-    ``batch_row_idx`` / ``fid_sidecar`` / ``fid_row_offsets`` are
-    threaded in for forward-compatibility with the FID-sidecar-based
-    name-resolution path; currently unused here because the per-
-    function pre-remap path via
-    ``section.call_targets[i].function_name_ptr -> line_to_name``
-    resolves callee names directly.
+    The parsed :class:`BlockTokenList` + the section-level invariants
+    are produced ONCE by the tree-model layer's
+    :func:`VariantNode.expand`; rebuilding them here would re-parse
+    the parent :class:`FunctionTokenList` per call (CLAUDE.md "no
+    re-parsing in call chains" rule).
     """
-    # Stage 1: build the FunctionTokenList view over the raw FunctionData.
-    # ``reconstruct_func_from_raw_bytes`` is the existing single-place
-    # codec; calling it here keeps the inspector's read path identical
-    # to every other consumer of ``FunctionData`` (see
-    # :mod:`tokenizer.memmap_validation._validator_mismatch_report`).
-    func_tokens = FunctionTokenList.reconstruct_func_from_raw_bytes(
-        function_data.tokens,
-        function_data.block_runlength,
-        function_data.insn_runlength,
-        vocab_manager,
-    )
-
-    if block_idx < 0 or block_idx >= func_tokens.block_count:
-        raise IndexError(
-            f"block_idx={block_idx} out of bounds "
-            f"(0 <= block_idx < {func_tokens.block_count})"
-        )
-
-    # Stage 2: precompute section-level indices once -- the per-instruction
-    # walk only does O(1) dict lookups thereafter.
-    kind_to_called_idx = _kind_to_called_idx(section)
-    variant_pins = _variant_index_for_called_idx(variant_block)
-
-    # Stage 3: iterate to the target block and walk its instructions.
-    # ``iter_blocks(transient=True)`` reuses one BlockTokenList object,
-    # matching the lazy-view discipline (no copy of metatoken arrays).
-    target_block = None
-    for i, block in enumerate(func_tokens.iter_blocks(transient=True)):
-        if i == block_idx:
-            target_block = block
-            break
-    if target_block is None:
-        # Defensive -- the bounds check above guarantees we hit the
-        # block, but iter_blocks could short-circuit on a corrupt
-        # function (e.g. block_count > yielded count). Surface as a
-        # typed error instead of silently returning [].
-        raise RuntimeError(
-            f"iter_blocks() yielded fewer than {block_idx + 1} blocks "
-            f"for function with block_count={func_tokens.block_count}"
-        )
-
     return list(
         _walk_block_instructions(
-            target_block,
-            arm=arm,
+            block,
             section=section,
             kind_to_called_idx=kind_to_called_idx,
             variant_pins=variant_pins,
@@ -348,14 +291,13 @@ def render_block(
 
 
 def _walk_block_instructions(
-    block,
+    block: BlockTokenList,
     *,
-    arm: SectionKind,
     section: Section,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
-    callee_arm_resolver,
+    callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
 ) -> Iterable[LineItem]:
     """Per-instruction generator: one :class:`AsmLine` then any inline
     call/jump entries from the instruction's metatoken stream."""
@@ -363,7 +305,6 @@ def _walk_block_instructions(
         yield AsmLine(text=insn.to_asm_like())
         yield from _emit_inline_entries(
             insn,
-            arm=arm,
             section=section,
             kind_to_called_idx=kind_to_called_idx,
             variant_pins=variant_pins,
@@ -375,12 +316,11 @@ def _walk_block_instructions(
 def _emit_inline_entries(
     insn,
     *,
-    arm: SectionKind,
     section: Section,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
-    callee_arm_resolver,
+    callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
 ) -> Iterable[LineItem]:
     """Inline call/jump items for ONE instruction.
 
@@ -399,7 +339,6 @@ def _emit_inline_entries(
                 section=section,
                 kind_to_called_idx=kind_to_called_idx,
                 variant_pins=variant_pins,
-                arm=arm,
                 callee_arm_resolver=callee_arm_resolver,
                 line_to_name=line_to_name,
             )
