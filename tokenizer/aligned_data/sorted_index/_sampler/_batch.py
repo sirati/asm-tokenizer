@@ -6,6 +6,24 @@ binary, opens one :class:`BinarySession` per binary via
 ``session_factory``, runs :func:`batch_decode` over each group, and
 concatenates the per-binary results via :func:`_concat_results`.
 
+One-collector-per-batch_load contract:
+
+The helper drives a SINGLE :class:`BucketedRunLengthCollector` across
+every per-binary Stage 1 walk in the batch_load. Per-binary
+``batch_decode`` calls run in the deferred dispatch shape
+(``collector`` provided): each call returns a
+:class:`PendingBatchDecode` whose Stage 1 has been staged but not
+flushed. After every binary's Stage 1 has been staged, the helper
+flushes the collector ONCE -- that single 2D pow2-bucketed
+``run_lengths`` dispatch amortises across every call_target row in
+the whole batch_load. Each pending decode is then finalised, running
+its own Stages 2-4 against the now-finalised :class:`Stage1Batch`.
+
+Every per-binary session stays open through both the staging phase AND
+the finalise phase (because Stages 2-4 read numpy views that may be
+memmap-backed by the session). :class:`contextlib.ExitStack` manages
+the multi-session lifecycle.
+
 Binary ordering: per-binary results are concatenated in alphabetical
 ``binary_name`` order (the same order
 :attr:`MultiBinarySortedIndexSampler.binary_names` exposes). This
@@ -19,15 +37,22 @@ any internal stage helpers.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import Callable, ContextManager, Dict, List, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.loader.batch_decode._entry import batch_decode
+from tokenizer.aligned_data.loader.batch_decode._entry import (
+    PendingBatchDecode,
+    batch_decode,
+)
 from tokenizer.aligned_data.loader.batch_decode._types import (
     BatchDecodeResult,
     SectionPointerSpec,
     VariantPadding,
+)
+from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
+    BucketedRunLengthCollector,
 )
 from tokenizer.aligned_data.loader.session import BinarySession
 
@@ -112,13 +137,24 @@ def open_length_bucketed_batch(
     # Iterate per-binary work in alphabetical order so the concat
     # input list is canonical and the resulting binary_id_per_row
     # numbering is stable.
-    per_binary_results: List[Tuple[str, BatchDecodeResult]] = []
-    for binary_name in sampler.binary_names:
-        section_pointers = per_binary_pointers.get(binary_name)
-        if section_pointers is None:
-            continue
-        with session_factory(binary_name) as session:
-            result = batch_decode(
+    #
+    # One collector spans every per-binary Stage 1 walk; one flush
+    # amortises every call_target row's ``run_lengths`` across the
+    # whole batch_load. The ExitStack keeps every session alive
+    # through both the staging phase AND the post-flush finalise
+    # phase, because the finalised Stage 1 + Stages 2-4 may read
+    # numpy views backed by session-owned memmaps.
+    collector = BucketedRunLengthCollector()
+    pending_decodes: List[Tuple[str, PendingBatchDecode]] = []
+    with ExitStack() as session_stack:
+        for binary_name in sampler.binary_names:
+            section_pointers = per_binary_pointers.get(binary_name)
+            if section_pointers is None:
+                continue
+            session = session_stack.enter_context(
+                session_factory(binary_name)
+            )
+            pending = batch_decode(
                 session,
                 section_pointers,
                 num_variants_per_section=num_variants_per_section,
@@ -131,7 +167,17 @@ def open_length_bucketed_batch(
                 include_fid_sidecar=include_fid_sidecar,
                 keep_intermediate=False,
                 rng=rng,
+                collector=collector,
             )
-        per_binary_results.append((binary_name, result))
+            pending_decodes.append((binary_name, pending))
+
+        # ONE flush -- one pow2-bucketed 2D run_lengths dispatch per
+        # bucket across every binary's call_target rows.
+        runlen_results = collector.flush()
+
+        per_binary_results: List[Tuple[str, BatchDecodeResult]] = [
+            (binary_name, pending.finalise(runlen_results))
+            for binary_name, pending in pending_decodes
+        ]
 
     return _concat_results(per_binary_results)
