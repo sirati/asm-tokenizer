@@ -10,6 +10,7 @@ reader, sampler, batch helper) lands in later phases.
 
 from __future__ import annotations
 
+from ._length_compute import compute_reduced_lengths
 from ._modes import parse_reduction
 from ._types import (
     LengthReduction,
@@ -24,6 +25,7 @@ __all__ = [
     "MultiBinaryBatchDecodeResult",
     "MultiBinarySectionPointer",
     "ReductionKind",
+    "compute_reduced_lengths",
     "encode_sorted_index",
     "parse_header",
     "parse_reduction",
