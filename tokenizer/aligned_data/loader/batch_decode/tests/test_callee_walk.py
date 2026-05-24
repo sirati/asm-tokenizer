@@ -57,20 +57,26 @@ from tokenizer.tokens import Category
 # ---------------------------------------------------------------------------
 
 
-def _make_function_data(name: str) -> FunctionData:
+def _make_function_data(
+    name: str,
+    *,
+    variant_tokens: Optional[np.ndarray] = None,
+) -> FunctionData:
     # ``build_inline_decode_state``'s ``run_lengths`` precondition
     # requires position 0 to be False (i.e. not a number-band token);
     # a single non-number token (>= 272 -- past the eager block in the
     # unified vocab) is the minimal valid stream that satisfies the
     # precondition without exercising any inline-byte / sign logic the
     # walker doesn't care about.
+    if variant_tokens is None:
+        variant_tokens = np.zeros(0, dtype=np.uint16)
     return FunctionData(
         func_name=name,
         metadata={"arch": "x86_64", "compiler": "gcc", "opt": "O2"},
         tokens=np.array([300], dtype=np.uint16),
         insn_runlength=np.array([1], dtype=np.uint32),
         block_runlength=np.array([1], dtype=np.uint32),
-        variant_tokens=np.zeros(0, dtype=np.uint16),
+        variant_tokens=variant_tokens,
     )
 
 
@@ -736,6 +742,60 @@ def test_negative_max_depth_rejected() -> None:
             max_depth=-1,
             inlined_equivalent_call_targets_only=False,
         )
+
+
+def test_variant_tokens_prepended_only_at_root_not_at_callees() -> None:
+    """Per-row variant-axis contract: the root call_target's
+    ``state.raw_tokens`` is ``variant_tokens + body_tokens``
+    (:meth:`FunctionData.full_token_stream`); every inlined callee's
+    ``state.raw_tokens`` is ``body_tokens`` only.
+
+    Each splice tree shares one compilation variant axis, so repeating
+    the variant-axis prefix at every callee splice point would waste
+    context. The root carries them once for the whole row; callees
+    contribute body-only token streams.
+    """
+    axis_tokens = np.array([280, 281, 282], dtype=np.uint16)
+    callee_section = _make_section(section_offset=200, function_name_ptr=2)
+    callee_fd = _make_function_data("callee", variant_tokens=axis_tokens)
+    root_section = _make_section(
+        section_offset=100,
+        function_name_ptr=1,
+        call_targets=[_ct_local(fid=2, target_offset=200)],
+        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+    )
+    root_fd = _make_function_data("root", variant_tokens=axis_tokens)
+
+    session = _FakeSession()
+    session.add_matched(root_section, {0: root_fd})
+    session.add_matched(callee_section, {0: callee_fd})
+
+    out = walk_callees(
+        session=session,
+        root_arm=SectionKind.MATCHED,
+        root_section=root_section,
+        root_variant_idx=0,
+        root_function_data=root_fd,
+        root_function_name_ptr=1,
+        max_depth=5,
+        inlined_equivalent_call_targets_only=False,
+    )
+
+    assert len(out) == 2
+    # Root: state.raw_tokens == variant_tokens + body_tokens
+    # (i.e. ``full_token_stream()``).
+    np.testing.assert_array_equal(
+        out[0].state.raw_tokens, root_fd.full_token_stream()
+    )
+    assert int(out[0].state.raw_tokens.shape[0]) == (
+        int(axis_tokens.shape[0]) + int(root_fd.tokens.shape[0])
+    )
+    # Callee: state.raw_tokens == body_tokens only -- variant_tokens
+    # are NOT prepended again at the splice point.
+    np.testing.assert_array_equal(out[1].state.raw_tokens, callee_fd.tokens)
+    assert int(out[1].state.raw_tokens.shape[0]) == int(
+        callee_fd.tokens.shape[0]
+    )
 
 
 def test_unmatched_arm_uses_load_unmatched_for_splice() -> None:

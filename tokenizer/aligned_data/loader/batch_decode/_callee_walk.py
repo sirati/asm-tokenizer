@@ -316,8 +316,11 @@ def _try_resolve_callee(
             session._load_unmatched_for_splice(callee_idx)
         )
 
+    # Variant tokens are prepended once per ROW (only the root carries
+    # them); inlined callees feed body-only into the decode state so
+    # the row never repeats the variant-axis prefix at each splice.
     callee_state = build_inline_decode_state(
-        callee_fd.full_token_stream(), format_version=1
+        callee_fd.tokens, format_version=1
     )
     callee_st1 = Stage1CallTarget(
         function_data=callee_fd,

@@ -357,25 +357,31 @@ def test_batch_decode_end_to_end_synthetic(tmp_path) -> None:
     assert row0_identities.dtype == np.uint16
 
 
-def test_batch_decode_prepends_variant_tokens_per_call_target(tmp_path) -> None:
-    """Each call_target's slice starts with its encounter-category self-token
-    immediately followed by that function's variant-axis tokens.
+def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
+    """Each row's variant-axis prefix is contributed ONCE, by the root
+    call_target. Inlined callees never re-emit variant_tokens.
 
-    The unified-vocab v2 wire-form stream per function is
-    conceptually ``variant_tokens + body_tokens``;
-    :meth:`FunctionData.full_token_stream` concatenates them. Stage 1
-    (:mod:`._callee_walk`) feeds ``full_token_stream()`` into
-    :func:`build_inline_decode_state` for the root AND every inlined
-    callee, so variant_tokens flow through ``InlineDecodeState`` as
-    real tokens (``raw_tokens > 256``) just like instruction reps. They
+    Every function in a single splice tree shares the same compilation
+    variant axis (same binary -> same arch/compiler/opt), so the
+    variant-axis prefix is a row-level property, not a per-function one.
+    Stage 1 (:mod:`._callee_walk`) reflects this by feeding the root's
+    :meth:`FunctionData.full_token_stream` (=
+    ``variant_tokens + body_tokens``) into
+    :func:`build_inline_decode_state` for the root and feeding
+    ``FunctionData.tokens`` (body only) for every inlined callee. The
+    root's variant_tokens flow through ``InlineDecodeState`` as real
+    tokens (``raw_tokens > 256``) just like instruction reps; they
     survive Stage 2's strip + shift (``id - 256``) and land in the
-    expanded stream right after each call_target's prepended
-    encounter-category self-token (plan D3 / ALG-9).
+    expanded stream right after the row's leading encounter-category
+    self-token (plan D3 / ALG-9).
 
-    This test locks in that contract end-to-end: variant axis IDs land
-    verbatim in the model-facing token tensor, post-shift, immediately
-    after the LOCAL_FUNC prepend, for every call_target -- closing the
-    "did the variant axis make it to the model?" question.
+    This test locks in that contract end-to-end at the model-facing
+    token tensor: every row begins with ``[LOCAL_FUNC prepend,
+    variant_tokens shifted, body_tokens shifted, ...]``. The
+    walker-level proof that callees do NOT also carry the variant_tokens
+    prefix lives in :func:`test_variant_tokens_prepended_only_at_root_not_at_callees`
+    in ``test_callee_walk.py``; the synthetic ``BinarySession`` fixture
+    here has no real callees in any of its rows.
     """
     from tokenizer.token_manager import VocabularyManager
 
