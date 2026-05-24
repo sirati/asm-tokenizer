@@ -44,8 +44,16 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 
+from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
+    BucketedRunLengthCollector,
+)
+
 from ._batch_layout import UINT32_MAX, compute_batch_idx_mapping
-from ._callee_walk import walk_callees
+from ._callee_walk import (
+    PendingCallTarget,
+    finalise_pending_call_targets,
+    walk_callees_pending,
+)
 from ._resolve_pointers import ResolvedSection, resolve_section_pointers
 from ._types import (
     SectionPointerSpec,
@@ -111,19 +119,50 @@ def walk_sections(
         rng=rng,
     )
 
-    # --- step 3+4: per resolved section, build Stage1Section ------------
+    # --- step 3a: drive ONE collector across every (section, variant) ---
+    # The pending pattern lets us amortise `run_lengths` over every
+    # call_target row in the batch: one pow2-bucketed 2D dispatch per
+    # bucket on flush.
+    collector = BucketedRunLengthCollector()
+    pending_per_variant: List[List[List[PendingCallTarget]]] = []
+    for rs in resolved:
+        section_pending: List[List[PendingCallTarget]] = []
+        for slot_v, variant_idx_in_section in enumerate(
+            rs.sampled_variant_indices
+        ):
+            root_function_data = rs.function_data_per_sampled_variant[slot_v]
+            section_pending.append(
+                walk_callees_pending(
+                    session=session,
+                    root_arm=rs.arm,
+                    root_section=rs.section,
+                    root_variant_idx=variant_idx_in_section,
+                    root_function_data=root_function_data,
+                    root_function_name_ptr=int(rs.section.function_name_ptr),
+                    max_depth=max_depth,
+                    inlined_equivalent_call_targets_only=(
+                        inlined_equivalent_call_targets_only
+                    ),
+                    collector=collector,
+                )
+            )
+        pending_per_variant.append(section_pending)
+
+    # --- step 3b: flush the collector + finalise pending rows ----------
+    runlen_results = collector.flush()
+
+    # --- step 3c+4: build the frozen Stage1 tree from finalised rows ---
     sections: List[Stage1Section] = []
-    for section_idx, rs in enumerate(resolved):
+    for section_idx, (rs, section_pending) in enumerate(
+        zip(resolved, pending_per_variant)
+    ):
         sections.append(
             _build_stage1_section(
-                session=session,
                 section_idx=section_idx,
                 resolved=rs,
+                section_pending=section_pending,
+                runlen_results=runlen_results,
                 batch_idx_to_section_variant=batch_idx_to_section_variant,
-                max_depth=max_depth,
-                inlined_equivalent_call_targets_only=(
-                    inlined_equivalent_call_targets_only
-                ),
             )
         )
 
@@ -141,20 +180,19 @@ def walk_sections(
 
 def _build_stage1_section(
     *,
-    session: "BinarySession",
     section_idx: int,
     resolved: ResolvedSection,
+    section_pending: List[List[PendingCallTarget]],
+    runlen_results: dict[int, np.ndarray],
     batch_idx_to_section_variant: np.ndarray,
-    max_depth: int,
-    inlined_equivalent_call_targets_only: bool,
 ) -> Stage1Section:
-    """Build one :class:`Stage1Section` from a resolved pointer.
+    """Build one :class:`Stage1Section` from a resolved pointer + the
+    per-variant pending rows collected during the DFS pass.
 
-    Per slot ``v`` in ``resolved.sampled_variant_indices``: read the
-    body's :class:`FunctionData` from
-    :attr:`ResolvedSection.function_data_per_sampled_variant`, walk the
-    splice tree via :func:`walk_callees`, and assemble the
-    :class:`Stage1Variant`.
+    Finalisation happens here -- the pending rows for each variant are
+    handed to :func:`finalise_pending_call_targets`, which consumes the
+    shared collector's flush result to construct the per-row
+    :class:`InlineDecodeState` + :class:`Stage1CallTarget` entries.
     """
     variants: List[Stage1Variant] = []
     for slot_v, variant_idx_in_section in enumerate(
@@ -162,16 +200,13 @@ def _build_stage1_section(
     ):
         variants.append(
             _build_stage1_variant(
-                session=session,
                 section_idx=section_idx,
                 slot_v=slot_v,
                 variant_idx_in_section=variant_idx_in_section,
                 resolved=resolved,
+                variant_pending=section_pending[slot_v],
+                runlen_results=runlen_results,
                 batch_idx_to_section_variant=batch_idx_to_section_variant,
-                max_depth=max_depth,
-                inlined_equivalent_call_targets_only=(
-                    inlined_equivalent_call_targets_only
-                ),
             )
         )
 
@@ -185,31 +220,20 @@ def _build_stage1_section(
 
 def _build_stage1_variant(
     *,
-    session: "BinarySession",
     section_idx: int,
     slot_v: int,
     variant_idx_in_section: int,
     resolved: ResolvedSection,
+    variant_pending: List[PendingCallTarget],
+    runlen_results: dict[int, np.ndarray],
     batch_idx_to_section_variant: np.ndarray,
-    max_depth: int,
-    inlined_equivalent_call_targets_only: bool,
 ) -> Stage1Variant:
-    """Build one :class:`Stage1Variant`: read pre-loaded body + DFS
-    callees + pick :attr:`Stage1Variant.batch_idx`.
+    """Build one :class:`Stage1Variant`: finalise pending rows into
+    :class:`Stage1CallTarget` instances + pick
+    :attr:`Stage1Variant.batch_idx`.
     """
-    root_function_data = resolved.function_data_per_sampled_variant[slot_v]
-
-    call_targets: List[Stage1CallTarget] = walk_callees(
-        session=session,
-        root_arm=resolved.arm,
-        root_section=resolved.section,
-        root_variant_idx=variant_idx_in_section,
-        root_function_data=root_function_data,
-        root_function_name_ptr=int(resolved.section.function_name_ptr),
-        max_depth=max_depth,
-        inlined_equivalent_call_targets_only=(
-            inlined_equivalent_call_targets_only
-        ),
+    call_targets: List[Stage1CallTarget] = finalise_pending_call_targets(
+        variant_pending, runlen_results
     )
 
     batch_idx = _first_batch_row_for_slot(
