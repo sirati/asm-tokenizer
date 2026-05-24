@@ -229,13 +229,13 @@ def _extract_called_funcs(
     The library dict is only populated by v2; v1 always returns ``{}``.
     """
     if "metadata" in column_index:
-        return _called_from_v2_metadata(row[column_index["metadata"]])
+        return called_from_v2_metadata(row[column_index["metadata"]])
     if "opaque_metadata" in column_index:
         return _called_from_v1_opaque_metadata(row[column_index["opaque_metadata"]])
     return [], {}
 
 
-def _called_from_v2_metadata(
+def called_from_v2_metadata(
     metadata_cell: str,
 ) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
     if not metadata_cell:

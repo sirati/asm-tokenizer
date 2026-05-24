@@ -48,6 +48,8 @@ runs before ``_split_to_chunks`` so f128 NaN / Inf is one chunk, not two.
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import numpy as np
 
 __all__ = [
@@ -56,6 +58,8 @@ __all__ = [
     "TARGET_EXPONENT_BIAS",
     "INFNAN_EXPONENT_UNBIASED",
     "pack_sign_exp",
+    "unpack_chunk",
+    "reconstruct_chunks",
     "from_int",
     "from_float16",
     "from_bfloat16",
@@ -92,6 +96,41 @@ def pack_sign_exp(sign: int, exponent_unbiased: int) -> np.uint32:
         )
     sign_bit = 0 if sign >= 0 else _SIGN_BIT
     return np.uint32(sign_bit | biased)
+
+
+def unpack_chunk(pair: tuple[np.uint64, np.uint32]) -> tuple[int, int, int]:
+    """Return (sig:int, sign:+1/-1, exponent_unbiased:int)."""
+    sig, sign_exp = pair
+    sign_exp_int = int(sign_exp)
+    sign = -1 if (sign_exp_int >> 31) & 1 else +1
+    biased = sign_exp_int & ((1 << 31) - 1)
+    return int(sig), sign, biased - TARGET_EXPONENT_BIAS
+
+
+def reconstruct_chunks(chunks: list[tuple[np.uint64, np.uint32]]) -> Fraction:
+    """Reconstruct the signed value (exact Fraction) from chunks.
+
+    Convention: value = sign * sig * 2**exp.  Signed-zero chunks contribute
+    nothing to the magnitude; non-zero chunks must share the same sign.
+    NaN / Inf sentinels are NOT handled here — those tests inspect the
+    sentinel exponent directly.
+    """
+    magnitude = Fraction(0)
+    sign_seen: int | None = None
+    for sig, sign, exp in (unpack_chunk(c) for c in chunks):
+        if sig == 0:
+            continue
+        contribution = (
+            Fraction(sig << exp, 1) if exp >= 0 else Fraction(sig, 1 << (-exp))
+        )
+        magnitude += contribution
+        if sign_seen is None:
+            sign_seen = sign
+        else:
+            assert sign == sign_seen, (
+                f"chunks disagree on sign: {sign_seen} vs {sign}"
+            )
+    return sign_seen * magnitude if sign_seen is not None else Fraction(0)
 
 
 def _encode_infnan(*, sign: int, mantissa_is_zero: bool) -> tuple[np.uint64, np.uint32]:

@@ -15,7 +15,7 @@ The loader-side docstring at
 :class:`CallTargetType` and concatenated LOCAL → PLT → EXT. The
 per-row :attr:`ParsedRecord.called_funcs` already satisfies the
 invariant (see
-:func:`tokenizer.aligned_data.parsed_record_iter._called_from_v2_metadata`),
+:func:`tokenizer.aligned_data.parsed_record_iter.called_from_v2_metadata`),
 but an inline first-seen union across variants interleaves categories
 when later variants contribute a novel callee whose category sits
 ahead of an already-seen category. Centralising the union here lets

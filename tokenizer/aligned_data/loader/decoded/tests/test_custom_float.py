@@ -34,44 +34,9 @@ from tokenizer.aligned_data.loader.decoded.custom_float import (
     from_float128,
     from_int,
     pack_sign_exp,
+    reconstruct_chunks,
+    unpack_chunk,
 )
-
-
-# ----- helpers -----------------------------------------------------------------
-
-def _unpack(pair: tuple[np.uint64, np.uint32]) -> tuple[int, int, int]:
-    """Return (sig:int, sign:+1/-1, exponent_unbiased:int)."""
-    sig, sign_exp = pair
-    sign_exp_int = int(sign_exp)
-    sign = -1 if (sign_exp_int >> 31) & 1 else +1
-    biased = sign_exp_int & ((1 << 31) - 1)
-    return int(sig), sign, biased - TARGET_EXPONENT_BIAS
-
-
-def _reconstruct(chunks: list[tuple[np.uint64, np.uint32]]) -> Fraction:
-    """Reconstruct the signed value (exact Fraction) from chunks.
-
-    Convention: value = sign * sig * 2**exp.  Signed-zero chunks contribute
-    nothing to the magnitude; non-zero chunks must share the same sign.
-    NaN / Inf sentinels are NOT handled here — those tests inspect the
-    sentinel exponent directly.
-    """
-    magnitude = Fraction(0)
-    sign_seen: int | None = None
-    for sig, sign, exp in (_unpack(c) for c in chunks):
-        if sig == 0:
-            continue
-        contribution = (
-            Fraction(sig << exp, 1) if exp >= 0 else Fraction(sig, 1 << (-exp))
-        )
-        magnitude += contribution
-        if sign_seen is None:
-            sign_seen = sign
-        else:
-            assert sign == sign_seen, (
-                f"chunks disagree on sign: {sign_seen} vs {sign}"
-            )
-    return sign_seen * magnitude if sign_seen is not None else Fraction(0)
 
 
 # ----- pack_sign_exp -----------------------------------------------------------
@@ -133,18 +98,18 @@ def test_from_int_zero_negative_signed_zero():
 def test_from_int_one():
     chunks = from_int(1, sign=+1)
     assert len(chunks) == 1
-    sig, sign, exp = _unpack(chunks[0])
+    sig, sign, exp = unpack_chunk(chunks[0])
     assert sig == 1 << 63
     assert sign == +1
     assert exp == -63
-    assert _reconstruct(chunks) == 1
+    assert reconstruct_chunks(chunks) == 1
 
 
 def test_from_int_two():
     chunks = from_int(2, sign=+1)
-    sig, _, exp = _unpack(chunks[0])
+    sig, _, exp = unpack_chunk(chunks[0])
     assert sig == 1 << 63 and exp == -62
-    assert _reconstruct(chunks) == 2
+    assert reconstruct_chunks(chunks) == 2
 
 
 def test_from_int_negative_value_raises():
@@ -155,44 +120,44 @@ def test_from_int_negative_value_raises():
 def test_from_int_max_u64():
     chunks = from_int((1 << 64) - 1, sign=+1)
     assert len(chunks) == 1
-    sig, _, exp = _unpack(chunks[0])
+    sig, _, exp = unpack_chunk(chunks[0])
     assert sig == (1 << 64) - 1
     assert exp == 0
-    assert _reconstruct(chunks) == (1 << 64) - 1
+    assert reconstruct_chunks(chunks) == (1 << 64) - 1
 
 
 def test_from_int_2_pow_64_low_chunk_signed_zero():
     chunks = from_int(1 << 64, sign=+1)
     assert len(chunks) == 2
-    low_sig, low_sign, low_exp = _unpack(chunks[0])
+    low_sig, low_sign, low_exp = unpack_chunk(chunks[0])
     assert low_sig == 0
     assert low_sign == +1
     assert low_exp == 0
-    high_sig, high_sign, high_exp = _unpack(chunks[1])
+    high_sig, high_sign, high_exp = unpack_chunk(chunks[1])
     assert high_sig == 1 << 63
     assert high_sign == +1
     assert high_exp == 1
-    assert _reconstruct(chunks) == 1 << 64
+    assert reconstruct_chunks(chunks) == 1 << 64
 
 
 def test_from_int_2_pow_64_negative_sign_on_both_chunks():
     chunks = from_int(1 << 64, sign=-1)
     for pair in chunks:
-        _, sign, _ = _unpack(pair)
+        _, sign, _ = unpack_chunk(pair)
         assert sign == -1
-    assert _reconstruct(chunks) == -(1 << 64)
+    assert reconstruct_chunks(chunks) == -(1 << 64)
 
 
 def test_from_int_2_pow_128_minus_1():
     chunks = from_int((1 << 128) - 1, sign=+1)
     assert len(chunks) == 2
-    low_sig, _, low_exp = _unpack(chunks[0])
-    high_sig, _, high_exp = _unpack(chunks[1])
+    low_sig, _, low_exp = unpack_chunk(chunks[0])
+    high_sig, _, high_exp = unpack_chunk(chunks[1])
     assert low_sig == (1 << 64) - 1
     assert low_exp == 0
     assert high_sig == (1 << 64) - 1
     assert high_exp == 64
-    assert _reconstruct(chunks) == (1 << 128) - 1
+    assert reconstruct_chunks(chunks) == (1 << 128) - 1
 
 
 def test_from_int_random_u192_roundtrip():
@@ -201,7 +166,7 @@ def test_from_int_random_u192_roundtrip():
         value = rng.randrange(1 << 192)
         chunks = from_int(value, sign=+1)
         assert len(chunks) == max(1, (value.bit_length() + 63) // 64)
-        assert _reconstruct(chunks) == value
+        assert reconstruct_chunks(chunks) == value
 
 
 def test_from_int_random_signed_u192_roundtrip():
@@ -209,7 +174,7 @@ def test_from_int_random_signed_u192_roundtrip():
     for _ in range(20):
         magnitude = rng.randrange(1, 1 << 192)
         chunks = from_int(magnitude, sign=-1)
-        assert _reconstruct(chunks) == -magnitude
+        assert reconstruct_chunks(chunks) == -magnitude
 
 
 def test_from_int_zero_chunk_in_middle():
@@ -217,13 +182,13 @@ def test_from_int_zero_chunk_in_middle():
     value = (1 << 128) | 1
     chunks = from_int(value, sign=-1)
     assert len(chunks) == 3
-    low_sig, low_sign, low_exp = _unpack(chunks[0])
-    mid_sig, mid_sign, mid_exp = _unpack(chunks[1])
-    high_sig, high_sign, high_exp = _unpack(chunks[2])
+    low_sig, low_sign, low_exp = unpack_chunk(chunks[0])
+    mid_sig, mid_sign, mid_exp = unpack_chunk(chunks[1])
+    high_sig, high_sign, high_exp = unpack_chunk(chunks[2])
     assert low_sig == 1 << 63 and low_exp == -63 and low_sign == -1
     assert mid_sig == 0 and mid_sign == -1 and mid_exp == 64
     assert high_sig == 1 << 63 and high_exp == 128 - 63 and high_sign == -1
-    assert _reconstruct(chunks) == -value
+    assert reconstruct_chunks(chunks) == -value
 
 
 # ----- FP helpers --------------------------------------------------------------
@@ -274,7 +239,7 @@ def _bf16_bits(sign: int, biased_exp: int, mantissa7: int) -> int:
 
 
 def _is_infnan_sentinel(pair: tuple[np.uint64, np.uint32]) -> bool:
-    _, _, exp = _unpack(pair)
+    _, _, exp = unpack_chunk(pair)
     return exp == INFNAN_EXPONENT_UNBIASED
 
 
@@ -282,78 +247,78 @@ def _is_infnan_sentinel(pair: tuple[np.uint64, np.uint32]) -> bool:
 
 def test_from_float32_positive_zero():
     chunks = from_float32(_f32_bits(0.0))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == +1
 
 
 def test_from_float32_negative_zero():
     chunks = from_float32(_f32_bits(-0.0))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == -1
 
 
 def test_from_float32_one():
     chunks = from_float32(_f32_bits(1.0))
-    assert _reconstruct(chunks) == 1
-    sig, _, _ = _unpack(chunks[0])
+    assert reconstruct_chunks(chunks) == 1
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1 << 63  # normalized
 
 
 def test_from_float32_negative_one():
     chunks = from_float32(_f32_bits(-1.0))
-    assert _reconstruct(chunks) == -1
+    assert reconstruct_chunks(chunks) == -1
 
 
 def test_from_float32_smallest_normal():
     # 2**-126
     chunks = from_float32(1 << 23)
-    assert _reconstruct(chunks) == Fraction(1, 1 << 126)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 126)
 
 
 def test_from_float32_smallest_denormal():
     # 2**-149
     chunks = from_float32(1)
-    assert _reconstruct(chunks) == Fraction(1, 1 << 149)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 149)
 
 
 def test_from_float32_largest_finite():
     bits = (254 << 23) | ((1 << 23) - 1)
     chunks = from_float32(bits)
     # largest f32 = (2**24 - 1) * 2**104
-    assert _reconstruct(chunks) == ((1 << 24) - 1) * (1 << 104)
+    assert reconstruct_chunks(chunks) == ((1 << 24) - 1) * (1 << 104)
 
 
 def test_from_float32_positive_inf():
     chunks = from_float32(255 << 23)
     assert _is_infnan_sentinel(chunks[0])
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == +1
 
 
 def test_from_float32_negative_inf():
     chunks = from_float32((1 << 31) | (255 << 23))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == -1
     assert _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float32_quiet_nan_collapses_to_sig_one():
     chunks = from_float32((255 << 23) | (1 << 22))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 1 and sign == +1
     assert _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float32_signalling_nan_collapses_to_sig_one():
     chunks = from_float32((255 << 23) | 1)
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1
     assert _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float32_negative_nan():
     chunks = from_float32((1 << 31) | (255 << 23) | (1 << 22))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 1 and sign == -1
     assert _is_infnan_sentinel(chunks[0])
 
@@ -373,53 +338,53 @@ def test_from_float32_random_normals_lossless():
             expected_value = Fraction(expected_sign * expected_mantissa * (1 << expected_exp), 1)
         else:
             expected_value = Fraction(expected_sign * expected_mantissa, 1 << (-expected_exp))
-        assert _reconstruct(chunks) == expected_value
+        assert reconstruct_chunks(chunks) == expected_value
 
 
 # ----- from_float64 ------------------------------------------------------------
 
 def test_from_float64_positive_zero():
-    sig, sign, _ = _unpack(from_float64(_f64_bits(0.0))[0])
+    sig, sign, _ = unpack_chunk(from_float64(_f64_bits(0.0))[0])
     assert sig == 0 and sign == +1
 
 
 def test_from_float64_negative_zero():
-    sig, sign, _ = _unpack(from_float64(_f64_bits(-0.0))[0])
+    sig, sign, _ = unpack_chunk(from_float64(_f64_bits(-0.0))[0])
     assert sig == 0 and sign == -1
 
 
 def test_from_float64_one():
-    assert _reconstruct(from_float64(_f64_bits(1.0))) == 1
+    assert reconstruct_chunks(from_float64(_f64_bits(1.0))) == 1
 
 
 def test_from_float64_negative_one():
-    assert _reconstruct(from_float64(_f64_bits(-1.0))) == -1
+    assert reconstruct_chunks(from_float64(_f64_bits(-1.0))) == -1
 
 
 def test_from_float64_smallest_normal():
-    assert _reconstruct(from_float64(1 << 52)) == Fraction(1, 1 << 1022)
+    assert reconstruct_chunks(from_float64(1 << 52)) == Fraction(1, 1 << 1022)
 
 
 def test_from_float64_smallest_denormal():
-    assert _reconstruct(from_float64(1)) == Fraction(1, 1 << 1074)
+    assert reconstruct_chunks(from_float64(1)) == Fraction(1, 1 << 1074)
 
 
 def test_from_float64_largest_finite():
     bits = (2046 << 52) | ((1 << 52) - 1)
     # largest f64 = (2**53 - 1) * 2**971
-    assert _reconstruct(from_float64(bits)) == ((1 << 53) - 1) * (1 << 971)
+    assert reconstruct_chunks(from_float64(bits)) == ((1 << 53) - 1) * (1 << 971)
 
 
 def test_from_float64_positive_inf():
     chunks = from_float64(2047 << 52)
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == +1
     assert _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float64_nan_collapses_to_sig_one():
     chunks = from_float64((2047 << 52) | 1)
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1
     assert _is_infnan_sentinel(chunks[0])
 
@@ -427,67 +392,67 @@ def test_from_float64_nan_collapses_to_sig_one():
 # ----- from_float16 ------------------------------------------------------------
 
 def test_from_float16_one():
-    assert _reconstruct(from_float16(15 << 10)) == 1
+    assert reconstruct_chunks(from_float16(15 << 10)) == 1
 
 
 def test_from_float16_negative_zero():
-    sig, sign, _ = _unpack(from_float16(1 << 15)[0])
+    sig, sign, _ = unpack_chunk(from_float16(1 << 15)[0])
     assert sig == 0 and sign == -1
 
 
 def test_from_float16_smallest_denormal():
     # 2**-24
-    assert _reconstruct(from_float16(1)) == Fraction(1, 1 << 24)
+    assert reconstruct_chunks(from_float16(1)) == Fraction(1, 1 << 24)
 
 
 def test_from_float16_smallest_normal():
     # 2**-14
-    assert _reconstruct(from_float16(1 << 10)) == Fraction(1, 1 << 14)
+    assert reconstruct_chunks(from_float16(1 << 10)) == Fraction(1, 1 << 14)
 
 
 def test_from_float16_largest_finite():
     bits = (30 << 10) | ((1 << 10) - 1)
     # largest f16 = (2**11 - 1) * 2**5
-    assert _reconstruct(from_float16(bits)) == ((1 << 11) - 1) * (1 << 5)
+    assert reconstruct_chunks(from_float16(bits)) == ((1 << 11) - 1) * (1 << 5)
 
 
 def test_from_float16_inf():
     chunks = from_float16(31 << 10)
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 0 and _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float16_nan():
     chunks = from_float16((31 << 10) | 1)
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1 and _is_infnan_sentinel(chunks[0])
 
 
 # ----- from_bfloat16 -----------------------------------------------------------
 
 def test_from_bfloat16_one():
-    assert _reconstruct(from_bfloat16(127 << 7)) == 1
+    assert reconstruct_chunks(from_bfloat16(127 << 7)) == 1
 
 
 def test_from_bfloat16_smallest_denormal():
     # 2**-133
-    assert _reconstruct(from_bfloat16(1)) == Fraction(1, 1 << 133)
+    assert reconstruct_chunks(from_bfloat16(1)) == Fraction(1, 1 << 133)
 
 
 def test_from_bfloat16_smallest_normal():
     # 2**-126
-    assert _reconstruct(from_bfloat16(1 << 7)) == Fraction(1, 1 << 126)
+    assert reconstruct_chunks(from_bfloat16(1 << 7)) == Fraction(1, 1 << 126)
 
 
 def test_from_bfloat16_largest_finite():
     bits = (254 << 7) | ((1 << 7) - 1)
     # largest bf16 = (2**8 - 1) * 2**120
-    assert _reconstruct(from_bfloat16(bits)) == ((1 << 8) - 1) * (1 << 120)
+    assert reconstruct_chunks(from_bfloat16(bits)) == ((1 << 8) - 1) * (1 << 120)
 
 
 def test_from_bfloat16_nan():
     chunks = from_bfloat16((255 << 7) | 1)
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1 and _is_infnan_sentinel(chunks[0])
 
 
@@ -496,52 +461,52 @@ def test_from_bfloat16_nan():
 def test_from_float80_one():
     # 1.0: sign=0, biased_exp=16383, mantissa=1<<63 (explicit leading bit)
     chunks = from_float80(_f80_bits(0, 16383, 1 << 63))
-    assert _reconstruct(chunks) == 1
+    assert reconstruct_chunks(chunks) == 1
 
 
 def test_from_float80_negative_one():
     chunks = from_float80(_f80_bits(1, 16383, 1 << 63))
-    assert _reconstruct(chunks) == -1
+    assert reconstruct_chunks(chunks) == -1
 
 
 def test_from_float80_positive_zero():
-    sig, sign, _ = _unpack(from_float80(_f80_bits(0, 0, 0))[0])
+    sig, sign, _ = unpack_chunk(from_float80(_f80_bits(0, 0, 0))[0])
     assert sig == 0 and sign == +1
 
 
 def test_from_float80_negative_zero():
-    sig, sign, _ = _unpack(from_float80(_f80_bits(1, 0, 0))[0])
+    sig, sign, _ = unpack_chunk(from_float80(_f80_bits(1, 0, 0))[0])
     assert sig == 0 and sign == -1
 
 
 def test_from_float80_smallest_denormal():
     # explicit leading bit=0, fractional=1, biased_exp=0 -> value = 2**-16445
     chunks = from_float80(_f80_bits(0, 0, 1))
-    assert _reconstruct(chunks) == Fraction(1, 1 << 16445)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 16445)
 
 
 def test_from_float80_smallest_normal():
     # biased_exp=1, mantissa=1<<63 -> value = 2**-16382
     chunks = from_float80(_f80_bits(0, 1, 1 << 63))
-    assert _reconstruct(chunks) == Fraction(1, 1 << 16382)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 16382)
 
 
 def test_from_float80_largest_finite():
     bits = _f80_bits(0, 0x7FFE, (1 << 64) - 1)
     # value = (2**64 - 1) * 2**(16383 - 63) = (2**64 - 1) * 2**16320
-    assert _reconstruct(chunks=from_float80(bits)) == ((1 << 64) - 1) * (1 << 16320)
+    assert reconstruct_chunks(chunks=from_float80(bits)) == ((1 << 64) - 1) * (1 << 16320)
 
 
 def test_from_float80_inf():
     chunks = from_float80(_f80_bits(0, 0x7FFF, 1 << 63))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == +1
     assert _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float80_nan():
     chunks = from_float80(_f80_bits(0, 0x7FFF, (1 << 63) | 1))
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1 and _is_infnan_sentinel(chunks[0])
 
 
@@ -568,7 +533,7 @@ def test_from_float80_unnormal_renormalizes_lossless():
 
     chunks = from_float80(bits)
     assert len(chunks) == 1
-    sig, sign, exp = _unpack(chunks[0])
+    sig, sign, exp = unpack_chunk(chunks[0])
 
     # Derivation of the pinned values (all from the locked-in unnormal
     # routing rule — biased_exp > 0 + explicit_leading == 0 -> denormal
@@ -593,69 +558,69 @@ def test_from_float80_unnormal_renormalizes_lossless():
 def test_from_float128_positive_zero():
     chunks = from_float128(_f128_bits(0, 0, 0))
     assert len(chunks) == 1
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == +1
 
 
 def test_from_float128_negative_zero():
     chunks = from_float128(_f128_bits(1, 0, 0))
     assert len(chunks) == 1
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == -1
 
 
 def test_from_float128_one_two_chunks_signed_zero_low():
     chunks = from_float128(_f128_bits(0, 16383, 0))
     assert len(chunks) == 2
-    low_sig, low_sign, low_exp = _unpack(chunks[0])
+    low_sig, low_sign, low_exp = unpack_chunk(chunks[0])
     # Low chunk: mantissa low 64 bits are 0 -> signed zero at exp = -112.
     assert low_sig == 0
     assert low_sign == +1
     assert low_exp == -112
-    high_sig, _, high_exp = _unpack(chunks[1])
+    high_sig, _, high_exp = unpack_chunk(chunks[1])
     # High chunk: bit 48 set after >>64 -> normalize_shift=15, base=-112+64=-48.
     # exp = -48 - 15 = -63.  sig=1<<63.  sig*2**exp = 2**63 * 2**-63 = 1.
     assert high_sig == 1 << 63
     assert high_exp == -63
-    assert _reconstruct(chunks) == 1
+    assert reconstruct_chunks(chunks) == 1
 
 
 def test_from_float128_inf():
     chunks = from_float128(_f128_bits(0, 0x7FFF, 0))
     assert len(chunks) == 1
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == +1 and _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float128_negative_inf():
     chunks = from_float128(_f128_bits(1, 0x7FFF, 0))
-    sig, sign, _ = _unpack(chunks[0])
+    sig, sign, _ = unpack_chunk(chunks[0])
     assert sig == 0 and sign == -1 and _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float128_nan():
     chunks = from_float128(_f128_bits(0, 0x7FFF, 0xDEAD_BEEF))
     assert len(chunks) == 1
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 1 and _is_infnan_sentinel(chunks[0])
 
 
 def test_from_float128_smallest_denormal():
     # mantissa=1, biased_exp=0 -> value = 2**-16494
     chunks = from_float128(_f128_bits(0, 0, 1))
-    assert _reconstruct(chunks) == Fraction(1, 1 << 16494)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 16494)
 
 
 def test_from_float128_smallest_normal():
     # biased_exp=1, mantissa=0 -> value = 2**-16382
     chunks = from_float128(_f128_bits(0, 1, 0))
-    assert _reconstruct(chunks) == Fraction(1, 1 << 16382)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 16382)
 
 
 def test_from_float128_largest_finite():
     bits = _f128_bits(0, 32766, (1 << 112) - 1)
     # largest f128 = (2**113 - 1) * 2**16271
-    assert _reconstruct(from_float128(bits)) == (2 ** 113 - 1) * (2 ** 16271)
+    assert reconstruct_chunks(from_float128(bits)) == (2 ** 113 - 1) * (2 ** 16271)
 
 
 def test_from_float128_random_normals_lossless():
@@ -677,7 +642,7 @@ def test_from_float128_random_normals_lossless():
             expected = Fraction(sign * eff * (1 << eff_exp), 1)
         else:
             expected = Fraction(sign * eff, 1 << (-eff_exp))
-        assert _reconstruct(chunks) == expected
+        assert reconstruct_chunks(chunks) == expected
 
 
 def test_from_float128_random_denormals_lossless():
@@ -689,7 +654,7 @@ def test_from_float128_random_denormals_lossless():
         chunks = from_float128(bits)
         sign = -1 if sign_bit else +1
         expected = Fraction(sign * mantissa_raw, 1 << 16494)
-        assert _reconstruct(chunks) == expected
+        assert reconstruct_chunks(chunks) == expected
 
 
 # ----- _encode_fp_normalized with a synthetic f24 layout -----------------------
@@ -701,7 +666,7 @@ def test_encode_fp_normalized_synthetic_f24_one():
     chunks = _encode_fp_normalized(
         bits, mantissa_bits=mantissa_bits, exponent_bits=exponent_bits, bias=bias
     )
-    assert _reconstruct(chunks) == 1
+    assert reconstruct_chunks(chunks) == 1
 
 
 def test_encode_fp_normalized_synthetic_f24_smallest_denormal():
@@ -710,7 +675,7 @@ def test_encode_fp_normalized_synthetic_f24_smallest_denormal():
         1, mantissa_bits=mantissa_bits, exponent_bits=exponent_bits, bias=bias
     )
     # smallest f24 denormal = 2**(1 - bias - mantissa_bits) = 2**-78
-    assert _reconstruct(chunks) == Fraction(1, 1 << 78)
+    assert reconstruct_chunks(chunks) == Fraction(1, 1 << 78)
 
 
 def test_encode_fp_normalized_synthetic_f24_inf():
@@ -719,7 +684,7 @@ def test_encode_fp_normalized_synthetic_f24_inf():
     chunks = _encode_fp_normalized(
         bits, mantissa_bits=mantissa_bits, exponent_bits=exponent_bits, bias=bias
     )
-    sig, _, _ = _unpack(chunks[0])
+    sig, _, _ = unpack_chunk(chunks[0])
     assert sig == 0 and _is_infnan_sentinel(chunks[0])
 
 
