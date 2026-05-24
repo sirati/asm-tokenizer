@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List
 
 # Sidecar suffix carried by every binary; see
 # :mod:`tokenizer.aligned_data.loader.function_names_loader`.
@@ -65,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def discover_binaries(memmap_dir: Path) -> List[str]:
+def discover_binaries(memmap_dir: Path) -> list[str]:
     """List binary names present in ``memmap_dir``.
 
     The anchor is the function-names sidecar (one per binary); names
@@ -76,8 +75,8 @@ def discover_binaries(memmap_dir: Path) -> List[str]:
         return []
     names = [
         p.name[: -len(_FUNCTION_NAMES_SUFFIX)]
-        for p in memmap_dir.iterdir()
-        if p.is_file() and p.name.endswith(_FUNCTION_NAMES_SUFFIX)
+        for p in memmap_dir.glob(f"*{_FUNCTION_NAMES_SUFFIX}")
+        if p.is_file()
     ]
     names.sort()
     return names
@@ -86,13 +85,24 @@ def discover_binaries(memmap_dir: Path) -> List[str]:
 def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
     """Return the binary name to open.
 
-    When ``requested`` is non-empty, return it verbatim (no existence
-    check here — the loader produces a clearer error if the prefix
-    does not match a sidecar). Otherwise scan ``memmap_dir`` for
-    binaries and require exactly one; zero or multiple is a user
-    error reported via :class:`SystemExit` with a candidate list.
+    Validates both user-facing flags at the CLI boundary: the
+    ``memmap_dir`` must exist, and when ``requested`` is given its
+    function-names sidecar must exist (otherwise the loader silently
+    yields a zero-match session, masking typos). When ``requested``
+    is omitted, scan ``memmap_dir`` for binaries and require exactly
+    one; zero or multiple is a user error reported via
+    :class:`SystemExit` with a candidate list.
     """
+    if not memmap_dir.is_dir():
+        raise SystemExit(f"memmap directory not found: {memmap_dir}")
     if requested:
+        sidecar = memmap_dir / f"{requested}{_FUNCTION_NAMES_SUFFIX}"
+        if not sidecar.is_file():
+            candidates = discover_binaries(memmap_dir)
+            raise SystemExit(
+                f"binary {requested!r} not found in {memmap_dir}; "
+                f"available: {candidates}."
+            )
         return requested
     candidates = discover_binaries(memmap_dir)
     if len(candidates) == 1:

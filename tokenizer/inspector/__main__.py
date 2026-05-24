@@ -43,7 +43,7 @@ def _matched_count(dataset: BinaryDataset) -> int:
     # ``BinaryDataset`` publishes the per-arm function count under the
     # legacy ``<prefix>_count`` attribute (see ``_publish_arm``); the
     # inspector seeds its tree from this number per plan D3.
-    return int(getattr(dataset, "matched_count", 0))
+    return dataset.matched_count
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,11 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     dataset, session = _open_session(memmap_dir, binary_name)
-    with session as sess:
-        # Touch the session so any deferred handle-open errors surface
-        # inside the ``with`` (where they get unwound cleanly) rather
-        # than later when the Textual app is the first thing to peek.
-        _ = sess
+    with session:
         count = _matched_count(dataset)
         print(
             f"tree would go here — {count} matched functions in "
