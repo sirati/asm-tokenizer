@@ -1,9 +1,17 @@
-"""Block-renderer for the inspector tree.
+"""Shared per-block rendering core for the inspector.
 
 Single concern: translate ONE pre-parsed
 :class:`~tokenizer.token_lists.BlockTokenList` into an ordered list
 of typed :class:`LineItem` s (:class:`AsmLine` +
 :class:`InlineCallEntry` + :class:`InlineJumpEntry`).
+
+The typed line-item dataclasses + :data:`LineItem` union live in
+:mod:`tokenizer.inspector._render._protocol` (the Wave-5 shared boundary
+both rendering backends emit through); this module imports them so a
+single in-process object identity flows through both
+``render_block`` (the FTL path) and the future BatchDecodeBackend
+walker -- the tree model's ``isinstance(item, AsmLine)`` checks remain
+consistent across backends.
 
 Parsing of the parent :class:`FunctionTokenList` + the per-section
 + per-variant invariants (``kind_to_called_idx`` /
@@ -57,7 +65,6 @@ these line items is :mod:`tokenizer.inspector._tree_model`'s job.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
@@ -67,10 +74,22 @@ from tokenizer.aligned_data.matched_sections_bin import (
     Section,
     VariantBlock,
 )
+from tokenizer.inspector._render._protocol import (
+    AsmLine,
+    InlineCallEntry,
+    InlineJumpEntry,
+    LineItem,
+)
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.tokens import TokenType
 
 
+# Re-export the typed line items so legacy callers (and the test
+# package at ``tokenizer.inspector.tests.test_render``) keep importing
+# them from this module's public surface. The dataclasses themselves
+# live in :mod:`._protocol` -- the Wave-5 shared boundary -- so the
+# walker emits the same in-process objects both rendering backends
+# (FTL + BatchDecode) and the tree model's ``isinstance`` checks see.
 __all__ = [
     "AsmLine",
     "InlineCallEntry",
@@ -78,63 +97,6 @@ __all__ = [
     "LineItem",
     "render_block",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Typed line items (public API consumed by ``_tree_model``)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class AsmLine:
-    """A plain assembly-like line emitted for one instruction."""
-
-    text: str
-
-
-@dataclass(frozen=True)
-class InlineCallEntry:
-    """One inline call site under a block.
-
-    ``counter_id`` is the encoder's per-Category counter (= the
-    position of the K-th call_target of ``kind`` in
-    ``section.call_targets``). ``callee_section_pointer`` is the
-    :class:`SectionPointerSpec` the tree-model layer can hand to
-    :func:`batch_decode` when the user expands this node;
-    ``None`` for ext calls or for LOCAL/PLT call_targets whose
-    ``function_section_ptr`` could not be resolved to a section.
-    ``variant_idx`` is the callee variant the parent's
-    ``per_call_entries`` pinned for THIS caller variant; equals
-    :data:`MISSING_VARIANT_INDEX` when no per_call_entry exists
-    (EXTERN) or when the callee section is reachable but lacks a
-    variant matching the caller's vkey.
-
-    ``kind`` is the canonical wire-format
-    :class:`~tokenizer.aligned_data.call_target_type.CallTargetType`
-    enum (LOCAL/PLT/EXTERN); the rendering layer
-    (:mod:`tokenizer.inspector._label`) routes its per-kind label
-    word off this same enum so no string-typed discriminator crosses
-    this boundary. ``provider`` is the library / sidecar name
-    appended after ``@`` for EXTERN rows; ``None`` for LOCAL/PLT
-    and for EXTERN rows whose provider is unknown.
-    """
-
-    kind: CallTargetType
-    counter_id: int
-    callee_name: str
-    callee_section_pointer: SectionPointerSpec | None
-    variant_idx: int
-    provider: str | None
-
-
-@dataclass(frozen=True)
-class InlineJumpEntry:
-    """One within-function jump target referenced by an instruction."""
-
-    target_block_idx: int
-
-
-LineItem = AsmLine | InlineCallEntry | InlineJumpEntry
 
 
 # ---------------------------------------------------------------------------
