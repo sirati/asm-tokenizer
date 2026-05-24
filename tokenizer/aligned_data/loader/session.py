@@ -84,6 +84,11 @@ class BinarySession(_BinarySessionHelpersMixin):
       * ``line_to_name``       -- ``dict[int, str]`` for resolving
                                   unmatched ``call_target`` FIDs to
                                   function names.
+      * ``line_to_provider``   -- ``dict[int, str]`` for resolving an
+                                  EXTERN ``call_target.function_section_ptr``
+                                  to its library / provider name
+                                  (loaded from the per-binary
+                                  ``<binary>_extern_providers.txt``).
 
     ``_data.bin`` records are self-describing -- their headers carry
     insn / block / token geometry -- so no companion ``lengths`` or
