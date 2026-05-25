@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 from tokenizer.inspector._tree_model import (
     FunctionNode,
     Node,
-    ShowAllVariantsNode,
     VariantNode,
 )
 from tokenizer.variant_info import VariantIdentity
@@ -110,18 +109,33 @@ def apply_grouping(
     model: Node,
     children: Sequence[Node],
 ) -> Sequence[Node]:
-    """Route variant-producing nodes through the sort + grouping pass.
+    """Route raw variant-sibling sets through the sort + grouping pass.
 
-    Other node kinds pass through untouched. When :attr:`InspectorApp._order_config`
-    is ``None``, the variants are still natsort-ordered via
-    :func:`sort_variants_flat` so the user-visible sibling order remains
-    ``v9`` before ``v10`` (etc.) even before the user opens the Order
-    dialog. When an :class:`OrderConfig` is active, :func:`group_variants`
-    owns both sort + partition. Single sort path (cluster M-2 / M1
-    audit findings — no longer a duplicate hand-rolled regex in
-    :mod:`tokenizer.inspector._label`).
+    The gate is structural ("are these children a homogeneous
+    :class:`VariantNode` sibling set?") with one negative exclusion
+    (``model`` is a :class:`VariantGroupNode`). The exclusion is the
+    "already organised" guard: a :class:`VariantGroupNode`'s ``expand``
+    surfaces its pre-grouped children verbatim, so re-applying the
+    sort + group pass would wrap them in an extra group level. Every
+    OTHER parent whose ``expand`` returns a :class:`VariantNode` list
+    -- currently :class:`FunctionNode`, :class:`ShowAllVariantsNode`,
+    and the no-pin / missing-variant fallback path on
+    :class:`InlineCallNode` -- gets the same sort + group treatment.
+    Mixed lists (e.g. :class:`InlineCallNode`'s D2 pinned path
+    returning blocks + a :class:`ShowAllVariantsNode` tail) have
+    ``first`` as a non-variant and short-circuit here.
+
+    When :attr:`InspectorApp._order_config` is ``None``, the variants are
+    still natsort-ordered via :func:`sort_variants_flat` so the user-
+    visible sibling order remains ``v9`` before ``v10`` (etc.) even
+    before the user opens the Order dialog. When an :class:`OrderConfig`
+    is active, :func:`group_variants` owns both sort + partition.
+    Single sort path (cluster M-2 / M1 audit findings — no longer a
+    duplicate hand-rolled regex in :mod:`tokenizer.inspector._label`).
     """
-    if not isinstance(model, (FunctionNode, ShowAllVariantsNode)):
+    if isinstance(model, VariantGroupNode):
+        # Already organised by a prior :func:`group_variants` call --
+        # the group's own ``expand`` is the verbatim hand-off.
         return children
     if not children:
         return children

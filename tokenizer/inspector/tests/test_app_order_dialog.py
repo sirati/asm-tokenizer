@@ -410,6 +410,135 @@ def test_group_variants_missing_value_sinks_to_question_bucket():
 
 
 # ---------------------------------------------------------------------------
+# apply_grouping: structural-gate regression tests.
+#
+# The dispatcher hands every model.expand() result through
+# :func:`_order_hooks.apply_grouping`. The gate is structural ("are these
+# children a homogeneous VariantNode sibling set?"), not a model-type
+# allowlist, so InlineCallNode.expand's no-pin / missing-variant fallback
+# path -- which returns a list of VariantNodes -- gets the same sort +
+# group treatment as FunctionNode / ShowAllVariantsNode.
+# ---------------------------------------------------------------------------
+
+
+def _make_variant_node_with_backend(
+    rv: RenderedVariant, backend: MagicMock
+) -> VariantNode:
+    """Like :func:`_make_variant_node` but threads a SHARED backend so the
+    ``backend.variants()`` lookup inside :func:`apply_grouping` sees the
+    full sibling set (not just this one variant)."""
+    factory = MagicMock(spec=BackendFactory)
+    return VariantNode(
+        factory=factory,
+        backend=backend,
+        variant_idx=rv.variant_idx,
+        label_axes=rv.label_axes,
+    )
+
+
+def _make_inline_call_fallback_variant_nodes(
+    rvs: list[RenderedVariant],
+) -> list[VariantNode]:
+    """Build the kind of sibling list an :class:`InlineCallNode`'s
+    fallback path returns: every callee variant as a flat
+    :class:`VariantNode`, all sharing the callee's :class:`RenderBackend`
+    (the dual-session-aware backend ``InlineCallNode.expand`` constructs
+    via the callee :class:`FunctionNode`)."""
+    callee_backend = MagicMock(spec=RenderBackend)
+    callee_backend.variants.return_value = rvs
+    return [_make_variant_node_with_backend(rv, callee_backend) for rv in rvs]
+
+
+def _stub_app(order_config: OrderConfig | None) -> MagicMock:
+    """Stub the only :class:`InspectorApp` surface :func:`apply_grouping`
+    reads: the active :class:`OrderConfig` (or ``None``)."""
+    app = MagicMock(spec=InspectorApp)
+    app._order_config = order_config
+    return app
+
+
+def test_apply_grouping_natsorts_inline_call_fallback_variants():
+    """Regression: under an :class:`InlineCallNode` whose pin misses
+    (the callee dropped that variant), :meth:`InlineCallNode.expand`
+    surfaces every callee variant as a flat :class:`VariantNode`. The
+    dispatcher MUST still route that list through
+    :func:`apply_grouping` so the siblings are natsort-ordered even
+    when no :class:`OrderConfig` is active -- previously they leaked
+    out in dataset order because the gate was a model-type allowlist
+    (FunctionNode / ShowAllVariantsNode only).
+    """
+    from tokenizer.inspector._app._order_hooks import apply_grouping
+    from tokenizer.inspector._tree_model import InlineCallNode
+
+    # Dataset-order RVs that are NOT in natsort order (mixed compilers +
+    # cvers -- natsort should put clang < gcc, and within compiler sort
+    # by cver: 3.5 < 7 -- matching the user's repro).
+    rvs = [
+        _make_rv(variant_idx=0, compiler="gcc", cver="5", opt="O0"),
+        _make_rv(variant_idx=1, compiler="clang", cver="7", opt="O3"),
+        _make_rv(variant_idx=2, compiler="clang", cver="3.5", opt="O2"),
+        _make_rv(variant_idx=3, compiler="gcc", cver="5", opt="Os"),
+        _make_rv(variant_idx=4, compiler="clang", cver="3.5", opt="Os"),
+    ]
+    children = _make_inline_call_fallback_variant_nodes(rvs)
+
+    # Stand-in model -- :func:`apply_grouping` no longer keys off the
+    # model-instance type, so an :class:`InlineCallNode` works the same
+    # as a :class:`FunctionNode`.
+    model = MagicMock(spec=InlineCallNode)
+    app = _stub_app(order_config=None)
+    out = apply_grouping(app, model, children)
+
+    # All flat VariantNodes (no grouping), natsort-ordered by the full
+    # canonical axis chain. Canonical chain: ARCH, COMP, CVER, OPT,
+    # BITWIDTH -- arch is uniform so comp tie-breaks first, then cver,
+    # then opt. Expected natsort: clang 3.5 O2, clang 3.5 Os, clang 7
+    # O3, gcc 5 O0, gcc 5 Os -> idx [2, 4, 1, 0, 3].
+    assert all(isinstance(c, VariantNode) for c in out)
+    assert [c.variant_idx for c in out] == [2, 4, 1, 0, 3]
+
+
+def test_apply_grouping_groups_inline_call_fallback_variants_by_compiler():
+    """Same scenario as the natsort regression, but with an
+    :class:`OrderConfig` that groups by ``compiler``: the InlineCallNode
+    fallback's flat :class:`VariantNode` list must surface as
+    :class:`VariantGroupNode` siblings (3 clang + 2 gcc -> 2 groups)."""
+    from tokenizer.inspector._app._order import AxisKind
+    from tokenizer.inspector._app._order_hooks import apply_grouping
+    from tokenizer.inspector._tree_model import InlineCallNode
+
+    rvs = [
+        _make_rv(variant_idx=0, compiler="gcc", cver="5", opt="O0"),
+        _make_rv(variant_idx=1, compiler="clang", cver="7", opt="O3"),
+        _make_rv(variant_idx=2, compiler="clang", cver="3.5", opt="O2"),
+        _make_rv(variant_idx=3, compiler="gcc", cver="5", opt="Os"),
+        _make_rv(variant_idx=4, compiler="clang", cver="3.5", opt="Os"),
+    ]
+    children = _make_inline_call_fallback_variant_nodes(rvs)
+
+    axes = build_canonical_axes()
+    comp_axis = next(
+        a for a in axes
+        if a.kind is AxisKind.POSITIONAL and a.key == COMP_PREFIX
+    )
+    config = OrderConfig(
+        ordered_axes=axes, grouping_axes=frozenset({comp_axis})
+    )
+    model = MagicMock(spec=InlineCallNode)
+    app = _stub_app(order_config=config)
+    out = apply_grouping(app, model, children)
+
+    # Two top-level groups (clang + gcc) -- the model-type gate fix
+    # routes this list through :func:`group_variants` just like a
+    # :class:`FunctionNode` sibling set.
+    assert all(isinstance(c, VariantGroupNode) for c in out)
+    assert [g.axis_value for g in out] == ["clang", "gcc"]
+    clang_group, gcc_group = out
+    assert {v.variant_idx for v in clang_group.children} == {1, 2, 4}
+    assert {v.variant_idx for v in gcc_group.children} == {0, 3}
+
+
+# ---------------------------------------------------------------------------
 # Modal dialog tests (Textual Pilot).
 # ---------------------------------------------------------------------------
 
