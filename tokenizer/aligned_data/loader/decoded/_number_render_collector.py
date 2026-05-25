@@ -182,7 +182,6 @@ class _NumberAccumulator:
         if needs_precision_expand(short_text, full_text):
             precision_entry = InlineNumberPrecisionEntry(
                 token_type=token_type,
-                chunks=chunks,
                 full_text=full_text,
             )
         else:

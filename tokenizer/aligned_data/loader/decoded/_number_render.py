@@ -155,13 +155,10 @@ class InlineNumberPrecisionEntry:
 
     Carried alongside the short-form row whenever
     :func:`needs_precision_expand` returns ``True``; the tree-model
-    reads :attr:`full_text` verbatim. :attr:`chunks` carries the
-    original wire chunks for future forensic-decomposition use cases
-    (W3-1 — kept as the producer's owned shape).
+    reads :attr:`full_text` verbatim.
     """
 
     token_type: TokenType
-    chunks: Tuple[_ChunkPair, ...]
     full_text: str
 
 

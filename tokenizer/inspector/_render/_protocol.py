@@ -35,6 +35,9 @@ from typing import Iterable, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
+from tokenizer.aligned_data.loader.decoded._number_render import (
+    InlineNumberPrecisionEntry,
+)
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.tokens import TokenType
 
@@ -237,29 +240,6 @@ class InlineJumpEntry:
     """
 
     target_block_idx: int
-
-
-@dataclass(frozen=True)
-class InlineNumberPrecisionEntry:
-    """Full-precision expansion sidecar for an abbreviated numeric token.
-
-    Produced for sources whose short text rounds: F80 / F128 mantissa
-    truncation, multi-chunk VC2 hex abbreviation, IEEE floats whose
-    significant-decimal-digit count exceeds the short-form budget. The
-    tree-model expands the carrying :class:`AsmLine` into a leaf row
-    whose text is :attr:`full_text` verbatim (no UI-side rendering).
-
-    ``token_type`` is the wire-format :class:`TokenType` of the source
-    (``VALUED_CONST_V2`` for VC2, per-width ``FLOAT*`` members for
-    IEEE) -- typed discriminator so consumers route per-width behaviour
-    off the enum, never off the rendered text. ``full_text`` is the
-    pre-rendered display string; per the integrated plan W3-1 W4-
-    amendment, the prior speculative ``chunks`` field is dropped (no
-    consumer for per-chunk decomposition).
-    """
-
-    token_type: TokenType
-    full_text: str
 
 
 Openable = Union[InlineCallEntry, InlineJumpEntry, InlineNumberPrecisionEntry]

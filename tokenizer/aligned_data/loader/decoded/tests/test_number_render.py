@@ -419,7 +419,6 @@ def test_accumulator_produces_precision_entry_when_short_truncates() -> None:
     assert isinstance(emission.precision_entry, InlineNumberPrecisionEntry)
     assert emission.precision_entry.token_type is TokenType.FLOAT64
     assert emission.precision_entry.full_text == "f64:0.31415926535897931 E1"
-    assert len(emission.precision_entry.chunks) == 1
 
 
 def test_accumulator_idempotent_flush() -> None:
