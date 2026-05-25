@@ -157,6 +157,26 @@ def test_function_node_expand_is_idempotent():
     assert factory.make.call_count == 2
 
 
+def test_function_node_expand_closes_prior_backend_on_reexpand():
+    """Re-expansion MUST close the previously cached backend before
+    constructing the new one; otherwise every collapse + re-expand
+    (e.g. dialog accept) leaks one backend instance.
+    """
+    first_backend = _make_backend(n_variants=1)
+    second_backend = _make_backend(n_variants=1)
+    handle = _make_handle()
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [handle]
+    factory.make.side_effect = [first_backend, second_backend]
+
+    node = FunctionNode(factory=factory, handle=handle)
+    node.expand()
+    assert first_backend.close.call_count == 0
+    node.expand()
+    assert first_backend.close.call_count == 1
+    assert second_backend.close.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # VariantNode.expand -- delegates to backend.blocks
 # ---------------------------------------------------------------------------
