@@ -85,7 +85,7 @@ class AsmLeaf:
     is_failed: bool = False
     # Per-row horizontal scroll memory; the UI saves the row's current
     # ``scroll_offset.x`` here on manual pan and restores it when the
-    # cursor returns to this row. See :mod:`tokenizer.inspector._app`.
+    # cursor returns to this row. See :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
 
     @property

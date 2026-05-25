@@ -49,7 +49,7 @@ class BlockNode:
     preview: str
     is_failed: bool = False
     can_expand: bool = field(default=True, init=False)
-    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app`.
+    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
 
     def expand(self) -> list:
@@ -79,7 +79,7 @@ class InlineJumpNode:
     target_block_idx: int
     is_failed: bool = False
     can_expand: bool = field(default=True, init=False)
-    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app`.
+    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
 
     def expand(self) -> list:

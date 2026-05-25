@@ -35,7 +35,7 @@ the assert below — same tripwire discipline as the prefixes module.
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Optional
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.variant_tokens.prefixes import (
@@ -49,6 +49,7 @@ from tokenizer.variant_tokens.prefixes import (
 
 __all__ = [
     "variant_label",
+    "variant_label_from_axes",
     "function_label",
     "block_preview",
     "resolve_function_name_for_fid",
@@ -109,6 +110,26 @@ _CALL_TARGET_TYPE_TO_LABEL: dict[CallTargetType, str] = {
 assert set(_CALL_TARGET_TYPE_TO_LABEL) == set(CallTargetType)
 
 
+def variant_label_from_axes(
+    label_axes: Mapping[str, Optional[str]],
+) -> str:
+    """Assemble the variant row label from a typed axis Mapping.
+
+    ``label_axes`` is the prefix-keyed Mapping carried by the
+    rendered-variant typed value (callers pre-flatten over
+    :data:`POSITIONAL_PREFIXES`). Reading the Mapping in that canonical
+    order yields a stable axis ordering: space-joined as
+    ``<arch> <comp> v<cver> -<opt>``. Missing axes render as
+    :data:`_MISSING_NAME` (``"?"``).
+    """
+    parts: list[str] = []
+    for prefix in POSITIONAL_PREFIXES:
+        value = label_axes.get(prefix)
+        value_str = _MISSING_NAME if value is None else str(value)
+        parts.append(f"{_AXIS_PREFIX_TO_LABEL_PREFIX[prefix]}{value_str}")
+    return " ".join(parts)
+
+
 def variant_label(function_data) -> str:
     """Assemble the positional-axis variant label.
 
@@ -117,15 +138,17 @@ def variant_label(function_data) -> str:
     space-joined string like ``"x86 clang v8.0 -O3"``. Missing axes
     render as ``"?"`` (use case: unmatched section synthesised before
     a resolver row was attached).
+
+    Thin wrapper around :func:`variant_label_from_axes`: bridges the
+    loader's metadata-key shape to the canonical prefix-keyed Mapping
+    via :data:`_AXIS_PREFIX_TO_METADATA_KEY`.
     """
     metadata = function_data.metadata
-    parts: list[str] = []
-    for prefix in POSITIONAL_PREFIXES:
-        metadata_key = _AXIS_PREFIX_TO_METADATA_KEY[prefix]
-        value = metadata.get(metadata_key)
-        value_str = _MISSING_NAME if value is None else str(value)
-        parts.append(f"{_AXIS_PREFIX_TO_LABEL_PREFIX[prefix]}{value_str}")
-    return " ".join(parts)
+    label_axes: dict[str, Optional[str]] = {
+        prefix: metadata.get(_AXIS_PREFIX_TO_METADATA_KEY[prefix])
+        for prefix in POSITIONAL_PREFIXES
+    }
+    return variant_label_from_axes(label_axes)
 
 
 def function_label(name: str | None) -> str:

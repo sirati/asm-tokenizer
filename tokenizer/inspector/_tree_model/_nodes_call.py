@@ -52,7 +52,7 @@ class InlineCallNode:
     variant_idx: int
     provider: str | None
     is_failed: bool = False
-    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app`.
+    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
 
     @property
