@@ -2,7 +2,7 @@
 
 Single concern: render policy (failed-node glyph + truncation marker)
 plus tree-local keyboard behaviour (editor-style horizontal-scroll
-memory, conditional ``left``/``right`` arrows, one-shot undo for the
+memory, conditional ``left``/``right`` arrows, chained undo for the
 ``left``-to-parent climb). Expand / error / search logic lives on
 :class:`InspectorApp` in :mod:`tokenizer.inspector._app._application`.
 
@@ -64,10 +64,15 @@ class _InspectorTree(Tree[Node]):
       overflows the viewport, expand a collapsed node otherwise.
     * Conditional ``←``: pan while ``scroll_x > 0``, else
       :meth:`action_cursor_parent`.
-    * One-shot undo for the ``←``-to-parent climb: when the left arrow
-      just escaped a child (cursor moved to its parent), the very next
-      ``→`` keypress restores the cursor to that child instead of
-      panning / expanding. Any other key invalidates this undo state.
+    * Chained undo for the ``←``-to-parent climb: each successful
+      climb pushes the just-evacuated child onto a return stack;
+      each subsequent ``→`` keypress pops one and restores the cursor
+      to that child instead of panning / expanding. The stack is
+      invalidated whenever the cursor moves off the parent of the
+      top-of-stack entry (i.e. any other navigation moves the cursor
+      elsewhere); a pure modal trip that doesn't move the tree cursor
+      keeps the stack intact, so ``o``/``Esc`` round-trips don't break
+      the undo chain.
 
     The tree's :class:`textual.containers.ScrollableContainer`
     ancestor binds ``left`` / ``right`` to its built-in
@@ -92,11 +97,20 @@ class _InspectorTree(Tree[Node]):
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
-        # One-shot undo target for the ``←``-to-parent climb. Set in
-        # :meth:`action_pan_left_or_parent` when the cursor actually
-        # moved up to its parent; consumed by the next ``→`` keypress
-        # via :meth:`on_key` or cleared by any other key.
-        self._undo_left_child: "Optional[TreeNode[Node]]" = None
+        # Return stack for the chained ``←``-to-parent undo. Each
+        # successful left-to-parent climb pushes the evacuated child;
+        # each subsequent ``→`` pops one and restores that cursor.
+        # Cleared by :meth:`watch_cursor_line` whenever the cursor
+        # leaves the parent of the top-of-stack entry without our own
+        # internal moves driving the change (see ``_pending_internal_move``).
+        self._undo_left_stack: "list[TreeNode[Node]]" = []
+        # Counter incremented around our own ``move_cursor`` /
+        # ``action_cursor_parent`` calls so the resulting
+        # :meth:`watch_cursor_line` notification skips the
+        # stack-invalidation check. A counter (not a bool) keeps nested
+        # safe should a future change wrap one internal move inside
+        # another.
+        self._pending_internal_move: int = 0
 
     def _compose_full_label(
         self,
@@ -136,8 +150,15 @@ class _InspectorTree(Tree[Node]):
         style: Style,
     ) -> Text:
         text = self._compose_full_label(node, base_style, style)
+        # Textual paints the line as ``guides + label``; the right
+        # edge of the LABEL region sits at
+        # ``viewport_width - guide_width``. Shrink the effective
+        # viewport so the marker fires when the label spills past the
+        # label region, not when it spills past the full row.
         return apply_truncation_marker(
-            text, self.size.width, self.scroll_offset.x
+            text,
+            max(0, self.size.width - self._row_guide_width(node)),
+            self.scroll_offset.x,
         )
 
     def label_cell_len(self, node: TreeNode[Node]) -> int:
@@ -151,6 +172,38 @@ class _InspectorTree(Tree[Node]):
         from rich.style import NULL_STYLE
 
         return self._compose_full_label(node, NULL_STYLE, NULL_STYLE).cell_len
+
+    def _row_guide_width(self, node: TreeNode[Node]) -> int:
+        """Cell-width of the indent-guide prefix Textual paints ahead of ``node``.
+
+        Textual's ``Tree`` renders each row as ``guides + label``
+        where the guides cost ``len(path) * guide_depth`` cells (see
+        :meth:`textual.widgets._tree._TreeLine._get_guide_width`).
+        Horizontal scroll and clipping address the FULL line, so any
+        row-overflow check that ignores the guide width misses the
+        case where the label cell-len alone fits the viewport but
+        the rendered row does not. Look up the cursor row's cached
+        tree-line and ask it; fall back to ``0`` when the row's line
+        has not been built yet (e.g. detached node, pre-mount).
+        """
+        line_index = node._line
+        if line_index < 0:
+            return 0
+        try:
+            tree_line = self._tree_lines[line_index]
+        except IndexError:
+            return 0
+        return tree_line._get_guide_width(self.guide_depth, self.show_root)
+
+    def _row_cell_len(self, node: TreeNode[Node]) -> int:
+        """Total cell-width of the row Textual paints for ``node``.
+
+        Combines :meth:`_row_guide_width` (the indent-guide prefix)
+        with :meth:`label_cell_len` (the composed label) so callers
+        comparing against ``scroll_offset.x + viewport_width`` see
+        the same column the user does on screen.
+        """
+        return self._row_guide_width(node) + self.label_cell_len(node)
 
     # --- editor-like per-row scroll memory actions ---------------------
     #
@@ -181,9 +234,9 @@ class _InspectorTree(Tree[Node]):
         new ``scroll_x`` onto the cursor row's remembered value.
 
         When the action takes the climb-to-parent branch and the
-        cursor actually moved, the just-evacuated child is stashed in
-        :attr:`_undo_left_child` so the next ``→`` press can restore
-        the cursor to it (see :meth:`on_key`).
+        cursor actually moved, the just-evacuated child is pushed onto
+        :attr:`_undo_left_stack` so a following sequence of ``→``
+        presses can pop the chain back down (see :meth:`on_key`).
         """
         if self.scroll_offset.x > 0:
             self.scroll_left(animate=False)
@@ -194,9 +247,13 @@ class _InspectorTree(Tree[Node]):
         # at the tree root; comparing the cursor before/after is the
         # only contract-stable way to detect whether the climb fired.
         pre_climb = self.cursor_node
-        self.action_cursor_parent()
+        self._pending_internal_move += 1
+        try:
+            self.action_cursor_parent()
+        finally:
+            self._pending_internal_move -= 1
         if pre_climb is not None and self.cursor_node is not pre_climb:
-            self._undo_left_child = pre_climb
+            self._undo_left_stack.append(pre_climb)
 
     def action_pan_right_or_expand(self) -> None:
         """Pan right when the cursor row overflows, else expand the node.
@@ -212,8 +269,12 @@ class _InspectorTree(Tree[Node]):
         node = self.cursor_node
         if node is None:
             return
-        cell_len = self.label_cell_len(node)
-        if cell_len > self.size.width + self.scroll_offset.x:
+        # Compare against the FULL rendered row (indent guides + label)
+        # so a label whose cell_len alone fits the viewport but whose
+        # row-with-guides spills past the right edge still pans
+        # instead of falling through to expand.
+        row_cell_len = self._row_cell_len(node)
+        if row_cell_len > self.size.width + self.scroll_offset.x:
             self.scroll_right(animate=False)
             self._save_cursor_scroll_x()
             return
@@ -235,37 +296,89 @@ class _InspectorTree(Tree[Node]):
         self.scroll_end(animate=False, x_axis=True, y_axis=False)
         self._save_cursor_scroll_x()
 
-    # --- one-shot undo for the ``←``-to-parent climb -------------------
+    # --- chained undo for the ``←``-to-parent climb --------------------
     #
     # The undo overlay lives at the key-event layer rather than inside
     # ``action_pan_right_or_expand``: this way the literal ``right``
     # key is the only trigger, while vim ``l`` (which shares the same
-    # action) is treated as "any other key" per the UX spec.
+    # action) is treated as "not undo" per the UX spec. Stack
+    # invalidation is driven by :meth:`watch_cursor_line` rather than
+    # by ``on_key`` so a keypress that doesn't move the tree cursor
+    # (e.g. opening a modal, search input focus) leaves the chain
+    # intact for resumption.
 
     async def on_key(self, event: events.Key) -> None:
-        """One-shot undo for the ``←``-to-parent climb.
+        """Pop one return-stack entry on ``→`` while the chain is live.
 
         Runs before the non-priority binding chain fires (see
-        ``App._on_key`` in textual): if the previous keypress was a
-        ``←`` that climbed to a parent and the next key is ``→``,
-        restore the cursor to the just-evacuated child and short-circuit
-        the binding. Any other key clears the undo state and falls
-        through to the normal binding dispatch.
+        ``App._on_key`` in textual): while the return stack is
+        non-empty and the next key is ``→``, pop the most-recent
+        evacuated child and move the cursor there, short-circuiting
+        the binding. Any other key falls through to the normal
+        dispatch -- the stack is invalidated by
+        :meth:`watch_cursor_line` only when the cursor actually leaves
+        the expected parent row.
         """
-        if self._undo_left_child is None:
+        if not self._undo_left_stack:
             return
-        if event.key == "right":
-            target = self._undo_left_child
-            self._undo_left_child = None
-            # ``move_cursor`` triggers the per-row scroll restore via
-            # :meth:`watch_cursor_line`, mirroring a normal cursor move.
-            self.move_cursor(target, animate=False)
+        if event.key != "right":
+            return
+        target = self._undo_left_stack.pop()
+        if not self._is_attached(target):
+            # Tree was rebuilt while the entry sat on the stack; the
+            # popped child is no longer reachable. Consume the right-
+            # arrow silently (the user pressed an undo step; we just
+            # can't fulfill this one), preserving the rest of the chain
+            # for the next press.
             event.stop()
             event.prevent_default()
             return
-        # Any other key invalidates the undo state without consuming
-        # the event.
-        self._undo_left_child = None
+        # ``move_cursor`` triggers the per-row scroll restore via
+        # :meth:`watch_cursor_line`, mirroring a normal cursor move.
+        # Suppress the stack-invalidation check for this internal move.
+        self._pending_internal_move += 1
+        try:
+            self.move_cursor(target, animate=False)
+        finally:
+            self._pending_internal_move -= 1
+        event.stop()
+        event.prevent_default()
+
+    def _is_attached(self, node: "TreeNode[Node]") -> bool:
+        """Whether ``node`` is still part of this tree's live structure.
+
+        Walks parent pointers up to the tree root; if any link is
+        missing along the way the node was detached (e.g. its subtree
+        was collapsed and re-built) and we must not move the cursor
+        onto it.
+        """
+        cursor: "Optional[TreeNode[Node]]" = node
+        while cursor is not None:
+            if cursor is self.root:
+                return True
+            cursor = cursor.parent
+        return False
+
+    def _maybe_invalidate_undo_stack(self) -> None:
+        """Clear the undo stack if the cursor wandered off the chain head.
+
+        Called from :meth:`watch_cursor_line` after each cursor move.
+        Our own internal cursor moves (left-to-parent climb + right-
+        arrow pop) wrap their ``move_cursor`` calls in
+        :attr:`_pending_internal_move`, so this clearing logic only
+        fires on user-driven moves -- arrows, page-up/down, mouse
+        click, etc. Once the cursor leaves the parent of the top-of-
+        stack entry, the chain semantics are broken and the stack is
+        emptied wholesale (a partial-clear policy would inflict
+        non-obvious undo behaviour on the user).
+        """
+        if self._pending_internal_move:
+            return
+        if not self._undo_left_stack:
+            return
+        expected_parent = self._undo_left_stack[-1].parent
+        if self.cursor_node is not expected_parent:
+            self._undo_left_stack.clear()
 
     # --- cursor-move scroll restore + auto-adjust ----------------------
 
@@ -293,19 +406,24 @@ class _InspectorTree(Tree[Node]):
         per-row repaint + ``NodeHighlighted`` post fire normally.
         """
         super().watch_cursor_line(previous_line, line)
+        self._maybe_invalidate_undo_stack()
         node = self.cursor_node
         if node is None or node.data is None:
             return
         remembered = getattr(node.data, "remembered_scroll_x", 0)
         viewport_width = self.size.width
-        cell_len = self.label_cell_len(node)
+        # Measure against the full rendered row (guides + label) since
+        # horizontal scroll addresses the full line; a label whose
+        # cell_len alone falls short of the viewport may still be
+        # clipped by indent-guide overhead on a deeply-nested row.
+        row_cell_len = self._row_cell_len(node)
 
         effective = remembered
-        if viewport_width > 0 and cell_len - remembered < viewport_width // 2:
+        if viewport_width > 0 and row_cell_len - remembered < viewport_width // 2:
             # Less than half a viewport of content sits past the
             # restored column; pull the right edge in so the row stays
             # visible. ``max(0, ...)`` clamps short rows to flush-left.
-            effective = max(0, cell_len - viewport_width)
+            effective = max(0, row_cell_len - viewport_width)
 
         self.scroll_to(x=effective, animate=False)
 
