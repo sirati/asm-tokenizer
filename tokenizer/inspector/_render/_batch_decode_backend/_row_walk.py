@@ -1,10 +1,15 @@
-"""Per-row stream walker for the BatchDecodeBackend.
+"""Per-row band-emit walker for the BatchDecodeBackend.
 
 Single concern: translate one row of :attr:`BatchDecodeResult.tokens`
-+ its aligned sidecars into ``[RowBlock, ...]``. Plan
-``inspector-render-backends.md`` §6 + decisions #16/#17/#18/#29/#30 +
-audits B-CRIT-1..4 / B-HIGH-5..7 / B-MED-9..11 / B-LOW-12,14. Cursors
-``id_cursor`` + ``num_cursor`` track per-row sidecar positions.
++ its aligned sidecars into ``[RowSection, ...]`` -- variant header,
+LOCAL_FUNC self-prepend (Function ID), and per-basic-block BODY
+sections with the ``Block_Def`` + ``block_v2`` header pair consumed
+silently (the parent tree row's label already encodes the block
+index). Cursors ``id_cursor`` + ``num_cursor`` track per-row sidecar
+positions. The section state machine (open / close / per-col
+transitions) is factored into :mod:`._sections` so this module owns
+only the per-band emission concern. Plan reference:
+``inspector-render-backends.md`` §6 + decisions #16/#17/#18/#29/#30.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from tokenizer.aligned_data.matched_sections_bin import (
 )
 from tokenizer.inspector._render._protocol import (
     AsmLine,
+    BlockKind,
     InlineCallEntry,
     InlineJumpEntry,
     LineItem,
@@ -44,9 +50,19 @@ from ._band_emitters import emit_instr_rep, emit_number
 from ._boundaries import call_target_starts, header_trigger_cols
 from ._callee_resolver import resolve_callee_pointer
 from ._fid_table import FidBaseTable
+from ._sections import (
+    RowSection,
+    WalkSectionState,
+    close_current_section,
+    enter_body_after_function_id,
+    enter_new_body_block,
+    enter_variant_header_to_function_id,
+    maybe_advance_call_target,
+    set_current_body_block_idx,
+)
 
 
-__all__ = ["RowBlock", "render_row_blocks"]
+__all__ = ["RowSection", "render_row_blocks"]
 
 
 # Per-Category -> CallTargetType for FUNCTION-band identity tokens.
@@ -62,83 +78,42 @@ assert set(_CATEGORY_TO_CALL_TARGET_TYPE) == set(FUNCTION_CATEGORIES), (
 )
 
 
-@dataclass(frozen=True)
-class RowBlock:
-    """One rendered block (a block_idx + its ordered LineItems)."""
-
-    block_idx: int
-    items: List[LineItem]
-
-
 @dataclass
-class _WalkState:
-    """Mutable per-row walk cursors + block accumulator.
+class _WalkState(WalkSectionState):
+    """Per-row walk state: composes :class:`WalkSectionState` (the
+    section concern; see :mod:`._sections`) with the band-emitter
+    cursors that the per-col loop reads + updates.
 
-    ``current_call_target_idx`` tracks which Stage1CallTarget we're
-    walking; it advances when we cross a call-target start column
-    (computed from ``partial_cut_lengths`` per
-    :func:`_call_target_starts`). The InlineCallEntry resolver reads
-    the current CT's ``call_targets_section`` to map (kind, counter) ->
-    ``CallTarget.function_section_ptr`` -> SectionPointerSpec.
-
-    ``last_number_shifted_id`` carries the most-recently-emitted
-    NUMBER-band token's shifted id (``-1`` = "none"). Resets to ``-1``
-    on every non-NUMBER token; drives multi-chunk trailing-slot
-    detection inside :func:`_emit_number`.
-
-    ``pending_header`` latches True at every block-header trigger
-    column (CT-boundary cols + runlength-computed in-CT block-start
-    cols); the NEXT BLOCK_V2 IDENTITY token (in stream order) clears
-    the latch and is treated as the block's header (overwrite +
-    flush+open). BLOCK_V2 tokens with ``pending_header=False`` are
-    in-function jumps. Latching matches both the production layout
-    (where col ``n_axis`` holds the LOCAL_FUNC self-prepend, NOT a
-    BLOCK_V2, and the actual header lands one slot later) and the
-    test layouts that place BLOCK_V2 directly at the CT-boundary col.
+    ``id_cursor`` / ``num_cursor`` track per-row sidecar positions.
+    ``current_col`` is the column index the loop is processing;
+    crosses :func:`_handle_block`'s ``n_axis`` invariant check.
+    ``last_number_shifted_id`` carries the prior NUMBER-band token's
+    shifted id (``-1`` = none); drives multi-chunk trailing-slot
+    detection inside :func:`emit_number` and resets on every
+    non-NUMBER emit.
     """
 
-    row: int
-    n_axis: int
-    id_cursor: int
-    num_cursor: int
-    current_block_idx: int
-    current_items: List[LineItem]
-    completed: List[RowBlock]
-    header_trigger_cols: frozenset[int]
-    ct_start_cols: list[int]
-    current_call_target_idx: int = 0
+    row: int = 0
+    n_axis: int = 0
+    id_cursor: int = 0
+    num_cursor: int = 0
     current_col: int = 0
-    pending_header: bool = False
-    header_seen: bool = False
     last_number_shifted_id: int = -1
 
 
-def _close_current_block(state: _WalkState) -> None:
-    state.completed.append(
-        RowBlock(block_idx=state.current_block_idx, items=state.current_items)
-    )
-
-
-def _open_new_block(state: _WalkState, block_idx: int) -> None:
-    state.current_block_idx = block_idx
-    state.current_items = []
-
-
 def _handle_block(state: _WalkState, *, counter: int) -> None:
-    """BLOCK_V2 IDENTITY dispatch (header vs inline jump).
+    """BLOCK_V2 IDENTITY dispatch: header vs inline jump.
 
-    With ``pending_header=True`` (latched from a CT-boundary or in-CT
-    block-start trigger), this BLOCK_V2 is the block's header: at row
-    start it overwrites the pre-allocated block_idx in place (no
-    flush); at any later header trigger it flushes the current block
-    and opens a new one. BLOCK_V2 tokens with ``pending_header=False``
-    are in-function jumps.
-
-    Row layout invariant: BLOCK_V2 IDENTITY tokens never land inside
-    the ``[0, n_axis)`` variant_tokens prefix range (the prefix is
-    pure instruction-rep). A BLOCK_V2 column at or below the prefix
-    end is a data-integrity violation (raised loud for the inspector
-    diagnostic surface; the row writer is upstream).
+    With ``pending_header=True`` (latched at runlength-derived
+    trigger cols) the BLOCK_V2 is a body-block header: it flushes
+    any prior BODY content and opens a fresh BODY block whose
+    ``block_idx`` is the encoded ``counter`` (the BLOCK identity
+    index, matching the InlineJumpEntry target scheme). BLOCK_V2
+    tokens with ``pending_header=False`` are in-function jumps. If
+    the latch fires while still in FUNCTION_ID (bare-BLOCK_V2 test
+    layouts), the FUNCTION_ID -> BODY transition runs first. A
+    BLOCK_V2 inside ``[0, n_axis)`` is raised loud (the
+    variant_tokens prefix is pure INSTR_REP by row-writer contract).
     """
     if state.current_col < state.n_axis:
         raise AssertionError(
@@ -146,14 +121,19 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
             f"inside the variant_tokens prefix (n_axis={state.n_axis}); "
             f"the prefix is pure instruction-rep by row-writer contract."
         )
+    if state.current_kind is BlockKind.FUNCTION_ID:
+        # Bare-BLOCK_V2 test layout: no self-prepend slot exists. The
+        # FUNCTION_ID section stays empty; transition to BODY block
+        # before consuming the header.
+        enter_body_after_function_id(state)
     if state.pending_header:
-        if not state.header_seen:
-            state.current_block_idx = counter
-            state.header_seen = True
-        else:
-            if state.current_items:
-                _close_current_block(state)
-            _open_new_block(state, block_idx=counter)
+        if state.current_items:
+            # Flush prior BODY block (e.g., the previous basic block
+            # before this header) and open a fresh one. The first
+            # BLOCK_V2 after FUNCTION_ID -> BODY transition has an
+            # empty section so this branch is skipped.
+            enter_new_body_block(state)
+        set_current_body_block_idx(state, block_idx=counter)
         state.pending_header = False
         return
     state.current_items.append(InlineJumpEntry(target_block_idx=counter))
@@ -173,16 +153,15 @@ def _handle_function_category(
 ) -> None:
     """FUNCTION-Category dispatch: FID lookup + InlineCallEntry.
 
-    For LOCAL / PLT call_targets, resolves the callee's
-    ``function_section_ptr`` to a :class:`SectionPointerSpec` via the
-    caller-supplied ``callee_arm_resolver`` closure (the inspector
-    factory threads in a session-backed
-    ``_idx_for_section_offset`` wrapper). EXT call_targets keep
-    ``callee_section_pointer=None`` -- there is no body to inline. The
-    LOCAL/PLT path consumes the CURRENT call-target's
-    ``call_targets_section`` (each Stage1CallTarget owns its own
-    table; inlined-callee call sites resolve against THEIR table, not
-    the row's root section's table).
+    LOCAL / PLT call_targets resolve their ``function_section_ptr``
+    via the caller-supplied ``callee_arm_resolver`` closure; EXT
+    call_targets keep ``callee_section_pointer=None``. The LOCAL/PLT
+    path consumes the CURRENT call-target's ``call_targets_section``
+    so inlined-callee call sites resolve against THEIR table. The
+    root CT's LOCAL_FUNC self-prepend (counter 0) emits into the
+    FUNCTION_ID section; its callee pointer cycles back to the same
+    function so the row is expandable into the function's own
+    variants (a useful self-reference for the inspector).
     """
     call_kind = _CATEGORY_TO_CALL_TARGET_TYPE[cat]
     fid = fid_table.lookup(row=state.row, cat=cat, counter=counter)
@@ -207,6 +186,9 @@ def _handle_function_category(
             provider=provider,
         )
     )
+    if state.current_kind is BlockKind.FUNCTION_ID:
+        # The self-prepend just emitted; transition to BODY block 0.
+        enter_body_after_function_id(state)
 
 
 def _emit_identity(
@@ -224,12 +206,12 @@ def _emit_identity(
     """IDENTITY band: resolve Category + dispatch per-Category.
 
     BLOCK -> :func:`_handle_block` (header vs jump driven by the
-    pre-computed block-start columns from the runlength sidecars).
-    FUNCTION categories -> :func:`_handle_function_category` (one
-    InlineCallEntry per token; EXT_FUNC provider keyed by FID per
-    decision #28; LOCAL/PLT callee_section_pointer resolved via the
-    session-backed callee_arm_resolver). COUNTER-but-not-BLOCK ->
-    placeholder AsmLine (plan §11 follow-up).
+    section-transition latch). FUNCTION categories ->
+    :func:`_handle_function_category` (one InlineCallEntry per token;
+    EXT_FUNC provider keyed by FID per decision #28; LOCAL/PLT
+    callee_section_pointer resolved via the session-backed
+    callee_arm_resolver). COUNTER-but-not-BLOCK -> placeholder
+    AsmLine (plan §11 follow-up).
     """
     counter = int(identities_row[state.id_cursor])
     state.id_cursor += 1
@@ -253,6 +235,38 @@ def _emit_identity(
     state.current_items.append(AsmLine(text=f"<{cat.name.lower()} {counter}>"))
 
 
+def _maybe_open_function_id_section(state: _WalkState, *, col: int) -> None:
+    """Open FUNCTION_ID at the root CT start col (VARIANT_HEADER ->
+    FUNCTION_ID). Subsequent FUNCTION_ID -> BODY transitions are
+    token-content-driven; see :func:`enter_body_after_function_id`.
+    """
+    if (
+        not state.ct_start_cols
+        or col != state.ct_start_cols[0]
+        or state.current_kind is not BlockKind.VARIANT_HEADER
+    ):
+        return
+    enter_variant_header_to_function_id(state)
+
+
+def _maybe_latch_header_trigger(state: _WalkState, *, col: int) -> None:
+    """Latch :attr:`pending_header` at runlength-derived trigger cols.
+
+    The actual BODY-block open is deferred to :func:`_handle_block`
+    when the upcoming BLOCK_V2 consumes the latch -- matches the
+    legacy walker's "no BLOCK_V2 = no new block" rule so jump-table
+    footer blocks (no BLOCK_V2 header) stay folded into the prior
+    BODY section. Latching is skipped while in VARIANT_HEADER /
+    FUNCTION_ID; those transitions own their own ``pending_header``
+    handling.
+    """
+    if col not in state.header_trigger_cols:
+        return
+    if state.current_kind in (BlockKind.VARIANT_HEADER, BlockKind.FUNCTION_ID):
+        return
+    state.pending_header = True
+
+
 def render_row_blocks(
     *,
     result: BatchDecodeResult,
@@ -265,30 +279,21 @@ def render_row_blocks(
     line_to_name: Mapping[int, str],
     line_to_provider: Mapping[int, str],
     callee_arm_resolver: Callable[[int], Optional[SectionPointerSpec]],
-) -> List[RowBlock]:
-    """Walk one row and split into blocks.
+) -> List[RowSection]:
+    """Walk one row and split into typed sections.
 
-    Pre-allocates an empty entry block; the variant-tokens prefix lands
-    in it as instruction-rep AsmLines, and the first BLOCK_V2 at a
-    runlength-computed block-start column overwrites the pre-allocated
-    block's index. Subsequent block-start columns flush + open a new
-    block. Terminates on ``token == 0`` (null padding tail) or end-of-
-    row.
-
-    Block boundaries are driven by the runlength sidecars
-    (:attr:`BatchDecodeResult.block_runlength` +
-    :attr:`BatchDecodeResult.insn_runlength` + their per-row offsets),
-    not by BLOCK_V2 tokens directly -- a single call_target may contain
-    multiple block headers, and BLOCK_V2 tokens NOT at a sidecar-
-    computed block-start column are in-function jumps.
-
-    ``call_targets_per_ct`` is the per-Stage1CallTarget
-    ``call_targets_section`` (the same list the FTL render path
-    consumes). ``callee_arm_resolver`` is the session-backed
-    ``_idx_for_section_offset`` closure -- LOCAL / PLT call_targets
-    resolve their ``function_section_ptr`` to a
-    :class:`SectionPointerSpec` (or ``None`` for cross-arm / missing)
-    via this closure; EXTERN call_targets always carry ``None``.
+    Section flow: pre-open VARIANT_HEADER (cols ``[0, n_axis)``); at
+    root CT start col transition to FUNCTION_ID; once the self-
+    prepend IDENTITY emits (or the first BLOCK_V2 IDENTITY in bare-
+    BLOCK_V2 test layouts), open BODY block 0 with ``pending_header``
+    set so the ``Block_Def`` + ``block_v2`` header pair is consumed
+    silently. Subsequent BODY blocks open at runlength-derived
+    :func:`header_trigger_cols`. Terminates on ``token == 0`` or
+    end-of-row. ``call_targets_per_ct`` carries each Stage1CallTarget's
+    own ``call_targets_section`` so inlined-callee call sites resolve
+    against THEIR table; ``callee_arm_resolver`` is the session-
+    backed ``_idx_for_section_offset`` closure (returns ``None`` for
+    cross-arm/missing; EXTERN call_targets always carry ``None``).
     """
     tokens_row = result.tokens[row]
     id_lo, id_hi = int(result.identity_row_offsets[row]), int(result.identity_row_offsets[row + 1])
@@ -296,10 +301,6 @@ def render_row_blocks(
     identities_row = result.identities[id_lo:id_hi]
     numbers_sig = result.numbers_significant[num_lo:num_hi]
     numbers_se = result.numbers_sign_exponent[num_lo:num_hi]
-
-    # Pull runlength sidecars -- the canonical block-boundary source.
-    # Required when ``emit_block_n_insns_runlength=True`` was passed to
-    # batch_decode; the BatchDecodeBackend pins this at True.
     if (
         result.block_runlength is None
         or result.block_runlength_row_offsets is None
@@ -317,7 +318,6 @@ def render_row_blocks(
     i_hi = int(result.insn_runlength_row_offsets[row + 1])
     block_runlength_row = result.block_runlength[b_lo:b_hi]
     insn_runlength_row = result.insn_runlength[i_lo:i_hi]
-
     triggers = header_trigger_cols(
         n_axis=n_axis,
         partial_cut_lengths=partial_cut_lengths,
@@ -327,7 +327,6 @@ def render_row_blocks(
     ct_start_cols = call_target_starts(
         n_axis=n_axis, partial_cut_lengths=partial_cut_lengths,
     )
-    ct_boundary_set = set(ct_start_cols)
     # Pre-build per-CT kind partition (LOCAL/PLT/EXTERN -> indices).
     kind_to_called_idx_per_ct: list[Mapping[CallTargetType, list[int]]] = [
         partition_call_target_kinds(ct.type for ct in call_targets_section)
@@ -335,26 +334,32 @@ def render_row_blocks(
     ]
 
     state = _WalkState(
-        row=row, n_axis=n_axis, id_cursor=0, num_cursor=0,
-        current_block_idx=0, current_items=[], completed=[],
-        header_trigger_cols=triggers,
+        current_kind=BlockKind.VARIANT_HEADER,
+        current_block_idx=-1,
+        current_items=[],
+        completed=[],
         ct_start_cols=ct_start_cols,
+        header_trigger_cols=triggers,
+        row=row, n_axis=n_axis,
     )
 
     n_cols = int(tokens_row.shape[0])
     for col in range(n_cols):
         state.current_col = col
-        if col in ct_boundary_set and col != n_axis:
-            # Advance to next call_target (root index 0 stays at col
-            # n_axis; subsequent CTs increment).
-            state.current_call_target_idx += 1
-        if col in triggers:
-            state.pending_header = True
+        _maybe_open_function_id_section(state, col=col)
+        _maybe_latch_header_trigger(state, col=col)
+        maybe_advance_call_target(state, col=col)
         shifted_id = int(tokens_row[col])
         if shifted_id == 0:
             break  # null-content padding tail
         band = classify_shifted_id(shifted_id)
         if band is Band.INSTR_REP:
+            if state.pending_header:
+                # ``Block_Def`` carrier -- absorbed silently so the
+                # BODY section's first emitted item is the first
+                # real instruction.
+                state.last_number_shifted_id = -1
+                continue
             emit_instr_rep(
                 state.current_items,
                 shifted_id=shifted_id,
@@ -390,6 +395,5 @@ def render_row_blocks(
                 f"row={row}, col={col} (shifted_id={shifted_id})"
             )
 
-    if state.current_items:
-        _close_current_block(state)
+    close_current_section(state)
     return state.completed

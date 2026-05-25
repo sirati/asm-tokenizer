@@ -32,6 +32,7 @@ from tokenizer.inspector._label import (
     inline_call_label,
     inline_jump_label,
 )
+from tokenizer.inspector._render._protocol import BlockKind
 from tokenizer.inspector._tree_model import (
     AsmLeaf,
     BlockNode,
@@ -117,6 +118,29 @@ def _variant_label_from_axes(
 # ---------------------------------------------------------------------------
 
 
+# Per-kind label policy for :class:`BlockNode` rows. The model node
+# carries the typed :class:`BlockKind` discriminator; the UI side
+# composes the row label per-kind without ``isinstance``-on-string
+# discriminators.
+_BLOCK_KIND_LABELS: dict[BlockKind, str] = {
+    BlockKind.VARIANT_HEADER: "Variant Header",
+    BlockKind.FUNCTION_ID: "Function ID",
+}
+
+
+def _block_node_label(node: "BlockNode") -> str:
+    """Compose the row text for a :class:`BlockNode`.
+
+    Dispatches off :attr:`BlockNode.kind`: the two non-body kinds
+    render their fixed section name; :attr:`BlockKind.BODY` composes
+    ``Block: <idx>   <preview>`` (the legacy shape).
+    """
+    fixed = _BLOCK_KIND_LABELS.get(node.kind)
+    if fixed is not None:
+        return fixed
+    return f"Block: {node.block_idx}   {node.preview}"
+
+
 def _compose_label(node: Node) -> Text:
     """Translate one model node into its visible label text.
 
@@ -130,7 +154,7 @@ def _compose_label(node: Node) -> Text:
     if isinstance(node, VariantNode):
         return Text(_variant_label_from_axes(node.label_axes))
     if isinstance(node, BlockNode):
-        return Text(f"Block: {node.block_idx}   {node.preview}")
+        return Text(_block_node_label(node))
     if isinstance(node, InlineCallNode):
         return Text(
             inline_call_label(

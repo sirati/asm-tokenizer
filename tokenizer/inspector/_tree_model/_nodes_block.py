@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 
+from tokenizer.inspector._render._protocol import BlockKind
+
+
 if TYPE_CHECKING:
     from tokenizer.inspector._render._protocol import (
         BackendFactory,
@@ -28,17 +31,20 @@ __all__ = [
 
 @dataclass
 class BlockNode:
-    """One per block within a variant body.
+    """One per section within a variant.
 
-    Carries the factory ref so inline-call descendants can spawn
-    callee :class:`FunctionNode` s against the same factory; carries
-    the backend ref so the render call lands on the parent's per-
-    function backend instance.
+    A section is one of :attr:`BlockKind.VARIANT_HEADER`,
+    :attr:`BlockKind.FUNCTION_ID`, or :attr:`BlockKind.BODY` (per the
+    :class:`RenderedBlock` Protocol contract). Carries the factory ref
+    so inline-call descendants can spawn callee :class:`FunctionNode`
+    s against the same factory; carries the backend ref so the render
+    call lands on the parent's per-function backend instance.
     """
 
     factory: "BackendFactory"
     backend: "RenderBackend"
     variant_idx: int
+    kind: BlockKind
     block_idx: int
     preview: str
     is_failed: bool = False
@@ -51,6 +57,7 @@ class BlockNode:
             factory=self.factory,
             backend=self.backend,
             variant_idx=self.variant_idx,
+            kind=self.kind,
             block_idx=self.block_idx,
         )
 
@@ -59,9 +66,10 @@ class BlockNode:
 class InlineJumpNode:
     """Inline jump to another block in the SAME variant.
 
-    Expansion renders the target block in place via
-    :meth:`RenderBackend.render_block`; the line-item translation is
-    shared with :class:`BlockNode` so jump-target rendering reuses the
+    Expansion renders the target BODY block in place via
+    :meth:`RenderBackend.render_block` (jumps always target BODY
+    sections); the line-item translation is shared with
+    :class:`BlockNode` so jump-target rendering reuses the
     block-expansion code path.
     """
 
@@ -79,6 +87,7 @@ class InlineJumpNode:
             factory=self.factory,
             backend=self.backend,
             variant_idx=self.variant_idx,
+            kind=BlockKind.BODY,
             block_idx=self.target_block_idx,
         )
 
@@ -88,6 +97,7 @@ def _translate_line_items(
     factory: "BackendFactory",
     backend: "RenderBackend",
     variant_idx: int,
+    kind: BlockKind,
     block_idx: int,
 ) -> list:
     """Translate one block's :class:`LineItem` stream into model nodes.
@@ -110,7 +120,7 @@ def _translate_line_items(
     from ._nodes_call import InlineCallNode
     from ._nodes_leaf import AsmLeaf
 
-    items = backend.render_block(variant_idx, block_idx)
+    items = backend.render_block(variant_idx, kind, block_idx)
 
     out: list = []
     for item in items:

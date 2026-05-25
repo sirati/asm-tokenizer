@@ -30,6 +30,7 @@ backend. :attr:`RenderBackend.closed` is the observable flag.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable, Mapping, Optional, Protocol, Sequence, Union, runtime_checkable
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
@@ -40,6 +41,7 @@ from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 __all__ = [
     "AsmLine",
     "BackendFactory",
+    "BlockKind",
     "FunctionHandle",
     "InlineCallEntry",
     "InlineJumpEntry",
@@ -48,6 +50,38 @@ __all__ = [
     "RenderedBlock",
     "RenderedVariant",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Section discriminator -- variant-header / function-id / body
+# ---------------------------------------------------------------------------
+
+
+class BlockKind(Enum):
+    """Discriminator for the three :class:`RenderedBlock` section kinds.
+
+    Variant-level layout (BatchDecodeBackend, the only producer that
+    splits all three):
+
+    * :attr:`VARIANT_HEADER` -- the variant_tokens prefix
+      (``arch:/comp:/cver:/opt:`` rows). Spans cols ``[0, n_axis)``.
+      ``block_idx == -1`` (sentinel: not a body block).
+    * :attr:`FUNCTION_ID` -- the row-assembler-owned LOCAL_FUNC
+      self-prepend slot (the function's own identity reference). One
+      column at ``col == n_axis``. ``block_idx == -1``.
+    * :attr:`BODY` -- one section per basic block. Spans the post-
+      header-pair content of the block; the ``Block_Def`` + ``block_v2``
+      header pair is consumed silently by the walker so the section
+      content starts at the first real instruction. ``block_idx`` is
+      the block index encoded by the consumed header.
+
+    FtlBackend emits only :attr:`BODY` sections (no variant_tokens /
+    self-prepend at the FTL stream layer).
+    """
+
+    VARIANT_HEADER = "variant_header"
+    FUNCTION_ID = "function_id"
+    BODY = "body"
 
 
 # ---------------------------------------------------------------------------
@@ -107,16 +141,26 @@ class RenderedVariant:
 
 @dataclass(frozen=True)
 class RenderedBlock:
-    """Per-block metadata for tree-row labels.
+    """Per-section metadata for tree-row labels.
+
+    Three section kinds are discriminated by :attr:`kind`
+    (:class:`BlockKind`): a BatchDecodeBackend variant exposes
+    ``[VARIANT_HEADER, FUNCTION_ID, BODY*]`` so the variant_tokens
+    prefix, LOCAL_FUNC self-prepend, and per-block body each get a
+    semantically-correct tree section. FtlBackend emits only
+    :attr:`BlockKind.BODY` entries.
 
     ``preview`` carries the raw asm-text head WITHOUT any UI
     truncation -- the UI layer (:func:`_label.block_preview`) owns
     the length policy (plan section 3, ``_label.py`` row).
 
     ``block_idx`` is the backend-internal block index threaded back
-    into :meth:`RenderBackend.render_block`.
+    into :meth:`RenderBackend.render_block`; ``-1`` for the non-body
+    kinds (``VARIANT_HEADER`` / ``FUNCTION_ID``) where there is no
+    block to address.
     """
 
+    kind: BlockKind
     block_idx: int
     preview: str
 
@@ -238,14 +282,20 @@ class RenderBackend(Protocol):
         ...
 
     def render_block(
-        self, variant_idx: int, block_idx: int
+        self, variant_idx: int, kind: BlockKind, block_idx: int
     ) -> Iterable[LineItem]:
-        """Materialise the per-block line-item stream.
+        """Materialise the per-section line-item stream.
 
-        Returns an :class:`Iterable` (not a list) so consumers cannot
-        mutate cached state. Re-callable on the same coordinates.
-        Raises on data-integrity violation; the UI's central
-        dispatcher (``_app.py``) catches and renders the error row.
+        The ``(kind, block_idx)`` pair addresses one section produced
+        by :meth:`blocks`. :attr:`BlockKind.BODY` sections use the
+        real block index; :attr:`BlockKind.VARIANT_HEADER` and
+        :attr:`BlockKind.FUNCTION_ID` use ``block_idx == -1`` (the
+        kind discriminates between them so the sentinel never
+        collides). Returns an :class:`Iterable` (not a list) so
+        consumers cannot mutate cached state. Re-callable on the
+        same coordinates. Raises on data-integrity violation; the
+        UI's central dispatcher (``_app.py``) catches and renders
+        the error row.
         """
         ...
 

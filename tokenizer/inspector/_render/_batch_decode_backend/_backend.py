@@ -32,6 +32,7 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
 )
 from tokenizer.inspector._render._protocol import (
     AsmLine,
+    BlockKind,
     FunctionHandle,
     LineItem,
     RenderedBlock,
@@ -47,7 +48,7 @@ from tokenizer.variant_tokens.prefixes import (
 )
 
 from ._fid_table import FidBaseTable
-from ._row_walk import RowBlock, render_row_blocks
+from ._row_walk import RowSection, render_row_blocks
 
 
 __all__ = ["BatchDecodeBackend"]
@@ -117,7 +118,7 @@ class BatchDecodeBackend:
         self._result: Optional[BatchDecodeResult] = None
         self._fid_table: Optional[FidBaseTable] = None
         self._variants_cache: Optional[List[RenderedVariant]] = None
-        self._row_blocks_by_variant: dict[int, List[RowBlock]] = {}
+        self._row_sections_by_variant: dict[int, List[RowSection]] = {}
         self._variant_row_index: dict[int, int] = {}
 
     # Public RenderBackend surface -----------------------------------------
@@ -138,29 +139,51 @@ class BatchDecodeBackend:
         return self._variants_cache
 
     def blocks(self, variant_idx: int) -> Sequence[RenderedBlock]:
+        """Per-section :class:`RenderedBlock` enumeration.
+
+        Returns ``[VARIANT_HEADER, FUNCTION_ID, BODY[0], BODY[1], ...]``
+        for every variant -- the per-row walker stamps each section
+        with its :class:`BlockKind` discriminator so the UI layer can
+        compose the right label for each tree row (Variant Header /
+        Function ID / Block: N). The preview text is the first
+        :class:`AsmLine`'s body within the section -- empty string
+        when the section carries no AsmLines (e.g. the FUNCTION_ID
+        section, which holds an :class:`InlineCallEntry` for the
+        self-prepend, not an AsmLine).
+        """
         self._assert_open()
         self._ensure_result()
-        row_blocks = self._row_blocks_for_variant(variant_idx)
+        sections = self._row_sections_for_variant(variant_idx)
         return [
             RenderedBlock(
-                block_idx=rb.block_idx,
-                preview=_preview_for_block(rb),
+                kind=section.kind,
+                block_idx=section.block_idx,
+                preview=_preview_for_section(section),
             )
-            for rb in row_blocks
+            for section in sections
         ]
 
-    def render_block(self, variant_idx: int, block_idx: int) -> Iterable[LineItem]:
+    def render_block(
+        self, variant_idx: int, kind: BlockKind, block_idx: int
+    ) -> Iterable[LineItem]:
+        """Materialise the items for one section.
+
+        Dispatch is by ``(kind, block_idx)`` pair: BODY sections
+        carry their real block index; the two non-body kinds
+        (VARIANT_HEADER + FUNCTION_ID) share ``block_idx == -1`` and
+        are disambiguated by ``kind``. Returns a tuple snapshot so
+        consumers can't mutate the cached list (Iterable per
+        Protocol).
+        """
         self._assert_open()
         self._ensure_result()
-        row_blocks = self._row_blocks_for_variant(variant_idx)
-        for rb in row_blocks:
-            if rb.block_idx == block_idx:
-                # Tuple snapshot so consumers can't mutate the cache
-                # (Iterable per Protocol; tuple satisfies it without
-                # leaking the cached list reference).
-                return tuple(rb.items)
+        sections = self._row_sections_for_variant(variant_idx)
+        for section in sections:
+            if section.kind is kind and section.block_idx == block_idx:
+                return tuple(section.items)
         raise KeyError(
-            f"BatchDecodeBackend.render_block: no block {block_idx} "
+            f"BatchDecodeBackend.render_block: no section "
+            f"kind={kind!r} block_idx={block_idx} "
             f"for variant {variant_idx}"
         )
 
@@ -171,7 +194,7 @@ class BatchDecodeBackend:
         self._result = None
         self._fid_table = None
         self._variants_cache = None
-        self._row_blocks_by_variant.clear()
+        self._row_sections_by_variant.clear()
         self._variant_row_index.clear()
 
     # Lazy load + per-variant walk ----------------------------------------
@@ -226,9 +249,9 @@ class BatchDecodeBackend:
             )
         return rendered
 
-    def _row_blocks_for_variant(self, variant_idx: int) -> List[RowBlock]:
+    def _row_sections_for_variant(self, variant_idx: int) -> List[RowSection]:
         """Lazy per-variant walk; cached idempotently."""
-        cached = self._row_blocks_by_variant.get(variant_idx)
+        cached = self._row_sections_by_variant.get(variant_idx)
         if cached is not None:
             return cached
         # variants() populates _variant_row_index; idempotent.
@@ -271,19 +294,23 @@ class BatchDecodeBackend:
             line_to_provider=self._line_to_provider,
             callee_arm_resolver=self._callee_arm_resolver,
         )
-        self._row_blocks_by_variant[variant_idx] = walked
+        self._row_sections_by_variant[variant_idx] = walked
         return walked
 
 
-def _preview_for_block(rb: RowBlock) -> str:
-    """First :class:`AsmLine`'s text or empty string.
+def _preview_for_section(section: RowSection) -> str:
+    """First :class:`AsmLine`'s text in the section, or empty string.
 
     Mirrors the FtlBackend's preview contract (the
-    :func:`tokenizer.inspector._label.block_preview` helper truncates as
-    the UI policy layer); this backend feeds the raw asm-text head so
-    the truncation policy applies uniformly across backends.
+    :func:`tokenizer.inspector._label.block_preview` helper truncates
+    as the UI policy layer); this backend feeds the raw asm-text head
+    so the truncation policy applies uniformly across backends. The
+    FUNCTION_ID section commonly carries no AsmLines (its single
+    entry is an :class:`InlineCallEntry` for the self-prepend), so
+    the preview falls through to empty -- the UI labels that section
+    with a fixed string, not a preview.
     """
-    for item in rb.items:
+    for item in section.items:
         if isinstance(item, AsmLine):
             return item.text
     return ""

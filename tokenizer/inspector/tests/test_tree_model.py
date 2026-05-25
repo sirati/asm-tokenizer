@@ -23,6 +23,7 @@ from tokenizer.inspector._render._protocol import (
     BackendFactory,
     FunctionHandle,
     RenderBackend,
+    BlockKind,
     RenderedBlock,
     RenderedVariant,
 )
@@ -78,7 +79,9 @@ def _make_backend(n_variants: int, n_blocks: int = 0) -> MagicMock:
         _make_rendered_variant(i) for i in range(n_variants)
     ]
     backend.blocks.return_value = [
-        RenderedBlock(block_idx=i, preview=f"preview {i}")
+        RenderedBlock(
+            kind=BlockKind.BODY, block_idx=i, preview=f"preview {i}",
+        )
         for i in range(n_blocks)
     ]
     backend.render_block.return_value = ()
@@ -195,13 +198,14 @@ def test_block_node_expand_translates_asm_line_to_leaf():
         factory=factory,
         backend=backend,
         variant_idx=0,
+        kind=BlockKind.BODY,
         block_idx=0,
         preview="preview",
     )
 
     children = node.expand()
 
-    backend.render_block.assert_called_once_with(0, 0)
+    backend.render_block.assert_called_once_with(0, BlockKind.BODY, 0)
     assert len(children) == 1
     assert isinstance(children[0], AsmLeaf)
     assert children[0].text == "nop"
@@ -231,6 +235,7 @@ def test_block_node_expand_translates_inline_call_entry():
         factory=factory,
         backend=backend,
         variant_idx=0,
+        kind=BlockKind.BODY,
         block_idx=0,
         preview="preview",
     )

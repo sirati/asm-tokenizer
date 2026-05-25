@@ -1,12 +1,21 @@
 """Per-row block / call-target boundary computation.
 
 Single concern: given a row's ``partial_cut_lengths`` + runlength
-sidecars, derive the column positions that trigger
-``pending_header`` (CT boundaries + in-CT block-start boundaries) and
-the per-call-target start columns the FUNCTION-category resolver
-indexes off.
+sidecars, derive the column positions that drive the walker's
+section transitions:
 
-The two helpers are pure-input -> pure-output (no dependencies on the
+* :func:`call_target_starts` -- per-call-target start cols (one per
+  CT), used so the FUNCTION-band resolver advances
+  ``current_call_target_idx`` into the right
+  ``call_targets_section`` table and so the section accumulator can
+  open the FUNCTION_ID section at the root CT's leading slot.
+* :func:`header_trigger_cols` -- ``pending_header``-latch trigger
+  cols (CT boundaries + in-CT block boundaries). The latch suppresses
+  the ``Block_Def`` INSTR_REP and consumes the ``block_v2`` IDENTITY
+  silently so the BODY section's first item is the first real
+  instruction.
+
+The helpers are pure-input -> pure-output (no dependencies on the
 walker's mutable state); separated from :mod:`._row_walk` so the
 boundary algorithm can be unit-tested + reused without standing up
 the full walker. Owned by the BatchDecode backend (the FTL backend
@@ -18,7 +27,10 @@ from __future__ import annotations
 import numpy as np
 
 
-__all__ = ["call_target_starts", "header_trigger_cols"]
+__all__ = [
+    "call_target_starts",
+    "header_trigger_cols",
+]
 
 
 def call_target_starts(

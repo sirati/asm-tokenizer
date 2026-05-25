@@ -61,6 +61,7 @@ class VariantNode:
                 factory=self.factory,
                 backend=self.backend,
                 variant_idx=self.variant_idx,
+                kind=rb.kind,
                 block_idx=rb.block_idx,
                 preview=rb.preview,
             )

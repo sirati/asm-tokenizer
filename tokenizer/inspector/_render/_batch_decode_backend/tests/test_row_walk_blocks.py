@@ -15,7 +15,14 @@ import pytest
 from tokenizer.inspector._render._batch_decode_backend._row_walk import (
     render_row_blocks,
 )
-from tokenizer.inspector._render._protocol import AsmLine, InlineJumpEntry
+from tokenizer.inspector._render._protocol import (
+    AsmLine,
+    BlockKind,
+    InlineJumpEntry,
+)
+
+from tokenizer.aligned_data.call_target_type import CallTargetType
+from tokenizer.inspector._render._protocol import InlineCallEntry
 
 from ._row_walk_fixtures import (
     BLOCK_V2,
@@ -23,6 +30,7 @@ from ._row_walk_fixtures import (
     EMPTY_FID_SIDECAR,
     EMPTY_NUMBERS,
     INSTR_REP_TOKEN,
+    LOCAL_FUNC,
     make_fid_table,
     make_result,
     vocab_stub,
@@ -162,13 +170,73 @@ def test_second_call_target_block_v2_flushes_then_opens() -> None:
     assert isinstance(blocks[1].items[0], AsmLine)
 
 
-def test_variant_prefix_lands_in_pre_allocated_block() -> None:
+def test_production_layout_splits_three_section_kinds() -> None:
+    """End-to-end production layout: variant_tokens prefix + LOCAL_FUNC
+    self-prepend + Block_Def + block_v2:N + body content.
+
+    Expected sections:
+    * VARIANT_HEADER -- 2 INSTR_REP AsmLines (the variant prefix).
+    * FUNCTION_ID -- 1 InlineCallEntry (the LOCAL_FUNC self-prepend).
+    * BODY block 0 -- 1 INSTR_REP AsmLine (the post-header content).
+
+    The ``Block_Def`` INSTR_REP and the ``block_v2:N`` IDENTITY
+    header pair are consumed silently -- they MUST NOT appear in the
+    BODY items because the parent ``Block: 0`` tree row already
+    encodes the block boundary.
+    """
+    from ._row_walk_fixtures import NULL_CALLEE_RESOLVER
+    numbers_sig, numbers_se = EMPTY_NUMBERS
+    # Row: [INSTR_REP, INSTR_REP, LOCAL_FUNC, INSTR_REP(=Block_Def), BLOCK_V2, INSTR_REP, 0]
+    #      |---variant prefix-----|--self-prep--|---header pair-------|--body--|
+    blocks = render_row_blocks(
+        result=make_result(
+            tokens_row=np.asarray(
+                [INSTR_REP_TOKEN, INSTR_REP_TOKEN, LOCAL_FUNC,
+                 INSTR_REP_TOKEN, BLOCK_V2, INSTR_REP_TOKEN, 0],
+                dtype=np.uint16,
+            ),
+            identities=np.asarray([0, 7], dtype=np.uint16),
+            numbers_sig=numbers_sig, numbers_se=numbers_se,
+        ),
+        row=0, n_axis=2,
+        partial_cut_lengths=[5],
+        call_targets_per_ct=[[]],
+        vocab_manager=vocab_stub(),
+        fid_table=make_fid_table(
+            per_category_counts=np.asarray([[1, 0, 0]], dtype=np.uint32),
+            sidecar=np.asarray([42], dtype=np.uint32),
+        ),
+        line_to_name={42: "my_func"},
+        line_to_provider={},
+        callee_arm_resolver=NULL_CALLEE_RESOLVER,
+    )
+    assert len(blocks) == 3
+    assert blocks[0].kind is BlockKind.VARIANT_HEADER
+    assert blocks[0].block_idx == -1
+    assert len(blocks[0].items) == 2
+    assert all(isinstance(it, AsmLine) for it in blocks[0].items)
+    assert blocks[1].kind is BlockKind.FUNCTION_ID
+    assert blocks[1].block_idx == -1
+    assert len(blocks[1].items) == 1
+    assert isinstance(blocks[1].items[0], InlineCallEntry)
+    assert blocks[1].items[0].kind is CallTargetType.LOCAL
+    assert blocks[1].items[0].callee_name == "my_func"
+    assert blocks[2].kind is BlockKind.BODY
+    assert blocks[2].block_idx == 7
+    # Critically: only ONE AsmLine (the body content); Block_Def +
+    # BLOCK_V2 were consumed silently.
+    assert len(blocks[2].items) == 1
+    assert isinstance(blocks[2].items[0], AsmLine)
+
+
+def test_variant_prefix_lands_in_variant_header_section() -> None:
     """A row with n_axis=2 variant-tokens prefix followed by a
-    BLOCK_V2 header: the prefix's two instr-rep AsmLines accumulate
-    into the pre-allocated block (block_idx=0); the BLOCK_V2 then
-    overwrites it to the real header counter. AsmLines emitted before
-    the overwrite remain attached to the block (decision #30: in-place
-    overwrite, no flush).
+    BLOCK_V2 header: the prefix lands in a dedicated VARIANT_HEADER
+    section (cols ``[0, n_axis)``); the BLOCK_V2 + subsequent
+    instr-reps land in a BODY section whose ``block_idx`` is the
+    BLOCK_V2's encoded counter. The variant prefix MUST NOT bleed
+    into the block contents -- the section split is the row writer's
+    semantic boundary.
     """
     blocks = _walk(
         tokens=np.asarray(
@@ -178,8 +246,14 @@ def test_variant_prefix_lands_in_pre_allocated_block() -> None:
         identities=np.asarray([99], dtype=np.uint16),
         n_axis=2, partial_cut_lengths=[3],
     )
-    assert len(blocks) == 1
-    assert blocks[0].block_idx == 99
-    # 3 AsmLines: 2 prefix + 1 post-header instr-rep.
-    assert len(blocks[0].items) == 3
+    # Two sections: VARIANT_HEADER (2 prefix AsmLines) +
+    # BODY (1 post-header instr-rep AsmLine).
+    assert len(blocks) == 2
+    assert blocks[0].kind is BlockKind.VARIANT_HEADER
+    assert blocks[0].block_idx == -1
+    assert len(blocks[0].items) == 2
     assert all(isinstance(item, AsmLine) for item in blocks[0].items)
+    assert blocks[1].kind is BlockKind.BODY
+    assert blocks[1].block_idx == 99
+    assert len(blocks[1].items) == 1
+    assert isinstance(blocks[1].items[0], AsmLine)

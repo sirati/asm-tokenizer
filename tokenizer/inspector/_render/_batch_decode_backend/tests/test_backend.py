@@ -31,6 +31,7 @@ from tokenizer.inspector._render._batch_decode_backend import (
     BatchDecodeBackend,
 )
 from tokenizer.inspector._render._protocol import (
+    BlockKind,
     FunctionHandle,
     RenderBackend,
 )
@@ -166,7 +167,7 @@ def test_render_block_after_close_raises_runtime_error() -> None:
     backend = _make_backend()
     backend.close()
     with pytest.raises(RuntimeError, match="BatchDecodeBackend closed"):
-        backend.render_block(variant_idx=0, block_idx=0)
+        backend.render_block(variant_idx=0, kind=BlockKind.BODY, block_idx=0)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +228,7 @@ def test_first_variants_call_invokes_compute_auto_sizes_with_handle() -> None:
 
 
 def test_render_block_unknown_block_raises_keyerror() -> None:
-    """:meth:`render_block` for a non-existent block raises
+    """:meth:`render_block` for a non-existent section raises
     :class:`KeyError` (audit B-LOW-12: typed missing-key signal, not
     a silent empty iterable).
     """
@@ -239,24 +240,26 @@ def test_render_block_unknown_block_raises_keyerror() -> None:
     ) as mock_size, patch(
         f"{backend_mod}.FidBaseTable.from_result"
     ) as mock_fid, patch.object(
-        BatchDecodeBackend, "_row_blocks_for_variant"
+        BatchDecodeBackend, "_row_sections_for_variant"
     ) as mock_walk:
         mock_size.return_value = MagicMock(
             num_variants_per_section=1, context_len=64,
         )
         # batch_decode stub; _build_variants reads
-        # ``intermediate.stage2.stage1.sections`` -- patch _row_blocks
-        # so we sidestep the walker and feed an empty row-blocks list.
+        # ``intermediate.stage2.stage1.sections`` -- patch _row_sections
+        # so we sidestep the walker and feed an empty row-sections list.
         decoded = MagicMock(name="decoded")
         stage1_section = MagicMock(name="section")
         stage1_section.variants = []
         decoded.intermediate.stage2.stage1.sections = [stage1_section]
         mock_decode.return_value = decoded
         mock_fid.return_value = MagicMock(name="fid_table")
-        mock_walk.return_value = []  # variant exists, no blocks
+        mock_walk.return_value = []  # variant exists, no sections
 
         # Need a variant in _variant_row_index for render_block to dispatch.
         backend._variant_row_index = {0: 0}
         backend._result = decoded
-        with pytest.raises(KeyError, match="no block 999"):
-            backend.render_block(variant_idx=0, block_idx=999)
+        with pytest.raises(KeyError, match="no section"):
+            backend.render_block(
+                variant_idx=0, kind=BlockKind.BODY, block_idx=999,
+            )

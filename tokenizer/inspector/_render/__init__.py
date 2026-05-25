@@ -22,6 +22,7 @@ import paths.
 
 from tokenizer.inspector._render._protocol import (
     BackendFactory,
+    BlockKind,
     FunctionHandle,
     RenderBackend,
     RenderedBlock,
@@ -39,6 +40,7 @@ from tokenizer.inspector._render._render_block import (
 __all__ = [
     "AsmLine",
     "BackendFactory",
+    "BlockKind",
     "FunctionHandle",
     "InlineCallEntry",
     "InlineJumpEntry",

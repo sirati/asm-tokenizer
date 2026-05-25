@@ -17,6 +17,7 @@ import types
 from typing import Dict, Iterable, List, Mapping, Optional
 
 from tokenizer.inspector._render._protocol import (
+    BlockKind,
     FunctionHandle,
     LineItem,
     RenderedBlock,
@@ -118,7 +119,14 @@ class FtlBackend:
         return self._variants_cache
 
     def blocks(self, variant_idx: int) -> List[RenderedBlock]:
-        """Per-block :class:`RenderedBlock`; triggers the variant parse."""
+        """Per-block :class:`RenderedBlock`; triggers the variant parse.
+
+        FTL records carry only basic-block bodies (no variant_tokens
+        prefix + no per-CT self-prepend; the FTL stream STARTS at the
+        function-body opening), so every emitted entry is
+        :attr:`BlockKind.BODY`. The variant_header + function_id
+        sections are a BatchDecodeBackend concern.
+        """
         self._raise_if_closed()
         if variant_idx in self._blocks_cache:
             return self._blocks_cache[variant_idx]
@@ -126,17 +134,32 @@ class FtlBackend:
         from tokenizer.inspector._label import block_preview
 
         rendered = [
-            RenderedBlock(block_idx=i, preview=block_preview(blk))
+            RenderedBlock(
+                kind=BlockKind.BODY,
+                block_idx=i,
+                preview=block_preview(blk),
+            )
             for i, blk in enumerate(state.blocks)
         ]
         self._blocks_cache[variant_idx] = rendered
         return rendered
 
     def render_block(
-        self, variant_idx: int, block_idx: int
+        self, variant_idx: int, kind: BlockKind, block_idx: int
     ) -> Iterable[LineItem]:
-        """Materialise the line-item stream for ``(variant, block)``."""
+        """Materialise the line-item stream for ``(variant, kind, block)``.
+
+        FTL only produces :attr:`BlockKind.BODY` sections; any other
+        ``kind`` lands on a :class:`KeyError` so callers don't
+        accidentally render an FTL "variant header" / "function id"
+        section that doesn't exist in the FTL stream layer.
+        """
         self._raise_if_closed()
+        if kind is not BlockKind.BODY:
+            raise KeyError(
+                f"FtlBackend.render_block: kind={kind!r} not "
+                f"supported (FTL emits BODY sections only)"
+            )
         state = self._ensure_variant_state(variant_idx)
         block = state.blocks[block_idx]
         return render_block(
