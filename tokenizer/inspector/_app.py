@@ -40,6 +40,7 @@ from tokenizer.inspector._tree_model import (
     InlineCallNode,
     InlineJumpNode,
     Node,
+    NumberPrecisionLeaf,
     ShowAllVariantsNode,
     VariantNode,
 )
@@ -164,6 +165,8 @@ def _compose_label(node: Node) -> Text:
     if isinstance(node, InlineJumpNode):
         return Text(inline_jump_label(node.target_block_idx))
     if isinstance(node, AsmLeaf):
+        return Text(node.text)
+    if isinstance(node, NumberPrecisionLeaf):
         return Text(node.text)
     if isinstance(node, ShowAllVariantsNode):
         return Text(node.label)

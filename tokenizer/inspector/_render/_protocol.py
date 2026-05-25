@@ -275,7 +275,19 @@ type at the tree-model boundary (per integrated plan W3-2 W4-amended).
 """
 
 
-LineItem = Union[AsmLine, InlineCallEntry, InlineJumpEntry]
+LineItem = AsmLine
+"""Post-R2 wire shape of one item in the
+:meth:`RenderBackend.render_block` stream.
+
+Narrowed to :class:`AsmLine` only (cluster #3 of the integrated plan
+W3-2 W4-amended): inline call sites, jump targets, and number-
+precision expansions now ride :attr:`AsmLine.openables` rather than
+sibling top-level LineItems. The type alias is retained -- not
+collapsed into ``AsmLine`` everywhere -- so the Protocol's
+``render_block`` signature still reads as a stream of typed items
+(open to future re-broadening if the stream ever carries a non-asm
+row again).
+"""
 
 
 # ---------------------------------------------------------------------------

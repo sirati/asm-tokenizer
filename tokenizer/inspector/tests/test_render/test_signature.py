@@ -13,7 +13,6 @@ import inspect
 from tokenizer.inspector._render import (
     AsmLine,
     InlineCallEntry,
-    InlineJumpEntry,
     LineItem,
     render_block,
 )
@@ -50,15 +49,13 @@ def test_render_block_signature_no_unused_params():
         )
 
 
-def test_line_item_union_covers_all_render_output_classes():
-    """The :data:`LineItem` union is what downstream consumers
-    (the tree model's ``_lift_render_items_to_nodes``) match against.
-    Pin it to exactly the three dataclasses the renderer yields so a
-    silent expansion of the union surfaces as a test break."""
-    # NB: LineItem is a `X | Y | Z` PEP-604 union; the runtime form is
-    # ``types.UnionType`` whose ``__args__`` enumerates the members.
-    members = set(LineItem.__args__)
-    assert members == {AsmLine, InlineCallEntry, InlineJumpEntry}
+def test_line_item_alias_is_asm_line_after_openables_migration():
+    """Post-R2 the :data:`LineItem` alias narrows to :class:`AsmLine`
+    only (cluster #3 plan W3-2 W4-amended): inline call sites, jump
+    targets, and number-precision expansions ride
+    :attr:`AsmLine.openables` rather than sibling top-level items.
+    Pin the alias so a future re-broadening surfaces here."""
+    assert LineItem is AsmLine
 
 
 def test_inline_call_entry_dataclass_field_set():

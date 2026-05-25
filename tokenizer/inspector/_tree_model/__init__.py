@@ -37,7 +37,7 @@ from __future__ import annotations
 from ._nodes_block import BlockNode, InlineJumpNode
 from ._nodes_call import InlineCallNode
 from ._nodes_function import FunctionNode
-from ._nodes_leaf import AsmLeaf, ShowAllVariantsNode
+from ._nodes_leaf import AsmLeaf, NumberPrecisionLeaf, ShowAllVariantsNode
 from ._nodes_variant import VariantNode
 
 
@@ -49,6 +49,7 @@ Node = (
     | FunctionNode
     | InlineCallNode
     | InlineJumpNode
+    | NumberPrecisionLeaf
     | ShowAllVariantsNode
     | VariantNode
 )
@@ -61,6 +62,7 @@ __all__ = [
     "InlineCallNode",
     "InlineJumpNode",
     "Node",
+    "NumberPrecisionLeaf",
     "ShowAllVariantsNode",
     "VariantNode",
 ]
