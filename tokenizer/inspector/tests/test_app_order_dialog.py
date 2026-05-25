@@ -322,6 +322,44 @@ def test_group_variants_arch_keeps_raw_value_when_bitwidth_not_grouping():
     assert [c.axis_value for c in grouped] == ["arm32", "arm64"]
 
 
+def test_group_variants_grouping_axis_after_other_axes_still_collapses_runs():
+    """Grouping by ONLY a non-leading canonical axis (``comp:``) must
+    still collapse all matching variants into ONE bucket per value, even
+    when the variants differ on other axes that precede the grouping
+    axis in :attr:`OrderConfig.ordered_axes` (here: ``arch`` /
+    ``bitwidth``). The sort key for the partition walk has to pull
+    grouping axes to the front; otherwise non-grouping leading axes
+    interleave runs (regression: 12 alternating ``clang``/``gcc``
+    groups instead of 2).
+    """
+    rvs = [
+        _make_rv(variant_idx=0, compiler="clang", arch="x64",   cver="10", opt="O0"),
+        _make_rv(variant_idx=1, compiler="clang", arch="arm32", cver="9",  opt="O2"),
+        _make_rv(variant_idx=2, compiler="clang", arch="arm64", cver="11", opt="O3"),
+        _make_rv(variant_idx=3, compiler="gcc",   arch="x64",   cver="8",  opt="O0"),
+        _make_rv(variant_idx=4, compiler="gcc",   arch="arm32", cver="10", opt="O2"),
+        _make_rv(variant_idx=5, compiler="gcc",   arch="arm64", cver="11", opt="O3"),
+    ]
+    variants = [_make_variant_node(rv) for rv in rvs]
+    rendered_by_variant = {rv.variant_idx: rv for rv in rvs}
+
+    axes = build_canonical_axes()
+    comp_axis = next(
+        a for a in axes if a.kind is AxisKind.POSITIONAL and a.key == COMP_PREFIX
+    )
+    config = OrderConfig(
+        ordered_axes=axes, grouping_axes=frozenset({comp_axis})
+    )
+    grouped = group_variants(variants, rendered_by_variant, config)
+
+    # Exactly two compiler buckets (clang, gcc) -- not one per variant.
+    assert all(isinstance(c, VariantGroupNode) for c in grouped)
+    assert [g.axis_value for g in grouped] == ["clang", "gcc"]
+    clang_group, gcc_group = grouped
+    assert {v.variant_idx for v in clang_group.children} == {0, 1, 2}
+    assert {v.variant_idx for v in gcc_group.children} == {3, 4, 5}
+
+
 def test_collect_suppressed_axes_walks_variant_group_node_ancestors():
     """Positional :class:`VariantGroupNode` ancestors contribute their
     axis ``key`` to the suppression set; BITWIDTH + EXTRA_META
