@@ -102,21 +102,16 @@ class _WalkState(WalkSectionState):
     slot detection inside :func:`emit_number` and resets on every
     non-NUMBER emit.
 
-    ``inside_jump_table_footer_block`` is the block-level flag W3-16
-    threads to :func:`._dispatch._handle_block`: once a
-    :attr:`Category.JUMP_TABLE` IDENTITY fires inside a block, every
-    subsequent ``Block_V2`` token in that block emits an
-    :class:`InlineJumpEntry` rather than consuming the
-    :attr:`WalkSectionState.pending_header` latch as a block header.
-    Reset on every body-block transition by the
-    :mod:`.._sections` helpers' wrappers in :mod:`._driver`.
-
     ``insn_emit_policy`` carries the per-instruction emit-decision
     policy described on :class:`_InsnEmitPolicy`. Pre-paved on
     :class:`_WalkState` so the R2c per-instruction collector
     (:mod:`._instruction`) reads + writes it through a single typed
     surface; the R2a structural split lands the type so the R2c
-    diff is a code-add only.
+    diff is a code-add only. ``saw_jump_table_this_insn`` is the
+    per-instruction sibling of
+    :attr:`WalkSectionState.inside_jump_table_footer_block`: set on
+    :class:`Category.JUMP_TABLE` IDENTITY emission, reset on
+    instruction-boundary finalize (W3-16 W4-AMENDED).
     """
 
     row: int = 0
@@ -125,5 +120,5 @@ class _WalkState(WalkSectionState):
     num_cursor: int = 0
     current_col: int = 0
     last_number_shifted_id: int = -1
-    inside_jump_table_footer_block: bool = False
     insn_emit_policy: _InsnEmitPolicy = _InsnEmitPolicy.REAL
+    saw_jump_table_this_insn: bool = False

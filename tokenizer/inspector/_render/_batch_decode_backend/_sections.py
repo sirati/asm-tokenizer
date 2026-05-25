@@ -69,10 +69,21 @@ class WalkSectionState:
     Owns only the fields the section state machine needs to read /
     mutate (``current_kind``, ``current_block_idx``, ``current_items``,
     ``completed``, ``ct_start_cols``, ``header_trigger_cols``,
-    ``current_call_target_idx``, ``pending_header``); the per-band
-    emitter state (token cursors, ``last_number_shifted_id``) lives
-    on :class:`_row_walk._WalkState` which composes this state via
-    inheritance. The split keeps the section concern self-contained.
+    ``current_call_target_idx``, ``pending_header``,
+    ``inside_jump_table_footer_block``); the per-band emitter state
+    (token cursors, ``last_number_shifted_id``) plus per-instruction
+    grouping policy live on :class:`_row_walk._WalkState` which
+    composes this state via inheritance. The split keeps the section
+    concern self-contained.
+
+    ``inside_jump_table_footer_block`` is a per-block flag W3-16
+    W4-AMENDED uses to disarm the ``Block_V2`` "consume as header"
+    branch in :func:`_handle_block`: once a :class:`Category.JUMP_TABLE`
+    IDENTITY fires inside a block, every subsequent ``Block_V2`` token
+    in the same block is a jump-table target -> :class:`InlineJumpEntry`,
+    NOT a body-block header. The flag is reset on every body-block
+    transition by :func:`enter_body_after_function_id` and
+    :func:`enter_new_body_block`.
     """
 
     current_kind: BlockKind
@@ -83,6 +94,7 @@ class WalkSectionState:
     header_trigger_cols: frozenset[int]
     current_call_target_idx: int = 0
     pending_header: bool = False
+    inside_jump_table_footer_block: bool = False
 
 
 def close_current_section(state: WalkSectionState) -> None:
@@ -155,6 +167,7 @@ def enter_body_after_function_id(state: WalkSectionState) -> None:
     close_current_section(state)
     open_section(state, kind=BlockKind.BODY, block_idx=0)
     state.pending_header = True
+    state.inside_jump_table_footer_block = False
 
 
 def enter_new_body_block(state: WalkSectionState) -> None:
@@ -173,6 +186,7 @@ def enter_new_body_block(state: WalkSectionState) -> None:
     close_current_section(state)
     open_section(state, kind=BlockKind.BODY, block_idx=prior_block_idx)
     state.pending_header = True
+    state.inside_jump_table_footer_block = False
 
 
 def set_current_body_block_idx(
