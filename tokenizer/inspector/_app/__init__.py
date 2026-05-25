@@ -23,38 +23,19 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
 from textual.widgets._tree import TOGGLE_STYLE, TreeNode
 
+from tokenizer.inspector._app._labels import _compose_label
 from tokenizer.inspector._horizontal_scroll import (
     apply_truncation_marker,
     assemble_failed_glyph,
 )
-from tokenizer.inspector._label import (
-    function_label,
-    inline_call_label,
-    inline_jump_label,
-)
-from tokenizer.inspector._render._protocol import BlockKind
 from tokenizer.inspector._tree_model import (
-    AsmLeaf,
-    BlockNode,
     FunctionNode,
-    InlineCallNode,
-    InlineJumpNode,
     Node,
-    NumberPrecisionLeaf,
-    ShowAllVariantsNode,
-    VariantNode,
-)
-from tokenizer.variant_tokens.prefixes import (
-    ARCH_PREFIX,
-    COMP_PREFIX,
-    CVER_PREFIX,
-    OPT_PREFIX,
-    POSITIONAL_PREFIXES,
 )
 
 
 if TYPE_CHECKING:
-    from typing import Mapping, Optional
+    from typing import Optional
 
     from tokenizer.inspector._render._protocol import (
         BackendFactory,
@@ -72,106 +53,6 @@ _ERR_STYLE = Style(color="red", dim=True)
 # the asm-tokenizer's existing logging config don't fight over
 # handlers. The file handler is attached in ``_setup_inspector_log``.
 _LOGGER_NAME = "tokenizer.inspector"
-
-
-# Per-axis label prefix used to format the variant row text from
-# :attr:`RenderedVariant.label_axes`. Mirrors the per-axis policy in
-# :func:`tokenizer.inspector._label.variant_label` (``v`` for cver,
-# ``-`` for opt; bare value for arch + compiler) but operates on the
-# typed prefix-keyed Mapping instead of the legacy ``function_data.
-# metadata`` shape. Anchored on POSITIONAL_PREFIXES so adding a new
-# axis trips the assert below in lockstep with :mod:`_label`.
-_AXIS_LABEL_PREFIX: dict[str, str] = {
-    ARCH_PREFIX: "",
-    COMP_PREFIX: "",
-    CVER_PREFIX: "v",
-    OPT_PREFIX: "-",
-}
-assert set(_AXIS_LABEL_PREFIX) == set(POSITIONAL_PREFIXES), (
-    "_AXIS_LABEL_PREFIX must mirror POSITIONAL_PREFIXES"
-)
-
-
-def _variant_label_from_axes(
-    label_axes: "Mapping[str, Optional[str]]",
-) -> str:
-    """Format the variant row label from the typed ``label_axes``.
-
-    Both backends pre-flatten ``label_axes`` over
-    :data:`POSITIONAL_PREFIXES` (plan decision 1); reading the Mapping
-    in that canonical order yields a stable axis ordering. ``None``
-    values render as ``"?"`` to match
-    :func:`tokenizer.inspector._label.variant_label`'s legacy policy
-    without re-deriving the unrelated ``metadata`` key shape.
-    """
-    parts: list[str] = []
-    for prefix in POSITIONAL_PREFIXES:
-        value = label_axes.get(prefix)
-        value_str = "?" if value is None else str(value)
-        parts.append(f"{_AXIS_LABEL_PREFIX[prefix]}{value_str}")
-    return " ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Label composition (UI side -- plan-drift audit explicitly accepts that
-# the BlockNode label composes ``"Block: <i>   <preview>"`` here, since
-# the model carries ``block_idx`` + ``preview`` separately).
-# ---------------------------------------------------------------------------
-
-
-# Per-kind label policy for :class:`BlockNode` rows. The model node
-# carries the typed :class:`BlockKind` discriminator; the UI side
-# composes the row label per-kind without ``isinstance``-on-string
-# discriminators.
-_BLOCK_KIND_LABELS: dict[BlockKind, str] = {
-    BlockKind.VARIANT_HEADER: "Variant Header",
-    BlockKind.FUNCTION_ID: "Function ID",
-}
-
-
-def _block_node_label(node: "BlockNode") -> str:
-    """Compose the row text for a :class:`BlockNode`.
-
-    Dispatches off :attr:`BlockNode.kind`: the two non-body kinds
-    render their fixed section name; :attr:`BlockKind.BODY` composes
-    ``Block: <idx>   <preview>`` (the legacy shape).
-    """
-    fixed = _BLOCK_KIND_LABELS.get(node.kind)
-    if fixed is not None:
-        return fixed
-    return f"Block: {node.block_idx}   {node.preview}"
-
-
-def _compose_label(node: Node) -> Text:
-    """Translate one model node into its visible label text.
-
-    Dispatch is by ``isinstance`` on the seven concrete node types
-    (no string compares on type names). The BlockNode label composes
-    its two model fields (``block_idx`` + ``preview``) into the row
-    text here on the UI side -- the model deliberately splits them.
-    """
-    if isinstance(node, FunctionNode):
-        return Text(function_label(node.name))
-    if isinstance(node, VariantNode):
-        return Text(_variant_label_from_axes(node.label_axes))
-    if isinstance(node, BlockNode):
-        return Text(_block_node_label(node))
-    if isinstance(node, InlineCallNode):
-        return Text(
-            inline_call_label(
-                node.kind, node.counter_id, node.callee_name, node.provider
-            )
-        )
-    if isinstance(node, InlineJumpNode):
-        return Text(inline_jump_label(node.target_block_idx))
-    if isinstance(node, AsmLeaf):
-        return Text(node.text)
-    if isinstance(node, NumberPrecisionLeaf):
-        return Text(node.text)
-    if isinstance(node, ShowAllVariantsNode):
-        return Text(node.label)
-    # Closed Node union; any miss is a model/UI contract drift.
-    raise TypeError(f"unsupported node type: {type(node).__name__}")
 
 
 # ---------------------------------------------------------------------------
