@@ -34,6 +34,7 @@ from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.inspector._app import InspectorApp
 from tokenizer.inspector._render._protocol import (
     BackendFactory,
+    BlockKind,
     FunctionHandle,
     RenderBackend,
 )
@@ -631,5 +632,261 @@ def test_vim_h_is_pure_pan_and_saves_remembered_scroll_x():
                 await pilot.pause()
                 assert tree.scroll_offset.x == 2
                 assert long_leaf.remembered_scroll_x == 2
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# One-shot undo for the ``←``-to-parent climb. After a left-arrow that
+# moved the cursor up to its parent (scroll_x already 0 path), the very
+# next keypress is special: ``→`` restores the cursor to the just-
+# evacuated child; any other key invalidates the undo state.
+# ---------------------------------------------------------------------------
+
+
+def test_right_arrow_after_left_to_parent_restores_child_cursor():
+    """``→`` immediately after ``←``-to-parent restores the prior cursor."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Short child so the right-arrow undo case can't be
+                # masked by a pan: a short row has no content past the
+                # viewport, so the binding's fallback would be "expand"
+                # (and AsmLeaf is can_expand=False -> no-op).
+                short_leaf = AsmLeaf(text="hi")
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [short_leaf])
+                )
+                child_tree_node = children[0]
+
+                # Park cursor on the child.
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+                assert tree.scroll_offset.x == 0
+
+                # ``←`` at scroll-zero: cursor climbs to the parent
+                # FunctionNode row.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # ``→`` immediately after: restore the child cursor.
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+                # The child is a non-expandable leaf, so the restore
+                # path did NOT also expand anything along the way.
+                assert child_tree_node.is_expanded is False
+
+    asyncio.run(runner())
+
+
+def test_undo_state_consumed_after_one_use():
+    """A second ``→`` after a successful undo falls back to normal behavior."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Use a collapsed expandable child so the post-undo
+                # second ``→`` exercises the expand fallback.
+                short_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    kind=BlockKind.BODY,
+                    block_idx=1,
+                    preview="x",
+                )
+                short_block.expand = MagicMock(return_value=[])
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [short_block])
+                )
+                child_tree_node = children[0]
+
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+                assert child_tree_node.is_expanded is False
+
+                # left -> parent.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # First right -> undo, cursor back to child.
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+                short_block.expand.assert_not_called()
+
+                # Second right -> undo state already consumed; the
+                # binding's normal expand path fires (row fits, node is
+                # collapsed + can_expand).
+                await pilot.press("right")
+                await pilot.pause()
+                assert child_tree_node.is_expanded is True
+                short_block.expand.assert_called_once()
+
+    asyncio.run(runner())
+
+
+def test_intervening_key_invalidates_undo():
+    """Any key other than ``→`` between ``←``-to-parent and ``→`` clears undo."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Collapsed expandable so the post-invalidation ``→``
+                # exercises the expand fallback (proving it's NOT undo).
+                short_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    kind=BlockKind.BODY,
+                    block_idx=1,
+                    preview="x",
+                )
+                short_block.expand = MagicMock(return_value=[])
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [short_block])
+                )
+                child_tree_node = children[0]
+
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+
+                # left -> parent.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # ``down`` invalidates the undo state. (There is no
+                # sibling FunctionNode in this fixture, so the cursor
+                # position after ``down`` is allowed to be anywhere;
+                # what matters is that the next ``→`` is NOT an undo.)
+                await pilot.press("down")
+                await pilot.pause()
+
+                # Move back to the parent fn_tree_node so the next
+                # ``→`` has a deterministic expand target.
+                tree.move_cursor(fn_tree_node, animate=False)
+                await pilot.pause()
+                # fn_tree_node is already expanded (children present),
+                # so the right-arrow falls through to the no-op branch
+                # on an already-expanded fitting row; assert the cursor
+                # did NOT return to the child (which would be the undo
+                # outcome).
+                short_block.expand.reset_mock()
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+                # Undo would have restored child_tree_node; it did not.
+                assert tree.cursor_node is not child_tree_node
+
+    asyncio.run(runner())
+
+
+def test_vim_l_does_not_trigger_undo():
+    """Vim ``l`` is "any other key" w.r.t. the undo overlay; it clears state.
+
+    The spec singles out the literal ``right`` key as the only trigger;
+    vim ``l`` (which shares the conditional pan/expand action) is
+    treated as an invalidating key.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                short_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    kind=BlockKind.BODY,
+                    block_idx=1,
+                    preview="x",
+                )
+                short_block.expand = MagicMock(return_value=[])
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [short_block])
+                )
+                child_tree_node = children[0]
+
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # ``l`` clears the undo state. The parent FunctionNode
+                # is already expanded (children present) + fits the
+                # viewport; the binding's expand fallback is a no-op
+                # on an already-expanded row.
+                await pilot.press("l")
+                await pilot.pause()
+                # Did NOT undo (cursor stayed on the parent).
+                assert tree.cursor_node is fn_tree_node
+
+                # A subsequent ``→`` is now normal: no undo state, so
+                # the binding falls through to the no-op expand on an
+                # already-expanded fitting row.
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+    asyncio.run(runner())
+
+
+def test_pan_left_branch_does_not_arm_undo():
+    """The ``←`` pan branch (scroll_x > 0) does NOT arm the undo state.
+
+    Only the cursor-to-parent climb arms undo. Confirm by panning right
+    so scroll_x > 0, then pressing ``←`` (pure pan-left), then ``→``:
+    the right-arrow must perform its normal pan / expand action, NOT a
+    cursor restore.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                long_leaf = AsmLeaf(text="x" * 200)
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_leaf]
+                )
+                row = children[0]
+                tree.move_cursor(row, animate=False)
+                await pilot.pause()
+
+                # Pan right twice -> scroll_x == 2.
+                await pilot.press("right")
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.scroll_offset.x == 2
+                cursor_before_left = tree.cursor_node
+
+                # ``←`` while scroll_x > 0: pure pan-left, cursor unchanged.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is cursor_before_left
+                assert tree.scroll_offset.x == 1
+
+                # ``→`` after a pan-left ``←``: must perform its normal
+                # pan-right action (NOT a cursor restore), so scroll_x
+                # increments back to 2.
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is cursor_before_left
+                assert tree.scroll_offset.x == 2
 
     asyncio.run(runner())

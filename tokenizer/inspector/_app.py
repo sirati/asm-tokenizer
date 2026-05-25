@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, ClassVar
 from rich.style import Style
 from rich.text import Text
 
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
@@ -197,6 +197,10 @@ class _InspectorTree(Tree[Node]):
       overflows the viewport, expand a collapsed node otherwise.
     * Conditional ``←``: pan while ``scroll_x > 0``, else
       :meth:`action_cursor_parent`.
+    * One-shot undo for the ``←``-to-parent climb: when the left arrow
+      just escaped a child (cursor moved to its parent), the very next
+      ``→`` keypress restores the cursor to that child instead of
+      panning / expanding. Any other key invalidates this undo state.
 
     The tree's :class:`textual.containers.ScrollableContainer`
     ancestor binds ``left`` / ``right`` to its built-in
@@ -216,6 +220,14 @@ class _InspectorTree(Tree[Node]):
         Binding("0", "pan_x_home", "Line start", show=False),
         Binding("dollar_sign", "pan_x_end", "Line end", show=False),
     ]
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        # One-shot undo target for the ``←``-to-parent climb. Set in
+        # :meth:`action_pan_left_or_parent` when the cursor actually
+        # moved up to its parent; consumed by the next ``→`` keypress
+        # via :meth:`on_key` or cleared by any other key.
+        self._undo_left_child: "Optional[TreeNode[Node]]" = None
 
     def _compose_full_label(
         self,
@@ -305,12 +317,24 @@ class _InspectorTree(Tree[Node]):
         on ``h`` for vim users who want pure horizontal scroll. When
         the action does pan, it saves the new ``scroll_x`` onto the
         cursor row's remembered value.
+
+        When the action takes the climb-to-parent branch and the
+        cursor actually moved, the just-evacuated child is stashed in
+        :attr:`_undo_left_child` so the next ``→`` press can restore
+        the cursor to it (see :meth:`on_key`).
         """
         if self.scroll_offset.x > 0:
             self.scroll_left(animate=False)
             self._save_cursor_scroll_x()
-        else:
-            self.action_cursor_parent()
+            return
+        # Climb branch: capture the pre-move cursor so a follow-up
+        # ``→`` can undo the jump. ``action_cursor_parent`` is a no-op
+        # at the tree root; comparing the cursor before/after is the
+        # only contract-stable way to detect whether the climb fired.
+        pre_climb = self.cursor_node
+        self.action_cursor_parent()
+        if pre_climb is not None and self.cursor_node is not pre_climb:
+            self._undo_left_child = pre_climb
 
     def action_pan_right_or_expand(self) -> None:
         """Pan right when the cursor row overflows, else expand the node.
@@ -348,6 +372,38 @@ class _InspectorTree(Tree[Node]):
     def action_pan_x_end(self) -> None:
         self.scroll_end(animate=False, x_axis=True, y_axis=False)
         self._save_cursor_scroll_x()
+
+    # --- one-shot undo for the ``←``-to-parent climb -------------------
+    #
+    # The undo overlay lives at the key-event layer rather than inside
+    # ``action_pan_right_or_expand``: this way the literal ``right``
+    # key is the only trigger, while vim ``l`` (which shares the same
+    # action) is treated as "any other key" per the UX spec.
+
+    async def on_key(self, event: events.Key) -> None:
+        """One-shot undo for the ``←``-to-parent climb.
+
+        Runs before the non-priority binding chain fires (see
+        ``App._on_key`` in textual): if the previous keypress was a
+        ``←`` that climbed to a parent and the next key is ``→``,
+        restore the cursor to the just-evacuated child and short-circuit
+        the binding. Any other key clears the undo state and falls
+        through to the normal binding dispatch.
+        """
+        if self._undo_left_child is None:
+            return
+        if event.key == "right":
+            target = self._undo_left_child
+            self._undo_left_child = None
+            # ``move_cursor`` triggers the per-row scroll restore via
+            # :meth:`watch_cursor_line`, mirroring a normal cursor move.
+            self.move_cursor(target, animate=False)
+            event.stop()
+            event.prevent_default()
+            return
+        # Any other key invalidates the undo state without consuming
+        # the event.
+        self._undo_left_child = None
 
     # --- cursor-move scroll restore + auto-adjust ----------------------
 
