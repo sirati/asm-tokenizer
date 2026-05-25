@@ -13,6 +13,7 @@ Plan reference: ``inspector-render-backends.md`` §6 + decisions
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.decoded._number_render import (
@@ -285,6 +286,39 @@ def test_float_short_lost_precision_carries_inline_precision_entry() -> None:
     entry = line.openables[0]
     assert isinstance(entry, InlineNumberPrecisionEntry)
     assert entry.full_text == "f64:0.31415926535897931 E1"
+
+
+def test_multi_chunk_source_spanning_instructions_raises_mid_row() -> None:
+    """W3-17 W4-AMENDED encoder-invariant guard (regression pin for
+    audit drift D-R2C-1): a multi-chunk NUMBER source MUST live within
+    ONE instruction. If the runlength sidecar splits the chunks across
+    two adjacent instructions (synthetic encoder-bug scenario), the
+    per-instruction finalizer's accumulator-drain MUST raise
+    ``AssertionError`` rather than silently emit garbage.
+
+    Construction: a 2-chunk F128 source with
+    ``insn_runlength=[1, 1]`` -- the first F128 NUMBER lands in a
+    1-slot instruction, finalize fires, the accumulator still has the
+    lead chunk pending (because the second chunk has not arrived yet);
+    the mid-row assert trips.
+    """
+    finite_bits = 0x3FFF0000000000000000000000000000  # 1.0
+    chunks = from_float128(finite_bits)
+    assert len(chunks) == 2
+    numbers_sig = np.asarray([c[0] for c in chunks], dtype=np.uint64)
+    numbers_se = np.asarray([c[1] for c in chunks], dtype=np.uint32)
+    with pytest.raises(AssertionError, match="encoder invariant"):
+        _walk(
+            tokens=np.asarray(
+                [BLOCK_V2, F128_NUMBER, F128_NUMBER, 0], dtype=np.uint16,
+            ),
+            identities=np.asarray([0], dtype=np.uint16),
+            numbers_sig=numbers_sig, numbers_se=numbers_se,
+            # Two 1-slot instructions: the lead F128 chunk sits in the
+            # first instruction; finalize fires before the trailing
+            # chunk arrives -> accumulator has pending mid-row -> raise.
+            insn_runlength=np.asarray([1, 1], dtype=np.uint32),
+        )
 
 
 def test_cut_variant_end_of_row_flushes_pending_chunks() -> None:
