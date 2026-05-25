@@ -3,28 +3,34 @@
 Single concern: turn a single ``(significand, sign_exponent)`` chunk
 (produced by the custom-float kernel in
 :mod:`tokenizer.aligned_data.loader.decoded.custom_float`) into the
-``"<basename>:<hex>"`` text shape the inspector emits as
-:class:`AsmLine` -- mirroring
-:meth:`token_manager._V2FloatInner.to_asm_like` /
+``"<basename>:<hex>"`` text shape the inspector emits as ``AsmLine``
+-- mirroring :meth:`token_manager._V2FloatInner.to_asm_like` /
 :meth:`token_manager.ValuedConstV2Inner.to_asm_like` so the
 BatchDecodeBackend's rendering aligns with the FtlBackend's
 ``Inner.to_asm_like`` text shape.
 
-Phase 1 limitation (plan v2 decisions #17 + #18 + audit B-HIGH-5):
-multi-chunk sources (F128 finite, K>1 VC2) render only the MSB chunk's
-contribution; trailing chunks are emitted as :class:`AsmLine("...")`
-by the walker (one ``AsmLine`` per trailing chunk). The walker --
-NOT this module -- drives the trailing-chunk emission.
+Plan reference: ``inspector-render-backends.md`` decision #18 places
+this helper next to :func:`unpack_chunk` / :func:`reconstruct_chunks`
+in the custom-float subpackage (sibling file ``number_hex_format.py``
+under the LOC cap; the encoder/decoder inversion stays per-concern in
+its own module).
+
+Phase 1 limitation (plan decision #17): multi-chunk sources (F128
+finite, K>1 VC2) cannot be reconstructed from a single chunk pair --
+the source mantissa is wider than 64 bits. The walker emits one
+``AsmLine("...")`` per trailing chunk of such a source; the lead chunk
+goes through this helper. For F128 specifically, even the lead chunk
+cannot be losslessly rendered without the sibling chunk, so the
+helper emits a ``"float128:..."`` placeholder. Phase-2 follow-up
+(plan section 11 + decision #17): real multi-chunk reconstruction via
+the chunk-count sidecar.
 
 For each ``TokenType``, this module inverts the encoder's per-chunk
 normalization (see ``custom_float._emit_chunk`` /
 ``_encode_fp_normalized``) to recover the source ``bits`` pattern.
 The recovered ``bits`` are zero-padded to the source type's natural
 width (``2 * width_bytes`` hex chars) and prefixed with the basename
-matching the encoder's ``_get_basename`` output. Phase-2 follow-up
-(plan section 11 + decision #17): real multi-chunk reconstruction
-moves here via the chunk-count sidecar; for now the MSB-only render
-documents the truncation by emitting the ``...`` tail tokens.
+matching the encoder's ``_get_basename`` output.
 """
 
 from __future__ import annotations
@@ -35,14 +41,13 @@ import numpy as np
 
 from tokenizer.aligned_data.loader.decoded.custom_float import (
     INFNAN_EXPONENT_UNBIASED,
-    TARGET_EXPONENT_BIAS,
     reconstruct_chunks,
     unpack_chunk,
 )
 from tokenizer.tokens import TokenType
 
 
-__all__ = ["chunks_to_hex_bits", "format_number"]
+__all__ = ["chunks_to_hex_bits"]
 
 
 # Per-IEEE-754 layout for the float TokenTypes that round-trip through a
@@ -93,6 +98,11 @@ def _ieee_bits_from_chunk(
     Signed zero (``sig == 0``) round-trips to ``+0`` / ``-0`` in source
     layout. NaN/Inf is handled at the dispatch layer above; this
     helper sees only finite-source chunks.
+
+    Requires ``mantissa_bits <= 63`` so the single-chunk reconstruction
+    fits a ``u64`` sig field; F128 (mantissa_bits=112) is routed to a
+    placeholder by :func:`chunks_to_hex_bits` before reaching this
+    helper (Phase-1 limitation per plan decision #17).
     """
     sign_bit = 0 if sign >= 0 else 1
     if sig == 0:
@@ -187,29 +197,34 @@ def chunks_to_hex_bits(
 ) -> str:
     """Render a single ``(sig, se)`` chunk as ``"<basename>:<hex>"``.
 
-    The MSB-only Phase-1 contract (plan #17): callers pass a single
-    chunk pair -- the MSB for multi-chunk sources. For F128 finite
-    callers MUST pass the MSB chunk (chunk index 1); the resulting
-    hex is the MSB half of the source bits, padded to the source type's
-    natural width. Trailing chunks are NOT this helper's concern;
-    the walker emits ``AsmLine("...")`` per trailing chunk.
+    Phase-1 contract (plan #17 + #18): callers pass a single chunk pair
+    -- the lead chunk for multi-chunk sources. The walker emits one
+    ``AsmLine("...")`` per trailing chunk; trailing-chunk rendering is
+    the walker's concern, not this helper's.
 
-    NaN/Inf (encoder sentinel exponent) and VC2 are dispatched off the
-    chunk's unbiased exponent + the token_type; finite IEEE floats go
-    through ``_ieee_bits_from_chunk``.
+    NaN/Inf (encoder sentinel exponent) is dispatched off the chunk's
+    unbiased exponent + the token_type. F128 finite cannot be
+    losslessly reconstructed from a single chunk pair (source mantissa
+    is 112 bits, wider than the 64-bit chunk sig); the helper emits a
+    ``"float128:..."`` placeholder and the Phase-2 follow-up uses the
+    chunk-count sidecar for full reconstruction. Other IEEE finite
+    floats round-trip exactly via :func:`_ieee_bits_from_chunk`; VC2
+    renders via :func:`reconstruct_chunks` and round-trips single-chunk
+    sources exactly (multi-chunk VC2 yields the lead chunk's partial
+    contribution).
     """
     sig_int, sign, exp_unbiased = unpack_chunk((sig, se))
     if token_type is TokenType.VALUED_CONST_V2:
-        # MSB-only render: reconstruct the chunk's contribution to the
+        # Lead-chunk render: reconstruct the chunk's contribution to the
         # source integer. For single-chunk VC2 this round-trips the
         # source value exactly; for multi-chunk VC2 (K>1) this is the
-        # MSB chunk's contribution (signed-integer value ``sig << exp``).
+        # lead chunk's contribution (signed-integer value ``sig << exp``).
         value = reconstruct_chunks([(sig, se)])
         # ``reconstruct_chunks`` returns a Fraction; VC2 is non-negative
         # by encoder contract (sign is carried via a separate
         # ``value_negative`` marker upstream) so the magnitude is an
         # integer.
-        magnitude = int(value) if value.denominator == 1 else int(value)
+        magnitude = int(value)
         # Mirror the encoder's :meth:`ValuedConstV2Inner.to_asm_like` shape.
         return f"v2:{magnitude:x}"
 
@@ -228,29 +243,23 @@ def chunks_to_hex_bits(
             exponent_bits=exponent_bits,
             has_explicit_leading_bit=has_explicit,
         )
-    else:
-        bits = _ieee_bits_from_chunk(
-            sig_int,
-            sign,
-            exp_unbiased,
-            mantissa_bits=mantissa_bits,
-            exponent_bits=exponent_bits,
-            bias=bias,
-            has_explicit_leading_bit=has_explicit,
-        )
+        return f"{basename}:{bits:0{width_bytes * 2}x}"
+
+    # F128 finite: source mantissa is 112 bits, wider than the 64-bit
+    # chunk sig. Single-chunk reconstruction is impossible; emit a
+    # placeholder per the Phase-1 limitation documented above.
+    if mantissa_bits > 63:
+        return f"{basename}:..."
+
+    bits = _ieee_bits_from_chunk(
+        sig_int,
+        sign,
+        exp_unbiased,
+        mantissa_bits=mantissa_bits,
+        exponent_bits=exponent_bits,
+        bias=bias,
+        has_explicit_leading_bit=has_explicit,
+    )
     return f"{basename}:{bits:0{width_bytes * 2}x}"
 
 
-def format_number(
-    token_type: TokenType,
-    sig: np.uint64,
-    se: np.uint32,
-) -> str:
-    """Convenience wrapper -- public surface mirroring the plan name.
-
-    Plan section 6 names the helper ``format_number``; we keep both the
-    plan-named entry point and the more descriptive
-    :func:`chunks_to_hex_bits` so callers can pick the name matching
-    their concern (rendering vs. chunk-bit packing).
-    """
-    return chunks_to_hex_bits(token_type, sig, se)

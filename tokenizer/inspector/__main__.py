@@ -65,9 +65,9 @@ class _OpenedBackend:
 def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
     """Open the memmap-mode backend.
 
-    The :class:`BinarySession` opened by the factory is entered into
-    the returned ExitStack so the caller's ``with`` block drives
-    clean shutdown.
+    The factory owns its :class:`BinarySession` lifetime; we register
+    only ``factory.close`` so the caller's ``with stack:`` block
+    drives the single shutdown hook (mirrors the CSV-mode opener).
     """
     memmap_dir: Path = ns.memmap_dir
     binary_name: str = ns.binary
@@ -76,11 +76,8 @@ def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
         binary_name,
         memmap_dir,
     )
-    factory, _dataset, session = make_batch_decode_factory(
-        memmap_dir, binary_name
-    )
+    factory = make_batch_decode_factory(memmap_dir, binary_name)
     stack = contextlib.ExitStack()
-    stack.enter_context(session)
     stack.callback(factory.close)
     return _OpenedBackend(
         factory=factory,

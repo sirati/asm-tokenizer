@@ -208,11 +208,10 @@ class BatchDecodeBackend:
             f"got {len(stage1.sections)}"
         )
         rendered: List[RenderedVariant] = []
+        # PAD_NULL is hard-pinned at construction (see :meth:`_build`):
+        # every Stage 1 variant has a non-``None`` batch_idx, so the
+        # row mapping is total.
         for s1v in stage1.sections[0].variants:
-            if s1v.batch_idx is None:
-                # RAGGED-policy drop or padding-out; PAD_NULL never
-                # produces this but guard against future policy changes.
-                continue
             self._variant_row_index[s1v.variant_idx] = int(s1v.batch_idx)
             rendered.append(
                 RenderedVariant(

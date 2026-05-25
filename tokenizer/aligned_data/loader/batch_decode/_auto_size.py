@@ -54,11 +54,18 @@ __all__ = [
 ]
 
 
-# Headroom (in tokens) added on top of the longest variant's body length
-# so :func:`batch_decode`'s ``context_len`` accommodates the per-row
-# variant-axis prefix + per-call prepend slot budget without mid-cut.
-# Mirrors the prior inspector-side constant -- promoted here so every
-# auto-sized caller agrees on the same safety budget.
+# Phase-1 headroom (in tokens) added on top of the longest variant's
+# raw body length so :func:`batch_decode`'s ``context_len`` covers the
+# per-row variant-axis prefix + per-call prepend slot + multi-chunk
+# promotion expansion without mid-cut. A Phase-2 follow-up (plan
+# decision #26 + plan section "compute_auto_sizes headroom
+# correctness") replaces this constant with Stage 1's precise
+# ``predicted_full_length`` -- summing per-call-target expansion under
+# Stage 2's ``expand_tokens`` and adding the per-variant
+# ``variant_tokens`` prefix. Until that lands, ``+64`` is the
+# conservative safety budget every auto-sized caller agrees on.
+# TODO(plan inspector-render-backends.md decision #26): switch to the
+# Stage 1 precise predictor.
 CONTEXT_LEN_HEADROOM: int = 64
 
 

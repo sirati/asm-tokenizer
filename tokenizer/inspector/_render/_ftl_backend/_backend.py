@@ -1,9 +1,9 @@
 """``FtlBackend`` -- the per-binary-CSV implementation of ``RenderBackend``.
 
-Single concern: bind one :class:`FunctionHandle` to the per-binary
-:class:`CsvIndex` and serve :meth:`variants` / :meth:`blocks` /
-:meth:`render_block` calls by routing into the shared
-:func:`tokenizer.inspector._render._render_block.render_block` body.
+Single concern: route :meth:`variants` / :meth:`blocks` /
+:meth:`render_block` calls for one :class:`FunctionHandle` into the
+shared :func:`tokenizer.inspector._render._render_block.render_block`
+body, backed by the per-binary :class:`CsvIndex`.
 
 The per-binary discovery + vocab cache + parsed-record cache live in
 :class:`CsvIndex` (one instance per binary, owned by the
@@ -141,7 +141,7 @@ class FtlBackend:
         block = state.blocks[block_idx]
         return render_block(
             block=block,
-            section=state.view,   # type: ignore[arg-type] -- duck-typed RenderableSection
+            section=state.view,
             kind_to_called_idx=state.kind_to_called_idx,
             variant_pins={},
             line_to_name=state.line_to_name,

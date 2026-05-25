@@ -98,14 +98,11 @@ def make_ftl_factory(csv_dir: Path, binary_name: str) -> BackendFactory:
 class _BatchDecodeBackendFactory:
     """:class:`BackendFactory` over a per-binary memmap (open session).
 
-    Wraps a :class:`BinaryDataset` + an already-opened
-    :class:`BinarySession`; :meth:`make` constructs one
-    :class:`BatchDecodeBackend` per :meth:`FunctionNode.expand` call.
-
-    Session lifetime is owned by the caller (``__main__`` enters
-    + exits the ``with session:`` block). :meth:`close` is therefore
-    a no-op on the session -- it only flips the closed flag so
-    subsequent :meth:`make` calls raise.
+    Wraps a :class:`BinaryDataset` + an entered :class:`BinarySession`;
+    :meth:`make` constructs one :class:`BatchDecodeBackend` per
+    :meth:`FunctionNode.expand` call. :meth:`close` exits the session
+    (mirrors :class:`_FtlBackendFactory.close` which closes its
+    :class:`CsvIndex`) so callers register only one shutdown hook.
     """
 
     dataset: BinaryDataset
@@ -125,37 +122,36 @@ class _BatchDecodeBackendFactory:
         )
 
     def close(self) -> None:
-        # Session is caller-owned (see class docstring); no-op beyond
-        # the closed-flag flip.
+        if self._closed:
+            return
+        self.session.close()
         self._closed = True
 
 
 def make_batch_decode_factory(
     memmap_dir: Path, binary_name: str
-) -> tuple[BackendFactory, BinaryDataset, BinarySession]:
+) -> BackendFactory:
     """Build the BatchDecode factory for one binary in ``memmap_dir``.
 
-    Returns the triple ``(factory, dataset, session)``; the caller
-    drives ``with session:`` so handles release on exit. ``handles`` is
-    the seed list of matched-arm functions in
-    ``dataset.matched_func_names`` order -- unmatched-arm functions are
-    not seeded into the tree (plan decision D3).
+    The returned factory owns the entered :class:`BinarySession`;
+    :meth:`BackendFactory.close` exits it. ``handles`` is the seed
+    list of matched-arm functions in ``dataset.matched_func_names``
+    order -- unmatched-arm functions are not seeded into the tree
+    (plan decision D3). The matched-func-names list is dataset-level
+    invariant (length ``== dataset.matched_count``), so the handle
+    index is read unconditionally.
     """
     vocab = load_and_validate_unified_vocab(memmap_dir / "unified_vocab.csv")
     dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab)
     session = dataset.open_session()
+    session.__enter__()
     func_names = dataset.matched_func_names
     handles: List[FunctionHandle] = [
-        FunctionHandle(
-            arm=SectionKind.MATCHED,
-            idx=idx,
-            name=func_names[idx] if idx < len(func_names) else "?",
-        )
+        FunctionHandle(arm=SectionKind.MATCHED, idx=idx, name=func_names[idx])
         for idx in range(dataset.matched_count)
     ]
-    factory = _BatchDecodeBackendFactory(
+    return _BatchDecodeBackendFactory(
         dataset=dataset,
         session=session,
         handles=handles,
     )
-    return factory, dataset, session

@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
-from tokenizer.aligned_data.parsed_record_iter import ParsedRecord, _V2_CATEGORY_TYPES
+from tokenizer.aligned_data.parsed_record_iter import ParsedRecord, V2_CATEGORY_TYPES
 
 
 __all__ = [
@@ -86,7 +86,7 @@ def build_section_view_from_record(record: ParsedRecord) -> FtlSectionView:
 
     ``ParsedRecord.called_funcs`` is already in the encoder's
     LOCAL -> PLT -> EXTERN category order (see
-    :data:`tokenizer.aligned_data.parsed_record_iter._V2_CATEGORY_TYPES`),
+    :data:`tokenizer.aligned_data.parsed_record_iter.V2_CATEGORY_TYPES`),
     with order preserved within each category. The flat position in
     ``called_funcs`` is therefore the ``function_name_ptr`` the
     renderer keys into via ``line_to_name``.
@@ -100,15 +100,15 @@ def build_section_view_from_record(record: ParsedRecord) -> FtlSectionView:
     ``record.extern_libraries``).
 
     ``F-MED-14`` runtime assert: the order of categories in
-    ``called_funcs`` must match :data:`_V2_CATEGORY_TYPES`. The
+    ``called_funcs`` must match :data:`V2_CATEGORY_TYPES`. The
     encoder's iterator (:func:`called_from_v2_metadata`) walks
-    ``_V2_CATEGORY_TYPES`` in fixed order, so any mismatch points at
+    ``V2_CATEGORY_TYPES`` in fixed order, so any mismatch points at
     a drift between this view and the parser. We assert at
     construction; the inspector is a diagnostic tool, surfacing the
     drift loudly is preferable to silently mis-routing every EXTERN
     row.
     """
-    expected_order = tuple(t for _key, t in _V2_CATEGORY_TYPES)
+    expected_order = tuple(t for _key, t in V2_CATEGORY_TYPES)
 
     targets: list[FtlCallTarget] = []
     extern_slot = 0  # 0-indexed counter within EXTERN category
@@ -152,7 +152,7 @@ def build_section_view_from_record(record: ParsedRecord) -> FtlSectionView:
             j += 1
         assert j < len(expected_order), (
             f"called_funcs category order {seen_unique!r} not a subsequence "
-            f"of _V2_CATEGORY_TYPES order {expected_order!r}"
+            f"of V2_CATEGORY_TYPES order {expected_order!r}"
         )
         j += 1
 

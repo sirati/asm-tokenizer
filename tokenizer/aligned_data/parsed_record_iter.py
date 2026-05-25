@@ -210,7 +210,7 @@ def _decode_tokens(
     return tokens.astype(np.uint16)
 
 
-_V2_CATEGORY_TYPES: "tuple[tuple[str, CallTargetType], ...]" = (
+V2_CATEGORY_TYPES: "tuple[tuple[str, CallTargetType], ...]" = (
     ("local_funcs", CallTargetType.LOCAL),
     ("plt_funcs", CallTargetType.PLT),
     ("ext_funcs", CallTargetType.EXTERN),
@@ -240,14 +240,15 @@ def called_from_v2_metadata(
 ) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
     if not metadata_cell:
         return [], {}
-    try:
-        meta = json.loads(metadata_cell)
-    except Exception:
-        return [], {}
+    # Raise loud on malformed metadata (F-MED-11 / plan decision #5):
+    # a corrupted CSV is a data-integrity violation that should crash
+    # the consumer rather than silently emit zero callees + collapse
+    # every EXTERN row to the same provider.
+    meta = json.loads(metadata_cell)
     if not isinstance(meta, dict):
         return [], {}
     # Preserve the encoder's per-category allocation order: each
-    # ``_V2_CATEGORY_TYPES`` array is the CSV's identity-indexed
+    # ``V2_CATEGORY_TYPES`` array is the CSV's identity-indexed
     # metadata cell, so the K-th name in category C is the function
     # whose encoder-assigned identity for C is K. Dedupe inside one
     # category via ``dict.fromkeys`` (order-preserving primitive); the
@@ -256,7 +257,7 @@ def called_from_v2_metadata(
     # Categories are concatenated in LOCAL -> PLT -> EXTERN order.
     called: list[tuple[str, CallTargetType]] = []
     extern_libraries: dict[str, str] = {}
-    for category_key, category_type in _V2_CATEGORY_TYPES:
+    for category_key, category_type in V2_CATEGORY_TYPES:
         names_in_order: list[str] = []
         for entry in meta.get(category_key, ()) or ():
             if isinstance(entry, dict):

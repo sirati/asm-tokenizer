@@ -24,6 +24,7 @@ from typing import Dict, Mapping, Tuple
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.parsed_record_iter import ParsedRecord
 from tokenizer.function_token_list import FunctionTokenList
+from tokenizer.inspector._render._render_block import partition_call_target_kinds
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
 
@@ -105,7 +106,9 @@ def build_variant_state(
        library) per plan decisions #28 + the F-HIGH-4 fix.
     """
     view = build_section_view_from_record(record)
-    kind_to_called_idx = _partition_kinds(view)
+    kind_to_called_idx = partition_call_target_kinds(
+        ct.type for ct in view.call_targets
+    )
     ftl = FunctionTokenList.reconstruct_func_from_raw_bytes(
         record.tokens,
         record.block_runlength,
@@ -153,16 +156,3 @@ def _build_line_to_provider(
     return line_to_provider
 
 
-def _partition_kinds(view: FtlSectionView) -> Mapping[CallTargetType, list[int]]:
-    """Per-kind index lists into ``view.call_targets``.
-
-    Mirrors :func:`_render_block._kind_to_called_idx` but operates on
-    the FTL-side view (the renderer's helper expects the writer-side
-    :class:`Section`). The K-th element of ``kind_to_idx[kind]`` is
-    the position of the K-th distinct call_target of that
-    ``CallTargetType`` -- matches the encoder's per-Category counter.
-    """
-    kind_to_idx: Dict[CallTargetType, list[int]] = {k: [] for k in CallTargetType}
-    for called_idx, ct in enumerate(view.call_targets):
-        kind_to_idx[ct.type].append(called_idx)
-    return kind_to_idx

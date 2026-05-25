@@ -31,7 +31,7 @@ The caller threads in:
   site go to": each LOCAL/PLT/EXT_FUNC token carries an
   encoder-allocated per-Category counter that maps DIRECTLY to the
   position of the K-th call_target of that ``CallTargetType`` in
-  ``section.call_targets`` (see :func:`_kind_to_called_idx`).
+  ``section.call_targets`` (see :func:`partition_call_target_kinds`).
 * ``kind_to_called_idx`` -- per-kind index lists into
   ``section.call_targets`` (variant-level invariant; the tree model
   builds it once per variant).
@@ -65,13 +65,12 @@ these line items is :mod:`tokenizer.inspector._tree_model`'s job.
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
 from tokenizer.aligned_data.matched_sections_bin import (
     MISSING_VARIANT_INDEX,
-    Section,
     VariantBlock,
 )
 from tokenizer.inspector._render._protocol import (
@@ -95,8 +94,44 @@ __all__ = [
     "InlineCallEntry",
     "InlineJumpEntry",
     "LineItem",
+    "RenderableCallTarget",
+    "RenderableSection",
+    "partition_call_target_kinds",
     "render_block",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Renderable-section Protocol
+# ---------------------------------------------------------------------------
+
+
+class RenderableCallTarget(Protocol):
+    """Minimum-surface call-target view consumed by :func:`render_block`.
+
+    Both the writer-side
+    :class:`~tokenizer.aligned_data.matched_sections_bin.CallTarget`
+    and the FTL-side :class:`FtlCallTarget` satisfy this Protocol. The
+    renderer reads only the three fields below; pinning them in this
+    Protocol prevents future call_target views from drifting.
+    """
+
+    type: CallTargetType
+    function_name_ptr: int
+    function_section_ptr: int
+
+
+class RenderableSection(Protocol):
+    """Minimum-surface section view consumed by :func:`render_block`.
+
+    The renderer reads only ``call_targets``; each entry must satisfy
+    :class:`RenderableCallTarget`. Both the writer-side
+    :class:`~tokenizer.aligned_data.matched_sections_bin.Section` and
+    the FTL :class:`FtlSectionView` qualify. Phase 2 views can opt in
+    by exposing the same attribute.
+    """
+
+    call_targets: Sequence[RenderableCallTarget]
 
 
 # ---------------------------------------------------------------------------
@@ -104,18 +139,25 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def _kind_to_called_idx(section: Section) -> dict[CallTargetType, list[int]]:
-    """Per-kind index lists into ``section.call_targets``.
+def partition_call_target_kinds(
+    call_target_types: Iterable[CallTargetType],
+) -> dict[CallTargetType, list[int]]:
+    """Per-:class:`CallTargetType` index lists into the source list.
 
-    The matched-sections writer concatenates call_targets in
-    non-decreasing :class:`CallTargetType` order (LOCAL -> PLT ->
-    EXTERN) with stable encounter-order within each block (see
-    :mod:`tokenizer.memmap_builder._pass2` ``_emit_section_call_targets``).
-    That guarantees the K-th element of ``kind_to_idx[kind]`` is the
-    K-th distinct callee of that ``CallTargetType`` IN THE SAME
-    ORDER THE ENCODER'S PER-CATEGORY COUNTER WALKED THEM -- so
-    ``counter_id`` from a LOCAL/PLT/EXT_FUNC token maps directly to
-    ``section.call_targets[kind_to_idx[kind][counter_id]]``.
+    Generic over the source: callers pass the ``ct.type`` stream from
+    whichever section-shape they hold (the writer-side
+    :class:`Section`, the FTL-side :class:`FtlSectionView`, or any
+    future Phase-2 view) and the helper returns a dict keyed by every
+    :class:`CallTargetType` member, with the K-th list entry equal to
+    the position of the K-th call_target of that type.
+
+    Both inspector backends partition their call-target list this way
+    (writer-side :class:`Section` for BatchDecode-rendered blocks,
+    FTL :class:`FtlSectionView` for the CSV path). Lifting the walk
+    out of each consumer keeps the encoder's LOCAL -> PLT -> EXTERN
+    encounter-order invariant pinned in ONE place; the K-th
+    ``kind_to_idx[kind]`` entry equals the K-th distinct callee of
+    that ``CallTargetType`` in encoder-allocation order.
 
     This is variant-level invariant; the tree model
     (:mod:`tokenizer.inspector._tree_model._nodes_variant`) builds it
@@ -125,8 +167,8 @@ def _kind_to_called_idx(section: Section) -> dict[CallTargetType, list[int]]:
     kind_to_idx: dict[CallTargetType, list[int]] = {
         k: [] for k in CallTargetType
     }
-    for called_idx, ct in enumerate(section.call_targets):
-        kind_to_idx[ct.type].append(called_idx)
+    for called_idx, ct_type in enumerate(call_target_types):
+        kind_to_idx[ct_type].append(called_idx)
     return kind_to_idx
 
 
@@ -192,7 +234,7 @@ def _emit_call_entry(
     *,
     kind: CallTargetType,
     counter_id: int,
-    section: Section,
+    section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
@@ -247,7 +289,7 @@ def _emit_call_entry(
 def render_block(
     *,
     block: BlockTokenList,
-    section: Section,
+    section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
@@ -286,7 +328,7 @@ def render_block(
 def _walk_block_instructions(
     block: BlockTokenList,
     *,
-    section: Section,
+    section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
@@ -311,7 +353,7 @@ def _walk_block_instructions(
 def _emit_inline_entries(
     insn,
     *,
-    section: Section,
+    section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
     line_to_name: Mapping[int, str],
