@@ -214,3 +214,70 @@ def test_negative_arithmetic_wide_immediate_emits_value_negative(handler, vm, lo
 # ``is_vtable`` that ``_UnknownLookup`` does not populate) and would
 # duplicate the rebind-correctness signal already pinned by the small-
 # immediate and wide-arithmetic cases above.
+
+
+# --------------------------------------------------------------------------
+# Control-flow path: intra-function jump target → ``block_v2``.
+# --------------------------------------------------------------------------
+
+
+class _LocalFunctionLookup:
+    """Stub ``MetadataLookup`` reporting ``AddressKind.LOCAL_FUNCTION`` with
+    a fixed ``start_addr`` for every query.
+
+    Models the Ghidra-side metadata stamp for a control-flow target whose
+    physical address falls inside the calling function's body: the
+    function-range entry is the function's first instruction, and any
+    interior address shares the same ``meta`` (since the lookup is
+    range-based). The v2 precedence walk distinguishes entry vs interior
+    via ``_is_function_entry(meta, value)``.
+    """
+
+    def __init__(self, start_addr: int) -> None:
+        self._view = SimpleNamespace(
+            kind=AddressKind.LOCAL_FUNCTION,
+            start_addr=start_addr,
+        )
+
+    def lookup(self, addr: int):
+        return self._view
+
+
+def test_intra_function_jump_target_emits_block_v2(handler, vm):
+    """x86 control-flow target strictly inside the calling function's body
+    must reach the v2 precedence walk's step 4 (``block_v2``), not be
+    short-circuited to step 11 (``valued_const_v2``).
+
+    Regression: the legacy ``is_arithmetic=True`` pre-classification at
+    this call site (mirrored from the shared ``operands_base`` path)
+    contradicted ``precedence.md`` step 4. The fix collapses the
+    pre-classification, handing both intra-function and cross-function
+    targets to the constant_handler with ``is_arithmetic=False`` so the
+    predicate dispatch decides.
+    """
+    func_start = 0x1000
+    func_end = 0x2000
+    intra_target = 0x1100  # strictly inside [func_start, func_end), != entry
+
+    out = tokenize_operand_immediate(
+        addressing_control_flow_instructions={"jmp"},
+        arithmetic_instructions=set(),
+        insn=_make_insn("jmp"),
+        lookup=_LocalFunctionLookup(start_addr=func_start),
+        op=_make_imm_op(intra_target),
+        func_max_addr=func_end,
+        func_min_addr=func_start,
+        constant_handler=handler,
+    )
+
+    ids = _ids(out)
+    block_v2_type_id = int(vm.Block_V2(0).get_token_ids().tolist()[0])
+    valued_const_v2_type_id = int(vm.Valued_Const_V2(0).get_token_ids().tolist()[0])
+    assert block_v2_type_id in ids, (
+        f"intra-function jump target must emit block_v2 (id {block_v2_type_id}); "
+        f"got {ids!r}"
+    )
+    assert valued_const_v2_type_id not in ids, (
+        f"intra-function jump target must NOT collapse to valued_const_v2 "
+        f"(id {valued_const_v2_type_id}); got {ids!r}"
+    )
