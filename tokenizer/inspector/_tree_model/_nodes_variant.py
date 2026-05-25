@@ -43,7 +43,7 @@ class VariantNode:
     label_axes: Mapping[str, Optional[str]]
     is_failed: bool = False
     can_expand: bool = field(default=True, init=False)
-    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app`.
+    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
 
     def expand(self) -> list["BlockNode"]:
