@@ -107,6 +107,20 @@ class _NumberAccumulator:
         """``True`` iff at least one chunk has been fed since the last flush."""
         return bool(self._pending_chunks)
 
+    def pending_shifted_id(self) -> Optional[int]:
+        """Shifted id of the in-flight source (``None`` when empty).
+
+        Exposed so callers can decide -- without inspecting the chunk
+        buffer -- whether an upcoming NUMBER token would EXTEND the
+        same source (matching shifted id) or START a new one
+        (different shifted id; auto-flushed on the next :meth:`feed`).
+        The row walker uses this to decide whether to pre-drain at an
+        instruction boundary: a NUMBER token with a different shifted
+        id at the boundary means the prior source is complete, so the
+        drain is legitimate (not a W3-17 invariant violation).
+        """
+        return self._pending_shifted_id
+
     def feed(
         self,
         *,
