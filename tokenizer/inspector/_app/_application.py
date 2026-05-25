@@ -26,7 +26,10 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
 
 from shared.logging_utils import setup_file_logger
-from tokenizer.inspector._label import aligned_variant_labels
+from tokenizer.inspector._label import (
+    aligned_variant_labels,
+    variant_natural_sort_key,
+)
 from tokenizer.inspector._tree_model import (
     FunctionNode,
     Node,
@@ -58,8 +61,27 @@ _LOGGER_NAME = "tokenizer.inspector"
 
 
 # ---------------------------------------------------------------------------
-# Variant sibling-set column alignment
+# Variant sibling-set natural sort + column alignment
 # ---------------------------------------------------------------------------
+
+
+def _sort_variants_naturally(children: list[Node]) -> None:
+    """Sort a homogeneous :class:`VariantNode` sibling set in-place by
+    :func:`variant_natural_sort_key` (so ``v10`` sorts AFTER ``v9``).
+
+    Single concern: natural sort across the immediate sibling set. The
+    sort runs BEFORE :func:`_stamp_aligned_variant_labels` so the
+    aligned-label column widths are computed in display order. Mixed
+    sibling sets are a no-op (sort order across heterogeneous kinds
+    is not well-defined here).
+    """
+    if not children or not all(isinstance(c, VariantNode) for c in children):
+        return
+    children.sort(
+        key=lambda node: variant_natural_sort_key(
+            node.label_axes  # type: ignore[union-attr]  # narrowed by isinstance guard
+        )
+    )
 
 
 def _stamp_aligned_variant_labels(children: list[Node]) -> None:
@@ -205,6 +227,7 @@ class InspectorApp(App[None]):
             node.refresh()
             return
 
+        _sort_variants_naturally(children)
         _stamp_aligned_variant_labels(children)
         for child in children:
             node.add(
