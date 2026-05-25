@@ -136,8 +136,8 @@ class _FakeSession:
         default_factory=dict
     )
     unmatched_sections: Dict[int, Section] = field(default_factory=dict)
-    unmatched_function_data: Dict[int, FunctionData] = field(
-        default_factory=dict
+    unmatched_variant_function_data: Dict[Tuple[int, int], FunctionData] = (
+        field(default_factory=dict)
     )
 
     # ---- registration -------------------------------------------------
@@ -151,9 +151,20 @@ class _FakeSession:
         for v_idx, fd in variant_function_data.items():
             self.matched_function_data[(section.section_offset, v_idx)] = fd
 
-    def add_unmatched(self, section: Section, fd: FunctionData) -> None:
+    def add_unmatched(
+        self,
+        section: Section,
+        variant_function_data: Dict[int, FunctionData],
+    ) -> None:
+        # Unmatched sections store one record per variant; the fake
+        # mirrors the matched-arm shape so the resolver's 1a path can
+        # surface every per-record body in parallel with
+        # ``section.variants``.
         self.unmatched_sections[section.section_offset] = section
-        self.unmatched_function_data[section.section_offset] = fd
+        for v_idx, fd in variant_function_data.items():
+            self.unmatched_variant_function_data[
+                (section.section_offset, v_idx)
+            ] = fd
 
     # ---- 1a path ------------------------------------------------------
 
@@ -171,12 +182,15 @@ class _FakeSession:
         matched = MatchedFunction(func_name=f"m{idx}", variants=variants)
         return section, section.section_offset, matched
 
-    def _load_unmatched_record_and_section(
+    def _load_unmatched_section_and_all_variants(
         self, idx: int
-    ) -> Tuple[Section, int, FunctionData]:
+    ) -> Tuple[Section, int, List[FunctionData]]:
         section = self.unmatched_sections[idx]
-        fd = self.unmatched_function_data[idx]
-        return section, section.section_offset, fd
+        variants = [
+            self.unmatched_variant_function_data[(idx, v)]
+            for v in range(len(section.variants))
+        ]
+        return section, section.section_offset, variants
 
     # ---- 1b path ------------------------------------------------------
 
@@ -347,7 +361,7 @@ def test_multiple_pointers_mixed_arms_preserve_order() -> None:
     )
     session = _FakeSession()
     session.add_matched(matched_section, {0: _make_function_data("m")})
-    session.add_unmatched(unmatched_section, _make_function_data("u"))
+    session.add_unmatched(unmatched_section, {0: _make_function_data("u")})
 
     pointers = [
         SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=200),
@@ -752,7 +766,7 @@ def test_unmatched_root_uses_unmatched_loader() -> None:
     )
     unmatched_fd = _make_function_data("unmatched_root")
     session = _FakeSession()
-    session.add_unmatched(section, unmatched_fd)
+    session.add_unmatched(section, {0: unmatched_fd})
 
     out = walk_sections(
         session=session,  # type: ignore[arg-type]

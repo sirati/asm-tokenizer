@@ -95,7 +95,7 @@ class _FakeSession:
     matched_sections: Dict[int, Section] = field(default_factory=dict)
     matched_functions: Dict[int, MatchedFunction] = field(default_factory=dict)
     unmatched_sections: Dict[int, Section] = field(default_factory=dict)
-    unmatched_function_data: Dict[int, FunctionData] = field(
+    unmatched_variant_function_data: Dict[int, List[FunctionData]] = field(
         default_factory=dict
     )
 
@@ -111,10 +111,17 @@ class _FakeSession:
         )
 
     def add_unmatched(
-        self, idx: int, section: Section, fd: FunctionData
+        self,
+        idx: int,
+        section: Section,
+        variant_function_data: List[FunctionData],
     ) -> None:
+        # Unmatched sections store one record per variant; the fake
+        # mirrors the matched-arm shape so the resolver can iterate
+        # ``section.variants`` in parallel with the per-variant body
+        # list.
         self.unmatched_sections[idx] = section
-        self.unmatched_function_data[idx] = fd
+        self.unmatched_variant_function_data[idx] = variant_function_data
 
     def _load_matched_section_and_variants(
         self, idx: int
@@ -122,11 +129,15 @@ class _FakeSession:
         section = self.matched_sections[idx]
         return section, section.section_offset, self.matched_functions[idx]
 
-    def _load_unmatched_record_and_section(
+    def _load_unmatched_section_and_all_variants(
         self, idx: int
-    ) -> Tuple[Section, int, FunctionData]:
+    ) -> Tuple[Section, int, List[FunctionData]]:
         section = self.unmatched_sections[idx]
-        return section, section.section_offset, self.unmatched_function_data[idx]
+        return (
+            section,
+            section.section_offset,
+            self.unmatched_variant_function_data[idx],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +250,12 @@ def test_compute_auto_sizes_matched_dispatch_returns_section_max():
 
 
 def test_compute_auto_sizes_unmatched_dispatch_single_variant():
-    """Unmatched sections have exactly one variant by the
-    matched_sections_bin invariant; the helper must surface that
-    correctly without exploding the variant axis."""
+    """An unmatched section with one variant surfaces its body's
+    token-length unchanged through the auto-size reducer."""
     section = _make_section(n_variants=1, section_offset=32)
     fd = _make_function_data("u_only", n_body_tokens=9, n_variant_tokens=2)
     session = _FakeSession()
-    session.add_unmatched(7, section, fd)
+    session.add_unmatched(7, section, [fd])
 
     spec = compute_auto_sizes(
         session,  # type: ignore[arg-type]
@@ -254,6 +264,33 @@ def test_compute_auto_sizes_unmatched_dispatch_single_variant():
 
     assert spec.num_variants_per_section == 1
     assert spec.context_len == (9 + 2) + CONTEXT_LEN_HEADROOM
+
+
+def test_compute_auto_sizes_unmatched_dispatch_multi_variant_no_index_error():
+    """Regression: an unmatched section with N>1 variants MUST resolve
+    without IndexError. Pre-fix the resolver's per-record loader
+    returned a 1-element FunctionData list while the section advertised
+    N variants, so the cap-bypass sampling step indexed out of range
+    on every multi-variant unmatched section (surfaced as
+    ``list index out of range`` when the inspector navigated to an
+    unmatched callee whose BIN section carried more than one variant).
+    """
+    section = _make_section(n_variants=3, section_offset=64)
+    fds = [
+        _make_function_data(f"u_v{v}", n_body_tokens=5 + v, n_variant_tokens=1)
+        for v in range(3)
+    ]
+    session = _FakeSession()
+    session.add_unmatched(0, section, fds)
+
+    spec = compute_auto_sizes(
+        session,  # type: ignore[arg-type]
+        [SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=0)],
+    )
+
+    assert spec.num_variants_per_section == 3
+    # Longest body is variant 2 (7 + 1 = 8).
+    assert spec.context_len == 8 + CONTEXT_LEN_HEADROOM
 
 
 def test_compute_auto_sizes_mixed_arms_max_across_request():
@@ -269,7 +306,7 @@ def test_compute_auto_sizes_mixed_arms_max_across_request():
     fd_u = _make_function_data("u", n_body_tokens=20, n_variant_tokens=4)
     session = _FakeSession()
     session.add_matched(0, sec_m, fds_m)
-    session.add_unmatched(0, sec_u, fd_u)
+    session.add_unmatched(0, sec_u, [fd_u])
 
     spec = compute_auto_sizes(
         session,  # type: ignore[arg-type]
