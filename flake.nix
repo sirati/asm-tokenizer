@@ -518,7 +518,15 @@
           # inspector can `import textual` while the default
           # `nix develop` shell remains textual-free.
           tuiPython = pkgs.python314.withPackages (
-            python-pkgs: (deploymentPythonPackages python-pkgs) ++ [ python-pkgs.textual ]
+            python-pkgs:
+              (deploymentPythonPackages python-pkgs)
+              ++ [
+                python-pkgs.textual
+                # natsort drives the inspector's variant grouping
+                # natural-alphanumeric sort (Order modal). TUI-only;
+                # the default ``nix develop`` shell stays leaner.
+                python-pkgs.natsort
+              ]
           );
         in
         {
