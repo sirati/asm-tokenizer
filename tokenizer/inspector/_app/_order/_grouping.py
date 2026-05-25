@@ -182,11 +182,16 @@ def group_variants(
 
     Algorithm:
     1. Compute each variant's sort key by chaining
-       :func:`extract_axis_value` over ``config.ordered_axes`` (NOT just
-       the grouping subset -- the order axes drive intra-group sort).
+       :func:`extract_axis_value` over ``config.ordered_axes``, but with
+       grouping axes pulled to the FRONT of the tuple (in their
+       ``ordered_axes`` order). This guarantees variants sharing a
+       grouping-axis-value land in a contiguous run so the partition
+       walk produces ONE bucket per value -- without this re-prioritising
+       a leading non-grouping axis (e.g. ``arch``) would interleave
+       grouping-value runs (e.g. ``clang``/``gcc`` per ``arch``).
     2. Partition the sorted variants by the grouping subset, in
-       ``ordered_axes`` order; non-grouping axes contribute to sort
-       only.
+       ``ordered_axes`` order; non-grouping axes contribute to
+       intra-group sort only.
     """
     if not variants:
         return []
@@ -194,6 +199,16 @@ def group_variants(
     grouping_in_order = [
         axis for axis in config.ordered_axes if axis in config.grouping_axes
     ]
+    non_grouping_in_order = [
+        axis for axis in config.ordered_axes if axis not in config.grouping_axes
+    ]
+    # Grouping-first sort axes: grouping axes (in ``ordered_axes`` order)
+    # precede non-grouping axes so the partition walk sees contiguous
+    # same-grouping-value runs. Without this re-ordering a non-grouping
+    # axis listed earlier in ``ordered_axes`` (e.g. the canonical-5
+    # ``arch`` at index 0 when grouping by ``comp:`` only) would split
+    # each grouping bucket into one-row sub-runs.
+    sort_axes = tuple(grouping_in_order) + tuple(non_grouping_in_order)
 
     # Cross-axis interaction context: when BOTH the arch axis AND the
     # bitwidth axis are configured for grouping, the arch axis must
@@ -212,7 +227,7 @@ def group_variants(
     decorated = [
         (
             _variant_sort_tuple(
-                v, rendered_by_variant, config.ordered_axes, collapse_arch_to_family
+                v, rendered_by_variant, sort_axes, collapse_arch_to_family
             ),
             v,
         )
