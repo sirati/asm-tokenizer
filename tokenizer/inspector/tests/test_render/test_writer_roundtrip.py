@@ -14,6 +14,7 @@ from .conftest import (
     _StubBlock,
     _StubInsn,
     _StubToken,
+    _flatten_openables,
     _kind_to_idx,
     _make_call_target,
     _make_section,
@@ -85,7 +86,7 @@ def test_variant_block_roundtrip_via_kind_to_called_idx_helper():
         callee_arm_resolver=lambda _o: None,
     )
 
-    calls = [it for it in items if isinstance(it, InlineCallEntry)]
+    calls = [it for it in _flatten_openables(items) if isinstance(it, InlineCallEntry)]
     assert [c.variant_idx for c in calls] == [7, 8, 9, MISSING_VARIANT_INDEX]
     assert [c.kind for c in calls] == [
         CallTargetType.LOCAL,
