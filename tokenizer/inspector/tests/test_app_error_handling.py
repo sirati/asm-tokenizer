@@ -848,12 +848,17 @@ def test_intervening_key_invalidates_undo():
     asyncio.run(runner())
 
 
-def test_vim_l_does_not_trigger_undo():
-    """Vim ``l`` is "any other key" w.r.t. the undo overlay; it clears state.
+def test_vim_l_does_not_pop_undo_stack():
+    """Vim ``l`` is NOT the undo trigger; only literal ``→`` pops.
 
-    The spec singles out the literal ``right`` key as the only trigger;
-    vim ``l`` (which shares the conditional pan/expand action) is
-    treated as an invalidating key.
+    The spec singles out the literal ``right`` key as the only pop
+    trigger; vim ``l`` (which shares the conditional pan/expand action)
+    is "any other key" from the on_key dispatcher's view -- it neither
+    pops nor clears (clearing is driven by ``watch_cursor_line`` when
+    the cursor leaves the chain-head parent). With the parent row
+    already expanded + fitting the viewport, ``l`` is a no-op on the
+    cursor, so the stack survives and a subsequent ``→`` resumes the
+    undo chain.
     """
 
     async def runner() -> None:
@@ -881,21 +886,199 @@ def test_vim_l_does_not_trigger_undo():
                 await pilot.pause()
                 assert tree.cursor_node is fn_tree_node
 
-                # ``l`` clears the undo state. The parent FunctionNode
-                # is already expanded (children present) + fits the
-                # viewport; the binding's expand fallback is a no-op
-                # on an already-expanded row.
+                # ``l`` is "not the pop trigger". The parent is already
+                # expanded + fits the viewport, so the pan/expand
+                # action is a no-op -- the cursor doesn't move, so the
+                # watch_cursor_line invalidator never fires.
                 await pilot.press("l")
                 await pilot.pause()
-                # Did NOT undo (cursor stayed on the parent).
+                # Did NOT pop (cursor stayed on the parent).
                 assert tree.cursor_node is fn_tree_node
 
-                # A subsequent ``→`` is now normal: no undo state, so
-                # the binding falls through to the no-op expand on an
-                # already-expanded fitting row.
+                # A subsequent ``→`` resumes the chain: the stack is
+                # still intact, so the right-arrow pops and restores
+                # the child cursor.
                 await pilot.press("right")
                 await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+
+
+def test_left_left_right_right_unwinds_two_level_climb():
+    """``←, ←, →, →`` returns the cursor to the original deep child row.
+
+    Regression for the chained-undo behaviour: each successful
+    ``←``-to-parent push grows a stack the symmetric ``→`` sequence
+    pops in reverse, restoring intermediate cursor positions one
+    level at a time. Setup is a 3-level tree (fn → block → asm
+    leaves); cursor starts on a grandchild leaf, climbs twice, then
+    descends twice.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Build a 3-level tree: fn -> block -> [asm leaf].
+                # The block must be can_expand=True; mock its expand to
+                # return one short AsmLeaf so we land on a deterministic
+                # grandchild row whose ``→`` would be a no-op (leaf, can't
+                # expand) -- proving the right-arrow ran the pop path.
+                block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    kind=BlockKind.BODY,
+                    block_idx=1,
+                    preview="x",
+                )
+                grandchild_leaf = AsmLeaf(text="hi")
+                block.expand = MagicMock(return_value=[grandchild_leaf])
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [block])
+                )
+                block_tree_node = children[0]
+                block_tree_node.expand()
+                await pilot.pause()
+                assert len(block_tree_node.children) == 1
+                grandchild_tree_node = block_tree_node.children[0]
+
+                # Park cursor on the grandchild row.
+                tree.move_cursor(grandchild_tree_node, animate=False)
+                await pilot.pause()
+                assert tree.cursor_node is grandchild_tree_node
+                assert tree.scroll_offset.x == 0
+
+                # First ``←``: climb grandchild -> block.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is block_tree_node
+
+                # Second ``←``: climb block -> fn.
+                await pilot.press("left")
+                await pilot.pause()
                 assert tree.cursor_node is fn_tree_node
+
+                # First ``→``: pop block (one level down).
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is block_tree_node
+
+                # Second ``→``: pop grandchild (back to start).
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is grandchild_tree_node
+
+    asyncio.run(runner())
+
+
+def test_non_cursor_keypress_preserves_undo_chain():
+    """A keypress that doesn't move the tree cursor leaves the chain intact.
+
+    Stack invalidation triggers on actual cursor moves (via
+    ``watch_cursor_line``), not on raw keys, so any key whose action
+    doesn't shift the tree's cursor must leave the undo chain ready
+    to resume. Models the modal-trip use case: ``o``-open / ``Esc``-
+    back round-trips don't move the tree cursor, so they must NOT
+    break the undo chain. We use an unbound letter here -- exercising
+    the same on_key path without dragging a real ModalScreen + its
+    own focus management into the assertion surface.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                short_leaf = AsmLeaf(text="hi")
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [short_leaf])
+                )
+                child_tree_node = children[0]
+
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # Press an unbound letter -- no binding fires, the
+                # cursor stays on the parent row, the on_key dispatcher
+                # sees a non-``right`` key and falls through without
+                # touching the stack.
+                await pilot.press("a")
+                await pilot.pause()
+
+                # Tree cursor still on the parent row.
+                assert tree.cursor_node is fn_tree_node
+
+                # ``→`` resumes the chain: stack still has the child,
+                # so the pop fires and the cursor returns to it.
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+
+
+    asyncio.run(runner())
+
+
+def test_intervening_down_clears_chained_stack():
+    """A cursor-moving key between climbs clears the entire chain.
+
+    Two left-arrows build a depth-2 stack; an intervening ``down``
+    moves the cursor off the chain-head parent, which invalidates
+    the stack wholesale. The next two ``→`` presses are not undos
+    -- they fall through to the normal pan/expand action.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Two short leaves so ``down`` from the second leaf
+                # has a row to move to (the first leaf, depending on
+                # cursor direction; either way the cursor leaves the
+                # chain-head parent).
+                leaf_a = AsmLeaf(text="a")
+                leaf_b = AsmLeaf(text="b")
+                tree, fn_tree_node, children = (
+                    await _expand_function_with_children(app, pilot, [leaf_a, leaf_b])
+                )
+                row_a, row_b = children
+
+                tree.move_cursor(row_b, animate=False)
+                await pilot.pause()
+                # ``←`` climbs row_b -> fn.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # ``down`` moves the cursor off the chain-head parent;
+                # the stack must be invalidated.
+                await pilot.press("down")
+                await pilot.pause()
+                cursor_after_down = tree.cursor_node
+                # Either a sibling or row_a; just NOT the chain head.
+                assert cursor_after_down is not fn_tree_node
+
+                # Move back to the parent so the next ``→`` has a
+                # deterministic target. The watch_cursor_line that
+                # fired on the ``down`` already cleared the stack, so
+                # this restoration cannot re-arm the chain.
+                tree.move_cursor(fn_tree_node, animate=False)
+                await pilot.pause()
+                # ``→`` is no-op now (parent already expanded + fits).
+                await pilot.press("right")
+                await pilot.pause()
+                # NOT an undo: cursor stays on fn (the expand path is
+                # also a no-op on an already-expanded fitting row).
+                assert tree.cursor_node is fn_tree_node
+                assert tree.cursor_node is not row_a
+                assert tree.cursor_node is not row_b
+
+
+    asyncio.run(runner())
 
     asyncio.run(runner())
 
