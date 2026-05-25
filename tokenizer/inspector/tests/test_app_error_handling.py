@@ -37,7 +37,7 @@ from tokenizer.inspector._render._protocol import (
     FunctionHandle,
     RenderBackend,
 )
-from tokenizer.inspector._tree_model import FunctionNode
+from tokenizer.inspector._tree_model import AsmLeaf, FunctionNode
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,55 @@ def test_quit_binding_returns_cleanly():
                 await pilot.pause()
             # App[None] -- return_value should be None on clean quit.
             assert app.return_value is None
+
+    asyncio.run(runner())
+
+
+def test_left_arrow_at_scroll_zero_moves_cursor_to_parent():
+    """Left arrow at ``scroll_offset.x == 0`` climbs to the parent row.
+
+    Standard file-tree TUI affordance: the arrow pans while there is
+    horizontal slack, then becomes cursor-to-parent once the row is
+    flush-left. Vim ``h`` retains its pure-pan semantics (separate
+    binding) and is covered by the no-op path implicitly: with
+    ``scroll_offset.x == 0`` it remains a no-op cursor-wise.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                tree, fn_tree_node = _root_tree_node(app)
+                fn_model: FunctionNode = fn_tree_node.data
+                # Stub the function's expand to attach one synthetic
+                # AsmLeaf child so we have a non-root cursor target.
+                child_leaf = AsmLeaf(text="stub-line")
+                fn_model.expand = MagicMock(return_value=[child_leaf])
+                fn_tree_node.expand()
+                await pilot.pause()
+                assert len(fn_tree_node.children) == 1
+
+                # Park the cursor on the child + confirm scroll_x is 0.
+                child_tree_node = fn_tree_node.children[0]
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+                assert tree.scroll_offset.x == 0
+                assert tree.cursor_node is child_tree_node
+
+                # Left arrow at scroll-zero -> parent function row.
+                await pilot.press("left")
+                await pilot.pause()
+                assert tree.cursor_node is fn_tree_node
+
+                # Vim ``h`` at scroll-zero is pure pan -> still a no-op
+                # cursor-wise. Move back to the child + press ``h``.
+                tree.move_cursor(child_tree_node, animate=False)
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
+                await pilot.press("h")
+                await pilot.pause()
+                assert tree.cursor_node is child_tree_node
 
     asyncio.run(runner())
 

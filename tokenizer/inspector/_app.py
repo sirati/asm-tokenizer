@@ -215,7 +215,12 @@ class InspectorApp(App[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("q", "quit", "Quit"),
-        Binding("h,left", "tree_scroll_left", "Pan left"),
+        # ``h`` stays a pure pan-left so vim users keep an unconditional
+        # horizontal-pan key; ``left`` adopts the standard file-tree TUI
+        # behaviour of climbing to the parent once the row is fully
+        # left-aligned (scroll_offset.x == 0).
+        Binding("h", "tree_scroll_left", "Pan left"),
+        Binding("left", "tree_scroll_left_or_parent", "Pan left / parent"),
         Binding("l,right", "tree_scroll_right", "Pan right"),
         Binding("0", "tree_scroll_x_home", "Line start"),
         Binding("dollar_sign", "tree_scroll_x_end", "Line end"),
@@ -316,6 +321,20 @@ class InspectorApp(App[None]):
 
     def action_tree_scroll_left(self) -> None:
         self.query_one("#tree", _InspectorTree).scroll_left(animate=False)
+
+    def action_tree_scroll_left_or_parent(self) -> None:
+        """Pan left while ``scroll_x > 0``, else climb to the parent row.
+
+        Standard file-tree TUI affordance: once the row is already
+        flush-left there is nothing more to pan, so the arrow becomes a
+        cursor-to-parent step. The unconditional pan binding survives
+        on ``h`` for vim users who want pure horizontal scroll.
+        """
+        tree = self.query_one("#tree", _InspectorTree)
+        if tree.scroll_offset.x > 0:
+            tree.scroll_left(animate=False)
+        else:
+            tree.action_cursor_parent()
 
     def action_tree_scroll_right(self) -> None:
         self.query_one("#tree", _InspectorTree).scroll_right(animate=False)
