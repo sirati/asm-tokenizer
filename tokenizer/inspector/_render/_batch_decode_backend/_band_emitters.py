@@ -21,8 +21,11 @@ from tokenizer.aligned_data.loader.decoded.number_hex_format import (
     chunks_to_hex_bits,
 )
 from tokenizer.inspector._render._protocol import AsmLine, LineItem
+from tokenizer.inspector._render._token_text import substitute_mem_chars
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
+
+from ._arch_prefix import strip_arch_prefix
 
 
 __all__ = [
@@ -59,10 +62,29 @@ def emit_instr_rep(
     *,
     shifted_id: int,
     vocab_manager: VocabularyManager,
+    arch_prefixes: tuple[str, ...] = (),
 ) -> None:
-    """INSTR_REP band: vocab lookup -> :class:`AsmLine`."""
+    """INSTR_REP band: vocab lookup -> polished display -> :class:`AsmLine`.
+
+    Two display transforms after the raw vocab-string lookup:
+
+    1. ``substitute_mem_chars`` collapses the six
+       :class:`MemoryOperandSymbol` vocab strings (``MEM_OPEN_BRACKET``
+       etc.) to their display chars (``[`` etc.) -- matches the FTL
+       backend's display per cluster #3 of the W3-3 W4-amended plan.
+    2. ``strip_arch_prefix`` removes the most-specific matching arch
+       prefix (per-ISA, family, then unified) so BatchDecode display
+       mirrors :meth:`PlatformTokenInner.to_asm_like`'s prefix-stripped
+       form.
+
+    ``arch_prefixes`` defaults to ``()``: callers that haven't plumbed
+    the arch through (test fixtures, legacy paths) get the substitution
+    transform without arch elision.
+    """
     original_id = int(shifted_id) + _V2_RESERVED_DIGIT_COUNT
-    items.append(AsmLine(text=vocab_manager.get_token_str(original_id)))
+    raw = vocab_manager.get_token_str(original_id)
+    display = strip_arch_prefix(substitute_mem_chars(raw), arch_prefixes)
+    items.append(AsmLine(text=display))
 
 
 def emit_number(
