@@ -35,7 +35,7 @@ the assert below — same tripwire discipline as the prefixes module.
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.variant_tokens.prefixes import (
@@ -48,6 +48,7 @@ from tokenizer.variant_tokens.prefixes import (
 
 
 __all__ = [
+    "aligned_variant_labels",
     "variant_label",
     "variant_label_from_axes",
     "function_label",
@@ -110,6 +111,26 @@ _CALL_TARGET_TYPE_TO_LABEL: dict[CallTargetType, str] = {
 assert set(_CALL_TARGET_TYPE_TO_LABEL) == set(CallTargetType)
 
 
+def _axis_value_strings(
+    label_axes: Mapping[str, Optional[str]],
+) -> list[str]:
+    """Per-axis rendered fragment list in :data:`POSITIONAL_PREFIXES` order.
+
+    Each entry is ``f"{label_prefix}{value_or_missing}"`` (e.g. ``"x86"``,
+    ``"clang"``, ``"v8.0"``, ``"-O3"``). Sole producer of the per-axis
+    string shape — shared by :func:`variant_label_from_axes` (joins with
+    a single space) and :func:`aligned_variant_labels` (column-pads
+    before joining). Missing axes render as :data:`_MISSING_NAME`
+    (``"?"``) with their per-axis prefix preserved (``"v?"`` / ``"-?"``).
+    """
+    parts: list[str] = []
+    for prefix in POSITIONAL_PREFIXES:
+        value = label_axes.get(prefix)
+        value_str = _MISSING_NAME if value is None else str(value)
+        parts.append(f"{_AXIS_PREFIX_TO_LABEL_PREFIX[prefix]}{value_str}")
+    return parts
+
+
 def variant_label_from_axes(
     label_axes: Mapping[str, Optional[str]],
 ) -> str:
@@ -122,12 +143,52 @@ def variant_label_from_axes(
     ``<arch> <comp> v<cver> -<opt>``. Missing axes render as
     :data:`_MISSING_NAME` (``"?"``).
     """
-    parts: list[str] = []
-    for prefix in POSITIONAL_PREFIXES:
-        value = label_axes.get(prefix)
-        value_str = _MISSING_NAME if value is None else str(value)
-        parts.append(f"{_AXIS_PREFIX_TO_LABEL_PREFIX[prefix]}{value_str}")
-    return " ".join(parts)
+    return " ".join(_axis_value_strings(label_axes))
+
+
+def aligned_variant_labels(
+    label_axes_list: Sequence[Mapping[str, Optional[str]]],
+) -> tuple[str, ...]:
+    """Return aligned variant labels in lockstep order.
+
+    Single concern: column alignment given the FULL sibling set. Each
+    axis's column width is the maximum rendered-fragment width across
+    the sibling set; each row's per-axis fragment is left-aligned to
+    that width and joined with a single space (preserving the existing
+    convention from :func:`variant_label_from_axes`). The trailing
+    axis column (``-opt``) is NOT padded with trailing spaces — pad
+    only fills the gap before the next column.
+
+    The per-axis label-prefix mapping + missing-axis rendering stay
+    owned by :func:`variant_label_from_axes` via the shared
+    :func:`_axis_value_strings` helper; this function adds the
+    sibling-set-aware column policy on top.
+
+    Empty input returns an empty tuple. Single-element input still
+    returns aligned strings (trivially: the row IS its own max).
+    """
+    rows: list[list[str]] = [
+        _axis_value_strings(axes) for axes in label_axes_list
+    ]
+    if not rows:
+        return ()
+    n_axes = len(POSITIONAL_PREFIXES)
+    # Per-axis max width across the sibling set; each row is guaranteed
+    # to have ``n_axes`` fragments by :func:`_axis_value_strings`. The
+    # trailing axis (``-opt``) intentionally uses its own per-row length
+    # as the "max" — :py:meth:`str.ljust` becomes a no-op there, so the
+    # last column has no trailing whitespace without a special-case
+    # branch inside the per-row loop.
+    column_widths: list[int] = [
+        max(len(row[axis_idx]) for row in rows) for axis_idx in range(n_axes - 1)
+    ]
+    return tuple(
+        " ".join(
+            [row[i].ljust(column_widths[i]) for i in range(n_axes - 1)]
+            + [row[n_axes - 1]]
+        )
+        for row in rows
+    )
 
 
 def variant_label(function_data) -> str:

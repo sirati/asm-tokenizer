@@ -75,6 +75,13 @@ def _compose_label(node: Node) -> Text:
     if isinstance(node, FunctionNode):
         return Text(function_label(node.name))
     if isinstance(node, VariantNode):
+        # ``aligned_label`` is pre-computed by the sibling-set-aware
+        # stamp in :mod:`tokenizer.inspector._app._application` when
+        # variants flow through the expand dispatcher; falls back to
+        # the unaligned form for nodes built outside that context
+        # (e.g. single-variant unit tests).
+        if node.aligned_label is not None:
+            return Text(node.aligned_label)
         return Text(variant_label_from_axes(node.label_axes))
     if isinstance(node, BlockNode):
         return Text(_block_node_label(node))
