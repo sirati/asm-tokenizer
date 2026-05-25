@@ -35,6 +35,7 @@ from tokenizer.aligned_data.matched_sections_bin import (
     MISSING_VARIANT_INDEX,
     CallTarget,
 )
+from tokenizer.inspector._label import inline_call_label, inline_jump_label
 from tokenizer.inspector._render._protocol import (
     BlockKind,
     InlineCallEntry,
@@ -96,7 +97,9 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
     if state.inside_jump_table_footer_block:
         # Footer target: buffer InlineJumpEntry; clear latch once.
         _consume_openable_slot(
-            state, openable=InlineJumpEntry(target_block_idx=counter),
+            state,
+            openable=InlineJumpEntry(target_block_idx=counter),
+            placeholder_text=inline_jump_label(counter),
         )
         state.pending_header = False
         return
@@ -113,7 +116,9 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
         state.current_insn_in_silent_header = True
         return
     _consume_openable_slot(
-        state, openable=InlineJumpEntry(target_block_idx=counter),
+        state,
+        openable=InlineJumpEntry(target_block_idx=counter),
+        placeholder_text=inline_jump_label(counter),
     )
 
 
@@ -166,6 +171,12 @@ def _handle_function_category(
             kind=call_kind, counter_id=counter, callee_name=callee_name,
             callee_section_pointer=callee_section_pointer,
             variant_idx=MISSING_VARIANT_INDEX,
+            provider=provider,
+        ),
+        placeholder_text=inline_call_label(
+            kind=call_kind,
+            counter_id=counter,
+            callee_name=callee_name,
             provider=provider,
         ),
     )

@@ -72,6 +72,7 @@ from tokenizer.aligned_data.matched_sections_bin import (
     MISSING_VARIANT_INDEX,
     VariantBlock,
 )
+from tokenizer.inspector._label import inline_call_label, inline_jump_label
 from tokenizer.inspector._render._protocol import (
     AsmLine,
     InlineCallEntry,
@@ -100,20 +101,6 @@ __all__ = [
     "partition_call_target_kinds",
     "render_block",
 ]
-
-
-def _render_insn_text(asm_like: str) -> str:
-    """Apply the shared MEM substitution to an FTL ``to_asm_like`` string.
-
-    :meth:`InsnTokenList.to_asm_like` joins each token's
-    ``to_asm_like()`` output with single spaces; every token returns a
-    single space-free atom, so splitting on ``" "`` recovers the atom
-    stream and :func:`substitute_display_chars` swaps any MEM-operand
-    vocab-string/asm-value form for its polished display char (``[``,
-    ``]``, ``+``, ``-``, ``*``, ``,``). FTL does NOT apply arch-prefix
-    elision -- :meth:`PlatformTokenInner.to_asm_like` already strips it.
-    """
-    return " ".join(substitute_display_chars(atom) for atom in asm_like.split(" "))
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +343,7 @@ def _walk_block_instructions(
     """Per-instruction generator: one :class:`AsmLine` per instruction
     with its inline-call/jump entries attached as ``openables``."""
     for insn in block.iter_insn(transient=True):
-        openables = _collect_inline_openables(
+        text, openables = _render_insn(
             insn,
             section=section,
             kind_to_called_idx=kind_to_called_idx,
@@ -365,13 +352,10 @@ def _walk_block_instructions(
             kind_to_provider_source=kind_to_provider_source,
             callee_arm_resolver=callee_arm_resolver,
         )
-        yield AsmLine(
-            text=_render_insn_text(insn.to_asm_like()),
-            openables=openables,
-        )
+        yield AsmLine(text=text, openables=openables)
 
 
-def _collect_inline_openables(
+def _render_insn(
     insn,
     *,
     section: RenderableSection,
@@ -380,36 +364,57 @@ def _collect_inline_openables(
     line_to_name: Mapping[int, str],
     kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
-) -> tuple[Openable, ...]:
-    """Inline call/jump openables for ONE instruction.
+) -> tuple[str, tuple[Openable, ...]]:
+    """Render ONE instruction's text + openables in lockstep.
 
-    Dispatch is one dict lookup (call kind) + one set membership
-    (jump); identity payload reads via :meth:`InsnTokenList.iter_tokens`
-    -- the same path :meth:`InsnTokenList.to_asm_like` walks, so the
-    AsmLine text and the openables tuple see a consistent token view.
+    Single per-token walk produces both halves: the AsmLine text and
+    the openables tuple. For LOCAL_FUNC / PLT_FUNC / EXT_FUNC tokens the
+    text atom is the resolved call label (:func:`._label.inline_call_label`)
+    and an :class:`InlineCallEntry` openable is attached. For BLOCK_V2
+    tokens the text atom is the resolved jump label
+    (:func:`._label.inline_jump_label`) and an :class:`InlineJumpEntry`
+    openable is attached. For all other tokens the atom is the token's
+    :meth:`Tokens.to_asm_like` output passed through
+    :func:`substitute_display_chars` (the existing MEM-operand display
+    substitution); no openable is attached.
 
-    Returns the ordered tuple of openables; the caller attaches it
-    onto the owning :class:`AsmLine` so the tree-model never sees
-    sibling Inline*Entry items at the block level.
+    Atoms are space-joined to match the legacy
+    :meth:`InsnTokenList.to_asm_like` shape; call/jump label fragments
+    themselves contain spaces (``"local function 0: foo"``) but the
+    outer join treats each token as one atom regardless of internal
+    spacing — the consumer (tree-row text widget) renders the full
+    string verbatim.
     """
+    atoms: list[str] = []
     openables: list[Openable] = []
     for token in insn.iter_tokens():
         token_type = token.token_type
         kind = _CALL_TOKEN_TYPES.get(token_type)
         if kind is not None:
-            openables.append(
-                _emit_call_entry(
-                    kind=kind,
-                    counter_id=int(token.id),
-                    section=section,
-                    kind_to_called_idx=kind_to_called_idx,
-                    variant_pins=variant_pins,
-                    callee_arm_resolver=callee_arm_resolver,
-                    line_to_name=line_to_name,
-                    kind_to_provider_source=kind_to_provider_source,
+            entry = _emit_call_entry(
+                kind=kind,
+                counter_id=int(token.id),
+                section=section,
+                kind_to_called_idx=kind_to_called_idx,
+                variant_pins=variant_pins,
+                callee_arm_resolver=callee_arm_resolver,
+                line_to_name=line_to_name,
+                kind_to_provider_source=kind_to_provider_source,
+            )
+            openables.append(entry)
+            atoms.append(
+                inline_call_label(
+                    kind=entry.kind,
+                    counter_id=entry.counter_id,
+                    callee_name=entry.callee_name,
+                    provider=entry.provider,
                 )
             )
             continue
         if token_type in _JUMP_TOKEN_TYPES:
-            openables.append(InlineJumpEntry(target_block_idx=int(token.id)))
-    return tuple(openables)
+            target_block_idx = int(token.id)
+            openables.append(InlineJumpEntry(target_block_idx=target_block_idx))
+            atoms.append(inline_jump_label(target_block_idx))
+            continue
+        atoms.append(substitute_display_chars(token.to_asm_like()))
+    return " ".join(atoms), tuple(openables)

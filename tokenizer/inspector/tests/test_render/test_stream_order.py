@@ -20,7 +20,9 @@ from .conftest import (
     _kind_to_idx,
     _make_call_target,
     _make_section,
+    _plain_insn,
     _resolver_never_called,
+    _text_token,
 )
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
@@ -44,7 +46,7 @@ def test_render_block_returns_list_of_asm_lines():
     call/jump entries hang off :attr:`AsmLine.openables` instead of
     siblings.
     """
-    block = _StubBlock(insns=[_StubInsn(asm="nop", tokens=[])])
+    block = _StubBlock(insns=[_plain_insn("nop")])
 
     items = render_block(
         block=block,
@@ -66,9 +68,9 @@ def test_render_block_emits_asm_lines_for_plain_instructions():
     """No call/jump tokens -> exactly one AsmLine per instruction, in order."""
     block = _StubBlock(
         insns=[
-            _StubInsn(asm="mov rax, rbx", tokens=[]),
-            _StubInsn(asm="add rax, 1", tokens=[]),
-            _StubInsn(asm="ret", tokens=[]),
+            _plain_insn("mov rax, rbx"),
+            _plain_insn("add rax, 1"),
+            _plain_insn("ret"),
         ]
     )
 
@@ -115,7 +117,6 @@ def test_inline_jump_entry_target_block_idx():
     block = _StubBlock(
         insns=[
             _StubInsn(
-                asm="jmp .L3",
                 tokens=[_StubToken(TokenType.BLOCK_V2, id=3)],
             ),
         ]
@@ -153,8 +154,8 @@ def test_inline_entries_attached_to_asm_line_in_stream_order():
     block = _StubBlock(
         insns=[
             _StubInsn(
-                asm="call+jump",
                 tokens=[
+                    _text_token("bl"),
                     _StubToken(TokenType.LOCAL_FUNC, id=0),
                     _StubToken(TokenType.BLOCK_V2, id=7),
                 ],
@@ -177,7 +178,8 @@ def test_inline_entries_attached_to_asm_line_in_stream_order():
     # Block-level stream is AsmLine-ONLY post-R2g.
     assert len(items) == 1
     assert isinstance(items[0], AsmLine)
-    assert items[0].text == "call+jump"
+    # Inline call + jump labels render in the instruction text.
+    assert items[0].text == "bl local function 0: loc_fn jump block: 7"
     # Openables carry the inline entries in token-stream order.
     openables = items[0].openables
     assert len(openables) == 2
@@ -200,13 +202,11 @@ def test_block_lines_contain_only_asm_lines_post_r2g():
     ]
     block = _StubBlock(
         insns=[
-            _StubInsn(asm="nop", tokens=[]),
+            _plain_insn("nop"),
             _StubInsn(
-                asm="call loc_fn",
                 tokens=[_StubToken(TokenType.LOCAL_FUNC, id=0)],
             ),
             _StubInsn(
-                asm="jmp .L7",
                 tokens=[_StubToken(TokenType.BLOCK_V2, id=7)],
             ),
         ]
@@ -243,7 +243,7 @@ def test_mem_substitution_applied_on_ftl_path():
     openables migration touches the line; pinning here ensures the
     R2g rewrite did not regress the W3-3 integration.
     """
-    block = _StubBlock(insns=[_StubInsn(asm="mov rax , mem[ rbp ]mem", tokens=[])])
+    block = _StubBlock(insns=[_plain_insn("mov rax , mem[ rbp ]mem")])
 
     items = render_block(
         block=block,
