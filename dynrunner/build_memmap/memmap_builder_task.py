@@ -428,6 +428,13 @@ class MemmapBuilderTask:
                     phase_id=_PHASE_ID,
                     type_id=_TYPE_ID,
                     affinity_id=None,
+                    # `task_id` is the per-task identity the framework's
+                    # memprofile sampler keys output filenames on. One
+                    # task per binary_name group, so the group's name is
+                    # the natural canonical identifier; matches the
+                    # `_index.bin` filename slot already produced by
+                    # `get_output_filename_pattern`.
+                    task_id=binary_name,
                     payload={
                         "binary_name": binary_name,
                         "versions": entries,

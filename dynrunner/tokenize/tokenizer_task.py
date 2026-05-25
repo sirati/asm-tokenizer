@@ -30,6 +30,7 @@ from dynrunner.binary_selection import (
     is_excluded_subfolder,
     process_selection_arguments,
 )
+from dynrunner.tokenize.identifier import TokenizerIdentifier
 from tokenizer.arch_translation import arch_to_platform
 from tokenizer.binary_discovery import BinaryHandle, walk_dataset
 from tokenizer.output_filename import format_output_csv_filename
@@ -245,18 +246,34 @@ class TokenizerTask:
                     wire_path = handle.path.relative_to(source_root)
                 except ValueError:
                     wire_path = handle.path
+                # `TokenizerIdentifier.identifier_key()` is the canonical
+                # per-task identity string the framework consumes via
+                # `TaskInfo.task_id`. The framework's memprofile sampler
+                # gates on a non-None `task_id` (output filenames key on
+                # it); without it the sampler short-circuits with a
+                # debug log. Keep the dataclass as the single owner of
+                # the canonical string format so we don't duplicate it
+                # at the construction site.
+                identifier = TokenizerIdentifier(
+                    binary_name=variant.pkg,
+                    platform=variant.arch,
+                    compiler=variant.compiler,
+                    version=variant.compiler_version,
+                    opt_level=variant.opt,
+                )
                 yield TaskInfo(
                     path=wire_path,
                     size=size,
                     identifier=BinaryIdentifier(
-                        binary_name=variant.pkg,
-                        platform=variant.arch,
-                        compiler=variant.compiler,
-                        version=variant.compiler_version,
-                        opt_level=variant.opt,
+                        binary_name=identifier.binary_name,
+                        platform=identifier.platform,
+                        compiler=identifier.compiler,
+                        version=identifier.version,
+                        opt_level=identifier.opt_level,
                     ),
                     phase_id=_PHASE_ID,
                     type_id=_TYPE_ID,
+                    task_id=identifier.identifier_key(),
                     payload=_build_payload(variant),
                 )
 
