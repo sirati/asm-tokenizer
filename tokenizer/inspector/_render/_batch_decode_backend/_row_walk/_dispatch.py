@@ -1,25 +1,13 @@
 """IDENTITY-band per-Category dispatch for the row walker.
 
-Single concern: given the IDENTITY band's resolved
-:class:`Category` + ``counter``, route the token to the right emit
-path. The three branches are:
-
-* :class:`Category.BLOCK` -> :func:`_handle_block` (header vs inline
-  jump driven by the section-transition latch + the per-block
-  jump-table-footer flag).
-* FUNCTION categories (LOCAL_FUNC / PLT_FUNC / EXT_FUNC) ->
-  :func:`_handle_function_category` (FID lookup + InlineCallEntry +
-  optional FUNCTION_ID -> BODY transition).
-* :class:`Category.JUMP_TABLE` -> arms the per-block jump-table-footer
-  flag (every subsequent ``Block_V2`` in the same block emits an
-  :class:`InlineJumpEntry` target, not a header consume) + emits the
-  ``<jump_table N>`` placeholder line.
-* Other counter-bearing categories -> ``AsmLine("<category counter>")``
-  placeholder (Phase-1 §11 follow-up).
+Single concern: route an IDENTITY token to the right emit path
+based on its resolved :class:`Category`. BLOCK -> header consume vs
+inline jump vs jump-table target. FUNCTION categories -> InlineCallEntry.
+JUMP_TABLE -> arms the per-block jump-table-footer flag (W3-16).
+Other counter-bearing categories -> ``<category counter>`` placeholder.
 
 The per-col loop driver (:mod:`._driver`) is the only caller; this
-module knows nothing about runlength sidecars, section transitions,
-or wire-level cursor advancement.
+module knows nothing about runlength sidecars or wire-level cursors.
 """
 
 from __future__ import annotations
@@ -67,23 +55,19 @@ __all__ = [
 def _handle_block(state: _WalkState, *, counter: int) -> None:
     """BLOCK_V2 IDENTITY dispatch: header vs inline jump vs jump-table target.
 
-    With ``pending_header=True`` (latched at runlength-derived
-    trigger cols) the BLOCK_V2 is a body-block header: it flushes
-    any prior BODY content and opens a fresh BODY block whose
-    ``block_idx`` is the encoded ``counter`` (the BLOCK identity
-    index, matching the InlineJumpEntry target scheme). BLOCK_V2
-    tokens with ``pending_header=False`` are in-function jumps. If
-    the latch fires while still in FUNCTION_ID (bare-BLOCK_V2 test
-    layouts), the FUNCTION_ID -> BODY transition runs first. A
-    BLOCK_V2 inside ``[0, n_axis)`` is raised loud (the
-    variant_tokens prefix is pure INSTR_REP by row-writer contract).
+    ``pending_header=True`` (latched at runlength-derived trigger cols)
+    consumes BLOCK_V2 as a body-block header: flushes any prior BODY
+    content and opens a fresh BODY block with ``block_idx = counter``
+    (matching the InlineJumpEntry target scheme). Otherwise BLOCK_V2 is
+    an in-function jump. A BLOCK_V2 inside ``[0, n_axis)`` is raised
+    loud -- the variant_tokens prefix is pure INSTR_REP by contract.
 
     W3-16 W4-AMENDED: once
-    :attr:`_WalkState.inside_jump_table_footer_block` is set (a prior
-    :attr:`Category.JUMP_TABLE` IDENTITY fired inside this block), the
+    :attr:`WalkSectionState.inside_jump_table_footer_block` is set,
     BLOCK_V2 is a jump-table target -- emit :class:`InlineJumpEntry`
-    and leave :attr:`pending_header` untouched so any latched header
-    still to come is consumed by the next actual header pair.
+    and clear ``pending_header`` once so subsequent INSTR_REPs are not
+    absorbed silently. Footer stays folded into the prior BODY section
+    per W3-16's "no Block_V2 = no new block" rule.
     """
     if state.current_col < state.n_axis:
         raise AssertionError(
@@ -92,25 +76,15 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
             f"the prefix is pure instruction-rep by row-writer contract."
         )
     if state.current_kind is BlockKind.FUNCTION_ID:
-        # Bare-BLOCK_V2 test layout: no self-prepend slot exists. The
-        # FUNCTION_ID section stays empty; transition to BODY block
-        # before consuming the header.
+        # Bare-BLOCK_V2 test layout: no self-prepend; transition first.
         enter_body_after_function_id(state)
     if state.inside_jump_table_footer_block:
-        # Jump-table target: emit InlineJumpEntry without consuming
-        # the header latch as a header (the footer stays folded into
-        # the prior BODY section per W3-16's "no Block_V2 = no new
-        # block" rule). Clear ``pending_header`` once so subsequent
-        # INSTR_REPs in the same row are not absorbed silently.
+        # Footer target: emit InlineJumpEntry; clear latch once.
         state.current_items.append(InlineJumpEntry(target_block_idx=counter))
         state.pending_header = False
         return
     if state.pending_header:
         if state.current_items:
-            # Flush prior BODY block (e.g., the previous basic block
-            # before this header) and open a fresh one. The first
-            # BLOCK_V2 after FUNCTION_ID -> BODY transition has an
-            # empty section so this branch is skipped.
             enter_new_body_block(state)
         set_current_body_block_idx(state, block_idx=counter)
         state.pending_header = False
@@ -132,15 +106,13 @@ def _handle_function_category(
 ) -> None:
     """FUNCTION-Category dispatch: FID lookup + InlineCallEntry.
 
-    LOCAL / PLT call_targets resolve their ``function_section_ptr``
-    via the caller-supplied ``callee_arm_resolver`` closure; EXT
-    call_targets keep ``callee_section_pointer=None``. The LOCAL/PLT
-    path consumes the CURRENT call-target's ``call_targets_section``
-    so inlined-callee call sites resolve against THEIR table. The
-    root CT's LOCAL_FUNC self-prepend (counter 0) emits into the
-    FUNCTION_ID section; its callee pointer cycles back to the same
-    function so the row is expandable into the function's own
-    variants (a useful self-reference for the inspector).
+    LOCAL/PLT resolve ``function_section_ptr`` via
+    ``callee_arm_resolver`` indexed into the CURRENT call-target's
+    ``call_targets_section`` (so inlined-callee call sites resolve
+    against THEIR table). EXT keeps ``callee_section_pointer=None``
+    and carries the provider name (decision #28). The root CT's
+    LOCAL_FUNC self-prepend (counter 0) emits into FUNCTION_ID and
+    then transitions to BODY block 0.
     """
     call_kind = _CATEGORY_TO_CALL_TARGET_TYPE[cat]
     fid = fid_table.lookup(row=state.row, cat=cat, counter=counter)
@@ -184,15 +156,11 @@ def _emit_identity(
 ) -> None:
     """IDENTITY band: resolve Category + dispatch per-Category.
 
-    BLOCK -> :func:`_handle_block` (header vs jump driven by the
-    section-transition latch + jump-table-footer flag). FUNCTION
-    categories -> :func:`_handle_function_category` (one
-    InlineCallEntry per token; EXT_FUNC provider keyed by FID per
-    decision #28; LOCAL/PLT callee_section_pointer resolved via the
-    session-backed callee_arm_resolver). JUMP_TABLE -> arms the
+    BLOCK -> :func:`_handle_block`. FUNCTION categories ->
+    :func:`_handle_function_category`. JUMP_TABLE -> arms the
     per-block jump-table-footer flag (W3-16) + emits the placeholder
-    line. COUNTER-but-not-BLOCK -> placeholder AsmLine (plan §11
-    follow-up).
+    line. Other counter-bearing categories -> ``<category counter>``
+    AsmLine placeholder (plan §11 follow-up).
     """
     counter = int(identities_row[state.id_cursor])
     state.id_cursor += 1
@@ -214,12 +182,10 @@ def _emit_identity(
         )
         return
     if cat is Category.JUMP_TABLE:
-        # The jump-table footer instruction begins here. Arm the
-        # block-level flag so the trailing ``Block_V2(t0..tK-1)``
-        # tokens emit as InlineJumpEntry targets, NOT as block
-        # headers. The per-instruction sibling
-        # :attr:`_WalkState.saw_jump_table_this_insn` is reset by the
-        # R2c per-instruction finalizer.
+        # Footer begins: arm block-level flag so trailing Block_V2
+        # tokens route as InlineJumpEntry. The per-instruction
+        # sibling ``saw_jump_table_this_insn`` is reset by R2c's
+        # per-instruction finalizer.
         state.inside_jump_table_footer_block = True
         state.saw_jump_table_this_insn = True
     state.current_items.append(AsmLine(text=f"<{cat.name.lower()} {counter}>"))

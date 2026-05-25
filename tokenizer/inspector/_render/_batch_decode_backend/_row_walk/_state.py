@@ -1,15 +1,10 @@
 """Per-row walk state for the BatchDecodeBackend row walker.
 
-Single concern: the mutable state the per-col loop reads / mutates,
-plus the typed enums that drive instruction-grouping policy decisions.
-
-:class:`_WalkState` composes :class:`WalkSectionState` (the section-
-state-machine concern owned by :mod:`.._sections`) with the band-
-emitter cursors. The :class:`_InsnEmitPolicy` enum encodes the
-per-instruction emit-decision policy (silent-header pair / jump-table
-footer / real instruction); :data:`saw_jump_table_this_insn` +
-:data:`inside_jump_table_footer_block` are the typed flags W3-16
-threads through the dispatch + finalizer surfaces. Plan reference:
+Single concern: the state the per-col loop reads/mutates plus the
+typed enums that drive instruction-grouping policy decisions, plus
+the construction-time slicing that derives the initial
+:class:`_WalkState` + :class:`_RowSidecars` from one
+:class:`BatchDecodeResult` row. Plan reference:
 ``inspector-followup.md`` W3-16 W4-AMENDED + A-L2 H2 (the enum
 replaces the implicit cross-product of legacy boolean flags) +
 A-L3 H-3 (jump-table footer detection).
@@ -19,20 +14,34 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Mapping, Sequence
+
+import numpy as np
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
     FUNCTION_CATEGORIES,
 )
+from tokenizer.aligned_data.loader.batch_decode._types import (
+    BatchDecodeResult,
+)
+from tokenizer.aligned_data.matched_sections_bin import CallTarget
+from tokenizer.inspector._render._protocol import BlockKind
+from tokenizer.inspector._render._render_block import (
+    partition_call_target_kinds,
+)
 from tokenizer.tokens import Category
 
+from .._boundaries import call_target_starts, header_trigger_cols
 from .._sections import WalkSectionState
 
 
 __all__ = [
     "_CATEGORY_TO_CALL_TARGET_TYPE",
     "_InsnEmitPolicy",
+    "_RowSidecars",
     "_WalkState",
+    "_init_walk_state",
 ]
 
 
@@ -54,33 +63,19 @@ class _InsnEmitPolicy(Enum):
 
     Replaces the implicit cross-product of legacy boolean flags
     (``current_insn_in_silent_header`` x ``pending_header`` x
-    ``saw_jump_table``) with a single typed discriminator per
-    audit A-L2 H2 + W3-16 W4-AMENDED.
+    ``saw_jump_table``) per audit A-L2 H2 + W3-16 W4-AMENDED.
 
-    State transitions live on :class:`_WalkState`:
+    * :attr:`SILENT_HEADER` -- ``Block_Def`` + ``block_v2:N`` header
+      pair being consumed; finalize asserts empty text/openables.
+    * :attr:`JUMP_TABLE_FOOTER` -- instruction has seen a
+      :attr:`Category.JUMP_TABLE` IDENTITY; subsequent ``Block_V2``
+      targets emit :class:`InlineJumpEntry`, NOT block headers.
+    * :attr:`REAL` -- ordinary instruction; emits one
+      :class:`AsmLine` per :func:`_finalize_instruction` (R2c).
 
-    * :attr:`SILENT_HEADER` -- the ``Block_Def`` + ``block_v2:N``
-      header pair currently being consumed. :func:`_finalize_instruction`
-      asserts empty text/openables, emits no :class:`AsmLine`. Set on
-      :func:`_start_new_instruction` when :attr:`WalkSectionState.pending_header`
-      is True at the instruction's first slot.
-    * :attr:`JUMP_TABLE_FOOTER` -- the instruction has seen a
-      :attr:`Category.JUMP_TABLE` IDENTITY token, so it is the
-      jump-table footer instruction, NOT a silent header. Each
-      subsequent ``Block_V2`` target IDENTITY emits an
-      :class:`InlineJumpEntry` rather than consuming the latch as a
-      block header. Transition: SILENT_HEADER -> JUMP_TABLE_FOOTER on
-      :attr:`Category.JUMP_TABLE` IDENTITY emission (see :mod:`._dispatch`).
-    * :attr:`REAL` -- ordinary instruction; emits one :class:`AsmLine`
-      per :func:`_finalize_instruction` call. Default state at the
-      start of every non-silent-header instruction.
-
-    The enum is consumed by :mod:`._instruction`'s
-    :func:`_finalize_instruction` (R2c) and by :mod:`._dispatch`'s
-    :func:`_handle_block` (R2a: routes :class:`Block_V2` to
-    :class:`InlineJumpEntry` when the block-level
-    :attr:`_WalkState.inside_jump_table_footer_block` flag is set,
-    preserving the latch for any pending header still to come).
+    Consumed by :mod:`._instruction`'s finalize (R2c) and by
+    :mod:`._dispatch._handle_block` (R2a: routes ``Block_V2`` via
+    :attr:`WalkSectionState.inside_jump_table_footer_block`).
     """
 
     SILENT_HEADER = "silent_header"
@@ -90,28 +85,19 @@ class _InsnEmitPolicy(Enum):
 
 @dataclass
 class _WalkState(WalkSectionState):
-    """Per-row walk state: composes :class:`WalkSectionState` (the
-    section concern; see :mod:`.._sections`) with the band-emitter
-    cursors that the per-col loop reads + updates.
+    """Per-row walk state: composes :class:`WalkSectionState` with
+    band-emitter cursors + per-instruction grouping fields.
 
     ``id_cursor`` / ``num_cursor`` track per-row sidecar positions.
-    ``current_col`` is the column index the loop is processing;
-    crosses :func:`._dispatch._handle_block`'s ``n_axis`` invariant
-    check. ``last_number_shifted_id`` carries the prior NUMBER-band
-    token's shifted id (``-1`` = none); drives multi-chunk trailing-
-    slot detection inside :func:`emit_number` and resets on every
-    non-NUMBER emit.
+    ``current_col`` is the column index the loop is processing.
+    ``last_number_shifted_id`` carries the prior NUMBER-band token's
+    shifted id (``-1`` = none); drives multi-chunk trailing-slot
+    detection inside :func:`emit_number`.
 
-    ``insn_emit_policy`` carries the per-instruction emit-decision
-    policy described on :class:`_InsnEmitPolicy`. Pre-paved on
-    :class:`_WalkState` so the R2c per-instruction collector
-    (:mod:`._instruction`) reads + writes it through a single typed
-    surface; the R2a structural split lands the type so the R2c
-    diff is a code-add only. ``saw_jump_table_this_insn`` is the
-    per-instruction sibling of
-    :attr:`WalkSectionState.inside_jump_table_footer_block`: set on
-    :class:`Category.JUMP_TABLE` IDENTITY emission, reset on
-    instruction-boundary finalize (W3-16 W4-AMENDED).
+    ``insn_emit_policy`` + ``saw_jump_table_this_insn`` are
+    pre-paved per-instruction surfaces (R2c per-instruction
+    collector consumes them; R2a's :mod:`._dispatch` sets the
+    sibling block-level flag :attr:`WalkSectionState.inside_jump_table_footer_block`).
     """
 
     row: int = 0
@@ -122,3 +108,79 @@ class _WalkState(WalkSectionState):
     last_number_shifted_id: int = -1
     insn_emit_policy: _InsnEmitPolicy = _InsnEmitPolicy.REAL
     saw_jump_table_this_insn: bool = False
+
+
+@dataclass(frozen=True)
+class _RowSidecars:
+    """Per-row sidecar slices threaded from :func:`_init_walk_state`
+    to the per-col loop. Frozen so loop bodies never accidentally
+    mutate the slice views.
+    """
+
+    tokens_row: np.ndarray
+    identities_row: np.ndarray
+    numbers_sig: np.ndarray
+    numbers_se: np.ndarray
+    kind_to_called_idx_per_ct: list[Mapping[CallTargetType, list[int]]]
+
+
+def _init_walk_state(
+    *,
+    result: BatchDecodeResult,
+    row: int,
+    n_axis: int,
+    partial_cut_lengths: list[int],
+    call_targets_per_ct: Sequence[Sequence[CallTarget]],
+) -> tuple[_WalkState, _RowSidecars]:
+    """Slice per-row sidecar arrays + build the initial :class:`_WalkState`.
+
+    Raises :class:`ValueError` when the runlength sidecars are
+    missing (call :func:`batch_decode` with
+    ``emit_block_n_insns_runlength=True``).
+    """
+    if (
+        result.block_runlength is None
+        or result.block_runlength_row_offsets is None
+        or result.insn_runlength is None
+        or result.insn_runlength_row_offsets is None
+    ):
+        raise ValueError(
+            "render_row_blocks: BatchDecodeResult missing runlength "
+            "sidecars; call batch_decode with "
+            "emit_block_n_insns_runlength=True."
+        )
+    id_lo = int(result.identity_row_offsets[row])
+    id_hi = int(result.identity_row_offsets[row + 1])
+    num_lo = int(result.number_row_offsets[row])
+    num_hi = int(result.number_row_offsets[row + 1])
+    b_lo = int(result.block_runlength_row_offsets[row])
+    b_hi = int(result.block_runlength_row_offsets[row + 1])
+    i_lo = int(result.insn_runlength_row_offsets[row])
+    i_hi = int(result.insn_runlength_row_offsets[row + 1])
+    state = _WalkState(
+        current_kind=BlockKind.VARIANT_HEADER,
+        current_block_idx=-1,
+        current_items=[],
+        completed=[],
+        ct_start_cols=call_target_starts(
+            n_axis=n_axis, partial_cut_lengths=partial_cut_lengths,
+        ),
+        header_trigger_cols=header_trigger_cols(
+            n_axis=n_axis,
+            partial_cut_lengths=partial_cut_lengths,
+            block_runlength_row=result.block_runlength[b_lo:b_hi],
+            insn_runlength_row=result.insn_runlength[i_lo:i_hi],
+        ),
+        row=row, n_axis=n_axis,
+    )
+    sidecars = _RowSidecars(
+        tokens_row=result.tokens[row],
+        identities_row=result.identities[id_lo:id_hi],
+        numbers_sig=result.numbers_significant[num_lo:num_hi],
+        numbers_se=result.numbers_sign_exponent[num_lo:num_hi],
+        kind_to_called_idx_per_ct=[
+            partition_call_target_kinds(ct.type for ct in cts)
+            for cts in call_targets_per_ct
+        ],
+    )
+    return state, sidecars
