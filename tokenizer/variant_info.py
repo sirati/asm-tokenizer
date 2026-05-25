@@ -43,9 +43,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Tuple
 
 from shared.binary_info import (
     BinaryFilenameFormat,
@@ -92,6 +93,42 @@ _VARIANT_SUFFIX_RE: re.Pattern = re.compile(
 _SIDECAR_AXIS_KEYS: tuple[str, ...] = (
     "arch", "compiler", "compiler_version", "opt", "pkg", "variant_id",
 )
+
+
+# Runtime ``FunctionData.metadata`` axis keys (loader-side wire shape;
+# ``compilerversion`` has no underscore because that is the prefix
+# grammar :func:`tokenizer.variant_tokens.encoder.decode_record` emits).
+_FD_METADATA_AXIS_KEYS: frozenset[str] = frozenset(
+    {"arch", "compiler", "compilerversion", "opt"}
+)
+
+# Loader-managed structural keys that ride in ``FunctionData.metadata``
+# alongside the axes. Stripped by ``from_function_data_metadata`` so
+# they never leak into the inspector's EXTRA_META grouping surface.
+_FD_METADATA_STRUCTURAL_KEYS: frozenset[str] = frozenset({
+    "variant_ref", "variant_refs", "variants", "called", "call_targets",
+    "data_offset", "category_counts", "filename", "variant_tokens",
+    "pkg", "variant_id",
+})
+
+
+@dataclass(frozen=True)
+class VariantIdentity:
+    """Frozen canonical-identity tuple ``(arch, compiler,
+    compiler_version, opt, pkg, variant_id)`` — mirrors
+    :meth:`VariantInfo.__eq__`. ``variant_id`` disambiguates two
+    same-canonical-4 variants (see
+    ``tokenizer.aligned_data.io.write_matched_section_csv``); used as a
+    hashable key in the inspector's expand-state preservation and as
+    the typed identity threaded through
+    :class:`RenderedVariant.variant_identity`."""
+
+    arch: str
+    compiler: str
+    compiler_version: str
+    opt: str
+    pkg: str
+    variant_id: int
 
 
 @dataclass(frozen=True, eq=False)
@@ -142,6 +179,16 @@ class VariantInfo:
                 self.pkg,
                 self.variant_id,
             )
+        )
+
+    @property
+    def identity(self) -> VariantIdentity:
+        """Canonical-identity tuple — single value-typed definition of
+        "two variants are the same variant" across the codebase."""
+        return VariantIdentity(
+            arch=self.arch, compiler=self.compiler,
+            compiler_version=self.compiler_version, opt=self.opt,
+            pkg=self.pkg, variant_id=self.variant_id,
         )
 
     @classmethod
@@ -280,6 +327,62 @@ class VariantInfo:
             extra_metadata=extra_metadata,
             filename=base,
         )
+
+    @classmethod
+    def from_function_data_metadata(
+        cls,
+        metadata: Mapping[str, Any],
+        *,
+        pkg: str = "",
+        variant_id: int = 0,
+    ) -> Tuple[VariantIdentity, Mapping[str, str]]:
+        """Project ``FunctionData.metadata`` into typed identity + residue.
+
+        Single canonical extraction step shared by both inspector
+        backends (cluster #9 H3). Pulls out the canonical-4 axes,
+        strips loader-managed structural keys, and emits the remaining
+        keys (sorted alphabetically, list-values comma-joined) as a
+        frozen :class:`types.MappingProxyType` — direct input for the
+        inspector's EXTRA_META axis grouping (one bucket per unique
+        value-set). ``pkg`` + ``variant_id`` are NOT recoverable from
+        runtime metadata; callers thread them in if known.
+        """
+        identity = VariantIdentity(
+            arch=_coerce_axis_value(metadata.get("arch")),
+            compiler=_coerce_axis_value(metadata.get("compiler")),
+            compiler_version=_coerce_axis_value(metadata.get("compilerversion")),
+            opt=_coerce_axis_value(metadata.get("opt")),
+            pkg=pkg,
+            variant_id=variant_id,
+        )
+        residue: dict[str, str] = {}
+        for key in sorted(metadata.keys()):
+            if key in _FD_METADATA_AXIS_KEYS:
+                continue
+            if key in _FD_METADATA_STRUCTURAL_KEYS:
+                continue
+            residue[key] = _coerce_extra_value(metadata[key])
+        return identity, types.MappingProxyType(residue)
+
+
+def _coerce_axis_value(value: Any) -> str:
+    """``None`` (missing key) / unmatched-arm sentinel collapses to
+    ``"unknown"`` so :class:`VariantIdentity` is always string-typed."""
+    if value is None:
+        return "unknown"
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value)
+    return str(value)
+
+
+def _coerce_extra_value(value: Any) -> str:
+    """Project an opaque metadata value onto one string; list values
+    comma-join so one bucket maps to one unique value-set."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value)
+    return str(value)
 
 
 def split_variant_id_suffix(binary_name: str) -> tuple[str, int]:
