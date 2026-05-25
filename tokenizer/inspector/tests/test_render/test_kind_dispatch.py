@@ -11,6 +11,7 @@ from __future__ import annotations
 from .conftest import (
     _StubBlock,
     _ct,
+    _flatten_openables,
     _insn_with_call,
     _kind_to_idx,
     _make_resolver,
@@ -50,7 +51,7 @@ def test_inline_call_entry_kind_matches_call_target_type():
         callee_arm_resolver=lambda _offset: spec,
     )
 
-    calls = [it for it in items if isinstance(it, InlineCallEntry)]
+    calls = [it for it in _flatten_openables(items) if isinstance(it, InlineCallEntry)]
     assert [c.kind for c in calls] == [
         CallTargetType.LOCAL,
         CallTargetType.PLT,
@@ -94,7 +95,7 @@ def test_inline_call_entry_provider_set_for_extern_only():
         callee_arm_resolver=lambda _offset: None,
     )
 
-    calls = [it for it in items if isinstance(it, InlineCallEntry)]
+    calls = [it for it in _flatten_openables(items) if isinstance(it, InlineCallEntry)]
     # LOCAL + PLT -> None even though function_section_ptr=200 sits in
     # the same numeric range; the dispatch table never reads
     # line_to_provider for non-EXTERN kinds.
@@ -132,7 +133,7 @@ def test_inline_call_entry_callee_section_pointer_via_resolver():
         callee_arm_resolver=resolver,
     )
 
-    calls = [it for it in items if isinstance(it, InlineCallEntry)]
+    calls = [it for it in _flatten_openables(items) if isinstance(it, InlineCallEntry)]
     assert calls[0].callee_section_pointer == local_spec
     assert calls[1].callee_section_pointer == plt_spec
     # EXTERN: resolver returns None for offset=42 (not in the map).
@@ -168,7 +169,7 @@ def test_inline_call_entry_variant_idx_from_pins_or_sentinel():
         callee_arm_resolver=lambda _offset: None,
     )
 
-    calls = [it for it in items if isinstance(it, InlineCallEntry)]
+    calls = [it for it in _flatten_openables(items) if isinstance(it, InlineCallEntry)]
     assert calls[0].variant_idx == 5
     assert calls[1].variant_idx == MISSING_VARIANT_INDEX
 
@@ -190,5 +191,5 @@ def test_unknown_callee_name_falls_back_to_question_mark():
         callee_arm_resolver=lambda _o: None,
     )
 
-    calls = [it for it in items if isinstance(it, InlineCallEntry)]
+    calls = [it for it in _flatten_openables(items) if isinstance(it, InlineCallEntry)]
     assert calls[0].callee_name == "?"

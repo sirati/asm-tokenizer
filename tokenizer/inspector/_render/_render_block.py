@@ -2,24 +2,23 @@
 
 Single concern: translate ONE pre-parsed
 :class:`~tokenizer.token_lists.BlockTokenList` into an ordered list
-of typed :class:`LineItem` s (:class:`AsmLine` +
-:class:`InlineCallEntry` + :class:`InlineJumpEntry`).
+of :class:`AsmLine` items. Each :class:`AsmLine` carries its own
+per-instruction openables tuple (:class:`InlineCallEntry` /
+:class:`InlineJumpEntry`) on :attr:`AsmLine.openables` -- there is no
+longer a top-level sibling stream of inline entries. Mirrors the
+BatchDecode emit shape so the tree-model consumes ONE item kind
+across both backends.
 
-The typed line-item dataclasses + :data:`LineItem` union live in
-:mod:`tokenizer.inspector._render._protocol` (the Wave-5 shared boundary
-both rendering backends emit through); this module imports them so a
-single in-process object identity flows through both
-``render_block`` (the FTL path) and the future BatchDecodeBackend
-walker -- the tree model's ``isinstance(item, AsmLine)`` checks remain
-consistent across backends.
+The typed line-item dataclasses + :data:`LineItem` / :data:`Openable`
+union live in :mod:`tokenizer.inspector._render._protocol` (the Wave-5
+shared boundary both rendering backends emit through); this module
+re-exports them so a single in-process object identity flows through
+the FTL path and the tree-model's ``isinstance(item, AsmLine)`` checks.
 
-Parsing of the parent :class:`FunctionTokenList` + the per-section
-+ per-variant invariants (``kind_to_called_idx`` /
-``variant_pins``) is the tree-model layer's concern -- this renderer
-receives them already built and walks the block's instruction stream
-once. Decoupling parse-from-render keeps the renderer cheap to call
-per inline-jump expansion and obeys the CLAUDE.md "no re-parsing in
-call chains" rule.
+Parsing of the parent :class:`FunctionTokenList` + the per-section /
+per-variant invariants (``kind_to_called_idx`` / ``variant_pins``) is
+the tree-model layer's concern; this renderer receives them already
+built (CLAUDE.md "no re-parsing in call chains" rule).
 
 The caller threads in:
 
@@ -78,6 +77,7 @@ from tokenizer.inspector._render._protocol import (
     InlineCallEntry,
     InlineJumpEntry,
     LineItem,
+    Openable,
 )
 from tokenizer.inspector._render._token_text import substitute_mem_chars
 from tokenizer.token_lists import BlockTokenList
@@ -106,18 +106,12 @@ def _render_insn_text(asm_like: str) -> str:
     """Apply the shared MEM substitution to an FTL ``to_asm_like`` string.
 
     :meth:`InsnTokenList.to_asm_like` joins each token's
-    ``to_asm_like()`` with single spaces; every token's output is a
+    ``to_asm_like()`` output with single spaces; every token returns a
     single space-free atom, so splitting on ``" "`` recovers the atom
-    stream the substitution dict expects. Each atom is looked up via
-    :func:`substitute_mem_chars` (vocab-string OR asm-value form) and
-    the result rejoined.
-
-    FTL does NOT apply arch-prefix elision -- :meth:`PlatformTokenInner
-    .to_asm_like` already returns the bare ``self.token`` without the
-    platform prefix. The substitution applies only to the six MEM
-    symbols whose asm-value (``mem[`` / ``]mem`` for brackets, identity
-    for ``+`` / ``-`` / ``*`` / ``,``) doesn't already match the
-    polished display form.
+    stream and :func:`substitute_mem_chars` swaps any MEM-operand
+    vocab-string/asm-value form for its polished display char (``[``,
+    ``]``, ``+``, ``-``, ``*``, ``,``). FTL does NOT apply arch-prefix
+    elision -- :meth:`PlatformTokenInner.to_asm_like` already strips it.
     """
     return " ".join(substitute_mem_chars(atom) for atom in asm_like.split(" "))
 
@@ -276,10 +270,9 @@ def _emit_call_entry(
     EXTERN, empty dict for LOCAL/PLT).
 
     An out-of-range ``counter_id`` for the kind raises
-    :class:`IndexError` naturally from the list lookup -- the
-    inspector is a diagnostic tool, surfacing a corrupt counter as a
-    crash points at the encoder bug rather than papering over it with
-    a ``"?"`` placeholder.
+    :class:`IndexError` naturally; the inspector is a diagnostic tool,
+    so a corrupt counter crashes loud rather than papering over a
+    likely encoder bug with a ``"?"`` placeholder.
     """
     called_idx = kind_to_called_idx[kind][counter_id]
     call_target = section.call_targets[called_idx]
@@ -316,16 +309,20 @@ def render_block(
     line_to_name: Mapping[int, str],
     line_to_provider: Mapping[int, str],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
-) -> list[LineItem]:
-    """Walk one block's instructions and emit typed line items.
+) -> list[AsmLine]:
+    """Walk one block's instructions and emit one :class:`AsmLine` each.
 
-    Iterates ``block.iter_insn`` and per instruction yields one
-    :class:`AsmLine` plus -- in token-stream order WITHIN the
-    instruction -- one :class:`InlineCallEntry` per
-    LOCAL_FUNC/PLT_FUNC/EXT_FUNC metatoken and one
-    :class:`InlineJumpEntry` per BLOCK_V2 metatoken. Token-type
+    Iterates ``block.iter_insn`` and per instruction emits ONE
+    :class:`AsmLine` whose :attr:`AsmLine.openables` tuple carries --
+    in token-stream order WITHIN the instruction -- one
+    :class:`InlineCallEntry` per LOCAL_FUNC/PLT_FUNC/EXT_FUNC metatoken
+    and one :class:`InlineJumpEntry` per BLOCK_V2 metatoken. Token-type
     discrimination is via the structured :class:`TokenType` enum (no
     string parsing of asm).
+
+    Inline entries are NO LONGER yielded as top-level sibling items;
+    they hang off their owning instruction's :class:`AsmLine` so the
+    tree-model consumes one item kind across both rendering backends.
 
     The parsed :class:`BlockTokenList` + the section-level invariants
     are produced ONCE by the tree-model layer's
@@ -355,12 +352,11 @@ def _walk_block_instructions(
     line_to_name: Mapping[int, str],
     kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
-) -> Iterable[LineItem]:
-    """Per-instruction generator: one :class:`AsmLine` then any inline
-    call/jump entries from the instruction's metatoken stream."""
+) -> Iterable[AsmLine]:
+    """Per-instruction generator: one :class:`AsmLine` per instruction
+    with its inline-call/jump entries attached as ``openables``."""
     for insn in block.iter_insn(transient=True):
-        yield AsmLine(text=_render_insn_text(insn.to_asm_like()))
-        yield from _emit_inline_entries(
+        openables = _collect_inline_openables(
             insn,
             section=section,
             kind_to_called_idx=kind_to_called_idx,
@@ -369,9 +365,13 @@ def _walk_block_instructions(
             kind_to_provider_source=kind_to_provider_source,
             callee_arm_resolver=callee_arm_resolver,
         )
+        yield AsmLine(
+            text=_render_insn_text(insn.to_asm_like()),
+            openables=openables,
+        )
 
 
-def _emit_inline_entries(
+def _collect_inline_openables(
     insn,
     *,
     section: RenderableSection,
@@ -380,28 +380,36 @@ def _emit_inline_entries(
     line_to_name: Mapping[int, str],
     kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
-) -> Iterable[LineItem]:
-    """Inline call/jump items for ONE instruction.
+) -> tuple[Openable, ...]:
+    """Inline call/jump openables for ONE instruction.
 
     Dispatch is one dict lookup (call kind) + one set membership
     (jump); identity payload reads via :meth:`InsnTokenList.iter_tokens`
     -- the same path :meth:`InsnTokenList.to_asm_like` walks, so the
-    AsmLine and inline entries see a consistent token view.
+    AsmLine text and the openables tuple see a consistent token view.
+
+    Returns the ordered tuple of openables; the caller attaches it
+    onto the owning :class:`AsmLine` so the tree-model never sees
+    sibling Inline*Entry items at the block level.
     """
+    openables: list[Openable] = []
     for token in insn.iter_tokens():
         token_type = token.token_type
         kind = _CALL_TOKEN_TYPES.get(token_type)
         if kind is not None:
-            yield _emit_call_entry(
-                kind=kind,
-                counter_id=int(token.id),
-                section=section,
-                kind_to_called_idx=kind_to_called_idx,
-                variant_pins=variant_pins,
-                callee_arm_resolver=callee_arm_resolver,
-                line_to_name=line_to_name,
-                kind_to_provider_source=kind_to_provider_source,
+            openables.append(
+                _emit_call_entry(
+                    kind=kind,
+                    counter_id=int(token.id),
+                    section=section,
+                    kind_to_called_idx=kind_to_called_idx,
+                    variant_pins=variant_pins,
+                    callee_arm_resolver=callee_arm_resolver,
+                    line_to_name=line_to_name,
+                    kind_to_provider_source=kind_to_provider_source,
+                )
             )
             continue
         if token_type in _JUMP_TOKEN_TYPES:
-            yield InlineJumpEntry(target_block_idx=int(token.id))
+            openables.append(InlineJumpEntry(target_block_idx=int(token.id)))
+    return tuple(openables)

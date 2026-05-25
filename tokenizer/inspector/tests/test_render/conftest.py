@@ -142,6 +142,22 @@ def _resolver_never_called(_offset: int) -> SectionPointerSpec | None:
     raise AssertionError("callee_arm_resolver should not have been invoked")
 
 
+def _flatten_openables(items):
+    """Collect openables from every :class:`AsmLine` in stream order.
+
+    Post-R2g the FTL renderer emits one :class:`AsmLine` per
+    instruction with inline call/jump entries on
+    :attr:`AsmLine.openables`; this helper concatenates them across
+    every line so tests that care about the per-block list of inline
+    entries (regardless of which instruction they hang off) can keep
+    their old assertion shape.
+    """
+    out = []
+    for it in items:
+        out.extend(it.openables)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Higher-level builders for the recurring "one LOCAL + one PLT + one EXTERN
 # call_target" pattern used by the kind-dispatch tests. Keeping the shape
