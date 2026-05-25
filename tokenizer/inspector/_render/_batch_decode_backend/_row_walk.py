@@ -14,7 +14,7 @@ only the per-band emission concern. Plan reference:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -27,6 +27,9 @@ from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
 from tokenizer.aligned_data.loader.batch_decode._types import (
     BatchDecodeResult,
     SectionPointerSpec,
+)
+from tokenizer.aligned_data.loader.decoded._number_render_collector import (
+    _NumberAccumulator,
 )
 from tokenizer.aligned_data.matched_sections_bin import (
     MISSING_VARIANT_INDEX,
@@ -46,7 +49,7 @@ from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Category
 
 from ._band import Band, classify_shifted_id
-from ._band_emitters import emit_instr_rep, emit_number
+from ._band_emitters import emit_instr_rep, emit_number, flush_accumulator_into
 from ._boundaries import call_target_starts, header_trigger_cols
 from ._callee_resolver import resolve_callee_pointer
 from ._fid_table import FidBaseTable
@@ -87,10 +90,12 @@ class _WalkState(WalkSectionState):
     ``id_cursor`` / ``num_cursor`` track per-row sidecar positions.
     ``current_col`` is the column index the loop is processing;
     crosses :func:`_handle_block`'s ``n_axis`` invariant check.
-    ``last_number_shifted_id`` carries the prior NUMBER-band token's
-    shifted id (``-1`` = none); drives multi-chunk trailing-slot
-    detection inside :func:`emit_number` and resets on every
-    non-NUMBER emit.
+    ``number_accumulator`` is the per-row :class:`_NumberAccumulator`
+    instance that groups multi-chunk NUMBER sources (W3-17). A band
+    switch off NUMBER -- an :class:`Band.INSTR_REP` or
+    :class:`Band.IDENTITY` token -- flushes pending chunks into the
+    current section; an end-of-row break also force-flushes per
+    cluster #21 H-4 cut-variant tolerance.
     """
 
     row: int = 0
@@ -98,7 +103,9 @@ class _WalkState(WalkSectionState):
     id_cursor: int = 0
     num_cursor: int = 0
     current_col: int = 0
-    last_number_shifted_id: int = -1
+    number_accumulator: _NumberAccumulator = field(
+        default_factory=_NumberAccumulator
+    )
 
 
 def _handle_block(state: _WalkState, *, counter: int) -> None:
@@ -355,11 +362,18 @@ def render_row_blocks(
             break  # null-content padding tail
         band = classify_shifted_id(shifted_id)
         if band is Band.INSTR_REP:
+            # Band switch off NUMBER -> flush any pending multi-chunk
+            # source so its rendered text lands BEFORE the upcoming
+            # INSTR_REP item (encoder invariant: multi-chunk sources
+            # never cross instruction boundaries, and every instruction
+            # starts with an INSTR_REP mnemonic).
+            flush_accumulator_into(
+                state.current_items, accumulator=state.number_accumulator,
+            )
             if state.pending_header:
                 # ``Block_Def`` carrier -- absorbed silently so the
                 # BODY section's first emitted item is the first
                 # real instruction.
-                state.last_number_shifted_id = -1
                 continue
             emit_instr_rep(
                 state.current_items,
@@ -367,7 +381,6 @@ def render_row_blocks(
                 vocab_manager=vocab_manager,
                 arch_prefixes=arch_prefixes,
             )
-            state.last_number_shifted_id = -1
         elif band is Band.NUMBER:
             state.num_cursor = emit_number(
                 state.current_items,
@@ -375,10 +388,15 @@ def render_row_blocks(
                 numbers_sig=numbers_sig,
                 numbers_se=numbers_se,
                 num_cursor=state.num_cursor,
-                last_number_shifted_id=state.last_number_shifted_id,
+                accumulator=state.number_accumulator,
             )
-            state.last_number_shifted_id = int(shifted_id)
         elif band is Band.IDENTITY:
+            # Band switch off NUMBER -> flush before the IDENTITY emit
+            # so the IDENTITY-band item appears after the prior
+            # NUMBER source's rendered text.
+            flush_accumulator_into(
+                state.current_items, accumulator=state.number_accumulator,
+            )
             _emit_identity(
                 state,
                 shifted_id=shifted_id,
@@ -390,12 +408,18 @@ def render_row_blocks(
                 kind_to_called_idx_per_ct=kind_to_called_idx_per_ct,
                 callee_arm_resolver=callee_arm_resolver,
             )
-            state.last_number_shifted_id = -1
         else:
             raise ValueError(
                 f"render_row_blocks: unexpected Band {band!r} at "
                 f"row={row}, col={col} (shifted_id={shifted_id})"
             )
 
+    # End-of-row flush per cluster #21 H-4: cut variants may have a
+    # multi-chunk source whose trailing chunks were truncated. Flush
+    # the lead-chunk contribution as best-effort so the visible
+    # operand text is not silently dropped.
+    flush_accumulator_into(
+        state.current_items, accumulator=state.number_accumulator,
+    )
     close_current_section(state)
     return state.completed
