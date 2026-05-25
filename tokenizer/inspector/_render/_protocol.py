@@ -29,13 +29,14 @@ backend. :attr:`RenderBackend.closed` is the observable flag.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, Mapping, Optional, Protocol, Sequence, Union, runtime_checkable
+from typing import Iterable, Mapping, Optional, Protocol, Sequence, Tuple, Union, runtime_checkable
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.tokens import TokenType
 
 
 __all__ = [
@@ -45,7 +46,9 @@ __all__ = [
     "FunctionHandle",
     "InlineCallEntry",
     "InlineJumpEntry",
+    "InlineNumberPrecisionEntry",
     "LineItem",
+    "Openable",
     "RenderBackend",
     "RenderedBlock",
     "RenderedVariant",
@@ -177,9 +180,20 @@ class AsmLine:
     Numeric tokens render here too (hex form ``"<basename>:<bits>"``
     per plan decision 18). The discriminator between asm / call / jump
     is the dataclass type, not a string prefix.
+
+    ``openables`` carries the per-instruction sidecar entries the
+    tree-model lazily expands into child rows: inline call sites
+    (:class:`InlineCallEntry`), intra-function jump targets
+    (:class:`InlineJumpEntry`), and full-precision number expansions
+    (:class:`InlineNumberPrecisionEntry`). Empty tuple = leaf row
+    (no expansion). Discriminator is the dataclass type itself
+    (``isinstance`` / ``match``); see :data:`Openable`. The field is
+    a tuple (not list) so the frozen-dataclass immutability extends
+    to the sidecar payload.
     """
 
     text: str
+    openables: Tuple["Openable", ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -223,6 +237,39 @@ class InlineJumpEntry:
     """
 
     target_block_idx: int
+
+
+@dataclass(frozen=True)
+class InlineNumberPrecisionEntry:
+    """Full-precision expansion sidecar for an abbreviated numeric token.
+
+    Produced for sources whose short text rounds: F80 / F128 mantissa
+    truncation, multi-chunk VC2 hex abbreviation, IEEE floats whose
+    significant-decimal-digit count exceeds the short-form budget. The
+    tree-model expands the carrying :class:`AsmLine` into a leaf row
+    whose text is :attr:`full_text` verbatim (no UI-side rendering).
+
+    ``token_type`` is the wire-format :class:`TokenType` of the source
+    (``VALUED_CONST_V2`` for VC2, per-width ``FLOAT*`` members for
+    IEEE) -- typed discriminator so consumers route per-width behaviour
+    off the enum, never off the rendered text. ``full_text`` is the
+    pre-rendered display string; per the integrated plan W3-1 W4-
+    amendment, the prior speculative ``chunks`` field is dropped (no
+    consumer for per-chunk decomposition).
+    """
+
+    token_type: TokenType
+    full_text: str
+
+
+Openable = Union[InlineCallEntry, InlineJumpEntry, InlineNumberPrecisionEntry]
+"""Sidecar entry attached to an :class:`AsmLine` for lazy expansion.
+
+The tree-model dispatches on the dataclass identity (``isinstance`` /
+``match``) -- there is intentionally NO ``OpenableKind`` enum and NO
+``openable_kind`` property. One openable type -> one wrapper-node
+type at the tree-model boundary (per integrated plan W3-2 W4-amended).
+"""
 
 
 LineItem = Union[AsmLine, InlineCallEntry, InlineJumpEntry]
