@@ -597,6 +597,92 @@ def test_right_arrow_on_overflowing_collapsed_node_pans_instead_of_expand():
     asyncio.run(runner())
 
 
+def test_right_arrow_on_indent_only_overflow_pans():
+    """``→`` panning must include the tree's indent-guide width.
+
+    Live reproducer: a row whose label cell_len ALONE fits the
+    viewport, but the rendered line (indent guides + label) spills
+    past the right edge. Textual's ``Tree`` reserves
+    ``guide_depth * (path_depth)`` cells on the left for guides;
+    horizontal scroll measures the FULL line. If the overflow check
+    only looks at ``label.cell_len > viewport_width + scroll_x`` the
+    row appears "fitting" even though the user sees the label clipped
+    on the right -- right-arrow then incorrectly fires expand instead
+    of pan.
+
+    Build a leaf whose label cell_len is just under the viewport while
+    the surrounding indent guides push the rendered line past it.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Pick a label cell_len just below the viewport so the
+                # label-only check would mis-conclude "fits".
+                viewport_width = 80  # textual's default pilot width
+                # cursor row is path length 3 (root + function + leaf)
+                # so guide_width == 2 * guide_depth (4) == 8. Pick a
+                # label cell_len that fits without guides but overflows
+                # with them.
+                long_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    kind=BlockKind.BODY,
+                    block_idx=1,
+                    # The BlockNode label is composed as
+                    # ``"Block: 1   <preview>"`` (11 chars) plus the
+                    # Tree's two-cell expand-icon prefix. Pick a
+                    # preview length so the final label cell_len lands
+                    # at viewport_width - 2 -- under the viewport, but
+                    # within ``guide_depth`` cells of it so the
+                    # indent guide pushes the full row past the right
+                    # edge.
+                    preview="x" * (viewport_width - 11 - 2 - 2),
+                )
+                long_block.expand = MagicMock(return_value=[])
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_block]
+                )
+                row = children[0]
+                tree.move_cursor(row, animate=False)
+                await pilot.pause()
+
+                # Sanity: label cell_len alone DOES fit (label-only
+                # overflow check would say "no overflow"), but the
+                # row's full rendered width (indent guides included)
+                # exceeds the viewport.
+                label_only = tree.label_cell_len(row)
+                guide_width = tree._tree_lines[
+                    row._line
+                ]._get_guide_width(tree.guide_depth, tree.show_root)
+                assert label_only <= tree.size.width, (
+                    f"test setup invalid: label cell_len {label_only} "
+                    f"already exceeds viewport {tree.size.width}; "
+                    f"shrink preview"
+                )
+                assert label_only + guide_width > tree.size.width, (
+                    f"test setup invalid: label cell_len {label_only} "
+                    f"+ guide width {guide_width} fits viewport "
+                    f"{tree.size.width}; grow preview"
+                )
+                assert row.is_expanded is False
+                scroll_before = tree.scroll_offset.x
+
+                await pilot.press("right")
+                await pilot.pause()
+
+                # The full line overflows -- pan wins over expand.
+                assert tree.scroll_offset.x == scroll_before + 1
+                assert long_block.remembered_scroll_x == scroll_before + 1
+                assert row.is_expanded is False
+                long_block.expand.assert_not_called()
+
+    asyncio.run(runner())
+
+
 def test_right_arrow_on_fitting_leaf_is_noop():
     """``→`` on a terminal (``can_expand=False``) fitting row: no-op."""
 
