@@ -32,24 +32,35 @@ from ._row_walk_fixtures import (
 def _walk(
     *, tokens: np.ndarray, identities: np.ndarray, n_axis: int,
     partial_cut_lengths: list[int],
+    block_runlength: np.ndarray | None = None,
+    insn_runlength: np.ndarray | None = None,
 ):
     """Shorthand: ``render_row_blocks`` with empty number sidecars and
     empty FID table -- the default for block-only dispatch tests.
+
+    Runlength sidecars (which drive block-boundary detection) default
+    to empty; per-test cases supply explicit per-row block / insn
+    counts when they want to exercise multi-block behavior.
     """
+    from ._row_walk_fixtures import NULL_CALLEE_RESOLVER
     numbers_sig, numbers_se = EMPTY_NUMBERS
     return render_row_blocks(
         result=make_result(
             tokens_row=tokens, identities=identities,
             numbers_sig=numbers_sig, numbers_se=numbers_se,
+            block_runlength=block_runlength,
+            insn_runlength=insn_runlength,
         ),
         row=0, n_axis=n_axis,
         partial_cut_lengths=partial_cut_lengths,
+        call_targets_per_ct=[[] for _ in partial_cut_lengths],
         vocab_manager=vocab_stub(),
         fid_table=make_fid_table(
             per_category_counts=EMPTY_FID_COUNTS,
             sidecar=EMPTY_FID_SIDECAR,
         ),
         line_to_name={}, line_to_provider={},
+        callee_arm_resolver=NULL_CALLEE_RESOLVER,
     )
 
 

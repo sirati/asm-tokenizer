@@ -109,6 +109,10 @@ def _make_result(
         fid_sidecar=fid_sidecar,
         fid_row_offsets=fid_row_offsets,
         fid_per_category_counts=fid_per_category_counts,
+        block_runlength=None,
+        block_runlength_row_offsets=None,
+        insn_runlength=None,
+        insn_runlength_row_offsets=None,
         intermediate=None,
     )
 

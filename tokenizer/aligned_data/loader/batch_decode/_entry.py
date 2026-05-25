@@ -89,6 +89,7 @@ class PendingBatchDecode:
     context_len: int
     include_fid_sidecar: bool
     keep_intermediate: bool
+    emit_block_n_insns_runlength: bool
 
     def finalise(
         self, runlen_results: dict[int, np.ndarray]
@@ -107,6 +108,7 @@ class PendingBatchDecode:
             context_len=self.context_len,
             include_fid_sidecar=self.include_fid_sidecar,
             keep_intermediate=self.keep_intermediate,
+            emit_block_n_insns_runlength=self.emit_block_n_insns_runlength,
         )
 
 
@@ -122,6 +124,7 @@ def batch_decode(
     inlined_equivalent_call_targets_only: bool = ...,
     include_fid_sidecar: bool = ...,
     keep_intermediate: bool = ...,
+    emit_block_n_insns_runlength: bool = ...,
     rng: "Optional[np.random.Generator]" = ...,
     collector: None = ...,
 ) -> BatchDecodeResult: ...
@@ -137,6 +140,7 @@ def batch_decode(
     inlined_equivalent_call_targets_only: bool = ...,
     include_fid_sidecar: bool = ...,
     keep_intermediate: bool = ...,
+    emit_block_n_insns_runlength: bool = ...,
     rng: "Optional[np.random.Generator]" = ...,
     collector: BucketedRunLengthCollector,
 ) -> PendingBatchDecode: ...
@@ -151,6 +155,7 @@ def batch_decode(
     inlined_equivalent_call_targets_only: bool = False,
     include_fid_sidecar: bool = False,
     keep_intermediate: bool = False,
+    emit_block_n_insns_runlength: bool = False,
     rng: "Optional[np.random.Generator]" = None,
     collector: Optional[BucketedRunLengthCollector] = None,
 ) -> Union[BatchDecodeResult, PendingBatchDecode]:
@@ -190,6 +195,14 @@ def batch_decode(
     keep_intermediate:
         When True, the finalised :class:`Stage3Batch` is carried on the
         result's :attr:`BatchDecodeResult.intermediate` field.
+    emit_block_n_insns_runlength:
+        When True, stage 4 builds the optional metatoken-runlength
+        sidecars ``(block_runlength, block_runlength_row_offsets,
+        insn_runlength, insn_runlength_row_offsets)`` on the result.
+        Computed via :func:`._runlengths.compute_metatoken_runlengths`
+        (the canonical FTL accountant); enables consumers like the
+        inspector to derive metatoken-level block / instruction
+        boundaries without reaching into :attr:`BatchDecodeResult.intermediate`.
     rng:
         :class:`numpy.random.Generator` for stage 1's variant sampling.
         Defaults to a fresh :func:`numpy.random.default_rng` -- i.e.
@@ -226,6 +239,7 @@ def batch_decode(
             context_len=context_len,
             include_fid_sidecar=include_fid_sidecar,
             keep_intermediate=keep_intermediate,
+            emit_block_n_insns_runlength=emit_block_n_insns_runlength,
         )
 
     stage1_pending = walk_sections(
@@ -245,6 +259,7 @@ def batch_decode(
         context_len=context_len,
         include_fid_sidecar=include_fid_sidecar,
         keep_intermediate=keep_intermediate,
+        emit_block_n_insns_runlength=emit_block_n_insns_runlength,
     )
 
 
@@ -254,6 +269,7 @@ def _batch_decode_post_stage1(
     context_len: int,
     include_fid_sidecar: bool,
     keep_intermediate: bool,
+    emit_block_n_insns_runlength: bool,
 ) -> BatchDecodeResult:
     """Run Stages 2 -> 3 -> 4 on a finalised :class:`Stage1Batch`.
 
@@ -269,4 +285,5 @@ def _batch_decode_post_stage1(
         context_len=context_len,
         include_fid_sidecar=include_fid_sidecar,
         keep_intermediate=keep_intermediate,
+        emit_block_n_insns_runlength=emit_block_n_insns_runlength,
     )

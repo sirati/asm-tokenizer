@@ -544,6 +544,33 @@ class BatchDecodeResult:
     multiple in-stream occurrences of the same counter collapse to ONE
     sidecar entry)."""
 
+    block_runlength: Optional[np.ndarray]
+    """``u32[total_blocks]`` flat per-block instruction count across the
+    whole batch; only when ``emit_block_n_insns_runlength=True``. Pairs
+    with :attr:`block_runlength_row_offsets` for per-row segmentation.
+    Computed via the canonical
+    :func:`tokenizer.aligned_data.loader.batch_decode._runlengths.compute_metatoken_runlengths`
+    helper applied per call_target (FTL's
+    :func:`tokenizer.utils.CA_BArle_to_CBrle` accountant) and concatenated
+    in row-then-DFS-encounter order. Function-body content only -- the
+    row-level variant_tokens prefix and per-call-target self-prepend
+    slot are NOT included (they live in the row assembler)."""
+
+    block_runlength_row_offsets: Optional[np.ndarray]
+    """``u32[batch_size + 1]``; cumsum of blocks-per-row; only when
+    ``emit_block_n_insns_runlength=True``."""
+
+    insn_runlength: Optional[np.ndarray]
+    """``u32[total_insns]`` flat per-instruction post-decode slot count
+    across the whole batch; only when ``emit_block_n_insns_runlength=True``.
+    Slot count reflects the post-promotion layout: F128 finite -> 2,
+    F128 NaN/Inf -> 1, VC2 K-chunk -> K, everything else -> 1. Pairs
+    with :attr:`insn_runlength_row_offsets` for per-row segmentation."""
+
+    insn_runlength_row_offsets: Optional[np.ndarray]
+    """``u32[batch_size + 1]``; cumsum of instructions-per-row; only
+    when ``emit_block_n_insns_runlength=True``."""
+
     intermediate: Optional[Stage3Batch]
     """The full hierarchical :class:`Stage3Batch`; only when
     ``keep_intermediate=True`` (default ``False``)."""

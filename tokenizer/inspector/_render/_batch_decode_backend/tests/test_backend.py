@@ -58,6 +58,7 @@ def _make_backend(**overrides) -> BatchDecodeBackend:
         ),
         line_to_name={},
         line_to_provider={},
+        callee_arm_resolver=lambda _offset: None,
     )
     kwargs.update(overrides)
     return BatchDecodeBackend(**kwargs)

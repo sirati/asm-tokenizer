@@ -20,8 +20,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence
+from typing import Callable, List, Optional, Sequence
 
+from tokenizer.aligned_data.loader.batch_decode._types import (
+    SectionPointerSpec,
+)
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.loader.session import BinarySession
@@ -103,6 +106,14 @@ class _BatchDecodeBackendFactory:
     :meth:`FunctionNode.expand` call. :meth:`close` exits the session
     (mirrors :class:`_FtlBackendFactory.close` which closes its
     :class:`CsvIndex`) so callers register only one shutdown hook.
+
+    The factory also OWNS the per-session callee_arm_resolver closure;
+    LOCAL / PLT call_targets resolve their ``function_section_ptr``
+    through ``session._idx_for_section_offset`` to a
+    :class:`SectionPointerSpec` (or ``None`` for cross-arm /
+    missing-section / EXTERN). The closure is built once at factory
+    construction time and shared across every backend instance it
+    spawns -- the inspector never reaches into session internals.
     """
 
     dataset: BinaryDataset
@@ -119,6 +130,7 @@ class _BatchDecodeBackendFactory:
             handle=handle,
             line_to_name=self.dataset.line_to_name,
             line_to_provider=self.dataset.line_to_provider,
+            callee_arm_resolver=_make_callee_arm_resolver(self.session),
         )
 
     def close(self) -> None:
@@ -126,6 +138,42 @@ class _BatchDecodeBackendFactory:
             return
         self.session.close()
         self._closed = True
+
+
+def _make_callee_arm_resolver(
+    session: BinarySession,
+) -> Callable[[int], Optional[SectionPointerSpec]]:
+    """Build the session-backed callee section-pointer resolver.
+
+    Each invocation maps a ``function_section_ptr`` byte offset (from
+    :class:`CallTarget.function_section_ptr`) to a
+    :class:`SectionPointerSpec` ``(arm, idx)`` -- the same pair every
+    :func:`batch_decode` request consumes for expansion. The two arms
+    are probed in MATCHED-then-UNMATCHED order; the first hit wins.
+    ``None`` is returned when neither arm resolves (cross-arm /
+    missing-section pointer). EXTERN call_targets are handled at the
+    walker (no body to inline); this closure is only consumed for
+    LOCAL / PLT.
+    """
+
+    def resolve(function_section_ptr: int) -> Optional[SectionPointerSpec]:
+        idx_matched = session._idx_for_section_offset(
+            function_section_ptr, "matched"
+        )
+        if idx_matched is not None:
+            return SectionPointerSpec(
+                arm=SectionKind.MATCHED, idx=int(idx_matched)
+            )
+        idx_unmatched = session._idx_for_section_offset(
+            function_section_ptr, "unmatched"
+        )
+        if idx_unmatched is not None:
+            return SectionPointerSpec(
+                arm=SectionKind.UNMATCHED, idx=int(idx_unmatched)
+            )
+        return None
+
+    return resolve
 
 
 def make_batch_decode_factory(

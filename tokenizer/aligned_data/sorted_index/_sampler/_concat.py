@@ -157,6 +157,33 @@ def _concat_results(
             "_concat_results: include_fid_sidecar inconsistent across inputs",
         )
 
+    # Optional metatoken-runlength sidecars (all-or-none across inputs).
+    # Mirrors the fid_sidecar pattern: per-binary all-or-none, flat
+    # array stacked + row offsets re-based.
+    block_rl_present = [r.block_runlength is not None for _, r in per_binary]
+    block_runlength: Optional[np.ndarray] = None
+    block_runlength_row_offsets: Optional[np.ndarray] = None
+    insn_runlength: Optional[np.ndarray] = None
+    insn_runlength_row_offsets: Optional[np.ndarray] = None
+    if all(block_rl_present):
+        block_runlength = np.concatenate(
+            [r.block_runlength for _, r in per_binary],
+        )
+        block_runlength_row_offsets = _concat_row_offsets(
+            [r.block_runlength_row_offsets for _, r in per_binary],
+        )
+        insn_runlength = np.concatenate(
+            [r.insn_runlength for _, r in per_binary],
+        )
+        insn_runlength_row_offsets = _concat_row_offsets(
+            [r.insn_runlength_row_offsets for _, r in per_binary],
+        )
+    elif any(block_rl_present):
+        raise ValueError(
+            "_concat_results: emit_block_n_insns_runlength inconsistent "
+            "across inputs",
+        )
+
     inner = BatchDecodeResult(
         tokens=tokens,
         identities=identities,
@@ -168,6 +195,10 @@ def _concat_results(
         fid_sidecar=fid_sidecar,
         fid_row_offsets=fid_offsets,
         fid_per_category_counts=fid_per_category_counts,
+        block_runlength=block_runlength,
+        block_runlength_row_offsets=block_runlength_row_offsets,
+        insn_runlength=insn_runlength,
+        insn_runlength_row_offsets=insn_runlength_row_offsets,
         intermediate=None,
     )
     return MultiBinaryBatchDecodeResult(

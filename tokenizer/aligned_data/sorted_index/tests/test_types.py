@@ -189,6 +189,10 @@ def _make_dummy_inner() -> BatchDecodeResult:
         fid_sidecar=None,
         fid_row_offsets=None,
         fid_per_category_counts=None,
+        block_runlength=None,
+        block_runlength_row_offsets=None,
+        insn_runlength=None,
+        insn_runlength_row_offsets=None,
         intermediate=None,
     )
 
