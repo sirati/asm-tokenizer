@@ -104,8 +104,15 @@ def test_first_block_v2_overwrites_pre_allocated_entry_block() -> None:
 
 def test_second_block_v2_inside_same_call_target_emits_inline_jump() -> None:
     """A non-``pending_header`` BLOCK_V2 (second in a single call-target
-    span) emits :class:`InlineJumpEntry` -- it does NOT open a new
+    span) routes :class:`InlineJumpEntry` as an openable on the
+    in-flight instruction's :class:`AsmLine` -- it does NOT open a new
     block; it appends under the current block.
+
+    Post-R2 narrowed-LineItem contract: ``section.items`` is AsmLine-
+    only; inline jumps ride on :attr:`AsmLine.openables`. With an empty
+    insn_runlength sidecar each slot is its own faux-instruction, so
+    the BLOCK_V2 jump lands on a standalone AsmLine carrying just the
+    openable (empty text + 1-tuple openables).
     """
     blocks = _walk(
         tokens=np.asarray(
@@ -118,11 +125,11 @@ def test_second_block_v2_inside_same_call_target_emits_inline_jump() -> None:
     assert len(blocks) == 1
     assert blocks[0].block_idx == 0
     items = blocks[0].items
+    # All items are AsmLines (R2f narrowed contract).
+    assert all(isinstance(item, AsmLine) for item in items)
     assert len(items) == 3
-    assert isinstance(items[0], AsmLine)
-    assert isinstance(items[1], InlineJumpEntry)
-    assert items[1].target_block_idx == 2
-    assert isinstance(items[2], AsmLine)
+    # Middle AsmLine carries the InlineJumpEntry as an openable.
+    assert items[1].openables == (InlineJumpEntry(target_block_idx=2),)
 
 
 def test_block_v2_inside_variant_prefix_raises_loud() -> None:
@@ -217,10 +224,17 @@ def test_production_layout_splits_three_section_kinds() -> None:
     assert all(isinstance(it, AsmLine) for it in blocks[0].items)
     assert blocks[1].kind is BlockKind.FUNCTION_ID
     assert blocks[1].block_idx == -1
+    # Post-R2 narrowed-LineItem contract: the LOCAL_FUNC self-prepend
+    # rides on the FUNCTION_ID AsmLine's openables tuple, NOT as a
+    # sibling top-level InlineCallEntry.
     assert len(blocks[1].items) == 1
-    assert isinstance(blocks[1].items[0], InlineCallEntry)
-    assert blocks[1].items[0].kind is CallTargetType.LOCAL
-    assert blocks[1].items[0].callee_name == "my_func"
+    func_id_line = blocks[1].items[0]
+    assert isinstance(func_id_line, AsmLine)
+    assert len(func_id_line.openables) == 1
+    func_id_call = func_id_line.openables[0]
+    assert isinstance(func_id_call, InlineCallEntry)
+    assert func_id_call.kind is CallTargetType.LOCAL
+    assert func_id_call.callee_name == "my_func"
     assert blocks[2].kind is BlockKind.BODY
     assert blocks[2].block_idx == 7
     # Critically: only ONE AsmLine (the body content); Block_Def +

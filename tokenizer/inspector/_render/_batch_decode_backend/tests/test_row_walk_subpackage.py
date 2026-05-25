@@ -154,18 +154,17 @@ def _walk(
 def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
     """Synthetic footer instruction: ``[BLOCK_V2(c=5), JUMP_TABLE(n=7),
     BLOCK_V2(t0=10), BLOCK_V2(t1=11), BLOCK_V2(t2=12), 0]`` with
-    ``partial_cut_lengths=[5]`` and an empty runlength sidecar (so no
-    mid-row trigger latches). The first BLOCK_V2 opens block 5;
-    subsequent BLOCK_V2 tokens after JUMP_TABLE are routed as
-    :class:`InlineJumpEntry`, NOT as new block headers.
-
-    W3-16 fix (cluster #21 H-3): without the
-    :attr:`WalkSectionState.inside_jump_table_footer_block` flag, each
-    trailing BLOCK_V2 would emit as a normal in-function jump (which
-    happens to coincide with the desired shape here -- empty runlength
-    sidecar means no ``pending_header`` latch). The pin is that even
-    with the flag fully armed (JUMP_TABLE seen), the trailing BLOCK_V2
-    targets stay as InlineJumpEntries.
+    ``partial_cut_lengths=[5]``. With ``insn_runlength=[1, 4]`` the
+    leading BLOCK_V2 opens block 5 as a single-slot silent-header
+    instruction, and the next 4-slot instruction IS the jump-table
+    footer (``JUMP_TABLE`` + 3 ``BLOCK_V2`` targets). Per W3-16
+    W4-AMENDED + cluster #21 H-3, the JUMP_TABLE IDENTITY arms both
+    the per-instruction ``saw_jump_table_this_insn`` flag and the
+    block-level ``inside_jump_table_footer_block`` flag; the finalize
+    flips :attr:`_InsnEmitPolicy.SILENT_HEADER` -> JUMP_TABLE_FOOTER so
+    the footer instruction emits a real AsmLine; the trailing BLOCK_V2
+    tokens route as :class:`InlineJumpEntry` openables on THAT same
+    AsmLine, NOT as new block headers.
     """
     blocks = _walk(
         tokens=np.asarray(
@@ -174,19 +173,30 @@ def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
         ),
         identities=np.asarray([5, 7, 10, 11, 12], dtype=np.uint16),
         n_axis=0, partial_cut_lengths=[5],
+        # BLOCK_V2(c=5) is consumed under FUNCTION_ID -> BODY transition
+        # (bare-BLOCK_V2 test layout; no Block_Def precedes it) so it
+        # spends 1 slot under FUNCTION_ID and DOES NOT consume an
+        # insn_runlength entry. The BODY-section instructions then start
+        # at col 1: ONE 4-slot footer instruction (JUMP_TABLE + 3
+        # BLOCK_V2 targets).
+        insn_runlength=np.asarray([4], dtype=np.uint32),
     )
     assert len(blocks) == 1
     block = blocks[0]
     assert block.kind is BlockKind.BODY
     assert block.block_idx == 5  # the leading BLOCK_V2(c=5) header
-    # Items: <jump_table 7> AsmLine + 3 InlineJumpEntry targets.
+    # One AsmLine for the footer instruction; its openables carry the
+    # 3 jump-table targets (the silent-header BLOCK_V2 emitted no row).
     items = block.items
-    assert len(items) == 4
-    assert isinstance(items[0], AsmLine)
-    assert items[0].text == "<jump_table 7>"
-    for item, expected in zip(items[1:], [10, 11, 12]):
-        assert isinstance(item, InlineJumpEntry)
-        assert item.target_block_idx == expected
+    assert len(items) == 1
+    line = items[0]
+    assert isinstance(line, AsmLine)
+    assert line.text == "<jump_table 7>"
+    assert line.openables == (
+        InlineJumpEntry(target_block_idx=10),
+        InlineJumpEntry(target_block_idx=11),
+        InlineJumpEntry(target_block_idx=12),
+    )
 
 
 def test_jump_table_flag_resets_on_new_body_block() -> None:
@@ -207,15 +217,19 @@ def test_jump_table_flag_resets_on_new_body_block() -> None:
         identities=np.asarray([0, 7, 10, 20], dtype=np.uint16),
         n_axis=0, partial_cut_lengths=[3, 2],
     )
-    # Two CT spans -> two blocks. First block (0) carries the footer
-    # placeholder + one InlineJumpEntry. Second block (20) carries the
-    # INSTR_REP AsmLine -- BLOCK_V2(c=20) was consumed as a header,
-    # not silently dropped or routed as InlineJumpEntry.
+    # Two CT spans -> two blocks. First block (0) emits the footer
+    # AsmLine carrying ``<jump_table 7>`` + InlineJumpEntry openable.
+    # Second block (20) carries the INSTR_REP AsmLine -- BLOCK_V2(c=20)
+    # was consumed as a header, not silently dropped or routed as
+    # InlineJumpEntry.
     assert len(blocks) == 2
     first = blocks[0]
     assert first.block_idx == 0
-    assert any(isinstance(it, AsmLine) and it.text == "<jump_table 7>"
-               for it in first.items)
+    # At least one AsmLine in the first block has the footer's text.
+    assert any(
+        isinstance(it, AsmLine) and "<jump_table 7>" in it.text
+        for it in first.items
+    )
     second = blocks[1]
     assert second.block_idx == 20
     asm_lines = [it for it in second.items if isinstance(it, AsmLine)]

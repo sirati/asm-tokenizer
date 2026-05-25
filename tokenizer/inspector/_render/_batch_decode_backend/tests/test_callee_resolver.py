@@ -28,8 +28,25 @@ from tokenizer.aligned_data.matched_sections_bin import CallTarget
 from tokenizer.inspector._render._batch_decode_backend._row_walk import (
     render_row_blocks,
 )
-from tokenizer.inspector._render._protocol import InlineCallEntry
+from tokenizer.inspector._render._protocol import AsmLine, InlineCallEntry
 from tokenizer.tokens import Category
+
+
+def _collect_inline_calls(items) -> list[InlineCallEntry]:
+    """Harvest :class:`InlineCallEntry` from every AsmLine's openables.
+
+    Post-R2 narrowed-LineItem contract: inline call sidecars ride on
+    :attr:`AsmLine.openables`, not as sibling top-level items. Tests
+    look for them by walking the openables tuple of each AsmLine in
+    a section's items list.
+    """
+    return [
+        op
+        for item in items
+        if isinstance(item, AsmLine)
+        for op in item.openables
+        if isinstance(op, InlineCallEntry)
+    ]
 
 from ._row_walk_fixtures import (
     EMPTY_FID_COUNTS,
@@ -120,7 +137,7 @@ def test_local_func_resolves_via_resolver_to_section_pointer() -> None:
         per_category_counts=np.asarray([[1, 0, 0]], dtype=np.uint32),
     )
     items = blocks[0].items
-    call_entries = [it for it in items if isinstance(it, InlineCallEntry)]
+    call_entries = _collect_inline_calls(items)
     assert len(call_entries) == 1
     assert call_entries[0].kind is CallTargetType.LOCAL
     assert call_entries[0].callee_section_pointer == expected_spec
@@ -147,7 +164,7 @@ def test_plt_func_resolves_via_resolver_to_section_pointer() -> None:
         per_category_counts=np.asarray([[0, 1, 0]], dtype=np.uint32),
     )
     items = blocks[0].items
-    call_entries = [it for it in items if isinstance(it, InlineCallEntry)]
+    call_entries = _collect_inline_calls(items)
     assert len(call_entries) == 1
     assert call_entries[0].kind is CallTargetType.PLT
     assert call_entries[0].callee_section_pointer == expected_spec
@@ -178,7 +195,7 @@ def test_ext_func_keeps_callee_section_pointer_none() -> None:
         per_category_counts=np.asarray([[0, 0, 1]], dtype=np.uint32),
     )
     items = blocks[0].items
-    call_entries = [it for it in items if isinstance(it, InlineCallEntry)]
+    call_entries = _collect_inline_calls(items)
     assert len(call_entries) == 1
     assert call_entries[0].kind is CallTargetType.EXTERN
     assert call_entries[0].callee_section_pointer is None
@@ -205,6 +222,6 @@ def test_local_func_resolver_returning_none_yields_none_pointer() -> None:
         per_category_counts=np.asarray([[1, 0, 0]], dtype=np.uint32),
     )
     items = blocks[0].items
-    call_entries = [it for it in items if isinstance(it, InlineCallEntry)]
+    call_entries = _collect_inline_calls(items)
     assert len(call_entries) == 1
     assert call_entries[0].callee_section_pointer is None

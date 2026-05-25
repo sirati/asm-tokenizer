@@ -27,6 +27,7 @@ from tokenizer.aligned_data.loader.decoded._number_render import (
     InlineNumberPrecisionEntry,
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.inspector._label import inline_call_label, inline_jump_label
 from tokenizer.inspector._render._protocol import (
     BackendFactory,
     InlineCallEntry,
@@ -214,6 +215,45 @@ def test_asmleaf_two_openables_produces_two_wrapper_rows():
     second_grandchildren = children[1].expand()
     assert len(second_grandchildren) == 1
     assert isinstance(second_grandchildren[0], InlineJumpNode)
+
+
+def test_wrapper_rows_use_canonical_label_helpers():
+    """The wrapper-AsmLeaf row label (2+-arm case) routes per-openable
+    label assembly through the canonical
+    :func:`tokenizer.inspector._label.inline_call_label` /
+    :func:`tokenizer.inspector._label.inline_jump_label` helpers --
+    NOT a hand-rolled local format. Single source of truth for row
+    labels lives in :mod:`tokenizer.inspector._label`; the 1-arm path
+    (via :class:`InlineCallNode` / :class:`InlineJumpNode`) and the
+    2+-arm wrapper path MUST agree on the visible string so a future
+    canonical-helper edit propagates to both call sites.
+    """
+    call_entry = InlineCallEntry(
+        kind=CallTargetType.EXTERN,
+        counter_id=4,
+        callee_name="printf",
+        callee_section_pointer=None,
+        variant_idx=0,
+        provider="libc.so",
+    )
+    jump_entry = _make_inline_jump_entry(target_block_idx=9)
+    precision_entry = _make_precision_entry(full_text="v:DEAD (57005)")
+    leaf = AsmLeaf(
+        text="multi", openables=(call_entry, jump_entry, precision_entry)
+    )
+
+    children = leaf.expand()
+
+    assert children[0].text == inline_call_label(
+        call_entry.kind,
+        call_entry.counter_id,
+        call_entry.callee_name,
+        call_entry.provider,
+    )
+    assert children[1].text == inline_jump_label(jump_entry.target_block_idx)
+    # Number-precision rows have no canonical helper: their label IS
+    # the pre-rendered full_text carried on the entry (passthrough).
+    assert children[2].text == precision_entry.full_text
 
 
 def test_asmleaf_three_openables_produces_three_wrapper_rows():

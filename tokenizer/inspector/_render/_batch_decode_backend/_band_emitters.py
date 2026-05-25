@@ -1,15 +1,18 @@
-"""Per-band emit primitives for the BatchDecodeBackend row walker.
+"""Per-band slot emitters for the BatchDecodeBackend row walker.
 
-Single concern: shifted-id -> :class:`LineItem` emission for the
+Single concern: shifted-id -> per-instruction-buffer routing for the
 INSTR_REP and NUMBER bands. The IDENTITY band lives in
-:mod:`._row_walk` (it owns the per-Category dispatch + block /
-function-category branching that need walker state). Each emitter
-mutates the supplied :class:`_WalkState`-shaped accumulator in place.
+:mod:`._row_walk._dispatch` (it owns the per-Category dispatch + block
+/ function-category branching that need walker state). Each emitter
+mutates the in-flight instruction's text-parts / openables buffers on
+:class:`._row_walk._state._WalkState` via the per-instruction collector
+helpers (:mod:`._row_walk._instruction`), keeping the single-emit-site
+discipline (W3-16 W4-AMENDED + A-L1 H2): one :class:`AsmLine` per
+:func:`._row_walk._instruction._finalize_instruction`, not one per
+slot.
 """
 
 from __future__ import annotations
-
-from typing import List
 
 import numpy as np
 
@@ -21,18 +24,18 @@ from tokenizer.aligned_data.loader.decoded._number_render_collector import (
     AccumulatorEmission,
     _NumberAccumulator,
 )
-from tokenizer.inspector._render._protocol import AsmLine, LineItem
 from tokenizer.inspector._render._token_text import substitute_mem_chars
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
 from ._arch_prefix import strip_arch_prefix
+from ._row_walk._instruction import _consume_text_slot
+from ._row_walk._state import _WalkState
 
 
 __all__ = [
     "emit_instr_rep",
     "emit_number",
-    "flush_accumulator_into",
     "MULTI_CHUNK_SHIFTED_IDS",
 ]
 
@@ -58,13 +61,13 @@ MULTI_CHUNK_SHIFTED_IDS: frozenset[int] = frozenset(
 
 
 def emit_instr_rep(
-    items: List[LineItem],
+    state: _WalkState,
     *,
     shifted_id: int,
     vocab_manager: VocabularyManager,
     arch_prefixes: tuple[str, ...] = (),
 ) -> None:
-    """INSTR_REP band: vocab lookup -> polished display -> :class:`AsmLine`.
+    """INSTR_REP band: vocab lookup -> polished display -> text-buffer.
 
     Two display transforms after the raw vocab-string lookup:
 
@@ -77,6 +80,11 @@ def emit_instr_rep(
        mirrors :meth:`PlatformTokenInner.to_asm_like`'s prefix-stripped
        form.
 
+    The rendered atom lands on the in-flight instruction's
+    :attr:`_WalkState.current_insn_text_parts` via
+    :func:`._row_walk._instruction._consume_text_slot`; the eventual
+    :class:`AsmLine` emission happens at instruction finalize.
+
     ``arch_prefixes`` defaults to ``()``: callers that haven't plumbed
     the arch through (test fixtures, legacy paths) get the substitution
     transform without arch elision.
@@ -84,26 +92,25 @@ def emit_instr_rep(
     original_id = int(shifted_id) + _V2_RESERVED_DIGIT_COUNT
     raw = vocab_manager.get_token_str(original_id)
     display = strip_arch_prefix(substitute_mem_chars(raw), arch_prefixes)
-    items.append(AsmLine(text=display))
+    _consume_text_slot(state, text=display)
 
 
 def emit_number(
-    items: List[LineItem],
+    state: _WalkState,
     *,
     shifted_id: int,
     numbers_sig: np.ndarray,
     numbers_se: np.ndarray,
-    num_cursor: int,
-    accumulator: _NumberAccumulator,
-) -> int:
+) -> None:
     """NUMBER band: feed one chunk pair into the accumulator.
 
-    Drives :class:`_NumberAccumulator` (the SSOT for multi-chunk
-    grouping + short / full text rendering). Multi-chunk-capable
-    shifted ids (VC2, F128; :data:`MULTI_CHUNK_SHIFTED_IDS`) extend
-    the accumulator across consecutive feeds with the same shifted id;
-    a shifted-id change auto-flushes the prior source and returns its
-    emission for in-place appending.
+    Drives :attr:`_WalkState.number_accumulator` (the SSOT for
+    multi-chunk grouping + short / full text rendering). Multi-chunk-
+    capable shifted ids (VC2, F128; :data:`MULTI_CHUNK_SHIFTED_IDS`)
+    extend the accumulator across consecutive feeds with the same
+    shifted id; a shifted-id change auto-flushes the prior source and
+    its emission flows into the in-flight instruction's text buffer
+    + openables list.
 
     Single-chunk shifted ids (F16/BF16/F32/F64/F80) are force-flushed
     immediately after the feed so two consecutive same-shifted-id
@@ -114,69 +121,39 @@ def emit_number(
     caller injects that knowledge via the force-flush after every
     non-multi-chunk feed.
 
-    Returns the post-emit ``num_cursor``; callers update their state's
-    cursor accordingly. The caller is responsible for flushing the
-    accumulator at instruction boundaries (W3-17) and at end-of-row
-    (cluster #21 H-4 cut-variant tolerance); see
-    :func:`flush_accumulator_into`.
+    Advances :attr:`_WalkState.num_cursor`. The caller is responsible
+    for the instruction-boundary flush (W3-17, done by
+    :func:`._row_walk._instruction._finalize_instruction`) and the
+    end-of-row flush (cluster #21 H-4 cut-variant tolerance, also done
+    by ``_finalize_instruction(end_of_row=True)``).
     """
     band_index = int(shifted_id) - _NUMBER_BAND_LO_SHIFTED
     token_type: TokenType = _NUMBER_BLOCK_TOKEN_TYPES[band_index]
-    chunk = (numbers_sig[num_cursor], numbers_se[num_cursor])
-    prior = accumulator.feed(
+    chunk = (numbers_sig[state.num_cursor], numbers_se[state.num_cursor])
+    prior = state.number_accumulator.feed(
         token_type=token_type, shifted_id=int(shifted_id), chunk=chunk,
     )
     if prior is not None:
-        _append_emission(items, prior)
+        _absorb_emission(state, prior)
     if int(shifted_id) not in MULTI_CHUNK_SHIFTED_IDS:
         # Single-chunk source: force-flush so a subsequent same-id
         # feed starts a fresh source instead of extending this one.
-        forced = accumulator.flush()
+        forced = state.number_accumulator.flush()
         if forced is not None:
-            _append_emission(items, forced)
-    return num_cursor + 1
+            _absorb_emission(state, forced)
+    state.num_cursor += 1
 
 
-def flush_accumulator_into(
-    items: List[LineItem], *, accumulator: _NumberAccumulator,
+def _absorb_emission(
+    state: _WalkState, emission: AccumulatorEmission,
 ) -> None:
-    """Flush the accumulator and append any emission to ``items``.
+    """Route an :class:`AccumulatorEmission` into the in-flight
+    instruction's text + openables buffers.
 
-    Idempotent: a no-pending accumulator yields ``None`` and the
-    function returns without touching ``items``. Callers invoke this
-    at:
-
-    1. Band switches off NUMBER (INSTR_REP / IDENTITY tokens):
-       within-instruction NUMBER groupings end at the next non-NUMBER
-       token; every instruction starts with an INSTR_REP mnemonic, so
-       a band switch off NUMBER is equivalent to an instruction
-       boundary in practice. This matches W3-17's flush trigger #2
-       (instruction boundary) without the row walker needing a full
-       instruction-runlength state machine (R2a's concern).
-    2. End-of-row (the ``shifted_id == 0`` break or end of columns):
-       cut-variant tolerance per cluster #21 H-4 -- pending multi-
-       chunk source's lead-chunk contribution is emitted as
-       best-effort.
+    Short text becomes a text atom; a non-``None`` precision entry
+    rides on the openables list so the tree-model's lazy expansion
+    surfaces the full-precision form as a child row.
     """
-    emission = accumulator.flush()
-    if emission is not None:
-        _append_emission(items, emission)
-
-
-def _append_emission(
-    items: List[LineItem], emission: AccumulatorEmission,
-) -> None:
-    """Convert an :class:`AccumulatorEmission` to an :class:`AsmLine`.
-
-    The short text becomes :attr:`AsmLine.text`; a non-``None``
-    :attr:`AccumulatorEmission.precision_entry` rides along on the
-    line's :attr:`AsmLine.openables` tuple so the tree-model's lazy
-    expansion path (R2e) can surface the full-precision form as a
-    child row.
-    """
-    openables: tuple
+    state.current_insn_text_parts.append(emission.short_text)
     if emission.precision_entry is not None:
-        openables = (emission.precision_entry,)
-    else:
-        openables = ()
-    items.append(AsmLine(text=emission.short_text, openables=openables))
+        state.current_insn_openables.append(emission.precision_entry)

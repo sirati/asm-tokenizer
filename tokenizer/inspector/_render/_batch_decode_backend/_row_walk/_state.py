@@ -29,7 +29,7 @@ from tokenizer.aligned_data.loader.decoded._number_render_collector import (
     _NumberAccumulator,
 )
 from tokenizer.aligned_data.matched_sections_bin import CallTarget
-from tokenizer.inspector._render._protocol import BlockKind
+from tokenizer.inspector._render._protocol import BlockKind, Openable
 from tokenizer.inspector._render._render_block import (
     partition_call_target_kinds,
 )
@@ -100,10 +100,37 @@ class _WalkState(WalkSectionState):
     current section; an end-of-row break also force-flushes per
     cluster #21 H-4 cut-variant tolerance.
 
-    ``insn_emit_policy`` + ``saw_jump_table_this_insn`` are
-    pre-paved per-instruction surfaces (R2c per-instruction
-    collector consumes them; R2a's :mod:`._dispatch` sets the
-    sibling block-level flag :attr:`WalkSectionState.inside_jump_table_footer_block`).
+    Per-instruction collector fields (W3-16 W4-AMENDED + W3-17):
+
+    * ``current_insn_text_parts`` -- atoms accumulated for the in-flight
+      instruction; joined via :func:`_join_instruction_text` at finalize.
+    * ``current_insn_openables`` -- :data:`Openable` sidecar entries
+      buffered for the in-flight instruction; attached to the emitted
+      :class:`AsmLine.openables` tuple at finalize.
+    * ``current_insn_in_silent_header`` -- latched at instruction start
+      from :attr:`WalkSectionState.pending_header`; under
+      :attr:`_InsnEmitPolicy.SILENT_HEADER` the finalize emits NO
+      AsmLine (the ``Block_Def`` + ``block_v2:N`` header pair is
+      consumed silently; the parent tree row's label encodes the block
+      index).
+    * ``saw_jump_table_this_insn`` -- set when a
+      :attr:`Category.JUMP_TABLE` IDENTITY fires inside the in-flight
+      instruction; the finalize uses this to flip a silent-header
+      policy to :attr:`_InsnEmitPolicy.JUMP_TABLE_FOOTER` so the footer
+      instruction emits as a real AsmLine with the trailing BLOCK_V2
+      targets as :class:`InlineJumpEntry` openables.
+    * ``insn_emit_policy`` -- decided at finalize-time from the
+      latched + observed flags; replaces the legacy boolean
+      cross-product (A-L2 H2).
+    * ``insn_cursor`` -- index into :attr:`_RowSidecars.insn_runlength_row`;
+      consumed sequentially as BODY instructions start.
+    * ``slots_remaining_in_insn`` -- countdown to the next finalize
+      boundary; decremented per consumed slot, reaching 0 triggers
+      finalize-then-start at the next col.
+    * ``has_active_instruction`` -- True between
+      :func:`_start_new_instruction` and :func:`_finalize_instruction`
+      so :func:`close_current_section` can defensively force a
+      finalize before flushing items.
     """
 
     row: int = 0
@@ -116,6 +143,12 @@ class _WalkState(WalkSectionState):
     )
     insn_emit_policy: _InsnEmitPolicy = _InsnEmitPolicy.REAL
     saw_jump_table_this_insn: bool = False
+    current_insn_text_parts: list[str] = field(default_factory=list)
+    current_insn_openables: list[Openable] = field(default_factory=list)
+    current_insn_in_silent_header: bool = False
+    insn_cursor: int = 0
+    slots_remaining_in_insn: int = 0
+    has_active_instruction: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,12 +156,22 @@ class _RowSidecars:
     """Per-row sidecar slices threaded from :func:`_init_walk_state`
     to the per-col loop. Frozen so loop bodies never accidentally
     mutate the slice views.
+
+    ``insn_runlength_row`` carries per-instruction slot counts for the
+    BODY sections (cumulative across CTs); the driver advances
+    :attr:`_WalkState.insn_cursor` through it to size each new BODY
+    instruction's :attr:`_WalkState.slots_remaining_in_insn`. The
+    VARIANT_HEADER + FUNCTION_ID sections size every instruction at 1
+    slot (each token is its own atomic instruction at the variant
+    prefix / self-prepend layer), so they do NOT consume entries from
+    this array.
     """
 
     tokens_row: np.ndarray
     identities_row: np.ndarray
     numbers_sig: np.ndarray
     numbers_se: np.ndarray
+    insn_runlength_row: np.ndarray
     kind_to_called_idx_per_ct: list[Mapping[CallTargetType, list[int]]]
 
 
@@ -186,6 +229,7 @@ def _init_walk_state(
         identities_row=result.identities[id_lo:id_hi],
         numbers_sig=result.numbers_significant[num_lo:num_hi],
         numbers_se=result.numbers_sign_exponent[num_lo:num_hi],
+        insn_runlength_row=result.insn_runlength[i_lo:i_hi],
         kind_to_called_idx_per_ct=[
             partition_call_target_kinds(ct.type for ct in cts)
             for cts in call_targets_per_ct
