@@ -79,7 +79,7 @@ from tokenizer.inspector._render._protocol import (
     LineItem,
     Openable,
 )
-from tokenizer.inspector._render._token_text import substitute_mem_chars
+from tokenizer.inspector._render._token_text import substitute_display_chars
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.tokens import TokenType
 
@@ -108,12 +108,12 @@ def _render_insn_text(asm_like: str) -> str:
     :meth:`InsnTokenList.to_asm_like` joins each token's
     ``to_asm_like()`` output with single spaces; every token returns a
     single space-free atom, so splitting on ``" "`` recovers the atom
-    stream and :func:`substitute_mem_chars` swaps any MEM-operand
+    stream and :func:`substitute_display_chars` swaps any MEM-operand
     vocab-string/asm-value form for its polished display char (``[``,
     ``]``, ``+``, ``-``, ``*``, ``,``). FTL does NOT apply arch-prefix
     elision -- :meth:`PlatformTokenInner.to_asm_like` already strips it.
     """
-    return " ".join(substitute_mem_chars(atom) for atom in asm_like.split(" "))
+    return " ".join(substitute_display_chars(atom) for atom in asm_like.split(" "))
 
 
 # ---------------------------------------------------------------------------

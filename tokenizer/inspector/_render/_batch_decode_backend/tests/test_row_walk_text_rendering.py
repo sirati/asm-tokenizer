@@ -1,7 +1,7 @@
 """End-to-end tests for the BatchDecode INSTR_REP text rendering path.
 
 Single concern: pin the R2b integration -- the row walker's
-:func:`emit_instr_rep` composes :func:`substitute_mem_chars`
+:func:`emit_instr_rep` composes :func:`substitute_display_chars`
 (W3-3 W4-amended; the shared MEM-symbol display table) with
 :func:`strip_arch_prefix` (the BatchDecode-side arch elision
 helper) so the resulting :class:`AsmLine` text mirrors the FTL
@@ -135,7 +135,7 @@ def test_unified_family_prefix_elision() -> None:
 
 def test_mem_open_bracket_substitutes_to_display_char() -> None:
     """``MEM_OPEN_BRACKET`` vocab string substitutes to ``"["`` via
-    :func:`substitute_mem_chars`; the arch-prefix elision is a no-op
+    :func:`substitute_display_chars`; the arch-prefix elision is a no-op
     because the substituted text does not start with any prefix
     (W3-3 W4-amended substitution covers all SIX MEM symbols).
     """

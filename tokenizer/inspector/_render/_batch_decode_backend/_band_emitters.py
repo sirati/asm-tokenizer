@@ -24,7 +24,7 @@ from tokenizer.aligned_data.loader.decoded._number_render_collector import (
     AccumulatorEmission,
     _NumberAccumulator,
 )
-from tokenizer.inspector._render._token_text import substitute_mem_chars
+from tokenizer.inspector._render._token_text import substitute_display_chars
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
@@ -71,7 +71,7 @@ def emit_instr_rep(
 
     Two display transforms after the raw vocab-string lookup:
 
-    1. ``substitute_mem_chars`` collapses the six
+    1. ``substitute_display_chars`` collapses the six
        :class:`MemoryOperandSymbol` vocab strings (``MEM_OPEN_BRACKET``
        etc.) to their display chars (``[`` etc.) -- matches the FTL
        backend's display per cluster #3 of the W3-3 W4-amended plan.
@@ -91,7 +91,7 @@ def emit_instr_rep(
     """
     original_id = int(shifted_id) + _V2_RESERVED_DIGIT_COUNT
     raw = vocab_manager.get_token_str(original_id)
-    display = strip_arch_prefix(substitute_mem_chars(raw), arch_prefixes)
+    display = strip_arch_prefix(substitute_display_chars(raw), arch_prefixes)
     _consume_text_slot(state, text=display)
 
 

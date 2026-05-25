@@ -49,7 +49,7 @@ __all__ = [
 # SYNTAX ERROR (``[..."})``) + included phantom ``(`` / ``)`` atoms
 # that no MemoryOperandSymbol value produces today (A-L5 H3). Kept
 # tight to the actual atom set produced by
-# ``_MEM_DISPLAY_SUBSTITUTION`` + the per-token text renderer.
+# ``_DISPLAY_SUBSTITUTION`` + the per-token text renderer.
 _NO_SPACE_BEFORE: frozenset[str] = frozenset({",", "]"})
 _NO_SPACE_AFTER: frozenset[str] = frozenset({"["})
 

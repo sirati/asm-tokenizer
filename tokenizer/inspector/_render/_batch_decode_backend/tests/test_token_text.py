@@ -2,10 +2,10 @@
 
 Pins three invariants:
 
-* :data:`MEM_DISPLAY_SUBSTITUTION` covers every
+* :data:`DISPLAY_SUBSTITUTION` covers every
   :class:`MemoryOperandSymbol` member in BOTH its source forms
   (vocab-string ``MEM_OPEN_BRACKET`` AND asm-value ``mem[``).
-* :func:`substitute_mem_chars` returns the polished display char for
+* :func:`substitute_display_chars` returns the polished display char for
   every source form and passes through unknown atoms unchanged.
 * The module-load tripwire fires when the underlying dict drops a
   symbol -- the "fabricated vocab string" failure mode Wave-4 audit
@@ -24,8 +24,8 @@ import pytest
 
 from tokenizer.inspector._render import _token_text
 from tokenizer.inspector._render._token_text import (
-    MEM_DISPLAY_SUBSTITUTION,
-    substitute_mem_chars,
+    DISPLAY_SUBSTITUTION,
+    substitute_display_chars,
 )
 from tokenizer.tokens import MemoryOperandSymbol
 
@@ -60,8 +60,8 @@ def test_substitute_covers_every_memory_operand_symbol_vocab_form(
     vocab string; FTL emits the asm-value via ``Inner.to_asm_like``)."""
     assert symbol.token_str() == vocab_str
     assert str(symbol.value) == asm_value
-    assert substitute_mem_chars(vocab_str) == display
-    assert substitute_mem_chars(asm_value) == display
+    assert substitute_display_chars(vocab_str) == display
+    assert substitute_display_chars(asm_value) == display
 
 
 def test_substitute_passes_unknown_atoms_through() -> None:
@@ -69,7 +69,7 @@ def test_substitute_passes_unknown_atoms_through() -> None:
     ``v2:HEX`` etc.) MUST pass through unchanged. The substitution is
     purely additive on the six MEM-symbol source forms."""
     for atom in ("mov", "rax", "0xdeadbeef", "v2:42", "block_v2:7", ""):
-        assert substitute_mem_chars(atom) == atom
+        assert substitute_display_chars(atom) == atom
 
 
 def test_substitution_table_covers_every_symbol() -> None:
@@ -80,8 +80,8 @@ def test_substitution_table_covers_every_symbol() -> None:
     test (not just an import-time assert) if a future refactor moves
     the table out of module scope."""
     for symbol in MemoryOperandSymbol:
-        assert symbol.token_str() in MEM_DISPLAY_SUBSTITUTION
-        assert str(symbol.value) in MEM_DISPLAY_SUBSTITUTION
+        assert symbol.token_str() in DISPLAY_SUBSTITUTION
+        assert str(symbol.value) in DISPLAY_SUBSTITUTION
 
 
 def test_module_load_tripwire_fires_on_dropped_symbol(
