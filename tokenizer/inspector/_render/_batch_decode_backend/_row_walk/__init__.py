@@ -5,211 +5,29 @@ Single concern: translate one row of :attr:`BatchDecodeResult.tokens`
 LOCAL_FUNC self-prepend (Function ID), and per-basic-block BODY
 sections with the ``Block_Def`` + ``block_v2`` header pair consumed
 silently (the parent tree row's label already encodes the block
-index). Cursors ``id_cursor`` + ``num_cursor`` track per-row sidecar
-positions. The section state machine (open / close / per-col
-transitions) is factored into :mod:`._sections` so this module owns
-only the per-band emission concern. Plan reference:
-``inspector-render-backends.md`` §6 + decisions #16/#17/#18/#29/#30.
+index).
+
+The implementation is split across the subpackage submodules:
+
+* :mod:`._state` -- :class:`_WalkState` dataclass + per-instruction
+  :class:`_InsnEmitPolicy` enum + the ``Category -> CallTargetType``
+  reverse map.
+* :mod:`._instruction` -- per-instruction text accumulation +
+  bracket-aware text join (W3-11). Pre-paved for the R2c
+  per-instruction collector wiring.
+* :mod:`._dispatch` -- IDENTITY-band per-Category dispatch (block /
+  function / jump-table-footer).
+* :mod:`._driver` -- per-col loop + section transitions.
+
+Plan reference: ``inspector-render-backends.md`` §6 + decisions
+#16/#17/#18/#29/#30; ``inspector-followup.md`` W3-11 / W3-16 /
+A-L2 H1+H2 / cluster #5 (subpackage split).
 """
 
 from __future__ import annotations
 
-from typing import Callable, List, Mapping, Optional, Sequence
-
-from tokenizer.aligned_data.call_target_type import CallTargetType
-from tokenizer.aligned_data.loader.batch_decode._types import (
-    BatchDecodeResult,
-    SectionPointerSpec,
-)
-from tokenizer.aligned_data.matched_sections_bin import (
-    CallTarget,
-)
-from tokenizer.inspector._render._protocol import (
-    BlockKind,
-)
-from tokenizer.inspector._render._render_block import (
-    partition_call_target_kinds,
-)
-from tokenizer.token_manager import VocabularyManager
-
-from .._band import Band, classify_shifted_id
-from .._band_emitters import emit_instr_rep, emit_number
-from .._boundaries import call_target_starts, header_trigger_cols
-from .._fid_table import FidBaseTable
-from .._sections import (
-    RowSection,
-    close_current_section,
-    enter_variant_header_to_function_id,
-    maybe_advance_call_target,
-)
-from ._dispatch import _emit_identity
-from ._state import _WalkState
+from .._sections import RowSection
+from ._driver import render_row_blocks
 
 
 __all__ = ["RowSection", "render_row_blocks"]
-
-
-def _maybe_open_function_id_section(state: _WalkState, *, col: int) -> None:
-    """Open FUNCTION_ID at the root CT start col (VARIANT_HEADER ->
-    FUNCTION_ID). Subsequent FUNCTION_ID -> BODY transitions are
-    token-content-driven; see :func:`enter_body_after_function_id`.
-    """
-    if (
-        not state.ct_start_cols
-        or col != state.ct_start_cols[0]
-        or state.current_kind is not BlockKind.VARIANT_HEADER
-    ):
-        return
-    enter_variant_header_to_function_id(state)
-
-
-def _maybe_latch_header_trigger(state: _WalkState, *, col: int) -> None:
-    """Latch :attr:`pending_header` at runlength-derived trigger cols.
-
-    The actual BODY-block open is deferred to :func:`_handle_block`
-    when the upcoming BLOCK_V2 consumes the latch -- matches the
-    legacy walker's "no BLOCK_V2 = no new block" rule so jump-table
-    footer blocks (no BLOCK_V2 header) stay folded into the prior
-    BODY section. Latching is skipped while in VARIANT_HEADER /
-    FUNCTION_ID; those transitions own their own ``pending_header``
-    handling.
-    """
-    if col not in state.header_trigger_cols:
-        return
-    if state.current_kind in (BlockKind.VARIANT_HEADER, BlockKind.FUNCTION_ID):
-        return
-    state.pending_header = True
-
-
-def render_row_blocks(
-    *,
-    result: BatchDecodeResult,
-    row: int,
-    n_axis: int,
-    partial_cut_lengths: list[int],
-    call_targets_per_ct: Sequence[Sequence[CallTarget]],
-    vocab_manager: VocabularyManager,
-    fid_table: FidBaseTable,
-    line_to_name: Mapping[int, str],
-    line_to_provider: Mapping[int, str],
-    callee_arm_resolver: Callable[[int], Optional[SectionPointerSpec]],
-    arch_prefixes: tuple[str, ...] = (),
-) -> List[RowSection]:
-    """Walk one row and split into typed sections.
-
-    Section flow: pre-open VARIANT_HEADER (cols ``[0, n_axis)``); at
-    root CT start col transition to FUNCTION_ID; once the self-
-    prepend IDENTITY emits (or the first BLOCK_V2 IDENTITY in bare-
-    BLOCK_V2 test layouts), open BODY block 0 with ``pending_header``
-    set so the ``Block_Def`` + ``block_v2`` header pair is consumed
-    silently. Subsequent BODY blocks open at runlength-derived
-    :func:`header_trigger_cols`. Terminates on ``token == 0`` or
-    end-of-row. ``call_targets_per_ct`` carries each Stage1CallTarget's
-    own ``call_targets_section`` so inlined-callee call sites resolve
-    against THEIR table; ``callee_arm_resolver`` is the session-
-    backed ``_idx_for_section_offset`` closure (returns ``None`` for
-    cross-arm/missing; EXTERN call_targets always carry ``None``).
-    """
-    tokens_row = result.tokens[row]
-    id_lo, id_hi = int(result.identity_row_offsets[row]), int(result.identity_row_offsets[row + 1])
-    num_lo, num_hi = int(result.number_row_offsets[row]), int(result.number_row_offsets[row + 1])
-    identities_row = result.identities[id_lo:id_hi]
-    numbers_sig = result.numbers_significant[num_lo:num_hi]
-    numbers_se = result.numbers_sign_exponent[num_lo:num_hi]
-    if (
-        result.block_runlength is None
-        or result.block_runlength_row_offsets is None
-        or result.insn_runlength is None
-        or result.insn_runlength_row_offsets is None
-    ):
-        raise ValueError(
-            "render_row_blocks: BatchDecodeResult missing runlength "
-            "sidecars; call batch_decode with "
-            "emit_block_n_insns_runlength=True."
-        )
-    b_lo = int(result.block_runlength_row_offsets[row])
-    b_hi = int(result.block_runlength_row_offsets[row + 1])
-    i_lo = int(result.insn_runlength_row_offsets[row])
-    i_hi = int(result.insn_runlength_row_offsets[row + 1])
-    block_runlength_row = result.block_runlength[b_lo:b_hi]
-    insn_runlength_row = result.insn_runlength[i_lo:i_hi]
-    triggers = header_trigger_cols(
-        n_axis=n_axis,
-        partial_cut_lengths=partial_cut_lengths,
-        block_runlength_row=block_runlength_row,
-        insn_runlength_row=insn_runlength_row,
-    )
-    ct_start_cols = call_target_starts(
-        n_axis=n_axis, partial_cut_lengths=partial_cut_lengths,
-    )
-    # Pre-build per-CT kind partition (LOCAL/PLT/EXTERN -> indices).
-    kind_to_called_idx_per_ct: list[Mapping[CallTargetType, list[int]]] = [
-        partition_call_target_kinds(ct.type for ct in call_targets_section)
-        for call_targets_section in call_targets_per_ct
-    ]
-
-    state = _WalkState(
-        current_kind=BlockKind.VARIANT_HEADER,
-        current_block_idx=-1,
-        current_items=[],
-        completed=[],
-        ct_start_cols=ct_start_cols,
-        header_trigger_cols=triggers,
-        row=row, n_axis=n_axis,
-    )
-
-    n_cols = int(tokens_row.shape[0])
-    for col in range(n_cols):
-        state.current_col = col
-        _maybe_open_function_id_section(state, col=col)
-        _maybe_latch_header_trigger(state, col=col)
-        maybe_advance_call_target(state, col=col)
-        shifted_id = int(tokens_row[col])
-        if shifted_id == 0:
-            break  # null-content padding tail
-        band = classify_shifted_id(shifted_id)
-        if band is Band.INSTR_REP:
-            if state.pending_header:
-                # ``Block_Def`` carrier -- absorbed silently so the
-                # BODY section's first emitted item is the first
-                # real instruction.
-                state.last_number_shifted_id = -1
-                continue
-            emit_instr_rep(
-                state.current_items,
-                shifted_id=shifted_id,
-                vocab_manager=vocab_manager,
-                arch_prefixes=arch_prefixes,
-            )
-            state.last_number_shifted_id = -1
-        elif band is Band.NUMBER:
-            state.num_cursor = emit_number(
-                state.current_items,
-                shifted_id=shifted_id,
-                numbers_sig=numbers_sig,
-                numbers_se=numbers_se,
-                num_cursor=state.num_cursor,
-                last_number_shifted_id=state.last_number_shifted_id,
-            )
-            state.last_number_shifted_id = int(shifted_id)
-        elif band is Band.IDENTITY:
-            _emit_identity(
-                state,
-                shifted_id=shifted_id,
-                identities_row=identities_row,
-                fid_table=fid_table,
-                line_to_name=line_to_name,
-                line_to_provider=line_to_provider,
-                call_targets_per_ct=call_targets_per_ct,
-                kind_to_called_idx_per_ct=kind_to_called_idx_per_ct,
-                callee_arm_resolver=callee_arm_resolver,
-            )
-            state.last_number_shifted_id = -1
-        else:
-            raise ValueError(
-                f"render_row_blocks: unexpected Band {band!r} at "
-                f"row={row}, col={col} (shifted_id={shifted_id})"
-            )
-
-    close_current_section(state)
-    return state.completed
