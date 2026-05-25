@@ -748,7 +748,11 @@ def test_undo_state_consumed_after_one_use():
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
                 # Use a collapsed expandable child so the post-undo
-                # second ``→`` exercises the expand fallback.
+                # second ``→`` exercises the expand fallback. A second
+                # sentinel sibling AsmLeaf keeps the FunctionNode's
+                # child count at 2 so the universal "auto-expand on
+                # exactly one child" rule does not pre-expand
+                # ``short_block`` and defeat the collapsed-state setup.
                 short_block = BlockNode(
                     factory=MagicMock(),
                     backend=MagicMock(),
@@ -758,8 +762,11 @@ def test_undo_state_consumed_after_one_use():
                     preview="x",
                 )
                 short_block.expand = MagicMock(return_value=[])
+                sentinel_sibling = AsmLeaf(text="sentinel")
                 tree, fn_tree_node, children = (
-                    await _expand_function_with_children(app, pilot, [short_block])
+                    await _expand_function_with_children(
+                        app, pilot, [short_block, sentinel_sibling]
+                    )
                 )
                 child_tree_node = children[0]
 

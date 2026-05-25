@@ -35,6 +35,7 @@ from tokenizer.inspector._tree_model import (
 from tokenizer.variant_info import VariantIdentity
 
 from . import _order_hooks
+from ._auto_expand import auto_expand_lone_child
 from ._help_dialog import HelpScreen
 from ._labels import _compose_label
 from ._order import OrderConfig, OrderResult
@@ -251,6 +252,15 @@ class InspectorApp(App[None]):
         # NodeExpanded asynchronously, so the walk descends across the
         # potentially-many-deep group tree without polling).
         _order_hooks.consume_auto_expand_post_mount(self, node, model)
+
+        # Universal "no selection when only one option" rule: delegated
+        # to :mod:`._auto_expand`. Single-concern: that module owns the
+        # UI policy (click-through-on-1-child); this dispatcher only
+        # invokes it post-mount. The cascade is naturally recursive
+        # because :meth:`TreeNode.expand` posts a
+        # :class:`Tree.NodeExpanded` that re-enters here for the
+        # auto-expanded child.
+        auto_expand_lone_child(node)
 
     # Horizontal-scroll concerns (editor-like per-row scroll memory +
     # cursor-aware auto-adjust + conditional right-arrow expand) live
