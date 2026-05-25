@@ -5,9 +5,12 @@ Expandable only when the callee is LOCAL and the
 :class:`SectionPointerSpec`; PLT / EXTERN have no body to inline.
 Expansion constructs a synthetic callee :class:`FunctionNode` against
 the same :class:`BackendFactory` the parent tree-open used; the
-returned variants are matched against ``self.variant_idx`` and the
-unmatched variants are bundled under a :class:`ShowAllVariantsNode`
-sibling (per plan section 4).
+matching variant's blocks are surfaced DIRECTLY (skipping the
+intermediate variant-list level, per plan decision D2) and the other
+variants are bundled under a :class:`ShowAllVariantsNode` sibling.
+The fallback path (caller's pin not in the callee's surviving set,
+e.g. ``MISSING_VARIANT_INDEX``) is to surface every variant as a
+sibling, matching the pre-D2 contract.
 """
 
 from __future__ import annotations
@@ -68,20 +71,22 @@ class InlineCallNode:
         )
 
     def expand(self) -> list:
-        """Open the callee + surface the matching variant + others.
+        """Open the callee + inline the matching variant's blocks.
 
         Constructs a synthetic :class:`FunctionNode` against the same
         factory; ``expand`` on that node returns one
         :class:`VariantNode` per callee variant. The variant whose
         ``variant_idx`` equals ``self.variant_idx`` is the row the
-        caller pinned to; the others are bundled under a
-        :class:`ShowAllVariantsNode` sibling.
+        caller pinned to — its blocks are spliced in DIRECTLY as the
+        InlineCallNode's children, skipping the intermediate variant-
+        list level (plan decision D2). The other variants are bundled
+        under a :class:`ShowAllVariantsNode` sibling appended after
+        the spliced blocks so they remain reachable.
 
         When the caller's variant is not in the callee's surviving
         set (e.g. ``MISSING_VARIANT_INDEX`` -- the callee dropped that
-        variant), the fallback is to surface all variants directly,
-        matching the pre-Wave-5 ``_find_matching_variant_index``
-        behaviour.
+        variant), the fallback is to surface every variant directly
+        as VariantNode siblings, matching the pre-D2 contract.
         """
         from ._nodes_function import FunctionNode
         from ._nodes_leaf import ShowAllVariantsNode
@@ -106,14 +111,20 @@ class InlineCallNode:
         others = tuple(
             v for i, v in enumerate(all_variants) if i != matched_idx_in_list
         )
-        if not others:
-            return [matched]
-        return [
-            matched,
-            ShowAllVariantsNode(
-                label="show all variants", other_variants=others
-            ),
-        ]
+        # Splice the matched variant's blocks in directly (D2: skip the
+        # intermediate variant-list level for the pinned variant). The
+        # callee's :class:`FunctionNode` already owns the
+        # :class:`RenderBackend` instance the :class:`VariantNode` was
+        # threaded with, so ``matched.expand()`` resolves blocks via
+        # the same backend cache — no extra factory.make call.
+        children: list = list(matched.expand())
+        if others:
+            children.append(
+                ShowAllVariantsNode(
+                    label="show all variants", other_variants=others
+                )
+            )
+        return children
 
 
 def _find_matching_variant_index(
