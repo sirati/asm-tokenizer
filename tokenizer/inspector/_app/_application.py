@@ -26,10 +26,7 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
 
 from shared.logging_utils import setup_file_logger
-from tokenizer.inspector._label import (
-    aligned_variant_labels,
-    variant_natural_sort_key,
-)
+from tokenizer.inspector._label import aligned_variant_labels
 from tokenizer.inspector._tree_model import (
     FunctionNode,
     Node,
@@ -64,27 +61,8 @@ _LOGGER_NAME = "tokenizer.inspector"
 
 
 # ---------------------------------------------------------------------------
-# Variant sibling-set natural sort + column alignment
+# Variant sibling-set column alignment (sort lives in _order_hooks.apply_grouping)
 # ---------------------------------------------------------------------------
-
-
-def _sort_variants_naturally(children: list[Node]) -> None:
-    """Sort a homogeneous :class:`VariantNode` sibling set in-place by
-    :func:`variant_natural_sort_key` (so ``v10`` sorts AFTER ``v9``).
-
-    Single concern: natural sort across the immediate sibling set. The
-    sort runs BEFORE :func:`_stamp_aligned_variant_labels` so the
-    aligned-label column widths are computed in display order. Mixed
-    sibling sets are a no-op (sort order across heterogeneous kinds
-    is not well-defined here).
-    """
-    if not children or not all(isinstance(c, VariantNode) for c in children):
-        return
-    children.sort(
-        key=lambda node: variant_natural_sort_key(
-            node.label_axes  # type: ignore[union-attr]  # narrowed by isinstance guard
-        )
-    )
 
 
 def _stamp_aligned_variant_labels(children: list[Node]) -> None:
@@ -247,18 +225,16 @@ class InspectorApp(App[None]):
             node.refresh()
             return
 
-        _sort_variants_naturally(children)
-        _stamp_aligned_variant_labels(children)
-        # Grouping pass: when the expanded model owns a variant list
-        # (FunctionNode / ShowAllVariantsNode) and an OrderConfig is
-        # active, route the variants through :func:`group_variants`
-        # at the :mod:`._order` boundary -- :class:`FunctionNode.expand`
-        # stays unchanged (cluster #6 W4-AMENDED). The sort + align
-        # passes above act on the flat variant list before grouping
-        # restructures it; the variant objects retain their stamped
-        # ``aligned_label`` across grouping (groups wrap the same
-        # variant instances).
+        # Sort + group pass: :func:`_order_hooks.apply_grouping` natsort-
+        # orders the variant siblings (always, with or without an active
+        # ``OrderConfig``) and optionally restructures them into
+        # :class:`VariantGroupNode`s when grouping axes are configured.
+        # :class:`FunctionNode.expand` stays unchanged (cluster #6 W4-
+        # AMENDED). The alignment stamp below runs AFTER grouping so it
+        # acts on the per-group sibling set when grouping is active and
+        # on the flat sorted set otherwise.
         children = _order_hooks.apply_grouping(self, model, children)
+        _stamp_aligned_variant_labels(children)
 
         for child in children:
             node.add(

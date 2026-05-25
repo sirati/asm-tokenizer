@@ -35,8 +35,7 @@ the assert below — same tripwire discipline as the prefixes module.
 
 from __future__ import annotations
 
-import re
-from typing import Mapping, Optional, Sequence, Tuple, Union
+from typing import Mapping, Optional, Sequence
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.variant_tokens.prefixes import (
@@ -52,7 +51,6 @@ __all__ = [
     "aligned_variant_labels",
     "variant_label",
     "variant_label_from_axes",
-    "variant_natural_sort_key",
     "function_label",
     "block_preview",
     "resolve_function_name_for_fid",
@@ -146,53 +144,6 @@ def variant_label_from_axes(
     :data:`_MISSING_NAME` (``"?"``).
     """
     return " ".join(_axis_value_strings(label_axes))
-
-
-# Natural-sort key: split a string into alternating (text, int) parts
-# so ``v10`` sorts AFTER ``v9`` (vs lexicographic where ``v10`` < ``v9``).
-# Digit sub-strings convert to ``int``; the leading/trailing/separator
-# text stays as-is. Empty-string placeholder where a row's axis value is
-# missing — sorts first under the missing-axes-first convention.
-_NATSORT_SPLIT = re.compile(r"(\d+)")
-
-
-def _natural_sort_key(value: Optional[str]) -> Tuple[Union[int, str], ...]:
-    """Return a natsort key tuple for one axis value.
-
-    Splits ``value`` on digit-runs; digit substrings become ``int``,
-    text substrings stay as ``str`` lower-cased (case-insensitive sort
-    so ``Clang`` and ``clang`` co-sort). ``None`` (missing axis) sorts
-    first via a sentinel empty tuple.
-    """
-    if value is None:
-        return ()
-    parts: list[Union[int, str]] = []
-    for part in _NATSORT_SPLIT.split(value):
-        if not part:
-            continue
-        if part.isdigit():
-            parts.append(int(part))
-        else:
-            parts.append(part.lower())
-    return tuple(parts)
-
-
-def variant_natural_sort_key(
-    label_axes: Mapping[str, Optional[str]],
-) -> Tuple[Tuple[Union[int, str], ...], ...]:
-    """Multi-axis natural-sort key for a variant's :attr:`label_axes`.
-
-    Single concern: produce the comparable key for sorting a variant
-    sibling set in the canonical :data:`POSITIONAL_PREFIXES` order so
-    ``v10`` sorts AFTER ``v9``. The tuple shape preserves Python's
-    lexicographic tuple compare while individual axis values use
-    :func:`_natural_sort_key` for the digit-aware ordering. Missing
-    axes sort first (empty inner tuple).
-    """
-    return tuple(
-        _natural_sort_key(label_axes.get(prefix))
-        for prefix in POSITIONAL_PREFIXES
-    )
 
 
 def aligned_variant_labels(

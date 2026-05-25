@@ -32,6 +32,8 @@ import natsort
 from tokenizer.inspector._render._protocol import RenderedVariant
 from tokenizer.inspector._tree_model import VariantNode
 
+from tokenizer.variant_tokens.prefixes import POSITIONAL_PREFIXES
+
 from ._axes import AxisDescriptor, OrderConfig, extract_axis_value
 
 
@@ -39,6 +41,7 @@ __all__ = [
     "VariantGroupNode",
     "format_grouping_label",
     "group_variants",
+    "sort_variants_flat",
 ]
 
 
@@ -119,6 +122,35 @@ def format_grouping_label(axis: AxisDescriptor, value: str) -> str:
 # ---------------------------------------------------------------------------
 # Grouping pass
 # ---------------------------------------------------------------------------
+
+
+def sort_variants_flat(
+    variants: Sequence[VariantNode],
+) -> List[VariantNode]:
+    """Sort variants in-canonical-axes-order using the same natsort key
+    that :func:`group_variants` uses, but without any grouping pass.
+
+    Used at the App boundary when no :class:`OrderConfig` is active so
+    the user-visible variant siblings still come out naturally sorted
+    (``v9`` before ``v10``; ``arm32`` before ``arm64``; ``x64`` before
+    ``x86``; ...). Sole source of truth for "default natural variant
+    sort" — :mod:`tokenizer.inspector._label` no longer re-implements
+    this with a hand-rolled regex (cluster M-2 / M1 audit findings).
+
+    Reads :attr:`VariantNode.label_axes` directly (no need for the
+    full :class:`RenderedVariant` side-table since :data:`POSITIONAL_PREFIXES`
+    fully determines the default sort).
+    """
+    if not variants:
+        return []
+
+    def _key(v: VariantNode) -> tuple:
+        return tuple(
+            _natsort_key_with_missing_last(v.label_axes.get(prefix))
+            for prefix in POSITIONAL_PREFIXES
+        )
+
+    return sorted(variants, key=_key)
 
 
 def group_variants(

@@ -34,6 +34,7 @@ from ._grouping import (
     VariantGroupNode,
     format_grouping_label,
     group_variants,
+    sort_variants_flat,
 )
 
 
@@ -53,6 +54,7 @@ __all__ = [
     "extract_axis_value",
     "format_grouping_label",
     "group_variants",
+    "sort_variants_flat",
 ]
 
 

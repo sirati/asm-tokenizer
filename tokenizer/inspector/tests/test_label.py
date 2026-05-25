@@ -21,7 +21,6 @@ from tokenizer.inspector._label import (
     resolve_function_name_for_fid,
     variant_label,
     variant_label_from_axes,
-    variant_natural_sort_key,
 )
 from tokenizer.variant_tokens.prefixes import (
     ARCH_PREFIX,
@@ -382,86 +381,3 @@ def test_aligned_variant_labels_preserves_input_order():
     assert aligned[0].startswith("z80")
     assert aligned[1].startswith("aaa")
     assert aligned[2].startswith("mid")
-
-
-# ---------------------------------------------------------------------------
-# variant_natural_sort_key
-# ---------------------------------------------------------------------------
-
-
-def test_variant_natural_sort_key_orders_v9_before_v10() -> None:
-    """Digit-aware sort: ``v9`` precedes ``v10`` despite lexicographic
-    ``v10 < v9`` (string compare). Pins the headline natsort case."""
-    k_v9 = variant_natural_sort_key(_axes("x86", "gcc", "9", "-O3"))
-    k_v10 = variant_natural_sort_key(_axes("x86", "gcc", "10", "-O3"))
-    assert k_v9 < k_v10
-
-
-def test_variant_natural_sort_key_orders_v3_5_between_v3_and_v4() -> None:
-    """Multi-digit-run sort: ``v3.5`` is between ``v3`` and ``v4``."""
-    k_v3 = variant_natural_sort_key(_axes("x86", "clang", "3", "-O0"))
-    k_v3_5 = variant_natural_sort_key(_axes("x86", "clang", "3.5", "-O0"))
-    k_v4 = variant_natural_sort_key(_axes("x86", "clang", "4", "-O0"))
-    assert k_v3 < k_v3_5 < k_v4
-
-
-def test_variant_natural_sort_key_arch_sorts_naturally() -> None:
-    """Arch axis sort: ``arm32`` < ``arm64``, ``x64`` < ``x86``."""
-    keys = [
-        variant_natural_sort_key(_axes(arch, "gcc", "5", "-O0"))
-        for arch in ("x86", "arm64", "arm32", "x64")
-    ]
-    archs_sorted = [a for _, a in sorted(zip(keys, ("x86", "arm64", "arm32", "x64")))]
-    assert archs_sorted == ["arm32", "arm64", "x64", "x86"]
-
-
-def test_variant_natural_sort_key_case_insensitive() -> None:
-    """Compiler axis sort: ``Clang`` and ``clang`` co-sort (case-fold)."""
-    k_clang_lower = variant_natural_sort_key(_axes("x86", "clang", "5", "-O0"))
-    k_clang_upper = variant_natural_sort_key(_axes("x86", "Clang", "5", "-O0"))
-    assert k_clang_lower == k_clang_upper
-
-
-def test_variant_natural_sort_key_missing_axis_sorts_first() -> None:
-    """A missing axis (None) sorts BEFORE any present value at the same
-    position so partial-axis variants don't get scattered."""
-    k_complete = variant_natural_sort_key(_axes("x86", "gcc", "5", "-O0"))
-    k_missing_cver = variant_natural_sort_key(
-        {ARCH_PREFIX: "x86", COMP_PREFIX: "gcc", CVER_PREFIX: None, OPT_PREFIX: "-O0"}
-    )
-    assert k_missing_cver < k_complete
-
-
-def test_variant_natural_sort_key_user_reported_scrambled_list_sorts() -> None:
-    """Pins the user-reported scrambled ncat::Calloc variant list: after
-    sort, all variants come out in natural-axis order."""
-    raw = [
-        ("arm32", "gcc", "5", "-O0"),
-        ("x86", "clang", "7", "-O3"),
-        ("x86", "clang", "3.5", "-O2"),
-        ("x86", "gcc", "5", "-Os"),
-        ("x64", "clang", "3.5", "-Os"),
-        ("mips64", "gcc", "9", "-O3"),
-        ("arm32", "gcc", "5", "-O3"),
-        ("arm64", "clang", "5.0", "-O0"),
-        ("arm32", "gcc", "4.8", "-O0"),
-        ("arm64", "gcc", "4.8", "-O3"),
-        ("mips64", "clang", "9", "-Os"),
-    ]
-    sorted_raw = sorted(raw, key=lambda t: variant_natural_sort_key(_axes(*t)))
-    # First sort key: arch. arm32 < arm64 < mips64 < x64 < x86.
-    archs = [t[0] for t in sorted_raw]
-    assert archs == [
-        "arm32", "arm32", "arm32",
-        "arm64", "arm64",
-        "mips64", "mips64",
-        "x64",
-        "x86", "x86", "x86",
-    ]
-    # Within arm32: gcc 4.8 -O0 < gcc 5 -O0 < gcc 5 -O3.
-    arm32 = [t for t in sorted_raw if t[0] == "arm32"]
-    assert arm32 == [
-        ("arm32", "gcc", "4.8", "-O0"),
-        ("arm32", "gcc", "5", "-O0"),
-        ("arm32", "gcc", "5", "-O3"),
-    ]

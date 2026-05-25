@@ -37,6 +37,7 @@ from ._order import (
     build_extra_meta_axis,
     discover_extra_meta_keys,
     group_variants,
+    sort_variants_flat,
 )
 
 
@@ -109,16 +110,17 @@ def apply_grouping(
     model: Node,
     children: Sequence[Node],
 ) -> Sequence[Node]:
-    """Route variant-producing nodes through :func:`group_variants`.
+    """Route variant-producing nodes through the sort + grouping pass.
 
-    Other node kinds pass through untouched. The pass needs a
-    ``variant_idx -> RenderedVariant`` lookup; the variants list is
-    :meth:`RenderBackend.variants`-memoised so re-fetching it here is
-    cheap (no second walk).
+    Other node kinds pass through untouched. When :attr:`InspectorApp._order_config`
+    is ``None``, the variants are still natsort-ordered via
+    :func:`sort_variants_flat` so the user-visible sibling order remains
+    ``v9`` before ``v10`` (etc.) even before the user opens the Order
+    dialog. When an :class:`OrderConfig` is active, :func:`group_variants`
+    owns both sort + partition. Single sort path (cluster M-2 / M1
+    audit findings — no longer a duplicate hand-rolled regex in
+    :mod:`tokenizer.inspector._label`).
     """
-    config = app._order_config
-    if config is None:
-        return children
     if not isinstance(model, (FunctionNode, ShowAllVariantsNode)):
         return children
     if not children:
@@ -126,6 +128,9 @@ def apply_grouping(
     first = children[0]
     if not isinstance(first, VariantNode):
         return children
+    config = app._order_config
+    if config is None:
+        return list(sort_variants_flat(children))  # type: ignore[arg-type]
     rendered_by_variant = _rendered_by_variant_lookup(first.backend)
     grouped = group_variants(list(children), rendered_by_variant, config)
     return list(grouped)
