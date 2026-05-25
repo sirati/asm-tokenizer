@@ -41,6 +41,14 @@ class VariantNode:
     backend: "RenderBackend"
     variant_idx: int
     label_axes: Mapping[str, Optional[str]]
+    # Pre-computed sibling-aware aligned label string; set by the UI
+    # layer (``_application._on_node_expanded``) when constructing the
+    # full sibling set of a function's variants so that axis values
+    # column-align across siblings. ``None`` for nodes constructed
+    # outside a sibling-set context — the label dispatcher falls back
+    # to :func:`tokenizer.inspector._label.variant_label_from_axes`,
+    # preserving backward compatibility with single-variant test setups.
+    aligned_label: Optional[str] = None
     is_failed: bool = False
     can_expand: bool = field(default=True, init=False)
     # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.

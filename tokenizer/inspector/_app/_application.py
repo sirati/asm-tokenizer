@@ -26,9 +26,11 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
 
 from shared.logging_utils import setup_file_logger
+from tokenizer.inspector._label import aligned_variant_labels
 from tokenizer.inspector._tree_model import (
     FunctionNode,
     Node,
+    VariantNode,
 )
 
 from ._labels import _compose_label
@@ -52,6 +54,35 @@ _ERR_STYLE = Style(color="red", dim=True)
 # the asm-tokenizer's existing logging config don't fight over
 # handlers. The file handler is attached in ``_setup_inspector_log``.
 _LOGGER_NAME = "tokenizer.inspector"
+
+
+# ---------------------------------------------------------------------------
+# Variant sibling-set column alignment
+# ---------------------------------------------------------------------------
+
+
+def _stamp_aligned_variant_labels(children: list[Node]) -> None:
+    """Stamp ``VariantNode.aligned_label`` across a sibling set.
+
+    Single concern: when an expand handler hands back a homogeneous
+    sibling set of :class:`VariantNode` (the FunctionNode -> variants
+    case today; grouped sub-sets when a future :class:`VariantGroupNode`
+    lands), compute the per-axis-column-padded label for each variant
+    and stamp it onto the node so :func:`_compose_label` reads the
+    pre-aligned form. Mixed sibling sets are a no-op (column-alignment
+    is only well-defined within a single set of variants).
+
+    Threading the aligned string through a node-side field keeps the
+    label dispatcher (:func:`_compose_label`) per-node and unaware of
+    the sibling set — preserving its single-concern shape.
+    """
+    variants = [c for c in children if isinstance(c, VariantNode)]
+    if len(variants) != len(children) or not variants:
+        # Heterogeneous (or empty) sibling set: nothing to align.
+        return
+    aligned = aligned_variant_labels([v.label_axes for v in variants])
+    for variant, label in zip(variants, aligned):
+        variant.aligned_label = label
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +201,7 @@ class InspectorApp(App[None]):
             node.refresh()
             return
 
+        _stamp_aligned_variant_labels(children)
         for child in children:
             node.add(
                 _compose_label(child),

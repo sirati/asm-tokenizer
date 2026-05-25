@@ -411,3 +411,84 @@ def test_expand_error_path_marks_is_failed_via_app_dispatcher():
     # Tree node should have had its error-leaf attached + refresh called.
     tree_node.add_leaf.assert_called_once()
     tree_node.refresh.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Sibling-set column alignment: the dispatcher stamps ``aligned_label``
+# on the variants returned by FunctionNode.expand so axis values align
+# in columns across siblings.
+# ---------------------------------------------------------------------------
+
+
+def test_function_expand_via_dispatcher_stamps_aligned_variant_labels():
+    """End-to-end pilot: a FunctionNode with multi-width axis values
+    across siblings flows through the central expand dispatcher and the
+    resulting :class:`VariantNode` children carry pre-aligned labels
+    with per-axis columns padded to the sibling-set max."""
+    pytest.importorskip("textual")
+
+    import types as _types
+    from pathlib import Path
+    import tempfile
+
+    from tokenizer.inspector._app import InspectorApp
+
+    # Build two variants with different per-axis widths: arch col widens
+    # to 5 (arm32 vs x86), comp col widens to 5 (gcc vs clang).
+    def _axes(arch: str, comp: str, cver: str, opt: str):
+        return _types.MappingProxyType(
+            {
+                ARCH_PREFIX: arch,
+                COMP_PREFIX: comp,
+                CVER_PREFIX: cver,
+                OPT_PREFIX: opt,
+            }
+        )
+
+    rendered_variants = [
+        RenderedVariant(
+            variant_idx=0,
+            label_axes=_axes("arm32", "gcc", "5", "O0"),
+            extra_metadata=_types.MappingProxyType({}),
+            variant_identity=VariantIdentity(
+                arch="arm32", compiler="gcc", compiler_version="5",
+                opt="O0", pkg="", variant_id=0,
+            ),
+        ),
+        RenderedVariant(
+            variant_idx=1,
+            label_axes=_axes("x86", "clang", "7", "O3"),
+            extra_metadata=_types.MappingProxyType({}),
+            variant_identity=VariantIdentity(
+                arch="x86", compiler="clang", compiler_version="7",
+                opt="O3", pkg="", variant_id=1,
+            ),
+        ),
+    ]
+    backend = MagicMock(spec=RenderBackend)
+    backend.handle = _make_handle()
+    backend.closed = False
+    backend.variants.return_value = rendered_variants
+    factory = _make_factory(backend)
+    handle = _make_handle()
+    fn = FunctionNode(factory=factory, handle=handle)
+
+    captured: list = []
+
+    tree_node = MagicMock(name="TreeNode")
+    tree_node.data = fn
+    tree_node.add = lambda _label, data, allow_expand: captured.append(data)
+    event = MagicMock(name="NodeExpanded")
+    event.node = tree_node
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "inspector.log"
+        app = InspectorApp(factory=factory, log_path=log_path)
+        app._on_node_expanded(event)
+
+    assert len(captured) == 2
+    assert all(isinstance(v, VariantNode) for v in captured)
+    # Aligned labels: arch col = 5, comp col = 5, cver col = 2; -opt
+    # trailing column unpadded. See aligned_variant_labels unit tests.
+    assert captured[0].aligned_label == "arm32 gcc   v5 -O0"
+    assert captured[1].aligned_label == "x86   clang v7 -O3"
