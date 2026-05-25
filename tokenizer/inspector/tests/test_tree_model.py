@@ -513,6 +513,142 @@ def test_inline_call_expand_missing_variant_falls_back_to_all_variants():
     assert [c.variant_idx for c in children] == [0, 1, 2]
 
 
+def test_inline_call_expand_falls_back_to_caller_variant_when_pin_missing():
+    """``caller_variant_idx`` rescues the no-pin case (e.g. Function-ID
+    self-references) by defaulting the inline-call to the caller's own
+    variant — instead of surfacing the full variant list as
+    :class:`VariantNode` siblings. Pins :attr:`variant_idx` to
+    :data:`MISSING_VARIANT_INDEX` and :attr:`caller_variant_idx` to a
+    valid callee variant; the expand result must splice that variant's
+    blocks directly + bundle the rest under :class:`ShowAllVariantsNode`.
+    """
+    from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
+
+    callee_backend = _make_backend(n_variants=3, n_blocks=2)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=MISSING_VARIANT_INDEX,  # no callee-side pin
+        provider=None,
+        caller_variant_idx=2,  # but caller's variant is known
+    )
+
+    children = node.expand()
+
+    # Splice the caller's variant (idx 2) directly; others go in the
+    # ShowAllVariantsNode bundle.
+    block_children = [c for c in children if isinstance(c, BlockNode)]
+    show_all_children = [c for c in children if isinstance(c, ShowAllVariantsNode)]
+    assert len(block_children) == 2
+    assert all(c.variant_idx == 2 for c in block_children)
+    assert len(show_all_children) == 1
+    other_idxs = sorted(v.variant_idx for v in show_all_children[0].other_variants)
+    assert other_idxs == [0, 1]
+
+
+def test_inline_call_expand_prefers_explicit_pin_over_caller_fallback():
+    """When both :attr:`variant_idx` and :attr:`caller_variant_idx`
+    are present and differ, the explicit callee-side pin wins. The
+    caller fallback only activates when the pin is
+    :data:`MISSING_VARIANT_INDEX`.
+    """
+    callee_backend = _make_backend(n_variants=3, n_blocks=2)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=1,  # explicit pin
+        provider=None,
+        caller_variant_idx=2,  # caller fallback (should be ignored)
+    )
+
+    children = node.expand()
+
+    block_children = [c for c in children if isinstance(c, BlockNode)]
+    assert all(c.variant_idx == 1 for c in block_children)
+
+
+def test_inline_call_expand_both_missing_surfaces_all_variants():
+    """Both :attr:`variant_idx` AND :attr:`caller_variant_idx`
+    :data:`MISSING_VARIANT_INDEX` -> no pinned variant resolves;
+    fallback surfaces every callee variant as a
+    :class:`VariantNode` sibling, matching the pre-D2 contract.
+    """
+    from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
+
+    callee_backend = _make_backend(n_variants=3, n_blocks=1)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=MISSING_VARIANT_INDEX,
+        provider=None,
+        caller_variant_idx=MISSING_VARIANT_INDEX,
+    )
+
+    children = node.expand()
+
+    assert len(children) == 3
+    assert all(isinstance(c, VariantNode) for c in children)
+    assert [c.variant_idx for c in children] == [0, 1, 2]
+
+
+def test_inline_call_expand_caller_pin_not_in_callee_surviving_set():
+    """Cross-arm edge case: the caller's variant_idx may not be in the
+    callee's surviving set (e.g. the callee dropped that variant
+    via vkey filter). Pin is :data:`MISSING_VARIANT_INDEX`, fallback
+    caller idx is 99 (not present in callee {0, 1, 2}). Result must
+    fall through to the all-variants surface — never a KeyError, never
+    a partial splice.
+    """
+    from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
+
+    callee_backend = _make_backend(n_variants=3, n_blocks=1)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=MISSING_VARIANT_INDEX,
+        provider=None,
+        caller_variant_idx=99,  # not in callee's surviving set
+    )
+
+    children = node.expand()
+
+    assert len(children) == 3
+    assert all(isinstance(c, VariantNode) for c in children)
+    assert [c.variant_idx for c in children] == [0, 1, 2]
+
+
 # ---------------------------------------------------------------------------
 # AsmLeaf -- terminal, gating on ``can_expand``.
 # ---------------------------------------------------------------------------

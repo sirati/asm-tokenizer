@@ -172,6 +172,7 @@ def _handle_function_category(
             callee_section_pointer=callee_section_pointer,
             variant_idx=MISSING_VARIANT_INDEX,
             provider=provider,
+            caller_variant_idx=state.caller_variant_idx,
         ),
         placeholder_text=inline_call_label(
             kind=call_kind,

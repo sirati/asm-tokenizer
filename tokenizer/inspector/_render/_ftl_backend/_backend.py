@@ -188,6 +188,7 @@ class FtlBackend:
             section=state.view,
             kind_to_called_idx=state.kind_to_called_idx,
             variant_pins={},
+            caller_variant_idx=variant_idx,
             line_to_name=state.line_to_name,
             line_to_provider=state.line_to_provider,
             callee_arm_resolver=_no_callee_arm,

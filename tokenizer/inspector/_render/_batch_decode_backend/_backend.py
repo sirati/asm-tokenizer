@@ -306,6 +306,7 @@ class BatchDecodeBackend:
         walked = render_row_blocks(
             result=self._result,
             row=row,
+            caller_variant_idx=variant_idx,
             n_axis=n_axis,
             partial_cut_lengths=pcl,
             call_targets_per_ct=call_targets_per_ct,

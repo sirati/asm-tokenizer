@@ -28,7 +28,10 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
 from tokenizer.aligned_data.loader.decoded._number_render_collector import (
     _NumberAccumulator,
 )
-from tokenizer.aligned_data.matched_sections_bin import CallTarget
+from tokenizer.aligned_data.matched_sections_bin import (
+    MISSING_VARIANT_INDEX,
+    CallTarget,
+)
 from tokenizer.inspector._render._protocol import BlockKind, Openable
 from tokenizer.inspector._render._render_block import (
     partition_call_target_kinds,
@@ -135,6 +138,12 @@ class _WalkState(WalkSectionState):
 
     row: int = 0
     n_axis: int = 0
+    # variant_idx of the row being walked; threaded onto every emitted
+    # :class:`InlineCallEntry`'s ``caller_variant_idx`` so InlineCall
+    # expand can default to the caller's variant when the callee's
+    # vkey pin is :data:`MISSING_VARIANT_INDEX` (e.g. Function-ID
+    # self-references).
+    caller_variant_idx: int = MISSING_VARIANT_INDEX
     id_cursor: int = 0
     num_cursor: int = 0
     current_col: int = 0
@@ -179,6 +188,7 @@ def _init_walk_state(
     *,
     result: BatchDecodeResult,
     row: int,
+    caller_variant_idx: int,
     n_axis: int,
     partial_cut_lengths: list[int],
     call_targets_per_ct: Sequence[Sequence[CallTarget]],
@@ -223,6 +233,7 @@ def _init_walk_state(
             insn_runlength_row=result.insn_runlength[i_lo:i_hi],
         ),
         row=row, n_axis=n_axis,
+        caller_variant_idx=caller_variant_idx,
     )
     sidecars = _RowSidecars(
         tokens_row=result.tokens[row],
