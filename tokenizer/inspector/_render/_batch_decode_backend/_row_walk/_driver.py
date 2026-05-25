@@ -63,13 +63,17 @@ def _maybe_latch_header_trigger(state: _WalkState, *, col: int) -> None:
     when the upcoming BLOCK_V2 consumes the latch (legacy "no Block_V2
     = no new block" rule -- jump-table footer blocks stay folded).
     Skipped while in VARIANT_HEADER / FUNCTION_ID; those own their own
-    ``pending_header`` handling.
+    ``pending_header`` handling. A fresh latch also clears
+    :attr:`WalkSectionState.inside_jump_table_footer_block`: a new
+    header trigger means "new block ahead", which is incompatible with
+    "still inside footer".
     """
     if col not in state.header_trigger_cols:
         return
     if state.current_kind in (BlockKind.VARIANT_HEADER, BlockKind.FUNCTION_ID):
         return
     state.pending_header = True
+    state.inside_jump_table_footer_block = False
 
 
 def render_row_blocks(
