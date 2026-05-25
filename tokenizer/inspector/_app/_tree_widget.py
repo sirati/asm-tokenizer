@@ -5,6 +5,11 @@ plus tree-local keyboard behaviour (editor-style horizontal-scroll
 memory, conditional ``left``/``right`` arrows, one-shot undo for the
 ``left``-to-parent climb). Expand / error / search logic lives on
 :class:`InspectorApp` in :mod:`tokenizer.inspector._app._application`.
+
+The vim ``h`` key is intentionally NOT bound here -- it is reserved as
+an App-level binding that opens the help modal. Pure horizontal pan
+remains reachable via ``←`` (conditional) and the editor-style
+``0`` / ``$`` line-start / line-end actions.
 """
 
 from __future__ import annotations
@@ -71,12 +76,14 @@ class _InspectorTree(Tree[Node]):
     actions instead.
     """
 
+    BINDING_GROUP_TITLE: ClassVar[str] = "Tree navigation"
+
     BINDINGS: ClassVar[list[BindingType]] = [
         # Override the ScrollableContainer's pan-only ``left`` / ``right``
-        # with the editor-style conditional variants. ``h`` retains the
-        # pure pan-left affordance for vim users; ``l`` mirrors ``→`` so
-        # both stay symmetric.
-        Binding("h", "pan_left", "Pan left", show=False),
+        # with the editor-style conditional variants. ``l`` mirrors ``→``
+        # so both stay symmetric. ``h`` is deliberately absent -- the
+        # App owns it as the help-modal trigger; pure pan-left is
+        # reachable via ``←`` when ``scroll_x > 0``.
         Binding("left", "pan_left_or_parent", "Pan left / parent", show=False),
         Binding("l,right", "pan_right_or_expand", "Pan right / expand", show=False),
         Binding("0", "pan_x_home", "Line start", show=False),
@@ -165,20 +172,13 @@ class _InspectorTree(Tree[Node]):
             return
         node.data.remembered_scroll_x = self.scroll_offset.x
 
-    def action_pan_left(self) -> None:
-        """Unconditional pan-left; saves the new ``scroll_x`` onto the row."""
-        self.scroll_left(animate=False)
-        self._save_cursor_scroll_x()
-
     def action_pan_left_or_parent(self) -> None:
         """Pan left while ``scroll_x > 0``, else climb to the parent row.
 
         Standard file-tree TUI affordance: once the row is already
         flush-left there is nothing more to pan, so the arrow becomes a
-        cursor-to-parent step. The unconditional pan binding survives
-        on ``h`` for vim users who want pure horizontal scroll. When
-        the action does pan, it saves the new ``scroll_x`` onto the
-        cursor row's remembered value.
+        cursor-to-parent step. When the action does pan, it saves the
+        new ``scroll_x`` onto the cursor row's remembered value.
 
         When the action takes the climb-to-parent branch and the
         cursor actually moved, the just-evacuated child is stashed in
