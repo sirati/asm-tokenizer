@@ -150,8 +150,15 @@ class _InspectorTree(Tree[Node]):
         style: Style,
     ) -> Text:
         text = self._compose_full_label(node, base_style, style)
+        # Textual paints the line as ``guides + label``; the right
+        # edge of the LABEL region sits at
+        # ``viewport_width - guide_width``. Shrink the effective
+        # viewport so the marker fires when the label spills past the
+        # label region, not when it spills past the full row.
         return apply_truncation_marker(
-            text, self.size.width, self.scroll_offset.x
+            text,
+            max(0, self.size.width - self._row_guide_width(node)),
+            self.scroll_offset.x,
         )
 
     def label_cell_len(self, node: TreeNode[Node]) -> int:
@@ -165,6 +172,38 @@ class _InspectorTree(Tree[Node]):
         from rich.style import NULL_STYLE
 
         return self._compose_full_label(node, NULL_STYLE, NULL_STYLE).cell_len
+
+    def _row_guide_width(self, node: TreeNode[Node]) -> int:
+        """Cell-width of the indent-guide prefix Textual paints ahead of ``node``.
+
+        Textual's ``Tree`` renders each row as ``guides + label``
+        where the guides cost ``len(path) * guide_depth`` cells (see
+        :meth:`textual.widgets._tree._TreeLine._get_guide_width`).
+        Horizontal scroll and clipping address the FULL line, so any
+        row-overflow check that ignores the guide width misses the
+        case where the label cell-len alone fits the viewport but
+        the rendered row does not. Look up the cursor row's cached
+        tree-line and ask it; fall back to ``0`` when the row's line
+        has not been built yet (e.g. detached node, pre-mount).
+        """
+        line_index = node._line
+        if line_index < 0:
+            return 0
+        try:
+            tree_line = self._tree_lines[line_index]
+        except IndexError:
+            return 0
+        return tree_line._get_guide_width(self.guide_depth, self.show_root)
+
+    def _row_cell_len(self, node: TreeNode[Node]) -> int:
+        """Total cell-width of the row Textual paints for ``node``.
+
+        Combines :meth:`_row_guide_width` (the indent-guide prefix)
+        with :meth:`label_cell_len` (the composed label) so callers
+        comparing against ``scroll_offset.x + viewport_width`` see
+        the same column the user does on screen.
+        """
+        return self._row_guide_width(node) + self.label_cell_len(node)
 
     # --- editor-like per-row scroll memory actions ---------------------
     #
@@ -230,8 +269,12 @@ class _InspectorTree(Tree[Node]):
         node = self.cursor_node
         if node is None:
             return
-        cell_len = self.label_cell_len(node)
-        if cell_len > self.size.width + self.scroll_offset.x:
+        # Compare against the FULL rendered row (indent guides + label)
+        # so a label whose cell_len alone fits the viewport but whose
+        # row-with-guides spills past the right edge still pans
+        # instead of falling through to expand.
+        row_cell_len = self._row_cell_len(node)
+        if row_cell_len > self.size.width + self.scroll_offset.x:
             self.scroll_right(animate=False)
             self._save_cursor_scroll_x()
             return
@@ -369,14 +412,18 @@ class _InspectorTree(Tree[Node]):
             return
         remembered = getattr(node.data, "remembered_scroll_x", 0)
         viewport_width = self.size.width
-        cell_len = self.label_cell_len(node)
+        # Measure against the full rendered row (guides + label) since
+        # horizontal scroll addresses the full line; a label whose
+        # cell_len alone falls short of the viewport may still be
+        # clipped by indent-guide overhead on a deeply-nested row.
+        row_cell_len = self._row_cell_len(node)
 
         effective = remembered
-        if viewport_width > 0 and cell_len - remembered < viewport_width // 2:
+        if viewport_width > 0 and row_cell_len - remembered < viewport_width // 2:
             # Less than half a viewport of content sits past the
             # restored column; pull the right edge in so the row stays
             # visible. ``max(0, ...)`` clamps short rows to flush-left.
-            effective = max(0, cell_len - viewport_width)
+            effective = max(0, row_cell_len - viewport_width)
 
         self.scroll_to(x=effective, animate=False)
 
