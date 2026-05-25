@@ -18,9 +18,9 @@ Plan reference: ``inspector-render-backends.md`` section 8.2.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Mapping, Optional, Sequence
 
 from tokenizer.aligned_data.loader.batch_decode._types import (
     SectionPointerSpec,
@@ -99,44 +99,81 @@ def make_ftl_factory(csv_dir: Path, binary_name: str) -> BackendFactory:
 
 @dataclass
 class _BatchDecodeBackendFactory:
-    """:class:`BackendFactory` over a per-binary memmap (open session).
+    """:class:`BackendFactory` over a per-binary memmap (open sessions).
 
-    Wraps a :class:`BinaryDataset` + an entered :class:`BinarySession`;
-    :meth:`make` constructs one :class:`BatchDecodeBackend` per
-    :meth:`FunctionNode.expand` call. :meth:`close` exits the session
-    (mirrors :class:`_FtlBackendFactory.close` which closes its
+    Wraps a :class:`BinaryDataset` + one entered :class:`BinarySession`
+    PER ARM (matched always; unmatched only when the binary has
+    unmatched data). :meth:`make` constructs one :class:`BatchDecodeBackend`
+    per :meth:`FunctionNode.expand` call, picking the session whose
+    arm matches the handle's :attr:`FunctionHandle.arm`. A
+    :class:`BinarySession` caches the first ``_data.bin`` arm it opens
+    for the lifetime of the session, so the dual-session model is
+    what lets cross-arm navigation (matched function expand -> inlined
+    unmatched callee) avoid a mid-session arm switch.
+
+    :meth:`close` exits every owned session (mirrors
+    :class:`_FtlBackendFactory.close` which closes its
     :class:`CsvIndex`) so callers register only one shutdown hook.
 
-    The factory also OWNS the per-session callee_arm_resolver closure;
-    LOCAL / PLT call_targets resolve their ``function_section_ptr``
-    through ``session._idx_for_section_offset`` to a
+    The factory also OWNS the callee_arm_resolver closure; LOCAL /
+    PLT call_targets resolve their ``function_section_ptr`` through
+    ``session._idx_for_section_offset`` to a
     :class:`SectionPointerSpec` (or ``None`` for cross-arm /
     missing-section / EXTERN). The closure is built once at factory
     construction time and shared across every backend instance it
-    spawns -- the inspector never reaches into session internals.
+    spawns. The closure reads ARM METADATA only (no ``_data.bin``
+    open), so binding it to a single session is safe regardless of
+    which arm the calling backend itself addresses.
     """
 
     dataset: BinaryDataset
-    session: BinarySession
+    sessions: Mapping[SectionKind, BinarySession]
     handles: Sequence[FunctionHandle]
+    _callee_arm_resolver: Callable[[int], Optional[SectionPointerSpec]] = field(
+        init=False
+    )
     _closed: bool = False
+
+    def __post_init__(self) -> None:
+        if SectionKind.MATCHED not in self.sessions:
+            raise ValueError(
+                "_BatchDecodeBackendFactory requires a MATCHED session; "
+                f"got arms={sorted(k.name for k in self.sessions)}"
+            )
+        # Metadata-only resolver: binding to the matched session is
+        # arbitrary -- both sessions share the dataset's metadata bag.
+        self._callee_arm_resolver = _make_callee_arm_resolver(
+            self.sessions[SectionKind.MATCHED]
+        )
 
     def make(self, handle: FunctionHandle) -> RenderBackend:
         if self._closed:
             raise RuntimeError("_BatchDecodeBackendFactory closed")
+        session = self.sessions.get(handle.arm)
+        if session is None:
+            raise KeyError(
+                f"_BatchDecodeBackendFactory: no session for arm "
+                f"{handle.arm.name}; binary has no {handle.arm.name.lower()} "
+                f"data (handle={handle!r})"
+            )
         return BatchDecodeBackend(
-            session=self.session,
+            session=session,
             vocab_manager=self.dataset.vocab_manager,
             handle=handle,
             line_to_name=self.dataset.line_to_name,
             line_to_provider=self.dataset.line_to_provider,
-            callee_arm_resolver=_make_callee_arm_resolver(self.session),
+            callee_arm_resolver=self._callee_arm_resolver,
         )
 
     def close(self) -> None:
         if self._closed:
             return
-        self.session.close()
+        # Close every owned session; deterministic order keeps unwind
+        # predictable when both arms are present.
+        for arm in (SectionKind.MATCHED, SectionKind.UNMATCHED):
+            session = self.sessions.get(arm)
+            if session is not None:
+                session.close()
         self._closed = True
 
 
@@ -181,18 +218,36 @@ def make_batch_decode_factory(
 ) -> BackendFactory:
     """Build the BatchDecode factory for one binary in ``memmap_dir``.
 
-    The returned factory owns the entered :class:`BinarySession`;
-    :meth:`BackendFactory.close` exits it. ``handles`` is the seed
-    list of matched-arm functions in ``dataset.matched_func_names``
-    order -- unmatched-arm functions are not seeded into the tree
-    (plan decision D3). The matched-func-names list is dataset-level
-    invariant (length ``== dataset.matched_count``), so the handle
-    index is read unconditionally.
+    The returned factory owns one entered :class:`BinarySession` per
+    populated arm (matched always; unmatched only when
+    ``dataset.unmatched_count > 0``); :meth:`BackendFactory.close`
+    exits every owned session. The two-session ownership model lets
+    cross-arm inline-call navigation reuse the right session without
+    triggering :class:`BinarySession`'s same-session arm-switch guard
+    (each session caches the first ``_data.bin`` arm it opens for its
+    lifetime).
+
+    ``handles`` is the seed list of matched-arm functions in
+    ``dataset.matched_func_names`` order -- unmatched-arm functions
+    are not seeded into the tree (plan decision D3). The
+    matched-func-names list is dataset-level invariant (length
+    ``== dataset.matched_count``), so the handle index is read
+    unconditionally.
     """
     vocab = load_and_validate_unified_vocab(memmap_dir / "unified_vocab.csv")
     dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab)
-    session = dataset.open_session()
-    session.__enter__()
+    sessions: dict[SectionKind, BinarySession] = {}
+    matched_session = dataset.open_session()
+    matched_session.__enter__()
+    sessions[SectionKind.MATCHED] = matched_session
+    # Open a SECOND session for unmatched lookups only when the binary
+    # carries unmatched data. The two sessions share the dataset's
+    # metadata bag but own independent ``_data.bin`` memmap handles, so
+    # each can pin to its own arm without interference.
+    if dataset.unmatched_count > 0:
+        unmatched_session = dataset.open_session()
+        unmatched_session.__enter__()
+        sessions[SectionKind.UNMATCHED] = unmatched_session
     func_names = dataset.matched_func_names
     handles: List[FunctionHandle] = [
         FunctionHandle(arm=SectionKind.MATCHED, idx=idx, name=func_names[idx])
@@ -200,6 +255,6 @@ def make_batch_decode_factory(
     ]
     return _BatchDecodeBackendFactory(
         dataset=dataset,
-        session=session,
+        sessions=sessions,
         handles=handles,
     )
