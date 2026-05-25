@@ -242,6 +242,86 @@ def test_group_variants_one_grouping_axis_nests_by_arch():
     assert len(x64_group.children) == 2
 
 
+def test_group_variants_arch_collapses_to_family_when_bitwidth_co_groups():
+    """When BOTH arch + bitwidth are grouping axes, the arch level
+    surfaces the family-display name (``arm`` / ``mips`` / ``x86``)
+    instead of the raw ``arm32`` / ``arm64`` / ... values; the
+    bitwidth level still shows ``32`` / ``64`` unchanged."""
+    rvs = [
+        _make_rv(variant_idx=0, arch="arm32"),
+        _make_rv(variant_idx=1, arch="arm64"),
+        _make_rv(variant_idx=2, arch="mips32"),
+        _make_rv(variant_idx=3, arch="mips64"),
+        _make_rv(variant_idx=4, arch="x86"),
+        _make_rv(variant_idx=5, arch="x64"),
+    ]
+    variants = [_make_variant_node(rv) for rv in rvs]
+    rendered_by_variant = {rv.variant_idx: rv for rv in rvs}
+
+    axes = build_canonical_axes()
+    arch_axis = next(
+        a for a in axes if a.kind is AxisKind.POSITIONAL and a.key == ARCH_PREFIX
+    )
+    bitwidth_axis = next(
+        a for a in axes
+        if a.kind is AxisKind.BITWIDTH and a.key == BITWIDTH_AXIS_KEY
+    )
+    config = OrderConfig(
+        ordered_axes=axes,
+        grouping_axes=frozenset({arch_axis, bitwidth_axis}),
+    )
+    grouped = group_variants(variants, rendered_by_variant, config)
+
+    # Top level: 3 family buckets (alphabetical natsort: arm, mips, x86).
+    assert all(isinstance(c, VariantGroupNode) for c in grouped)
+    assert [c.axis_value for c in grouped] == ["arm", "mips", "x86"]
+    # Each family has two bitwidth sub-buckets (32, 64) carrying one
+    # variant each.
+    for family_group, expected_bitwidth_pairs in zip(
+        grouped,
+        [
+            [("32", 0), ("64", 1)],   # arm32 -> 0, arm64 -> 1
+            [("32", 2), ("64", 3)],   # mips32 -> 2, mips64 -> 3
+            [("32", 4), ("64", 5)],   # x86 -> 4, x64 -> 5
+        ],
+    ):
+        assert family_group.axis == arch_axis
+        bw_children = family_group.children
+        assert all(isinstance(c, VariantGroupNode) for c in bw_children)
+        assert [c.axis_value for c in bw_children] == [
+            bw for bw, _ in expected_bitwidth_pairs
+        ]
+        for bw_group, (_, expected_variant_idx) in zip(
+            bw_children, expected_bitwidth_pairs
+        ):
+            assert bw_group.axis == bitwidth_axis
+            assert len(bw_group.children) == 1
+            assert bw_group.children[0].variant_idx == expected_variant_idx
+
+
+def test_group_variants_arch_keeps_raw_value_when_bitwidth_not_grouping():
+    """arch-only grouping (no bitwidth co-grouping) keeps the raw
+    bitness-bearing arch value -- the family collapse is gated on
+    bitwidth being a sibling grouping axis."""
+    rvs = [
+        _make_rv(variant_idx=0, arch="arm32"),
+        _make_rv(variant_idx=1, arch="arm64"),
+    ]
+    variants = [_make_variant_node(rv) for rv in rvs]
+    rendered_by_variant = {rv.variant_idx: rv for rv in rvs}
+
+    axes = build_canonical_axes()
+    arch_axis = next(
+        a for a in axes if a.kind is AxisKind.POSITIONAL and a.key == ARCH_PREFIX
+    )
+    config = OrderConfig(
+        ordered_axes=axes, grouping_axes=frozenset({arch_axis})
+    )
+    grouped = group_variants(variants, rendered_by_variant, config)
+
+    assert [c.axis_value for c in grouped] == ["arm32", "arm64"]
+
+
 def test_group_variants_missing_value_sinks_to_question_bucket():
     """An EXTRA_META value missing on one variant -> ``"?"`` bucket
     placed after the populated ones."""
