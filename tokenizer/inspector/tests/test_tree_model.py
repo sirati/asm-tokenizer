@@ -32,6 +32,7 @@ from tokenizer.inspector._tree_model import (
     BlockNode,
     FunctionNode,
     InlineCallNode,
+    ShowAllVariantsNode,
     VariantNode,
 )
 from tokenizer.variant_info import VariantIdentity
@@ -344,6 +345,114 @@ def test_inline_call_node_cannot_expand_for_plt_or_extern(kind):
     presence."""
     node = _make_inline_call(kind, _make_handle(idx=1, name="callee"))
     assert node.can_expand is False
+
+
+# ---------------------------------------------------------------------------
+# InlineCallNode.expand -- pinned-variant splice + MISSING fallback (D2).
+# ---------------------------------------------------------------------------
+
+
+def test_inline_call_expand_splices_pinned_variant_blocks_directly():
+    """Plan decision D2: an InlineCallNode whose ``variant_idx`` matches
+    one of the callee's variants surfaces THAT variant's blocks as the
+    InlineCallNode's children directly, skipping the intermediate
+    variant-list level. The other (unmatched) variants are reachable
+    via a trailing :class:`ShowAllVariantsNode` sibling.
+    """
+    # Three callee variants (idx 0, 1, 2); each yields 2 blocks.
+    callee_backend = _make_backend(n_variants=3, n_blocks=2)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=1,  # pin variant idx 1
+        provider=None,
+    )
+
+    children = node.expand()
+
+    # First N children are BlockNode (the pinned variant's blocks);
+    # final child is the ShowAllVariantsNode bundling the OTHER two
+    # variants (idx 0, 2). No VariantNode appears among the pinned-
+    # variant siblings -- the variant-list level is skipped.
+    block_children = [c for c in children if isinstance(c, BlockNode)]
+    show_all_children = [c for c in children if isinstance(c, ShowAllVariantsNode)]
+
+    assert len(block_children) == 2
+    assert all(c.variant_idx == 1 for c in block_children)
+    assert [c.block_idx for c in block_children] == [0, 1]
+    assert len(show_all_children) == 1
+    # Trailing sibling -- last child slot.
+    assert isinstance(children[-1], ShowAllVariantsNode)
+    # Other variants in the bundle: idx 0 + idx 2 (NOT the pinned 1).
+    other_idxs = sorted(v.variant_idx for v in show_all_children[0].other_variants)
+    assert other_idxs == [0, 2]
+
+
+def test_inline_call_expand_pinned_variant_solo_no_show_all_sibling():
+    """When the callee has exactly one variant and the caller pins to
+    it, the InlineCallNode's children are just the variant's blocks --
+    no :class:`ShowAllVariantsNode` is appended (the bundle would be
+    empty)."""
+    callee_backend = _make_backend(n_variants=1, n_blocks=3)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=0,
+        provider=None,
+    )
+
+    children = node.expand()
+
+    assert len(children) == 3
+    assert all(isinstance(c, BlockNode) for c in children)
+    assert not any(isinstance(c, ShowAllVariantsNode) for c in children)
+
+
+def test_inline_call_expand_missing_variant_falls_back_to_all_variants():
+    """When the caller's variant_idx is not in the callee's surviving
+    set (e.g. :data:`MISSING_VARIANT_INDEX` -- the callee dropped that
+    variant), the fallback path surfaces EVERY callee variant as a
+    sibling :class:`VariantNode` -- matching the pre-D2 contract.
+    """
+    from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
+
+    callee_backend = _make_backend(n_variants=3, n_blocks=1)
+    callee_handle = _make_handle(idx=7, name="callee")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_handle=callee_handle,
+        variant_idx=MISSING_VARIANT_INDEX,
+        provider=None,
+    )
+
+    children = node.expand()
+
+    assert len(children) == 3
+    assert all(isinstance(c, VariantNode) for c in children)
+    assert [c.variant_idx for c in children] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
