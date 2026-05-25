@@ -44,6 +44,9 @@ build/
 dist/
 *.egg-info/
 
+# Rust target directories
+**/target/
+
 # Python packaging
 pip-wheel-metadata/
 
