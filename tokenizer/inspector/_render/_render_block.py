@@ -79,6 +79,7 @@ from tokenizer.inspector._render._protocol import (
     InlineJumpEntry,
     LineItem,
 )
+from tokenizer.inspector._render._token_text import substitute_mem_chars
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.tokens import TokenType
 
@@ -99,6 +100,26 @@ __all__ = [
     "partition_call_target_kinds",
     "render_block",
 ]
+
+
+def _render_insn_text(asm_like: str) -> str:
+    """Apply the shared MEM substitution to an FTL ``to_asm_like`` string.
+
+    :meth:`InsnTokenList.to_asm_like` joins each token's
+    ``to_asm_like()`` with single spaces; every token's output is a
+    single space-free atom, so splitting on ``" "`` recovers the atom
+    stream the substitution dict expects. Each atom is looked up via
+    :func:`substitute_mem_chars` (vocab-string OR asm-value form) and
+    the result rejoined.
+
+    FTL does NOT apply arch-prefix elision -- :meth:`PlatformTokenInner
+    .to_asm_like` already returns the bare ``self.token`` without the
+    platform prefix. The substitution applies only to the six MEM
+    symbols whose asm-value (``mem[`` / ``]mem`` for brackets, identity
+    for ``+`` / ``-`` / ``*`` / ``,``) doesn't already match the
+    polished display form.
+    """
+    return " ".join(substitute_mem_chars(atom) for atom in asm_like.split(" "))
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +359,7 @@ def _walk_block_instructions(
     """Per-instruction generator: one :class:`AsmLine` then any inline
     call/jump entries from the instruction's metatoken stream."""
     for insn in block.iter_insn(transient=True):
-        yield AsmLine(text=insn.to_asm_like())
+        yield AsmLine(text=_render_insn_text(insn.to_asm_like()))
         yield from _emit_inline_entries(
             insn,
             section=section,

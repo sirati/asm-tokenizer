@@ -279,6 +279,7 @@ def render_row_blocks(
     line_to_name: Mapping[int, str],
     line_to_provider: Mapping[int, str],
     callee_arm_resolver: Callable[[int], Optional[SectionPointerSpec]],
+    arch_prefixes: tuple[str, ...] = (),
 ) -> List[RowSection]:
     """Walk one row and split into typed sections.
 
@@ -364,6 +365,7 @@ def render_row_blocks(
                 state.current_items,
                 shifted_id=shifted_id,
                 vocab_manager=vocab_manager,
+                arch_prefixes=arch_prefixes,
             )
             state.last_number_shifted_id = -1
         elif band is Band.NUMBER:

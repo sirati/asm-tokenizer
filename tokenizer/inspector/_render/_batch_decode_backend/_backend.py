@@ -47,6 +47,7 @@ from tokenizer.variant_tokens.prefixes import (
     POSITIONAL_PREFIXES,
 )
 
+from ._arch_prefix import arch_prefix_tuple
 from ._fid_table import FidBaseTable
 from ._row_walk import RowSection, render_row_blocks
 
@@ -282,6 +283,17 @@ class BatchDecodeBackend:
         call_targets_per_ct = [
             ct.call_targets_section for ct in stage1_variant.call_targets
         ]
+        # Arch-prefix tuple for INSTR_REP display elision. Derived from
+        # the variant's ``arch`` axis (sidecar string -> Platform via
+        # ``arch_to_platform``); an empty / missing axis collapses to
+        # ``()`` so the emitter skips the strip altogether. The source
+        # is the root call_target's ``FunctionData.metadata`` -- the
+        # same dict ``_label_axes_for_variant`` reads.
+        root_metadata = stage1_variant.call_targets[0].function_data.metadata
+        arch_axis = root_metadata.get(_AXIS_PREFIX_TO_METADATA_KEY[ARCH_PREFIX])
+        arch_prefixes = arch_prefix_tuple(
+            "" if arch_axis is None else str(arch_axis)
+        )
         walked = render_row_blocks(
             result=self._result,
             row=row,
@@ -293,6 +305,7 @@ class BatchDecodeBackend:
             line_to_name=self._line_to_name,
             line_to_provider=self._line_to_provider,
             callee_arm_resolver=self._callee_arm_resolver,
+            arch_prefixes=arch_prefixes,
         )
         self._row_sections_by_variant[variant_idx] = walked
         return walked
