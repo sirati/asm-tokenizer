@@ -89,7 +89,7 @@ class _FakeSession:
     matched_sections: Dict[int, Section] = field(default_factory=dict)
     matched_functions: Dict[int, MatchedFunction] = field(default_factory=dict)
     unmatched_sections: Dict[int, Section] = field(default_factory=dict)
-    unmatched_function_data: Dict[int, FunctionData] = field(
+    unmatched_variant_function_data: Dict[int, List[FunctionData]] = field(
         default_factory=dict
     )
 
@@ -107,10 +107,15 @@ class _FakeSession:
         )
 
     def add_unmatched(
-        self, idx: int, section: Section, fd: FunctionData
+        self,
+        idx: int,
+        section: Section,
+        variant_function_data: List[FunctionData],
     ) -> None:
+        # Parallels :py:meth:`add_matched`: unmatched sections store one
+        # record per variant, so the fake mirrors the matched-arm shape.
         self.unmatched_sections[idx] = section
-        self.unmatched_function_data[idx] = fd
+        self.unmatched_variant_function_data[idx] = variant_function_data
 
     # ---- load helpers -------------------------------------------------
 
@@ -120,11 +125,15 @@ class _FakeSession:
         section = self.matched_sections[idx]
         return section, section.section_offset, self.matched_functions[idx]
 
-    def _load_unmatched_record_and_section(
+    def _load_unmatched_section_and_all_variants(
         self, idx: int
-    ) -> Tuple[Section, int, FunctionData]:
+    ) -> Tuple[Section, int, List[FunctionData]]:
         section = self.unmatched_sections[idx]
-        return section, section.section_offset, self.unmatched_function_data[idx]
+        return (
+            section,
+            section.section_offset,
+            self.unmatched_variant_function_data[idx],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +154,16 @@ def _register_matched(
 
 def _register_unmatched(
     session: _FakeSession, idx: int, section: Section
-) -> FunctionData:
-    """Register an unmatched section + its single root FunctionData;
-    return the FunctionData so assertions can match on identity."""
-    fd = _make_function_data(f"u{idx}")
-    session.add_unmatched(idx, section, fd)
-    return fd
+) -> List[FunctionData]:
+    """Register an unmatched section + one synthetic FunctionData per
+    variant; return the per-variant FunctionData list so individual
+    assertions can match on identity."""
+    fds = [
+        _make_function_data(f"u{idx}_v{v}")
+        for v in range(len(section.variants))
+    ]
+    session.add_unmatched(idx, section, fds)
+    return fds
 
 
 def test_resolution_smoke_matched_and_unmatched():
@@ -266,10 +279,10 @@ def test_undersample_returns_distinct_indices_of_requested_count():
     assert indices == sorted(indices)
 
 
-def test_unmatched_arm_has_at_most_one_variant():
-    """Unmatched sections have exactly one variant by the
-    matched_sections_bin invariant; sampling -- regardless of the
-    ``num_variants_per_section`` request -- returns a 1-element list."""
+def test_unmatched_single_variant_section_returns_one_entry():
+    """A single-variant unmatched section returns a 1-element
+    ``sampled_variant_indices`` regardless of the
+    ``num_variants_per_section`` request."""
     unmatched_section = _make_section(n_variants=1, section_offset=32)
     session = _FakeSession()
     _register_unmatched(session, 0, unmatched_section)
@@ -292,6 +305,27 @@ def test_unmatched_arm_has_at_most_one_variant():
         rng=np.random.default_rng(0),
     )
     assert result_exact[0].sampled_variant_indices == [0]
+
+
+def test_unmatched_multi_variant_section_returns_every_variant():
+    """An unmatched section with N>1 variants surfaces every per-record
+    body alongside its sampled indices; the per-sampled-variant list is
+    parallel to ``sampled_variant_indices`` and indexable without an
+    :class:`IndexError`."""
+    unmatched_section = _make_section(n_variants=3, section_offset=64)
+    session = _FakeSession()
+    fds = _register_unmatched(session, 0, unmatched_section)
+    pointers = [SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=0)]
+
+    result = resolve_section_pointers(
+        session,  # type: ignore[arg-type]
+        pointers,
+        num_variants_per_section=10,
+        rng=np.random.default_rng(0),
+    )
+    assert result[0].sampled_variant_indices == [0, 1, 2]
+    # Identity check -- each sampled body is the corresponding registered fd.
+    assert result[0].function_data_per_sampled_variant == fds
 
 
 def test_order_preservation_across_mixed_arms():
@@ -377,12 +411,12 @@ def test_function_data_parallel_to_sampled_variants_matched():
 
 
 def test_function_data_parallel_to_sampled_variants_unmatched():
-    """For unmatched the 1-element FunctionData list is the loader's
-    single returned :class:`FunctionData` (matched_sections_bin
-    invariant: 1 variant per unmatched section)."""
+    """For unmatched the FunctionData list parallels the sampled
+    variant indices, one entry per per-record body the section
+    carries."""
     unmatched_section = _make_section(n_variants=1, section_offset=32)
     session = _FakeSession()
-    expected_fd = _register_unmatched(session, 0, unmatched_section)
+    expected_fds = _register_unmatched(session, 0, unmatched_section)
     pointers = [SectionPointerSpec(arm=SectionKind.UNMATCHED, idx=0)]
 
     result = resolve_section_pointers(
@@ -393,8 +427,8 @@ def test_function_data_parallel_to_sampled_variants_unmatched():
     )
     rs = result[0]
     assert rs.sampled_variant_indices == [0]
-    assert rs.function_data_per_sampled_variant == [expected_fd]
-    assert rs.function_data_per_sampled_variant[0] is expected_fd
+    assert rs.function_data_per_sampled_variant == expected_fds
+    assert rs.function_data_per_sampled_variant[0] is expected_fds[0]
 
 
 def test_resolved_section_is_frozen():

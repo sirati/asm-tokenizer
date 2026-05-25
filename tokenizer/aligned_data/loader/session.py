@@ -239,6 +239,61 @@ class BinarySession(_BinarySessionHelpersMixin):
         )
         return section, section_offset, fd
 
+    def _load_unmatched_section_and_all_variants(
+        self, idx: int
+    ) -> Tuple[Section, int, list]:
+        """Parse the unmatched section at ``idx`` + build every variant's FunctionData.
+
+        Mirrors :py:meth:`_load_matched_section_and_variants` for the
+        unmatched arm: returns ``(section, section_offset, list[FunctionData])``
+        where the per-variant list is parallel to ``section.variants``.
+        Unmatched sections store one record per variant; the iteration
+        walks records ``[idx .. idx + len(section.variants) - 1]`` and
+        loads each via the per-record body shape. ``idx`` MUST be the
+        section's first-record idx (the value
+        :py:meth:`_idx_for_section_offset` returns for the unmatched arm);
+        a non-base record idx raises :class:`ValueError`.
+        """
+        arm = self._meta_get("unmatched_arm")
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        # Pin ``idx`` to the section's first-record slot. Loading a
+        # non-base record into the per-section variants list would lose
+        # the preceding slots, breaking the parallel
+        # ``section.variants`` <-> returned list contract.
+        section_idx = self._unmatched_section_idx(arm, idx)
+        base = self._unmatched_record_slot_base(arm, section_idx)
+        if idx != base:
+            raise ValueError(
+                f"unmatched section variants require first-record idx "
+                f"(section[{section_idx}] base={base}); got idx={idx}"
+            )
+        data_mmap = self._open_data("unmatched")
+        line_to_name = self._meta_get("line_to_name") or {}
+        base_start = int(starts[base])
+        section, section_offset = self._unmatched_section_for_record(
+            arm, base, base_start
+        )
+        variants: list = []
+        for slot in range(len(section.variants)):
+            record_idx = base + slot
+            start = int(starts[record_idx])
+            insn_rl, block_rl, tokens = self._slice_data_record(
+                data_mmap, start
+            )
+            variants.append(
+                build_unmatched_function_data(
+                    section,
+                    self._unmatched_func_name(arm, record_idx),
+                    start,
+                    tokens, insn_rl, block_rl,
+                    resolve_ref=self.get_variant_by_ref,
+                    line_to_name=line_to_name,
+                )
+            )
+        return section, section_offset, variants
+
     def _slice_data_record(self, data_mmap, offset: int):
         """Slice + parse + egress-copy one record (memmap-view detach).
 

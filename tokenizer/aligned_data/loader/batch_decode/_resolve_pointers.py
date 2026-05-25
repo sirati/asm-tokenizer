@@ -80,9 +80,10 @@ class ResolvedSection:
         sampled_variant_indices: The RNG-selected variant indices in
             their existing encounter order (``_select_variant_indices``
             sorts its sampled output, and returns ``range(n)`` when the
-            request covers every variant). For unmatched sections the
-            list has at most 1 entry by the matched_sections_bin
-            invariant.
+            request covers every variant). Length is bounded by
+            ``len(section.variants)`` regardless of arm -- unmatched
+            sections store one record per variant and the loader
+            harvests every record.
         function_data_per_sampled_variant: Parallel to
             ``sampled_variant_indices`` -- entry ``v`` is the
             :class:`FunctionData` for the variant body identified by
@@ -198,15 +199,14 @@ def _load_section_and_variant_bodies(
     Kept module-private + arm-dispatch-only so
     :func:`resolve_section_pointers` is a clean walk over the input
     list. The two loader return tuples differ on their third element
-    (``MatchedFunction`` vs ``FunctionData``); this helper hides that
-    asymmetry behind a uniform ``(section, variant_bodies)`` shape so
-    the resolver's sampling step can index ``variant_bodies[v]``
+    (``MatchedFunction`` vs ``list[FunctionData]``); this helper hides
+    that asymmetry behind a uniform ``(section, variant_bodies)`` shape
+    so the resolver's sampling step can index ``variant_bodies[v]``
     regardless of arm.
 
-    Unmatched sections have exactly one variant by the
-    matched_sections_bin invariant; the loader's single
-    :class:`FunctionData` becomes a 1-element list whose only valid
-    index is 0.
+    Unmatched sections store one record per variant; the per-section
+    loader iterates every record so ``len(variant_bodies) ==
+    len(section.variants)`` parallels the matched-arm shape.
 
     Raises:
         ValueError: On an unknown :class:`SectionKind` member.
@@ -217,8 +217,8 @@ def _load_section_and_variant_bodies(
         )
         return section, list(matched.variants)
     if pointer.arm is SectionKind.UNMATCHED:
-        section, _section_offset, fd = (
-            session._load_unmatched_record_and_section(pointer.idx)
+        section, _section_offset, variants = (
+            session._load_unmatched_section_and_all_variants(pointer.idx)
         )
-        return section, [fd]
+        return section, list(variants)
     raise ValueError(f"unknown SectionKind: {pointer.arm!r}")
