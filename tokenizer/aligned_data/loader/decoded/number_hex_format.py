@@ -1,13 +1,17 @@
-"""Hex-form rendering for NUMBER-band chunk pairs.
+"""Hex-form rendering for NUMBER-band chunk pairs (FtlBackend-parity helper).
 
 Single concern: turn a single ``(significand, sign_exponent)`` chunk
 (produced by the custom-float kernel in
 :mod:`tokenizer.aligned_data.loader.decoded.custom_float`) into the
-``"<basename>:<hex>"`` text shape the inspector emits as ``AsmLine``
--- mirroring :meth:`token_manager._V2FloatInner.to_asm_like` /
-:meth:`token_manager.ValuedConstV2Inner.to_asm_like` so the
-BatchDecodeBackend's rendering aligns with the FtlBackend's
-``Inner.to_asm_like`` text shape.
+``"<basename>:<hex>"`` text shape that mirrors
+:meth:`token_manager._V2FloatInner.to_asm_like` /
+:meth:`token_manager.ValuedConstV2Inner.to_asm_like`.
+
+This module is a FtlBackend-parity debug helper; live
+BatchDecodeBackend rendering uses
+:mod:`tokenizer.aligned_data.loader.decoded._number_render`, which
+produces the inspector-display short / full forms and handles sign
+explicitly (see W3-14 in the inspector follow-up plan).
 
 Plan reference: ``inspector-render-backends.md`` decision #18 places
 this helper next to :func:`unpack_chunk` / :func:`reconstruct_chunks`
@@ -35,7 +39,7 @@ matching the encoder's ``_get_basename`` output.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import NamedTuple
 
 import numpy as np
 
@@ -47,21 +51,38 @@ from tokenizer.aligned_data.loader.decoded.custom_float import (
 from tokenizer.tokens import TokenType
 
 
-__all__ = ["chunks_to_hex_bits"]
+__all__ = ["chunks_to_hex_bits", "IEEELayout", "_IEEE_LAYOUTS"]
+
+
+class IEEELayout(NamedTuple):
+    """Per-format IEEE-754 (or x87 f80) layout descriptor.
+
+    Named-tuple shape so callers can use either positional unpacking
+    (legacy ``mantissa_bits, exponent_bits, bias, has_explicit, basename
+    = layout``) or attribute access (``layout.mantissa_bits``,
+    ``layout.basename``). The decoded-side number-render module
+    (``_number_render.py``) consumes this table via attribute access
+    to derive ``_FULL_PRECISION_DIGITS`` + the short-form prefix.
+    """
+
+    mantissa_bits: int
+    exponent_bits: int
+    bias: int
+    has_explicit_leading_bit: bool
+    basename: str
 
 
 # Per-IEEE-754 layout for the float TokenTypes that round-trip through a
 # single chunk (or the MSB chunk in Phase-1 multi-chunk rendering).
 # ``has_explicit_leading_bit`` mirrors the encoder's two mantissa
 # conventions (False for IEEE, True for x87 f80).
-_IEEE_LAYOUTS: dict[TokenType, Tuple[int, int, int, bool, str]] = {
-    # token_type: (mantissa_bits, exponent_bits, bias, has_explicit_leading, basename)
-    TokenType.FLOAT16: (10, 5, 15, False, "float16"),
-    TokenType.BFLOAT16: (7, 8, 127, False, "bfloat16"),
-    TokenType.FLOAT32: (23, 8, 127, False, "float32"),
-    TokenType.FLOAT64: (52, 11, 1023, False, "float64"),
-    TokenType.FLOAT80: (64, 15, 16383, True, "float80"),
-    TokenType.FLOAT128: (112, 15, 16383, False, "float128"),
+_IEEE_LAYOUTS: dict[TokenType, IEEELayout] = {
+    TokenType.FLOAT16: IEEELayout(10, 5, 15, False, "float16"),
+    TokenType.BFLOAT16: IEEELayout(7, 8, 127, False, "bfloat16"),
+    TokenType.FLOAT32: IEEELayout(23, 8, 127, False, "float32"),
+    TokenType.FLOAT64: IEEELayout(52, 11, 1023, False, "float64"),
+    TokenType.FLOAT80: IEEELayout(64, 15, 16383, True, "float80"),
+    TokenType.FLOAT128: IEEELayout(112, 15, 16383, False, "float128"),
 }
 
 
@@ -224,6 +245,11 @@ def chunks_to_hex_bits(
         # by encoder contract (sign is carried via a separate
         # ``value_negative`` marker upstream) so the magnitude is an
         # integer.
+        # FIXME(W3-14): for negative magnitudes this renders ``-7b`` etc.
+        # The live BatchDecodeBackend path uses ``_number_render.py``
+        # which handles sign explicitly; this helper stays as the
+        # FtlBackend-parity debug surface and is intentionally kept
+        # unfixed here so the parity-pinning tests pin current behaviour.
         magnitude = int(value)
         # Mirror the encoder's :meth:`ValuedConstV2Inner.to_asm_like` shape.
         return f"v2:{magnitude:x}"
@@ -233,7 +259,11 @@ def chunks_to_hex_bits(
         raise ValueError(
             f"chunks_to_hex_bits: unsupported NUMBER token_type {token_type!r}"
         )
-    mantissa_bits, exponent_bits, bias, has_explicit, basename = layout
+    mantissa_bits = layout.mantissa_bits
+    exponent_bits = layout.exponent_bits
+    bias = layout.bias
+    has_explicit = layout.has_explicit_leading_bit
+    basename = layout.basename
     width_bytes = _WIDTH_BYTES[token_type]
     if exp_unbiased == INFNAN_EXPONENT_UNBIASED:
         bits = _ieee_nan_inf_bits(
