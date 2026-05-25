@@ -46,6 +46,12 @@ _V2_NUMBER_BLOCK_START = VocabularyManager._V2_NUMBER_BLOCK_START  # 257
 _V2_NUMBER_BLOCK_COUNT = VocabularyManager._V2_NUMBER_BLOCK_COUNT  # 7
 _VC2_VOCAB_ID = _V2_NUMBER_BLOCK_START
 _FLOAT128_VOCAB_ID = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT - 1
+# ``value_negative`` (id 256) is a v2 boundary (id >= 256 starts a new
+# metatoken in FTL's accounting) but is stripped post-decode by
+# ``_expand_tokens``' ``working_tokens > 256`` keep mask. So a metatoken
+# whose first id is 256 contributes ZERO slots to the post-decode wire
+# stream, even though it IS counted as its own metatoken upstream.
+_VALUE_NEGATIVE_VOCAB_ID = _V2_RESERVED_DIGIT_COUNT
 
 
 def _per_metatoken_slot_counts(
@@ -65,6 +71,11 @@ def _per_metatoken_slot_counts(
     * F128 (``raw_tokens[p] == _FLOAT128_VOCAB_ID``): chunk_count = 1
       if the high u16 of the payload is all-ones (NaN/Inf, sign bit
       stripped via ``& 0x7FFF``), else 2.
+    * value_negative (``raw_tokens[p] == _VALUE_NEGATIVE_VOCAB_ID``):
+      0 slots -- the id 256 marker IS a v2 boundary (per FTL's ``>= 256``
+      rule) but ``_expand_tokens``' strip predicate ``> 256`` drops it
+      from the post-decode wire stream, so it contributes nothing to the
+      consumer-visible slot count.
     * Everything else: 1 slot.
 
     Tail-bound checks for F128 (need raw_tokens[p+1] AND raw_tokens[p+2])
@@ -77,6 +88,14 @@ def _per_metatoken_slot_counts(
         return slot_counts
 
     first_ids = raw_tokens[boundary_positions]
+
+    # value_negative (id 256) is stripped post-decode -- zero slots on
+    # the consumer-visible wire stream. Subtracting here (rather than
+    # excluding 256 from ``boundary_positions``) keeps the VC2 metatoken
+    # run-length unchanged (the trailing value_negative would otherwise
+    # be absorbed into the VC2's payload count, inflating
+    # ``ceil(payload_runlen / 8)`` for any K*8-byte negative magnitude).
+    slot_counts[first_ids == _VALUE_NEGATIVE_VOCAB_ID] = np.uint32(0)
 
     # VC2 promotion: chunk_count = max(1, ceil(payload_runlen / 8))
     vc2_mask = first_ids == _VC2_VOCAB_ID
