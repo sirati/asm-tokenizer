@@ -29,6 +29,7 @@ from tokenizer.inspector._render._protocol import (
     RenderBackend,
     RenderedBlock,
     RenderedVariant,
+    VariantIdentity,
 )
 from tokenizer.inspector._render._render_block import (
     AsmLine,
@@ -52,5 +53,6 @@ __all__ = [
     "RenderBackend",
     "RenderedBlock",
     "RenderedVariant",
+    "VariantIdentity",
     "render_block",
 ]

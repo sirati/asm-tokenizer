@@ -55,6 +55,27 @@ def _build_label_axes(info: VariantInfo) -> Mapping[str, Optional[str]]:
     )
 
 
+def _build_extra_metadata(info: VariantInfo) -> Mapping[str, str]:
+    """Project :attr:`VariantInfo.extra_metadata` onto the string-valued
+    frozen mapping :class:`RenderedVariant.extra_metadata` expects.
+
+    Keys are emitted in sorted order (one bucket per unique value-set
+    so the inspector's EXTRA_META axis grouping stays stable); list
+    values comma-join, matching the BatchDecode backend's residue
+    derivation in :meth:`VariantInfo.from_function_data_metadata`.
+    """
+    coerced: dict[str, str] = {}
+    for key in sorted(info.extra_metadata):
+        value = info.extra_metadata[key]
+        if value is None:
+            coerced[key] = ""
+        elif isinstance(value, list):
+            coerced[key] = ",".join(str(v) for v in value)
+        else:
+            coerced[key] = str(value)
+    return types.MappingProxyType(coerced)
+
+
 def _no_callee_arm(_function_section_ptr: int) -> None:
     """FtlBackend cannot resolve callees to a section pointer.
 
@@ -203,6 +224,8 @@ class FtlBackend:
                 RenderedVariant(
                     variant_idx=variant_idx,
                     label_axes=_build_label_axes(info),
+                    extra_metadata=_build_extra_metadata(info),
+                    variant_identity=info.identity,
                 )
             )
         return rendered

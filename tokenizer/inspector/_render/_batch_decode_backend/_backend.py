@@ -39,6 +39,7 @@ from tokenizer.inspector._render._protocol import (
     RenderedVariant,
 )
 from tokenizer.token_manager import VocabularyManager
+from tokenizer.variant_info import VariantIdentity, VariantInfo
 from tokenizer.variant_tokens.prefixes import (
     ARCH_PREFIX,
     COMP_PREFIX,
@@ -55,37 +56,42 @@ from ._row_walk import RowSection, render_row_blocks
 __all__ = ["BatchDecodeBackend"]
 
 
-# Mapping from the canonical positional-axis prefix to its
-# ``FunctionData.metadata`` dict key. Mirrors
-# :data:`tokenizer.inspector._label._AXIS_PREFIX_TO_METADATA_KEY`; this
-# backend re-pins the mapping inline rather than importing ``_label``
-# because :mod:`._label`'s public surface is the string-formatted
-# variant_label, not a structured ``label_axes`` emitter. Phase-2
-# promotion (factor a shared ``axes_from_metadata``) is plan §11 cleanup.
-_AXIS_PREFIX_TO_METADATA_KEY: dict[str, str] = {
+# Positional-axis prefix -> :class:`VariantIdentity` field name. Used to
+# project the typed identity onto the canonical ``label_axes`` Mapping
+# both backends emit; the runtime metadata-key shape lives inside
+# :meth:`VariantInfo.from_function_data_metadata` so this module never
+# sees the wire-layer ``compilerversion`` key directly.
+_AXIS_PREFIX_TO_IDENTITY_FIELD: dict[str, str] = {
     ARCH_PREFIX: "arch",
     COMP_PREFIX: "compiler",
-    CVER_PREFIX: "compilerversion",
+    CVER_PREFIX: "compiler_version",
     OPT_PREFIX: "opt",
 }
-assert set(_AXIS_PREFIX_TO_METADATA_KEY) == set(POSITIONAL_PREFIXES), (
-    "_AXIS_PREFIX_TO_METADATA_KEY must match POSITIONAL_PREFIXES"
+assert set(_AXIS_PREFIX_TO_IDENTITY_FIELD) == set(POSITIONAL_PREFIXES), (
+    "_AXIS_PREFIX_TO_IDENTITY_FIELD must match POSITIONAL_PREFIXES"
 )
 
 
-def _label_axes_for_variant(s1v: Stage1Variant) -> Mapping[str, Optional[str]]:
-    """Flatten root call_target's ``FunctionData.metadata`` into the
-    canonical-axis Mapping wrapped as :class:`types.MappingProxyType`
-    (decision #21: frozen-dataclass field must not be mutable from
-    callers).
+def _project_variant(
+    s1v: Stage1Variant,
+) -> tuple[Mapping[str, Optional[str]], Mapping[str, str], VariantIdentity]:
+    """Project a :class:`Stage1Variant` into the
+    ``(label_axes, extra_metadata, variant_identity)`` triple
+    :class:`RenderedVariant` needs.
+
+    Single canonical step — both the inspector's POSITIONAL grouping
+    axes and the EXTRA_META grouping axes derive from the same
+    factory call. ``VariantInfo.from_function_data_metadata`` owns the
+    structural-key strip list + canonical-axis extraction, so this
+    backend stays free of any "everything-else" residue knowledge.
     """
     metadata = s1v.call_targets[0].function_data.metadata
-    axes: dict[str, Optional[str]] = {}
-    for prefix in POSITIONAL_PREFIXES:
-        key = _AXIS_PREFIX_TO_METADATA_KEY[prefix]
-        value = metadata.get(key)
-        axes[prefix] = None if value is None else str(value)
-    return types.MappingProxyType(axes)
+    identity, extra_metadata = VariantInfo.from_function_data_metadata(metadata)
+    label_axes: dict[str, Optional[str]] = {
+        prefix: getattr(identity, _AXIS_PREFIX_TO_IDENTITY_FIELD[prefix])
+        for prefix in POSITIONAL_PREFIXES
+    }
+    return types.MappingProxyType(label_axes), extra_metadata, identity
 
 
 class BatchDecodeBackend:
@@ -242,10 +248,13 @@ class BatchDecodeBackend:
         # row mapping is total.
         for s1v in stage1.sections[0].variants:
             self._variant_row_index[s1v.variant_idx] = int(s1v.batch_idx)
+            label_axes, extra_metadata, variant_identity = _project_variant(s1v)
             rendered.append(
                 RenderedVariant(
                     variant_idx=s1v.variant_idx,
-                    label_axes=_label_axes_for_variant(s1v),
+                    label_axes=label_axes,
+                    extra_metadata=extra_metadata,
+                    variant_identity=variant_identity,
                 )
             )
         return rendered
@@ -283,14 +292,14 @@ class BatchDecodeBackend:
         call_targets_per_ct = [
             ct.call_targets_section for ct in stage1_variant.call_targets
         ]
-        # Arch-prefix tuple for INSTR_REP display elision. Derived from
-        # the variant's ``arch`` axis (sidecar string -> Platform via
-        # ``arch_to_platform``); an empty / missing axis collapses to
-        # ``()`` so the emitter skips the strip altogether. The source
-        # is the root call_target's ``FunctionData.metadata`` -- the
-        # same dict ``_label_axes_for_variant`` reads.
+        # Arch-prefix tuple for INSTR_REP display elision. Read the raw
+        # ``arch`` value out of the runtime metadata dict directly so
+        # the missing-key collapse to ``""`` (empty-tuple no-op for
+        # backends that haven't plumbed the arch) stays separate from
+        # the canonical-identity coercion (``None -> "unknown"``) that
+        # :meth:`VariantInfo.from_function_data_metadata` applies.
         root_metadata = stage1_variant.call_targets[0].function_data.metadata
-        arch_axis = root_metadata.get(_AXIS_PREFIX_TO_METADATA_KEY[ARCH_PREFIX])
+        arch_axis = root_metadata.get("arch")
         arch_prefixes = arch_prefix_tuple(
             "" if arch_axis is None else str(arch_axis)
         )
