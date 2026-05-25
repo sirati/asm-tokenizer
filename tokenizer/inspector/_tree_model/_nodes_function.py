@@ -67,6 +67,8 @@ class FunctionNode:
         """
         from ._nodes_variant import VariantNode
 
+        if self._backend is not None:
+            self._backend.close()
         backend = self.factory.make(self.handle)
         self._backend = backend
         return [
