@@ -37,11 +37,13 @@ from tokenizer.variant_info import VariantIdentity
 from . import _order_hooks
 from ._help_dialog import HelpScreen
 from ._labels import _compose_label
-from ._order import OrderConfig, OrderResult
+from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
 from ._tree_widget import _InspectorTree
 
 
 if TYPE_CHECKING:
+    from textual.widgets._tree import TreeNode
+
     from tokenizer.inspector._render._protocol import (
         BackendFactory,
         FunctionHandle,
@@ -65,7 +67,10 @@ _LOGGER_NAME = "tokenizer.inspector"
 # ---------------------------------------------------------------------------
 
 
-def _stamp_aligned_variant_labels(children: list[Node]) -> None:
+def _stamp_aligned_variant_labels(
+    children: list[Node],
+    suppressed_axes: frozenset[str] = frozenset(),
+) -> None:
     """Stamp ``VariantNode.aligned_label`` across a sibling set.
 
     Single concern: when an expand handler hands back a homogeneous
@@ -79,14 +84,53 @@ def _stamp_aligned_variant_labels(children: list[Node]) -> None:
     Threading the aligned string through a node-side field keeps the
     label dispatcher (:func:`_compose_label`) per-node and unaware of
     the sibling set — preserving its single-concern shape.
+
+    ``suppressed_axes`` (collected from the expanded parent's
+    :class:`VariantGroupNode` ancestor chain) is forwarded to
+    :func:`aligned_variant_labels` so axis values already disclosed by
+    a grouping-row above are dropped from the variant label. Empty set
+    (no grouping ancestors) preserves the un-grouped layout verbatim.
     """
     variants = [c for c in children if isinstance(c, VariantNode)]
     if len(variants) != len(children) or not variants:
         # Heterogeneous (or empty) sibling set: nothing to align.
         return
-    aligned = aligned_variant_labels([v.label_axes for v in variants])
+    aligned = aligned_variant_labels(
+        [v.label_axes for v in variants], suppressed_axes
+    )
     for variant, label in zip(variants, aligned):
         variant.aligned_label = label
+
+
+def _collect_suppressed_axes(
+    expanded_tree_node: "TreeNode[Node]",
+) -> frozenset[str]:
+    """Positional axis keys disclosed by :class:`VariantGroupNode` ancestors.
+
+    Single concern: walk the tree-node's parent chain at the App
+    boundary and collect the canonical positional-prefix key of each
+    enclosing :class:`VariantGroupNode` whose grouping axis is
+    :attr:`AxisKind.POSITIONAL`. The returned frozenset is passed
+    through to the rendering helpers so a variant label drops any
+    axis-value already visible on a group row above.
+
+    BITWIDTH + EXTRA_META grouping ancestors do NOT contribute (the
+    variant's positional label does not redundantly display those
+    axes anyway — BITWIDTH is a derived 32/64 with no direct slot in
+    the positional label, EXTRA_META isn't part of the canonical
+    positional label at all). When no :class:`VariantGroupNode`
+    ancestors exist (un-grouped tree) the result is the empty
+    frozenset, preserving the legacy layout exactly.
+    """
+    suppressed: set[str] = set()
+    cursor: Optional["TreeNode[Node]"] = expanded_tree_node
+    while cursor is not None:
+        data = cursor.data
+        if isinstance(data, VariantGroupNode):
+            if data.axis.kind is AxisKind.POSITIONAL:
+                suppressed.add(data.axis.key)
+        cursor = cursor.parent
+    return frozenset(suppressed)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +278,8 @@ class InspectorApp(App[None]):
         # acts on the per-group sibling set when grouping is active and
         # on the flat sorted set otherwise.
         children = _order_hooks.apply_grouping(self, model, children)
-        _stamp_aligned_variant_labels(children)
+        suppressed_axes = _collect_suppressed_axes(node)
+        _stamp_aligned_variant_labels(children, suppressed_axes)
 
         for child in children:
             node.add(

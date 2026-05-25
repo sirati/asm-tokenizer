@@ -111,8 +111,25 @@ _CALL_TARGET_TYPE_TO_LABEL: dict[CallTargetType, str] = {
 assert set(_CALL_TARGET_TYPE_TO_LABEL) == set(CallTargetType)
 
 
+def _surviving_prefixes(
+    suppressed_axes: frozenset[str],
+) -> tuple[str, ...]:
+    """The :data:`POSITIONAL_PREFIXES` order minus ``suppressed_axes``.
+
+    Sole producer of the per-row axis-prefix sequence consumed by the
+    rendering helpers; centralising the filter here keeps both the
+    aligned + unaligned paths in lockstep (same axes, same order, same
+    drop policy). ``suppressed_axes`` carries the canonical positional
+    prefix keys (e.g. :data:`CVER_PREFIX`); membership compares by
+    string equality so the App-side helper can pass through
+    :attr:`AxisDescriptor.key` directly.
+    """
+    return tuple(p for p in POSITIONAL_PREFIXES if p not in suppressed_axes)
+
+
 def _axis_value_strings(
     label_axes: Mapping[str, Optional[str]],
+    suppressed_axes: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Per-axis rendered fragment list in :data:`POSITIONAL_PREFIXES` order.
 
@@ -122,9 +139,16 @@ def _axis_value_strings(
     a single space) and :func:`aligned_variant_labels` (column-pads
     before joining). Missing axes render as :data:`_MISSING_NAME`
     (``"?"``) with their per-axis prefix preserved (``"v?"`` / ``"-?"``).
+
+    ``suppressed_axes`` (positional-prefix keys already disclosed by a
+    grouping-ancestor chain in the rendered tree) are dropped from the
+    output entirely so the variant row's label shows only the axes the
+    user has not yet seen via an enclosing :class:`VariantGroupNode`
+    row. The filter is delegated to :func:`_surviving_prefixes` so the
+    drop order matches the canonical positional order.
     """
     parts: list[str] = []
-    for prefix in POSITIONAL_PREFIXES:
+    for prefix in _surviving_prefixes(suppressed_axes):
         value = label_axes.get(prefix)
         value_str = _MISSING_NAME if value is None else str(value)
         parts.append(f"{_AXIS_PREFIX_TO_LABEL_PREFIX[prefix]}{value_str}")
@@ -133,6 +157,7 @@ def _axis_value_strings(
 
 def variant_label_from_axes(
     label_axes: Mapping[str, Optional[str]],
+    suppressed_axes: frozenset[str] = frozenset(),
 ) -> str:
     """Assemble the variant row label from a typed axis Mapping.
 
@@ -142,12 +167,19 @@ def variant_label_from_axes(
     order yields a stable axis ordering: space-joined as
     ``<arch> <comp> v<cver> -<opt>``. Missing axes render as
     :data:`_MISSING_NAME` (``"?"``).
+
+    ``suppressed_axes`` are dropped from the rendered label (used when
+    a :class:`VariantGroupNode` ancestor has already disclosed that
+    axis's value). An empty result (all axes suppressed) returns
+    ``""`` — the surrounding tree structure already discloses every
+    axis.
     """
-    return " ".join(_axis_value_strings(label_axes))
+    return " ".join(_axis_value_strings(label_axes, suppressed_axes))
 
 
 def aligned_variant_labels(
     label_axes_list: Sequence[Mapping[str, Optional[str]]],
+    suppressed_axes: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """Return aligned variant labels in lockstep order.
 
@@ -166,19 +198,30 @@ def aligned_variant_labels(
 
     Empty input returns an empty tuple. Single-element input still
     returns aligned strings (trivially: the row IS its own max).
+
+    ``suppressed_axes`` carries the canonical positional prefix keys
+    already disclosed by an enclosing :class:`VariantGroupNode`
+    ancestor chain; those axes' columns are dropped from every row
+    (and the per-axis width recomputed over the surviving axes). When
+    every positional axis is suppressed each row returns ``""`` —
+    the tree structure has already disclosed everything.
     """
     rows: list[list[str]] = [
-        _axis_value_strings(axes) for axes in label_axes_list
+        _axis_value_strings(axes, suppressed_axes) for axes in label_axes_list
     ]
     if not rows:
         return ()
-    n_axes = len(POSITIONAL_PREFIXES)
+    n_axes = len(rows[0])
+    if n_axes == 0:
+        # All axes suppressed — every row's label is the empty string;
+        # the tree's group-ancestor chain has disclosed every axis.
+        return tuple("" for _ in rows)
     # Per-axis max width across the sibling set; each row is guaranteed
     # to have ``n_axes`` fragments by :func:`_axis_value_strings`. The
-    # trailing axis (``-opt``) intentionally uses its own per-row length
-    # as the "max" — :py:meth:`str.ljust` becomes a no-op there, so the
-    # last column has no trailing whitespace without a special-case
-    # branch inside the per-row loop.
+    # trailing axis intentionally uses its own per-row length as the
+    # "max" — :py:meth:`str.ljust` becomes a no-op there, so the last
+    # column has no trailing whitespace without a special-case branch
+    # inside the per-row loop.
     column_widths: list[int] = [
         max(len(row[axis_idx]) for row in rows) for axis_idx in range(n_axes - 1)
     ]

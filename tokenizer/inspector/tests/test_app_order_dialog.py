@@ -242,6 +242,72 @@ def test_group_variants_one_grouping_axis_nests_by_arch():
     assert len(x64_group.children) == 2
 
 
+def test_collect_suppressed_axes_walks_variant_group_node_ancestors():
+    """Positional :class:`VariantGroupNode` ancestors contribute their
+    axis ``key`` to the suppression set; BITWIDTH + EXTRA_META
+    ancestors do NOT (those axes are not in the canonical positional
+    label so dropping a column wouldn't make sense)."""
+    from tokenizer.inspector._app._application import _collect_suppressed_axes
+
+    axes = build_canonical_axes()
+    arch_axis = next(a for a in axes if a.kind is AxisKind.POSITIONAL and a.key == ARCH_PREFIX)
+    cver_axis = next(a for a in axes if a.key == CVER_PREFIX)
+    opt_axis = next(a for a in axes if a.key == OPT_PREFIX)
+    bitwidth_axis = next(a for a in axes if a.kind is AxisKind.BITWIDTH)
+    extra_axis = build_extra_meta_axis("sanitizer")
+
+    rv = _make_rv(variant_idx=0)
+
+    def _mock_tree_node(data, parent):
+        node = MagicMock()
+        node.data = data
+        node.parent = parent
+        return node
+
+    # Synthetic chain: root (None data) <- function (None data) <- cver group
+    # <- opt group <- the freshly-expanded opt-group node (still the
+    # caller). The walk reads ``cursor.data`` + ``cursor.parent`` only.
+    root = _mock_tree_node(None, None)
+    fn_node = _mock_tree_node(None, root)
+    cver_group = VariantGroupNode(
+        axis=cver_axis, axis_value="5.0", children=[], rendered_by_variant={0: rv}
+    )
+    cver_tree_node = _mock_tree_node(cver_group, fn_node)
+    opt_group = VariantGroupNode(
+        axis=opt_axis, axis_value="O0", children=[], rendered_by_variant={0: rv}
+    )
+    opt_tree_node = _mock_tree_node(opt_group, cver_tree_node)
+
+    # Caller passes the EXPANDED node (the opt group). Walk includes
+    # the expanded node itself + every ancestor.
+    suppressed = _collect_suppressed_axes(opt_tree_node)
+    assert suppressed == frozenset({CVER_PREFIX, OPT_PREFIX})
+
+    # Un-grouped path: expanding the function itself (no group ancestors)
+    # yields an empty frozenset -- legacy behavior preserved.
+    assert _collect_suppressed_axes(fn_node) == frozenset()
+
+    # BITWIDTH + EXTRA_META group ancestors do NOT contribute to the
+    # positional-axis suppression set.
+    bw_group = VariantGroupNode(
+        axis=bitwidth_axis, axis_value="32", children=[], rendered_by_variant={0: rv}
+    )
+    bw_tree_node = _mock_tree_node(bw_group, fn_node)
+    extra_group = VariantGroupNode(
+        axis=extra_axis, axis_value="address", children=[], rendered_by_variant={0: rv}
+    )
+    extra_tree_node = _mock_tree_node(extra_group, bw_tree_node)
+    assert _collect_suppressed_axes(extra_tree_node) == frozenset()
+
+    # Mixed chain: ARCH positional under BITWIDTH derived -- only ARCH
+    # is suppressed (BITWIDTH does not occupy a positional column).
+    arch_group = VariantGroupNode(
+        axis=arch_axis, axis_value="arm32", children=[], rendered_by_variant={0: rv}
+    )
+    arch_tree_node = _mock_tree_node(arch_group, bw_tree_node)
+    assert _collect_suppressed_axes(arch_tree_node) == frozenset({ARCH_PREFIX})
+
+
 def test_group_variants_missing_value_sinks_to_question_bucket():
     """An EXTRA_META value missing on one variant -> ``"?"`` bucket
     placed after the populated ones."""
