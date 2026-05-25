@@ -3,7 +3,6 @@ from typing import List
 
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
-from tokenizer.disasm.metadata import AddressKind
 from tokenizer.disasm.types import (
     AddressSizePrefixView,
     BranchHintPrefixView,
@@ -338,42 +337,21 @@ def tokenize_operand_immediate(
             )
             tokens.extend(imm_token)
         elif insn.mnemonic in addressing_control_flow_instructions:
-            # Addressing/control flow instruction - check for metadata.
+            # Control-flow target: hand the raw value + metadata to the v2
+            # precedence walk and let ``_pred_block`` / ``_pred_local_func``
+            # / extern / etc. decide. Intra-function targets land at step 4
+            # (``block_v2``) per ``precedence.md``; function entries fall
+            # to step 3 (``local_func``). No pre-classification here — the
+            # constant_handler owns the address-kind dispatch.
             # todo we have a major issue here: a lot of targets are NOI in this table, e.g. I got .plt but angr can resolve it cfg.kb.functions.get(call_target_addr)
             meta = lookup.lookup(raw_imm)
-            # Internal-jump heuristic: a control-flow target inside the
-            # current function body (and not at the function entry) is
-            # treated as a raw arithmetic value rather than a typed
-            # ``block`` token. Function entries (``start_addr == raw_imm``)
-            # — including recursive calls — fall through to the typed
-            # path so the ``local_func`` precedence rule fires.
-            #
-            # Negative ``raw_imm`` never matches a function entry
-            # (provider-reported function addresses are non-negative) and
-            # never falls within ``[func_min_addr, func_max_addr)``
-            # (both bounds non-negative), so the heuristic safely
-            # short-circuits on negative arithmetic immediates that
-            # share a control-flow mnemonic.
-            if (
-                meta.kind == AddressKind.LOCAL_FUNCTION
-                and meta.start_addr is not None
-                and meta.start_addr != raw_imm
-                and func_min_addr <= raw_imm < func_max_addr
-            ):
-                imm_token = constant_handler.process_constant_v2(
-                    raw_imm,
-                    is_arithmetic=True,
-                    fp_immediate_type=fp_immediate,
-                )
-                tokens.extend(imm_token)
-            else:
-                imm_token = constant_handler.process_constant_v2(
-                    raw_imm,
-                    meta=meta,
-                    is_arithmetic=False,
-                    fp_immediate_type=fp_immediate,
-                )
-                tokens.extend(imm_token)
+            imm_token = constant_handler.process_constant_v2(
+                raw_imm,
+                meta=meta,
+                is_arithmetic=False,
+                fp_immediate_type=fp_immediate,
+            )
+            tokens.extend(imm_token)
         else:  # Fallback - create opaque constant
             meta = lookup.lookup(raw_imm)
             imm_token = constant_handler.process_constant_v2(
