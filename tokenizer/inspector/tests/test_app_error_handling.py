@@ -37,7 +37,7 @@ from tokenizer.inspector._render._protocol import (
     FunctionHandle,
     RenderBackend,
 )
-from tokenizer.inspector._tree_model import AsmLeaf, FunctionNode
+from tokenizer.inspector._tree_model import AsmLeaf, BlockNode, FunctionNode
 
 
 # ---------------------------------------------------------------------------
@@ -304,5 +304,332 @@ def test_search_input_focus_and_clear():
                 await pilot.press("escape")
                 await pilot.pause()
                 assert "visible" not in search.classes
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Per-row horizontal-scroll memory + cursor-aware auto-adjust + conditional
+# right-arrow expand. The tests below treat the tree's rows like editor
+# lines: each row owns its own ``remembered_scroll_x``; the cursor move
+# restores it; manual pan saves it; the right arrow only pans when the
+# row would otherwise hide content past the viewport.
+# ---------------------------------------------------------------------------
+
+
+async def _expand_function_with_children(
+    app: "InspectorApp", pilot, children: list
+):
+    """Stub the root function's expand to return ``children`` + drive expand.
+
+    The dispatcher attaches children asynchronously (it runs in response
+    to the :class:`Tree.NodeExpanded` message); the helper yields once
+    via ``pilot.pause()`` so the returned ``child_tree_nodes`` tuple
+    contains the attached :class:`textual.widgets._tree.TreeNode`
+    instances.
+
+    Returns ``(tree, fn_tree_node, child_tree_nodes)``.
+    """
+    tree, fn_tree_node = _root_tree_node(app)
+    fn_model: FunctionNode = fn_tree_node.data
+    fn_model.expand = MagicMock(return_value=children)
+    fn_tree_node.expand()
+    await pilot.pause()
+    return tree, fn_tree_node, list(fn_tree_node.children)
+
+
+def test_remembered_scroll_x_default_is_zero():
+    """Every model node ships with ``remembered_scroll_x == 0`` by default."""
+
+    long_leaf = AsmLeaf(text="x" * 200)
+    short_leaf = AsmLeaf(text="hi")
+    assert long_leaf.remembered_scroll_x == 0
+    assert short_leaf.remembered_scroll_x == 0
+
+
+def test_pan_right_on_long_row_saves_remembered_scroll_x():
+    """Manual pan on the cursor row persists its ``scroll_x`` onto the model."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                long_leaf = AsmLeaf(text="x" * 200)
+                tree, _fn, child_tree_nodes = (
+                    await _expand_function_with_children(app, pilot, [long_leaf])
+                )
+
+                tree.move_cursor(child_tree_nodes[0], animate=False)
+                await pilot.pause()
+                # Restore path leaves scroll_x at the remembered value (0).
+                assert tree.scroll_offset.x == 0
+                assert long_leaf.remembered_scroll_x == 0
+
+                # Right arrow on a long row -> pans + saves.
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.scroll_offset.x == 1
+                assert long_leaf.remembered_scroll_x == 1
+
+                # A few more pans -> the saved value tracks each step.
+                await pilot.press("right")
+                await pilot.press("right")
+                await pilot.pause()
+                assert tree.scroll_offset.x == 3
+                assert long_leaf.remembered_scroll_x == 3
+
+    asyncio.run(runner())
+
+
+def test_cursor_move_restores_per_row_scroll_memory():
+    """Moving cursor across rows restores each row's remembered ``scroll_x``."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                long_a = AsmLeaf(text="a" * 200)
+                long_b = AsmLeaf(text="b" * 200)
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_a, long_b]
+                )
+                row_a, row_b = children
+
+                # Pan row A right by 5 columns.
+                tree.move_cursor(row_a, animate=False)
+                await pilot.pause()
+                for _ in range(5):
+                    await pilot.press("right")
+                await pilot.pause()
+                assert long_a.remembered_scroll_x == 5
+
+                # Move to row B -- its remembered_scroll_x is 0, viewport
+                # restores to 0 (long row, auto-adjust does not fire).
+                tree.move_cursor(row_b, animate=False)
+                await pilot.pause()
+                assert tree.scroll_offset.x == 0
+                assert long_b.remembered_scroll_x == 0
+
+                # Back to row A -- viewport restores to row A's remembered 5.
+                tree.move_cursor(row_a, animate=False)
+                await pilot.pause()
+                assert tree.scroll_offset.x == 5
+                # Saved value persists across the round-trip.
+                assert long_a.remembered_scroll_x == 5
+
+    asyncio.run(runner())
+
+
+def test_cursor_move_auto_adjusts_when_destination_row_off_screen():
+    """Auto-adjust pulls a short destination row into view without saving.
+
+    Pan row A far right (scroll_x large); cursor to a short row B whose
+    cell_len is much smaller than the current scroll_x. The viewport
+    auto-adjusts so row B's content stays visible (effective scroll_x =
+    0 when the label fits entirely). Row B's remembered_scroll_x stays
+    at the model default 0 (the user never panned on B).
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                long_a = AsmLeaf(text="a" * 200)
+                short_b = AsmLeaf(text="hi")
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_a, short_b]
+                )
+                row_a, row_b = children
+
+                # Pan row A by 50 columns -- saved as A's remembered.
+                tree.move_cursor(row_a, animate=False)
+                await pilot.pause()
+                for _ in range(50):
+                    await pilot.press("right")
+                await pilot.pause()
+                assert long_a.remembered_scroll_x == 50
+
+                # Move to short row B. cell_len("hi") == 2 << viewport
+                # width (80), so the auto-adjust clamps to flush-left.
+                tree.move_cursor(row_b, animate=False)
+                await pilot.pause()
+                # Effective scroll_x is 0 (short row fits at flush-left).
+                assert tree.scroll_offset.x == 0
+                # Auto-adjust does NOT save -- the row's remembered stays 0.
+                assert short_b.remembered_scroll_x == 0
+
+                # Move back to row A -- the saved 50 is honoured.
+                tree.move_cursor(row_a, animate=False)
+                await pilot.pause()
+                assert tree.scroll_offset.x == 50
+                assert long_a.remembered_scroll_x == 50
+
+    asyncio.run(runner())
+
+
+def test_right_arrow_on_fitting_row_expands_collapsed_node():
+    """``→`` on a row that fits + ``can_expand=True`` expands the node."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # A BlockNode with a short preview fits within the 80-col
+                # viewport; can_expand is True so right-arrow must expand.
+                short_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    block_idx=1,
+                    preview="x",
+                )
+                short_block.expand = MagicMock(return_value=[])
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [short_block]
+                )
+                row = children[0]
+                tree.move_cursor(row, animate=False)
+                await pilot.pause()
+
+                assert row.is_expanded is False
+                scroll_before = tree.scroll_offset.x
+
+                await pilot.press("right")
+                await pilot.pause()
+
+                # Did NOT pan -- the row fit, so the action fell through
+                # to expand. The model's expand spy was invoked.
+                assert tree.scroll_offset.x == scroll_before
+                assert row.is_expanded is True
+                short_block.expand.assert_called_once()
+
+    asyncio.run(runner())
+
+
+def test_right_arrow_on_already_expanded_fitting_row_is_noop():
+    """``→`` on a row that fits + already expanded: scroll unchanged + no extra expand."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                short_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    block_idx=1,
+                    preview="x",
+                )
+                short_block.expand = MagicMock(return_value=[])
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [short_block]
+                )
+                row = children[0]
+                tree.move_cursor(row, animate=False)
+                await pilot.pause()
+
+                # Pre-expand the row so the action's expand-fallback
+                # branch must take the no-op path.
+                row.expand()
+                await pilot.pause()
+                assert row.is_expanded is True
+                short_block.expand.reset_mock()
+                scroll_before = tree.scroll_offset.x
+
+                await pilot.press("right")
+                await pilot.pause()
+
+                assert tree.scroll_offset.x == scroll_before
+                # No new expand call -- the action is a no-op on an
+                # already-expanded fitting row.
+                short_block.expand.assert_not_called()
+
+    asyncio.run(runner())
+
+
+def test_right_arrow_on_fitting_leaf_is_noop():
+    """``→`` on a terminal (``can_expand=False``) fitting row: no-op."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                short_leaf = AsmLeaf(text="hi")
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [short_leaf]
+                )
+                row = children[0]
+                tree.move_cursor(row, animate=False)
+                await pilot.pause()
+                scroll_before = tree.scroll_offset.x
+
+                await pilot.press("right")
+                await pilot.pause()
+
+                # No pan + leaf cannot expand -> action is a no-op.
+                assert tree.scroll_offset.x == scroll_before
+                assert row.is_expanded is False
+
+
+    asyncio.run(runner())
+
+
+def test_vim_l_mirrors_right_arrow():
+    """``l`` behaves like ``→``: pan on overflow, expand on fitting."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                long_leaf = AsmLeaf(text="x" * 200)
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_leaf]
+                )
+                tree.move_cursor(children[0], animate=False)
+                await pilot.pause()
+                assert tree.scroll_offset.x == 0
+
+                # ``l`` on overflow -> pan + save remembered.
+                await pilot.press("l")
+                await pilot.pause()
+                assert tree.scroll_offset.x == 1
+                assert long_leaf.remembered_scroll_x == 1
+
+    asyncio.run(runner())
+
+
+def test_vim_h_is_pure_pan_and_saves_remembered_scroll_x():
+    """``h`` is unconditional pan-left and persists the new ``scroll_x``."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                long_leaf = AsmLeaf(text="x" * 200)
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_leaf]
+                )
+                tree.move_cursor(children[0], animate=False)
+                await pilot.pause()
+                # Pan right by 3.
+                for _ in range(3):
+                    await pilot.press("right")
+                await pilot.pause()
+                assert tree.scroll_offset.x == 3
+                assert long_leaf.remembered_scroll_x == 3
+
+                # ``h`` pulls back by 1 + saves.
+                await pilot.press("h")
+                await pilot.pause()
+                assert tree.scroll_offset.x == 2
+                assert long_leaf.remembered_scroll_x == 2
 
     asyncio.run(runner())

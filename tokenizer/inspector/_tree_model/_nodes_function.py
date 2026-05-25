@@ -41,6 +41,10 @@ class FunctionNode:
     handle: "FunctionHandle"
     is_failed: bool = False
     can_expand: bool = field(default=True, init=False)
+    # Per-row horizontal scroll memory; the UI saves the row's current
+    # ``scroll_offset.x`` here on manual pan and restores it when the
+    # cursor returns to this row. See :mod:`tokenizer.inspector._app`.
+    remembered_scroll_x: int = field(default=0, init=False)
     _backend: "Optional[RenderBackend]" = field(default=None, init=False, repr=False)
 
     @property

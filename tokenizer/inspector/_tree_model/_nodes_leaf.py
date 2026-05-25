@@ -30,6 +30,10 @@ class AsmLeaf:
     text: str
     can_expand: bool = field(default=False, init=False)
     is_failed: bool = False
+    # Per-row horizontal scroll memory; the UI saves the row's current
+    # ``scroll_offset.x`` here on manual pan and restores it when the
+    # cursor returns to this row. See :mod:`tokenizer.inspector._app`.
+    remembered_scroll_x: int = field(default=0, init=False)
 
     def expand(self) -> list:
         """Terminal node -- callers must gate on ``can_expand``."""
@@ -50,6 +54,8 @@ class ShowAllVariantsNode:
     other_variants: tuple["VariantNode", ...]
     can_expand: bool = field(default=True, init=False)
     is_failed: bool = False
+    # Per-row horizontal scroll memory; see :class:`AsmLeaf`.
+    remembered_scroll_x: int = field(default=0, init=False)
 
     def expand(self) -> list:
         return list(self.other_variants)

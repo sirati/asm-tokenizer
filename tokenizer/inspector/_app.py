@@ -155,19 +155,58 @@ def _compose_label(node: Node) -> Text:
 class _InspectorTree(Tree[Node]):
     """Tree widget that paints the ``[*]`` failed glyph + ``>>`` marker.
 
-    Render policy only -- expand / error / search logic lives on
-    :class:`InspectorApp`. Per repaint: (a) pick prefix glyph
-    (default Tree icons vs ``[*]`` red on a failed node), (b) route
-    through :func:`apply_truncation_marker` so the right-edge ``>>``
-    marker tracks the horizontal scroll position.
+    Render policy + tree-local keyboard behaviour. Expand / error /
+    search logic still lives on :class:`InspectorApp`. Per repaint:
+    (a) pick prefix glyph (default Tree icons vs ``[*]`` red on a
+    failed node), (b) route through :func:`apply_truncation_marker`
+    so the right-edge ``>>`` marker tracks the horizontal scroll
+    position.
+
+    Tree-local keyboard concerns owned here:
+
+    * Editor-like per-row horizontal scroll memory (each
+      :class:`Node` model carries ``remembered_scroll_x``; the tree
+      saves on manual pan + restores on cursor change).
+    * Cursor-aware auto-adjust when the destination row's content
+      would otherwise land mostly off-screen.
+    * Conditional ``→`` (and vim ``l``): pan when the cursor row
+      overflows the viewport, expand a collapsed node otherwise.
+    * Conditional ``←``: pan while ``scroll_x > 0``, else
+      :meth:`action_cursor_parent`.
+
+    The tree's :class:`textual.containers.ScrollableContainer`
+    ancestor binds ``left`` / ``right`` to its built-in
+    ``scroll_left`` / ``scroll_right`` actions; the BINDINGS override
+    below routes them through our save-on-pan + conditional-expand
+    actions instead.
     """
 
-    def render_label(
+    BINDINGS: ClassVar[list[BindingType]] = [
+        # Override the ScrollableContainer's pan-only ``left`` / ``right``
+        # with the editor-style conditional variants. ``h`` retains the
+        # pure pan-left affordance for vim users; ``l`` mirrors ``→`` so
+        # both stay symmetric.
+        Binding("h", "pan_left", "Pan left", show=False),
+        Binding("left", "pan_left_or_parent", "Pan left / parent", show=False),
+        Binding("l,right", "pan_right_or_expand", "Pan right / expand", show=False),
+        Binding("0", "pan_x_home", "Line start", show=False),
+        Binding("dollar_sign", "pan_x_end", "Line end", show=False),
+    ]
+
+    def _compose_full_label(
         self,
         node: TreeNode[Node],
         base_style: Style,
         style: Style,
     ) -> Text:
+        """Assemble prefix + node label *without* the truncation marker.
+
+        Shared by :meth:`render_label` and :meth:`label_cell_len`. The
+        marker is a viewport-dependent visual hint; the underlying row
+        width MUST be measured against the marker-free label so cursor-
+        aware scroll decisions (see :meth:`watch_cursor_line`) don't
+        bake the cosmetic ' >>' suffix into their math.
+        """
         node_label = node._label.copy()
         node_label.stylize(style)
 
@@ -183,10 +222,150 @@ class _InspectorTree(Tree[Node]):
         else:
             prefix = Text("", style=base_style)
 
-        text = prefix + node_label
+        return prefix + node_label
+
+    def render_label(
+        self,
+        node: TreeNode[Node],
+        base_style: Style,
+        style: Style,
+    ) -> Text:
+        text = self._compose_full_label(node, base_style, style)
         return apply_truncation_marker(
             text, self.size.width, self.scroll_offset.x
         )
+
+    def label_cell_len(self, node: TreeNode[Node]) -> int:
+        """Cell-width of ``node``'s composed label (no truncation marker).
+
+        The scroll-memory + auto-adjust logic measures rows against
+        the actual content; bypass :meth:`get_label_width` which would
+        re-enter :func:`apply_truncation_marker` and inflate the
+        result when the row spills the current viewport.
+        """
+        from rich.style import NULL_STYLE
+
+        return self._compose_full_label(node, NULL_STYLE, NULL_STYLE).cell_len
+
+    # --- editor-like per-row scroll memory actions ---------------------
+    #
+    # Manual pan saves the cursor row's new ``scroll_x`` onto its model
+    # node (``Node.remembered_scroll_x``). Cursor moves restore the
+    # destination row's saved value; a temporary auto-adjustment kicks
+    # in when the restored column would leave less than half a viewport
+    # of content visible.
+
+    def _save_cursor_scroll_x(self) -> None:
+        """Persist ``scroll_offset.x`` onto the cursor row's model.
+
+        No-op when the cursor sits on the root or a stray node without
+        model data (e.g. the dim-red error child attached on failed
+        expansion).
+        """
+        node = self.cursor_node
+        if node is None or node.data is None:
+            return
+        node.data.remembered_scroll_x = self.scroll_offset.x
+
+    def action_pan_left(self) -> None:
+        """Unconditional pan-left; saves the new ``scroll_x`` onto the row."""
+        self.scroll_left(animate=False)
+        self._save_cursor_scroll_x()
+
+    def action_pan_left_or_parent(self) -> None:
+        """Pan left while ``scroll_x > 0``, else climb to the parent row.
+
+        Standard file-tree TUI affordance: once the row is already
+        flush-left there is nothing more to pan, so the arrow becomes a
+        cursor-to-parent step. The unconditional pan binding survives
+        on ``h`` for vim users who want pure horizontal scroll. When
+        the action does pan, it saves the new ``scroll_x`` onto the
+        cursor row's remembered value.
+        """
+        if self.scroll_offset.x > 0:
+            self.scroll_left(animate=False)
+            self._save_cursor_scroll_x()
+        else:
+            self.action_cursor_parent()
+
+    def action_pan_right_or_expand(self) -> None:
+        """Pan right when the cursor row overflows, else expand the node.
+
+        Editor-like ``→``: only pan when there is content past the
+        rightmost visible column of the cursor row. If the row fits
+        within the viewport already, fall through to expanding a
+        collapsed node with children (``can_expand and not is_expanded``);
+        on an already-expanded or terminal row the action is a no-op.
+        When the action does pan, it saves the new ``scroll_x`` onto
+        the cursor row's remembered value.
+        """
+        node = self.cursor_node
+        if node is None:
+            return
+        cell_len = self.label_cell_len(node)
+        if cell_len > self.size.width + self.scroll_offset.x:
+            self.scroll_right(animate=False)
+            self._save_cursor_scroll_x()
+            return
+        # Row fits: fall through to the expand affordance.
+        model = node.data
+        if (
+            model is not None
+            and getattr(model, "can_expand", False)
+            and not node.is_expanded
+        ):
+            node.expand()
+        # else: already expanded or leaf -- no-op.
+
+    def action_pan_x_home(self) -> None:
+        self.scroll_home(animate=False, x_axis=True, y_axis=False)
+        self._save_cursor_scroll_x()
+
+    def action_pan_x_end(self) -> None:
+        self.scroll_end(animate=False, x_axis=True, y_axis=False)
+        self._save_cursor_scroll_x()
+
+    # --- cursor-move scroll restore + auto-adjust ----------------------
+
+    def watch_cursor_line(self, previous_line: int, line: int) -> None:
+        """Restore the destination row's remembered ``scroll_x`` on cursor move.
+
+        Hooks Textual's reactive watcher pattern (see
+        ``widgets/_tree.py``'s ``watch_cursor_line``) rather than the
+        ``Tree.NodeHighlighted`` message, because the message is
+        deferred and gets coalesced; the watcher runs synchronously
+        right after the cursor-line update, giving us the cleanest
+        moment to apply the restore + auto-adjust before any render.
+
+        Behaviour:
+
+        * scroll to the destination's stored ``remembered_scroll_x``;
+        * if less than half a viewport of content sits past that
+          column, pull the right edge in so the row stays visible.
+          The adjustment is NOT saved -- the row's remembered value
+          is the user's last manual choice, the auto-adjust is purely
+          ergonomic.
+
+        Stays compatible with the superclass: the parent
+        :meth:`Tree.watch_cursor_line` is invoked first so the
+        per-row repaint + ``NodeHighlighted`` post fire normally.
+        """
+        super().watch_cursor_line(previous_line, line)
+        node = self.cursor_node
+        if node is None or node.data is None:
+            return
+        remembered = getattr(node.data, "remembered_scroll_x", 0)
+        viewport_width = self.size.width
+        cell_len = self.label_cell_len(node)
+
+        effective = remembered
+        if viewport_width > 0 and cell_len - remembered < viewport_width // 2:
+            # Less than half a viewport of content sits past the
+            # restored column; pull the right edge in so the row stays
+            # visible. ``max(0, ...)`` clamps short rows to flush-left.
+            effective = max(0, cell_len - viewport_width)
+
+        self.scroll_to(x=effective, animate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -215,15 +394,10 @@ class InspectorApp(App[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("q", "quit", "Quit"),
-        # ``h`` stays a pure pan-left so vim users keep an unconditional
-        # horizontal-pan key; ``left`` adopts the standard file-tree TUI
-        # behaviour of climbing to the parent once the row is fully
-        # left-aligned (scroll_offset.x == 0).
-        Binding("h", "tree_scroll_left", "Pan left"),
-        Binding("left", "tree_scroll_left_or_parent", "Pan left / parent"),
-        Binding("l,right", "tree_scroll_right", "Pan right"),
-        Binding("0", "tree_scroll_x_home", "Line start"),
-        Binding("dollar_sign", "tree_scroll_x_end", "Line end"),
+        # Horizontal-pan bindings live on :class:`_InspectorTree` (the
+        # widget that owns the cursor + viewport) so the action runs
+        # before the ScrollableContainer's built-in pan-only bindings
+        # would otherwise capture ``left`` / ``right``.
         Binding("slash", "focus_search", "Search"),
         Binding("escape", "hide_search", "Hide search", show=False),
     ]
@@ -317,37 +491,11 @@ class InspectorApp(App[None]):
                 allow_expand=getattr(child, "can_expand", False),
             )
 
-    # --- horizontal-scroll actions ---------------------------------
-
-    def action_tree_scroll_left(self) -> None:
-        self.query_one("#tree", _InspectorTree).scroll_left(animate=False)
-
-    def action_tree_scroll_left_or_parent(self) -> None:
-        """Pan left while ``scroll_x > 0``, else climb to the parent row.
-
-        Standard file-tree TUI affordance: once the row is already
-        flush-left there is nothing more to pan, so the arrow becomes a
-        cursor-to-parent step. The unconditional pan binding survives
-        on ``h`` for vim users who want pure horizontal scroll.
-        """
-        tree = self.query_one("#tree", _InspectorTree)
-        if tree.scroll_offset.x > 0:
-            tree.scroll_left(animate=False)
-        else:
-            tree.action_cursor_parent()
-
-    def action_tree_scroll_right(self) -> None:
-        self.query_one("#tree", _InspectorTree).scroll_right(animate=False)
-
-    def action_tree_scroll_x_home(self) -> None:
-        self.query_one("#tree", _InspectorTree).scroll_home(
-            animate=False, x_axis=True, y_axis=False
-        )
-
-    def action_tree_scroll_x_end(self) -> None:
-        self.query_one("#tree", _InspectorTree).scroll_end(
-            animate=False, x_axis=True, y_axis=False
-        )
+    # Horizontal-scroll concerns (editor-like per-row scroll memory +
+    # cursor-aware auto-adjust + conditional right-arrow expand) live
+    # on :class:`_InspectorTree`. The tree owns the cursor, viewport,
+    # and the per-row model nodes, so keeping the keyboard logic
+    # there avoids the App brokering tree state through actions.
 
     # --- search ----------------------------------------------------
 

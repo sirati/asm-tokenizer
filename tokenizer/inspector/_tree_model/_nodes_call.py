@@ -12,7 +12,7 @@ sibling (per plan section 4).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
@@ -52,6 +52,8 @@ class InlineCallNode:
     variant_idx: int
     provider: str | None
     is_failed: bool = False
+    # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app`.
+    remembered_scroll_x: int = field(default=0, init=False)
 
     @property
     def can_expand(self) -> bool:
