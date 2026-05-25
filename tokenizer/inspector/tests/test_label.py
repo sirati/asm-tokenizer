@@ -381,3 +381,116 @@ def test_aligned_variant_labels_preserves_input_order():
     assert aligned[0].startswith("z80")
     assert aligned[1].startswith("aaa")
     assert aligned[2].startswith("mid")
+
+
+# ---------------------------------------------------------------------------
+# aligned_variant_labels — grouping-ancestor axis suppression
+# ---------------------------------------------------------------------------
+
+
+def test_aligned_variant_labels_suppressed_axes_dropped_from_every_row():
+    """When the caller passes the canonical-prefix keys disclosed by a
+    grouping-ancestor chain, those axis columns are dropped from each
+    row's rendered label — so the variant row stops repeating values
+    the user already sees on the group rows above."""
+    rows = [
+        _axes(arch="arm32", comp="clang", cver="5.0", opt="O0"),
+        _axes(arch="arm64", comp="clang", cver="5.0", opt="O0"),
+        _axes(arch="x86", comp="gcc", cver="5.0", opt="O0"),
+    ]
+    aligned = aligned_variant_labels(
+        rows, suppressed_axes=frozenset({CVER_PREFIX, OPT_PREFIX})
+    )
+    # Only arch + compiler columns survive; widths recomputed.
+    assert aligned == (
+        "arm32 clang",
+        "arm64 clang",
+        "x86   gcc",
+    )
+
+
+def test_aligned_variant_labels_all_axes_suppressed_yields_empty_rows():
+    """4-deep grouping covers every positional axis; each variant
+    row's label collapses to ``""`` — the tree structure has already
+    disclosed everything and the row's prefix glyph alone marks the
+    leaf."""
+    rows = [
+        _axes(arch="x86", comp="clang", cver="8.0", opt="O3"),
+        _axes(arch="x86", comp="clang", cver="8.0", opt="O3"),
+    ]
+    aligned = aligned_variant_labels(
+        rows,
+        suppressed_axes=frozenset(
+            {ARCH_PREFIX, COMP_PREFIX, CVER_PREFIX, OPT_PREFIX}
+        ),
+    )
+    assert aligned == ("", "")
+
+
+def test_aligned_variant_labels_suppress_single_middle_axis():
+    """Dropping a middle axis preserves the surrounding axes' order
+    (``arch comp v? -opt`` minus ``comp`` -> ``arch v? -opt``)."""
+    rows = [
+        _axes(arch="x86", comp="clang", cver="8.0", opt="O3"),
+        _axes(arch="arm64", comp="clang", cver="9.1", opt="O0"),
+    ]
+    aligned = aligned_variant_labels(
+        rows, suppressed_axes=frozenset({COMP_PREFIX})
+    )
+    # arch + cver + opt only. arch width = 5 (arm64). cver width = 4 (v8.0 / v9.1).
+    assert aligned == (
+        "x86   v8.0 -O3",
+        "arm64 v9.1 -O0",
+    )
+
+
+def test_aligned_variant_labels_unknown_suppressed_key_is_no_op():
+    """A suppressed key not in :data:`POSITIONAL_PREFIXES` is silently
+    ignored — the canonical-prefix filter is the source of truth for
+    column membership."""
+    rows = [_axes(arch="x86", comp="clang", cver="8.0", opt="O3")]
+    aligned = aligned_variant_labels(
+        rows, suppressed_axes=frozenset({"not-a-real-prefix:"})
+    )
+    assert aligned == ("x86 clang v8.0 -O3",)
+
+
+def test_variant_label_from_axes_suppressed_axis_dropped():
+    """Non-aligned fallback path honours the same suppression policy."""
+    axes = _axes(arch="x86", comp="clang", cver="8.0", opt="O3")
+    label = variant_label_from_axes(
+        axes, suppressed_axes=frozenset({OPT_PREFIX, CVER_PREFIX})
+    )
+    assert label == "x86 clang"
+
+
+def test_variant_label_from_axes_all_axes_suppressed_returns_empty():
+    """All-positional suppression collapses the fallback label to ``""``."""
+    axes = _axes(arch="x86", comp="clang", cver="8.0", opt="O3")
+    label = variant_label_from_axes(
+        axes,
+        suppressed_axes=frozenset(
+            {ARCH_PREFIX, COMP_PREFIX, CVER_PREFIX, OPT_PREFIX}
+        ),
+    )
+    assert label == ""
+
+
+def test_variant_label_from_axes_default_suppressed_axes_preserves_legacy():
+    """Default ``suppressed_axes`` is empty — un-grouped behavior is
+    byte-identical to the pre-suppression rendering."""
+    axes = _axes(arch="x86", comp="clang", cver="8.0", opt="O3")
+    assert variant_label_from_axes(axes) == "x86 clang v8.0 -O3"
+
+
+def test_aligned_variant_labels_default_suppressed_axes_preserves_legacy():
+    """Default ``suppressed_axes`` is empty — un-grouped behavior is
+    byte-identical to the pre-suppression alignment."""
+    rows = [
+        _axes(arch="arm32", comp="gcc", cver="5", opt="O0"),
+        _axes(arch="x86", comp="clang", cver="7", opt="O3"),
+    ]
+    assert aligned_variant_labels(rows) == (
+        "arm32 gcc   v5 -O0",
+        "x86   clang v7 -O3",
+    )
