@@ -129,6 +129,13 @@ def test_consecutive_f128_tokens_group_into_one_finite_source() -> None:
         ),
         identities=np.asarray([0], dtype=np.uint16),
         numbers_sig=numbers_sig, numbers_se=numbers_se,
+        # Per W3-17 W4-AMENDED, multi-chunk sources MUST live within
+        # ONE instruction; supply an insn_runlength sidecar that groups
+        # both F128 chunk slots into a single 2-slot instruction (the
+        # silent-header pair contains the BLOCK_V2 + an INSTR_REP, but
+        # in this bare layout the BLOCK_V2 IS the header so the BODY
+        # body contains exactly one 2-slot instruction).
+        insn_runlength=np.asarray([2], dtype=np.uint32),
     )
     items = blocks[0].items
     # Exactly ONE AsmLine -- the two chunks reconstructed into a single
@@ -312,8 +319,10 @@ def test_cut_variant_end_of_row_flushes_pending_chunks() -> None:
 
 def test_local_func_resolves_fid_via_line_to_name() -> None:
     """``[BLOCK_V2(c=0), LOCAL_FUNC(c=0)]`` with sidecar=[42] +
-    line_to_name={42:'my_func'} -> :class:`InlineCallEntry` carries
-    name + LOCAL kind + ``variant_idx=MISSING_VARIANT_INDEX``.
+    line_to_name={42:'my_func'} -> :class:`InlineCallEntry` rides on
+    the in-flight AsmLine's openables (post-R2 narrowed-LineItem
+    contract); carries name + LOCAL kind +
+    ``variant_idx=MISSING_VARIANT_INDEX``.
     """
     blocks = _walk(
         tokens=np.asarray([BLOCK_V2, LOCAL_FUNC, 0], dtype=np.uint16),
@@ -322,7 +331,10 @@ def test_local_func_resolves_fid_via_line_to_name() -> None:
         sidecar=np.asarray([42], dtype=np.uint32),
         line_to_name={42: "my_func"},
     )
-    call = blocks[0].items[0]
+    line = blocks[0].items[0]
+    assert isinstance(line, AsmLine)
+    assert len(line.openables) == 1
+    call = line.openables[0]
     assert isinstance(call, InlineCallEntry)
     assert call.kind is CallTargetType.LOCAL
     assert call.counter_id == 0
@@ -334,7 +346,8 @@ def test_local_func_resolves_fid_via_line_to_name() -> None:
 def test_ext_func_carries_provider_from_line_to_provider() -> None:
     """EXTERN -> ``provider`` field carries the library name keyed by
     FID. LOCAL leaves provider None even with a matching dict entry
-    (provider is EXTERN-only by contract).
+    (provider is EXTERN-only by contract). The InlineCallEntry items
+    ride on the per-instruction AsmLines' openables tuples (R2f).
     """
     blocks = _walk(
         tokens=np.asarray(
@@ -347,12 +360,17 @@ def test_ext_func_carries_provider_from_line_to_provider() -> None:
         line_to_provider={100: "libc.so", 200: "libm.so"},
     )
     items = blocks[0].items
+    assert all(isinstance(item, AsmLine) for item in items)
     assert len(items) == 2
-    ext_call, local_call = items
+    ext_line, local_line = items
+    assert len(ext_line.openables) == 1
+    ext_call = ext_line.openables[0]
     assert isinstance(ext_call, InlineCallEntry)
     assert ext_call.kind is CallTargetType.EXTERN
     assert ext_call.callee_name == "ext_callee"
     assert ext_call.provider == "libm.so"
+    assert len(local_line.openables) == 1
+    local_call = local_line.openables[0]
     assert isinstance(local_call, InlineCallEntry)
     assert local_call.kind is CallTargetType.LOCAL
     assert local_call.provider is None
@@ -361,7 +379,8 @@ def test_ext_func_carries_provider_from_line_to_provider() -> None:
 def test_unknown_fid_renders_question_mark_via_line_to_name_default() -> None:
     """``line_to_name.get(fid, "?")`` -- a FID missing from the mapping
     falls back to ``"?"``. Pins the default so a name-table miss never
-    crashes the walker.
+    crashes the walker. The InlineCallEntry rides on the AsmLine's
+    openables (R2f narrowed contract).
     """
     blocks = _walk(
         tokens=np.asarray([BLOCK_V2, LOCAL_FUNC, 0], dtype=np.uint16),
@@ -369,7 +388,10 @@ def test_unknown_fid_renders_question_mark_via_line_to_name_default() -> None:
         per_category_counts=np.asarray([[1, 0, 0]], dtype=np.uint32),
         sidecar=np.asarray([999], dtype=np.uint32),
     )
-    call = blocks[0].items[0]
+    line = blocks[0].items[0]
+    assert isinstance(line, AsmLine)
+    assert len(line.openables) == 1
+    call = line.openables[0]
     assert isinstance(call, InlineCallEntry)
     assert call.callee_name == "?"
 

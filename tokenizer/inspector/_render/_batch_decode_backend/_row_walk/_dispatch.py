@@ -2,12 +2,20 @@
 
 Single concern: route an IDENTITY token to the right emit path
 based on its resolved :class:`Category`. BLOCK -> header consume vs
-inline jump vs jump-table target. FUNCTION categories -> InlineCallEntry.
-JUMP_TABLE -> arms the per-block jump-table-footer flag (W3-16).
-Other counter-bearing categories -> ``<category counter>`` placeholder.
+inline jump vs jump-table target. FUNCTION categories -> InlineCallEntry
+on the in-flight instruction's openables buffer. JUMP_TABLE -> arms
+the per-block jump-table-footer flag (W3-16) AND the per-instruction
+``saw_jump_table_this_insn`` flag (consumed by
+:func:`._instruction._finalize_instruction`). Other counter-bearing
+categories -> ``<category counter>`` text-buffer placeholder.
 
 The per-col loop driver (:mod:`._driver`) is the only caller; this
 module knows nothing about runlength sidecars or wire-level cursors.
+The InlineCallEntry / InlineJumpEntry are routed via
+:func:`._instruction._consume_openable_slot` -- they NEVER land
+directly on ``state.current_items`` (post-R2f narrowed-LineItem
+contract: ``LineItem == AsmLine`` and inline sidecars ride on
+:attr:`AsmLine.openables`).
 """
 
 from __future__ import annotations
@@ -28,7 +36,6 @@ from tokenizer.aligned_data.matched_sections_bin import (
     CallTarget,
 )
 from tokenizer.inspector._render._protocol import (
-    AsmLine,
     BlockKind,
     InlineCallEntry,
     InlineJumpEntry,
@@ -42,6 +49,7 @@ from .._sections import (
     enter_new_body_block,
     set_current_body_block_idx,
 )
+from ._instruction import _consume_openable_slot, _consume_text_slot
 from ._state import _CATEGORY_TO_CALL_TARGET_TYPE, _WalkState
 
 
@@ -57,17 +65,21 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
 
     ``pending_header=True`` (latched at runlength-derived trigger cols)
     consumes BLOCK_V2 as a body-block header: flushes any prior BODY
-    content and opens a fresh BODY block with ``block_idx = counter``
-    (matching the InlineJumpEntry target scheme). Otherwise BLOCK_V2 is
-    an in-function jump. A BLOCK_V2 inside ``[0, n_axis)`` is raised
-    loud -- the variant_tokens prefix is pure INSTR_REP by contract.
+    content (via the per-instruction finalize chain in
+    :mod:`._driver`) and opens a fresh BODY block with
+    ``block_idx = counter`` (matching the InlineJumpEntry target
+    scheme). Otherwise BLOCK_V2 is an in-function jump and lands on
+    the in-flight instruction's openables buffer. A BLOCK_V2 inside
+    ``[0, n_axis)`` is raised loud -- the variant_tokens prefix is
+    pure INSTR_REP by contract.
 
     W3-16 W4-AMENDED: once
     :attr:`WalkSectionState.inside_jump_table_footer_block` is set,
-    BLOCK_V2 is a jump-table target -- emit :class:`InlineJumpEntry`
-    and clear ``pending_header`` once so subsequent INSTR_REPs are not
-    absorbed silently. Footer stays folded into the prior BODY section
-    per W3-16's "no Block_V2 = no new block" rule.
+    BLOCK_V2 is a jump-table target -- buffer
+    :class:`InlineJumpEntry` on the in-flight instruction and clear
+    ``pending_header`` once so subsequent INSTR_REPs are not absorbed
+    silently. Footer stays folded into the prior BODY section per
+    W3-16's "no Block_V2 = no new block" rule.
     """
     if state.current_col < state.n_axis:
         raise AssertionError(
@@ -77,10 +89,15 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
         )
     if state.current_kind is BlockKind.FUNCTION_ID:
         # Bare-BLOCK_V2 test layout: no self-prepend; transition first.
+        # The FUNCTION_ID instruction (if any) was already finalized
+        # by the driver before this slot's consumption, so the
+        # section close runs against an empty in-flight buffer.
         enter_body_after_function_id(state)
     if state.inside_jump_table_footer_block:
-        # Footer target: emit InlineJumpEntry; clear latch once.
-        state.current_items.append(InlineJumpEntry(target_block_idx=counter))
+        # Footer target: buffer InlineJumpEntry; clear latch once.
+        _consume_openable_slot(
+            state, openable=InlineJumpEntry(target_block_idx=counter),
+        )
         state.pending_header = False
         return
     if state.pending_header:
@@ -88,8 +105,16 @@ def _handle_block(state: _WalkState, *, counter: int) -> None:
             enter_new_body_block(state)
         set_current_body_block_idx(state, block_idx=counter)
         state.pending_header = False
+        # Mark this slot's instruction as silent-header so its
+        # finalize emits no AsmLine. The latch is normally set at
+        # _start_new_instruction from pending_header, but bare-BLOCK_V2
+        # layouts (FUNCTION_ID -> BODY transition mid-IDENTITY) skip
+        # that path; setting it here covers both flows uniformly.
+        state.current_insn_in_silent_header = True
         return
-    state.current_items.append(InlineJumpEntry(target_block_idx=counter))
+    _consume_openable_slot(
+        state, openable=InlineJumpEntry(target_block_idx=counter),
+    )
 
 
 def _handle_function_category(
@@ -104,15 +129,21 @@ def _handle_function_category(
     kind_to_called_idx_per_ct: Sequence[Mapping[CallTargetType, list[int]]],
     callee_arm_resolver: Callable[[int], Optional[SectionPointerSpec]],
 ) -> None:
-    """FUNCTION-Category dispatch: FID lookup + InlineCallEntry.
+    """FUNCTION-Category dispatch: FID lookup + InlineCallEntry on the
+    in-flight instruction's openables buffer.
 
     LOCAL/PLT resolve ``function_section_ptr`` via
     ``callee_arm_resolver`` indexed into the CURRENT call-target's
     ``call_targets_section`` (so inlined-callee call sites resolve
     against THEIR table). EXT keeps ``callee_section_pointer=None``
     and carries the provider name (decision #28). The root CT's
-    LOCAL_FUNC self-prepend (counter 0) emits into FUNCTION_ID and
-    then transitions to BODY block 0.
+    LOCAL_FUNC self-prepend (counter 0) buffers into the FUNCTION_ID
+    section's in-flight instruction and then transitions to BODY
+    block 0; the per-instruction collector ensures the AsmLine
+    carrying the InlineCallEntry openable lands in the FUNCTION_ID
+    section (finalize was called by the driver at the next instruction
+    boundary BEFORE the section transition would happen at the next
+    col's slot).
     """
     call_kind = _CATEGORY_TO_CALL_TARGET_TYPE[cat]
     fid = fid_table.lookup(row=state.row, cat=cat, counter=counter)
@@ -129,17 +160,34 @@ def _handle_function_category(
         ],
         callee_arm_resolver=callee_arm_resolver,
     )
-    state.current_items.append(
-        InlineCallEntry(
+    _consume_openable_slot(
+        state,
+        openable=InlineCallEntry(
             kind=call_kind, counter_id=counter, callee_name=callee_name,
             callee_section_pointer=callee_section_pointer,
             variant_idx=MISSING_VARIANT_INDEX,
             provider=provider,
-        )
+        ),
     )
     if state.current_kind is BlockKind.FUNCTION_ID:
-        # The self-prepend just emitted; transition to BODY block 0.
-        enter_body_after_function_id(state)
+        # The self-prepend openable just landed; transition to BODY
+        # block 0 now. The per-instruction finalize runs first (via
+        # the driver's section-close hook) so the FUNCTION_ID
+        # AsmLine carrying this InlineCallEntry lands in the right
+        # section before current_items resets to the BODY block.
+        _finalize_and_transition_to_body(state)
+
+
+def _finalize_and_transition_to_body(state: _WalkState) -> None:
+    """Finalize the FUNCTION_ID in-flight instruction + open BODY 0.
+
+    Late import keeps the :mod:`._instruction` -> :mod:`._dispatch`
+    import order linear (avoiding a circular import the simple way).
+    """
+    from ._instruction import _finalize_instruction
+
+    _finalize_instruction(state)
+    enter_body_after_function_id(state)
 
 
 def _emit_identity(
@@ -158,9 +206,11 @@ def _emit_identity(
 
     BLOCK -> :func:`_handle_block`. FUNCTION categories ->
     :func:`_handle_function_category`. JUMP_TABLE -> arms the
-    per-block jump-table-footer flag (W3-16) + emits the placeholder
-    line. Other counter-bearing categories -> ``<category counter>``
-    AsmLine placeholder (plan §11 follow-up).
+    per-block jump-table-footer flag (W3-16) + the per-instruction
+    ``saw_jump_table_this_insn`` flag + emits the ``<jump_table N>``
+    text placeholder onto the in-flight instruction's text buffer.
+    Other counter-bearing categories -> ``<category counter>`` text
+    placeholder (plan §11 follow-up).
     """
     counter = int(identities_row[state.id_cursor])
     state.id_cursor += 1
@@ -183,9 +233,8 @@ def _emit_identity(
         return
     if cat is Category.JUMP_TABLE:
         # Footer begins: arm block-level flag so trailing Block_V2
-        # tokens route as InlineJumpEntry. The per-instruction
-        # sibling ``saw_jump_table_this_insn`` is reset by R2c's
-        # per-instruction finalizer.
+        # tokens route as InlineJumpEntry; arm per-instruction flag
+        # so finalize flips SILENT_HEADER -> JUMP_TABLE_FOOTER policy.
         state.inside_jump_table_footer_block = True
         state.saw_jump_table_this_insn = True
-    state.current_items.append(AsmLine(text=f"<{cat.name.lower()} {counter}>"))
+    _consume_text_slot(state, text=f"<{cat.name.lower()} {counter}>")

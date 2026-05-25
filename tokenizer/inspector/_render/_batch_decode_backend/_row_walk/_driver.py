@@ -1,12 +1,18 @@
 """Per-col loop driver for the BatchDecodeBackend row walker.
 
 Single concern: walk one row's tokens column-by-column, dispatching
-each shifted-id to its band-specific emit path. Section transitions
-(VARIANT_HEADER -> FUNCTION_ID, FUNCTION_ID -> BODY) and the
-runlength-derived ``pending_header`` latch live here; the per-band
-emit primitives are in :mod:`.._band_emitters` and the IDENTITY
-dispatch is in :mod:`._dispatch`. Plan reference:
-``inspector-render-backends.md`` §6 + decisions #16/#17/#18/#29/#30.
+each shifted-id to its band-specific emit path AND driving the
+per-instruction collector boundaries (W3-16 W4-AMENDED + W3-17
+W4-AMENDED). Section transitions (VARIANT_HEADER -> FUNCTION_ID,
+FUNCTION_ID -> BODY) and the runlength-derived ``pending_header``
+latch live here; the per-band emit primitives are in
+:mod:`.._band_emitters` and the IDENTITY dispatch is in
+:mod:`._dispatch`. The per-instruction collector quartet
+(:mod:`._instruction`) is invoked at instruction boundaries so the
+section's :attr:`WalkSectionState.current_items` accumulates one
+:class:`AsmLine` per instruction, not one per slot. Plan reference:
+``inspector-render-backends.md`` §6 + decisions #16/#17/#18/#29/#30;
+``inspector-followup.md`` W3-16 + W3-17 + cluster A-L1 H2.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from tokenizer.inspector._render._protocol import (
 from tokenizer.token_manager import VocabularyManager
 
 from .._band import Band, classify_shifted_id
-from .._band_emitters import emit_instr_rep, emit_number, flush_accumulator_into
+from .._band_emitters import emit_instr_rep, emit_number
 from .._fid_table import FidBaseTable
 from .._sections import (
     RowSection,
@@ -35,7 +41,11 @@ from .._sections import (
     maybe_advance_call_target,
 )
 from ._dispatch import _emit_identity
-from ._state import _WalkState, _init_walk_state
+from ._instruction import (
+    _finalize_instruction,
+    _start_new_instruction,
+)
+from ._state import _RowSidecars, _WalkState, _init_walk_state
 
 
 __all__ = ["render_row_blocks"]
@@ -44,7 +54,9 @@ __all__ = ["render_row_blocks"]
 def _maybe_open_function_id_section(state: _WalkState, *, col: int) -> None:
     """VARIANT_HEADER -> FUNCTION_ID at the root CT start col.
 
-    Subsequent FUNCTION_ID -> BODY transitions are token-content-
+    Finalizes the in-flight VARIANT_HEADER instruction (if any) so its
+    AsmLine lands in the VARIANT_HEADER section before the section
+    closes; subsequent FUNCTION_ID -> BODY transitions are token-content-
     driven; see :func:`.._sections.enter_body_after_function_id`.
     """
     if (
@@ -53,10 +65,13 @@ def _maybe_open_function_id_section(state: _WalkState, *, col: int) -> None:
         or state.current_kind is not BlockKind.VARIANT_HEADER
     ):
         return
+    _finalize_instruction(state)
     enter_variant_header_to_function_id(state)
 
 
-def _maybe_latch_header_trigger(state: _WalkState, *, col: int) -> None:
+def _maybe_latch_header_trigger(
+    state: _WalkState, sidecars: _RowSidecars, *, col: int,
+) -> None:
     """Latch ``pending_header`` at runlength-derived trigger cols.
 
     The BODY-block open is deferred to :func:`._dispatch._handle_block`
@@ -67,13 +82,39 @@ def _maybe_latch_header_trigger(state: _WalkState, *, col: int) -> None:
     :attr:`WalkSectionState.inside_jump_table_footer_block`: a new
     header trigger means "new block ahead", which is incompatible with
     "still inside footer".
+
+    The in-flight instruction is also finalized here: a header trigger
+    marks the start of a new BODY block, so any prior in-flight
+    instruction in the same (or prior) block MUST finalize before the
+    next ``_start_new_instruction`` re-latches
+    ``current_insn_in_silent_header`` from the freshly-set
+    ``pending_header``.
     """
     if col not in state.header_trigger_cols:
         return
     if state.current_kind in (BlockKind.VARIANT_HEADER, BlockKind.FUNCTION_ID):
         return
+    # Finalize any in-flight instruction before flipping the latch so
+    # the prior instruction's policy is decided on the OLD pending_header.
+    _finalize_instruction(state)
     state.pending_header = True
     state.inside_jump_table_footer_block = False
+
+
+def _maybe_finalize_and_start_instruction(
+    state: _WalkState, sidecars: _RowSidecars,
+) -> None:
+    """Finalize the in-flight instruction (if any) and start a new one.
+
+    Triggered at every per-col loop iteration BEFORE the slot's emit:
+    if the current instruction's slot budget is exhausted (or no
+    instruction is active yet), finalize-then-start so the next slot
+    lands on a fresh per-instruction buffer.
+    """
+    if state.has_active_instruction and state.slots_remaining_in_insn > 0:
+        return
+    _finalize_instruction(state)
+    _start_new_instruction(state, sidecars)
 
 
 def render_row_blocks(
@@ -97,6 +138,15 @@ def render_row_blocks(
     trigger col; ``Block_Def`` + ``block_v2`` header pair consumed
     silently). Terminates on ``token == 0`` or end-of-row.
 
+    Per-instruction emit discipline (W3-16 W4-AMENDED + cluster A-L1
+    H2): the band emit + IDENTITY dispatch paths route their atoms +
+    openables onto an in-flight instruction's text-parts / openables
+    buffers (on :class:`_WalkState`); the per-col loop finalizes the
+    in-flight instruction at its slot-budget boundary and starts a
+    fresh one. One :class:`AsmLine` per instruction, not per slot;
+    inline call / jump / number-precision sidecars ride on
+    :attr:`AsmLine.openables`.
+
     ``call_targets_per_ct`` carries each Stage1CallTarget's own
     ``call_targets_section`` so inlined-callee call sites resolve
     against THEIR table; ``callee_arm_resolver`` returns ``None`` for
@@ -112,48 +162,36 @@ def render_row_blocks(
     for col in range(n_cols):
         state.current_col = col
         _maybe_open_function_id_section(state, col=col)
-        _maybe_latch_header_trigger(state, col=col)
+        _maybe_latch_header_trigger(state, sidecars, col=col)
         maybe_advance_call_target(state, col=col)
         shifted_id = int(sidecars.tokens_row[col])
         if shifted_id == 0:
             break  # null-content padding tail
+        _maybe_finalize_and_start_instruction(state, sidecars)
         band = classify_shifted_id(shifted_id)
         if band is Band.INSTR_REP:
-            # Band switch off NUMBER -> flush any pending multi-chunk
-            # source so its rendered text lands BEFORE the upcoming
-            # INSTR_REP item (encoder invariant: multi-chunk sources
-            # never cross instruction boundaries, and every instruction
-            # starts with an INSTR_REP mnemonic).
-            flush_accumulator_into(
-                state.current_items, accumulator=state.number_accumulator,
-            )
             if state.pending_header:
                 # ``Block_Def`` carrier -- absorbed silently so the
                 # BODY section's first emitted item is the first
-                # real instruction.
-                continue
-            emit_instr_rep(
-                state.current_items,
-                shifted_id=shifted_id,
-                vocab_manager=vocab_manager,
-                arch_prefixes=arch_prefixes,
-            )
+                # real instruction. The per-instruction finalize
+                # under SILENT_HEADER policy asserts the text buffer
+                # stayed empty across this slot.
+                pass
+            else:
+                emit_instr_rep(
+                    state,
+                    shifted_id=shifted_id,
+                    vocab_manager=vocab_manager,
+                    arch_prefixes=arch_prefixes,
+                )
         elif band is Band.NUMBER:
-            state.num_cursor = emit_number(
-                state.current_items,
+            emit_number(
+                state,
                 shifted_id=shifted_id,
                 numbers_sig=sidecars.numbers_sig,
                 numbers_se=sidecars.numbers_se,
-                num_cursor=state.num_cursor,
-                accumulator=state.number_accumulator,
             )
         elif band is Band.IDENTITY:
-            # Band switch off NUMBER -> flush before the IDENTITY emit
-            # so the IDENTITY-band item appears after the prior
-            # NUMBER source's rendered text.
-            flush_accumulator_into(
-                state.current_items, accumulator=state.number_accumulator,
-            )
             _emit_identity(
                 state,
                 shifted_id=shifted_id,
@@ -170,13 +208,12 @@ def render_row_blocks(
                 f"render_row_blocks: unexpected Band {band!r} at "
                 f"row={row}, col={col} (shifted_id={shifted_id})"
             )
+        # Consumed one slot in the in-flight instruction.
+        state.slots_remaining_in_insn -= 1
 
-    # End-of-row flush per cluster #21 H-4: cut variants may have a
-    # multi-chunk source whose trailing chunks were truncated. Flush
-    # the lead-chunk contribution as best-effort so the visible
-    # operand text is not silently dropped.
-    flush_accumulator_into(
-        state.current_items, accumulator=state.number_accumulator,
-    )
+    # End-of-row finalize per cluster #21 H-4: any in-flight instruction
+    # (including a cut-variant partial) MUST emit best-effort so its
+    # surviving slot's content is not silently dropped.
+    _finalize_instruction(state, end_of_row=True)
     close_current_section(state)
     return state.completed
