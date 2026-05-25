@@ -16,9 +16,12 @@ Row layouts (mirrors plan ``polished-greeting-moler.md`` § D4):
   off ``FunctionData.metadata``.
 * Block row: ``Block: <i>   <first N chars of to_asm_like()>`` — preview
   truncation only; the UI layer owns the ``>>`` marker.
-* Inline call row: ``call <kind> function <K>: <name>[@<provider>]``
+* Inline call row: ``<kind> function <K>: <name>[@<provider>]``
   with ``kind`` routed off the typed :class:`CallTargetType` (LOCAL /
-  PLT / EXTERN) — no string compares.
+  PLT / EXTERN) — no string compares. The token marks a function
+  *reference* (the LOCAL_FUNC / PLT_FUNC / EXT_FUNC identity-band
+  token); the actual ``call`` opcode is a separate instruction-rep
+  token that renders on its own asm line, so no ``call `` prefix here.
 * Inline jump row: ``jump block: <target_block_idx>``.
 
 The variant-axis-key mapping below is the loader's metadata-dict shape
@@ -173,11 +176,21 @@ def inline_call_label(
 ) -> str:
     """Render the inline-call row label.
 
-    Per plan D4:
+    NOTE: The function name (``inline_call_label`` / ``InlineCallEntry``
+    / ``InlineCallNode``) is historical — semantically these rows mark
+    a function *reference* token (LOCAL_FUNC / PLT_FUNC / EXT_FUNC in
+    the IDENTITY band), NOT a ``call`` opcode. The actual ``call``
+    asm instruction is a separate instruction-rep token (``>=16``)
+    that renders on its own asm line within the block. Renaming the
+    symbols is a wider refactor and out of scope here; the rendered
+    label text below has been corrected to drop the misleading
+    ``"call "`` prefix.
 
-    * ``CallTargetType.LOCAL`` -> ``"call local function <K>: <name>"``
-    * ``CallTargetType.PLT``   -> ``"call plt function <K>: <name>"``
-    * ``CallTargetType.EXTERN`` -> ``"call ext function <K>: <name>@<provider>"``
+    Per plan D4 (corrected):
+
+    * ``CallTargetType.LOCAL`` -> ``"local function <K>: <name>"``
+    * ``CallTargetType.PLT``   -> ``"plt function <K>: <name>"``
+    * ``CallTargetType.EXTERN`` -> ``"ext function <K>: <name>@<provider>"``
 
     Missing ``callee_name`` renders as ``"?"`` (the FID resolved to
     nothing). For EXTERN, ``provider`` is the library / sidecar name
@@ -190,7 +203,7 @@ def inline_call_label(
     """
     word = _CALL_TARGET_TYPE_TO_LABEL[kind]
     name = _MISSING_NAME if callee_name is None else callee_name
-    base = f"call {word} function {counter_id}: {name}"
+    base = f"{word} function {counter_id}: {name}"
     if kind is CallTargetType.EXTERN:
         provider_str = _MISSING_NAME if provider is None else provider
         return f"{base}@{provider_str}"

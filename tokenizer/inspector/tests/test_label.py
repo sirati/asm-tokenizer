@@ -176,21 +176,21 @@ def test_block_preview_empty_string():
 def test_inline_call_label_local():
     assert (
         inline_call_label(CallTargetType.LOCAL, 0, "foo")
-        == "call local function 0: foo"
+        == "local function 0: foo"
     )
 
 
 def test_inline_call_label_plt():
     assert (
         inline_call_label(CallTargetType.PLT, 1, "printf")
-        == "call plt function 1: printf"
+        == "plt function 1: printf"
     )
 
 
 def test_inline_call_label_extern_with_provider():
     assert (
         inline_call_label(CallTargetType.EXTERN, 2, "puts", "libc.so")
-        == "call ext function 2: puts@libc.so"
+        == "ext function 2: puts@libc.so"
     )
 
 
@@ -198,35 +198,35 @@ def test_inline_call_label_extern_without_provider():
     """No provider -> ``@?`` fallback, preserving the visual shape."""
     assert (
         inline_call_label(CallTargetType.EXTERN, 3, "exit")
-        == "call ext function 3: exit@?"
+        == "ext function 3: exit@?"
     )
 
 
 def test_inline_call_label_local_unknown_callee():
     assert (
         inline_call_label(CallTargetType.LOCAL, 5, None)
-        == "call local function 5: ?"
+        == "local function 5: ?"
     )
 
 
 def test_inline_call_label_plt_unknown_callee():
     assert (
         inline_call_label(CallTargetType.PLT, 7, None)
-        == "call plt function 7: ?"
+        == "plt function 7: ?"
     )
 
 
 def test_inline_call_label_extern_unknown_callee_with_provider():
     assert (
         inline_call_label(CallTargetType.EXTERN, 9, None, "libm.so")
-        == "call ext function 9: ?@libm.so"
+        == "ext function 9: ?@libm.so"
     )
 
 
 def test_inline_call_label_extern_unknown_callee_and_provider():
     assert (
         inline_call_label(CallTargetType.EXTERN, 11, None)
-        == "call ext function 11: ?@?"
+        == "ext function 11: ?@?"
     )
 
 
@@ -234,11 +234,11 @@ def test_inline_call_label_provider_ignored_for_non_extern():
     """LOCAL / PLT never emit an ``@provider`` suffix even if one is supplied."""
     assert (
         inline_call_label(CallTargetType.LOCAL, 0, "foo", provider="should_ignore")
-        == "call local function 0: foo"
+        == "local function 0: foo"
     )
     assert (
         inline_call_label(CallTargetType.PLT, 1, "printf", provider="should_ignore")
-        == "call plt function 1: printf"
+        == "plt function 1: printf"
     )
 
 
