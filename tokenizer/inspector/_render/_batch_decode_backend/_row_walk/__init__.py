@@ -45,12 +45,12 @@ from tokenizer.inspector._render._render_block import (
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Category
 
-from ._band import Band, classify_shifted_id
-from ._band_emitters import emit_instr_rep, emit_number
-from ._boundaries import call_target_starts, header_trigger_cols
-from ._callee_resolver import resolve_callee_pointer
-from ._fid_table import FidBaseTable
-from ._sections import (
+from .._band import Band, classify_shifted_id
+from .._band_emitters import emit_instr_rep, emit_number
+from .._boundaries import call_target_starts, header_trigger_cols
+from .._callee_resolver import resolve_callee_pointer
+from .._fid_table import FidBaseTable
+from .._sections import (
     RowSection,
     WalkSectionState,
     close_current_section,
