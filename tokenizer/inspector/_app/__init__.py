@@ -24,11 +24,11 @@ __all__ = ["InspectorApp", "run_inspector"]
 
 
 if TYPE_CHECKING:
-    from tokenizer.inspector._app._application import (
+    from ._application import (
         InspectorApp,
         run_inspector,
     )
-    from tokenizer.inspector._app._tree_widget import _InspectorTree
+    from ._tree_widget import _InspectorTree
 
 
 def __getattr__(name: str) -> object:
@@ -41,14 +41,14 @@ def __getattr__(name: str) -> object:
     so resolve through the same path.
     """
     if name in ("InspectorApp", "run_inspector"):
-        from tokenizer.inspector._app._application import (
+        from ._application import (
             InspectorApp,
             run_inspector,
         )
 
         return {"InspectorApp": InspectorApp, "run_inspector": run_inspector}[name]
     if name == "_InspectorTree":
-        from tokenizer.inspector._app._tree_widget import _InspectorTree
+        from ._tree_widget import _InspectorTree
 
         return _InspectorTree
     raise AttributeError(

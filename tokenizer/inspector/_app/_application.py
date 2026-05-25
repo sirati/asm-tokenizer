@@ -26,12 +26,13 @@ from textual.binding import Binding, BindingType
 from textual.widgets import Input, Tree
 
 from shared.logging_utils import setup_file_logger
-from tokenizer.inspector._app._labels import _compose_label
-from tokenizer.inspector._app._tree_widget import _InspectorTree
 from tokenizer.inspector._tree_model import (
     FunctionNode,
     Node,
 )
+
+from ._labels import _compose_label
+from ._tree_widget import _InspectorTree
 
 
 if TYPE_CHECKING:
