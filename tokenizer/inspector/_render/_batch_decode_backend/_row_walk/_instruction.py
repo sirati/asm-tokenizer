@@ -155,9 +155,9 @@ def _consume_openable_slot(
     the in-flight instruction.
 
     ``placeholder_text`` is the legacy ``<category counter>`` /
-    ``call <name>`` / ``jump -> block N`` text that USED to ride as a
-    sibling :class:`AsmLine` and now folds into the owning
-    instruction's text buffer. Pass ``None`` when the openable's
+    canonical ``inline_call_label`` / ``inline_jump_label`` text that
+    USED to ride as a sibling :class:`AsmLine` and now folds into the
+    owning instruction's text buffer. Pass ``None`` when the openable's
     presence on the AsmLine is enough (e.g. a number-precision entry
     whose short_text was already appended via :func:`_consume_text_slot`).
     """

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from tokenizer.aligned_data.loader.decoded._number_render import (
     InlineNumberPrecisionEntry,
 )
+from tokenizer.inspector._label import inline_call_label, inline_jump_label
 from tokenizer.inspector._render._protocol import (
     InlineCallEntry,
     InlineJumpEntry,
@@ -214,12 +215,26 @@ def _wrap_openable_as_node(
 
 
 def _label_for_openable(openable: Openable) -> str:
-    """Short row label for a wrapper-AsmLeaf (2+ case)."""
+    """Short row label for a wrapper-AsmLeaf (2+ case).
+
+    Routes per-openable label assembly through the canonical
+    :mod:`tokenizer.inspector._label` helpers so the 2+-arm wrapper
+    rows and the 1-arm dispatched-node rows render labels off the
+    SAME source of truth (single concern: ``_label.py`` owns inline-
+    row label formatting). The number-precision case has no canonical
+    helper -- its label IS the pre-rendered ``full_text`` carried on
+    the entry, so passthrough is the right contract.
+    """
     match openable:
         case InlineCallEntry():
-            return f"call {openable.callee_name}"
+            return inline_call_label(
+                openable.kind,
+                openable.counter_id,
+                openable.callee_name,
+                openable.provider,
+            )
         case InlineJumpEntry():
-            return f"jump -> block {openable.target_block_idx}"
+            return inline_jump_label(openable.target_block_idx)
         case InlineNumberPrecisionEntry():
             return openable.full_text
         case _:
