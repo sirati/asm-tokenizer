@@ -474,6 +474,7 @@ def test_right_arrow_on_fitting_row_expands_collapsed_node():
                     factory=MagicMock(),
                     backend=MagicMock(),
                     variant_idx=0,
+                    kind=BlockKind.BODY,
                     block_idx=1,
                     preview="x",
                 )
@@ -512,6 +513,7 @@ def test_right_arrow_on_already_expanded_fitting_row_is_noop():
                     factory=MagicMock(),
                     backend=MagicMock(),
                     variant_idx=0,
+                    kind=BlockKind.BODY,
                     block_idx=1,
                     preview="x",
                 )
@@ -538,6 +540,59 @@ def test_right_arrow_on_already_expanded_fitting_row_is_noop():
                 # No new expand call -- the action is a no-op on an
                 # already-expanded fitting row.
                 short_block.expand.assert_not_called()
+
+    asyncio.run(runner())
+
+
+def test_right_arrow_on_overflowing_collapsed_node_pans_instead_of_expand():
+    """``→`` on an overflowing collapsed expandable row: scroll wins over expand.
+
+    When the cursor row's content extends past the viewport's right
+    edge (the ``>>`` truncation marker is visible) and the model also
+    advertises ``can_expand=True``, the user's first ``→`` keystroke
+    must reveal more of the current row's content, not collapse the
+    user's mental ``>>``-driven intent into an irreversible expand.
+    The expand affordance is reached once enough panning has flushed
+    the overflow (covered separately by the fitting-row test above).
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # A BlockNode whose preview spills past the 80-col viewport
+                # AND can_expand=True. Both the scroll path and the expand
+                # path are reachable; the priority order must pick scroll.
+                long_block = BlockNode(
+                    factory=MagicMock(),
+                    backend=MagicMock(),
+                    variant_idx=0,
+                    kind=BlockKind.BODY,
+                    block_idx=1,
+                    preview="x" * 200,
+                )
+                long_block.expand = MagicMock(return_value=[])
+                tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [long_block]
+                )
+                row = children[0]
+                tree.move_cursor(row, animate=False)
+                await pilot.pause()
+                # Sanity: the row actually overflows the viewport.
+                assert tree.label_cell_len(row) > tree.size.width
+                assert row.is_expanded is False
+                scroll_before = tree.scroll_offset.x
+
+                await pilot.press("right")
+                await pilot.pause()
+
+                # Scroll advanced + expand spy NOT called -- priority
+                # respected.
+                assert tree.scroll_offset.x == scroll_before + 1
+                assert long_block.remembered_scroll_x == scroll_before + 1
+                assert row.is_expanded is False
+                long_block.expand.assert_not_called()
 
     asyncio.run(runner())
 
