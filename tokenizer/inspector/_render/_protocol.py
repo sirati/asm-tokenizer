@@ -39,6 +39,7 @@ from tokenizer.aligned_data.loader.decoded._number_render import (
     InlineNumberPrecisionEntry,
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
 from tokenizer.tokens import TokenType
 from tokenizer.variant_info import VariantIdentity
 
@@ -243,6 +244,14 @@ class InlineCallEntry:
     string-typed discriminator crosses the boundary. ``provider`` is
     the library name appended after ``@`` for EXTERN rows; ``None``
     for LOCAL/PLT and for EXTERN rows whose provider is unknown.
+    ``caller_variant_idx`` is the variant_idx of the row that emitted
+    this entry — :class:`InlineCallNode.expand` falls back to it when
+    :attr:`variant_idx` equals :data:`MISSING_VARIANT_INDEX` (e.g.
+    Function-ID self-references, or callees whose vkey did not match)
+    so the inline-call defaults to the caller's variant instead of
+    surfacing the full variant list. :data:`MISSING_VARIANT_INDEX`
+    here means "no caller pin known" (FtlBackend's Phase-1 default,
+    test fixtures that don't thread it).
     """
 
     kind: CallTargetType
@@ -251,6 +260,7 @@ class InlineCallEntry:
     callee_section_pointer: Optional[SectionPointerSpec]
     variant_idx: int
     provider: Optional[str]
+    caller_variant_idx: int = MISSING_VARIANT_INDEX
 
 
 @dataclass(frozen=True)

@@ -123,6 +123,35 @@ def test_asmleaf_single_inline_call_produces_inline_call_node():
     assert call.callee_handle.name == "callee"
 
 
+def test_asmleaf_single_inline_call_threads_caller_variant_idx():
+    """The :attr:`InlineCallEntry.caller_variant_idx` field is threaded
+    through to the resulting :class:`InlineCallNode.caller_variant_idx`
+    so :meth:`InlineCallNode.expand`'s caller-fallback path activates.
+    """
+    factory = MagicMock(spec=BackendFactory)
+    entry = InlineCallEntry(
+        kind=CallTargetType.LOCAL,
+        counter_id=0,
+        callee_name="callee",
+        callee_section_pointer=SectionPointerSpec(
+            arm=SectionKind.MATCHED, idx=7
+        ),
+        variant_idx=0,
+        provider=None,
+        caller_variant_idx=4,
+    )
+    leaf = AsmLeaf(
+        text="call foo", openables=(entry,), factory=factory
+    )
+
+    children = leaf.expand()
+
+    assert len(children) == 1
+    call = children[0]
+    assert isinstance(call, InlineCallNode)
+    assert call.caller_variant_idx == 4
+
+
 def test_asmleaf_single_inline_jump_produces_inline_jump_node():
     """A leaf carrying ONE :class:`InlineJumpEntry` expands directly
     to an :class:`InlineJumpNode` (no wrapper row), with the parent

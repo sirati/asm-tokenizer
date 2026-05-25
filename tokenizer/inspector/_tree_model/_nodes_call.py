@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
+from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
 
 
 if TYPE_CHECKING:
@@ -54,6 +55,13 @@ class InlineCallNode:
     callee_handle: "FunctionHandle | None"
     variant_idx: int
     provider: str | None
+    # Caller-row variant_idx; used as a fallback pin when the
+    # callee-side ``variant_idx`` is :data:`MISSING_VARIANT_INDEX`
+    # (e.g. Function-ID self-references where no vkey pin is recorded).
+    # Defaults to :data:`MISSING_VARIANT_INDEX` so existing constructors
+    # without caller threading retain the pre-existing all-variants
+    # fallback behaviour.
+    caller_variant_idx: int = MISSING_VARIANT_INDEX
     is_failed: bool = False
     # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
@@ -75,18 +83,24 @@ class InlineCallNode:
 
         Constructs a synthetic :class:`FunctionNode` against the same
         factory; ``expand`` on that node returns one
-        :class:`VariantNode` per callee variant. The variant whose
-        ``variant_idx`` equals ``self.variant_idx`` is the row the
-        caller pinned to — its blocks are spliced in DIRECTLY as the
-        InlineCallNode's children, skipping the intermediate variant-
-        list level (plan decision D2). The other variants are bundled
-        under a :class:`ShowAllVariantsNode` sibling appended after
-        the spliced blocks so they remain reachable.
+        :class:`VariantNode` per callee variant. The pinned variant is
+        chosen by ``self.variant_idx`` when it is not
+        :data:`MISSING_VARIANT_INDEX`, otherwise by
+        ``self.caller_variant_idx`` (the row that emitted this call
+        site) — so Function-ID self-references and other no-vkey-pin
+        cases still default to the caller's variant instead of
+        surfacing the full variant list. That pinned variant's blocks
+        are spliced in DIRECTLY as the InlineCallNode's children,
+        skipping the intermediate variant-list level (plan decision D2).
+        The other variants are bundled under a
+        :class:`ShowAllVariantsNode` sibling appended after the
+        spliced blocks so they remain reachable.
 
-        When the caller's variant is not in the callee's surviving
-        set (e.g. ``MISSING_VARIANT_INDEX`` -- the callee dropped that
-        variant), the fallback is to surface every variant directly
-        as VariantNode siblings, matching the pre-D2 contract.
+        When neither pin resolves to a surviving callee variant
+        (e.g. both are :data:`MISSING_VARIANT_INDEX`, or the callee
+        dropped both indices), the fallback is to surface every
+        variant directly as VariantNode siblings, matching the
+        pre-D2 contract.
         """
         from ._nodes_function import FunctionNode
         from ._nodes_leaf import ShowAllVariantsNode
@@ -99,8 +113,15 @@ class InlineCallNode:
         callee = FunctionNode(factory=self.factory, handle=self.callee_handle)
         all_variants = callee.expand()
 
-        matched_idx_in_list = _find_matching_variant_index(
-            all_variants, self.variant_idx
+        pinned = (
+            self.variant_idx
+            if self.variant_idx != MISSING_VARIANT_INDEX
+            else self.caller_variant_idx
+        )
+        matched_idx_in_list = (
+            None
+            if pinned == MISSING_VARIANT_INDEX
+            else _find_matching_variant_index(all_variants, pinned)
         )
         if matched_idx_in_list is None:
             # Caller's variant not in callee's surviving set -- fall

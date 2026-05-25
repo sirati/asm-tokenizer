@@ -36,6 +36,7 @@ def test_render_block_signature_no_unused_params():
         "section",
         "kind_to_called_idx",
         "variant_pins",
+        "caller_variant_idx",
         "line_to_name",
         "line_to_provider",
         "callee_arm_resolver",
@@ -72,5 +73,6 @@ def test_inline_call_entry_dataclass_field_set():
         "callee_section_pointer",
         "variant_idx",
         "provider",
+        "caller_variant_idx",
     }
     assert {f.name for f in InlineCallEntry.__dataclass_fields__.values()} == expected
