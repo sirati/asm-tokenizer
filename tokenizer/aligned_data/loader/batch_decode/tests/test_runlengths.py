@@ -40,6 +40,7 @@ from tokenizer.aligned_data.loader.tests._session_fixture import (
 # Vocab anchors mirror :mod:`._runlengths` so the synthetic streams
 # below remain readable.
 _RESERVED = 256
+_VALUE_NEGATIVE = 256  # protocol-pinned: postfix sign marker at id 256.
 _VC2 = 257
 _F128 = 263  # last NUMBER carrier: VC2(257) + 6 = F128(263)
 _BLOCK_V2 = 264
@@ -213,6 +214,99 @@ def test_vc2_single_byte_payload_one_chunk() -> None:
         tokens=tokens,
         insn_runlength=np.array([2], dtype=np.uint32),
         block_runlength=np.array([2], dtype=np.uint32),
+    )
+    block_rl, insn_rl = compute_metatoken_runlengths(fd)
+    assert block_rl.tolist() == [1]
+    assert insn_rl.tolist() == [1]
+
+
+# ---------------------------------------------------------------------------
+# value_negative (id 256) postfix: counted as a metatoken upstream (FTL's
+# ``>= 256`` boundary rule) but stripped post-decode by ``_expand_tokens``'
+# ``> 256`` keep mask. Slot count contribution: 0.
+# ---------------------------------------------------------------------------
+
+
+def test_negative_vc2_two_chunks_does_not_count_value_negative() -> None:
+    """Audit cluster #21 H-2 pinning case: 9-byte negative VC2 magnitude.
+
+    Wire shape: ``[VC2, 9 payload bytes, value_negative]``. Post-decode
+    wire slot count = 2 (VC2 produces ceil(9/8) = 2 chunks; the trailing
+    value_negative marker is stripped). The metatoken-runlength helper
+    must mirror that count exactly so downstream row-walkers can advance
+    one slot per emitted wire token.
+    """
+    tokens = np.array(
+        [_VC2] + [0x42] * 9 + [_VALUE_NEGATIVE], dtype=np.uint16,
+    )
+    n = int(tokens.size)
+    fd = _make_function_data(
+        tokens=tokens,
+        insn_runlength=np.array([n], dtype=np.uint32),
+        block_runlength=np.array([n], dtype=np.uint32),
+    )
+    block_rl, insn_rl = compute_metatoken_runlengths(fd)
+    assert block_rl.tolist() == [1]
+    assert insn_rl.tolist() == [2]
+
+
+def test_negative_vc2_eight_byte_magnitude_stays_one_chunk() -> None:
+    """Eight-byte negative VC2 magnitude (e.g., ``-(1 << 63)``):
+    chunk_count = ceil(8/8) = 1, post-decode slot count = 1.
+
+    Edge case: K*8-byte magnitudes are where the naive
+    "drop value_negative from the boundary mask" alternative would
+    silently inflate the VC2 chunk count (the trailing 256 would be
+    absorbed into the VC2 metatoken's run-length, turning
+    ``payload_runlen = 8`` into ``9`` and bumping
+    ``ceil(payload_runlen / 8)`` from 1 to 2). The correct accountant
+    subtracts the value_negative slot AFTER the run-length is computed,
+    leaving the VC2 chunk-count derivation intact.
+    """
+    tokens = np.array(
+        [_VC2] + [0x42] * 8 + [_VALUE_NEGATIVE], dtype=np.uint16,
+    )
+    n = int(tokens.size)
+    fd = _make_function_data(
+        tokens=tokens,
+        insn_runlength=np.array([n], dtype=np.uint32),
+        block_runlength=np.array([n], dtype=np.uint32),
+    )
+    block_rl, insn_rl = compute_metatoken_runlengths(fd)
+    assert block_rl.tolist() == [1]
+    assert insn_rl.tolist() == [1]
+
+
+def test_negative_vc2_sixteen_byte_magnitude_two_chunks() -> None:
+    """Sixteen-byte negative VC2 magnitude: chunk_count = ceil(16/8) = 2,
+    post-decode slot count = 2. Second K*8-byte edge case (paired with
+    the 8-byte test above) to keep both boundaries pinned.
+    """
+    tokens = np.array(
+        [_VC2] + [0x42] * 16 + [_VALUE_NEGATIVE], dtype=np.uint16,
+    )
+    n = int(tokens.size)
+    fd = _make_function_data(
+        tokens=tokens,
+        insn_runlength=np.array([n], dtype=np.uint32),
+        block_runlength=np.array([n], dtype=np.uint32),
+    )
+    block_rl, insn_rl = compute_metatoken_runlengths(fd)
+    assert block_rl.tolist() == [1]
+    assert insn_rl.tolist() == [2]
+
+
+def test_negative_vc2_single_byte_magnitude_one_chunk() -> None:
+    """One-byte negative VC2 magnitude (e.g., ``-1``):
+    chunk_count = max(1, ceil(1/8)) = 1, post-decode slot count = 1.
+    """
+    tokens = np.array(
+        [_VC2, 0x42, _VALUE_NEGATIVE], dtype=np.uint16,
+    )
+    fd = _make_function_data(
+        tokens=tokens,
+        insn_runlength=np.array([3], dtype=np.uint32),
+        block_runlength=np.array([3], dtype=np.uint32),
     )
     block_rl, insn_rl = compute_metatoken_runlengths(fd)
     assert block_rl.tolist() == [1]
