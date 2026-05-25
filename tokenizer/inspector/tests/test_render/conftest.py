@@ -36,32 +36,56 @@ from tokenizer.tokens import TokenType
 
 @dataclass
 class _StubToken:
-    """Minimal metatoken stand-in: just ``.token_type`` + ``.id``.
+    """Minimal metatoken stand-in: ``.token_type`` + ``.id`` + per-token
+    ``to_asm_like()`` text.
 
     The renderer reads ``token.token_type`` to discriminate (LOCAL_FUNC
-    / PLT_FUNC / EXT_FUNC / BLOCK_V2) and ``int(token.id)`` for the
-    per-Category counter (calls) or jump-target block index (BLOCK_V2).
-    No other attributes are touched, so a flat dataclass suffices.
+    / PLT_FUNC / EXT_FUNC / BLOCK_V2 lift to inline call / jump
+    openables; any other type renders its ``to_asm_like()`` atom
+    verbatim). ``int(token.id)`` carries the per-Category counter (for
+    calls) or jump-target block index (BLOCK_V2). ``asm_text`` is the
+    per-token ``to_asm_like`` atom; defaults match the production
+    :meth:`Tokens.to_asm_like` shape (``f"<basename>:<id>"`` for
+    identity tokens), and pure-text instructions pass plain text via
+    a non-discriminated :class:`TokenType` (e.g. ``PLATFORM``) with
+    ``asm_text="nop"``.
     """
 
     token_type: TokenType
     id: int = 0
+    asm_text: str = ""
+
+    def to_asm_like(self) -> str:
+        return self.asm_text
+
+
+def _text_token(text: str) -> _StubToken:
+    """Plain-text token: renders as ``text`` with no inline-openable
+    discrimination (TokenType.PLATFORM is the non-call/non-jump
+    discriminator chosen here; the renderer only inspects
+    ``token.token_type`` for the call/jump kinds, so any other type
+    works)."""
+    return _StubToken(token_type=TokenType.PLATFORM, id=0, asm_text=text)
+
+
+def _plain_insn(asm: str) -> "_StubInsn":
+    """Build a pure-text :class:`_StubInsn` from a space-joined asm
+    string: each space-delimited atom becomes one plain-text token, so
+    the per-token renderer produces the same joined text back."""
+    return _StubInsn(tokens=[_text_token(atom) for atom in asm.split(" ")])
 
 
 @dataclass
 class _StubInsn:
     """Stand-in for :class:`InsnTokenList`.
 
-    Implements the two methods :func:`_walk_block_instructions` calls:
-    ``to_asm_like()`` for the AsmLine text and ``iter_tokens()`` for
-    the inline-call/jump scan.
+    Implements :meth:`iter_tokens` for the per-token walk in
+    :func:`_render_insn`; the AsmLine text is rebuilt by the renderer
+    from each token's :meth:`to_asm_like`, mirroring the production
+    :meth:`InsnTokenList.to_asm_like` contract.
     """
 
-    asm: str
     tokens: List[_StubToken] = field(default_factory=list)
-
-    def to_asm_like(self) -> str:
-        return self.asm
 
     def iter_tokens(self) -> Iterable[_StubToken]:
         return iter(self.tokens)
@@ -178,8 +202,15 @@ def _ct(kind: CallTargetType, name_ptr: int, section_ptr: int) -> CallTarget:
 
 
 def _insn_with_call(asm: str, token_type: TokenType, *, id: int = 0) -> "_StubInsn":
-    """One asm line carrying a single call-or-jump metatoken."""
-    return _StubInsn(asm=asm, tokens=[_StubToken(token_type, id=id)])
+    """One asm line carrying a single call-or-jump metatoken.
+
+    ``asm`` is retained as a positional hint for test readability but
+    is no longer used by the renderer; the line text is derived from
+    the metatoken's resolved label. Tests that pin call/jump text
+    assert on the resolved label, not on ``asm``.
+    """
+    del asm  # noqa: F841 — kept positionally for test readability
+    return _StubInsn(tokens=[_StubToken(token_type, id=id)])
 
 
 def _three_kind_call_targets(

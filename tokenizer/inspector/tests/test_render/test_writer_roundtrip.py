@@ -69,10 +69,10 @@ def test_variant_block_roundtrip_via_kind_to_called_idx_helper():
     # counter_id=0 for PLT   -> called_idx 2 -> pin 9
     block = _StubBlock(
         insns=[
-            _StubInsn(asm="l0", tokens=[_StubToken(TokenType.LOCAL_FUNC, id=0)]),
-            _StubInsn(asm="l1", tokens=[_StubToken(TokenType.LOCAL_FUNC, id=1)]),
-            _StubInsn(asm="p0", tokens=[_StubToken(TokenType.PLT_FUNC, id=0)]),
-            _StubInsn(asm="e0", tokens=[_StubToken(TokenType.EXT_FUNC, id=0)]),
+            _StubInsn(tokens=[_StubToken(TokenType.LOCAL_FUNC, id=0)]),
+            _StubInsn(tokens=[_StubToken(TokenType.LOCAL_FUNC, id=1)]),
+            _StubInsn(tokens=[_StubToken(TokenType.PLT_FUNC, id=0)]),
+            _StubInsn(tokens=[_StubToken(TokenType.EXT_FUNC, id=0)]),
         ]
     )
 

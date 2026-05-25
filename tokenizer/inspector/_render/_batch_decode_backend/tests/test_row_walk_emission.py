@@ -485,6 +485,51 @@ def test_ext_func_carries_provider_from_line_to_provider() -> None:
     assert local_call.provider is None
 
 
+def test_inline_call_label_appears_in_asm_line_text() -> None:
+    """The IDENTITY-band dispatch routes a LOCAL_FUNC slot through
+    :func:`inline_call_label`, appending the resolved label
+    (``"local function 0: my_func"``) to the in-flight instruction's
+    text buffer alongside the :class:`InlineCallEntry` openable. The
+    AsmLine then reads inline as ``"<opcode> local function 0: <name>"``
+    so the tree row no longer hides the callee reference behind a
+    non-visible openable.
+    """
+    blocks = _walk(
+        tokens=np.asarray([BLOCK_V2, LOCAL_FUNC, 0], dtype=np.uint16),
+        identities=np.asarray([0, 0], dtype=np.uint16),
+        per_category_counts=np.asarray([[1, 0, 0]], dtype=np.uint32),
+        sidecar=np.asarray([42], dtype=np.uint32),
+        line_to_name={42: "my_func"},
+    )
+    line = blocks[0].items[0]
+    assert isinstance(line, AsmLine)
+    assert line.text == "local function 0: my_func"
+    assert len(line.openables) == 1
+    assert isinstance(line.openables[0], InlineCallEntry)
+
+
+def test_inline_jump_label_appears_in_asm_line_text() -> None:
+    """An in-instruction BLOCK_V2 (regular intra-function jump target)
+    routes through :func:`inline_jump_label`, so the AsmLine text reads
+    ``"jump block: N"`` alongside the :class:`InlineJumpEntry`
+    openable. Uses a one-instruction body whose second BLOCK_V2 is a
+    jump target (the first being the silent body-block header).
+    """
+    from tokenizer.inspector._render._protocol import InlineJumpEntry
+
+    blocks = _walk(
+        tokens=np.asarray([BLOCK_V2, BLOCK_V2, 0], dtype=np.uint16),
+        identities=np.asarray([0, 7], dtype=np.uint16),
+        # The leading BLOCK_V2 is the body-block header (silent); the
+        # second BLOCK_V2 is the jump target landing on the in-flight
+        # instruction's openables + text buffer.
+    )
+    line = blocks[0].items[0]
+    assert isinstance(line, AsmLine)
+    assert line.text == "jump block: 7"
+    assert line.openables == (InlineJumpEntry(target_block_idx=7),)
+
+
 def test_unknown_fid_renders_question_mark_via_line_to_name_default() -> None:
     """``line_to_name.get(fid, "?")`` -- a FID missing from the mapping
     falls back to ``"?"``. Pins the default so a name-table miss never

@@ -191,7 +191,9 @@ def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
     assert len(items) == 1
     line = items[0]
     assert isinstance(line, AsmLine)
-    assert line.text == "<jump_table 7>"
+    assert line.text == (
+        "<jump_table 7> jump block: 10 jump block: 11 jump block: 12"
+    )
     assert line.openables == (
         InlineJumpEntry(target_block_idx=10),
         InlineJumpEntry(target_block_idx=11),
