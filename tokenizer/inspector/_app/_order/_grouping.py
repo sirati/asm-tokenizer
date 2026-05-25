@@ -29,12 +29,20 @@ from typing import Any, List, Mapping, Sequence, Union
 
 import natsort
 
+from tokenizer.arch.family_display import PLATFORM_FAMILY_DISPLAY
+from tokenizer.arch_translation import arch_to_platform
 from tokenizer.inspector._render._protocol import RenderedVariant
 from tokenizer.inspector._tree_model import VariantNode
 
-from tokenizer.variant_tokens.prefixes import POSITIONAL_PREFIXES
+from tokenizer.variant_tokens.prefixes import ARCH_PREFIX, POSITIONAL_PREFIXES
 
-from ._axes import AxisDescriptor, OrderConfig, extract_axis_value
+from ._axes import (
+    AxisDescriptor,
+    AxisKind,
+    BITWIDTH_AXIS_KEY,
+    OrderConfig,
+    extract_axis_value,
+)
 
 
 __all__ = [
@@ -187,10 +195,27 @@ def group_variants(
         axis for axis in config.ordered_axes if axis in config.grouping_axes
     ]
 
+    # Cross-axis interaction context: when BOTH the arch axis AND the
+    # bitwidth axis are configured for grouping, the arch axis must
+    # surface the family-display name (``arm`` / ``mips`` / ``x86`` /
+    # ...) instead of the raw bitness-bearing arch (``arm32``/``arm64``
+    # /...) so the two-level group tree reads as
+    # ``arch: arm`` -> ``32/64: {32,64}`` instead of duplicating the
+    # bitness information at both levels. The bitwidth axis still
+    # surfaces ``32`` / ``64`` unchanged. Computed once per
+    # ``group_variants`` call (the answer is config-level, not
+    # variant-level).
+    collapse_arch_to_family = _arch_family_collapse_active(config)
+
     # Pre-compute the full sort tuple per variant. The tuple covers
     # every ordered axis; missing values sink via the force-last prefix.
     decorated = [
-        (_variant_sort_tuple(v, rendered_by_variant, config.ordered_axes), v)
+        (
+            _variant_sort_tuple(
+                v, rendered_by_variant, config.ordered_axes, collapse_arch_to_family
+            ),
+            v,
+        )
         for v in variants
     ]
     decorated.sort(key=lambda item: item[0])
@@ -200,7 +225,10 @@ def group_variants(
         return list(sorted_variants)
 
     return _partition_recursive(
-        sorted_variants, rendered_by_variant, grouping_in_order
+        sorted_variants,
+        rendered_by_variant,
+        grouping_in_order,
+        collapse_arch_to_family,
     )
 
 
@@ -209,10 +237,60 @@ def group_variants(
 # ---------------------------------------------------------------------------
 
 
+def _arch_family_collapse_active(config: OrderConfig) -> bool:
+    """``True`` when BOTH the arch positional axis AND the bitwidth
+    axis are in :attr:`OrderConfig.grouping_axes`.
+
+    Sole gate for the family-display collapse applied by
+    :func:`_axis_value_for_grouping`. Pure-config decision; no
+    per-variant input.
+    """
+    has_arch = any(
+        axis.kind is AxisKind.POSITIONAL and axis.key == ARCH_PREFIX
+        for axis in config.grouping_axes
+    )
+    has_bitwidth = any(
+        axis.kind is AxisKind.BITWIDTH and axis.key == BITWIDTH_AXIS_KEY
+        for axis in config.grouping_axes
+    )
+    return has_arch and has_bitwidth
+
+
+def _axis_value_for_grouping(
+    axis: AxisDescriptor,
+    rv: RenderedVariant,
+    collapse_arch_to_family: bool,
+) -> str | None:
+    """Same as :func:`extract_axis_value` plus the arch-to-family
+    collapse when ``collapse_arch_to_family`` is on.
+
+    Single chokepoint for the cross-axis interaction so both the sort
+    tuple and the partition pass see identical values (without this,
+    the partition walk's consecutive-same-value chunking would split
+    a single family into multiple bucket runs whenever raw-arch sort
+    order disagrees with family contiguity — e.g. ``i686`` would
+    sort before ``arm32`` and break the ``x86`` family bucket).
+    """
+    raw = extract_axis_value(axis, rv)
+    if (
+        not collapse_arch_to_family
+        or raw is None
+        or axis.kind is not AxisKind.POSITIONAL
+        or axis.key != ARCH_PREFIX
+    ):
+        return raw
+    try:
+        platform = arch_to_platform(raw)
+    except ValueError:
+        return raw
+    return PLATFORM_FAMILY_DISPLAY.get(platform, raw)
+
+
 def _variant_sort_tuple(
     variant: VariantNode,
     rendered_by_variant: Mapping[int, RenderedVariant],
     ordered_axes: Sequence[AxisDescriptor],
+    collapse_arch_to_family: bool,
 ) -> tuple:
     """Tuple of natsort keys, one entry per axis (in ``ordered_axes``).
 
@@ -222,7 +300,11 @@ def _variant_sort_tuple(
     rv = rendered_by_variant.get(variant.variant_idx)
     parts: list[Any] = []
     for axis in ordered_axes:
-        value = None if rv is None else extract_axis_value(axis, rv)
+        value = (
+            None
+            if rv is None
+            else _axis_value_for_grouping(axis, rv, collapse_arch_to_family)
+        )
         parts.append(_natsort_key_with_missing_last(value))
     return tuple(parts)
 
@@ -239,6 +321,7 @@ def _partition_recursive(
     sorted_variants: Sequence[VariantNode],
     rendered_by_variant: Mapping[int, RenderedVariant],
     remaining_grouping: Sequence[AxisDescriptor],
+    collapse_arch_to_family: bool,
 ) -> List[Union[VariantGroupNode, VariantNode]]:
     """Recursive partition by ``remaining_grouping[0]``, descend on the rest.
 
@@ -263,7 +346,9 @@ def _partition_recursive(
         nonlocal current_children, current_bucket_label
         if not current_children or current_bucket_label is None:
             return
-        nested = _partition_recursive(current_children, rendered_by_variant, rest)
+        nested = _partition_recursive(
+            current_children, rendered_by_variant, rest, collapse_arch_to_family
+        )
         groups.append(
             VariantGroupNode(
                 axis=head,
@@ -277,7 +362,11 @@ def _partition_recursive(
 
     for variant in sorted_variants:
         rv = rendered_by_variant.get(variant.variant_idx)
-        raw_value = None if rv is None else extract_axis_value(head, rv)
+        raw_value = (
+            None
+            if rv is None
+            else _axis_value_for_grouping(head, rv, collapse_arch_to_family)
+        )
         label = _MISSING_VALUE_LABEL if raw_value is None else str(raw_value)
         if label != current_bucket_label:
             _flush()
