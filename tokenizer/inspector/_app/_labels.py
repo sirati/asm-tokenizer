@@ -30,6 +30,8 @@ from tokenizer.inspector._tree_model import (
     VariantNode,
 )
 
+from ._order import VariantGroupNode, format_grouping_label
+
 
 __all__ = ["_compose_label", "_block_node_label", "_BLOCK_KIND_LABELS"]
 
@@ -92,5 +94,7 @@ def _compose_label(node: Node) -> Text:
         return Text(node.text)
     if isinstance(node, ShowAllVariantsNode):
         return Text(node.label)
+    if isinstance(node, VariantGroupNode):
+        return Text(format_grouping_label(node.axis, node.axis_value))
     # Closed Node union; any miss is a model/UI contract drift.
     raise TypeError(f"unsupported node type: {type(node).__name__}")

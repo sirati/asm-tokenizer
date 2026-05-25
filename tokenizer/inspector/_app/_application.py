@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 from rich.style import Style
 from rich.text import Text
@@ -30,8 +30,11 @@ from tokenizer.inspector._tree_model import (
     FunctionNode,
     Node,
 )
+from tokenizer.variant_info import VariantIdentity
 
+from . import _order_hooks
 from ._labels import _compose_label
+from ._order import OrderConfig, OrderResult
 from ._tree_widget import _InspectorTree
 
 
@@ -86,6 +89,7 @@ class InspectorApp(App[None]):
         # would otherwise capture ``left`` / ``right``.
         Binding("slash", "focus_search", "Search"),
         Binding("escape", "hide_search", "Hide search", show=False),
+        Binding("o", "open_order_dialog", "Order", show=True),
     ]
 
     def __init__(
@@ -97,6 +101,22 @@ class InspectorApp(App[None]):
         super().__init__()
         self._factory = factory
         self._log = _setup_inspector_log(log_path)
+        # Current variant ordering + grouping. ``None`` means
+        # "default-sorted, no grouping" -- mirrors the legacy
+        # backend-order rendering until the user opens the Order modal
+        # at least once. One ``OrderConfig`` per binary (W3-21); no
+        # per-function override.
+        self._order_config: Optional[OrderConfig] = None
+        # Per-:class:`FunctionHandle` pending auto-expand set, populated
+        # by :meth:`_rebuild_expanded_subtrees` capture-on-rebuild. The
+        # dispatcher consumes the set after the FunctionNode re-expand
+        # mounts its children so previously-open variant rows surface
+        # under their new group ancestors. The same set is also
+        # consulted whenever a descendant :class:`VariantGroupNode`
+        # mounts its children (the group's expand posts a NodeExpanded
+        # asynchronously), so the chain auto-expands across the
+        # potentially-many-deep group tree without polling.
+        self._pending_auto_expand: dict["FunctionHandle", "set[VariantIdentity]"] = {}
 
     # --- compose ---------------------------------------------------
 
@@ -170,12 +190,28 @@ class InspectorApp(App[None]):
             node.refresh()
             return
 
+        # Grouping pass: when the expanded model owns a variant list
+        # (FunctionNode / ShowAllVariantsNode) and an OrderConfig is
+        # active, route the variants through :func:`group_variants`
+        # at the :mod:`._order` boundary -- :class:`FunctionNode.expand`
+        # stays unchanged (cluster #6 W4-AMENDED).
+        children = _order_hooks.apply_grouping(self, model, children)
+
         for child in children:
             node.add(
                 _compose_label(child),
                 data=child,
                 allow_expand=getattr(child, "can_expand", False),
             )
+
+        # Capture-on-rebuild expand-state restoration: a prior
+        # rebuild may have stashed an auto-expand identity set for
+        # this FunctionNode. The set is consulted post-mount HERE
+        # (on the FunctionNode itself) AND on every descendant
+        # :class:`VariantGroupNode` mount (the group's expand posts a
+        # NodeExpanded asynchronously, so the walk descends across the
+        # potentially-many-deep group tree without polling).
+        _order_hooks.consume_auto_expand_post_mount(self, node, model)
 
     # Horizontal-scroll concerns (editor-like per-row scroll memory +
     # cursor-aware auto-adjust + conditional right-arrow expand) live
@@ -219,6 +255,24 @@ class InspectorApp(App[None]):
                 child.expand()
                 self.action_hide_search()
                 return
+
+    # --- order dialog ----------------------------------------------
+
+    def action_open_order_dialog(self) -> None:
+        """Open the Order modal.
+
+        Heavy lifting (axis discovery + reorder-state preservation
+        across regroup) lives in :mod:`tokenizer.inspector._app._order_hooks`
+        so this module's single concern stays the tree dispatcher.
+        """
+        _order_hooks.open_order_dialog(self)
+
+    def _on_order_dialog_dismissed(
+        self, result: Optional[OrderResult]
+    ) -> None:
+        """Dispatcher for the :class:`OrderDialog` result; delegates to
+        :mod:`._order_hooks`."""
+        _order_hooks.on_order_dialog_dismissed(self, result)
 
 
 # ---------------------------------------------------------------------------
