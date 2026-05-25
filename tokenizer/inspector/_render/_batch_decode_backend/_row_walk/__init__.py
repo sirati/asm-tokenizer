@@ -14,14 +14,12 @@ only the per-band emission concern. Plan reference:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
-    FUNCTION_CATEGORIES,
     _SHIFTED_ID_TO_CATEGORY,
 )
 from tokenizer.aligned_data.loader.batch_decode._types import (
@@ -52,7 +50,6 @@ from .._callee_resolver import resolve_callee_pointer
 from .._fid_table import FidBaseTable
 from .._sections import (
     RowSection,
-    WalkSectionState,
     close_current_section,
     enter_body_after_function_id,
     enter_new_body_block,
@@ -60,45 +57,10 @@ from .._sections import (
     maybe_advance_call_target,
     set_current_body_block_idx,
 )
+from ._state import _CATEGORY_TO_CALL_TARGET_TYPE, _InsnEmitPolicy, _WalkState
 
 
 __all__ = ["RowSection", "render_row_blocks"]
-
-
-# Per-Category -> CallTargetType for FUNCTION-band identity tokens.
-# Mirrors ``_dedup_walk._constants._CALL_TARGET_TYPE_TO_CATEGORY`` in
-# reverse so we never invert a dict at the call site.
-_CATEGORY_TO_CALL_TARGET_TYPE: dict[Category, CallTargetType] = {
-    Category.LOCAL_FUNC: CallTargetType.LOCAL,
-    Category.PLT_FUNC: CallTargetType.PLT,
-    Category.EXT_FUNC: CallTargetType.EXTERN,
-}
-assert set(_CATEGORY_TO_CALL_TARGET_TYPE) == set(FUNCTION_CATEGORIES), (
-    "FUNCTION_CATEGORIES must match the CallTargetType reverse map"
-)
-
-
-@dataclass
-class _WalkState(WalkSectionState):
-    """Per-row walk state: composes :class:`WalkSectionState` (the
-    section concern; see :mod:`._sections`) with the band-emitter
-    cursors that the per-col loop reads + updates.
-
-    ``id_cursor`` / ``num_cursor`` track per-row sidecar positions.
-    ``current_col`` is the column index the loop is processing;
-    crosses :func:`_handle_block`'s ``n_axis`` invariant check.
-    ``last_number_shifted_id`` carries the prior NUMBER-band token's
-    shifted id (``-1`` = none); drives multi-chunk trailing-slot
-    detection inside :func:`emit_number` and resets on every
-    non-NUMBER emit.
-    """
-
-    row: int = 0
-    n_axis: int = 0
-    id_cursor: int = 0
-    num_cursor: int = 0
-    current_col: int = 0
-    last_number_shifted_id: int = -1
 
 
 def _handle_block(state: _WalkState, *, counter: int) -> None:
