@@ -32,6 +32,41 @@ from tokenizer.disasm.types import FpType
 
 
 # ---------------------------------------------------------------------------
+# JVM startup
+# ---------------------------------------------------------------------------
+
+# Shenandoah uncommits committed heap back to the OS during idle periods,
+# which eases cgroup-memory pressure between tasks in long-lived workers
+# (Ghidra holds the JVM process-globally and only releases per-task state
+# in `close()`). Tuned for fast uncommit response while the worker waits
+# on its next task.
+_GHIDRA_JVM_VMARGS = (
+    "-XX:+UnlockExperimentalVMOptions",
+    "-XX:+UseShenandoahGC",
+    "-XX:ShenandoahUncommitDelay=1000",
+    "-XX:ShenandoahGuaranteedGCInterval=10000",
+)
+
+
+def _ensure_jvm_started() -> None:
+    """Idempotently boot the Ghidra JVM with our vmargs injected.
+
+    pyghidra exposes vmargs only via the ``HeadlessPyGhidraLauncher``
+    object; the convenience ``pyghidra.start()`` builds its own launcher
+    internally and gives no hook to add vmargs. Routing every provider
+    through this helper keeps the vmargs configuration in one place and
+    preserves the original ``pyghidra.started()`` short-circuit.
+    """
+    import pyghidra
+
+    if pyghidra.started():
+        return
+    launcher = pyghidra.HeadlessPyGhidraLauncher()
+    launcher.add_vmargs(*_GHIDRA_JVM_VMARGS)
+    launcher.start()
+
+
+# ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
 
@@ -58,8 +93,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # Prevent JVM from hanging on Python exit (known JPype issue)
         jpype.config.destroy_jvm = False
 
-        if not pyghidra.started():
-            pyghidra.start()
+        _ensure_jvm_started()
 
         self.binary_path = binary_path
         # ``None`` -> dump disabled (zero work in iter_functions). When
