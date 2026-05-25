@@ -40,6 +40,7 @@ from tokenizer.aligned_data.loader.decoded._number_render import (
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.tokens import TokenType
+from tokenizer.variant_info import VariantIdentity
 
 
 __all__ = [
@@ -55,6 +56,7 @@ __all__ = [
     "RenderBackend",
     "RenderedBlock",
     "RenderedVariant",
+    "VariantIdentity",
 ]
 
 
@@ -139,10 +141,31 @@ class RenderedVariant:
     ``variant_idx`` is the backend-internal variant index threaded
     back into :meth:`RenderBackend.blocks` /
     :meth:`RenderBackend.render_block`.
+
+    ``extra_metadata`` carries the per-variant non-axis metadata
+    residue (sidecar fields, build-flag groups, hardening / sanitizer
+    settings, ...) as a frozen string mapping. Both backends derive it
+    via :meth:`tokenizer.variant_info.VariantInfo.from_function_data_metadata`
+    or by projecting the variant's :class:`VariantInfo.extra_metadata`
+    onto a string mapping — the inspector keys its EXTRA_META axis
+    grouping on this field. Wrapped as :class:`types.MappingProxyType`
+    per plan decision 21.
+
+    ``variant_identity`` is the typed canonical-identity
+    (:class:`tokenizer.variant_info.VariantIdentity`) shared with the
+    rest of the codebase via :class:`VariantInfo.__eq__` /
+    :class:`VariantInfo.__hash__`. The inspector's expand-state
+    preservation keys on this value across grouping rebuilds — using a
+    hand-rolled tuple would collide on the canonical-4 across variants
+    that differ only in :attr:`VariantIdentity.variant_id` (the
+    dedup-disambiguator documented at
+    ``tokenizer.aligned_data.io.write_matched_section_csv``).
     """
 
     variant_idx: int
     label_axes: Mapping[str, Optional[str]]
+    extra_metadata: Mapping[str, str]
+    variant_identity: VariantIdentity
 
 
 @dataclass(frozen=True)

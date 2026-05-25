@@ -34,6 +34,7 @@ from tokenizer.inspector._tree_model import (
     InlineCallNode,
     VariantNode,
 )
+from tokenizer.variant_info import VariantIdentity
 from tokenizer.variant_tokens.prefixes import (
     ARCH_PREFIX,
     COMP_PREFIX,
@@ -59,9 +60,19 @@ def _make_label_axes() -> dict[str, str | None]:
     )
 
 
+def _make_variant_identity(variant_idx: int) -> VariantIdentity:
+    return VariantIdentity(
+        arch="x86", compiler="clang", compiler_version="8.0", opt="O3",
+        pkg="", variant_id=variant_idx,
+    )
+
+
 def _make_rendered_variant(variant_idx: int) -> RenderedVariant:
     return RenderedVariant(
-        variant_idx=variant_idx, label_axes=_make_label_axes()
+        variant_idx=variant_idx,
+        label_axes=_make_label_axes(),
+        extra_metadata=types.MappingProxyType({}),
+        variant_identity=_make_variant_identity(variant_idx),
     )
 
 
