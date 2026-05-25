@@ -1,11 +1,13 @@
 """Emission-band invariants of :func:`render_row_blocks`.
 
-NUMBER-band trailing-chunk placeholder (decision #17), FUNCTION-band
-FID resolution via :class:`FidBaseTable`, EXTERN provider routing,
-counter-but-not-BLOCK Phase-1 placeholder.
+NUMBER-band multi-chunk grouping via :class:`_NumberAccumulator`
+(R2c; replaces the legacy ``"..."`` trailing-slot placeholder),
+FUNCTION-band FID resolution via :class:`FidBaseTable`, EXTERN
+provider routing, counter-but-not-BLOCK Phase-1 placeholder.
 
 Plan reference: ``inspector-render-backends.md`` §6 + decisions
-#16/#17/#28 + audits B-CRIT-1 / B-CRIT-4 / B-HIGH-6 / B-HIGH-7.
+#16/#17/#28 + audits B-CRIT-1 / B-CRIT-4 / B-HIGH-6 / B-HIGH-7;
+``inspector-followup.md`` §W3-12 / W3-17 (R2c integration).
 """
 
 from __future__ import annotations
@@ -13,9 +15,13 @@ from __future__ import annotations
 import numpy as np
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
+from tokenizer.aligned_data.loader.decoded._number_render import (
+    InlineNumberPrecisionEntry,
+)
 from tokenizer.aligned_data.loader.decoded.custom_float import (
     from_float128,
     from_float32,
+    from_float64,
     from_int,
 )
 from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
@@ -98,19 +104,19 @@ def _walk(
 
 
 # ---------------------------------------------------------------------------
-# Multi-chunk trailing-slot placeholder (decision #17)
+# NUMBER-band multi-chunk grouping via _NumberAccumulator (R2c)
 # ---------------------------------------------------------------------------
 
 
-def test_consecutive_f128_tokens_render_lead_plus_placeholder() -> None:
-    """Two consecutive F128 NUMBER tokens belong to the SAME source
-    (encoder emits K consecutive same-shifted-id tokens per multi-chunk
-    source). Lead chunk -> :func:`chunks_to_hex_bits`; trailing slot ->
-    ``AsmLine("...")``.
+def test_consecutive_f128_tokens_group_into_one_finite_source() -> None:
+    """Two consecutive F128 NUMBER tokens with the same shifted id are
+    one finite F128 source per encoder discipline (K_visible=2). The
+    accumulator buffers BOTH chunks and emits ONE :class:`AsmLine`
+    with the short-form rendering when the band switches off NUMBER
+    (or the row ends).
 
-    Finite F128 -> lead-chunk render is ``"float128:..."`` (Phase-1
-    placeholder); the trailing slot still independently emits the
-    dedicated ``"..."`` placeholder.
+    The legacy Phase-1 ``"..."`` trailing-slot placeholder is GONE;
+    the accumulator is the SSOT (A-L4 M2).
     """
     finite_bits = 0x3FFF0000000000000000000000000000  # 1.0
     chunks = from_float128(finite_bits)
@@ -125,14 +131,21 @@ def test_consecutive_f128_tokens_render_lead_plus_placeholder() -> None:
         numbers_sig=numbers_sig, numbers_se=numbers_se,
     )
     items = blocks[0].items
-    assert len(items) == 2
-    assert items[0].text == "float128:..."  # finite F128 placeholder
-    assert items[1].text == "..."  # trailing-slot placeholder
+    # Exactly ONE AsmLine -- the two chunks reconstructed into a single
+    # finite-F128 source rendered at short precision.
+    assert len(items) == 1
+    assert isinstance(items[0], AsmLine)
+    assert items[0].text == "f128:0.1 E1"
 
 
 def test_consecutive_single_chunk_floats_each_render_independently() -> None:
     """Two consecutive F32 (single-chunk) tokens come from DISTINCT
-    sources; each MUST render independently (no trailing-slot dispatch).
+    sources; each MUST render independently. The accumulator-side
+    grouping policy collapses by shifted id, so the row walker
+    force-flushes after every non-multi-chunk feed (see
+    :data:`MULTI_CHUNK_SHIFTED_IDS` exclusion); without that gate
+    these two would mis-group into one mis-rendered source (cluster
+    #21 / R1-Audit L-4).
     """
     chunks_a = from_float32(0x3F800000)  # +1.0
     chunks_b = from_float32(0x40000000)  # +2.0
@@ -151,13 +164,43 @@ def test_consecutive_single_chunk_floats_each_render_independently() -> None:
     )
     items = blocks[0].items
     assert len(items) == 2
-    assert items[0].text == "float32:3f800000"
-    assert items[1].text == "float32:40000000"
+    # R1c short form: ``f32:0.<digits> E<exp>``.
+    assert items[0].text == "f32:0.1 E1"
+    assert items[1].text == "f32:0.2 E1"
+
+
+def test_consecutive_same_id_single_chunk_floats_render_separately() -> None:
+    """Audit gap R1-Audit L-4: two F32 tokens with the SAME shifted id
+    AND IDENTICAL chunk payloads ALSO render as two separate AsmLines.
+
+    The accumulator's auto-flush triggers only on shifted_id MISMATCH,
+    so without the row walker's force-flush after each single-chunk
+    feed (MULTI_CHUNK_SHIFTED_IDS exclusion gate) these two feeds
+    would extend ONE source instead of producing two.
+    """
+    chunks = from_float32(0x3F800000)  # +1.0
+    numbers_sig = np.asarray(
+        [chunks[0][0], chunks[0][0]], dtype=np.uint64,
+    )
+    numbers_se = np.asarray(
+        [chunks[0][1], chunks[0][1]], dtype=np.uint32,
+    )
+    blocks = _walk(
+        tokens=np.asarray(
+            [BLOCK_V2, F32_NUMBER, F32_NUMBER, 0], dtype=np.uint16,
+        ),
+        identities=np.asarray([0], dtype=np.uint16),
+        numbers_sig=numbers_sig, numbers_se=numbers_se,
+    )
+    items = blocks[0].items
+    assert len(items) == 2
+    assert items[0].text == "f32:0.1 E1"
+    assert items[1].text == "f32:0.1 E1"
 
 
 def test_single_chunk_vc2_renders_via_inner_text_shape() -> None:
-    """A single-chunk VC2 renders via ``reconstruct_chunks`` ->
-    ``"v2:<hex>"`` parity with :meth:`ValuedConstV2Inner.to_asm_like`.
+    """A single-chunk VC2 renders via the R1c short renderer ->
+    ``"v:<HEX> (<decimal>)"``.
     """
     chunks = from_int(0xCAFE)
     numbers_sig = np.asarray([chunks[0][0]], dtype=np.uint64)
@@ -169,14 +212,17 @@ def test_single_chunk_vc2_renders_via_inner_text_shape() -> None:
     )
     items = blocks[0].items
     assert len(items) == 1
-    assert items[0].text == "v2:cafe"
+    assert items[0].text == "v:CAFE (51966)"
 
 
-def test_identity_between_number_tokens_resets_trailing_state() -> None:
-    """Decision #17 contract: ``last_number_shifted_id`` resets on
-    every NON-number token. A row ``[BLOCK_V2(c=0), F32, BLOCK_V2(c=1),
-    F32]`` with two identical F32 sources should render BOTH F32s as
-    real hex (the IDENTITY in between resets the trailing-chunk state).
+def test_identity_between_number_tokens_flushes_accumulator() -> None:
+    """A non-NUMBER (IDENTITY) token between two same-id NUMBER tokens
+    triggers an accumulator flush so the second F32 source renders
+    independently of the first.
+
+    Row ``[BLOCK_V2(c=0), F32, BLOCK_V2(c=1), F32]``: the second
+    BLOCK_V2 (under the SAME body block) is an inline jump; the F32
+    after it MUST render as its own source, not extend the prior.
     """
     chunks = from_float32(0x3F800000)
     numbers_sig = np.asarray(
@@ -192,15 +238,71 @@ def test_identity_between_number_tokens_resets_trailing_state() -> None:
         identities=np.asarray([0, 1], dtype=np.uint16),
         numbers_sig=numbers_sig, numbers_se=numbers_se,
     )
-    # First block: AsmLine (F32 render) + InlineJumpEntry (BLOCK_V2 c=1)
-    # Wait: second BLOCK_V2 is an inline-jump under the FIRST block
-    # because we have only one partial_cut_length segment. The F32 after
-    # the inline jump renders as real hex (state reset by the IDENTITY).
     items = blocks[0].items
     asm_text = [it.text for it in items if isinstance(it, AsmLine)]
-    assert "float32:3f800000" in asm_text
-    # Both F32 emissions are real hex (no "..." trailing placeholder).
-    assert asm_text.count("float32:3f800000") == 2
+    # Both F32 emissions render in the new short form.
+    assert asm_text.count("f32:0.1 E1") == 2
+
+
+def test_float_short_lost_precision_carries_inline_precision_entry() -> None:
+    """An F64 value that does NOT fit losslessly in the 4-digit short
+    form carries an :class:`InlineNumberPrecisionEntry` on the emitted
+    :class:`AsmLine`'s ``openables`` tuple. The tree-model (R2e) later
+    expands that entry as a child row.
+
+    Uses pi (irrational): short form ``f64:0.3142 E1`` loses precision
+    vs full ``f64:0.<17digits> E1``.
+    """
+    import math
+    # Build a single-chunk F64 of math.pi via from_float64.
+    import struct
+    pi_bits = struct.unpack(">Q", struct.pack(">d", math.pi))[0]
+    chunks = from_float64(pi_bits)
+    numbers_sig = np.asarray([chunks[0][0]], dtype=np.uint64)
+    numbers_se = np.asarray([chunks[0][1]], dtype=np.uint32)
+    blocks = _walk(
+        tokens=np.asarray(
+            [BLOCK_V2, F32_NUMBER + 1, 0], dtype=np.uint16,
+        ),  # F64 shifted id sits at F32_NUMBER + 1 in the NUMBER band.
+        identities=np.asarray([0], dtype=np.uint16),
+        numbers_sig=numbers_sig, numbers_se=numbers_se,
+    )
+    items = blocks[0].items
+    assert len(items) == 1
+    line = items[0]
+    assert isinstance(line, AsmLine)
+    # The short form truncates pi to 4 digits.
+    assert line.text == "f64:0.3142 E1"
+    # The precision entry rides along on the openables tuple.
+    assert len(line.openables) == 1
+    entry = line.openables[0]
+    assert isinstance(entry, InlineNumberPrecisionEntry)
+    assert entry.full_text == "f64:0.31415926535897931 E1"
+
+
+def test_cut_variant_end_of_row_flushes_pending_chunks() -> None:
+    """Cluster #21 H-4: a row that ends mid-multi-chunk source MUST
+    still emit the lead-chunk contribution (best-effort), not silently
+    drop it. Synthetic: a finite F128 source has 2 chunks but the row
+    carries only ONE F128 NUMBER token (the second chunk got cut).
+    The end-of-row flush emits one :class:`AsmLine` rendering only the
+    lead chunk's content.
+    """
+    finite_bits = 0x3FFF0000000000000000000000000000  # 1.0
+    chunks = from_float128(finite_bits)
+    assert len(chunks) == 2
+    # Only feed the LEAD chunk; trailing chunk is "cut" (not in the row).
+    numbers_sig = np.asarray([chunks[0][0]], dtype=np.uint64)
+    numbers_se = np.asarray([chunks[0][1]], dtype=np.uint32)
+    blocks = _walk(
+        tokens=np.asarray([BLOCK_V2, F128_NUMBER, 0], dtype=np.uint16),
+        identities=np.asarray([0], dtype=np.uint16),
+        numbers_sig=numbers_sig, numbers_se=numbers_se,
+    )
+    items = blocks[0].items
+    # End-of-row flush emits the partial source as best-effort.
+    assert len(items) == 1
+    assert isinstance(items[0], AsmLine)
 
 
 # ---------------------------------------------------------------------------
