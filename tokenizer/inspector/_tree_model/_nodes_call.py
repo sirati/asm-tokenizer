@@ -1,8 +1,10 @@
 """``InlineCallNode`` -- inline call site under a block.
 
-Expandable only when the callee is LOCAL and the
-:class:`InlineCallEntry` carried a resolvable
-:class:`SectionPointerSpec`; PLT / EXTERN have no body to inline.
+Expandable whenever the :class:`InlineCallEntry` carried a resolvable
+:class:`SectionPointerSpec`; LOCAL and PLT both qualify (the writer
+treats them identically -- a PLT thunk is sectioned just like a local
+function, its body is the small jump-thunk to the resolved extern).
+EXTERN has no callee section at all so it never expands.
 Expansion constructs a synthetic callee :class:`FunctionNode` against
 the same :class:`BackendFactory` the parent tree-open used; the
 matching variant's blocks are surfaced DIRECTLY (skipping the
@@ -61,14 +63,15 @@ class InlineCallNode:
     @property
     def can_expand(self) -> bool:
         # Single dispatch point; the UI gates the expand call on this.
-        # Mirrors the legacy contract: only LOCAL with a resolved
-        # callee section is expandable. PLT / EXTERN have no body to
-        # inline; LOCAL without a resolved pointer (callee_handle is
-        # None) cannot construct a FunctionNode either.
-        return (
-            self.kind is CallTargetType.LOCAL
-            and self.callee_handle is not None
-        )
+        # LOCAL and PLT call_targets both point at a section the writer
+        # emitted (the writer's ``_resolve_function_section_ptr`` treats
+        # them identically -- PLT thunks are sectioned just like local
+        # functions, their body being the small jump-thunk that calls
+        # the resolved extern). EXTERN has no callee section so its
+        # ``callee_handle`` is always ``None`` here; LOCAL/PLT without
+        # a resolved pointer (cross-arm miss) likewise cannot construct
+        # a FunctionNode.
+        return self.callee_handle is not None
 
     def expand(self) -> list:
         """Open the callee + inline the matching variant's blocks.

@@ -339,11 +339,33 @@ def test_inline_call_node_cannot_expand_for_local_without_handle():
     assert node.can_expand is False
 
 
-@pytest.mark.parametrize("kind", [CallTargetType.PLT, CallTargetType.EXTERN])
-def test_inline_call_node_cannot_expand_for_plt_or_extern(kind):
-    """PLT / EXTERN have no inlineable body regardless of pointer
-    presence."""
-    node = _make_inline_call(kind, _make_handle(idx=1, name="callee"))
+def test_inline_call_node_can_expand_for_plt_with_handle():
+    """PLT call_targets resolve to a sectioned PLT thunk (the writer
+    treats LOCAL and PLT identically) -- so a PLT entry with a
+    resolved ``callee_handle`` is expandable into the small jump-thunk
+    body that calls the resolved extern."""
+    node = _make_inline_call(
+        CallTargetType.PLT, _make_handle(idx=1, name="callee")
+    )
+    assert node.can_expand is True
+
+
+def test_inline_call_node_cannot_expand_for_plt_without_handle():
+    """A PLT call whose thunk section was not resolvable (cross-arm
+    miss / dropped by pass-1) carries ``callee_handle=None`` and is
+    therefore not expandable -- the gate is "has a handle", not "is
+    LOCAL"."""
+    node = _make_inline_call(CallTargetType.PLT, None)
+    assert node.can_expand is False
+
+
+def test_inline_call_node_cannot_expand_for_extern():
+    """EXTERN has no callee section at all -- the resolver returns
+    ``None`` unconditionally, so ``callee_handle`` is ``None`` and the
+    node is non-expandable. The AsmLeaf 1-arm dispatch constructs the
+    InlineCallNode with ``callee_handle=None`` for EXTERN regardless of
+    any handle the test fixture supplies."""
+    node = _make_inline_call(CallTargetType.EXTERN, None)
     assert node.can_expand is False
 
 
@@ -422,6 +444,42 @@ def test_inline_call_expand_pinned_variant_solo_no_show_all_sibling():
     assert len(children) == 3
     assert all(isinstance(c, BlockNode) for c in children)
     assert not any(isinstance(c, ShowAllVariantsNode) for c in children)
+
+
+def test_inline_call_expand_plt_yields_thunk_body_blocks():
+    """Regression: a PLT call whose thunk section resolves to a
+    backend with 1 variant + N blocks expands into those N blocks
+    directly -- not into an empty body (the prior gate restricted
+    expansion to LOCAL kinds, leaving PLT rows expandable-looking but
+    yielding zero children). The user observed the empty-body
+    symptom on ``▼ bl plt function 0: calloc`` -> ``plt function 0:
+    calloc`` with no further content; PLT thunks ARE sectioned by the
+    writer (small jump-thunk to the resolved extern) so the inline
+    expand must surface that body.
+    """
+    callee_backend = _make_backend(n_variants=1, n_blocks=2)
+    callee_handle = _make_handle(idx=7, name="calloc")
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [callee_handle]
+    factory.make.return_value = callee_backend
+
+    node = InlineCallNode(
+        factory=factory,
+        kind=CallTargetType.PLT,
+        counter_id=0,
+        callee_name="calloc",
+        callee_handle=callee_handle,
+        variant_idx=0,
+        provider=None,
+    )
+
+    assert node.can_expand is True
+    children = node.expand()
+    # PLT thunk body surfaced -- non-empty list of BlockNodes, no
+    # ShowAllVariantsNode (single-variant callee).
+    assert len(children) == 2
+    assert all(isinstance(c, BlockNode) for c in children)
+    assert [c.block_idx for c in children] == [0, 1]
 
 
 def test_inline_call_expand_missing_variant_falls_back_to_all_variants():
