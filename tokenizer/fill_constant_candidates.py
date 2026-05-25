@@ -35,15 +35,20 @@ def _emit_jump_table_footer_for(
     jt_token = vocab_manager.Jump_Table(jt_id)
     target_tokens: list[Tokens] = []
     for target_addr in target_addrs:
-        target_key = hex(int(target_addr))
+        target_addr_int = int(target_addr)
         # Mirror the per-block emission's key shape so that targets which
         # are already known blocks of this function share identity via
         # the existing cache entry — ``get_identity`` returns the cached
         # id and ignores ``meta`` on cache hits, so the
         # "comes_from_jump_table" annotation only attaches to brand-new
         # targets (slots that were never emitted as a regular block).
-        target_meta = {"addr": target_key, "comes_from_jump_table": jt_id}
-        target_id = resolver.get_identity(Category.BLOCK, target_key, target_meta)
+        # The ``Category.BLOCK`` cache is keyed by the typed ``int``
+        # address (matching ``ConstantHandler._emit_block`` and the v2
+        # block-def emission in ``fill_constant_candidates``); the hex
+        # form is kept in ``target_meta["addr"]`` for human-readable
+        # metadata only.
+        target_meta = {"addr": hex(target_addr_int), "comes_from_jump_table": jt_id}
+        target_id = resolver.get_identity(Category.BLOCK, target_addr_int, target_meta)
         target_tokens.append(vocab_manager.Block_V2(target_id))
 
     footer_tokens: list[Tokens] = [vocab_manager.Block_Def(), jt_token, *target_tokens]
@@ -84,7 +89,8 @@ def _emit_jump_table_footer(
     per-function metadata accumulator records both the table address and
     each target's address; identities for already-known targets are shared
     with the per-block emission earlier in ``fill_constant_candidates``
-    (same ``Category.BLOCK`` cache, same ``hex(addr)`` key).
+    (same ``Category.BLOCK`` cache, same typed ``int`` address key —
+    matching ``ConstantHandler._emit_block``'s key form).
 
     Dedup: footer-emit must be deterministic. When BOTH the provider
     yields a table and a slot-classification call has registered the
@@ -199,8 +205,14 @@ def fill_constant_candidates(
     for block in ordered_blocks:
         func_max_addr = max(block.addr, block.addr + block.size)
 
+        # ``block_addr`` is the human-readable label used by ``block_dict``,
+        # ``blocks`` set, ``temp_bbs``, etc. The resolver's BLOCK cache, in
+        # contrast, is keyed by the typed ``int`` address (matching the
+        # int key used by ``ConstantHandler._emit_block`` for intra-function
+        # jump-target references). Hand the int to ``get_block_id`` so block
+        # definitions and references to the same block share identity.
         block_addr = hex(block.addr)
-        block_id = resolver.get_block_id(block_addr)
+        block_id = resolver.get_block_id(int(block.addr))
         block_token = vocab_manager.BlockId(block_id)
         block_list.append(
             {
