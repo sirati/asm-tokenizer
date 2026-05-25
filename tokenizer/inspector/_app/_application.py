@@ -33,6 +33,7 @@ from tokenizer.inspector._tree_model import (
     VariantNode,
 )
 
+from ._help_dialog import HelpScreen
 from ._labels import _compose_label
 from ._tree_widget import _InspectorTree
 
@@ -109,6 +110,8 @@ class InspectorApp(App[None]):
     #search.visible { display: block; }
     """
 
+    BINDING_GROUP_TITLE: ClassVar[str] = "Application"
+
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("q", "quit", "Quit"),
         # Horizontal-pan bindings live on :class:`_InspectorTree` (the
@@ -116,6 +119,7 @@ class InspectorApp(App[None]):
         # before the ScrollableContainer's built-in pan-only bindings
         # would otherwise capture ``left`` / ``right``.
         Binding("slash", "focus_search", "Search"),
+        Binding("h", "open_help", "Help", show=True),
         Binding("escape", "hide_search", "Hide search", show=False),
     ]
 
@@ -214,6 +218,19 @@ class InspectorApp(App[None]):
     # on :class:`_InspectorTree`. The tree owns the cursor, viewport,
     # and the per-row model nodes, so keeping the keyboard logic
     # there avoids the App brokering tree state through actions.
+
+    # --- modals ----------------------------------------------------
+
+    def action_open_help(self) -> None:
+        """Push the help modal listing every active binding.
+
+        The modal's :class:`BindingsTable` reads the screen stacked
+        below itself (this app's root screen), so the rendered table
+        auto-tracks any future addition to :class:`InspectorApp` or
+        :class:`_InspectorTree` BINDINGS without a hand-maintained
+        help string.
+        """
+        self.push_screen(HelpScreen())
 
     # --- search ----------------------------------------------------
 

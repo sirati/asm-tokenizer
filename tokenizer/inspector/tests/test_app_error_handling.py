@@ -240,9 +240,7 @@ def test_left_arrow_at_scroll_zero_moves_cursor_to_parent():
 
     Standard file-tree TUI affordance: the arrow pans while there is
     horizontal slack, then becomes cursor-to-parent once the row is
-    flush-left. Vim ``h`` retains its pure-pan semantics (separate
-    binding) and is covered by the no-op path implicitly: with
-    ``scroll_offset.x == 0`` it remains a no-op cursor-wise.
+    flush-left.
     """
 
     async def runner() -> None:
@@ -271,15 +269,6 @@ def test_left_arrow_at_scroll_zero_moves_cursor_to_parent():
                 await pilot.press("left")
                 await pilot.pause()
                 assert tree.cursor_node is fn_tree_node
-
-                # Vim ``h`` at scroll-zero is pure pan -> still a no-op
-                # cursor-wise. Move back to the child + press ``h``.
-                tree.move_cursor(child_tree_node, animate=False)
-                await pilot.pause()
-                assert tree.cursor_node is child_tree_node
-                await pilot.press("h")
-                await pilot.pause()
-                assert tree.cursor_node is child_tree_node
 
     asyncio.run(runner())
 
@@ -606,8 +595,15 @@ def test_vim_l_mirrors_right_arrow():
     asyncio.run(runner())
 
 
-def test_vim_h_is_pure_pan_and_saves_remembered_scroll_x():
-    """``h`` is unconditional pan-left and persists the new ``scroll_x``."""
+def test_tree_h_no_longer_pans():
+    """``h`` is reserved for the App-level help modal -- the tree drops it.
+
+    Positive confirmation that pressing ``h`` while the tree has focus
+    no longer triggers a horizontal pan: ``scroll_offset.x`` stays
+    untouched and the model's ``remembered_scroll_x`` stays at its
+    pre-press value. The App-level binding (covered separately) takes
+    over the keystroke.
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -620,18 +616,21 @@ def test_vim_h_is_pure_pan_and_saves_remembered_scroll_x():
                 )
                 tree.move_cursor(children[0], animate=False)
                 await pilot.pause()
-                # Pan right by 3.
+                # Pan right by 3 with the standard binding so we land
+                # at a non-zero scroll position; any future tree-level
+                # ``h``-binding regression would pan back to 2.
                 for _ in range(3):
                     await pilot.press("right")
                 await pilot.pause()
                 assert tree.scroll_offset.x == 3
                 assert long_leaf.remembered_scroll_x == 3
 
-                # ``h`` pulls back by 1 + saves.
                 await pilot.press("h")
                 await pilot.pause()
-                assert tree.scroll_offset.x == 2
-                assert long_leaf.remembered_scroll_x == 2
+                # Scroll position + remembered value MUST be unchanged
+                # -- the tree no longer consumes ``h``.
+                assert tree.scroll_offset.x == 3
+                assert long_leaf.remembered_scroll_x == 3
 
     asyncio.run(runner())
 
