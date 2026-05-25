@@ -18,7 +18,7 @@ subsequent calls raise :class:`RuntimeError` (audit A-HIGH-3).
 from __future__ import annotations
 
 import types
-from typing import Iterable, List, Mapping, Optional, Sequence
+from typing import Callable, Iterable, List, Mapping, Optional, Sequence
 
 from tokenizer.aligned_data.loader.batch_decode._auto_size import (
     compute_auto_sizes,
@@ -103,12 +103,16 @@ class BatchDecodeBackend:
         handle: FunctionHandle,
         line_to_name: Mapping[int, str],
         line_to_provider: Mapping[int, str],
+        callee_arm_resolver: Callable[
+            [int], Optional[SectionPointerSpec]
+        ],
     ) -> None:
         self._session = session
         self._vocab_manager = vocab_manager
         self._handle = handle
         self._line_to_name = line_to_name
         self._line_to_provider = line_to_provider
+        self._callee_arm_resolver = callee_arm_resolver
         self._closed: bool = False
         self._result: Optional[BatchDecodeResult] = None
         self._fid_table: Optional[FidBaseTable] = None
@@ -190,6 +194,7 @@ class BatchDecodeBackend:
             variant_padding=VariantPadding.PAD_NULL,
             include_fid_sidecar=True,
             keep_intermediate=True,
+            emit_block_n_insns_runlength=True,
         )
         self._fid_table = FidBaseTable.from_result(self._result)
 
@@ -239,16 +244,32 @@ class BatchDecodeBackend:
         stage1_variant = stage1.sections[0].variants[variant_idx]
         stage2_variant = stage2_section.variants[variant_idx]
         n_axis = int(stage1_variant.variant_tokens.shape[0])
-        pcl = [int(ct.partial_cut_length) for ct in stage2_variant.call_targets]
+        # Per-CT slot budget the row writer actually emitted (post-cut).
+        # surviving_token_count includes the row-assembler-owned self-
+        # prepend slot at the CT's body start (col = ct_start) and the
+        # function-body that follows (cols ct_start+1 .. ct_start+pcl).
+        pcl = [
+            int(ct.surviving_token_count) for ct in stage2_variant.call_targets
+        ]
+        # Per-CT call_targets_section: each Stage1CallTarget owns its
+        # own table (root + every inlined callee). The FUNCTION-band
+        # token resolver indexes into the CURRENT walking CT's table,
+        # NOT the root section's table, because inlined-callee call
+        # sites reference THEIR own table.
+        call_targets_per_ct = [
+            ct.call_targets_section for ct in stage1_variant.call_targets
+        ]
         walked = render_row_blocks(
             result=self._result,
             row=row,
             n_axis=n_axis,
             partial_cut_lengths=pcl,
+            call_targets_per_ct=call_targets_per_ct,
             vocab_manager=self._vocab_manager,
             fid_table=self._fid_table,
             line_to_name=self._line_to_name,
             line_to_provider=self._line_to_provider,
+            callee_arm_resolver=self._callee_arm_resolver,
         )
         self._row_blocks_by_variant[variant_idx] = walked
         return walked

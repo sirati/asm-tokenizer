@@ -60,12 +60,13 @@ from dedup_hashmap import HashMapU32U16
 from tokenizer.tokens import Category
 
 from ._dedup_walk import FUNCTION_CATEGORIES, apply_per_row_remap
+from ._runlengths import compute_metatoken_runlengths
 from ._sidecar_concat import assemble_number_sidecars
 from ._token_assembly import assemble_tokens
 from ._types import BatchDecodeResult
 
 if TYPE_CHECKING:
-    from ._types import Stage3Batch
+    from ._types import Stage2Batch, Stage3Batch
 
 
 __all__ = ["assemble_batch"]
@@ -108,6 +109,7 @@ def assemble_batch(
     context_len: int,
     include_fid_sidecar: bool = False,
     keep_intermediate: bool = False,
+    emit_block_n_insns_runlength: bool = False,
 ) -> "BatchDecodeResult":
     """Compose the stage-4 modules into a :class:`BatchDecodeResult`.
 
@@ -177,9 +179,22 @@ def assemble_batch(
     # Step 3: number sidecars.
     numbers_significant, numbers_sign_exponent = assemble_number_sidecars(stage3)
 
-    # Step 4: pack.
+    # Step 4: optional metatoken-runlength sidecar (per the canonical
+    # FTL accountant; see :mod:`._runlengths`).
     stage2 = stage3.stage2
     stage1 = stage2.stage1
+    (
+        block_runlength,
+        block_runlength_row_offsets,
+        insn_runlength,
+        insn_runlength_row_offsets,
+    ) = (
+        _assemble_runlength_sidecars(stage2)
+        if emit_block_n_insns_runlength
+        else (None, None, None, None)
+    )
+
+    # Step 5: pack.
     return BatchDecodeResult(
         tokens=tokens,
         identities=identities,
@@ -191,5 +206,163 @@ def assemble_batch(
         fid_sidecar=fid_sidecar,
         fid_row_offsets=fid_row_offsets,
         fid_per_category_counts=fid_per_category_counts,
+        block_runlength=block_runlength,
+        block_runlength_row_offsets=block_runlength_row_offsets,
+        insn_runlength=insn_runlength,
+        insn_runlength_row_offsets=insn_runlength_row_offsets,
         intermediate=stage3 if keep_intermediate else None,
     )
+
+
+def _truncate_runlengths_to_surviving(
+    block_rl: np.ndarray,
+    insn_rl: np.ndarray,
+    surviving_body_slots: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Clip per-call-target runlengths to the surviving body-slot count.
+
+    ``surviving_body_slots`` is ``surviving_token_count - 1`` (drop the
+    self-prepend slot, which is row-assembler-owned and not present in
+    the runlengths). Emit blocks until cumulative slot count >=
+    ``surviving_body_slots``; the cut block is INCLUDED with its full
+    instruction list (the inspector clamps its column range at render
+    time). Per-instruction slot counts are NOT trimmed -- a partially-
+    cut instruction keeps its full slot count in the sidecar.
+    """
+    if surviving_body_slots <= 0 or block_rl.size == 0:
+        return (
+            np.zeros(0, dtype=np.uint32),
+            np.zeros(0, dtype=np.uint32),
+        )
+    insn_cumulative = np.cumsum(insn_rl, dtype=np.int64)
+    # Determine how many blocks survive: track cumulative slot count
+    # via block-end positions in the insn array.
+    block_end_insn_idx = np.cumsum(block_rl, dtype=np.int64)
+    # Slot count at end of each block:
+    # insn_cumulative[block_end_insn_idx[k] - 1] (when block_end_insn_idx[k] > 0)
+    surviving_block_count = 0
+    for k in range(int(block_rl.size)):
+        end_idx = int(block_end_insn_idx[k])
+        if end_idx == 0:
+            continue
+        block_end_slot = int(insn_cumulative[end_idx - 1])
+        block_start_slot = (
+            int(insn_cumulative[int(block_end_insn_idx[k - 1]) - 1])
+            if k > 0 and int(block_end_insn_idx[k - 1]) > 0
+            else 0
+        )
+        surviving_block_count = k + 1
+        if block_end_slot >= surviving_body_slots:
+            break
+        # else: still under cut, continue
+    # Insn count: sum of block_rl over surviving blocks.
+    if surviving_block_count == 0:
+        return (
+            np.zeros(0, dtype=np.uint32),
+            np.zeros(0, dtype=np.uint32),
+        )
+    surviving_insn_count = int(block_end_insn_idx[surviving_block_count - 1])
+    return (
+        block_rl[:surviving_block_count].astype(np.uint32, copy=False),
+        insn_rl[:surviving_insn_count].astype(np.uint32, copy=False),
+    )
+
+
+def _assemble_runlength_sidecars(
+    stage2: "Stage2Batch",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate per-row per-call_target metatoken runlengths.
+
+    Walks ``stage2.stage1.batch_idx_to_section_variant`` row-by-row and
+    for each non-padding row concatenates the per-call_target
+    ``(block_runlength, insn_runlength)`` produced by
+    :func:`compute_metatoken_runlengths`, clipped to the
+    per-call-target ``surviving_token_count`` (stage 2's cutoff walk).
+    Padding rows contribute zero blocks and zero instructions; multi-
+    mapped variants (RESAMPLE / REDISTRIBUTE) contribute the same per-
+    variant content for every referencing row.
+
+    Returns ``(block_runlength, block_runlength_row_offsets,
+    insn_runlength, insn_runlength_row_offsets)`` -- each shaped per
+    :class:`BatchDecodeResult`'s field docstrings.
+    """
+    sentinel = int(np.iinfo(np.uint32).max)
+    stage1 = stage2.stage1
+    batch_idx_map = stage1.batch_idx_to_section_variant
+    batch_size = int(stage1.batch_size)
+
+    # Per-unique-variant cache of (block_rl, insn_rl) concatenated
+    # across the variant's call_targets in DFS encounter order, with
+    # per-CT cutoff clipping applied.
+    per_variant_block_rl: list[np.ndarray] = []
+    per_variant_insn_rl: list[np.ndarray] = []
+    section_variant_offsets: list[int] = [0]
+    for s2_section in stage2.sections:
+        for s2_variant in s2_section.variants:
+            block_pieces: list[np.ndarray] = []
+            insn_pieces: list[np.ndarray] = []
+            for s2_ct in s2_variant.call_targets:
+                # Surviving body slots = surviving_token_count - 1 (drop
+                # the row-assembler-owned self-prepend slot).
+                surviving = int(s2_ct.surviving_token_count)
+                if surviving <= 0:
+                    continue
+                surviving_body_slots = surviving - 1
+                full_br, full_ir = compute_metatoken_runlengths(
+                    s2_ct.stage1.function_data
+                )
+                br, ir = _truncate_runlengths_to_surviving(
+                    full_br, full_ir, surviving_body_slots
+                )
+                block_pieces.append(br)
+                insn_pieces.append(ir)
+            per_variant_block_rl.append(
+                np.concatenate(block_pieces) if block_pieces
+                else np.zeros(0, dtype=np.uint32)
+            )
+            per_variant_insn_rl.append(
+                np.concatenate(insn_pieces) if insn_pieces
+                else np.zeros(0, dtype=np.uint32)
+            )
+        section_variant_offsets.append(len(per_variant_block_rl))
+
+    # Walk batch_idx_to_section_variant row-by-row, gathering the per-
+    # variant arrays in row order. Pure-Python loop here (batch_size is
+    # bounded by the row count, not the much larger per-row content).
+    row_block_pieces: list[np.ndarray] = []
+    row_insn_pieces: list[np.ndarray] = []
+    block_row_offsets = np.empty(batch_size + 1, dtype=np.uint32)
+    insn_row_offsets = np.empty(batch_size + 1, dtype=np.uint32)
+    block_row_offsets[0] = 0
+    insn_row_offsets[0] = 0
+    running_blocks = 0
+    running_insns = 0
+    for row in range(batch_size):
+        section_idx = int(batch_idx_map[row, 0])
+        slot_idx = int(batch_idx_map[row, 1])
+        if section_idx == sentinel or slot_idx == sentinel:
+            # Padding row -- contributes zero.
+            block_row_offsets[row + 1] = running_blocks
+            insn_row_offsets[row + 1] = running_insns
+            continue
+        flat_variant_idx = section_variant_offsets[section_idx] + slot_idx
+        br = per_variant_block_rl[flat_variant_idx]
+        ir = per_variant_insn_rl[flat_variant_idx]
+        row_block_pieces.append(br)
+        row_insn_pieces.append(ir)
+        running_blocks += int(br.size)
+        running_insns += int(ir.size)
+        block_row_offsets[row + 1] = running_blocks
+        insn_row_offsets[row + 1] = running_insns
+
+    block_runlength = (
+        np.concatenate(row_block_pieces).astype(np.uint32)
+        if row_block_pieces
+        else np.zeros(0, dtype=np.uint32)
+    )
+    insn_runlength = (
+        np.concatenate(row_insn_pieces).astype(np.uint32)
+        if row_insn_pieces
+        else np.zeros(0, dtype=np.uint32)
+    )
+    return block_runlength, block_row_offsets, insn_runlength, insn_row_offsets

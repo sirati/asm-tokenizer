@@ -51,21 +51,34 @@ def _walk(
     sidecar: np.ndarray = None,
     line_to_name: dict | None = None,
     line_to_provider: dict | None = None,
+    block_runlength: np.ndarray | None = None,
+    insn_runlength: np.ndarray | None = None,
+    call_targets_per_ct: list | None = None,
+    callee_arm_resolver=None,
 ):
     """Shorthand: ``render_row_blocks`` with n_axis=0 + single-CT span.
 
     Number / FID arrays default to "empty"; callers populate only what
-    their dispatch needs to exercise.
+    their dispatch needs to exercise. The runlength sidecars default
+    to empty (every BLOCK_V2 token becomes an InlineJumpEntry) -- tests
+    that exercise block-boundary detection supply explicit per-row
+    counts.
     """
+    from ._row_walk_fixtures import NULL_CALLEE_RESOLVER
     sig_default, se_default = EMPTY_NUMBERS
     return render_row_blocks(
         result=make_result(
             tokens_row=tokens, identities=identities,
             numbers_sig=numbers_sig if numbers_sig is not None else sig_default,
             numbers_se=numbers_se if numbers_se is not None else se_default,
+            block_runlength=block_runlength,
+            insn_runlength=insn_runlength,
         ),
         row=0, n_axis=0,
         partial_cut_lengths=[int(tokens.shape[0])],
+        call_targets_per_ct=(
+            call_targets_per_ct if call_targets_per_ct is not None else [[]]
+        ),
         vocab_manager=vocab_stub(),
         fid_table=make_fid_table(
             per_category_counts=(
@@ -77,6 +90,10 @@ def _walk(
         ),
         line_to_name=line_to_name or {},
         line_to_provider=line_to_provider or {},
+        callee_arm_resolver=(
+            callee_arm_resolver if callee_arm_resolver is not None
+            else NULL_CALLEE_RESOLVER
+        ),
     )
 
 

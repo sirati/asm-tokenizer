@@ -47,9 +47,15 @@ def make_result(
     identities: np.ndarray,
     numbers_sig: np.ndarray,
     numbers_se: np.ndarray,
+    block_runlength: np.ndarray | None = None,
+    insn_runlength: np.ndarray | None = None,
 ) -> BatchDecodeResult:
     """Construct a 1-row :class:`BatchDecodeResult` stub via
     :class:`MagicMock`; only fields the walker reads are populated.
+
+    ``block_runlength`` / ``insn_runlength`` default to empty arrays --
+    callers exercising the runlength-driven block boundaries supply
+    explicit per-row counts.
     """
     stub = MagicMock(spec=BatchDecodeResult)
     stub.tokens = np.asarray([tokens_row], dtype=np.uint16)
@@ -62,7 +68,30 @@ def make_result(
     stub.number_row_offsets = np.asarray(
         [0, len(numbers_sig)], dtype=np.uint32,
     )
+    br = (
+        block_runlength.astype(np.uint32)
+        if block_runlength is not None
+        else np.zeros(0, dtype=np.uint32)
+    )
+    ir = (
+        insn_runlength.astype(np.uint32)
+        if insn_runlength is not None
+        else np.zeros(0, dtype=np.uint32)
+    )
+    stub.block_runlength = br
+    stub.block_runlength_row_offsets = np.asarray(
+        [0, int(br.size)], dtype=np.uint32,
+    )
+    stub.insn_runlength = ir
+    stub.insn_runlength_row_offsets = np.asarray(
+        [0, int(ir.size)], dtype=np.uint32,
+    )
     return stub
+
+
+# Resolver stub for tests that don't exercise callee resolution: every
+# pointer resolves to ``None`` (matches EXTERN's no-body behavior).
+NULL_CALLEE_RESOLVER = lambda _offset: None
 
 
 def make_fid_table(
