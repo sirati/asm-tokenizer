@@ -43,6 +43,7 @@ from .._sections import (
 from ._dispatch import _emit_identity
 from ._instruction import (
     _finalize_instruction,
+    _flush_accumulator_into_current_insn,
     _start_new_instruction,
 )
 from ._state import _RowSidecars, _WalkState, _init_walk_state
@@ -99,6 +100,42 @@ def _maybe_latch_header_trigger(
     _finalize_instruction(state)
     state.pending_header = True
     state.inside_jump_table_footer_block = False
+
+
+def _maybe_flush_accumulator_at_boundary(
+    state: _WalkState, *, upcoming_shifted_id: int, upcoming_band: Band,
+) -> None:
+    """Pre-finalize drain at legitimate source-completion boundaries.
+
+    Runs at the TOP of each per-col iteration, BEFORE any finalize-
+    causing logic (section transitions, header-trigger latch,
+    slot-budget boundary). The accumulator's pending source has
+    completed when EITHER:
+
+    * the upcoming token is NOT in the NUMBER band, OR
+    * the upcoming token IS a NUMBER token whose shifted id differs
+      from the pending source's shifted id (the encoder switched chunk
+      types, so the prior source ended).
+
+    In both cases the drain lands in the IN-FLIGHT instruction's text
+    + openables buffers (the instruction that consumed the pending
+    source's chunks), so the subsequent finalize sees an empty
+    accumulator and does not falsely flag the boundary as a W3-17
+    invariant violation. Genuine spanning (same shifted id NUMBER
+    crossing an instruction boundary) leaves the accumulator pending;
+    :func:`._instruction._drain_accumulator_into_buffer`'s W3-17 check
+    then fires inside finalize.
+
+    No-op when the accumulator is empty.
+    """
+    if not state.number_accumulator.has_pending():
+        return
+    if upcoming_band is Band.NUMBER:
+        pending_id = state.number_accumulator.pending_shifted_id()
+        if upcoming_shifted_id == pending_id:
+            # Same source candidate; let emit_number / finalize decide.
+            return
+    _flush_accumulator_into_current_insn(state)
 
 
 def _maybe_finalize_and_start_instruction(
@@ -161,14 +198,22 @@ def render_row_blocks(
     n_cols = int(sidecars.tokens_row.shape[0])
     for col in range(n_cols):
         state.current_col = col
-        _maybe_open_function_id_section(state, col=col)
-        _maybe_latch_header_trigger(state, sidecars, col=col)
-        maybe_advance_call_target(state, col=col)
         shifted_id = int(sidecars.tokens_row[col])
         if shifted_id == 0:
             break  # null-content padding tail
-        _maybe_finalize_and_start_instruction(state, sidecars)
         band = classify_shifted_id(shifted_id)
+        # Pre-finalize drain at legitimate source-completion boundaries.
+        # MUST run before any finalize-causing logic (section transitions,
+        # header-trigger latch, slot-budget boundary) so the in-flight
+        # instruction's NUMBER-source chunks land in its OWN buffer rather
+        # than tripping the W3-17 encoder-invariant assert at finalize.
+        _maybe_flush_accumulator_at_boundary(
+            state, upcoming_shifted_id=shifted_id, upcoming_band=band,
+        )
+        _maybe_open_function_id_section(state, col=col)
+        _maybe_latch_header_trigger(state, sidecars, col=col)
+        maybe_advance_call_target(state, col=col)
+        _maybe_finalize_and_start_instruction(state, sidecars)
         if band is Band.INSTR_REP:
             if state.pending_header:
                 # ``Block_Def`` carrier -- absorbed silently so the

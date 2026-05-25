@@ -39,6 +39,7 @@ __all__ = [
     "_consume_openable_slot",
     "_consume_text_slot",
     "_finalize_instruction",
+    "_flush_accumulator_into_current_insn",
     "_join_instruction_text",
     "_start_new_instruction",
 ]
@@ -229,36 +230,56 @@ def _finalize_instruction(
     state.has_active_instruction = False
 
 
-def _drain_accumulator_into_buffer(
-    state: _WalkState, *, end_of_row: bool
-) -> None:
-    """Flush :attr:`_WalkState.number_accumulator` into the in-flight
-    instruction's text + openables buffers.
+def _flush_accumulator_into_current_insn(state: _WalkState) -> None:
+    """Drain :attr:`_WalkState.number_accumulator` into the in-flight
+    instruction's text + openables buffers (no-op if empty).
 
-    W3-17 W4-AMENDED: at mid-row instruction boundaries the accumulator
-    MUST be empty (encoder invariant: multi-chunk sources never span
-    instructions). At end-of-row a cut-variant tail MAY leave pending
-    chunks; best-effort flush their lead-chunk contribution.
+    Pure plumbing: routes a flushed :class:`AccumulatorEmission` to the
+    per-instruction buffers via the same shape as
+    :func:`._band_emitters._absorb_emission`. Does NOT inspect the
+    W3-17 encoder invariant -- that lives in
+    :func:`_drain_accumulator_into_buffer` so the driver can pre-drain
+    at legitimate source-completion boundaries (band switch, NUMBER
+    shifted-id change at instruction boundary) without tripping the
+    invariant check.
     """
-    if state.number_accumulator.has_pending() and not end_of_row:
-        # Drain into the buffer first so the assert message can quote
-        # the offending source's rendered short form for diagnosis.
-        emission = state.number_accumulator.flush()
-        if emission is not None:
-            state.current_insn_text_parts.append(emission.short_text)
-            if emission.precision_entry is not None:
-                state.current_insn_openables.append(emission.precision_entry)
-        raise AssertionError(
-            "encoder invariant: multi-chunk NUMBER source spanned "
-            f"instruction boundary at row={state.row}, "
-            f"insn_cursor={state.insn_cursor}"
-        )
     emission = state.number_accumulator.flush()
     if emission is None:
         return
     state.current_insn_text_parts.append(emission.short_text)
     if emission.precision_entry is not None:
         state.current_insn_openables.append(emission.precision_entry)
+
+
+def _drain_accumulator_into_buffer(
+    state: _WalkState, *, end_of_row: bool
+) -> None:
+    """Flush :attr:`_WalkState.number_accumulator` into the in-flight
+    instruction's text + openables buffers, with W3-17 invariant check.
+
+    W3-17 W4-AMENDED encoder invariant: a multi-chunk NUMBER source's
+    chunks all live within ONE instruction. The DRIVER pre-drains the
+    accumulator at legitimate source-completion boundaries (band switch
+    off NUMBER, or NUMBER shifted-id change at an instruction boundary)
+    so by the time finalize runs the accumulator is empty for those
+    cases. If a non-empty accumulator reaches finalize mid-row it means
+    the upcoming token at the new instruction WAS a NUMBER token with
+    the SAME shifted id as the pending source -- the encoder failed to
+    keep the multi-chunk source intact within one instruction. Raise.
+
+    At end-of-row a cut-variant tail MAY leave pending chunks; best-
+    effort flush their lead-chunk contribution.
+    """
+    if state.number_accumulator.has_pending() and not end_of_row:
+        # Drain into the buffer first so the assert message can quote
+        # the offending source's rendered short form for diagnosis.
+        _flush_accumulator_into_current_insn(state)
+        raise AssertionError(
+            "encoder invariant: multi-chunk NUMBER source spanned "
+            f"instruction boundary at row={state.row}, "
+            f"insn_cursor={state.insn_cursor}"
+        )
+    _flush_accumulator_into_current_insn(state)
 
 
 def _emit_one_asmline(state: _WalkState) -> None:

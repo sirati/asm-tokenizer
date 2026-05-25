@@ -321,6 +321,81 @@ def test_multi_chunk_source_spanning_instructions_raises_mid_row() -> None:
         )
 
 
+def test_vc2_as_last_slot_drains_before_next_instruction_boundary() -> None:
+    """Regression: a NUMBER token (multi-chunk-capable shifted id) as
+    the LAST slot of an instruction does NOT trip the W3-17 assert at
+    the next instruction's boundary. The driver's pre-finalize drain
+    routes the accumulator's pending K=1 source into the IN-FLIGHT
+    instruction's buffer; the subsequent finalize sees an empty
+    accumulator.
+
+    Construction mirrors the LMU-smoke crash (e.g. ``add r11, sp, #4``):
+    a 2-slot instruction whose last slot is a single-chunk VC2 immediate,
+    followed by a second instruction starting with INSTR_REP. Without
+    the band-switch flush, the finalize at the second instruction's
+    start would falsely flag the legitimate VC2 source completion as
+    a multi-chunk source spanning an instruction boundary.
+    """
+    chunks = from_int(0x4)  # the immediate ``#4``
+    numbers_sig = np.asarray([chunks[0][0]], dtype=np.uint64)
+    numbers_se = np.asarray([chunks[0][1]], dtype=np.uint32)
+    # Tokens: BLOCK_V2 silent header, then insn A = [INSTR_REP, VC2]
+    # (2 slots; VC2 is the LAST slot), then insn B = [INSTR_REP]
+    # (1 slot). Terminator at the end. insn_runlength encodes the
+    # per-instruction slot counts for the BODY section.
+    from ._row_walk_fixtures import INSTR_REP_TOKEN
+    blocks = _walk(
+        tokens=np.asarray(
+            [BLOCK_V2, INSTR_REP_TOKEN, VC2_NUMBER, INSTR_REP_TOKEN, 0],
+            dtype=np.uint16,
+        ),
+        identities=np.asarray([0], dtype=np.uint16),
+        numbers_sig=numbers_sig, numbers_se=numbers_se,
+        insn_runlength=np.asarray([2, 1], dtype=np.uint32),
+    )
+    items = blocks[0].items
+    # Two AsmLines, one per BODY instruction. The first carries the VC2
+    # immediate's short text; the second carries just the opcode.
+    assert len(items) == 2
+    assert isinstance(items[0], AsmLine)
+    assert isinstance(items[1], AsmLine)
+    assert "v:4 (4)" in items[0].text
+    assert "v:" not in items[1].text
+
+
+def test_vc2_at_end_of_insn_with_different_number_id_next_drains() -> None:
+    """Regression sibling: a single-chunk VC2 at the end of insn A
+    followed by a DIFFERENT NUMBER shifted id (e.g. F32) at the start
+    of insn B also drains cleanly. The driver flushes when the upcoming
+    NUMBER token's shifted id differs from the accumulator's pending
+    source's shifted id; the prior source is complete.
+    """
+    vc2_chunks = from_int(0x4)
+    f32_chunks = from_float32(0x3F800000)  # +1.0
+    numbers_sig = np.asarray(
+        [vc2_chunks[0][0], f32_chunks[0][0]], dtype=np.uint64,
+    )
+    numbers_se = np.asarray(
+        [vc2_chunks[0][1], f32_chunks[0][1]], dtype=np.uint32,
+    )
+    from ._row_walk_fixtures import INSTR_REP_TOKEN
+    blocks = _walk(
+        tokens=np.asarray(
+            [BLOCK_V2, INSTR_REP_TOKEN, VC2_NUMBER, F32_NUMBER, 0],
+            dtype=np.uint16,
+        ),
+        identities=np.asarray([0], dtype=np.uint16),
+        numbers_sig=numbers_sig, numbers_se=numbers_se,
+        # Two 1-slot-for-the-number instructions: insn A = [INSTR_REP, VC2]
+        # (VC2 last); insn B = [F32] (single slot).
+        insn_runlength=np.asarray([2, 1], dtype=np.uint32),
+    )
+    items = blocks[0].items
+    assert len(items) == 2
+    assert "v:4 (4)" in items[0].text
+    assert "f32:0.1 E1" in items[1].text
+
+
 def test_cut_variant_end_of_row_flushes_pending_chunks() -> None:
     """Cluster #21 H-4: a row that ends mid-multi-chunk source MUST
     still emit the lead-chunk contribution (best-effort), not silently
