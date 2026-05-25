@@ -100,69 +100,46 @@ def _translate_line_items(
     kind: BlockKind,
     block_idx: int,
 ) -> list:
-    """Translate one block's :class:`LineItem` stream into model nodes.
+    """Translate one block's :class:`AsmLine` stream into model leaves.
 
     Shared by :meth:`BlockNode.expand` and :meth:`InlineJumpNode.expand`.
-    The discriminator is the dataclass type (per plan section 4: no
-    string-typed prefix). Unknown item types raise -- that signals a
-    drift between the protocol union and the model layer that should
-    crash loud rather than render an empty leaf.
-    """
-    # Lazy imports so the package can be split by concern without
-    # tripping circular imports (InlineCallNode imports FunctionNode).
-    from tokenizer.inspector._render._protocol import (
-        AsmLine,
-        FunctionHandle,
-        InlineCallEntry,
-        InlineJumpEntry,
-    )
+    Post-R2 contract (plan W3-2 W4-amended cluster #3): the backend's
+    ``render_block`` stream contains ONLY :class:`AsmLine` items;
+    per-instruction call / jump / number-precision sidecars flow
+    through ``AsmLine.openables`` and are surfaced by
+    :meth:`AsmLeaf.expand`, not as sibling top-level rows. The parent
+    BlockNode's ``factory`` / ``backend`` / ``variant_idx`` are
+    threaded onto each leaf so its lazy expand can spawn an
+    :class:`InlineCallNode` / :class:`InlineJumpNode` with the same
+    model-graph context.
 
-    from ._nodes_call import InlineCallNode
+    Non-AsmLine items raise -- that signals a drift between the
+    Protocol's narrowed LineItem and the model layer; loud crash is
+    the right contract.
+    """
+    # Lazy import so the package can be split by concern without
+    # tripping circular imports.
+    from tokenizer.inspector._render._protocol import AsmLine
+
     from ._nodes_leaf import AsmLeaf
 
     items = backend.render_block(variant_idx, kind, block_idx)
 
     out: list = []
     for item in items:
-        if isinstance(item, AsmLine):
-            out.append(AsmLeaf(text=item.text))
-            continue
-        if isinstance(item, InlineCallEntry):
-            # Derive the callee FunctionHandle from the typed pointer
-            # spec on the entry. When the pointer is None the call is
-            # non-expandable; InlineCallNode.can_expand gates on that.
-            spec = item.callee_section_pointer
-            callee_handle = (
-                None
-                if spec is None
-                else FunctionHandle(
-                    arm=spec.arm, idx=spec.idx, name=item.callee_name
-                )
+        if not isinstance(item, AsmLine):
+            # Post-R2 the LineItem stream is AsmLine-only; any other
+            # type signals a producer/consumer contract drift.
+            raise TypeError(
+                f"unknown render line item type: {type(item).__name__}"
             )
-            out.append(
-                InlineCallNode(
-                    factory=factory,
-                    kind=item.kind,
-                    counter_id=item.counter_id,
-                    callee_name=item.callee_name,
-                    callee_handle=callee_handle,
-                    variant_idx=item.variant_idx,
-                    provider=item.provider,
-                )
+        out.append(
+            AsmLeaf(
+                text=item.text,
+                openables=item.openables,
+                factory=factory,
+                backend=backend,
+                variant_idx=variant_idx,
             )
-            continue
-        if isinstance(item, InlineJumpEntry):
-            out.append(
-                InlineJumpNode(
-                    factory=factory,
-                    backend=backend,
-                    variant_idx=variant_idx,
-                    target_block_idx=item.target_block_idx,
-                )
-            )
-            continue
-        # Closed LineItem union; any miss is a render/model drift.
-        raise TypeError(
-            f"unknown render line item type: {type(item).__name__}"
         )
     return out

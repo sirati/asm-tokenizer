@@ -211,24 +211,35 @@ def test_block_node_expand_translates_asm_line_to_leaf():
     assert children[0].text == "nop"
 
 
-def test_block_node_expand_translates_inline_call_entry():
-    """A LOCAL :class:`InlineCallEntry` with a section pointer becomes
-    an expandable :class:`InlineCallNode` whose callee handle carries
-    the pointer's ``(arm, idx)`` + the entry's callee name."""
-    from tokenizer.inspector._render._protocol import InlineCallEntry
+def test_block_node_expand_only_produces_asmleaf_children_post_r2():
+    """Post-R2 contract (plan W3-2 W4-amended cluster #3): BlockNode
+    children are :class:`AsmLeaf` only -- inline call sites, jump
+    targets, and number-precision sidecars no longer surface as
+    sibling top-level rows. The openables ride on
+    :attr:`AsmLine.openables` and surface as children of the leaf at
+    leaf-expand time."""
+    from tokenizer.inspector._render._protocol import (
+        AsmLine,
+        InlineCallEntry,
+        InlineJumpEntry,
+    )
 
+    call_entry = InlineCallEntry(
+        kind=CallTargetType.LOCAL,
+        counter_id=2,
+        callee_name="callee",
+        callee_section_pointer=SectionPointerSpec(
+            arm=SectionKind.MATCHED, idx=7
+        ),
+        variant_idx=0,
+        provider=None,
+    )
+    jump_entry = InlineJumpEntry(target_block_idx=3)
     backend = _make_backend(n_variants=1)
     backend.render_block.return_value = (
-        InlineCallEntry(
-            kind=CallTargetType.LOCAL,
-            counter_id=2,
-            callee_name="callee",
-            callee_section_pointer=SectionPointerSpec(
-                arm=SectionKind.MATCHED, idx=7
-            ),
-            variant_idx=0,
-            provider=None,
-        ),
+        AsmLine(text="call foo", openables=(call_entry,)),
+        AsmLine(text="jmp .L3", openables=(jump_entry,)),
+        AsmLine(text="nop"),
     )
     factory = _make_factory(backend)
     node = BlockNode(
@@ -242,14 +253,27 @@ def test_block_node_expand_translates_inline_call_entry():
 
     children = node.expand()
 
-    assert len(children) == 1
-    call = children[0]
+    # All three rows are AsmLeaf -- nothing else surfaces at the top
+    # level under a BlockNode now.
+    assert len(children) == 3
+    assert all(isinstance(c, AsmLeaf) for c in children)
+
+    # The call-carrying leaf is expandable; expanding it produces the
+    # InlineCallNode (the 1-arm dispatch).
+    call_leaf = children[0]
+    assert call_leaf.can_expand is True
+    grandchildren = call_leaf.expand()
+    assert len(grandchildren) == 1
+    call = grandchildren[0]
     assert isinstance(call, InlineCallNode)
     assert call.can_expand is True
     assert call.callee_handle is not None
     assert call.callee_handle.arm is SectionKind.MATCHED
     assert call.callee_handle.idx == 7
     assert call.callee_handle.name == "callee"
+
+    # The plain ``nop`` row is terminal -- no openables, no expand.
+    assert children[2].can_expand is False
 
 
 # ---------------------------------------------------------------------------
