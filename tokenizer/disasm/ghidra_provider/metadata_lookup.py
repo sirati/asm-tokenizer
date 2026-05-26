@@ -664,6 +664,19 @@ class GhidraMetadataLookup:
             funcs = []
         for func in funcs:
             try:
+                if func.isThunk():
+                    # PLT trampolines look like 1-target computed jumps in
+                    # Ghidra's reference graph (DATA-READ to the GOT slot +
+                    # COMPUTED_JUMP to PLT0). Skip — thunks don't own switch
+                    # tables; their indirect-call semantics surface via the
+                    # thunk-target path. Mirrors the gate in
+                    # ``GhidraDisassemblyProvider.iter_switch_tables``.
+                    continue
+            except Exception:
+                # Defensive: malformed Function handle. Treat as "no thunk
+                # info" rather than crashing the cache build.
+                pass
+            try:
                 body = func.getBody()
                 insn_iter = self._listing.getInstructions(body, True)
             except Exception:

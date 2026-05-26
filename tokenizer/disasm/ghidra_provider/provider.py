@@ -445,6 +445,19 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         ghidra_function = self._funcs_by_entry.get(entry)
         if ghidra_function is None:
             return
+        try:
+            if ghidra_function.isThunk():
+                # PLT trampolines emit ``ldr pc, [GOT_slot]`` / ``jmp [GOT_slot]``
+                # whose Ghidra reference graph is structurally identical to a
+                # 1-target switch-table dispatch (computed-jump flow + DATA-READ
+                # to the GOT slot + COMPUTED_JUMP to PLT0). Thunks don't carry
+                # switch tables; their indirect-call semantics surface via the
+                # thunk-target path, so skip them here.
+                return
+        except Exception:
+            # Defensive: malformed Function handle. Treat as "no thunk info"
+            # rather than crashing the iter loop.
+            pass
 
         from ghidra.program.model.symbol import RefType
 
