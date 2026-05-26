@@ -506,13 +506,23 @@ def run_inspector(
     *,
     factory: "BackendFactory",
     log_path: Path,
+    memmap_path: Optional[Path] = None,
+    csv_path: Optional[Path] = None,
 ) -> int:
     """Construct + run the app; return ``0`` on clean quit.
 
     Every backend the factory mints is opened lazily on first
     ``FunctionNode.expand`` call; the caller (``__main__``) owns the
-    factory + any session it wraps via ``with stack:``.
+    factory + any session it wraps via ``with stack:``. The optional
+    ``memmap_path`` / ``csv_path`` arguments seed the binary-switcher
+    dialog's "current path" indicator — pass whichever
+    ``--memmap-dir`` / ``--csv-dir`` flag the CLI consumed.
     """
-    app = InspectorApp(factory=factory, log_path=log_path)
+    app = InspectorApp(
+        factory=factory,
+        log_path=log_path,
+        memmap_path=memmap_path,
+        csv_path=csv_path,
+    )
     app.run()
     return 0

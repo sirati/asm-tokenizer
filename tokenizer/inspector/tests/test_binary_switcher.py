@@ -31,6 +31,7 @@ from tokenizer.inspector._app._binary_switcher import (
     FolderPickerDialog,
     LoaderProvider,
     SwitchTarget,
+    perform_switch,
 )
 from tokenizer.inspector._app._binary_switcher._scan import (
     FolderScanResult,
@@ -351,5 +352,71 @@ def test_binary_switcher_open_this_folder_yields_no_binary():
                 target = results[0]
                 assert target.binary is None
                 assert target.path == path
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# perform_switch
+# ---------------------------------------------------------------------------
+
+
+def test_perform_switch_preserves_order_config():
+    """:func:`perform_switch` keeps ``app._order_config`` across the swap."""
+    from tokenizer.inspector._app._order import (
+        AxisDescriptor,
+        AxisKind,
+        OrderConfig,
+    )
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path1 = Path(td) / "src1"
+            path1.mkdir()
+            (path1 / "foo_function_names.txt").write_text("")
+            path2 = Path(td) / "src2"
+            path2.mkdir()
+            (path2 / "bar_function_names.txt").write_text("")
+            log_path = Path(td) / "tui.log"
+            app = _build_app(log_path, memmap_path=path1)
+
+            # Set an order config so we can verify preservation.
+            axis = AxisDescriptor(
+                kind=AxisKind.POSITIONAL,
+                key="arch_",
+                label="arch",
+            )
+            app._order_config = OrderConfig(
+                ordered_axes=(axis,),
+                grouping_axes=frozenset(),
+            )
+
+            # Stub the opener dispatch so the test doesn't need real
+            # memmap data (the real loader requires *_sections.bin etc.).
+            new_factory = MagicMock(spec=BackendFactory)
+            new_factory.handles = []
+            new_factory.close = MagicMock()
+
+            from tokenizer.inspector._app._binary_switcher import _switch
+
+            original = _switch._OPENERS[LoaderProvider.MEMMAP]
+            _switch._OPENERS[LoaderProvider.MEMMAP] = lambda p, b: new_factory
+            try:
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    target = SwitchTarget(
+                        provider=LoaderProvider.MEMMAP,
+                        path=path2,
+                        binary="bar",
+                    )
+                    perform_switch(app, target)
+                    await pilot.pause()
+                    assert app._order_config is not None
+                    assert app._order_config.ordered_axes == (axis,)
+                    assert app._factory is new_factory
+                    assert app._current_memmap_path == path2
+                    assert app._current_provider is LoaderProvider.MEMMAP
+            finally:
+                _switch._OPENERS[LoaderProvider.MEMMAP] = original
 
     asyncio.run(runner())
