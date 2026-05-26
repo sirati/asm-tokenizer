@@ -168,6 +168,15 @@ class FilterDialog(ModalScreen[FilterResult]):
     # --- compose ---------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        # Button row lives INSIDE the scrollable area so the dialog
+        # adapts to any terminal height: at large heights the
+        # ``height: auto`` outer body shrinks to its content and the
+        # buttons sit just below the last axis row (no scroll needed);
+        # at small heights the scroll caps at the modal max-height and
+        # the buttons scroll into view rather than getting clipped at
+        # the dialog's bottom edge (the latter is what happens when the
+        # buttons live outside the scroll on a viewport too short to
+        # hold both).
         with Vertical(id="filter-body"):
             with VerticalScroll(id="filter-scroll"):
                 for index, axis in enumerate(self._axes_in_order):
@@ -200,11 +209,11 @@ class FilterDialog(ModalScreen[FilterResult]):
                             id=_axis_list_id(index),
                             classes="filter-axis-list",
                         )
-            with Horizontal(id="filter-buttons"):
-                yield Button(
-                    "[u]A[/]ccept", id="filter-accept", variant="primary"
-                )
-                yield Button("[u]C[/]ancel", id="filter-cancel")
+                with Horizontal(id="filter-buttons"):
+                    yield Button(
+                        "[u]A[/]ccept", id="filter-accept", variant="primary"
+                    )
+                    yield Button("[u]C[/]ancel", id="filter-cancel")
 
     # --- focus -----------------------------------------------------
 
