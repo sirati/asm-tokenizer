@@ -30,6 +30,9 @@ from tokenizer.disasm.ghidra_provider.section_classify import (
     _looks_like_vtable_symbol_name,
     _section_type_from_block,
 )
+from tokenizer.disasm.ghidra_provider.switch_table_walker import (
+    walk_switch_tables_for_function,
+)
 from tokenizer.disasm.ghidra_views.function import (
     _ghidra_function_comment,
     _ghidra_identity_key,
@@ -677,82 +680,31 @@ class GhidraMetadataLookup:
     def _ensure_switch_table_cache(self) -> dict[int, list[int]]:
         """Build (once) the ``{table_base -> [targets]}`` cache.
 
-        Walks every function in the program via ``iter_switch_tables``
-        and merges the results. Idempotent; subsequent calls return the
-        cached dict directly. Cost is paid on first JUMP_TABLE_SLOT
-        slot_target access; pure-data lookups never trigger this.
+        Walks every function in the program via
+        ``walk_switch_tables_for_function`` (the same helper consumed by
+        ``GhidraDisassemblyProvider.iter_switch_tables``) and merges the
+        results. Idempotent; subsequent calls return the cached dict
+        directly. Cost is paid on first ``JUMP_TABLE_SLOT`` slot_target
+        access; pure-data lookups never trigger this.
+
+        The walker helper lives in
+        ``tokenizer.disasm.ghidra_provider.switch_table_walker`` rather
+        than reaching back through ``GhidraDisassemblyProvider``; that
+        keeps ``MetadataLookup`` decoupled from the provider while
+        sharing the same single source of truth for the
+        per-function dispatch walk.
         """
         if self._switch_table_cache is not None:
             return self._switch_table_cache
         cache: dict[int, list[int]] = {}
-        # ``iter_switch_tables`` lives on the provider; we don't have a
-        # back-ref here, so re-implement the per-function walk inline.
-        # Avoids coupling MetadataLookup to GhidraDisassemblyProvider.
-        try:
-            from ghidra.program.model.symbol import RefType  # noqa: F401
-        except Exception:
-            self._switch_table_cache = cache
-            return cache
         try:
             funcs = list(self._fm.getFunctions(True))
         except Exception:
             funcs = []
         for func in funcs:
-            try:
-                if func.isThunk():
-                    # PLT trampolines look like 1-target computed jumps in
-                    # Ghidra's reference graph (DATA-READ to the GOT slot +
-                    # COMPUTED_JUMP to PLT0). Skip — thunks don't own switch
-                    # tables; their indirect-call semantics surface via the
-                    # thunk-target path. Mirrors the gate in
-                    # ``GhidraDisassemblyProvider.iter_switch_tables``.
-                    continue
-            except Exception:
-                # Defensive: malformed Function handle. Treat as "no thunk
-                # info" rather than crashing the cache build.
-                pass
-            try:
-                body = func.getBody()
-                insn_iter = self._listing.getInstructions(body, True)
-            except Exception:
-                continue
-            while True:
-                try:
-                    if not insn_iter.hasNext():
-                        break
-                    insn = insn_iter.next()
-                except Exception:
-                    break
-                try:
-                    flow_type = insn.getFlowType()
-                    if not (flow_type.isJump() and flow_type.isComputed()):
-                        continue
-                except Exception:
-                    continue
-                table_addr: Optional[int] = None
-                targets: list[int] = []
-                try:
-                    refs_from = list(insn.getReferencesFrom() or ())
-                except Exception:
-                    refs_from = []
-                for ref in refs_from:
-                    try:
-                        rtype = ref.getReferenceType()
-                    except Exception:
-                        continue
-                    try:
-                        if rtype.isData() and rtype.isRead():
-                            if table_addr is None:
-                                table_addr = int(ref.getToAddress().getOffset())
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        if rtype.isJump() and rtype.isComputed():
-                            targets.append(int(ref.getToAddress().getOffset()))
-                    except Exception:
-                        pass
-                if table_addr is not None and targets:
-                    cache.setdefault(table_addr, list(targets))
+            for table_addr, targets in walk_switch_tables_for_function(
+                func, self._listing
+            ):
+                cache.setdefault(table_addr, list(targets))
         self._switch_table_cache = cache
         return cache
