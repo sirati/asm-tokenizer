@@ -64,6 +64,8 @@ class _GhidraDecodeHelper:
     The helper centralizes:
       - mnemonic split + alias canonicalization
       - architecture detection (cached per program)
+      - per-instruction has-LOAD/STORE PCode signal (computed once,
+        cached at the cursor level via ``InstructionView.has_load_store``)
       - per-operand FP-type computation
       - per-instruction typed-prefix list build
       - per-operand decompose-mem callback construction (lazy: returns a
@@ -93,6 +95,15 @@ class _GhidraDecodeHelper:
     ) -> tuple[str, ArmConditionCode | None]:
         """Strip the Ghidra ARM/AArch64 cc-suffix from ``mnemonic``."""
         return _strip_arm_cc_suffix(mnemonic)
+
+    def has_load_store(self, ghidra_insn: Any) -> bool:
+        """Return ``True`` when the instruction's PCode contains a LOAD or
+        STORE op. Cached at the ``_GhidraInstructionView`` cursor level
+        (``InstructionView.has_load_store``); the per-instruction signal
+        feeds both the operand-classifier inside ``operand_spec`` and
+        the downstream resolved-target keep/drop policy.
+        """
+        return has_load_store(ghidra_insn)
 
     def alias_mnemonic(self, base: str) -> str:
         # Ghidra's MIPS SLEIGH spec emits `_sra` / `_li` / ... for the
@@ -308,6 +319,8 @@ class _GhidraDecodeHelper:
         arch: Architecture,
         base_mnemonic: str,
         reg_map: "_RegisterMap",
+        *,
+        instruction_has_mem_access: bool,
     ) -> dict:
         """Return a kwargs dict for ``_GhidraOperandView._advance``.
 
@@ -321,6 +334,11 @@ class _GhidraDecodeHelper:
         ``reg_map`` is passed explicitly (not read from ``self._reg_map``)
         so the spec composes cleanly with the views' constructor wiring;
         in practice they are the same object.
+
+        ``instruction_has_mem_access`` is the per-instruction PCode
+        LOAD/STORE signal, computed ONCE by the instruction-view cursor
+        in ``_advance`` and threaded through here to avoid the
+        per-operand re-computation the legacy decode path performed.
         """
         from ghidra.program.model.address import Address
         from ghidra.program.model.lang import OperandType, Register
@@ -391,7 +409,6 @@ class _GhidraDecodeHelper:
         #    rich-typed Character via isinstance + charValue without
         #    string parsing.
         scalar_in_objects = any(isinstance(o, Scalar) for o in objects or ())
-        instruction_has_mem_access = has_load_store(ghidra_insn)
         operand_has_brackets = operand_is_bracketed(ghidra_insn, op_idx, arch)
 
         arm_family = arch in (Architecture.ARM32, Architecture.AARCH64)
@@ -545,19 +562,24 @@ class _GhidraDecodeHelper:
             # uses; ``disp=0`` here disables the equal-to-disp filter
             # (a REG operand has no disp, so the filter is moot).
             #
-            # Gate on instruction-has-LOAD/STORE: Ghidra's analyzer also
-            # propagates value-flow refs through pure-register
-            # instructions (e.g. aarch64 ``csel x1, x3, x1, ne`` —
-            # x1 inherits a string_ptr data-ref from an upstream
-            # ``adrp+add`` sequence). Without the gate, the resolved
-            # target on those operands surfaces a spurious string_ptr
-            # token mid-operand-list. Only LOAD-class instructions
-            # legitimately attach a string_ptr to the destination
-            # register (the literal-pool-load pattern).
-            if instruction_has_mem_access:
-                spec["resolved_target"] = _compute_resolved_target(
-                    ghidra_insn, op_idx, disp=0
-                )
+            # Capture UNCONDITIONALLY: the keep/drop policy now lives
+            # downstream (``tokenizer/disasm/resolved_target_policy.py``)
+            # so the decode helper stays a pure data extractor. The
+            # legacy gate on ``instruction_has_mem_access`` was a
+            # csel-class suppression heuristic; the policy module
+            # subsumes it with a layered design that admits high-
+            # confidence address-kind matches (STRING / PLT_FUNCTION /
+            # LOCAL_FUNCTION / CODE_PTR_TABLE_SLOT) AND intra-function
+            # block targets even on pure-register instructions, while
+            # preserving the original suppression for low-confidence
+            # kinds (RO_DATA_PTR / UNKNOWN). It additionally opens a
+            # per-ISA pair-terminal allow-list (e.g. arm32 ``movt``
+            # holding the high half of a ``movw``+``movt`` string-
+            # pointer build) which the legacy gate dropped because the
+            # high-half terminal carries no LOAD/STORE PCode.
+            spec["resolved_target"] = _compute_resolved_target(
+                ghidra_insn, op_idx, disp=0
+            )
             return spec
         if isinstance(first, Scalar):
             spec["kind"] = OperandKind.IMM

@@ -411,6 +411,21 @@ class InstructionView(Protocol):
     @property
     def prefixes(self) -> PrefixesView: ...
 
+    @property
+    def has_load_store(self) -> bool: ...
+    # Rich-IR signal that this instruction performs at least one LOAD or
+    # STORE memory access. Ghidra populates the value from PCode op
+    # inspection; the angr/Capstone path derives the same boolean from
+    # ``cs_insn.groups`` (CS_GRP_LOAD / CS_GRP_STORE) where available
+    # and falls back to ``False`` when groups are not surfaced.
+    #
+    # Consumed by the resolved-target keep/drop policy
+    # (``tokenizer/disasm/resolved_target_policy.py``) to decide whether
+    # a Ghidra-resolved DATA ref on a REG operand is honored. Low-
+    # confidence kinds (RO_DATA_PTR / UNKNOWN / etc.) trust the
+    # resolved_target only when the instruction is a real LOAD/STORE OR
+    # the mnemonic matches a per-ISA pair-terminal allow-list entry.
+
     def __deepcopy__(self, memo) -> "InstructionView": ...
 
 
