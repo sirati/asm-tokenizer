@@ -264,14 +264,21 @@ class BatchDecodeBackend:
         cached = self._row_sections_by_variant.get(variant_idx)
         if cached is not None:
             return cached
-        # variants() populates _variant_row_index; idempotent.
-        self.variants()
+        # variants() populates _variant_row_index AND _variants_cache;
+        # idempotent. We look the variant_identity up from the cached
+        # :class:`RenderedVariant` list rather than re-projecting here
+        # so the typed-identity construction lives in ONE place
+        # (:func:`_project_variant`).
+        rendered_variants = self.variants()
         row = self._variant_row_index.get(variant_idx)
         if row is None:
             raise KeyError(
                 f"BatchDecodeBackend: unknown variant_idx {variant_idx}; "
                 f"valid={sorted(self._variant_row_index)}"
             )
+        caller_variant_identity = _lookup_variant_identity(
+            rendered_variants, variant_idx
+        )
         stage1 = self._result.intermediate.stage2.stage1
         stage2_section = self._result.intermediate.stage2.sections[0]
         stage1_variant = stage1.sections[0].variants[variant_idx]
@@ -306,7 +313,7 @@ class BatchDecodeBackend:
         walked = render_row_blocks(
             result=self._result,
             row=row,
-            caller_variant_idx=variant_idx,
+            caller_variant_identity=caller_variant_identity,
             n_axis=n_axis,
             partial_cut_lengths=pcl,
             call_targets_per_ct=call_targets_per_ct,
@@ -319,6 +326,27 @@ class BatchDecodeBackend:
         )
         self._row_sections_by_variant[variant_idx] = walked
         return walked
+
+
+def _lookup_variant_identity(
+    rendered_variants: Sequence[RenderedVariant], variant_idx: int,
+) -> VariantIdentity:
+    """Linear lookup of a variant's typed identity by ``variant_idx``.
+
+    The variant list is short (per-function, not corpus-wide) so an
+    O(N) sweep is cheaper than maintaining a parallel dict. Single
+    source of truth for the variant_idx -> :class:`VariantIdentity`
+    projection on this backend; threaded into the row walker so every
+    emitted :class:`InlineCallEntry` carries the caller's typed
+    identity instead of the opaque per-section ``variant_idx``.
+    """
+    for rv in rendered_variants:
+        if rv.variant_idx == variant_idx:
+            return rv.variant_identity
+    raise KeyError(
+        f"BatchDecodeBackend: variant_idx {variant_idx} not in "
+        f"rendered_variants ({len(rendered_variants)} entries)"
+    )
 
 
 def _preview_for_section(section: RowSection) -> str:

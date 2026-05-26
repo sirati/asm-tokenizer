@@ -170,7 +170,7 @@ def _expand_single_openable(
                 callee_handle=callee_handle,
                 variant_idx=openable.variant_idx,
                 provider=openable.provider,
-                caller_variant_idx=openable.caller_variant_idx,
+                caller_variant_identity=openable.caller_variant_identity,
             )
         case InlineJumpEntry():
             return InlineJumpNode(

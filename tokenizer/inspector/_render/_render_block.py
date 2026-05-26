@@ -64,7 +64,7 @@ these line items is :mod:`tokenizer.inspector._tree_model`'s job.
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Mapping, Protocol, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Protocol, Sequence
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._types import SectionPointerSpec
@@ -83,6 +83,7 @@ from tokenizer.inspector._render._protocol import (
 from tokenizer.inspector._render._token_text import substitute_display_chars
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.tokens import TokenType
+from tokenizer.variant_info import VariantIdentity
 
 
 # Re-export the typed line items so legacy callers (and the test
@@ -239,7 +240,7 @@ def _emit_call_entry(
     section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
-    caller_variant_idx: int,
+    caller_variant_identity: Optional[VariantIdentity],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
     line_to_name: Mapping[int, str],
     kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
@@ -280,7 +281,7 @@ def _emit_call_entry(
         callee_section_pointer=callee_section_pointer,
         variant_idx=variant_idx,
         provider=provider,
-        caller_variant_idx=caller_variant_idx,
+        caller_variant_identity=caller_variant_identity,
     )
 
 
@@ -295,7 +296,7 @@ def render_block(
     section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
-    caller_variant_idx: int = MISSING_VARIANT_INDEX,
+    caller_variant_identity: Optional[VariantIdentity] = None,
     line_to_name: Mapping[int, str],
     line_to_provider: Mapping[int, str],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
@@ -326,7 +327,7 @@ def render_block(
             section=section,
             kind_to_called_idx=kind_to_called_idx,
             variant_pins=variant_pins,
-            caller_variant_idx=caller_variant_idx,
+            caller_variant_identity=caller_variant_identity,
             line_to_name=line_to_name,
             kind_to_provider_source=_provider_sources(line_to_provider),
             callee_arm_resolver=callee_arm_resolver,
@@ -340,7 +341,7 @@ def _walk_block_instructions(
     section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
-    caller_variant_idx: int,
+    caller_variant_identity: Optional[VariantIdentity],
     line_to_name: Mapping[int, str],
     kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
@@ -353,7 +354,7 @@ def _walk_block_instructions(
             section=section,
             kind_to_called_idx=kind_to_called_idx,
             variant_pins=variant_pins,
-            caller_variant_idx=caller_variant_idx,
+            caller_variant_identity=caller_variant_identity,
             line_to_name=line_to_name,
             kind_to_provider_source=kind_to_provider_source,
             callee_arm_resolver=callee_arm_resolver,
@@ -367,7 +368,7 @@ def _render_insn(
     section: RenderableSection,
     kind_to_called_idx: Mapping[CallTargetType, list[int]],
     variant_pins: Mapping[int, int],
-    caller_variant_idx: int,
+    caller_variant_identity: Optional[VariantIdentity],
     line_to_name: Mapping[int, str],
     kind_to_provider_source: Mapping[CallTargetType, Mapping[int, str]],
     callee_arm_resolver: Callable[[int], SectionPointerSpec | None],
@@ -404,7 +405,7 @@ def _render_insn(
                 section=section,
                 kind_to_called_idx=kind_to_called_idx,
                 variant_pins=variant_pins,
-                caller_variant_idx=caller_variant_idx,
+                caller_variant_identity=caller_variant_identity,
                 callee_arm_resolver=callee_arm_resolver,
                 line_to_name=line_to_name,
                 kind_to_provider_source=kind_to_provider_source,

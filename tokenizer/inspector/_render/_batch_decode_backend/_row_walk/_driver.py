@@ -24,13 +24,13 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     SectionPointerSpec,
 )
 from tokenizer.aligned_data.matched_sections_bin import (
-    MISSING_VARIANT_INDEX,
     CallTarget,
 )
 from tokenizer.inspector._render._protocol import (
     BlockKind,
 )
 from tokenizer.token_manager import VocabularyManager
+from tokenizer.variant_info import VariantIdentity
 
 from .._band import Band, classify_shifted_id
 from .._band_emitters import emit_instr_rep, emit_number
@@ -159,7 +159,7 @@ def render_row_blocks(
     *,
     result: BatchDecodeResult,
     row: int,
-    caller_variant_idx: int = MISSING_VARIANT_INDEX,
+    caller_variant_identity: Optional[VariantIdentity] = None,
     n_axis: int,
     partial_cut_lengths: list[int],
     call_targets_per_ct: Sequence[Sequence[CallTarget]],
@@ -193,7 +193,7 @@ def render_row_blocks(
     """
     state, sidecars = _init_walk_state(
         result=result, row=row, n_axis=n_axis,
-        caller_variant_idx=caller_variant_idx,
+        caller_variant_identity=caller_variant_identity,
         partial_cut_lengths=partial_cut_lengths,
         call_targets_per_ct=call_targets_per_ct,
     )
