@@ -37,6 +37,7 @@ from . import _order_hooks
 from ._auto_expand import collapse_single_child_chains
 from ._help_dialog import HelpScreen
 from ._labels import _ERR_STYLE, _compose_label
+from ._menu_bar import Alignment, MenuBar, MenuItem
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
 from ._tree_widget import _InspectorTree
 
@@ -148,6 +149,7 @@ class InspectorApp(App[None]):
 
     CSS: ClassVar[str] = """
     Screen { layout: vertical; }
+    #menubar { height: 1; }
     #tree { height: 1fr; }
     #search { display: none; height: 3; }
     #search.visible { display: block; }
@@ -165,6 +167,7 @@ class InspectorApp(App[None]):
         Binding("h", "open_help", "Help", show=True),
         Binding("escape", "hide_search", "Hide search", show=False),
         Binding("o", "open_order_dialog", "Order", show=True),
+        Binding("b", "open_binary_switcher", "Switch binary", show=True),
     ]
 
     def __init__(
@@ -196,6 +199,7 @@ class InspectorApp(App[None]):
     # --- compose ---------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        yield MenuBar(items=self._menu_items(), id="menubar")
         tree: _InspectorTree = _InspectorTree("inspector", id="tree")
         # Seed the root with one FunctionNode per handle the factory
         # published. The factory owns discovery; the UI just iterates.
@@ -209,6 +213,29 @@ class InspectorApp(App[None]):
         tree.root.expand()
         yield tree
         yield Input(placeholder="/ search function name", id="search")
+
+    def _menu_items(self) -> tuple[MenuItem, ...]:
+        """Static set of top-bar menu items.
+
+        Kept in lockstep with the App-level BINDINGS so the hotkey hint
+        the bar shows matches the actual binding. Future menu entries
+        (filter, view, ...) extend this tuple — the bar widget is
+        item-list-driven and does not require changes.
+        """
+        return (
+            MenuItem(
+                label="Switch binary",
+                action_name="open_binary_switcher",
+                hotkey="b",
+                alignment=Alignment.LEFT,
+            ),
+            MenuItem(
+                label="help",
+                action_name="open_help",
+                hotkey="h",
+                alignment=Alignment.RIGHT,
+            ),
+        )
 
     def _build_root_function_node(
         self, handle: "FunctionHandle"
@@ -340,6 +367,19 @@ class InspectorApp(App[None]):
     # there avoids the App brokering tree state through actions.
 
     # --- modals ----------------------------------------------------
+
+    def action_open_binary_switcher(self) -> None:
+        """Open the binary-switcher modal.
+
+        The heavy lifting (provider tree, folder picker, switch) lives
+        in :mod:`tokenizer.inspector._app._binary_switcher` so this
+        module's single concern stays the tree dispatcher. Imported
+        lazily inside the action so the Phase-1 menu-bar landing does
+        not require the switcher subpackage to exist before it ships.
+        """
+        from ._binary_switcher import open_binary_switcher
+
+        open_binary_switcher(self)
 
     def action_open_help(self) -> None:
         """Push the help modal listing every active binding.
