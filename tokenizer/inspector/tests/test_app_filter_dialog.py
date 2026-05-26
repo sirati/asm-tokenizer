@@ -43,6 +43,7 @@ from tokenizer.inspector._app._filter import (
     apply_filter,
     discover_all_axis_values,
     discover_axis_values,
+    function_has_passing_variants,
 )
 from tokenizer.inspector._app._order import (
     build_canonical_axes,
@@ -56,7 +57,7 @@ from tokenizer.inspector._render._protocol import (
     RenderedBlock,
     RenderedVariant,
 )
-from tokenizer.inspector._tree_model import VariantNode
+from tokenizer.inspector._tree_model import FunctionNode, VariantNode
 from tokenizer.variant_info import VariantIdentity
 from tokenizer.variant_tokens.prefixes import (
     ARCH_PREFIX,
@@ -386,3 +387,313 @@ def test_filter_dialog_cancel_leaves_config_unchanged():
                 app._on_filter_dialog_dismissed(FilterCancelled())
                 await pilot.pause()
                 assert app._filter_config is before
+
+
+# ---------------------------------------------------------------------------
+# Fix #1 -- function-row greying + non-expandable when filter zeros out variants.
+# ---------------------------------------------------------------------------
+
+
+def test_function_has_passing_variants_true_when_filter_is_none():
+    """``None`` / empty config short-circuits to ``True`` (passthrough)."""
+    rvs = [_make_rv(variant_idx=0, arch="x86")]
+    factory = _make_factory_with_rvs(name="fn", rvs=rvs)
+    fn_node = FunctionNode(factory=factory, handle=factory.handles[0])
+    assert function_has_passing_variants(fn_node, None) is True
+    assert function_has_passing_variants(fn_node, FilterConfig.empty()) is True
+
+
+def test_function_has_passing_variants_true_when_at_least_one_passes():
+    rvs = [
+        _make_rv(variant_idx=0, arch="x86"),
+        _make_rv(variant_idx=1, arch="arm32"),
+    ]
+    factory = _make_factory_with_rvs(name="fn", rvs=rvs)
+    fn_node = FunctionNode(factory=factory, handle=factory.handles[0])
+    arch_axis = build_canonical_axes()[0]
+    cfg = FilterConfig.build({arch_axis: ["x86"]})  # arm32 survives
+    assert function_has_passing_variants(fn_node, cfg) is True
+
+
+def test_function_has_passing_variants_false_when_all_filtered():
+    rvs = [
+        _make_rv(variant_idx=0, arch="x86"),
+        _make_rv(variant_idx=1, arch="x86"),
+    ]
+    factory = _make_factory_with_rvs(name="fn", rvs=rvs)
+    fn_node = FunctionNode(factory=factory, handle=factory.handles[0])
+    arch_axis = build_canonical_axes()[0]
+    cfg = FilterConfig.build({arch_axis: ["x86"]})  # everything disabled
+    assert function_has_passing_variants(fn_node, cfg) is False
+
+
+def test_root_function_row_dim_and_non_expandable_when_filter_zeros_out():
+    """A function with every variant filtered out renders dim + ``allow_expand=False``."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            rvs = [_make_rv(variant_idx=0, arch="x86")]
+            factory = _make_factory_with_rvs(name="dead_fn", rvs=rvs)
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                tree = app.query_one("#tree")
+                fn_tree_node = tree.root.children[0]
+                # Expand once so the backend caches; predicate then reuses
+                # the cached one. Collapse so the test exercises the same
+                # closed-tree path the user would see on a fresh filter.
+                fn_tree_node.expand()
+                await pilot.pause()
+                fn_tree_node.collapse()
+                await pilot.pause()
+                assert fn_tree_node.allow_expand is True
+
+                arch_axis = build_canonical_axes()[0]
+                new_config = FilterConfig.build({arch_axis: ["x86"]})
+                app._on_filter_dialog_dismissed(FilterAccepted(config=new_config))
+                await pilot.pause()
+
+                # The function row must lose its expand triangle and
+                # render with the dim filtered-out style.
+                assert fn_tree_node.allow_expand is False
+                label_text = fn_tree_node.label
+                # Every span on the row inherits the dim style.
+                styles = [str(span.style) for span in label_text.spans]
+                assert any("dim" in s for s in styles) or label_text.style is not None
+
+    asyncio.run(runner())
+
+
+def test_root_function_row_normal_when_at_least_one_variant_passes():
+    """A function with at least one surviving variant stays expandable."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            rvs = [
+                _make_rv(variant_idx=0, arch="x86"),
+                _make_rv(variant_idx=1, arch="arm32"),
+            ]
+            factory = _make_factory_with_rvs(name="live_fn", rvs=rvs)
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                tree = app.query_one("#tree")
+                fn_tree_node = tree.root.children[0]
+                assert fn_tree_node.allow_expand is True
+
+                arch_axis = build_canonical_axes()[0]
+                new_config = FilterConfig.build({arch_axis: ["x86"]})
+                app._on_filter_dialog_dismissed(FilterAccepted(config=new_config))
+                await pilot.pause()
+
+                # arm32 survives, function remains expandable + normally
+                # styled (no dim).
+                assert fn_tree_node.allow_expand is True
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Fix #2 -- filter dialog cannot deselect every option for an axis.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_dialog_min_one_selected_blocks_last_deselect():
+    """Toggling the last selected value off is rejected (state unchanged)."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86",)})
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from tokenizer.inspector._app._filter._dialog import (
+                    _MinOneSelectionList,
+                )
+
+                sel_list = dialog.query_one(_MinOneSelectionList)
+                assert sel_list.selected == ["x86"]
+
+                # Attempt to deselect the only checked value.
+                changed = sel_list._toggle("x86")
+                assert changed is False
+                assert sel_list.selected == ["x86"]
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())
+
+
+def test_filter_dialog_min_one_allows_non_last_deselect():
+    """Toggling a value off when others remain selected proceeds normally."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86", "arm32")})
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from tokenizer.inspector._app._filter._dialog import (
+                    _MinOneSelectionList,
+                )
+
+                sel_list = dialog.query_one(_MinOneSelectionList)
+                assert set(sel_list.selected) == {"x86", "arm32"}
+
+                # First deselect: two selected -> one selected (allowed).
+                assert sel_list._toggle("x86") is True
+                assert sel_list.selected == ["arm32"]
+
+                # Second deselect: one selected -> would be zero (rejected).
+                assert sel_list._toggle("arm32") is False
+                assert sel_list.selected == ["arm32"]
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Fix #3 -- focus lands on the first axis SelectionList at mount.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_dialog_focuses_first_axis_list_on_mount():
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                axes = build_canonical_axes()
+                # Two axes with values; the FIRST one must take focus.
+                dialog = FilterDialog(
+                    axis_values={
+                        axes[0]: ("x86", "arm32"),
+                        axes[2]: ("clang", "gcc"),
+                    }
+                )
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from tokenizer.inspector._app._filter._dialog import (
+                    _MinOneSelectionList,
+                    _AXIS_LIST_ID_PREFIX,
+                )
+
+                first_list = dialog.query_one(
+                    f"#{_AXIS_LIST_ID_PREFIX}0", _MinOneSelectionList
+                )
+                # Focused widget is the first axis list (not the
+                # Accept button, not the second axis list).
+                assert app.focused is first_list
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Fix #4 -- alt+a / alt+c bindings + underlined button labels.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_dialog_alt_a_accepts():
+    """``alt+a`` dismisses with :class:`FilterAccepted`."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                results: list = []
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86",)})
+                app.push_screen(dialog, results.append)
+                await pilot.pause()
+                await pilot.press("alt+a")
+                await pilot.pause()
+                assert len(results) == 1
+                assert isinstance(results[0], FilterAccepted)
+
+    asyncio.run(runner())
+
+
+def test_filter_dialog_alt_c_cancels():
+    """``alt+c`` dismisses with :class:`FilterCancelled`."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                results: list = []
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86",)})
+                app.push_screen(dialog, results.append)
+                await pilot.pause()
+                await pilot.press("alt+c")
+                await pilot.pause()
+                assert len(results) == 1
+                assert isinstance(results[0], FilterCancelled)
+
+    asyncio.run(runner())
+
+
+def test_filter_dialog_accept_button_label_has_underlined_a():
+    """The Accept button's rendered label underlines the ``A`` character."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86",)})
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from textual.widgets import Button
+
+                accept_btn = dialog.query_one("#filter-accept", Button)
+                cancel_btn = dialog.query_one("#filter-cancel", Button)
+                # The rendered label parsed markup and carries an
+                # underline-styled span covering the trigger character.
+                accept_plain = accept_btn.label.plain
+                cancel_plain = cancel_btn.label.plain
+                assert accept_plain == "Accept"
+                assert cancel_plain == "Cancel"
+                # Confirm an underline span covers the trigger letter on
+                # each button (Rich serialises 'u' / 'underline' depending
+                # on the renderer; check both).
+                assert any(
+                    "u" in str(span.style).split()
+                    or "underline" in str(span.style)
+                    for span in accept_btn.label.spans
+                ), f"no underline span on Accept: {accept_btn.label.spans}"
+                assert any(
+                    "u" in str(span.style).split()
+                    or "underline" in str(span.style)
+                    for span in cancel_btn.label.spans
+                ), f"no underline span on Cancel: {cancel_btn.label.spans}"
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())

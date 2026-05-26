@@ -20,6 +20,7 @@ from ._config import (
     FilterResult,
     MISSING_VALUE_TOKEN,
     apply_filter,
+    function_has_passing_variants,
     missing_value_token,
 )
 from ._values import discover_all_axis_values, discover_axis_values
@@ -35,6 +36,7 @@ __all__ = [
     "apply_filter",
     "discover_all_axis_values",
     "discover_axis_values",
+    "function_has_passing_variants",
     "missing_value_token",
 ]
 

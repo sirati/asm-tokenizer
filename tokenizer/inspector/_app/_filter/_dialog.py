@@ -4,10 +4,10 @@ Single concern: present a :class:`textual.screen.ModalScreen` whose
 body is a vertical stack of one :class:`SelectionList[str]` per
 candidate axis, where every distinct value seen across the loaded
 variants gets one checkable row. ``space`` toggles the checkbox
-(SelectionList built-in); ``ctrl+s`` OR the ``[Accept]`` :class:`Button`
-dismisses with :class:`FilterAccepted(config)`; ``escape`` dismisses
-with :class:`FilterCancelled()` (mirrors :class:`OrderDialog` so the
-two modals share keybindings).
+(SelectionList built-in); ``ctrl+s`` / ``alt+a`` OR the ``[Accept]``
+:class:`Button` dismisses with :class:`FilterAccepted(config)`;
+``escape`` / ``alt+c`` dismisses with :class:`FilterCancelled()`
+(mirrors :class:`OrderDialog` so the two modals share keybindings).
 
 Construction: the dialog takes a ``Mapping[AxisDescriptor, tuple[str, ...]]``
 (axis -> seen values, built by :mod:`._values.discover_all_axis_values`)
@@ -18,6 +18,16 @@ axes/values land CHECKED by default.
 
 Accept path collects the UNCHECKED values per axis -- those are the
 "disabled" values that go into the new :class:`FilterConfig`.
+
+Min-one-selected invariant: each per-axis :class:`SelectionList` is a
+:class:`_MinOneSelectionList` subclass that refuses the toggle which
+would drop the last selected value. An axis with zero values checked
+would mean "filter accepts nothing on this axis", which makes the
+filter useless; the subclass keeps the last selection pinned so the
+user can never reach that degenerate state.
+
+Focus: :meth:`on_mount` focuses the first axis :class:`SelectionList`
+so the dialog opens keyboard-ready (no extra Tab press).
 """
 
 from __future__ import annotations
@@ -46,6 +56,31 @@ __all__ = ["FilterDialog"]
 # Per-axis SelectionList id prefix; the accept path queries each one by
 # composed id to recover its checked-state list.
 _AXIS_LIST_ID_PREFIX = "filter-axis-list-"
+
+
+class _MinOneSelectionList(SelectionList[str]):
+    """:class:`SelectionList` that refuses to deselect the last checked row.
+
+    Single concern: pin the "at least one value remains selected" axis
+    invariant at the toggle boundary. A deselect that would drop the
+    selected count to zero is silently rejected (the option stays
+    checked); every other toggle behaves exactly like the upstream
+    widget.
+
+    The override targets :meth:`SelectionList._toggle` -- the single
+    code path the spacebar key, click-on-row, and programmatic
+    :meth:`SelectionList.toggle` all funnel through. Overriding here
+    (rather than fielding the public :class:`SelectionList.SelectionToggled`
+    message + reverting) means the rejected toggle never produces a
+    transient zero-selected state visible to subscribers.
+    """
+
+    def _toggle(self, value: str) -> bool:  # type: ignore[override]
+        if value in self._selected and len(self._selected) == 1:
+            # Dropping the last selected value would leave the axis
+            # with zero checked rows; reject the toggle (no-op).
+            return False
+        return super()._toggle(value)
 
 
 class FilterDialog(ModalScreen[FilterResult]):
@@ -104,8 +139,10 @@ class FilterDialog(ModalScreen[FilterResult]):
     BINDING_GROUP_TITLE: ClassVar[str] = "Filter dialog"
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("escape", "cancel", "Cancel", show=True),
-        Binding("ctrl+s", "accept", "Accept", show=True),
+        Binding("escape", "cancel", "[u]C[/]ancel", show=True),
+        Binding("alt+c", "cancel", "[u]C[/]ancel", show=True),
+        Binding("ctrl+s", "accept", "[u]A[/]ccept", show=True),
+        Binding("alt+a", "accept", "[u]A[/]ccept", show=True),
     ]
 
     def __init__(
@@ -138,11 +175,20 @@ class FilterDialog(ModalScreen[FilterResult]):
                     if not values:
                         continue
                     disabled_prior = self._prior_disabled.get(axis, frozenset())
+                    # Re-seat the prior-disabled values to land CHECKED
+                    # when EVERY value would otherwise land unchecked:
+                    # an axis whose prior config disabled every value is
+                    # an out-of-band state the min-one invariant would
+                    # not let the user reach via the dialog. We snap it
+                    # back to "all checked" so the user has a usable
+                    # starting point.
+                    if disabled_prior and disabled_prior.issuperset(values):
+                        disabled_prior = frozenset()
                     with Vertical(classes="filter-axis-section"):
                         yield Label(
                             axis.label, classes="filter-axis-header"
                         )
-                        yield SelectionList(
+                        yield _MinOneSelectionList(
                             *(
                                 Selection(
                                     prompt=value,
@@ -155,8 +201,37 @@ class FilterDialog(ModalScreen[FilterResult]):
                             classes="filter-axis-list",
                         )
             with Horizontal(id="filter-buttons"):
-                yield Button("Accept", id="filter-accept", variant="primary")
-                yield Button("Cancel", id="filter-cancel")
+                yield Button(
+                    "[u]A[/]ccept", id="filter-accept", variant="primary"
+                )
+                yield Button("[u]C[/]ancel", id="filter-cancel")
+
+    # --- focus -----------------------------------------------------
+
+    def on_mount(self) -> None:
+        """Land keyboard focus on the first axis :class:`SelectionList`.
+
+        The default ModalScreen focus path lands on the first focusable
+        widget in compose order. Stating the focus explicitly here
+        survives any future re-ordering of the compose tree (e.g.
+        toolbar-style accept buttons mounted above the body) and gives
+        the user a keyboard-ready dialog without an extra Tab press.
+
+        When every axis has zero values (no expanded function has
+        reported a row yet), the dialog renders no SelectionList at all
+        -- in that case the loop falls through and the default focus
+        path handles it (the Accept button takes focus and ``alt+a`` /
+        ``alt+c`` still work via the screen-level BINDINGS).
+        """
+        for index in range(len(self._axes_in_order)):
+            try:
+                sel_list = self.query_one(
+                    f"#{_axis_list_id(index)}", _MinOneSelectionList
+                )
+            except Exception:
+                continue
+            sel_list.focus()
+            return
 
     # --- actions ---------------------------------------------------
 

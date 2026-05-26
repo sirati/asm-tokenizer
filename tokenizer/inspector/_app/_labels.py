@@ -44,6 +44,16 @@ from ._order import VariantGroupNode, format_grouping_label
 # additional "re-run the failing expand on next click" semantics).
 _ERR_STYLE: Style = Style(color="red", dim=True)
 
+# Style applied to a :class:`FunctionNode` row whose variants are all
+# filtered out by the active :class:`FilterConfig`. The row stays
+# visible (so the user can see the function exists) but loses its
+# expand triangle (mounted with ``allow_expand=False``) and renders
+# dim so the eye skims past it. Single point of control: every
+# "function filtered to nothing" rendering must reach this style via
+# :func:`_compose_label_filtered_out` -- no concatenated escapes, no
+# inline styling at the call site.
+_FILTERED_OUT_STYLE: Style = Style(dim=True)
+
 
 # Muted style for the per-block-row asm preview suffix appended after
 # the ``"Block: <i>"`` / ``"Jump table: <i>"`` prefix. ``dim`` lets the
@@ -58,8 +68,10 @@ __all__ = [
     "_BLOCK_KIND_LABELS",
     "_BLOCK_PREVIEW_STYLE",
     "_ERR_STYLE",
+    "_FILTERED_OUT_STYLE",
     "_block_node_label",
     "_compose_label",
+    "_compose_label_filtered_out",
 ]
 
 
@@ -173,3 +185,17 @@ def _compose_label(node: Node, *, show_block_preview: bool = True) -> Text:
         return Text(format_grouping_label(node.axis, node.axis_value))
     # Closed Node union; any miss is a model/UI contract drift.
     raise TypeError(f"unsupported node type: {type(node).__name__}")
+
+
+def _compose_label_filtered_out(node: Node) -> Text:
+    """:func:`_compose_label` result re-styled with :data:`_FILTERED_OUT_STYLE`.
+
+    Single concern: paint a node whose visible content is correct but
+    whose semantic state is "filtered to nothing" -- the row stays
+    addressable but reads as inactive. Reuses :func:`_compose_label` so
+    the underlying text composition (FunctionNode prefix, variant
+    aligned label, etc.) cannot diverge from the un-styled path.
+    """
+    text = _compose_label(node)
+    text.stylize(_FILTERED_OUT_STYLE)
+    return text

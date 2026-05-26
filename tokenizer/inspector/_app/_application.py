@@ -38,9 +38,9 @@ from tokenizer.inspector._tree_model import (
 
 from . import _filter_hooks, _order_hooks
 from ._auto_expand import collapse_single_child_chains
-from ._filter import FilterConfig, FilterResult
+from ._filter import FilterConfig, FilterResult, function_has_passing_variants
 from ._help_dialog import HelpScreen
-from ._labels import _ERR_STYLE, _compose_label
+from ._labels import _ERR_STYLE, _compose_label, _compose_label_filtered_out
 from ._menu_bar import Alignment, MenuBar, MenuItem
 from ._node_path import CapturedExpandState
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
@@ -250,10 +250,11 @@ class InspectorApp(App[None]):
         # published. The factory owns discovery; the UI just iterates.
         for handle in self._factory.handles:
             fn_node = self._build_root_function_node(handle)
+            passing = function_has_passing_variants(fn_node, self._filter_config)
             tree.root.add(
-                _compose_label(fn_node),
+                _compose_label(fn_node) if passing else _compose_label_filtered_out(fn_node),
                 data=fn_node,
-                allow_expand=True,
+                allow_expand=passing,
             )
         tree.root.expand()
         yield tree

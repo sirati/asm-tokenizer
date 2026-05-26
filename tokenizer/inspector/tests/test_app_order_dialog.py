@@ -994,3 +994,86 @@ def test_expand_state_preserved_across_regroup():
                 )
 
     asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Fix #4 -- alt+a / alt+c bindings + underlined button labels for OrderDialog.
+# ---------------------------------------------------------------------------
+
+
+def test_order_dialog_alt_a_accepts():
+    """``alt+a`` dismisses with :class:`OrderAccepted`."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                results: list = []
+                dialog = OrderDialog(candidate_axes=build_canonical_axes())
+                app.push_screen(dialog, results.append)
+                await pilot.pause()
+                await pilot.press("alt+a")
+                await pilot.pause()
+                assert len(results) == 1
+                assert isinstance(results[0], OrderAccepted)
+
+    asyncio.run(runner())
+
+
+def test_order_dialog_alt_c_cancels():
+    """``alt+c`` dismisses with :class:`OrderCancelled`."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                results: list = []
+                dialog = OrderDialog(candidate_axes=build_canonical_axes())
+                app.push_screen(dialog, results.append)
+                await pilot.pause()
+                await pilot.press("alt+c")
+                await pilot.pause()
+                assert len(results) == 1
+                assert isinstance(results[0], OrderCancelled)
+
+    asyncio.run(runner())
+
+
+def test_order_dialog_button_labels_have_underline_spans():
+    """The Accept / Cancel buttons render with the trigger letter underlined."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                dialog = OrderDialog(candidate_axes=build_canonical_axes())
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from textual.widgets import Button
+
+                accept_btn = dialog.query_one("#accept", Button)
+                cancel_btn = dialog.query_one("#cancel", Button)
+                assert accept_btn.label.plain == "Accept"
+                assert cancel_btn.label.plain == "Cancel"
+                assert any(
+                    "u" in str(span.style).split()
+                    or "underline" in str(span.style)
+                    for span in accept_btn.label.spans
+                ), f"no underline span on Accept: {accept_btn.label.spans}"
+                assert any(
+                    "u" in str(span.style).split()
+                    or "underline" in str(span.style)
+                    for span in cancel_btn.label.spans
+                ), f"no underline span on Cancel: {cancel_btn.label.spans}"
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())

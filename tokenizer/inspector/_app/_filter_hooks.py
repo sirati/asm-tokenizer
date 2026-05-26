@@ -33,7 +33,9 @@ from ._filter import (
     FilterDialog,
     FilterResult,
     discover_all_axis_values,
+    function_has_passing_variants,
 )
+from ._labels import _compose_label, _compose_label_filtered_out
 
 
 if TYPE_CHECKING:
@@ -155,7 +157,40 @@ def _refresh_after_change(app: "InspectorApp") -> None:
     capture-on-rebuild auto-expand walk fires for the filter change
     too -- a previously-opened variant that survives the filter stays
     expanded after the rebuild, mirroring the order modal's behaviour.
+
+    Then re-applies :func:`function_has_passing_variants` across every
+    root :class:`FunctionNode` so a function that was previously
+    expandable becomes greyed + non-expandable (and vice-versa) when
+    its variants flip in/out of the surviving set under the new
+    config. The walk uses the same predicate the initial mount path
+    consults, so the two render paths cannot diverge.
     """
     from ._order_hooks import _rebuild_expanded_subtrees  # noqa: PLC0415
 
     _rebuild_expanded_subtrees(app)
+    _refresh_root_function_row_styles(app)
+
+
+def _refresh_root_function_row_styles(app: "InspectorApp") -> None:
+    """Walk root :class:`FunctionNode` rows and re-apply the filter predicate.
+
+    For each root function, recompute :func:`function_has_passing_variants`
+    against the app's active :class:`FilterConfig`; rewrite the row's
+    label + ``allow_expand`` to match. A function whose surviving variant
+    set is empty under the new filter loses its triangle and renders
+    dim; a function that gained back at least one surviving variant
+    (e.g. the user re-enabled an axis value) is restored to normal.
+    """
+    from ._tree_widget import _InspectorTree  # noqa: PLC0415
+
+    tree = app.query_one("#tree", _InspectorTree)
+    for tree_node in tree.root.children:
+        model = tree_node.data
+        if not isinstance(model, FunctionNode):
+            continue
+        passing = function_has_passing_variants(model, app._filter_config)
+        tree_node.allow_expand = passing
+        tree_node.set_label(
+            _compose_label(model) if passing
+            else _compose_label_filtered_out(model)
+        )
