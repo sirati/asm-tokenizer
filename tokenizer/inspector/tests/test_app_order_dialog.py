@@ -678,26 +678,34 @@ def test_expand_state_preserved_across_regroup():
 
                 # The function node now has two VariantGroupNode
                 # children (one per arch bucket); the previously-
-                # opened variant must surface under its bucket and be
-                # expanded again.
+                # opened variant must surface under its bucket. With
+                # the single-child-chain collapse policy, each group's
+                # lone variant is folded into the group's direct
+                # children -- so the group hosting the previously-
+                # opened variant must itself be expanded (showing the
+                # collapsed-past variant's blocks/leaves) rather than
+                # containing an inner expanded variant row.
                 group_children = list(fn_tree_node.children)
                 assert all(
                     isinstance(child.data, VariantGroupNode)
                     for child in group_children
                 )
-                # Find the variant tree node carrying our identity.
-                found_expanded = False
+                # Locate the group whose model wraps our target
+                # variant identity; it must be expanded so the user
+                # sees the same content they had before the regroup.
+                found_expanded_group = False
                 for group_tree_node in group_children:
-                    for variant_tree_node in group_tree_node.children:
-                        v_model = variant_tree_node.data
-                        if (
-                            isinstance(v_model, VariantNode)
-                            and v_model.variant_idx == target_variant_model.variant_idx
-                        ):
-                            if variant_tree_node.is_expanded:
-                                found_expanded = True
-                assert found_expanded, (
-                    "previously-expanded variant did not survive the regroup"
+                    group_model = group_tree_node.data
+                    contains_target = any(
+                        isinstance(c, VariantNode)
+                        and c.variant_idx == target_variant_model.variant_idx
+                        for c in group_model.children
+                    )
+                    if contains_target and group_tree_node.is_expanded:
+                        found_expanded_group = True
+                assert found_expanded_group, (
+                    "group hosting the previously-expanded variant "
+                    "did not auto-expand across the regroup"
                 )
 
     asyncio.run(runner())

@@ -1,23 +1,28 @@
-"""Pilot tests for the inspector tree's auto-expand-single-child rule.
+"""Pilot tests for the inspector tree's collapse-single-child-chain rule.
 
 Universal rule (per user-stated UX): when a parent's
-:meth:`Node.expand` returns exactly one expandable child, the
-intermediate selection row carries no information -- the user would
-always click through it. The tree dispatcher
-(:meth:`InspectorApp._on_node_expanded`) auto-expands the lone child
-so the deeper content surfaces without an extra keypress. The cascade
-is recursive: a chain of 1-child wrappers unfolds end-to-end.
+:meth:`Node.expand` returns exactly one expandable child, that child
+is a content-free "selection of one" wrapper -- the inspector REMOVES
+it from the rendered tree and surfaces its own expand result in its
+place. The collapse is recursive: a chain of 1-expandable-child
+wrappers unfolds end-to-end until either zero, two-or-more, or a
+terminal child is reached.
+
+Contrast with the prior in-tree-auto-expand variant: that flavour
+kept wrappers visible (just initially expanded). The current contract
+is stricter -- wrappers must be GONE so the deepest content sits
+directly under the parent that actually carries information.
 
 The tests below drive :class:`InspectorApp` via a Textual Pilot and
 exercise:
 
-* exactly-one-child + expandable -> auto-expand fires
-* exactly-one-child + terminal -> auto-expand does NOT fire
-* two-or-more children (heterogeneous) -> auto-expand does NOT fire
-* multi-level chain of single-child wrappers -> cascades all levels
-* top-level FunctionNode list -> never auto-expanded (the
-  ``compose()`` root has no model, dispatcher returns early)
-* idempotent vs. capture-on-rebuild's restore walk
+* exactly-one-expandable-child -> wrapper REMOVED, grandchildren mounted
+* exactly-one-terminal-child -> kept as-is (no chain to collapse into)
+* two-or-more children (homogeneous or mixed) -> no collapse
+* multi-level chain of single-child wrappers -> collapses fully
+* top-level FunctionNode list -> never collapsed (root has no model)
+* failure mid-chain -> wrapper kept visible, flagged ``is_failed``
+* recursion depth bound -> defensive cutoff against pathological loops
 
 The file is gated on ``pytest.importorskip("textual")`` so the default
 ``nix develop`` shell (textual-free) shows it as SKIPPED rather than
@@ -39,6 +44,7 @@ from unittest.mock import MagicMock
 
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.inspector._app import InspectorApp
+from tokenizer.inspector._app._auto_expand import collapse_single_child_chains
 from tokenizer.inspector._render._protocol import (
     BackendFactory,
     BlockKind,
@@ -123,58 +129,68 @@ def _make_expandable_block(*, expand_returns: list) -> BlockNode:
 
 
 # ---------------------------------------------------------------------------
-# Single-child auto-expand: the core rule.
+# Single-child collapse: wrapper removed, grandchildren mounted.
 # ---------------------------------------------------------------------------
 
 
-def test_single_expandable_child_auto_expands():
-    """FunctionNode with exactly one expandable child -> child auto-expands."""
+def test_single_expandable_child_collapsed_grandchildren_mounted():
+    """FunctionNode with one expandable child -> wrapper REMOVED, grandchildren under FunctionNode."""
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                # A single :class:`BlockNode` child whose own ``expand``
-                # returns no grandchildren (so the cascade stops cleanly).
-                lone_block = _make_expandable_block(expand_returns=[])
-                _tree, _fn, children = await _expand_function_with_children(
-                    app, pilot, [lone_block]
+                # Grandchildren: two terminal leaves so the chain stops
+                # (multi-child level) and gets mounted as-is.
+                grand_a = AsmLeaf(text="grandchild-a")
+                grand_b = AsmLeaf(text="grandchild-b")
+                wrapper = _make_expandable_block(
+                    expand_returns=[grand_a, grand_b]
                 )
-                assert len(children) == 1
-                only_child = children[0]
-                # The lone child was auto-expanded by the dispatcher; the
-                # spy was invoked exactly once (the auto-expand cascade,
-                # not a user keypress).
-                assert only_child.is_expanded is True
-                lone_block.expand.assert_called_once()
+                _tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [wrapper]
+                )
+                # The wrapper is GONE; the two grandchildren are now
+                # the FunctionNode's direct children.
+                assert len(children) == 2
+                child_models = [c.data for c in children]
+                assert child_models == [grand_a, grand_b]
+                # The wrapper's expand was invoked during collapse.
+                wrapper.expand.assert_called_once()
 
     asyncio.run(runner())
 
 
-def test_single_terminal_child_does_not_auto_expand():
-    """FunctionNode with exactly one ``can_expand=False`` child -> no auto-expand."""
+def test_single_terminal_child_kept_in_place():
+    """FunctionNode with exactly one ``can_expand=False`` child -> child stays as-is.
+
+    A terminal lone child has no deeper content to surface; the
+    collapse cannot "expand into" it, so the leaf is mounted directly
+    under the parent (without any wrapper between them since the
+    FunctionNode IS the parent already).
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                # AsmLeaf with no openables is terminal (can_expand=False).
                 lone_leaf = AsmLeaf(text="just-one")
                 _tree, _fn, children = await _expand_function_with_children(
                     app, pilot, [lone_leaf]
                 )
+                # 1 child mounted, NOT expanded (terminal).
                 assert len(children) == 1
                 only_child = children[0]
-                # No auto-expand: nothing to surface under a terminal row.
+                assert only_child.data is lone_leaf
                 assert only_child.is_expanded is False
 
     asyncio.run(runner())
 
 
-def test_two_children_does_not_auto_expand():
-    """FunctionNode with two children -> neither auto-expanded (user picks)."""
+def test_two_children_no_collapse():
+    """FunctionNode with two children -> both mounted, neither auto-expanded."""
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -182,7 +198,7 @@ def test_two_children_does_not_auto_expand():
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
                 # Two expandable children -> the selection node carries
-                # information (which one?); we leave it to the user.
+                # information (which one?); the user picks.
                 first = _make_expandable_block(expand_returns=[])
                 second = _make_expandable_block(expand_returns=[])
                 _tree, _fn, children = await _expand_function_with_children(
@@ -197,14 +213,14 @@ def test_two_children_does_not_auto_expand():
     asyncio.run(runner())
 
 
-def test_heterogeneous_children_does_not_auto_expand():
-    """Mixed children (1 expandable + 1 leaf) -> no auto-skip.
+def test_heterogeneous_children_no_collapse():
+    """Mixed children (1 expandable + 1 leaf) -> no collapse.
 
     Strict interpretation of "exactly one child": count is on the
     mounted child list, not on the expandable subset. This preserves
     the pinned-variant fix's heterogeneous shape (N BlockNodes +
     1 ShowAllVariantsNode under an InlineCallNode -- multiple children,
-    no auto-skip) without a special case.
+    no collapse) without a special case.
     """
 
     async def runner() -> None:
@@ -218,8 +234,8 @@ def test_heterogeneous_children_does_not_auto_expand():
                     app, pilot, [expandable, leaf]
                 )
                 assert len(children) == 2
-                # The lone expandable did NOT pre-empt the leaf row's
-                # visibility under the parent.
+                # Both rows surfaced under FunctionNode; the expandable
+                # one was NOT auto-expanded.
                 assert children[0].is_expanded is False
                 expandable.expand.assert_not_called()
 
@@ -227,18 +243,18 @@ def test_heterogeneous_children_does_not_auto_expand():
 
 
 # ---------------------------------------------------------------------------
-# Recursion: a chain of 1-child wrappers unfolds end-to-end.
+# Recursion: a chain of 1-expandable-child wrappers collapses fully.
 # ---------------------------------------------------------------------------
 
 
-def test_three_level_chain_auto_expands_all():
-    """3-level chain of 1-child nodes -> every wrapper auto-expanded.
+def test_three_level_chain_collapses_to_deepest_content():
+    """3-level chain of 1-child wrappers -> all wrappers REMOVED.
 
-    Models the Calloc case: Function ID has 1 child -> auto-expand;
-    that child is an AsmLeaf with one openable that resolves to an
-    InlineCallNode with 1 pinned variant -> auto-expand; the variant
-    has multiple blocks (or 1 block here for the chain test) -> the
-    cascade stops at the terminal level.
+    Models the Calloc case: Function ID has 1 child (AsmLeaf) -> collapse;
+    that AsmLeaf has 1 openable resolving to an InlineCallNode -> collapse;
+    the InlineCallNode surfaces blocks. Only the deepest mounted level
+    becomes visible under Function ID; the two intermediate wrappers
+    disappear entirely.
     """
 
     async def runner() -> None:
@@ -246,46 +262,39 @@ def test_three_level_chain_auto_expands_all():
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                # Build bottom-up so each parent's expand spy returns the
-                # next-level child. The leaf at the bottom has zero
-                # grandchildren so the cascade has a clear base case.
-                leaf = _make_expandable_block(expand_returns=[])
-                middle = _make_expandable_block(expand_returns=[leaf])
+                # Build bottom-up: the bottom level is multi-child so the
+                # chain has a clear stopping point with visible content.
+                final_a = AsmLeaf(text="final-a")
+                final_b = AsmLeaf(text="final-b")
+                middle = _make_expandable_block(expand_returns=[final_a, final_b])
                 top = _make_expandable_block(expand_returns=[middle])
                 _tree, _fn, children = await _expand_function_with_children(
                     app, pilot, [top]
                 )
 
-                # 1 child at the FunctionNode level -> top auto-expanded.
-                assert len(children) == 1
-                top_tree_node = children[0]
-                assert top_tree_node.is_expanded is True
+                # The two final leaves are mounted DIRECTLY under the
+                # FunctionNode; ``top`` and ``middle`` wrappers are GONE.
+                assert len(children) == 2
+                assert [c.data for c in children] == [final_a, final_b]
                 top.expand.assert_called_once()
-
-                # Top's lone child is middle -> middle auto-expanded.
-                assert len(top_tree_node.children) == 1
-                middle_tree_node = top_tree_node.children[0]
-                assert middle_tree_node.is_expanded is True
                 middle.expand.assert_called_once()
-
-                # Middle's lone child is leaf -> leaf auto-expanded.
-                assert len(middle_tree_node.children) == 1
-                leaf_tree_node = middle_tree_node.children[0]
-                assert leaf_tree_node.is_expanded is True
-                leaf.expand.assert_called_once()
 
     asyncio.run(runner())
 
 
 def test_chain_stops_when_branch_becomes_multi_child():
-    """Cascade stops at the level whose expand returns 2+ children."""
+    """Cascade stops at the level whose expand returns 2+ children.
+
+    The multi-child level's siblings get mounted under the original
+    parent (the wrappers above the multi-child level are gone).
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                # top -> middle (auto) -> [block_a, block_b] (NO auto)
+                # top -> middle (collapses) -> [block_a, block_b] (NO collapse)
                 block_a = _make_expandable_block(expand_returns=[])
                 block_b = _make_expandable_block(expand_returns=[])
                 middle = _make_expandable_block(expand_returns=[block_a, block_b])
@@ -294,11 +303,11 @@ def test_chain_stops_when_branch_becomes_multi_child():
                     app, pilot, [top]
                 )
 
-                top_tree_node = children[0]
-                middle_tree_node = top_tree_node.children[0]
-                # The 2-child level mounts both, but neither auto-expands.
-                assert len(middle_tree_node.children) == 2
-                for grandchild in middle_tree_node.children:
+                # Top + middle wrappers GONE; block_a + block_b are
+                # mounted as direct children of the FunctionNode.
+                assert len(children) == 2
+                assert [c.data for c in children] == [block_a, block_b]
+                for grandchild in children:
                     assert grandchild.is_expanded is False
                 block_a.expand.assert_not_called()
                 block_b.expand.assert_not_called()
@@ -306,16 +315,36 @@ def test_chain_stops_when_branch_becomes_multi_child():
     asyncio.run(runner())
 
 
+def test_chain_bottoms_out_at_empty_expand():
+    """A chain whose deepest wrapper returns ``[]`` -> parent shows no children."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(["main"], log_path)
+            async with app.run_test() as pilot:
+                # Lone wrapper whose expand returns nothing -- the chain
+                # bottoms out at empty; the parent mounts zero children.
+                lone = _make_expandable_block(expand_returns=[])
+                _tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [lone]
+                )
+                assert children == []
+                lone.expand.assert_called_once()
+
+    asyncio.run(runner())
+
+
 # ---------------------------------------------------------------------------
-# Top-level FunctionNode list is never auto-expanded.
+# Top-level FunctionNode list is never collapsed.
 # ---------------------------------------------------------------------------
 
 
-def test_root_with_single_function_does_not_auto_expand():
-    """One FunctionNode under the tree root -> NOT auto-expanded.
+def test_root_with_single_function_does_not_collapse():
+    """One FunctionNode under the tree root -> never auto-opened or removed.
 
     The ``compose()`` root has ``data is None``, so the dispatcher
-    returns early before the auto-expand check ever runs against it.
+    returns early before the collapse check ever runs against it.
     This preserves the user-facing affordance: the root function list
     is the inspector's navigation entry point and must stay
     collapsible regardless of how few binaries are loaded.
@@ -329,25 +358,28 @@ def test_root_with_single_function_does_not_auto_expand():
                 await pilot.pause()
                 _tree, fn_tree_node = _root_tree_node(app)
                 # Root has 1 FunctionNode; it must remain user-collapsed
-                # (no automatic expand off the back of compose()).
+                # (no automatic expand off the back of compose()) and
+                # visible (the root is NOT subject to collapse).
                 assert fn_tree_node.is_expanded is False
+                assert fn_tree_node.data is not None
 
     asyncio.run(runner())
 
 
 # ---------------------------------------------------------------------------
-# Idempotence: auto-expand does not re-fire on an already-expanded child.
+# Failure mid-chain: wrapper kept visible with is_failed=True.
 # ---------------------------------------------------------------------------
 
 
-def test_auto_expand_idempotent_when_child_already_expanded():
-    """A pre-expanded lone child -> auto-expand stays a no-op.
+def test_failed_wrapper_kept_visible_for_error_surfacing():
+    """If a wrapper's ``expand`` raises during collapse, the wrapper is kept.
 
-    Mirrors the capture-on-rebuild interaction: if another code path
-    already expanded the child before the dispatcher's auto-expand
-    block ran (e.g. via the Order modal's identity-set restore), we
-    must NOT post a duplicate :class:`Tree.NodeExpanded`. The guard
-    is :attr:`TreeNode.is_expanded`.
+    The dispatcher's ``_safe_expand_one`` callback logs + flips
+    ``is_failed`` on the wrapper; the collapse helper sees ``None``
+    and stops at this level, returning the wrapper as-is. The user
+    sees the wrapper with the ``[*]`` glyph; expanding it manually
+    re-runs the failing ``expand`` through the main dispatcher path,
+    which attaches the dim-red error leaf.
     """
 
     async def runner() -> None:
@@ -355,25 +387,66 @@ def test_auto_expand_idempotent_when_child_already_expanded():
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                lone_block = _make_expandable_block(expand_returns=[])
-                _tree, _fn, children = await _expand_function_with_children(
-                    app, pilot, [lone_block]
+                bad_wrapper = _make_expandable_block(expand_returns=[])
+                bad_wrapper.expand = MagicMock(
+                    side_effect=RuntimeError("simulated failure")
                 )
-                only_child = children[0]
-                # After the first expand cycle, child is already expanded
-                # by the auto-expand pass + the spy was called once.
-                assert only_child.is_expanded is True
-                lone_block.expand.assert_called_once()
-
-                # Manually call expand() on the already-expanded child;
-                # Textual posts another NodeExpanded which re-enters the
-                # dispatcher. The dispatcher re-runs model.expand (it
-                # remove_children + remounts), so the spy gets a SECOND
-                # call. The auto-expand guard's job is then to NOT
-                # post a third call. Verify the cascade settles at 2
-                # (no infinite loop).
-                only_child.expand()
-                await pilot.pause()
-                assert lone_block.expand.call_count == 2
+                _tree, _fn, children = await _expand_function_with_children(
+                    app, pilot, [bad_wrapper]
+                )
+                # The wrapper is mounted (collapse stopped on failure)
+                # with is_failed flipped by the dispatcher's callback.
+                assert len(children) == 1
+                assert children[0].data is bad_wrapper
+                assert bad_wrapper.is_failed is True
 
     asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Recursion-depth bound: pathological loops are cut off defensively.
+# ---------------------------------------------------------------------------
+
+
+def test_collapse_respects_depth_limit():
+    """An infinite 1-child chain is bounded by ``depth_limit``.
+
+    Drive the standalone helper (not via Pilot) so we can detect the
+    EXACT number of ``expand_one`` calls and assert the bound holds.
+    """
+    # Pathological model whose ``expand`` returns itself wrapped in a
+    # single-child list -- a chain that would loop forever without the
+    # depth bound.
+    loop_node = _make_expandable_block(expand_returns=[])
+    loop_node.expand = MagicMock(return_value=[loop_node])
+
+    call_count = [0]
+
+    def expand_one(node):
+        call_count[0] += 1
+        return list(node.expand())
+
+    out = collapse_single_child_chains(
+        [loop_node], expand_one=expand_one, depth_limit=5
+    )
+    # The chain hits the bound after exactly ``depth_limit`` expansions;
+    # the result is the most-recent single-child list we walked into.
+    assert call_count[0] == 5
+    # And the helper still returns a list (not None / not raised).
+    assert isinstance(out, list)
+
+
+def test_collapse_helper_handles_failure_via_none():
+    """``expand_one`` returning ``None`` halts the chain at that level.
+
+    Direct standalone-helper test so we don't depend on Textual + the
+    dispatcher's full plumbing for the failure-return contract.
+    """
+    wrapper = _make_expandable_block(expand_returns=[])
+    # ``expand_one`` returning None mirrors a failed wrapper expand.
+    out = collapse_single_child_chains(
+        [wrapper], expand_one=lambda _n: None
+    )
+    # Wrapper stays in the returned list so the dispatcher can mount
+    # it with the failure flag.
+    assert out == [wrapper]
