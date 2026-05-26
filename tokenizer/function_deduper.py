@@ -62,6 +62,7 @@ correctly.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Dict, Hashable, Optional, Tuple
 
@@ -182,6 +183,34 @@ def canonical_function_name(
     return name
 
 
+# ``@thunk:<digits>`` — the only canonical suffix that is NOT cross-ISA-
+# stable in practice. The Ghidra-supplied identity_key for PLT thunks is
+# ``getThunkedFunction(True).getEntryPoint().getOffset()``; for externals
+# that offset is a placeholder address in the per-binary EXTERNAL block
+# that varies across ELF variants (link order, library count, layout).
+# The C++ comment-derived suffix is omitted on purpose: it's the
+# demangled signature, which IS deterministic across builds.
+_THUNK_SUFFIX_RE = re.compile(r"@thunk:\d+$")
+
+
+def logical_function_name(canonical_name: str) -> str:
+    """Strip the ``@thunk:<digits>`` suffix to recover the cross-binary
+    logical function name.
+
+    Consumers that need to group same-source-symbol functions across
+    binaries (the inspector function list is the only current caller)
+    feed every canonical name through this helper and use the result as
+    the grouping key. Names without the suffix pass through verbatim,
+    so callers don't need a fast-path branch.
+
+    The comment-derived ``@<sanitized_signature>`` suffix from
+    :func:`canonical_function_name` is intentionally preserved -- it is
+    the demangled C++ signature and is deterministic across builds of
+    the same source.
+    """
+    return _THUNK_SUFFIX_RE.sub("", canonical_name)
+
+
 @dataclass(frozen=True)
 class DedupResolution:
     """Outcome of :meth:`FunctionDeduper.resolve` for one function.
@@ -296,4 +325,9 @@ class FunctionDeduper:
         )
 
 
-__all__ = ("DedupResolution", "FunctionDeduper", "canonical_function_name")
+__all__ = (
+    "DedupResolution",
+    "FunctionDeduper",
+    "canonical_function_name",
+    "logical_function_name",
+)
