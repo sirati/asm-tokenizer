@@ -17,6 +17,13 @@ itself (just the ``escape`` binding). We override one method to read
 ``app.screen_stack[-2]`` (the inspector screen beneath the modal)
 instead; every other concern -- component styles, key-display
 formatting, ``BINDING_GROUP_TITLE`` grouping -- stays the upstream's.
+
+The widget is mounted directly on the modal screen (no
+:class:`textual.containers.Container` wrapper). Textual's auto-width
+propagation collapses to width 0 when an auto-sized parent wraps an
+auto-sized :class:`BindingsTable` child, so the modal screen's
+``align: center middle`` rule centres the widget itself -- and the
+border + padding styling lives on the widget rather than a wrapper.
 """
 
 from __future__ import annotations
@@ -32,7 +39,6 @@ from rich.text import Text
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container
 from textual.screen import ModalScreen
 from textual.widgets._key_panel import BindingsTable
 
@@ -46,6 +52,16 @@ __all__ = ["HelpScreen"]
 
 class _UnderlyingScreenBindingsTable(BindingsTable):
     """Retarget the binding source to the screen under the modal."""
+
+    DEFAULT_CSS: ClassVar[str] = """
+    _UnderlyingScreenBindingsTable {
+        max-width: 90%;
+        max-height: 90%;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
 
     def render_bindings_table(self) -> Table:  # type: ignore[override]
         return _render_active_bindings_table(self, self._source_screen())
@@ -138,15 +154,6 @@ class HelpScreen(ModalScreen[None]):
     HelpScreen {
         align: center middle;
     }
-    HelpScreen > Container {
-        width: auto;
-        height: auto;
-        max-width: 90%;
-        max-height: 90%;
-        padding: 1 2;
-        border: thick $primary;
-        background: $surface;
-    }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -156,5 +163,4 @@ class HelpScreen(ModalScreen[None]):
     BINDING_GROUP_TITLE: ClassVar[str] = "Help"
 
     def compose(self) -> ComposeResult:
-        with Container():
-            yield _UnderlyingScreenBindingsTable()
+        yield _UnderlyingScreenBindingsTable()
