@@ -187,8 +187,92 @@ def test_render_block_raises_on_unknown_v2_id() -> None:
     blocks = [_block_with_header_and_body(vm, n=0, body_text="body")]
     backend = _make_backend_with_state(_stub_variant_state(blocks))
 
-    with pytest.raises(KeyError, match="block_v2 id 99"):
+    with pytest.raises(KeyError, match="BODY, 99"):
         list(backend.render_block(variant_idx=0, kind=BlockKind.BODY, block_idx=99))
+
+
+def _jump_table_footer_block(
+    vm: VocabularyManager, *, jt_id: int, target_ns: list[int]
+) -> BlockTokenList:
+    """Build a writer-shaped jump-table footer block.
+
+    Mirrors :func:`tokenizer.fill_constant_candidates._emit_jump_table_footer_for`:
+    one synthetic instruction carrying
+    ``[Block_Def, Jump_Table(jt_id), Block_V2(t0), ...]``. The whole
+    block has exactly one instruction (the writer never adds bodies
+    to footer blocks).
+    """
+    blk = BlockTokenList(1, vocab_manager=vm)
+    target_tokens = [vm.Block_V2(t) for t in target_ns]
+    blk.append_as_insn(
+        insn_str=f"jump_table 0x{jt_id:x}",
+        tokens=[vm.Block_Def(), vm.Jump_Table(jt_id), *target_tokens],
+    )
+    return blk
+
+
+def test_blocks_emits_jump_table_kind_for_footer_blocks() -> None:
+    """User-reported crash: a function with a jump-table footer block
+    crashed the inspector with
+    ``ValueError("block does not open with [BLOCK_DEF, BLOCK_V2] ...")``
+    because the gate rejected the JUMP_TABLE header. Post-fix the
+    backend must emit a :attr:`BlockKind.JUMP_TABLE` RenderedBlock per
+    footer block, with ``block_idx`` carrying the JUMP_TABLE id (not
+    a BLOCK_V2 id).
+
+    The body block + jump-table footer sit as siblings in the
+    variant's blocks tuple -- mirroring writer order via
+    :func:`func_tokens.add_block`. The renderer must yield both as
+    separate :class:`RenderedBlock` entries.
+    """
+    vm = _vm()
+    blocks = [
+        _block_with_header_and_body(vm, n=0, body_text="body"),
+        _jump_table_footer_block(vm, jt_id=7, target_ns=[0, 0, 0]),
+    ]
+    backend = _make_backend_with_state(_stub_variant_state(blocks))
+
+    rendered = backend.blocks(variant_idx=0)
+
+    assert [(rb.kind, rb.block_idx) for rb in rendered] == [
+        (BlockKind.BODY, 0),
+        (BlockKind.JUMP_TABLE, 7),
+    ]
+
+
+def test_render_block_supports_jump_table_kind() -> None:
+    """``render_block(kind=JUMP_TABLE, block_idx=N)`` must locate the
+    footer block by N in the JUMP_TABLE namespace -- distinct from
+    the BLOCK_V2 namespace so a coincidental id collision (e.g. a
+    body block N=7 + a jump-table N=7 in the same function) does
+    not cross-resolve.
+    """
+    vm = _vm()
+    # Body block N=7 + footer N=7 -- same int N, different namespace.
+    blocks = [
+        _block_with_header_and_body(vm, n=7, body_text="body-seven"),
+        _jump_table_footer_block(vm, jt_id=7, target_ns=[7]),
+    ]
+    backend = _make_backend_with_state(_stub_variant_state(blocks))
+
+    body_items = list(
+        backend.render_block(variant_idx=0, kind=BlockKind.BODY, block_idx=7)
+    )
+    jt_items = list(
+        backend.render_block(
+            variant_idx=0, kind=BlockKind.JUMP_TABLE, block_idx=7
+        )
+    )
+
+    # Body block has one body insn (the "_def" placeholder); the
+    # jump-table footer has zero body insns (the synthetic 1-insn
+    # header is fully absorbed by BodyBlockView).
+    assert len(body_items) == 1
+    assert isinstance(body_items[0], AsmLine)
+    assert body_items[0].text == "_def"
+    # Jump-table footer has no body insn so the rendered stream is
+    # empty (mirrors BatchDecode's silent-header-only emission).
+    assert jt_items == []
 
 
 def test_render_block_stream_omits_header_pair() -> None:

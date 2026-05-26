@@ -1,17 +1,23 @@
-"""Header-pair absorption + block_v2 id resolution for FTL rendering.
+"""Header-pair absorption + typed-header read for FTL rendering.
 
-Pins three invariants the user-observed mislabeling violated:
+Pins four invariants the user-observed mislabeling / crash violated:
 
 * The sibling positional index of a block in
   :meth:`FunctionTokenList.iter_blocks` is NOT in general the
   ``block_v2:N`` identity printed by the writer; the inspector's
   ``Block: <i>`` label MUST come from the latter.
-* The opening ``[Block_Def, block_v2:N]`` instruction pair is a
+* The opening ``[Block_Def, <header>:N]`` instruction pair is a
   header, not body content -- it must NOT leak into the rendered
   asm-line stream OR into the preview text.
 * The lookup that turns a ``RenderedBlock.block_idx`` back into a
-  block (in :meth:`FtlBackend.render_block`) keys by ``N``, so
-  jump-target wires and tree-row IDs share one address space.
+  block (in :meth:`FtlBackend.render_block`) keys by ``(kind, N)``,
+  so jump-target wires + tree-row IDs share one address space per
+  section kind.
+* The gate accepts BOTH ``BLOCK_V2`` and ``JUMP_TABLE`` as valid
+  second-token kinds: production functions have jump-table footer
+  blocks (``[Block_Def, Jump_Table:N, Block_V2:t0, ...]``) emitted
+  as full siblings of body blocks (see
+  :mod:`tokenizer.fill_constant_candidates`).
 
 Mirrors BatchDecode's :attr:`WalkSectionState.pending_header` policy
 on the FTL path.
@@ -21,9 +27,10 @@ from __future__ import annotations
 
 from tokenizer.inspector._render._ftl_backend._block_header import (
     BodyBlockView,
-    block_v2_id,
+    block_header,
     body_block_view,
 )
+from tokenizer.inspector._render._protocol import BlockKind
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
 
@@ -48,25 +55,60 @@ def _build_block_with_header(
     return blk
 
 
+def _build_jump_table_footer_block(
+    vm: VocabularyManager, jt_id: int, target_ns: list[int]
+) -> BlockTokenList:
+    """Build a writer-shaped jump-table footer block.
+
+    Mirrors :func:`tokenizer.fill_constant_candidates._emit_jump_table_footer_for`:
+    one synthetic instruction carrying
+    ``[Block_Def, Jump_Table(jt_id), Block_V2(t0), Block_V2(t1), ...]``.
+    The trailing ``Block_V2`` tokens are jump-table TARGETS, not
+    body-block headers -- the per-block JUMP_TABLE flag (W3-16 on
+    BatchDecode; structural in FTL via the gate's typed header) keeps
+    them addressed as :class:`InlineJumpEntry` openables downstream.
+    """
+    blk = BlockTokenList(1, vocab_manager=vm)
+    target_tokens = [vm.Block_V2(t) for t in target_ns]
+    blk.append_as_insn(
+        insn_str=f"jump_table 0x{jt_id:x}",
+        tokens=[vm.Block_Def(), vm.Jump_Table(jt_id), *target_tokens],
+    )
+    return blk
+
+
 def _vm() -> VocabularyManager:
     """v2 unified vocab; needed because Block_V2 / Block_Def are v2 inners."""
     return VocabularyManager(platform=None, format_version=2)
 
 
 # ---------------------------------------------------------------------------
-# block_v2_id
+# block_header -- typed (kind, N) read from the opening pair
 # ---------------------------------------------------------------------------
 
 
-def test_block_v2_id_reads_n_from_header_pair() -> None:
+def test_block_header_reads_kind_and_n_from_body_block_header_pair() -> None:
     vm = _vm()
     blk = _build_block_with_header(vm, n=7, body_insns=[("nop", [vm.Block_Def()])])
     # The body insn here doesn't need to be a "real" non-header insn for
     # this assertion; we're only reading the FIRST insn's tokens.
-    assert block_v2_id(blk) == 7
+    assert block_header(blk) == (BlockKind.BODY, 7)
 
 
-def test_block_v2_id_handles_non_sequential_n() -> None:
+def test_block_header_reads_jump_table_kind_and_id() -> None:
+    """User-observed crash on real arm32 exit@thunk:exit:
+    ``ValueError("block does not open with [BLOCK_DEF, BLOCK_V2] ...")``
+    fired because the gate rejected jump-table footer blocks. The
+    gate must accept both BLOCK_V2 + JUMP_TABLE as valid second-token
+    kinds and discriminate the section namespace via the returned
+    :class:`BlockKind`.
+    """
+    vm = _vm()
+    blk = _build_jump_table_footer_block(vm, jt_id=11, target_ns=[3, 4, 5])
+    assert block_header(blk) == (BlockKind.JUMP_TABLE, 11)
+
+
+def test_block_header_handles_non_sequential_n() -> None:
     """User-observed shape: block_v2 IDs go [0, 1, 2, 4, 3, 5, ...].
 
     The writer assigns block_v2 identities via
@@ -82,20 +124,36 @@ def test_block_v2_id_handles_non_sequential_n() -> None:
         _build_block_with_header(vm, n=n, body_insns=[("nop", [vm.Block_Def()])])
         for n in ids
     ]
-    assert [block_v2_id(b) for b in blocks] == ids
+    assert [block_header(b) for b in blocks] == [(BlockKind.BODY, n) for n in ids]
 
 
-def test_block_v2_id_raises_on_missing_header_pair() -> None:
-    """A block whose first insn is NOT ``[BLOCK_DEF, BLOCK_V2]`` is
+def test_block_header_raises_on_missing_header_pair() -> None:
+    """A block whose first insn is NOT ``[BLOCK_DEF, <accepted>]`` is
     a corrupt FTL stream -- surface it loudly, don't mislabel.
     """
     import pytest
 
     vm = _vm()
     blk = BlockTokenList(1, vocab_manager=vm)
-    blk.append_as_insn(insn_str="bare", tokens=[vm.Block_Def()])  # no BLOCK_V2
+    blk.append_as_insn(insn_str="bare", tokens=[vm.Block_Def()])  # no header
     with pytest.raises(ValueError, match="header pair"):
-        block_v2_id(blk)
+        block_header(blk)
+
+
+def test_block_header_error_message_lists_accepted_kinds() -> None:
+    """The diagnostic message must surface BOTH accepted second-token
+    kinds so a future producer can self-diagnose without code-reading.
+    """
+    import pytest
+
+    vm = _vm()
+    blk = BlockTokenList(1, vocab_manager=vm)
+    blk.append_as_insn(insn_str="bare", tokens=[vm.Block_Def()])
+    with pytest.raises(ValueError) as exc_info:
+        block_header(blk)
+    msg = str(exc_info.value)
+    assert "BLOCK_V2" in msg
+    assert "JUMP_TABLE" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +177,21 @@ def test_body_block_view_skips_header_insn() -> None:
     assert len(insns) == 2
 
 
+def test_body_block_view_absorbs_jump_table_header_too() -> None:
+    """The header-absorption contract is kind-agnostic: a jump-table
+    footer's synthetic 1-insn header must also be skipped so the
+    preview / rendered stream does not leak the ``_def jump_table:N``
+    fragment.
+
+    A jump-table footer typically has ONLY the header insn (no body
+    insns); the view's ``iter_insn`` must therefore yield zero items.
+    """
+    vm = _vm()
+    blk = _build_jump_table_footer_block(vm, jt_id=4, target_ns=[1, 2])
+    view = body_block_view(blk)
+    assert list(view.iter_insn(transient=False)) == []
+
+
 def test_body_block_view_to_asm_like_omits_header_text() -> None:
     """``to_asm_like`` must not include the ``_def block_v2:N`` fragment."""
     vm = _vm()
@@ -134,6 +207,17 @@ def test_body_block_view_to_asm_like_omits_header_text() -> None:
     # ``block_v2:4`` does NOT appear at all because the header was the
     # only carrier of the BLOCK_V2 token.)
     assert "block_v2:" not in asm
+
+
+def test_body_block_view_to_asm_like_omits_jump_table_header_text() -> None:
+    """Mirror of the BLOCK_V2 absorption test for the JUMP_TABLE
+    header kind: ``to_asm_like`` on a jump-table footer must not leak
+    the ``_def jump_table:N`` fragment.
+    """
+    vm = _vm()
+    blk = _build_jump_table_footer_block(vm, jt_id=9, target_ns=[1])
+    asm = body_block_view(blk).to_asm_like()
+    assert "jump_table:" not in asm
 
 
 def test_body_block_view_is_duck_compatible_with_block_preview() -> None:

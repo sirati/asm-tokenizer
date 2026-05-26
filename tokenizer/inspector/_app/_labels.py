@@ -46,6 +46,7 @@ _ERR_STYLE: Style = Style(color="red", dim=True)
 
 
 __all__ = [
+    "_BLOCK_KIND_INDEXED_PREFIXES",
     "_BLOCK_KIND_LABELS",
     "_ERR_STYLE",
     "_block_node_label",
@@ -63,24 +64,40 @@ __all__ = [
 # Per-kind label policy for :class:`BlockNode` rows. The model node
 # carries the typed :class:`BlockKind` discriminator; the UI side
 # composes the row label per-kind without ``isinstance``-on-string
-# discriminators.
+# discriminators. The non-indexed kinds (variant prefix / function
+# id) carry a fixed-string label; the indexed kinds (body block,
+# jump-table footer) compose ``"<prefix>: <idx>   <preview>"`` via
+# the per-kind prefix dict below.
 _BLOCK_KIND_LABELS: dict[BlockKind, str] = {
     BlockKind.VARIANT_HEADER: "Variant Header",
     BlockKind.FUNCTION_ID: "Function ID",
+}
+
+# Per-kind row-prefix word for the indexed section kinds. The prefix
+# selects the user-visible label noun: body blocks render as
+# ``"Block: <idx>"`` and jump-table footers render as
+# ``"Jump table: <idx>"`` (per user directive: "list jump tables just
+# as you list blocks"). Centralising the dispatch here avoids forking
+# the label-compose path on the section discriminator.
+_BLOCK_KIND_INDEXED_PREFIXES: dict[BlockKind, str] = {
+    BlockKind.BODY: "Block",
+    BlockKind.JUMP_TABLE: "Jump table",
 }
 
 
 def _block_node_label(node: "BlockNode") -> str:
     """Compose the row text for a :class:`BlockNode`.
 
-    Dispatches off :attr:`BlockNode.kind`: the two non-body kinds
-    render their fixed section name; :attr:`BlockKind.BODY` composes
-    ``Block: <idx>   <preview>`` (the legacy shape).
+    Dispatches off :attr:`BlockNode.kind`: the non-indexed kinds
+    (variant prefix / function id) render their fixed section name;
+    the indexed kinds (body block / jump-table footer) compose
+    ``"<prefix>: <idx>   <preview>"`` with the per-kind prefix.
     """
     fixed = _BLOCK_KIND_LABELS.get(node.kind)
     if fixed is not None:
         return fixed
-    return f"Block: {node.block_idx}   {node.preview}"
+    prefix = _BLOCK_KIND_INDEXED_PREFIXES[node.kind]
+    return f"{prefix}: {node.block_idx}   {node.preview}"
 
 
 def _compose_label(node: Node) -> Text:

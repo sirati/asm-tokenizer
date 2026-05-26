@@ -34,11 +34,12 @@ class BlockNode:
     """One per section within a variant.
 
     A section is one of :attr:`BlockKind.VARIANT_HEADER`,
-    :attr:`BlockKind.FUNCTION_ID`, or :attr:`BlockKind.BODY` (per the
-    :class:`RenderedBlock` Protocol contract). Carries the factory ref
-    so inline-call descendants can spawn callee :class:`FunctionNode`
-    s against the same factory; carries the backend ref so the render
-    call lands on the parent's per-function backend instance.
+    :attr:`BlockKind.FUNCTION_ID`, :attr:`BlockKind.BODY`, or
+    :attr:`BlockKind.JUMP_TABLE` (per the :class:`RenderedBlock`
+    Protocol contract). Carries the factory ref so inline-call
+    descendants can spawn callee :class:`FunctionNode` s against the
+    same factory; carries the backend ref so the render call lands on
+    the parent's per-function backend instance.
     """
 
     factory: "BackendFactory"

@@ -32,7 +32,7 @@ from tokenizer.variant_tokens.prefixes import (
     OPT_PREFIX,
 )
 
-from ._block_header import block_v2_id, body_block_view
+from ._block_header import block_header, body_block_view
 from ._csv_index import CsvIndex
 from ._variant_state import VariantState, build_variant_state
 
@@ -143,20 +143,23 @@ class FtlBackend:
     def blocks(self, variant_idx: int) -> List[RenderedBlock]:
         """Per-block :class:`RenderedBlock`; triggers the variant parse.
 
-        FTL records carry only basic-block bodies (no variant_tokens
+        FTL records carry only function-body sections (no variant_tokens
         prefix + no per-CT self-prepend; the FTL stream STARTS at the
-        function-body opening), so every emitted entry is
-        :attr:`BlockKind.BODY`. The variant_header + function_id
-        sections are a BatchDecodeBackend concern.
+        function-body opening), so emitted entries are either
+        :attr:`BlockKind.BODY` (basic blocks) or
+        :attr:`BlockKind.JUMP_TABLE` (writer-emitted jump-table footer
+        blocks). The variant_header + function_id sections are a
+        BatchDecodeBackend concern.
 
-        ``block_idx`` is read from each block's
-        ``[Block_Def, block_v2:N]`` opening pair via
-        :func:`block_v2_id` -- the sibling positional index only
+        ``kind`` + ``block_idx`` are read from each block's
+        ``[Block_Def, <BLOCK_V2|JUMP_TABLE>:N]`` opening pair via
+        :func:`block_header` -- the sibling positional index only
         matches N for the simplest straight-line functions, and the
         UI label needs the authoritative N. The preview is taken from
         a :class:`BodyBlockView` so the header pair stays absorbed
         (mirrors BatchDecode's ``pending_header`` latch); the
-        rendered body never carries the ``_def block_v2:N`` text.
+        rendered body never carries the ``_def block_v2:N`` /
+        ``_def jump_table:N`` text.
         """
         self._raise_if_closed()
         if variant_idx in self._blocks_cache:
@@ -164,14 +167,16 @@ class FtlBackend:
         state = self._ensure_variant_state(variant_idx)
         from tokenizer.inspector._label import block_preview
 
-        rendered = [
-            RenderedBlock(
-                kind=BlockKind.BODY,
-                block_idx=block_v2_id(blk),
-                preview=block_preview(body_block_view(blk)),
+        rendered: List[RenderedBlock] = []
+        for blk in state.blocks:
+            section_kind, n = block_header(blk)
+            rendered.append(
+                RenderedBlock(
+                    kind=section_kind,
+                    block_idx=n,
+                    preview=block_preview(body_block_view(blk)),
+                )
             )
-            for blk in state.blocks
-        ]
         self._blocks_cache[variant_idx] = rendered
         return rendered
 
@@ -180,26 +185,29 @@ class FtlBackend:
     ) -> Iterable[LineItem]:
         """Materialise the line-item stream for ``(variant, kind, block)``.
 
-        FTL only produces :attr:`BlockKind.BODY` sections; any other
-        ``kind`` lands on a :class:`KeyError` so callers don't
-        accidentally render an FTL "variant header" / "function id"
-        section that doesn't exist in the FTL stream layer.
+        FTL produces :attr:`BlockKind.BODY` + :attr:`BlockKind.JUMP_TABLE`
+        sections; any other ``kind`` lands on a :class:`KeyError` so
+        callers don't accidentally render an FTL "variant header" /
+        "function id" section that doesn't exist in the FTL stream
+        layer.
 
-        ``block_idx`` is the block_v2 N read from the header pair (see
-        :meth:`blocks`); we look up the matching block by N rather
-        than by sibling position so callers and jump targets address
-        blocks in the same N space. The block is wrapped in a
+        ``(kind, block_idx)`` together address one block: the kind
+        discriminates which identity namespace ``N`` lives in (body
+        blocks vs jump-table footers), the index is the encoded N. We
+        look up the matching block by ``(kind, N)`` rather than by
+        sibling position so callers and jump targets address blocks
+        in the same coordinate space. The block is wrapped in a
         :class:`BodyBlockView` so the renderer's per-instruction walk
-        skips the opening ``[Block_Def, block_v2:N]`` pair.
+        skips the opening header pair.
         """
         self._raise_if_closed()
-        if kind is not BlockKind.BODY:
+        if kind not in (BlockKind.BODY, BlockKind.JUMP_TABLE):
             raise KeyError(
                 f"FtlBackend.render_block: kind={kind!r} not "
-                f"supported (FTL emits BODY sections only)"
+                f"supported (FTL emits BODY + JUMP_TABLE sections only)"
             )
         state = self._ensure_variant_state(variant_idx)
-        block = self._block_for_v2_id(state, block_idx)
+        block = self._block_for_header(state, kind, block_idx)
         # FtlBackend has no encoder-side per-call pin data (the CSV
         # stream carries no per_call_entries); every InlineCallEntry
         # emits with ``variant_idx == MISSING_VARIANT_INDEX`` so
@@ -216,8 +224,10 @@ class FtlBackend:
         )
 
     @staticmethod
-    def _block_for_v2_id(state: VariantState, block_idx: int):
-        """Locate the block whose ``block_v2:N`` header equals ``block_idx``.
+    def _block_for_header(
+        state: VariantState, kind: BlockKind, block_idx: int
+    ):
+        """Locate the block whose header matches ``(kind, block_idx)``.
 
         Linear scan keeps the lookup self-describing (the cached
         ``state.blocks`` is the single source of truth); typical block
@@ -227,12 +237,13 @@ class FtlBackend:
         with the same diagnostic shape as the BatchDecodeBackend.
         """
         for blk in state.blocks:
-            if block_v2_id(blk) == block_idx:
+            blk_kind, n = block_header(blk)
+            if blk_kind is kind and n == block_idx:
                 return blk
+        have = [block_header(b) for b in state.blocks]
         raise KeyError(
-            f"FtlBackend.render_block: no block with block_v2 id "
-            f"{block_idx} (have "
-            f"{[block_v2_id(b) for b in state.blocks]})"
+            f"FtlBackend.render_block: no block with header "
+            f"({kind.name}, {block_idx}) (have {have!r})"
         )
 
     def close(self) -> None:

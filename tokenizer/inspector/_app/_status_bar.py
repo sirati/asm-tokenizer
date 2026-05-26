@@ -44,8 +44,6 @@ from tokenizer.inspector._tree_model import (
     ShowAllVariantsNode,
     VariantNode,
 )
-from tokenizer.inspector._render._protocol import BlockKind
-
 from ._filter import FilterConfig
 from ._order import VariantGroupNode
 
@@ -125,13 +123,19 @@ def node_breadcrumb_segment(node: Node) -> Optional[str]:
         # to empty so every axis present on the variant surfaces here.
         return variant_label_from_axes(node.label_axes)
     if isinstance(node, BlockNode):
-        if node.kind is BlockKind.BODY:
-            return f"Block: {node.block_idx}"
-        # Match the labels module's per-kind names.
-        return {
-            BlockKind.VARIANT_HEADER: "Variant Header",
-            BlockKind.FUNCTION_ID: "Function ID",
-        }.get(node.kind, f"block:{node.block_idx}")
+        # Indexed kinds render ``"<prefix>: <idx>"`` (body block /
+        # jump-table footer); non-indexed kinds (variant prefix /
+        # function id) carry a fixed label. Routed through the
+        # labels-module dispatch tables so the breadcrumb stays in
+        # lockstep with the tree-row label.
+        from ._labels import _BLOCK_KIND_INDEXED_PREFIXES, _BLOCK_KIND_LABELS
+
+        indexed_prefix = _BLOCK_KIND_INDEXED_PREFIXES.get(node.kind)
+        if indexed_prefix is not None:
+            return f"{indexed_prefix}: {node.block_idx}"
+        return _BLOCK_KIND_LABELS.get(
+            node.kind, f"block:{node.block_idx}"
+        )
     if isinstance(node, InlineCallNode):
         return f"call {node.counter_id}: {node.callee_name}"
     if isinstance(node, InlineJumpNode):
