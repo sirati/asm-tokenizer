@@ -112,12 +112,11 @@ class FilterDialog(ModalScreen[FilterResult]):
         border: tall $accent;
         padding: 1 2;
         width: 80;
-        height: auto;
-        max-height: 90%;
+        height: 1fr;
+        margin: 3 0;
     }
     FilterDialog #filter-scroll {
-        height: auto;
-        max-height: 24;
+        height: 1fr;
     }
     FilterDialog .filter-axis-section {
         height: auto;

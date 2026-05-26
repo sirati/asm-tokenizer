@@ -1043,6 +1043,38 @@ def test_order_dialog_alt_c_cancels():
     asyncio.run(runner())
 
 
+def test_order_dialog_focuses_axis_list_on_mount():
+    """On mount the dialog's :class:`_ReorderableSelectionList` (the
+    per-axis checklist + reorder widget) holds keyboard focus, so the
+    user lands directly on the primary interaction surface (no extra
+    Tab press needed).
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                dialog = OrderDialog(candidate_axes=build_canonical_axes())
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from tokenizer.inspector._app._order._dialog import (
+                    _ReorderableSelectionList,
+                )
+
+                axis_list = dialog.query_one(
+                    "#order-list", _ReorderableSelectionList
+                )
+                assert app.focused is axis_list
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())
+
+
 def test_order_dialog_button_labels_have_underline_spans():
     """The Accept / Cancel buttons render with the trigger letter underlined."""
 

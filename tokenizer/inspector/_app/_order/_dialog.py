@@ -17,6 +17,10 @@ The dialog is constructed with the candidate axis tuple
 existing :class:`OrderConfig` carrying the previous run's ordering +
 grouping checks. Reconcile-against-candidates on construction: new
 candidates land at the end UNCHECKED; stale candidates drop silently.
+
+Focus: :meth:`on_mount` focuses the axis :class:`SelectionList` so
+the dialog opens keyboard-ready (no extra Tab press), mirroring the
+:class:`FilterDialog` focus-on-mount pattern.
 """
 
 from __future__ import annotations
@@ -254,6 +258,24 @@ class OrderDialog(ModalScreen[OrderResult]):
                 with Horizontal(id="order-buttons"):
                     yield Button("[u]A[/]ccept", id="accept", variant="primary")
                     yield Button("[u]C[/]ancel", id="cancel")
+
+    # --- focus -----------------------------------------------------
+
+    def on_mount(self) -> None:
+        """Land keyboard focus on the axis :class:`SelectionList`.
+
+        The dialog's primary interaction surface is the per-axis
+        checklist + reorder widget; focusing it on mount gives the
+        user a keyboard-ready dialog (no extra Tab press) and mirrors
+        the :class:`FilterDialog` focus-on-mount pattern.
+
+        When the candidate-axes tuple is empty the SelectionList
+        renders no rows but the widget still mounts -- focusing it is
+        still the right call (the screen-level ``alt+a`` / ``alt+c``
+        bindings stay live).
+        """
+        sel_list = self.query_one("#order-list", _ReorderableSelectionList)
+        sel_list.focus()
 
     # --- actions ---------------------------------------------------
 
