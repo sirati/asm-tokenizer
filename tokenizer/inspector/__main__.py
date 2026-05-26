@@ -60,6 +60,7 @@ class _OpenedBackend:
     stack: contextlib.ExitStack
     path: Path
     provider: LoaderProvider
+    binary: str
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
         stack=stack,
         path=path,
         provider=LoaderProvider.MEMMAP,
+        binary=binary_name,
     )
 
 
@@ -114,6 +116,7 @@ def _open_csv_backend(ns: argparse.Namespace) -> _OpenedBackend:
         stack=stack,
         path=path,
         provider=LoaderProvider.CSV,
+        binary=binary_name,
     )
 
 
@@ -161,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             log_path=log_path,
             path=opened.path,
             provider=opened.provider,
+            binary=opened.binary,
         )
 
 

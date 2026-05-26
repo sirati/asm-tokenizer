@@ -182,6 +182,7 @@ class InspectorApp(App[None]):
         log_path: Path,
         path: Optional[Path] = None,
         provider: "Optional[LoaderProvider]" = None,
+        binary: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._factory = factory
@@ -200,6 +201,7 @@ class InspectorApp(App[None]):
             )
         self._current_path: Optional[Path] = path
         self._current_provider: "Optional[LoaderProvider]" = provider
+        self._current_binary: Optional[str] = binary
         # Current variant ordering + grouping. ``None`` means
         # "default-sorted, no grouping" -- mirrors the legacy
         # backend-order rendering until the user opens the Order modal
@@ -567,6 +569,7 @@ def run_inspector(
     log_path: Path,
     path: Optional[Path] = None,
     provider: "Optional[LoaderProvider]" = None,
+    binary: Optional[str] = None,
 ) -> int:
     """Construct + run the app; return ``0`` on clean quit.
 
@@ -583,6 +586,7 @@ def run_inspector(
         log_path=log_path,
         path=path,
         provider=provider,
+        binary=binary,
     )
     app.run()
     return 0
