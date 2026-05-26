@@ -201,10 +201,12 @@ def test_factory_emits_keys_in_alphabetical_order():
 
 
 def test_factory_handles_unmatched_arm_unknown_sentinel():
-    """Unmatched-arm metadata carries ``"unknown"`` for every axis
-    (per ``_session_parsers.build_unmatched_function_data``). The
-    factory passes it through unchanged so per-arm bucketing remains
-    stable."""
+    """Defensive ``"unknown"`` fallback (legacy unmatched-arm shape:
+    datasets without ``_variants.bin`` cannot recover axes, so
+    ``_session_parsers.build_unmatched_function_data`` falls back to
+    the literal ``"unknown"`` placeholder via ``setdefault``). The
+    factory passes the sentinel through unchanged so per-arm bucketing
+    remains stable on those legacy corpora."""
     metadata = {
         "arch": "unknown", "compiler": "unknown",
         "compilerversion": "unknown", "opt": "unknown",

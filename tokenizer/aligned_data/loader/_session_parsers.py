@@ -124,12 +124,25 @@ def build_unmatched_function_data(
     insn_rl,
     block_rl,
     *,
+    variant_slot: int,
     resolve_ref: Callable,
     line_to_name: Dict[int, str],
 ) -> FunctionData:
     """Assemble an unmatched ``FunctionData`` from its BIN section + bytes.
 
-    Output dict carries ``variant_refs``, ``variants``, ``called``,
+    ``variant_slot`` indexes into ``section.variants`` and identifies
+    THIS record's variant (unmatched sections store one record per
+    variant). Its ``variant_ref_offset`` is resolved to pull the
+    canonical-4 axes (``arch / compiler / compilerversion / opt``) and
+    the variant's prefix-token stream out of ``_variants.bin``; the
+    metadata dict that lands on :class:`FunctionData` carries those
+    per-record axes directly, NOT the unmatched-arm ``"unknown"``
+    placeholder. Downstream consumers (inspector, variant-identity
+    factory) read the canonical axes off ``FunctionData.metadata``
+    without knowing this is the unmatched arm.
+
+    Output dict carries ``arch``/``compiler``/``compilerversion``/``opt``
+    (recovered per-slot), ``variant_refs``, ``variants``, ``called``,
     ``call_targets``, and ``data_offset``. Fields derive from
     ``section``'s parsed call_target table + per-variant blocks:
 
@@ -145,11 +158,27 @@ def build_unmatched_function_data(
       ``_data.bin`` so no length / overlong flag crosses this boundary.
     * ``data_offset`` -- the per-record offset the session passed in
       (from ``unmatched_index.bin``).
+
+    The ``variant_refs`` / ``variants`` / ``call_targets`` lists are
+    still section-wide (every variant block), preserving the legacy
+    metadata contract; the per-record axes ride alongside them.
     """
     variant_refs = [f"{v.variant_ref_offset:x}" for v in section.variants]
     variants = [
         v for v in (resolve_ref(r) for r in variant_refs) if v is not None
     ]
+    if variant_slot < 0 or variant_slot >= len(section.variants):
+        raise IndexError(
+            f"unmatched variant_slot={variant_slot} out of bounds for "
+            f"section with {len(section.variants)} variants"
+        )
+    # Resolve THIS record's variant directly — its ``variant_ref_offset``
+    # may differ from neighbouring section variants (cross-arch / cross-
+    # compiler variants in the same unmatched section), so picking the
+    # first resolved entry of ``variants`` would mis-label every slot
+    # past 0. Falling back to ``None`` keeps legacy datasets without a
+    # ``_variants.bin`` sidecar (resolver returns ``None``) working.
+    this_variant_row = resolve_ref(variant_refs[variant_slot])
     called: List[str] = []
     for ct in section.call_targets:
         name = line_to_name.get(ct.function_name_ptr)
@@ -168,11 +197,7 @@ def build_unmatched_function_data(
                 ]
             )
 
-    metadata = {
-        "arch": "unknown",
-        "compiler": "unknown",
-        "compilerversion": "unknown",
-        "opt": "unknown",
+    metadata: Dict[str, Any] = {
         "variant_refs": variant_refs,
         "variants": variants,
         "called": called,
@@ -184,12 +209,25 @@ def build_unmatched_function_data(
         # arm so downstream stages remain arm-agnostic.
         "category_counts": compute_category_counts(tokens),
     }
-    # Unmatched functions span multiple variants; ``FunctionData.variant_tokens``
-    # carries the first resolved variant's prefix (deterministic by section-row
-    # order). Consumers wanting the full per-variant axis token streams find
-    # them on ``metadata["variants"][i]["variant_tokens"]``.
-    primary_variant = variants[0] if variants else None
+    # Per-slot canonical-4 axes via the variant resolver. The resolver
+    # returns ``{arch, compiler, compilerversion, opt, ...}`` keys; we
+    # merge them in so consumers (``VariantInfo.from_function_data_metadata``,
+    # the inspector's label_axes, the arch-prefix elider) see real
+    # axes instead of the ``"unknown"`` placeholder. Missing resolver
+    # (legacy datasets without ``_variants.bin``) keeps the historical
+    # unknown-axis fallback.
+    if this_variant_row is not None:
+        for axis_key in ("arch", "compiler", "compilerversion", "opt"):
+            value = this_variant_row.get(axis_key)
+            if value is not None:
+                metadata[axis_key] = value
+        for k, v in this_variant_row.items():
+            metadata.setdefault(k, v)
+    metadata.setdefault("arch", "unknown")
+    metadata.setdefault("compiler", "unknown")
+    metadata.setdefault("compilerversion", "unknown")
+    metadata.setdefault("opt", "unknown")
     return FunctionData(
         func_name, metadata, tokens, insn_rl, block_rl,
-        variant_tokens=_variant_tokens_from_row(primary_variant),
+        variant_tokens=_variant_tokens_from_row(this_variant_row),
     )

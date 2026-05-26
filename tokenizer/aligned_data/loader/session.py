@@ -228,12 +228,22 @@ class BinarySession(_BinarySessionHelpersMixin):
         section, section_offset = self._unmatched_section_for_record(
             arm, idx, start
         )
+        # Per-record -> per-variant slot inside the owning section.
+        # Unmatched sections store one record per variant; the slot is
+        # the offset from the section's first-record idx in the arm's
+        # ``record_to_section_idx`` mapping. Threaded into the builder
+        # so the per-slot ``variant_ref`` resolves to THIS record's
+        # canonical-4 axes (not the section's first variant).
+        section_idx = self._unmatched_section_idx(arm, idx)
+        base = self._unmatched_record_slot_base(arm, section_idx)
+        variant_slot = idx - base
         line_to_name = self._meta_get("line_to_name") or {}
         fd = build_unmatched_function_data(
             section,
             self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
+            variant_slot=variant_slot,
             resolve_ref=self.get_variant_by_ref,
             line_to_name=line_to_name,
         )
@@ -288,6 +298,7 @@ class BinarySession(_BinarySessionHelpersMixin):
                     self._unmatched_func_name(arm, record_idx),
                     start,
                     tokens, insn_rl, block_rl,
+                    variant_slot=slot,
                     resolve_ref=self.get_variant_by_ref,
                     line_to_name=line_to_name,
                 )
