@@ -50,11 +50,16 @@ class _OpenedBackend:
     ``factory`` is the live :class:`BackendFactory`; ``stack`` owns
     its shutdown (the caller drives ``with stack:``). ``log_dir`` is
     the source directory used for the inspector log path.
+    ``memmap_path`` / ``csv_path`` carry the source path so the
+    binary-switcher dialog knows which provider was opened (exactly
+    one is set; the other is ``None``).
     """
 
     factory: BackendFactory
     stack: contextlib.ExitStack
     log_dir: Path
+    memmap_path: Path | None = None
+    csv_path: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +88,7 @@ def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
         factory=factory,
         stack=stack,
         log_dir=memmap_dir,
+        memmap_path=memmap_dir,
     )
 
 
@@ -107,6 +113,7 @@ def _open_csv_backend(ns: argparse.Namespace) -> _OpenedBackend:
         factory=factory,
         stack=stack,
         log_dir=csv_dir,
+        csv_path=csv_dir,
     )
 
 
@@ -155,7 +162,12 @@ def main(argv: list[str] | None = None) -> int:
 
     with opened.stack:
         log_path = opened.log_dir / ".tui-inspector.log"
-        return run_inspector(factory=opened.factory, log_path=log_path)
+        return run_inspector(
+            factory=opened.factory,
+            log_path=log_path,
+            memmap_path=opened.memmap_path,
+            csv_path=opened.csv_path,
+        )
 
 
 if __name__ == "__main__":

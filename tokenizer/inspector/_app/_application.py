@@ -37,6 +37,7 @@ from ._auto_expand import collapse_single_child_chains
 from ._filter import FilterConfig, FilterResult
 from ._help_dialog import HelpScreen
 from ._labels import _ERR_STYLE, _compose_label
+from ._menu_bar import Alignment, MenuBar, MenuItem
 from ._node_path import CapturedExpandState
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
 from ._status_bar import StatusBar
@@ -149,6 +150,7 @@ class InspectorApp(App[None]):
 
     CSS: ClassVar[str] = """
     Screen { layout: vertical; }
+    #menubar { height: 1; }
     #tree { height: 1fr; }
     #search { display: none; height: 3; }
     #search.visible { display: block; }
@@ -168,6 +170,7 @@ class InspectorApp(App[None]):
         Binding("escape", "hide_search", "Hide search", show=False),
         Binding("o", "open_order_dialog", "Order", show=True),
         Binding("f", "open_filter_dialog", "Filter", show=True),
+        Binding("b", "open_binary_switcher", "Switch binary", show=True),
     ]
 
     def __init__(
@@ -175,10 +178,27 @@ class InspectorApp(App[None]):
         *,
         factory: "BackendFactory",
         log_path: Path,
+        memmap_path: Optional[Path] = None,
+        csv_path: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self._factory = factory
         self._log = _setup_inspector_log(log_path)
+        # Current-source tracking for the binary-switcher dialog: the
+        # active provider (memmap vs csv) and the path the factory was
+        # opened against. ``__main__`` passes whichever ``--memmap-dir``
+        # / ``--csv-dir`` argument the user supplied; both being ``None``
+        # is the mock-factory-in-tests case where the switch dialog is
+        # not exercised against a real source. The current provider is
+        # inferred from which path is non-``None``.
+        from ._binary_switcher import LoaderProvider
+
+        self._current_memmap_path: Optional[Path] = memmap_path
+        self._current_csv_path: Optional[Path] = csv_path
+        self._current_provider: Optional[LoaderProvider] = (
+            LoaderProvider.MEMMAP if memmap_path is not None
+            else (LoaderProvider.CSV if csv_path is not None else None)
+        )
         # Current variant ordering + grouping. ``None`` means
         # "default-sorted, no grouping" -- mirrors the legacy
         # backend-order rendering until the user opens the Order modal
@@ -205,6 +225,7 @@ class InspectorApp(App[None]):
     # --- compose ---------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        yield MenuBar(items=self._menu_items(), id="menubar")
         tree: _InspectorTree = _InspectorTree("inspector", id="tree")
         # Seed the root with one FunctionNode per handle the factory
         # published. The factory owns discovery; the UI just iterates.
@@ -221,6 +242,29 @@ class InspectorApp(App[None]):
         status_bar = StatusBar(id="status-bar")
         status_bar.set_tree(tree)
         yield status_bar
+
+    def _menu_items(self) -> tuple[MenuItem, ...]:
+        """Static set of top-bar menu items.
+
+        Kept in lockstep with the App-level BINDINGS so the hotkey hint
+        the bar shows matches the actual binding. Future menu entries
+        (filter, view, ...) extend this tuple — the bar widget is
+        item-list-driven and does not require changes.
+        """
+        return (
+            MenuItem(
+                label="Switch binary",
+                action_name="open_binary_switcher",
+                hotkey="b",
+                alignment=Alignment.LEFT,
+            ),
+            MenuItem(
+                label="help",
+                action_name="open_help",
+                hotkey="h",
+                alignment=Alignment.RIGHT,
+            ),
+        )
 
     def _build_root_function_node(
         self, handle: "FunctionHandle"
@@ -375,6 +419,19 @@ class InspectorApp(App[None]):
 
     # --- modals ----------------------------------------------------
 
+    def action_open_binary_switcher(self) -> None:
+        """Open the binary-switcher modal.
+
+        The heavy lifting (provider tree, folder picker, switch) lives
+        in :mod:`tokenizer.inspector._app._binary_switcher` so this
+        module's single concern stays the tree dispatcher. Imported
+        lazily inside the action so the Phase-1 menu-bar landing does
+        not require the switcher subpackage to exist before it ships.
+        """
+        from ._binary_switcher import open_binary_switcher
+
+        open_binary_switcher(self)
+
     def action_open_help(self) -> None:
         """Push the help modal listing every active binding.
 
@@ -507,13 +564,23 @@ def run_inspector(
     *,
     factory: "BackendFactory",
     log_path: Path,
+    memmap_path: Optional[Path] = None,
+    csv_path: Optional[Path] = None,
 ) -> int:
     """Construct + run the app; return ``0`` on clean quit.
 
     Every backend the factory mints is opened lazily on first
     ``FunctionNode.expand`` call; the caller (``__main__``) owns the
-    factory + any session it wraps via ``with stack:``.
+    factory + any session it wraps via ``with stack:``. The optional
+    ``memmap_path`` / ``csv_path`` arguments seed the binary-switcher
+    dialog's "current path" indicator — pass whichever
+    ``--memmap-dir`` / ``--csv-dir`` flag the CLI consumed.
     """
-    app = InspectorApp(factory=factory, log_path=log_path)
+    app = InspectorApp(
+        factory=factory,
+        log_path=log_path,
+        memmap_path=memmap_path,
+        csv_path=csv_path,
+    )
     app.run()
     return 0
