@@ -53,9 +53,12 @@ def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
     if not vocab_path.exists():
         raise ValueError(
             f"unified_vocab.csv not found at {vocab_path}; the "
-            "variant-aware dataloader requires a corpus-wide unified "
-            "vocab. Run `python -m tokenizer.vocab_unifier --source "
-            "<dir> --output <dir>` to produce one."
+            "variant-aware dataloader requires the SAME corpus-wide "
+            "unified vocab that was used to build this memmap (the "
+            "vocab is part of the memmap's identity — building a new "
+            "one would produce ids that disagree with the bin data). "
+            "Copy the unified_vocab.csv from the build-pipeline output "
+            "alongside the rest of the memmap files."
         )
 
     from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
