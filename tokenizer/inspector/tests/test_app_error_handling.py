@@ -470,6 +470,10 @@ def test_right_arrow_on_fitting_row_expands_collapsed_node():
             async with app.run_test() as pilot:
                 # A BlockNode with a short preview fits within the 80-col
                 # viewport; can_expand is True so right-arrow must expand.
+                # A sentinel AsmLeaf sibling keeps the FunctionNode's
+                # mounted child count at 2 so the collapse-single-child-
+                # chain policy does not remove ``short_block`` from the
+                # tree before the keyboard interaction we're asserting.
                 short_block = BlockNode(
                     factory=MagicMock(),
                     backend=MagicMock(),
@@ -479,8 +483,9 @@ def test_right_arrow_on_fitting_row_expands_collapsed_node():
                     preview="x",
                 )
                 short_block.expand = MagicMock(return_value=[])
+                sentinel_sibling = AsmLeaf(text="sentinel")
                 tree, _fn, children = await _expand_function_with_children(
-                    app, pilot, [short_block]
+                    app, pilot, [short_block, sentinel_sibling]
                 )
                 row = children[0]
                 tree.move_cursor(row, animate=False)
@@ -509,6 +514,9 @@ def test_right_arrow_on_already_expanded_fitting_row_is_noop():
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
+                # Sentinel sibling keeps the FunctionNode's mounted
+                # child count at 2 so the collapse-single-child-chain
+                # policy does not remove ``short_block``.
                 short_block = BlockNode(
                     factory=MagicMock(),
                     backend=MagicMock(),
@@ -518,8 +526,9 @@ def test_right_arrow_on_already_expanded_fitting_row_is_noop():
                     preview="x",
                 )
                 short_block.expand = MagicMock(return_value=[])
+                sentinel_sibling = AsmLeaf(text="sentinel")
                 tree, _fn, children = await _expand_function_with_children(
-                    app, pilot, [short_block]
+                    app, pilot, [short_block, sentinel_sibling]
                 )
                 row = children[0]
                 tree.move_cursor(row, animate=False)
@@ -564,6 +573,8 @@ def test_right_arrow_on_overflowing_collapsed_node_pans_instead_of_expand():
                 # A BlockNode whose preview spills past the 80-col viewport
                 # AND can_expand=True. Both the scroll path and the expand
                 # path are reachable; the priority order must pick scroll.
+                # Sentinel sibling defeats the collapse-single-child-chain
+                # policy so ``long_block`` stays in the tree.
                 long_block = BlockNode(
                     factory=MagicMock(),
                     backend=MagicMock(),
@@ -573,8 +584,9 @@ def test_right_arrow_on_overflowing_collapsed_node_pans_instead_of_expand():
                     preview="x" * 200,
                 )
                 long_block.expand = MagicMock(return_value=[])
+                sentinel_sibling = AsmLeaf(text="sentinel")
                 tree, _fn, children = await _expand_function_with_children(
-                    app, pilot, [long_block]
+                    app, pilot, [long_block, sentinel_sibling]
                 )
                 row = children[0]
                 tree.move_cursor(row, animate=False)
@@ -643,8 +655,11 @@ def test_right_arrow_on_indent_only_overflow_pans():
                     preview="x" * (viewport_width - 11 - 2 - 2),
                 )
                 long_block.expand = MagicMock(return_value=[])
+                # Sentinel sibling defeats the collapse-single-child-
+                # chain policy so ``long_block`` stays in the tree.
+                sentinel_sibling = AsmLeaf(text="sentinel")
                 tree, _fn, children = await _expand_function_with_children(
-                    app, pilot, [long_block]
+                    app, pilot, [long_block, sentinel_sibling]
                 )
                 row = children[0]
                 tree.move_cursor(row, animate=False)
@@ -893,6 +908,8 @@ def test_intervening_key_invalidates_undo():
             async with app.run_test() as pilot:
                 # Collapsed expandable so the post-invalidation ``→``
                 # exercises the expand fallback (proving it's NOT undo).
+                # Sentinel sibling defeats the collapse-single-child-
+                # chain policy so ``short_block`` stays in the tree.
                 short_block = BlockNode(
                     factory=MagicMock(),
                     backend=MagicMock(),
@@ -902,8 +919,11 @@ def test_intervening_key_invalidates_undo():
                     preview="x",
                 )
                 short_block.expand = MagicMock(return_value=[])
+                sentinel_sibling = AsmLeaf(text="sentinel")
                 tree, fn_tree_node, children = (
-                    await _expand_function_with_children(app, pilot, [short_block])
+                    await _expand_function_with_children(
+                        app, pilot, [short_block, sentinel_sibling]
+                    )
                 )
                 child_tree_node = children[0]
 

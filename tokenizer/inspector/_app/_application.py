@@ -35,7 +35,7 @@ from tokenizer.inspector._tree_model import (
 from tokenizer.variant_info import VariantIdentity
 
 from . import _order_hooks
-from ._auto_expand import auto_expand_lone_child
+from ._auto_expand import collapse_single_child_chains
 from ._help_dialog import HelpScreen
 from ._labels import _compose_label
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
@@ -270,6 +270,18 @@ class InspectorApp(App[None]):
             node.refresh()
             return
 
+        # Universal "no selection when only one option" rule: delegated
+        # to :mod:`._auto_expand`. When the parent's expand result is
+        # a chain of single-expandable-child wrappers, those wrappers
+        # are REMOVED from the rendered tree and the deepest content
+        # is mounted under this parent directly. The chain expansion
+        # threads through ``_safe_expand_one`` so an intermediate
+        # wrapper failure stops the collapse + marks the wrapper for
+        # the dispatcher's normal error-leaf flow.
+        children = collapse_single_child_chains(
+            children, expand_one=self._safe_expand_one
+        )
+
         # Sort + group pass: :func:`_order_hooks.apply_grouping` natsort-
         # orders the variant siblings (always, with or without an active
         # ``OrderConfig``) and optionally restructures them into
@@ -277,7 +289,9 @@ class InspectorApp(App[None]):
         # :class:`FunctionNode.expand` stays unchanged (cluster #6 W4-
         # AMENDED). The alignment stamp below runs AFTER grouping so it
         # acts on the per-group sibling set when grouping is active and
-        # on the flat sorted set otherwise.
+        # on the flat sorted set otherwise. Collapse runs FIRST so a
+        # variant list surfaced from beneath a collapsed wrapper still
+        # gets the same sort + group treatment.
         children = _order_hooks.apply_grouping(self, model, children)
         suppressed_axes = _collect_suppressed_axes(node)
         _stamp_aligned_variant_labels(children, suppressed_axes)
@@ -298,14 +312,31 @@ class InspectorApp(App[None]):
         # potentially-many-deep group tree without polling).
         _order_hooks.consume_auto_expand_post_mount(self, node, model)
 
-        # Universal "no selection when only one option" rule: delegated
-        # to :mod:`._auto_expand`. Single-concern: that module owns the
-        # UI policy (click-through-on-1-child); this dispatcher only
-        # invokes it post-mount. The cascade is naturally recursive
-        # because :meth:`TreeNode.expand` posts a
-        # :class:`Tree.NodeExpanded` that re-enters here for the
-        # auto-expanded child.
-        auto_expand_lone_child(node)
+    def _safe_expand_one(self, model: "Node") -> "Optional[list[Node]]":
+        """Wrapper-level ``model.expand`` with the dispatcher's error policy.
+
+        Returns the model's own child list on success, ``None`` on
+        failure. Failure path mirrors :meth:`_on_node_expanded`'s
+        try/except: log the traceback at ERROR + flip ``is_failed``
+        so the wrapper (which collapse will now KEEP instead of skip)
+        paints with the ``[*]`` prefix and re-runs the failing expand
+        when the user opens it manually.
+
+        Lives on :class:`InspectorApp` -- not in
+        :mod:`._auto_expand` -- because the error policy (logger,
+        ``is_failed`` flag) is the dispatcher's concern; the collapse
+        module stays selection-shape-only.
+        """
+        try:
+            return list(model.expand())
+        except Exception:
+            self._log.error(
+                "wrapper expand failed for %r during collapse: %s",
+                model,
+                traceback.format_exc(),
+            )
+            model.is_failed = True
+            return None
 
     # Horizontal-scroll concerns (editor-like per-row scroll memory +
     # cursor-aware auto-adjust + conditional right-arrow expand) live
