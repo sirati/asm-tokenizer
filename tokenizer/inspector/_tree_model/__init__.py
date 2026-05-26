@@ -19,7 +19,8 @@ demand. :class:`InlineCallNode.expand` constructs a synthetic callee
 The package is split by concern (one node family per submodule):
 
 * :mod:`._nodes_leaf` -- terminal :class:`AsmLeaf` +
-  :class:`ShowAllVariantsNode`.
+  :class:`NumberPrecisionLeaf` + :class:`InlineCallMissingVariantLeaf`
+  + :class:`ShowAllVariantsNode`.
 * :mod:`._nodes_function` -- top-level :class:`FunctionNode`.
 * :mod:`._nodes_variant` -- :class:`VariantNode`.
 * :mod:`._nodes_block` -- :class:`BlockNode` + :class:`InlineJumpNode`.
@@ -37,7 +38,12 @@ from __future__ import annotations
 from ._nodes_block import BlockNode, InlineJumpNode
 from ._nodes_call import InlineCallNode
 from ._nodes_function import FunctionNode
-from ._nodes_leaf import AsmLeaf, NumberPrecisionLeaf, ShowAllVariantsNode
+from ._nodes_leaf import (
+    AsmLeaf,
+    InlineCallMissingVariantLeaf,
+    NumberPrecisionLeaf,
+    ShowAllVariantsNode,
+)
 from ._nodes_variant import VariantNode
 
 
@@ -47,6 +53,7 @@ Node = (
     AsmLeaf
     | BlockNode
     | FunctionNode
+    | InlineCallMissingVariantLeaf
     | InlineCallNode
     | InlineJumpNode
     | NumberPrecisionLeaf
@@ -59,6 +66,7 @@ __all__ = [
     "AsmLeaf",
     "BlockNode",
     "FunctionNode",
+    "InlineCallMissingVariantLeaf",
     "InlineCallNode",
     "InlineJumpNode",
     "Node",

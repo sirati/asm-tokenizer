@@ -17,7 +17,6 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional
 
-from rich.style import Style
 from rich.text import Text
 
 from textual import on
@@ -37,7 +36,7 @@ from tokenizer.variant_info import VariantIdentity
 from . import _order_hooks
 from ._auto_expand import collapse_single_child_chains
 from ._help_dialog import HelpScreen
-from ._labels import _compose_label
+from ._labels import _ERR_STYLE, _compose_label
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
 from ._tree_widget import _InspectorTree
 
@@ -52,10 +51,6 @@ if TYPE_CHECKING:
 
 
 __all__ = ["InspectorApp", "run_inspector"]
-
-
-# Dim red style for the error-child leaf placed under a failed node.
-_ERR_STYLE = Style(color="red", dim=True)
 
 # Logger name -- dedicated logger (not root) so pytest's caplog and
 # the asm-tokenizer's existing logging config don't fight over

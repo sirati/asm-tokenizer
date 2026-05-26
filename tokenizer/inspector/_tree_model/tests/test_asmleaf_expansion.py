@@ -129,7 +129,8 @@ def test_asmleaf_single_inline_call_threads_variant_idx():
     :attr:`VariantBlock.per_call_entries`) is threaded through to
     :class:`InlineCallNode.variant_idx`. The expand path uses this
     to splice the matching callee variant's blocks in directly (D2);
-    a :data:`MISSING_VARIANT_INDEX` value would surface every variant.
+    a :data:`MISSING_VARIANT_INDEX` value surfaces the no-pin error
+    leaf + show-all-variants sibling fallback.
     """
     factory = MagicMock(spec=BackendFactory)
     entry = InlineCallEntry(
