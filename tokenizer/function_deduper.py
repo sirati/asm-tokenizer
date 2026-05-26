@@ -237,12 +237,19 @@ def canonical_function_name(
       Ghidra ``Function``s with ``name=='reset'``); the demangled
       signature is the natural cross-ISA-stable disambiguator.
     * ``comment`` is None AND ``identity_key`` populated ->
-      ``f"{name}@thunk:{sanitised_key}"``. PLT thunks share the
-      resolved target's name; the suffix comes from the
-      :class:`ThunkIdentity` ``key`` field (the imported symbol name
-      for external-target thunks — cross-binary stable; a hex offset
-      for local-target thunks — within-binary stable). Legacy callers
-      passing a bare integer fall through to ``str(int)``.
+      ``f"thunk:{sanitised_key}"`` when the identity is a typed
+      :class:`ThunkIdentity`. The ``name`` axis carries no cross-
+      binary signal in the thunk case (it's either the resolved
+      target's name — redundant with the key, or a per-binary
+      placeholder rename — actively destabilising), so it is dropped.
+      The suffix comes from the :class:`ThunkIdentity` ``key`` field
+      (the imported symbol name for external-target thunks — cross-
+      binary stable; the target function name for named local-target
+      thunks — also cross-binary stable; a hex offset for unnamed
+      local targets — within-binary stable only). Legacy callers
+      passing a bare integer fall through to ``f"{name}@thunk:{int}"``
+      — they pre-date the typed identity and the prefix-drop is
+      gated on the dataclass isinstance check.
     * Both None -> ``name`` verbatim. The deduper's body-divergence
       diagnostic and the FDM's positional ``_N`` allocator are the only
       callers that touch this branch's downstream disambiguation (which
@@ -260,7 +267,20 @@ def canonical_function_name(
         suffix = _sanitize_comment_suffix(comment)
         return f"{name}@{suffix}"
     if identity_key is not None:
-        return f"{name}@thunk:{_identity_key_suffix(identity_key)}"
+        suffix = _identity_key_suffix(identity_key)
+        if isinstance(identity_key, ThunkIdentity):
+            # The thunk identity IS the canonical name; the ``name``
+            # axis is either redundant (Ghidra resolved name = target
+            # name), uninformative (per-binary ``unnamed @<hash>``
+            # placeholder rename), or a custom alias preserved
+            # separately on the deduper's identity tuple. Collapsing
+            # here makes thunk renderings cross-binary stable provided
+            # the :class:`ThunkIdentity` itself is — the provider's
+            # contract for EXTERNAL and named-target LOCAL thunks.
+            return f"thunk:{suffix}"
+        # Legacy bare-int identity_key path (pre-typed callers;
+        # preserved for back-compat).
+        return f"{name}@thunk:{suffix}"
     return name
 
 
