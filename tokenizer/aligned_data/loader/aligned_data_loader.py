@@ -28,7 +28,10 @@ import numpy as np
 from .binary_dataset import BinaryDataset
 from .function_data import FunctionData
 from .matched_function import MatchedFunction
-from .unified_vocab_gate import load_and_validate_unified_vocab
+from .unified_vocab_gate import (
+    load_and_validate_unified_vocab,
+    resolve_unified_vocab_path,
+)
 
 
 class AlignedDataLoader:
@@ -63,10 +66,12 @@ class AlignedDataLoader:
             max_length: Maximum token length (inclusive), None for no limit
             seed: Random seed for reproducibility
             unified_vocab_path: Path to the corpus-wide ``unified_vocab.csv``.
-                Defaults to ``base_path / "unified_vocab.csv"``. Loaded once
-                here and threaded into every ``BinaryDataset`` so variant-axis
-                tokens decode through the same ID space the memmap_builder
-                wrote.
+                Defaults to the first existing candidate from
+                :func:`resolve_unified_vocab_path` — alongside the memmap
+                bins, or at the corpus-root parent when the bins live in
+                a subdirectory. Loaded once here and threaded into every
+                ``BinaryDataset`` so variant-axis tokens decode through the
+                same ID space the memmap_builder wrote.
 
         Raises:
             ValueError: If the unified vocab is missing, unparseable, or its
@@ -81,12 +86,14 @@ class AlignedDataLoader:
         self.max_length = max_length if max_length is not None else 1_000_000
         self.rng = np.random.default_rng(seed)
 
-        # Resolve unified vocab path with a base-path-relative default; keep
-        # it on the instance for diagnostics.
+        # Resolve unified vocab path: explicit caller-supplied path wins;
+        # otherwise search the policy candidates (vocab alongside the
+        # memmap bins or one level up at the corpus root). Keep the
+        # resolved path on the instance for diagnostics.
         self.unified_vocab_path = (
             Path(unified_vocab_path)
             if unified_vocab_path is not None
-            else self.base_path / "unified_vocab.csv"
+            else resolve_unified_vocab_path(self.base_path)
         )
 
         # Load + gate the unified vocab BEFORE constructing any BinaryDataset.

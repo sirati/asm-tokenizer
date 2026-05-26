@@ -20,6 +20,7 @@ from tokenizer.aligned_data.loader import unified_vocab_gate
 from tokenizer.aligned_data.loader.unified_vocab_gate import (
     REQUIRED_UNIFIED_VOCAB_FORMAT_VERSION,
     load_and_validate_unified_vocab,
+    resolve_unified_vocab_path,
 )
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 
@@ -116,3 +117,70 @@ def test_unparseable_vocab_raises(tmp_path: Path) -> None:
             load_and_validate_unified_vocab(vocab_path)
 
     assert "failed to parse" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Search-path policy — ``resolve_unified_vocab_path``
+# ---------------------------------------------------------------------------
+def test_resolve_finds_vocab_alongside_memmap_bins(tmp_path: Path) -> None:
+    """Primary lookup: vocab sits in the same directory as the memmap bins."""
+    memmap_dir = tmp_path / "memmap"
+    memmap_dir.mkdir()
+    in_dir = memmap_dir / "unified_vocab.csv"
+    _touch(in_dir)
+
+    assert resolve_unified_vocab_path(memmap_dir) == in_dir
+
+
+def test_resolve_falls_back_to_parent_when_bins_in_subdir(tmp_path: Path) -> None:
+    """Corpus-root layout: bins in ``<root>/memmap/``, vocab at ``<root>/``.
+
+    This is the layout the user runs with — the memmap subdir holds the
+    per-binary bins and the vocab lives one level up at the corpus root.
+    Resolver must walk up one level when nothing is found alongside.
+    """
+    corpus_root = tmp_path / "corpus"
+    memmap_dir = corpus_root / "memmap"
+    memmap_dir.mkdir(parents=True)
+    at_root = corpus_root / "unified_vocab.csv"
+    _touch(at_root)
+
+    assert resolve_unified_vocab_path(memmap_dir) == at_root
+
+
+def test_resolve_prefers_in_directory_over_parent(tmp_path: Path) -> None:
+    """When both candidates exist, the in-directory copy wins.
+
+    An explicit per-memmap-dir vocab is the operator's signal that it
+    overrides any inherited corpus-root copy. Without this priority a
+    legitimate per-dir override could be silently shadowed by a stale
+    parent vocab.
+    """
+    corpus_root = tmp_path / "corpus"
+    memmap_dir = corpus_root / "memmap"
+    memmap_dir.mkdir(parents=True)
+    in_dir = memmap_dir / "unified_vocab.csv"
+    at_root = corpus_root / "unified_vocab.csv"
+    _touch(in_dir)
+    _touch(at_root)
+
+    assert resolve_unified_vocab_path(memmap_dir) == in_dir
+
+
+def test_resolve_missing_lists_all_candidates(tmp_path: Path) -> None:
+    """No candidate exists -> ValueError enumerating every probed path.
+
+    Operator-facing diagnostic: the message must name both candidates so
+    a copy-to-the-right-place fix is mechanical.
+    """
+    corpus_root = tmp_path / "corpus"
+    memmap_dir = corpus_root / "memmap"
+    memmap_dir.mkdir(parents=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        resolve_unified_vocab_path(memmap_dir)
+
+    message = str(excinfo.value)
+    assert "unified_vocab.csv not found" in message
+    assert str(memmap_dir / "unified_vocab.csv") in message
+    assert str(corpus_root / "unified_vocab.csv") in message

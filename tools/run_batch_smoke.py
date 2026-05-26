@@ -106,8 +106,9 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Override unified_vocab.csv path (default: "
-            "<memmap-dir>/unified_vocab.csv)."
+            "Override unified_vocab.csv path (default: searched at "
+            "<memmap-dir>/unified_vocab.csv then "
+            "<memmap-dir>/../unified_vocab.csv)."
         ),
     )
     parser.add_argument(
@@ -213,15 +214,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"no binaries discovered under {memmap_dir}", file=sys.stderr)
         return 2
 
-    unified_vocab = (
+    unified_vocab_override = (
         args.unified_vocab.expanduser().resolve()
         if args.unified_vocab is not None
-        else memmap_dir / "unified_vocab.csv"
+        else None
     )
 
     print(
         f"memmap_dir   : {memmap_dir}\n"
-        f"unified_vocab: {unified_vocab}\n"
+        f"unified_vocab: {unified_vocab_override or '<resolved via search policy>'}\n"
         f"binaries     : {binary_names}\n"
         f"max_per_bin  : {args.max_functions_per_binary}\n"
         f"context_len  : {args.context_len}",
@@ -232,7 +233,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     loader = AlignedDataLoader(
         base_path=memmap_dir,
         binary_names=binary_names,
-        unified_vocab_path=unified_vocab,
+        unified_vocab_path=unified_vocab_override,
     )
 
     # Single Generator shared across binaries; deterministic across runs
