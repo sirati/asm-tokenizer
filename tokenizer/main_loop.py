@@ -16,11 +16,13 @@ from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
 from tokenizer.function_deduper import FunctionDeduper, canonical_function_name
 from tokenizer.function_filter import FunctionFilter
+from tokenizer.function_range_sidecar import FunctionRangeSidecar
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.opaque_remapping import (
     apply_opaque_mapping,
     apply_opaque_mapping_raw_optimized,
 )
+from tokenizer.output_filename import derive_sidecar_path
 from tokenizer.string_sidecar import StringSidecar
 from tokenizer.tokens import Category, TokenResolver
 from tokenizer.vocab_unifier import save_vocabulary
@@ -50,18 +52,20 @@ _V2_METADATA_KEY_ORDER: list[tuple[Category, str]] = [
 def _strings_path_for(csv_path: Path) -> Path:
     """Derive the per-binary ``_strings.bin`` sidecar path from the CSV path.
 
-    Both paths share a ``<base>`` prefix (see ``tokenizer/output_filename.py``);
-    the CSV ends in ``_output.csv`` and the sidecar ends in ``_strings.bin``.
+    Thin wrapper over ``output_filename.derive_sidecar_path`` so the
+    ``<base>``-derivation rule lives in exactly one place.
     """
-    csv_path = Path(csv_path)
-    name = csv_path.name
-    suffix = "_output.csv"
-    if name.endswith(suffix):
-        base = name[: -len(suffix)]
-    else:
-        # Defensive fallback — strip a trailing extension only.
-        base = csv_path.stem
-    return csv_path.with_name(f"{base}_strings.bin")
+    return derive_sidecar_path(csv_path, "_strings.bin")
+
+
+def _function_ranges_path_for(csv_path: Path) -> Path:
+    """Derive the per-binary ``_function_ranges.txt`` sidecar path.
+
+    Debug-feature companion to the output CSV; emitted unconditionally
+    so downstream verification scripts can rely on its presence (the
+    file is tiny next to the CSV).
+    """
+    return derive_sidecar_path(csv_path, "_function_ranges.txt")
 
 
 def _build_v2_string_ptr_entry(
@@ -217,6 +221,16 @@ def main_loop(
         sidecar: Optional[StringSidecar] = (
             StringSidecar(_strings_path_for(Path(csv_path))) if is_v2 else None
         )
+        # Debug-feature sidecar: one line per FUNCTION row written to
+        # the CSV recording the function's address range. Always
+        # emitted (format-version-agnostic) so downstream verifiers can
+        # cross-reference any ``valued_const_v2:<addr>`` token against
+        # the hosting function's body extent. Closed at the bottom of
+        # this ``with`` block; see the analogous lifecycle comment on
+        # ``sidecar`` above (same broad ``try/except`` envelope).
+        range_sidecar = FunctionRangeSidecar(
+            _function_ranges_path_for(Path(csv_path))
+        )
         writer = csv.writer(csvfile, lineterminator='\n')
         if is_v2:
             # Prelude row: single cell announcing the wire-format
@@ -282,7 +296,15 @@ def main_loop(
                 if function_analysis is None:
                     continue
 
-                (temp_bbs, block_list, block_dict, constant_handler, func_tokens) = function_analysis
+                (
+                    temp_bbs,
+                    block_list,
+                    block_dict,
+                    constant_handler,
+                    func_tokens,
+                    func_min_addr,
+                    func_max_addr,
+                ) = function_analysis
 
                 func_addr_range[func_addr] = sorted(block_list, key=lambda d: list(d.values())[0][0])
 
@@ -417,6 +439,12 @@ def main_loop(
                     ]
 
                     writer.writerow(row)
+                    # Co-step the function-range sidecar: one line
+                    # immediately after the FUNCTION row, mirroring the
+                    # CSV's function-row ordering. Filtered / dedup-
+                    # folded functions skip the CSV write above via
+                    # ``continue``, so they also skip this line.
+                    range_sidecar.add(func_min_addr, func_max_addr)
                     prev_func_name = canonical_name
 
                     if i & 16383 == 16383:
@@ -488,6 +516,9 @@ def main_loop(
         # ``with`` block. Idempotent if already closed.
         if sidecar is not None:
             sidecar.close()
+        # Function-range sidecar close — paired with the open at the
+        # top of this ``with`` block. Always present (not v2-gated).
+        range_sidecar.close()
 
     if len(exceptions) > 0:
         # Per-function errors were already log+continue (see inner

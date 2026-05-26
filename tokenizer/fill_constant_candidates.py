@@ -172,6 +172,8 @@ def fill_constant_candidates(
         dict[str, BlockToken],
         ConstantHandler,
         FunctionTokenList,
+        int,
+        int,
     ]
 ]:
     func_min_addr: int = int(func_addr)
@@ -287,4 +289,6 @@ def fill_constant_candidates(
         block_dict,
         constant_handler,
         func_tokens,
+        func_min_addr,
+        func_max_addr,
     )
