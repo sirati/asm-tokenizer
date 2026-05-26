@@ -31,6 +31,7 @@ from tokenizer.disasm.ghidra_views.function import (
     _ghidra_function_comment,
     _ghidra_identity_key,
 )
+from tokenizer.disasm.ghidra_views.unnamed_rename import placeholder_renamed_name
 from tokenizer.disasm.metadata import (
     AddressKind,
     AddressMetadataView,
@@ -84,12 +85,31 @@ class GhidraMetadataLookup:
     ``tokenizer/disasm/angr_limitations.md``).
     """
 
-    def __init__(self, program: Any, function_manager: Any) -> None:
+    def __init__(
+        self,
+        program: Any,
+        function_manager: Any,
+        binary_id_hash: bytes,
+    ) -> None:
         self._program = program
         self._fm = function_manager
         self._memory = program.getMemory()
         self._symbol_table = program.getSymbolTable()
         self._listing = program.getListing()
+        # 16-byte per-binary identity hash threaded in from the provider
+        # (computed once at provider construction; see
+        # ``tokenizer.disasm.ghidra_views.unnamed_rename``). Every
+        # ``getName()`` call site whose result lands in ``meta.name`` is
+        # routed through ``placeholder_renamed_name`` with this hash so
+        # ``SourceType.DEFAULT`` placeholders (``FUN_<hex>`` /
+        # ``LAB_<hex>`` / ``thunk_FUN_<hex>``) collapse into the same
+        # deterministic + binary-scoped opaque label that the
+        # FunctionView already surfaces in column 0 of the per-binary
+        # CSV. Without this thread the JSON metadata column
+        # (``local_funcs[].name`` et al.) would leak raw placeholder
+        # names, which downstream consumers (function-names sidecar,
+        # batch-decode walkers) inherit verbatim.
+        self._binary_id_hash: bytes = binary_id_hash
         # Lazy switch-table cache: built on first JUMP_TABLE_SLOT slot_target
         # access. Maps table-base-addr -> list of resolved target block
         # addresses (slot order). Populated by walking every function once
@@ -340,11 +360,18 @@ class GhidraMetadataLookup:
             containing_func = None
 
         # 1. Exact symbol match -- legacy bare ``"symbol"`` is replaced with
-        #    a section-derived type. The symbol's name is preserved as-is.
+        #    a section-derived type. The symbol's name is preserved as-is
+        #    except for the ``SourceType.DEFAULT`` placeholder rename
+        #    (``LAB_<hex>`` / ``FUN_<hex>`` / ...) which is folded into the
+        #    deterministic ``unnamed @{b64hash}`` opaque label so the JSON
+        #    metadata column matches the column-0 canonical name from
+        #    ``iter_functions``.
         symbols = self._symbol_table.getSymbols(addr_obj)
         if symbols:
             sym = symbols[0]
-            name = str(sym.getName())
+            name = placeholder_renamed_name(
+                str(sym.getName()), sym.getSource(), self._binary_id_hash
+            )
             # Derive type from the containing section (if any). For a symbol
             # in ``.text`` we promote to ``local_function`` whenever the
             # address lies inside any function body (FUNCTION-typed entry
@@ -383,7 +410,14 @@ class GhidraMetadataLookup:
                 body = func.getBody()
                 size = int(body.getNumAddresses())
                 is_external = func.isExternal() or func.isThunk()
-                name = str(func.getName())
+                # ``SourceType.DEFAULT`` placeholder rename: same scheme
+                # as branch 1 + ``iter_functions`` so the JSON metadata
+                # column never leaks a raw ``FUN_<hex>`` name.
+                name = placeholder_renamed_name(
+                    str(func.getName()),
+                    func.getSymbol().getSource(),
+                    self._binary_id_hash,
+                )
                 type_str = "library_function" if is_external else "local_function"
                 start_addr = entry
                 end_addr = entry + size

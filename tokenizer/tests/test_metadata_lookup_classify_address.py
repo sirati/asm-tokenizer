@@ -113,20 +113,50 @@ class _MockBlock:
         return self._size
 
 
-class _MockSymbol:
-    """Stand-in for ``Symbol`` -- the classifier reads ``getName`` and
-    ``getSymbolType`` (the latter via ``str().upper()``-compare against
-    ``FUNCTION``)."""
+class _MockSourceType:
+    """JPype-style enum stand-in: ``str(...)`` returns the constant name.
 
-    def __init__(self, name: str, symbol_type: str) -> None:
+    Drives the ``placeholder_renamed_name`` predicate that gates the
+    DEFAULT-source rename inside ``_classify_address``.
+    """
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __str__(self) -> str:
+        return self._name
+
+
+_USER_DEFINED_SOURCE = _MockSourceType("USER_DEFINED")
+_DEFAULT_SOURCE = _MockSourceType("DEFAULT")
+
+
+class _MockSymbol:
+    """Stand-in for ``Symbol`` -- the classifier reads ``getName``,
+    ``getSymbolType`` (the latter via ``str().upper()``-compare against
+    ``FUNCTION``), and ``getSource`` (feeds the placeholder-rename
+    predicate)."""
+
+    def __init__(
+        self,
+        name: str,
+        symbol_type: str,
+        source: Any = _USER_DEFINED_SOURCE,
+    ) -> None:
         self._name = name
         self._symbol_type = symbol_type
+        self._source = source
 
     def getName(self) -> str:
         return self._name
 
     def getSymbolType(self) -> str:
         return self._symbol_type
+
+    def getSource(self) -> Any:
+        return self._source
 
 
 class _MockBody:
@@ -140,7 +170,9 @@ class _MockBody:
 class _MockFunction:
     """Stand-in for ``Function``. Implements the subset the classifier
     + canonical-name helpers touch: ``getEntryPoint``, ``getBody``,
-    ``getName``, ``isExternal``, ``isThunk``, ``getComment``,
+    ``getName``, ``getSymbol`` (the classifier reads
+    ``func.getSymbol().getSource()`` to drive the placeholder-rename
+    predicate), ``isExternal``, ``isThunk``, ``getComment``,
     ``getThunkedFunction``."""
 
     def __init__(
@@ -151,12 +183,14 @@ class _MockFunction:
         name: str = "func",
         external: bool = False,
         thunk: bool = False,
+        source: Any = _USER_DEFINED_SOURCE,
     ) -> None:
         self._entry = int(entry)
         self._body = _MockBody(body_size)
         self._name = name
         self._external = external
         self._thunk = thunk
+        self._symbol = _MockSymbol(name, "FUNCTION", source)
 
     def getEntryPoint(self) -> _MockAddress:
         return _MockAddress(self._entry)
@@ -166,6 +200,9 @@ class _MockFunction:
 
     def getName(self) -> str:
         return self._name
+
+    def getSymbol(self) -> _MockSymbol:
+        return self._symbol
 
     def isExternal(self) -> bool:
         return self._external
@@ -266,6 +303,9 @@ class _MockProgram:
 # ---------------------------------------------------------------------------
 
 
+_TEST_BINARY_ID_HASH = bytes(range(16))
+
+
 def _build_lookup(
     *,
     block: _MockBlock,
@@ -273,12 +313,20 @@ def _build_lookup(
     symbols_by_addr: dict[int, List[_MockSymbol]],
     functions_at: dict[int, _MockFunction],
     functions_containing: dict[int, _MockFunction],
+    binary_id_hash: bytes = _TEST_BINARY_ID_HASH,
 ) -> GhidraMetadataLookup:
     """Wire a ``GhidraMetadataLookup`` over the duck-typed mocks.
 
     ``block_range`` enumerates the offsets that should report ``block``
     from ``memory.getBlock``; the test cases pass a small range covering
     the addresses they query.
+
+    ``binary_id_hash`` is the per-binary identity hash the provider would
+    precompute via
+    :func:`tokenizer.disasm.ghidra_views.unnamed_rename.compute_binary_identity_hash`.
+    A deterministic 16-byte stub is used by default (the actual value
+    only matters for the rename's cross-binary distinctness invariant,
+    which is covered by the rename helper's own tests).
     """
     blocks_by_addr = {addr: block for addr in block_range}
     memory = _MockMemory(blocks_by_addr)
@@ -293,7 +341,7 @@ def _build_lookup(
         functions_at=functions_at,
         functions_containing=functions_containing,
     )
-    return GhidraMetadataLookup(program, fm)
+    return GhidraMetadataLookup(program, fm, binary_id_hash)
 
 
 # ---------------------------------------------------------------------------
@@ -423,3 +471,114 @@ def test_classify_address_label_outside_function_body_stays_non_function() -> No
     # raw address.
     assert view.start_addr == addr
     assert view.end_addr == addr
+
+
+# ---------------------------------------------------------------------------
+# ``SourceType.DEFAULT`` placeholder rename: the JSON metadata column
+# (``local_funcs[].name`` et al.) is fed by ``meta.name`` from this lookup.
+# The same rename ``iter_functions`` applies to column 0 must reach this
+# column too, otherwise the function-names sidecar inherits raw
+# ``FUN_<hex>`` placeholders via the per-CSV callee extractor.
+# ---------------------------------------------------------------------------
+
+
+from tokenizer.disasm.ghidra_views.unnamed_rename import PLACEHOLDER_PREFIX  # noqa: E402
+
+
+def test_classify_address_renames_default_source_function_name() -> None:
+    """Function-match branch: a containing function whose Symbol's
+    ``getSource()`` is ``DEFAULT`` (Ghidra placeholder ``FUN_<hex>``)
+    must surface the deterministic ``unnamed @{...}`` opaque label on
+    ``view.name``, not the raw placeholder."""
+    func_entry = 0x4000
+    func_body_size = 0x80
+    interior_addr = func_entry + 0x10
+
+    func = _MockFunction(
+        entry=func_entry,
+        body_size=func_body_size,
+        name="FUN_00004000",
+        source=_DEFAULT_SOURCE,
+    )
+    block = _MockBlock(".text", is_execute=True)
+
+    lookup = _build_lookup(
+        block=block,
+        block_range=range(func_entry, func_entry + func_body_size + 1),
+        # No symbol at the interior address -> branch 2 (function match)
+        # of the classifier fires.
+        symbols_by_addr={},
+        functions_at={func_entry: func},
+        functions_containing={
+            addr: func for addr in range(func_entry, func_entry + func_body_size)
+        },
+    )
+
+    view = lookup.lookup(interior_addr)
+
+    assert view.name is not None
+    assert view.name.startswith(PLACEHOLDER_PREFIX), (
+        f"DEFAULT-source func name must be renamed to ``{PLACEHOLDER_PREFIX}...``; "
+        f"got {view.name!r}"
+    )
+    assert "FUN_" not in view.name, (
+        f"raw ``FUN_<hex>`` placeholder leaked into meta.name: {view.name!r}"
+    )
+
+
+def test_classify_address_renames_default_source_symbol_name() -> None:
+    """Symbol-match branch: a Ghidra ``LAB_<hex>`` auto-symbol carries
+    ``SourceType.DEFAULT``; ``meta.name`` must surface the renamed
+    opaque label rather than the raw placeholder text."""
+    addr = 0x5000
+    block = _MockBlock(".text", is_execute=True)
+    label = _MockSymbol(
+        name="LAB_00005000",
+        symbol_type="LABEL",
+        source=_DEFAULT_SOURCE,
+    )
+
+    lookup = _build_lookup(
+        block=block,
+        block_range=range(addr - 1, addr + 2),
+        symbols_by_addr={addr: [label]},
+        functions_at={},
+        functions_containing={},  # branch 1 with no containing function
+    )
+
+    view = lookup.lookup(addr)
+
+    assert view.name is not None
+    assert view.name.startswith(PLACEHOLDER_PREFIX), (
+        f"DEFAULT-source label name must be renamed to ``{PLACEHOLDER_PREFIX}...``; "
+        f"got {view.name!r}"
+    )
+    assert "LAB_" not in view.name, (
+        f"raw ``LAB_<hex>`` placeholder leaked into meta.name: {view.name!r}"
+    )
+
+
+def test_classify_address_preserves_user_defined_symbol_name() -> None:
+    """Non-DEFAULT sources (``USER_DEFINED`` / ``IMPORTED`` / ``ANALYSIS``)
+    are real symbols and must pass through the lookup unchanged. Pinned
+    here as a guard against an overzealous rename that would also touch
+    real names."""
+    addr = 0x6000
+    block = _MockBlock(".text", is_execute=True)
+    sym = _MockSymbol(name="my_real_func", symbol_type="FUNCTION")  # default USER_DEFINED
+
+    func = _MockFunction(entry=addr, body_size=0x10, name="my_real_func")
+
+    lookup = _build_lookup(
+        block=block,
+        block_range=range(addr, addr + 0x11),
+        symbols_by_addr={addr: [sym]},
+        functions_at={addr: func},
+        functions_containing={addr: func},
+    )
+
+    view = lookup.lookup(addr)
+
+    assert view.name == "my_real_func", (
+        f"real symbol name must pass through unchanged; got {view.name!r}"
+    )
