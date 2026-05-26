@@ -1,7 +1,7 @@
 """Unit tests for ``tokenizer.inspector._label`` helpers.
 
 Pure-Python (no Textual, no I/O); covers the four positional axes,
-FID-to-name resolution, block preview truncation, inline call/jump
+FID-to-name resolution, block preview shape, inline call/jump
 labels, and the POSITIONAL_PREFIXES axis-order invariant.
 """
 
@@ -14,7 +14,7 @@ import pytest
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.inspector._label import (
     aligned_variant_labels,
-    block_preview,
+    block_preview_from_asm_texts,
     function_label,
     inline_call_label,
     inline_jump_label,
@@ -135,48 +135,41 @@ def test_resolve_function_name_multiple_entries():
 
 
 # ---------------------------------------------------------------------------
-# block_preview
+# block_preview_from_asm_texts -- full-length join; no fixed-char cap
 # ---------------------------------------------------------------------------
 
 
-def _block_with_asm(asm: str) -> MagicMock:
-    block = MagicMock()
-    block.to_asm_like.return_value = asm
-    return block
+def test_block_preview_from_asm_texts_short_joins_full_string():
+    """Short input joins with ``"; "`` and returns unchanged."""
+    assert (
+        block_preview_from_asm_texts(["mov eax, ebx", "ret"])
+        == "mov eax, ebx; ret"
+    )
 
 
-def test_block_preview_short_returns_full_string():
-    block = _block_with_asm("mov eax, ebx")
-    assert block_preview(block) == "mov eax, ebx"
+def test_block_preview_from_asm_texts_long_returns_full_string():
+    """No fixed-char cap -- the FULL joined string flows out so the
+    tree widget's per-row horizontal-scroll can pan past the viewport
+    edge. A fixed-char truncation here would strip the scrollable
+    content before the user reaches it."""
+    texts = ["instr" + str(i) for i in range(100)]
+    out = block_preview_from_asm_texts(texts)
+    assert out == "; ".join(texts)
+    # No truncation -- the full join, regardless of length.
+    assert len(out) > 80
 
 
-def test_block_preview_at_boundary_returns_full_string():
-    asm = "a" * 80
-    assert block_preview(_block_with_asm(asm)) == asm
+def test_block_preview_from_asm_texts_does_not_append_overflow_marker():
+    """The UI layer (:func:`apply_truncation_marker`) owns the ``>>``
+    marker; this pure helper never appends one."""
+    texts = ["x" * 100 for _ in range(5)]
+    out = block_preview_from_asm_texts(texts)
+    assert ">>" not in out
+    assert not out.endswith(">")
 
 
-def test_block_preview_long_truncates_to_max_chars():
-    asm = "a" * 200
-    preview = block_preview(_block_with_asm(asm))
-    assert preview == "a" * 80
-    assert len(preview) == 80
-
-
-def test_block_preview_custom_max_chars():
-    asm = "abcdefghijklmnop"
-    assert block_preview(_block_with_asm(asm), max_chars=5) == "abcde"
-
-
-def test_block_preview_does_not_append_overflow_marker():
-    """Truncation is raw — the UI layer owns the ``>>`` marker, not us."""
-    asm = "x" * 200
-    preview = block_preview(_block_with_asm(asm))
-    assert ">>" not in preview
-    assert not preview.endswith(">")
-
-
-def test_block_preview_empty_string():
-    assert block_preview(_block_with_asm("")) == ""
+def test_block_preview_from_asm_texts_empty_iterable():
+    assert block_preview_from_asm_texts([]) == ""
 
 
 # ---------------------------------------------------------------------------

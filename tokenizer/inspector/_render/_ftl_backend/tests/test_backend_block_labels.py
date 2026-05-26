@@ -139,6 +139,85 @@ def test_blocks_preview_does_not_include_header_pair() -> None:
     assert "_def block_v2" not in preview
 
 
+def _block_with_mem_operand(vm: VocabularyManager, *, n: int) -> BlockTokenList:
+    """Build a v2 block whose body insn carries a MEM bracket pair.
+
+    Reproduces the user-observed ``mem[ ... ]mem`` shape: the FTL
+    backend's preview path must apply the same
+    :func:`substitute_display_chars` map that the expand path uses,
+    so the bracket symbols render as the polished ``[`` / ``]`` chars
+    on BOTH the preview text and the rendered AsmLine stream.
+    """
+    from tokenizer.tokens import MemoryOperandSymbol
+
+    blk = BlockTokenList(2, vocab_manager=vm)
+    blk.append_as_insn(
+        insn_str=f"block 0x{n:x}",
+        tokens=[vm.Block_Def(), vm.Block_V2(n)],
+    )
+    blk.append_as_insn(
+        insn_str="ldr r0 [r11]",
+        tokens=[
+            vm.MemoryOperand(MemoryOperandSymbol.OPEN_BRACKET),
+            vm.MemoryOperand(MemoryOperandSymbol.CLOSE_BRACKET),
+        ],
+    )
+    return blk
+
+
+def test_blocks_preview_substitutes_mem_bracket_display_chars() -> None:
+    """The FTL preview path must apply the MEM-bracket display
+    substitution (``mem[`` -> ``[``, ``]mem`` -> ``]``) just like the
+    expanded body does. The user-observed mismatch (collapsed row
+    showed ``mem[ ... ]mem`` while the expanded body showed ``[ ... ]``)
+    came from the preview routing through a raw-token
+    ``to_asm_like`` path that bypassed the substitution layer; the
+    fix routes BOTH paths through the shared row walker.
+    """
+    vm = _vm()
+    blocks = [_block_with_mem_operand(vm, n=0)]
+    backend = _make_backend_with_state(_stub_variant_state(blocks))
+
+    rendered = backend.blocks(variant_idx=0)
+    preview = rendered[0].preview
+
+    # Polished display chars present:
+    assert "[" in preview
+    assert "]" in preview
+    # Raw asm-value forms must NOT bleed through:
+    assert "mem[" not in preview
+    assert "]mem" not in preview
+
+
+def test_blocks_preview_returns_full_string_without_cap() -> None:
+    """The preview carries the FULL ``"; "``-joined per-instruction
+    text -- no fixed-char cap. Overflow is handled by the tree
+    widget's per-row horizontal scroll, not by truncation here; a
+    cap would strip the scrollable content before the user can pan
+    to it (the bug behind the user-observed "cuts off and won't
+    scroll" report).
+    """
+    vm = _vm()
+    # Build a long body: 30 plain insns past the header.
+    blk = BlockTokenList(31, vocab_manager=vm)
+    blk.append_as_insn(
+        insn_str="header",
+        tokens=[vm.Block_Def(), vm.Block_V2(0)],
+    )
+    for i in range(30):
+        blk.append_as_insn(insn_str=f"insn-{i}", tokens=[vm.Block_Def()])
+    backend = _make_backend_with_state(_stub_variant_state([blk]))
+
+    rendered = backend.blocks(variant_idx=0)
+    preview = rendered[0].preview
+
+    # 30 ``_def`` tokens joined with ``"; "`` -- well past the legacy
+    # 80-char cap, but the full string MUST flow out.
+    assert len(preview) > 80
+    # Last instruction's text appears (no mid-string truncation):
+    assert preview.endswith("_def")
+
+
 # ---------------------------------------------------------------------------
 # render_block(): lookup by N + body-only stream
 # ---------------------------------------------------------------------------

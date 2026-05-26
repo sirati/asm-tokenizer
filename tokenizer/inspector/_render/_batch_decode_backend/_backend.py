@@ -369,17 +369,17 @@ def _preview_for_section(section: RowSection) -> str:
 
     Routes every AsmLine in the section's item stream through
     :func:`tokenizer.inspector._label.block_preview_from_asm_texts`
-    so the preview lists every instruction (``"; "``-joined), capped
-    at the helper's ``max_chars`` policy. Same single source of truth
-    the FTL backend's :func:`block_preview` against
-    :class:`BodyBlockView` consumes; both backends emit the same
-    visual preview shape.
+    so the preview lists every instruction (``"; "``-joined). The
+    FULL string is returned -- overflow is handled by the tree
+    widget's per-row horizontal-scroll feature, not by a fixed-char
+    truncation here. Same single source of truth the FTL backend's
+    preview path consumes; both backends emit the same visual shape.
 
     Crucially, this reads the SAME ``section.items`` list that
     :meth:`BatchDecodeBackend.render_block` returns on expansion --
     the preview text is guaranteed to correspond to the items the
-    user sees when they open the block row (Fix #1: no off-by-one
-    or variant-threading drift between the label and the expansion).
+    user sees when they open the block row (no off-by-one or
+    variant-threading drift between the label and the expansion).
 
     The FUNCTION_ID section commonly carries no AsmLines (its single
     entry is an :class:`InlineCallEntry` for the self-prepend), so

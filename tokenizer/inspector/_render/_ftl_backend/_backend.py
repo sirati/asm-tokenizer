@@ -16,7 +16,9 @@ from __future__ import annotations
 import types
 from typing import Dict, Iterable, List, Mapping, Optional
 
+from tokenizer.inspector._label import block_preview_from_asm_texts
 from tokenizer.inspector._render._protocol import (
+    AsmLine,
     BlockKind,
     FunctionHandle,
     LineItem,
@@ -155,17 +157,24 @@ class FtlBackend:
         ``[Block_Def, <BLOCK_V2|JUMP_TABLE>:N]`` opening pair via
         :func:`block_header` -- the sibling positional index only
         matches N for the simplest straight-line functions, and the
-        UI label needs the authoritative N. The preview is taken from
-        a :class:`BodyBlockView` so the header pair stays absorbed
-        (mirrors BatchDecode's ``pending_header`` latch); the
-        rendered body never carries the ``_def block_v2:N`` /
-        ``_def jump_table:N`` text.
+        UI label needs the authoritative N.
+
+        The preview is sourced from the SAME render walk
+        :meth:`render_block` returns on expand (:func:`render_block`
+        from :mod:`._render_block`) so the asm text shown next to
+        ``Block: <i>`` matches the items the row yields on expand --
+        in particular the MEM-bracket / register-list display
+        substitution (``mem[``->``[``, ``]mem``->``]``, ...) is applied
+        through :func:`substitute_display_chars` exactly as the
+        expanded body sees. The block is wrapped in a
+        :class:`BodyBlockView` so the leading
+        ``[Block_Def, <BLOCK_V2|JUMP_TABLE>:N]`` header pair stays
+        absorbed (mirrors BatchDecode's ``pending_header`` latch).
         """
         self._raise_if_closed()
         if variant_idx in self._blocks_cache:
             return self._blocks_cache[variant_idx]
         state = self._ensure_variant_state(variant_idx)
-        from tokenizer.inspector._label import block_preview
 
         rendered: List[RenderedBlock] = []
         for blk in state.blocks:
@@ -174,11 +183,36 @@ class FtlBackend:
                 RenderedBlock(
                     kind=section_kind,
                     block_idx=n,
-                    preview=block_preview(body_block_view(blk)),
+                    preview=self._block_preview(state, blk),
                 )
             )
         self._blocks_cache[variant_idx] = rendered
         return rendered
+
+    @staticmethod
+    def _block_preview(state: VariantState, blk) -> str:
+        """Render ``blk`` through the shared row walker and join the
+        :class:`AsmLine` texts for the preview.
+
+        Same call shape as :meth:`render_block` so both paths emit
+        identical AsmLine text streams -- the preview is GUARANTEED
+        to match what the user sees on expand, including the
+        :func:`substitute_display_chars` substitutions that turn the
+        MEM-bracket / register-list vocab strings into the polished
+        display chars (``mem[``->``[``, ``]mem``->``]``, ...).
+        """
+        lines = render_block(
+            block=body_block_view(blk),
+            section=state.view,
+            kind_to_called_idx=state.kind_to_called_idx,
+            variant_pins={},
+            line_to_name=state.line_to_name,
+            line_to_provider=state.line_to_provider,
+            callee_arm_resolver=_no_callee_arm,
+        )
+        return block_preview_from_asm_texts(
+            line.text for line in lines if isinstance(line, AsmLine)
+        )
 
     def render_block(
         self, variant_idx: int, kind: BlockKind, block_idx: int
