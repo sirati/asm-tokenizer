@@ -7,6 +7,7 @@ import cle
 from intervaltree import IntervalTree
 
 from tokenizer.disasm.angr_provider import _AngrAddressMetadataView
+from tokenizer.disasm.angr_provider.function_identity import _angr_identity_key
 from tokenizer.disasm.metadata import (
     AddressKind,
     AddressMetadataView,
@@ -270,6 +271,16 @@ class AngrMetadataLookup:
                 ):
                     func_name = f"sub_{func.addr:x}"
 
+                # PLT stubs and SimProcedures forward to imported symbols;
+                # the resolved name lives on the angr Function itself.
+                # Capture it as a cross-binary-stable :class:`ThunkIdentity`
+                # so the populate path can hand it to
+                # :func:`canonical_function_name` and the deduper sees the
+                # same identity_key across every binary that imports this
+                # symbol (matches the Ghidra provider's
+                # ``isExternal()``-true branch).
+                identity_key = _angr_identity_key(func)
+
                 meta = dict(
                     name=func_name,
                     type=func_type,
@@ -280,6 +291,7 @@ class AngrMetadataLookup:
                     library=library,
                     is_plt=is_plt,
                     is_extern_synthetic=is_extern_synthetic,
+                    identity_key=identity_key,
                 )
 
                 self.exact_lookup[func.addr] = meta
@@ -410,13 +422,18 @@ class AngrMetadataLookup:
 
         # Numeric / name fields: pass through, normalizing types. The
         # name is funnelled through ``canonical_function_name`` for
-        # cross-provider parity with the Ghidra path (the helper
-        # short-circuits to the raw name when both axes are None, which
-        # is always the case on the angr path -- no demangler hook, no
-        # thunk-identity surface, see ``angr_limitations.md``).
+        # cross-provider parity with the Ghidra path. The angr indexer
+        # captures a :class:`ThunkIdentity` on the index entry for PLT
+        # stubs / SimProcedures (cross-binary stable, see
+        # ``tokenizer/disasm/angr_provider/function_identity.py``);
+        # non-thunk entries carry ``identity_key=None`` so the helper
+        # short-circuits to the raw name. angr has no demangler hook,
+        # so the ``comment`` axis stays ``None`` (see
+        # ``angr_limitations.md``).
         raw_name = index_meta.get("name")
+        identity_key = index_meta.get("identity_key")
         name: Optional[str] = None if raw_name is None else canonical_function_name(
-            str(raw_name), None, None
+            str(raw_name), None, identity_key
         )
 
         raw_size = index_meta.get("size")
@@ -435,6 +452,7 @@ class AngrMetadataLookup:
             string_encoding=string_encoding,
             string_bytes=string_bytes,
             name=name,
+            identity_key=identity_key,
             start_addr=start_addr,
             end_addr=end_addr,
             size=size,

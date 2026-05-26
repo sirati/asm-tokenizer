@@ -466,15 +466,22 @@ class FunctionView(Protocol):
     # same-named function as distinct (the legacy occurrence-suffix
     # / per-row disambiguator path).
     #
-    # The canonical use-case is PLT thunks: every ISA variant has N
-    # distinct trampoline slots all resolving to the same external
-    # symbol, and they all surface with the external's name. The Ghidra
-    # provider returns the resolved external's entry-point offset
-    # (``Function.getThunkedFunction(True).getEntryPoint().getOffset()``)
-    # which is identical across the colliding thunks and stable across
-    # ISA variants. The angr/Capstone path lacks the thunk-resolution
-    # surface and returns ``None`` unconditionally (no merge, legacy
-    # disambiguation).
+    # The canonical use-case is PLT thunks. Providers emit a typed
+    # :class:`tokenizer.function_deduper.ThunkIdentity`:
+    #   * EXTERNAL-target thunks key on the imported symbol name —
+    #     cross-binary stable for the same source symbol. Both
+    #     providers populate this case: the Ghidra side detects it
+    #     via ``Function.getThunkedFunction(True).isExternal()`` and
+    #     reads ``thunked.getName()``; the angr side detects it via
+    #     ``Function.is_plt`` / ``Function.is_simprocedure`` and reads
+    #     ``Function.name`` (the loader resolves the PLT slot to the
+    #     import-table symbol at load time).
+    #   * LOCAL-target thunks (rare — hand-written assembly aliases,
+    #     IFUNCs, some toolchain trampolines on the Ghidra side) key
+    #     on the thunked entry-point offset rendered as hex — stable
+    #     within binary; cross-binary stability is NOT claimed.
+    # The Ghidra side emits both kinds; the angr side emits only the
+    # EXTERNAL kind (CFG-resolved PLT stubs and SimProcedures).
 
     @property
     def comment(self) -> Optional[str]: ...
