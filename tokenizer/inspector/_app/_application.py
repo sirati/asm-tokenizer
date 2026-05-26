@@ -280,7 +280,7 @@ class InspectorApp(App[None]):
 
     # --- expand dispatcher -----------------------------------------
 
-    @on(Tree.NodeExpanded)
+    @on(Tree.NodeExpanded, "#tree")
     def _on_node_expanded(self, event: Tree.NodeExpanded[Node]) -> None:
         """Central expand dispatcher (the ONE try/except wrapping model
         ``expand``).
@@ -397,7 +397,7 @@ class InspectorApp(App[None]):
 
     # --- status bar --------------------------------------------------
 
-    @on(Tree.NodeHighlighted)
+    @on(Tree.NodeHighlighted, "#tree")
     def _on_node_highlighted(self, event: Tree.NodeHighlighted[Node]) -> None:
         """Refresh the status bar's breadcrumb when the cursor moves.
 
