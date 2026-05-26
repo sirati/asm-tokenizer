@@ -10,6 +10,7 @@ from tokenizer.arch.arm32.operands import (
 from tokenizer.arch.provider import ArchitectureProvider
 from tokenizer.architecture import PlatformInstructionTypes
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm.resolved_target_policy import should_honor_resolved_target
 from tokenizer.disasm.types import (
     ArmConditionCode,
     ConditionCodePrefixView,
@@ -119,16 +120,39 @@ class ARM32Provider(ArchitectureProvider):
                 # the register token retains its identity, and the
                 # resolved data target gets precedence-classified
                 # (steps 7 / 9 fire for string_ptr / ro_data_ptr).
+                #
+                # ``should_honor_resolved_target`` owns the keep/drop
+                # policy: high-confidence address kinds (STRING /
+                # PLT_FUNCTION / LOCAL_FUNCTION / CODE_PTR_TABLE_SLOT)
+                # and intra-function targets ALWAYS fire; lower-
+                # confidence kinds (RO_DATA_PTR / EXT_FUNCTION_SYNTHETIC
+                # / UNKNOWN) fall through to the mem-access gate plus
+                # per-ISA pair-terminal allow-list (e.g. arm32 ``movt``
+                # holding the high half of a ``movw``+``movt`` string-
+                # pointer build). csel-class value-flow inheritance
+                # ("aarch64 ``csel x1, x3, x1, ne`` inherits an upstream
+                # string_ptr ref on x1") is dropped when the kind is
+                # low-confidence — the policy preserves the original
+                # ``instruction_has_mem_access`` suppression there.
                 resolved_target = op.resolved_target
                 if resolved_target is not None:
                     meta = lookup.lookup(resolved_target)
-                    insn_tokens.extend(
-                        constant_handler.process_constant_v2(
-                            resolved_target,
-                            meta=meta,
-                            is_arithmetic=False,
+                    if should_honor_resolved_target(
+                        meta=meta,
+                        resolved_target=resolved_target,
+                        func_min_addr=func_min_addr,
+                        func_max_addr=func_max_addr,
+                        arch=reg.arch,
+                        base_mnemonic=insn.base_mnemonic,
+                        has_load_store=insn.has_load_store,
+                    ):
+                        insn_tokens.extend(
+                            constant_handler.process_constant_v2(
+                                resolved_target,
+                                meta=meta,
+                                is_arithmetic=False,
+                            )
                         )
-                    )
             elif op.kind == OperandKind.IMM:
                 immediate_tokens = tokenize_operand_immediate(
                     instr_sets.addressing_control_flow,

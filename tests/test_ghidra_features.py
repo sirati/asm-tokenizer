@@ -794,3 +794,73 @@ def test_absolute_addressed_x86_mem_emits_string_ptr_x64_zlibversion(
         f"expected at least one MEM bracket window in zlibVersion to "
         f"contain string_ptr (the rodata version literal); got: {names}"
     )
+
+
+# ---------- 9. Pair-terminal high-half mnemonic: arm32 movw+movt -----------
+
+_ARM32_CLANG_ZLIB_BINARY = _ARM32_ZLIB_SRC / "arm32-clang-3.5-O0_minigzip"
+
+
+@pytest.mark.slow
+def test_movt_pair_terminal_emits_string_ptr_arm32_zlibversion(
+    fresh_ghidra_csv,
+) -> None:
+    """arm32-clang-3.5-O0_minigzip's ``zlibVersion`` is the canonical
+    ARM constant-build pair pattern::
+
+        movw r0, #0xC78
+        movt r0, #1          ; combined address = 0x10C78 (.rodata string)
+        bx lr
+
+    Ghidra recombines the two halves at analysis time and attaches a
+    primary DATA ref to the ``movt`` destination operand pointing at
+    0x10C78. The instruction itself carries no LOAD/STORE PCode (it is
+    a pure-register insert), so the pre-Scope-C decode-helper gate
+    suppressed the resolved target and the operand emitted a bare
+    ``valued_const_v2`` for the literal ``0x1``.
+
+    Post-fix, the resolved-target keep/drop policy admits ``movt`` via
+    the per-ISA pair-terminal allow-list, the operand emits the typed
+    ``string_ptr`` identity, and the literal-value ``valued_const_v2``
+    follows. This pins the post-fix shape so any future change to the
+    policy that removes ``movt`` from the allow-list trips the test.
+    """
+    if not _ARM32_CLANG_ZLIB_BINARY.is_file():
+        pytest.skip(f"arm32-clang fixture missing at {_ARM32_CLANG_ZLIB_BINARY}")
+
+    csv_path = fresh_ghidra_csv(
+        _ARM32_CLANG_ZLIB_BINARY.name, _ARM32_ZLIB_SRC
+    )
+    _, names = _function_tokens(csv_path, "zlibVersion")
+
+    # Locate the ``arm32_movt`` token; its emit window (``arm32_movt
+    # arm32_r0 string_ptr <id-bytes> valued_const_v2 <0x01>``) must
+    # carry the typed identity.
+    try:
+        movt_idx = names.index("arm32_movt")
+    except ValueError:
+        pytest.fail(f"arm32_movt token missing from zlibVersion: {names}")
+
+    # Walk forward from movt until we hit the next mnemonic (e.g.
+    # arm32_bx). The intervening tokens describe movt's operands.
+    end_idx = len(names)
+    for j in range(movt_idx + 1, len(names)):
+        if names[j].startswith("arm32_") and names[j] != "arm32_r0":
+            end_idx = j
+            break
+    window = names[movt_idx + 1 : end_idx]
+    non_digit = [w for w in window if not w.startswith("<digit_")]
+
+    assert "string_ptr" in non_digit, (
+        f"arm32_movt operand window lacks the string_ptr identity "
+        f"(post-Scope-C policy should admit movt via the pair-terminal "
+        f"allow-list and emit string_ptr for the resolved 0x10C78 ref); "
+        f"window: {window}"
+    )
+    # The literal-value ``valued_const_v2`` for the ``#1`` immediate
+    # follows the identity, NOT replaces it.
+    assert "valued_const_v2" in non_digit, (
+        f"arm32_movt operand window lacks the literal valued_const_v2 "
+        f"(the #1 high-half should still surface as a literal value "
+        f"alongside the resolved-target identity); window: {window}"
+    )
