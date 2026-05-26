@@ -223,12 +223,16 @@ def _ghidra_identity_key(ghidra_function: Any) -> Optional[ThunkIdentity]:
       symbol name (``thunked.getName()``) IS cross-binary stable for
       the same source symbol; that is the identity key.
     * Local-target thunk (``isExternal()`` is False — rare; hand-written
-      assembly aliases, IFUNCs, some toolchain trampolines). The
-      resolved Function lives in real code; its entry-point offset is
-      stable within the binary. Cross-binary stability is NOT claimed
-      (the offset would shift across binaries), but local-target thunks
-      are a small minority and the legacy within-binary disambiguation
-      is the only invariant downstream needs.
+      assembly aliases, IFUNCs, some toolchain trampolines). When the
+      target carries a real (non-DEFAULT) symbol source — the common
+      sub-case — its ``getName()`` is cross-binary stable (Ghidra
+      assigns the same name to the same source function across
+      binaries) and we key on that. When the target itself is a
+      DEFAULT-source placeholder (``FUN_xxx``-style) — the only sub-
+      case where no cross-binary name exists — we fall back to the
+      entry-point offset, which is within-binary stable. The kind axis
+      stays LOCAL in both sub-cases so cross-kind collisions remain
+      impossible.
 
     Non-thunk functions return ``None`` (legacy disambiguation path —
     the provider declines to assert identity beyond name).
@@ -261,7 +265,25 @@ def _ghidra_identity_key(ghidra_function: Any) -> Optional[ThunkIdentity]:
         except Exception:
             return None
         return ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key=name)
-    # Local-target thunk: offset is stable within binary.
+    # Local-target thunk: prefer the target function's name (cross-
+    # binary stable when the target carries a real symbol source —
+    # USER_DEFINED / IMPORTED / ANALYSIS), fall back to the entry-
+    # point offset only when the target itself is DEFAULT-source
+    # (``FUN_xxx``-style placeholder). String-compare on
+    # ``str(getSource())`` mirrors the ``_DEFAULT_SOURCE_STR`` pattern
+    # in ``unnamed_rename.py`` and shields the call site from JPype's
+    # evolving enum-import idioms.
+    try:
+        target_symbol = thunked.getSymbol()
+        target_source = target_symbol.getSource() if target_symbol is not None else None
+    except Exception:
+        target_source = None
+    if target_source is not None and str(target_source) != "DEFAULT":
+        try:
+            name = str(thunked.getName())
+        except Exception:
+            return None
+        return ThunkIdentity(kind=ThunkTargetKind.LOCAL, key=name)
     try:
         offset = int(thunked.getEntryPoint().getOffset())
     except Exception:
