@@ -162,7 +162,7 @@ class InspectorApp(App[None]):
     BINDING_GROUP_TITLE: ClassVar[str] = "Application"
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("q", "quit", "Quit"),
+        Binding("q", "confirm_quit", "Quit"),
         # Horizontal-pan bindings live on :class:`_InspectorTree` (the
         # widget that owns the cursor + viewport) so the action runs
         # before the ScrollableContainer's built-in pan-only bindings
@@ -434,6 +434,16 @@ class InspectorApp(App[None]):
         from ._binary_switcher import open_binary_switcher
 
         open_binary_switcher(self)
+
+    def action_confirm_quit(self) -> None:
+        """Push the quit-confirmation modal; exit only on Accept."""
+        from ._quit_dialog import QuitConfirmScreen
+
+        def _on_dismiss(confirmed: bool | None) -> None:
+            if confirmed:
+                self.exit()
+
+        self.push_screen(QuitConfirmScreen(), _on_dismiss)
 
     def action_open_help(self) -> None:
         """Push the help modal listing every active binding.
