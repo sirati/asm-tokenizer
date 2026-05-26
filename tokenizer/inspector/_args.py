@@ -34,10 +34,14 @@ flag.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Callable, Dict, List
 
-from tokenizer.inspector._app._binary_switcher._provider import LoaderProvider
+from tokenizer.inspector._app._binary_switcher._provider import (
+    LoaderProvider,
+    resolve_provider_dirs,
+)
 from tokenizer.variant_info import VariantInfo
 
 
@@ -162,40 +166,117 @@ def discover_binaries_csv(csv_dir: Path) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Subdir-aware discovery: union over in-place + provider-subdir candidates
+# ---------------------------------------------------------------------------
+
+
+# Per-provider, the strictly-in-place discovery function. Same shape
+# across providers so the subdir-search policy is generic.
+_IN_PLACE_DISCOVERY: Dict[LoaderProvider, Callable[[Path], List[str]]] = {
+    LoaderProvider.MEMMAP: discover_binaries,
+    LoaderProvider.CSV: discover_binaries_csv,
+}
+
+
+def discover_binaries_with_paths(
+    path: Path, provider: LoaderProvider
+) -> Dict[str, Path]:
+    """Map each binary discoverable under ``path`` to its effective dir.
+
+    Walks every candidate dir from :func:`resolve_provider_dirs`
+    (in-place first, then ``path/<provider.subdir_name>/``) and
+    accumulates ``binary_name -> dir_containing_its_files``. In-place
+    wins on collision, matching the unified-vocab gate's "explicit copy
+    beats inherited" rule. Returns an empty dict when neither candidate
+    contains data for ``provider``.
+
+    Callers that only need the name list can union the keys of this
+    map; callers that need to actually open the files (CLI resolver,
+    backend opener) read the value side to thread the correct dir into
+    the loader.
+    """
+    discover = _IN_PLACE_DISCOVERY[provider]
+    binary_to_dir: Dict[str, Path] = {}
+    # Iterate candidates in the policy order so the first-seen entry
+    # wins (in-place precedes subdir).
+    for candidate in resolve_provider_dirs(path, provider):
+        if not candidate.is_dir():
+            continue
+        for name in discover(candidate):
+            binary_to_dir.setdefault(name, candidate)
+    return binary_to_dir
+
+
+# ---------------------------------------------------------------------------
 # Per-provider binary resolution
 # ---------------------------------------------------------------------------
 
 
-def _resolve_binary_memmap(memmap_dir: Path, requested: str | None) -> str:
+@dataclass(frozen=True)
+class ResolvedBinary:
+    """Resolver result: the effective dir + the binary name.
+
+    ``path`` is the dir the loader should consume (either the
+    user-supplied anchor or its provider-subdir). ``name`` is the
+    binary name to focus on. The split lets the CLI / dialog keep the
+    user's anchor intact (for next-dialog seeding) while the opener
+    threads the loader-side path.
+    """
+
+    path: Path
+    name: str
+
+
+def _candidate_dirs_for(path: Path, provider: LoaderProvider) -> List[Path]:
+    """Helper: candidate dirs from :func:`resolve_provider_dirs`, filtered.
+
+    Returns only the candidates that exist on disk + are directories.
+    Keeps the policy order intact (in-place first), so the resolver's
+    first-hit semantics agree with
+    :func:`discover_binaries_with_paths`'s in-place-wins rule.
+    """
+    return [c for c in resolve_provider_dirs(path, provider) if c.is_dir()]
+
+
+def _resolve_binary_memmap(
+    memmap_dir: Path, requested: str | None
+) -> ResolvedBinary:
     """Memmap-side ``--binary`` resolution.
 
-    Validates the directory exists and -- when ``requested`` is given
-    -- that its function-names sidecar is on disk (otherwise the
-    loader silently yields a zero-match session, masking typos). When
-    ``requested`` is omitted, requires exactly one binary; zero or
-    multiple is a user error with a candidate list.
+    Searches the in-place dir first, then ``memmap_dir/memmap/``.
+    Validates that ``requested`` (when given) has its function-names
+    sidecar on disk in EITHER candidate; otherwise the loader silently
+    yields a zero-match session, masking typos. When ``requested`` is
+    omitted, requires exactly one binary across both candidates; zero
+    or multiple is a user error with a candidate list. The returned
+    :class:`ResolvedBinary.path` names whichever candidate carries the
+    binary's files (so the caller threads it into the loader).
     """
     if not memmap_dir.is_dir():
         raise SystemExit(f"memmap directory not found: {memmap_dir}")
+    binary_to_dir = discover_binaries_with_paths(
+        memmap_dir, LoaderProvider.MEMMAP
+    )
     if requested:
-        sidecar = memmap_dir / f"{requested}{_FUNCTION_NAMES_SUFFIX}"
-        if not sidecar.is_file():
-            candidates = discover_binaries(memmap_dir)
+        if requested not in binary_to_dir:
             raise SystemExit(
                 f"binary {requested!r} not found in {memmap_dir}; "
-                f"available: {candidates}."
+                f"available: {sorted(binary_to_dir)}."
             )
-        return requested
-    candidates = discover_binaries(memmap_dir)
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
+        return ResolvedBinary(path=binary_to_dir[requested], name=requested)
+    if len(binary_to_dir) == 1:
+        name, dir_ = next(iter(binary_to_dir.items()))
+        return ResolvedBinary(path=dir_, name=name)
+    if not binary_to_dir:
+        searched = ", ".join(
+            str(c) for c in resolve_provider_dirs(memmap_dir, LoaderProvider.MEMMAP)
+        )
         raise SystemExit(
             f"--binary not given and no binaries detected in "
             f"{memmap_dir} (looked for files matching "
-            f"'*{_FUNCTION_NAMES_SUFFIX}')."
+            f"'*{_FUNCTION_NAMES_SUFFIX}' under: {searched})."
         )
-    listing = ", ".join(candidates)
+    listing = ", ".join(sorted(binary_to_dir))
     raise SystemExit(
         f"--binary not given and {memmap_dir} contains multiple "
         f"binaries; pass --binary <name> to pick one. "
@@ -203,32 +284,40 @@ def _resolve_binary_memmap(memmap_dir: Path, requested: str | None) -> str:
     )
 
 
-def _resolve_binary_csv(csv_dir: Path, requested: str | None) -> str:
+def _resolve_binary_csv(
+    csv_dir: Path, requested: str | None
+) -> ResolvedBinary:
     """CSV-side ``--binary`` resolution.
 
-    Mirrors :func:`_resolve_binary_memmap`: directory must exist;
-    when ``requested`` is given, at least one CSV must report a
-    matching ``pkg``; when omitted, exactly one distinct ``pkg``
-    must be present.
+    Mirrors :func:`_resolve_binary_memmap`: searches the in-place dir
+    first, then ``csv_dir/csv/``; directory must exist; ``requested``
+    (when given) must appear in at least one candidate's CSV union;
+    when omitted, exactly one distinct ``pkg`` must be present across
+    candidates.
     """
     if not csv_dir.is_dir():
         raise SystemExit(f"csv directory not found: {csv_dir}")
-    candidates = discover_binaries_csv(csv_dir)
+    binary_to_dir = discover_binaries_with_paths(csv_dir, LoaderProvider.CSV)
     if requested:
-        if requested not in candidates:
+        if requested not in binary_to_dir:
             raise SystemExit(
                 f"binary {requested!r} not found in {csv_dir}; "
-                f"available (from VariantInfo.pkg): {candidates}."
+                f"available (from VariantInfo.pkg): {sorted(binary_to_dir)}."
             )
-        return requested
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
+        return ResolvedBinary(path=binary_to_dir[requested], name=requested)
+    if len(binary_to_dir) == 1:
+        name, dir_ = next(iter(binary_to_dir.items()))
+        return ResolvedBinary(path=dir_, name=name)
+    if not binary_to_dir:
+        searched = ", ".join(
+            str(c) for c in resolve_provider_dirs(csv_dir, LoaderProvider.CSV)
+        )
         raise SystemExit(
             f"--binary not given and no binaries detected in "
-            f"{csv_dir} (looked for *_output.csv recursively)."
+            f"{csv_dir} (looked for *_output.csv recursively under: "
+            f"{searched})."
         )
-    listing = ", ".join(candidates)
+    listing = ", ".join(sorted(binary_to_dir))
     raise SystemExit(
         f"--binary not given and {csv_dir} contains multiple "
         f"binaries; pass --binary <name> to pick one. "
@@ -238,8 +327,13 @@ def _resolve_binary_csv(csv_dir: Path, requested: str | None) -> str:
 
 # Public name kept for backwards compat (used by tests + older callers).
 def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
-    """Memmap-side resolver (backwards-compat alias)."""
-    return _resolve_binary_memmap(memmap_dir, requested)
+    """Memmap-side resolver (backwards-compat alias).
+
+    Returns only the binary name string, matching the pre-subdir-search
+    contract. Callers that need the effective dir use
+    :func:`_resolve_binary_memmap` directly.
+    """
+    return _resolve_binary_memmap(memmap_dir, requested).name
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +341,9 @@ def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-_RESOLVERS = {
+_RESOLVERS: Dict[
+    LoaderProvider, Callable[[Path, "str | None"], ResolvedBinary]
+] = {
     LoaderProvider.MEMMAP: _resolve_binary_memmap,
     LoaderProvider.CSV: _resolve_binary_csv,
 }
@@ -258,9 +354,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     The mutex group guarantees ``ns.provider`` is set to a
     :class:`LoaderProvider`; the resolver is selected off that enum.
+
+    Post-resolve the namespace carries two paths:
+
+    * ``ns.path`` -- the user's anchor (unchanged from argparse).
+    * ``ns.effective_path`` -- where the binary's files actually live
+      (either ``ns.path`` itself or the provider's subdir under it).
+
+    Downstream the opener consumes ``effective_path`` while the App
+    stores ``path`` as the dialog's anchor so the next switch opens
+    against the corpus root, not the subdir.
     """
     parser = build_parser()
     ns = parser.parse_args(argv)
     resolver = _RESOLVERS[ns.provider]
-    ns.binary = resolver(ns.path, ns.binary)
+    resolved = resolver(ns.path, ns.binary)
+    ns.binary = resolved.name
+    ns.effective_path = resolved.path
     return ns

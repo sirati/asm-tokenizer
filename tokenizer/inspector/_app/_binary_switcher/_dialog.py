@@ -92,9 +92,13 @@ class _PathHeaderRow(_TreeNodePayload):
 class _BinaryRoot(_TreeNodePayload):
     """Tree row: one binary discovered under the current path.
 
-    Children are :class:`_ProviderRow` instances (one per provider that
-    has data for this binary). Clicking the binary node itself is a
-    no-op; the user must drill into a provider child to commit.
+    ``path`` is the user's anchor (corpus root or wherever they
+    browsed to in the folder picker), NOT the per-provider effective
+    dir — children are :class:`_ProviderRow` instances and EACH child
+    carries its own effective dir because a binary may have memmap
+    bins in ``<anchor>/memmap/`` and stage-1 CSVs at ``<anchor>``
+    simultaneously. Clicking the binary node itself is a no-op; the
+    user must drill into a provider child to commit.
     """
 
     __slots__ = ("path", "binary")
@@ -105,18 +109,30 @@ class _BinaryRoot(_TreeNodePayload):
 
 
 class _ProviderRow(_TreeNodePayload):
-    """Tree row: one (binary, provider) leaf — clicking commits the switch."""
+    """Tree row: one (binary, provider) leaf — clicking commits the switch.
 
-    __slots__ = ("provider", "path", "binary")
+    ``path`` is the EFFECTIVE dir where the provider's files live for
+    this binary (either the anchor itself or
+    ``<anchor>/<provider.subdir_name>/``). ``anchor_path`` is the
+    user's anchor so the dismissed :class:`SwitchTarget` preserves it
+    for the App's ``_current_path`` (which seeds the dialog's anchor
+    on re-open). Splitting the two paths means the loader gets the
+    right bins-path while the user's browse position stays at the
+    corpus root they typed.
+    """
+
+    __slots__ = ("provider", "path", "anchor_path", "binary")
 
     def __init__(
         self,
         provider: LoaderProvider,
         path: Path,
+        anchor_path: Path,
         binary: str,
     ) -> None:
         self.provider = provider
         self.path = path
+        self.anchor_path = anchor_path
         self.binary = binary
 
 
@@ -235,10 +251,14 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
     ) -> None:
         """Add one binary subtree under ``root``.
 
-        Each provider that has ``binary`` under ``path`` gets a child
-        leaf; the leaf label suffixes ``[current]`` when both the path
-        and provider match the App's currently-active selection so the
-        user can see "you are here" at a glance.
+        Each provider that has ``binary`` under ``path`` (in-place or
+        in its canonical subdir) gets a child leaf; the leaf label
+        suffixes ``[current]`` when both the anchor path and provider
+        match the App's currently-active selection so the user can see
+        "you are here" at a glance. The per-provider effective dir
+        comes from the scan's ``binary_to_dir`` map so the dismissed
+        :class:`SwitchTarget` threads the loader-correct path while
+        ``anchor_path`` stays at the user's browse position.
         """
         binary_node = root.add(
             Text(binary, style=_GREEN_STYLE),
@@ -246,7 +266,8 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
             expand=True,
         )
         for provider in LoaderProvider:
-            if binary not in scans[provider].binaries:
+            effective = scans[provider].binary_to_dir.get(binary)
+            if effective is None:
                 continue
             stage = _PROVIDER_STAGE_LABELS[provider]
             suffix = self._current_marker(path, provider)
@@ -256,13 +277,18 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
             )
             binary_node.add_leaf(
                 label,
-                data=_ProviderRow(provider, path, binary),
+                data=_ProviderRow(
+                    provider=provider,
+                    path=effective,
+                    anchor_path=path,
+                    binary=binary,
+                ),
             )
 
     def _current_marker(
         self, path: Path, provider: LoaderProvider
     ) -> str:
-        """``"  [current]"`` when (path, provider) match the App's state."""
+        """``"  [current]"`` when (anchor, provider) match the App's state."""
         if (
             self._current_provider is provider
             and self._anchor_path == path
@@ -284,6 +310,7 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
                     provider=data.provider,
                     path=data.path,
                     binary=data.binary,
+                    anchor_path=data.anchor_path,
                 )
             )
             return
