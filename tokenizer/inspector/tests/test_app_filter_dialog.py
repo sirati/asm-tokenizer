@@ -740,6 +740,47 @@ def test_filter_dialog_buttons_inside_scroll_container():
     asyncio.run(runner())
 
 
+def test_filter_dialog_body_fills_viewport_minus_three_lines_top_and_bottom():
+    """At a generous viewport height H the dialog body fills H-6 lines
+    (3 lines of breathing room above + 3 below). The sizing is driven
+    by Textual's ``height: 1fr; margin: 3 0`` CSS on the outer body,
+    so the dialog grows with the terminal instead of capping at a
+    fixed line count.
+    """
+
+    async def runner() -> None:
+        for viewport_height in (24, 40, 60):
+            with tempfile.TemporaryDirectory() as td:
+                log_path = Path(td) / "tui.log"
+                factory = _make_factory_with_rvs(name="main", rvs=[])
+                app = InspectorApp(factory=factory, log_path=log_path)
+                async with app.run_test(size=(120, viewport_height)) as pilot:
+                    arch_axis = build_canonical_axes()[0]
+                    dialog = FilterDialog(
+                        axis_values={arch_axis: ("x86", "arm32")}
+                    )
+                    app.push_screen(dialog)
+                    await pilot.pause()
+
+                    body = dialog.query_one("#filter-body")
+                    # Body sits 3 lines from the top + fills the
+                    # remaining height minus 3 trailing lines.
+                    assert body.region.y == 3, (
+                        f"vh={viewport_height}: body.region.y "
+                        f"{body.region.y} != 3 (top margin)"
+                    )
+                    assert body.region.height == viewport_height - 6, (
+                        f"vh={viewport_height}: body.region.height "
+                        f"{body.region.height} != {viewport_height - 6} "
+                        f"(viewport - 6)"
+                    )
+
+                    await pilot.press("escape")
+                    await pilot.pause()
+
+    asyncio.run(runner())
+
+
 def test_filter_dialog_opens_at_ten_line_terminal_without_error():
     """A 10-line viewport (too small for content + buttons stacked)
     must still mount the dialog and let the screen-level Accept
