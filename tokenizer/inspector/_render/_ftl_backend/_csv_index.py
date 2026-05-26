@@ -36,7 +36,6 @@ from tokenizer.aligned_data.parsed_record_iter import (
     lockstep_records,
     open_parsed_record_iter,
 )
-from tokenizer.function_deduper import logical_function_name
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.variant_info import VariantInfo
 from tokenizer.vocab_unifier.loader import load_vocab_manager
@@ -51,14 +50,11 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# A function-key identifies one logical-name group by ``(logical_name,
-# group_content_hash)``. The logical name is the canonical name with
-# the per-binary ``@thunk:<digits>`` suffix stripped via
-# :func:`logical_function_name`, so PLT trampolines whose Ghidra-supplied
-# resolved-extern offset varies across ELF builds still collapse into
-# one inspector function-list entry. Two unrelated functions sharing a
-# display name still appear as distinct handles via the disambiguating
-# content hash.
+# A function-key identifies one Matched/Unmatched record by name + the
+# content hash of its first surviving variant (so two unrelated
+# functions sharing a display name still appear as distinct handles in
+# the tree). Pre-computed at discovery so backends don't re-walk the
+# record list to derive a stable key.
 FunctionKey = tuple[str, int]
 
 
@@ -119,15 +115,8 @@ class CsvIndex:
         self._vocab_by_csv: Dict[Path, Optional[VocabularyManager]] = {}
         # Discovery: per-variant CSV walk + empty-CSV filter.
         self._csv_paths: List[Path] = _discover_csv_paths(csv_dir, binary_name)
-        # Lazy: built on first ``function_keys()`` call. ``_records`` is
-        # the raw stream from :func:`lockstep_records` (one entry per
-        # canonical-name yield); ``_groups`` is the post-pass that
-        # collapses canonical names sharing a logical name (see
-        # :func:`logical_function_name`) into one inspector function-list
-        # entry. ``handle.idx`` indexes into ``_groups``.
+        # Lazy: built on first ``function_keys()`` call.
         self._records: Optional[List[LockstepYield]] = None
-        self._groups: Optional[List[List[int]]] = None
-        self._group_logical_names: Optional[List[str]] = None
         self._closed = False
 
     @property
@@ -143,26 +132,17 @@ class CsvIndex:
         return self._csv_paths
 
     def function_keys(self) -> List[FunctionKey]:
-        """Dense list of ``(logical_name, content_hash)`` keys for the binary.
+        """Dense list of ``(func_name, content_hash)`` keys for the binary.
 
         Streams :func:`lockstep_records` over the surviving CSVs once
-        (cached for the index's lifetime), then groups same-logical-name
-        canonical yields so PLT thunks whose ``@thunk:<offset>`` varies
-        across ELF builds collapse into one inspector function. Position
-        in the returned list is the canonical ``handle.idx`` for backend
-        construction.
+        (cached for the index's lifetime). Position in the returned
+        list is the canonical ``handle.idx`` for backend construction.
         """
         self._ensure_open()
         self._ensure_records_loaded()
         assert self._records is not None
-        assert self._groups is not None
-        assert self._group_logical_names is not None
         return [
-            (
-                self._group_logical_names[group_idx],
-                _content_hash_for_group(self._records, member_indices),
-            )
-            for group_idx, member_indices in enumerate(self._groups)
+            (r.func_name, _content_hash_for_record(r)) for r in self._records
         ]
 
     def parsed_record_for(
@@ -170,50 +150,34 @@ class CsvIndex:
     ) -> Optional[ParsedRecord]:
         """Look up the parsed record for ``(handle.idx, variant_idx)``.
 
-        Walks every canonical-name yield in the logical-name group at
-        ``idx`` and returns the first record whose variant slot matches.
-        Returns ``None`` when no yield in the group covers
-        ``variant_idx`` -- the variant CSV either didn't include any
-        same-logical-name function (group-wide Matched gap) or this
-        single-variant function is reported only against a different
-        slot.
-
-        When more than one yield in the group has data for the same
-        variant slot (e.g. a binary that carries both a local ``foo``
-        AND a PLT thunk ``foo@thunk:N``), the first-yielded record wins
-        and the rest are dropped with a logged warning. Per the task:
-        the inspector function list collapses by logical name, which is
-        a known information-loss trade-off in that rare edge case.
+        Returns ``None`` when the function exists in this binary but
+        not in this particular variant slot -- both :class:`Matched`
+        (some variant CSVs didn't include this function) and
+        :class:`Unmatched` (only one variant has the function; lookup
+        on any other slot returns ``None``).
         """
         self._ensure_open()
         self._ensure_records_loaded()
         assert self._records is not None
-        assert self._groups is not None
-        first: Optional[ParsedRecord] = None
-        for record_idx in self._groups[idx]:
-            record = self._records[record_idx]
-            parsed = _variant_lookup(record, variant_idx)
-            if parsed is None:
-                continue
-            if first is None:
-                first = parsed
-                continue
-            logger.warning(
-                "logical-name group %r has multiple records in variant_idx=%d "
-                "(canonical names collide post-suffix-strip); using the first "
-                "(%r) and dropping %r",
-                self._group_logical_names[idx]
-                if self._group_logical_names is not None
-                else "?",
-                variant_idx,
-                first.func_name,
-                parsed.func_name,
-            )
-        return first
+        record = self._records[idx]
+        if isinstance(record, Matched):
+            return record.records.get(variant_idx)
+        if isinstance(record, Unmatched):
+            if record.variant_index == variant_idx:
+                return record.record
+            return None
+        raise TypeError(f"unexpected LockstepYield arm: {type(record).__name__}")
 
     def has_variant(self, idx: int, variant_idx: int) -> bool:
         """``True`` iff the function appears in this variant slot."""
         return self.parsed_record_for(idx, variant_idx) is not None
+
+    def lockstep_record(self, idx: int) -> LockstepYield:
+        """The raw :class:`Matched` / :class:`Unmatched` for ``idx``."""
+        self._ensure_open()
+        self._ensure_records_loaded()
+        assert self._records is not None
+        return self._records[idx]
 
     def vocab_for(self, csv_path: Path) -> Optional[VocabularyManager]:
         """Lazy-load + cache the per-CSV :class:`VocabularyManager`."""
@@ -227,8 +191,6 @@ class CsvIndex:
         if self._closed:
             return
         self._records = None
-        self._groups = None
-        self._group_logical_names = None
         self._vocab_by_csv.clear()
         self._closed = True
 
@@ -257,71 +219,13 @@ class CsvIndex:
                 wrapper, it, _header = open_parsed_record_iter(str(p))
                 wrappers.append(wrapper)
                 iters.append(it)
-            records = list(lockstep_records(iters))
+            self._records = list(lockstep_records(iters))
         finally:
             for w in wrappers:
                 try:
                     w.close()
                 except Exception:  # noqa: BLE001 - best-effort cleanup
                     pass
-        self._records = records
-        self._groups, self._group_logical_names = _build_logical_groups(records)
-
-
-def _build_logical_groups(
-    records: List[LockstepYield],
-) -> "tuple[List[List[int]], List[str]]":
-    """Collapse same-logical-name canonical yields into one group each.
-
-    Preserves first-occurrence ordering so the inspector's function list
-    keeps the lockstep-driven (alphabetical-ish) order rather than
-    flipping to a Python-hash one. Returns ``(groups, logical_names)``
-    where ``groups[k]`` is the list of indices into ``records`` whose
-    canonical names map to ``logical_names[k]`` under
-    :func:`logical_function_name`.
-    """
-    groups: List[List[int]] = []
-    logical_names: List[str] = []
-    name_to_group_idx: Dict[str, int] = {}
-    for record_idx, record in enumerate(records):
-        logical = logical_function_name(record.func_name)
-        existing = name_to_group_idx.get(logical)
-        if existing is None:
-            name_to_group_idx[logical] = len(groups)
-            groups.append([record_idx])
-            logical_names.append(logical)
-        else:
-            groups[existing].append(record_idx)
-    return groups, logical_names
-
-
-def _variant_lookup(
-    record: LockstepYield, variant_idx: int
-) -> Optional[ParsedRecord]:
-    """Per-(yield, variant_idx) record lookup. ``None`` on miss."""
-    if isinstance(record, Matched):
-        return record.records.get(variant_idx)
-    if isinstance(record, Unmatched):
-        if record.variant_index == variant_idx:
-            return record.record
-        return None
-    raise TypeError(f"unexpected LockstepYield arm: {type(record).__name__}")
-
-
-def _content_hash_for_group(
-    records: List[LockstepYield], member_indices: List[int]
-) -> int:
-    """Stable content-hash for a logical-name group.
-
-    The first member's :func:`_content_hash_for_record` is the group
-    key (deterministic given the lockstep yield order is fixed). Two
-    unrelated functions whose canonical names happen to share a logical
-    name still appear as distinct handles because they land in distinct
-    groups (each canonical-name lockstep yield is its own pre-grouping
-    record); only same-logical-name yields collapse here.
-    """
-    first = records[member_indices[0]]
-    return _content_hash_for_record(first)
 
 
 def _discover_csv_paths(csv_dir: Path, binary_name: str) -> List[Path]:
