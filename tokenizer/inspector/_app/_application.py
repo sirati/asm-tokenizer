@@ -39,6 +39,7 @@ from ._filter import FilterConfig, FilterResult
 from ._help_dialog import HelpScreen
 from ._labels import _ERR_STYLE, _compose_label
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
+from ._status_bar import StatusBar
 from ._tree_widget import _InspectorTree
 
 
@@ -152,6 +153,7 @@ class InspectorApp(App[None]):
     #tree { height: 1fr; }
     #search { display: none; height: 3; }
     #search.visible { display: block; }
+    #status-bar { height: 1; }
     """
 
     BINDING_GROUP_TITLE: ClassVar[str] = "Application"
@@ -217,6 +219,9 @@ class InspectorApp(App[None]):
         tree.root.expand()
         yield tree
         yield Input(placeholder="/ search function name", id="search")
+        status_bar = StatusBar(id="status-bar")
+        status_bar.set_tree(tree)
+        yield status_bar
 
     def _build_root_function_node(
         self, handle: "FunctionHandle"
@@ -347,6 +352,28 @@ class InspectorApp(App[None]):
     # and the per-row model nodes, so keeping the keyboard logic
     # there avoids the App brokering tree state through actions.
 
+    # --- status bar --------------------------------------------------
+
+    @on(Tree.NodeHighlighted)
+    def _on_node_highlighted(self, event: Tree.NodeHighlighted[Node]) -> None:
+        """Refresh the status bar's breadcrumb when the cursor moves.
+
+        Listens for Textual's :class:`Tree.NodeHighlighted` post (fired
+        synchronously from :meth:`Tree.watch_cursor_line` after the
+        :class:`_InspectorTree`'s own override-side scroll-restore
+        completes). The status bar reads ``cursor_node`` off the tree
+        it was handed at compose-time, so no event payload is needed
+        here.
+        """
+        del event  # The widget reads cursor_node directly.
+        try:
+            status_bar = self.query_one("#status-bar", StatusBar)
+        except Exception:
+            # Status bar may not be mounted yet during the very first
+            # tree-root highlight that fires before compose finishes.
+            return
+        status_bar.refresh_state()
+
     # --- modals ----------------------------------------------------
 
     def action_open_help(self) -> None:
@@ -430,8 +457,14 @@ class InspectorApp(App[None]):
         self, result: Optional[FilterResult]
     ) -> None:
         """Dispatcher for the :class:`FilterDialog` result; delegates to
-        :mod:`._filter_hooks`."""
+        :mod:`._filter_hooks`. Also refreshes the status bar so its
+        filter-summary segment reflects the new config."""
         _filter_hooks.on_filter_dialog_dismissed(self, result)
+        try:
+            status_bar = self.query_one("#status-bar", StatusBar)
+        except Exception:
+            return
+        status_bar.set_filter_config(self._filter_config)
 
 
 # ---------------------------------------------------------------------------
