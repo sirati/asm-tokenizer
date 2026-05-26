@@ -28,7 +28,10 @@ from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
     _ghidra_processor_to_architecture,
 )
-from tokenizer.disasm.ghidra_views.unnamed_rename import compute_binary_identity_hash
+from tokenizer.disasm.ghidra_views.unnamed_rename import (
+    compute_binary_identity_hash,
+    placeholder_renamed_name,
+)
 from tokenizer.disasm.types import FpType
 
 
@@ -295,10 +298,18 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         )
         self._function_view = function_view
 
-        # Collect + sort by name (legacy contract).
+        # Collect + sort by name (legacy contract). The DEFAULT-source
+        # placeholder rename is applied here so the same name flows
+        # through every downstream channel — the sort key, the
+        # ``duplicate_function_dump`` collision detector, the yielded
+        # tuple's ``name`` slot, and ``function_view.name``. See
+        # ``tokenizer.disasm.ghidra_views.unnamed_rename`` for the
+        # rationale + scheme.
         funcs: list[tuple[int, str, Any]] = []
         for func in self._fm.getFunctions(True):
-            name = str(func.getName())
+            raw_name = str(func.getName())
+            source = func.getSymbol().getSource()
+            name = placeholder_renamed_name(raw_name, source, self._binary_id_hash)
             addr = int(func.getEntryPoint().getOffset())
             funcs.append((addr, name, func))
 
@@ -340,6 +351,12 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
 
             function_view._advance(ghidra_func, block_count)
             self._funcs_by_entry[addr] = ghidra_func
+            # ``name`` is the post-``placeholder_renamed_name`` value
+            # collected above, so the yielded tuple's ``name`` slot
+            # matches ``function_view.name`` — both downstream channels
+            # (``main_loop`` -> ``canonical_function_name`` reads the
+            # tuple slot; the view reads its cursor) see the same
+            # rename.
             yield addr, name, function_view
 
     # ----------------------------------------------------------------------
