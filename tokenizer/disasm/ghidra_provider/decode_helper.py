@@ -337,15 +337,26 @@ class _GhidraDecodeHelper:
             op_type = 0
 
         # Pre-collect Register objects: used both by the is_memory check
-        # below (a memory operand MUST involve at least one base/index
-        # register) and the ARM/AArch64 reg-list classifier below.
+        # below (DYNAMIC-shaped memory operands MUST involve at least one
+        # base/index register; the absolute-addressed x86 case below is
+        # the explicit exception) and the ARM/AArch64 reg-list classifier
+        # below.
         register_objs = [o for o in objects if isinstance(o, Register)]
 
-        # A memory operand MUST involve at least one base/index register.
-        # Without that, Ghidra's DYNAMIC bit on a pure-scalar operand
-        # (e.g. RISC-V c.addi's immediate, or c.sdsp's disp scalar that
-        # SLEIGH split off from its base register) is misleading and
-        # produces a degenerate base-less mem-bracket rendering.
+        # DYNAMIC-shaped memory operands MUST involve at least one base/
+        # index register. Without that, Ghidra's DYNAMIC bit on a pure-
+        # scalar operand (e.g. RISC-V c.addi's immediate, or c.sdsp's
+        # disp scalar that SLEIGH split off from its base register) is
+        # misleading and produces a degenerate base-less mem-bracket
+        # rendering. The one shape this rule does NOT apply to is the
+        # x86 absolute-addressed memory operand (``lea rax, [0x10D7C0]``
+        # / ``mov eax, [0x12345678]``): Ghidra surfaces ONLY an Address/
+        # Scalar (no Register) on those, with op_type = ADDRESS|SCALAR
+        # (no REGISTER, no DYNAMIC, no CODE bits) and brackets in the
+        # rendered representation. That shape escapes the register gate
+        # via the dedicated ``absolute_addressed_no_register_mem`` branch
+        # below; the rest of the is_memory clauses keep the original
+        # ``MUST involve at least one base/index register`` invariant.
         #
         # ARM pre-indexed-with-writeback (``stp x29, x30, [sp, #-48]!``):
         # Ghidra reports ``op_type = REGISTER|ADDRESS`` (no DYNAMIC) and
@@ -389,34 +400,54 @@ class _GhidraDecodeHelper:
             and (not arm_family or instruction_has_mem_access)
         )
 
-        is_memory = bool(register_objs) and operand_has_brackets and (
-            dynamic_admits_memory
-            or bool(op_type & OperandType.INDIRECT)
-            or (
-                bool(op_type & OperandType.ADDRESS)
-                and bool(op_type & OperandType.SCALAR)
-                and not (op_type & (OperandType.REGISTER | OperandType.CODE))
-            )
-            or (
-                bool(op_type & OperandType.REGISTER)
-                and bool(op_type & OperandType.ADDRESS)
-                and not (op_type & OperandType.CODE)
-                and scalar_in_objects
-            )
-            or (
-                # ARM32 pre-indexed STORE: ``strb r9, [r8, #0x1]!`` op_type
-                # is REGISTER-only (no ADDRESS, no DYNAMIC; Ghidra's
-                # arm32 SLEIGH spec is asymmetric vs pre-indexed LOAD
-                # which DOES carry ADDRESS). The disambiguator vs a
-                # plain REGISTER operand is the Scalar in objects (the
-                # pre-disp) plus the instruction-level rich-IR signal
-                # that it accesses memory (LOAD/STORE in PCode). The
-                # outer ``operand_has_brackets`` gate keeps this from
-                # claiming non-bracketed register operands.
-                bool(op_type & OperandType.REGISTER)
-                and not (op_type & OperandType.CODE)
-                and scalar_in_objects
-                and instruction_has_mem_access
+        # x86 absolute-addressed memory operand: ``lea rax, [0x10D7C0]``
+        # / ``mov eax, [0x12345678]``. Ghidra's getOpObjects surfaces only
+        # a Scalar/Address (no Register), so ``register_objs`` is empty;
+        # the op_type is ADDRESS|SCALAR with no REGISTER/CODE/DYNAMIC.
+        # This shape is structurally distinct from every register-bearing
+        # mem-operand kind and from every non-mem kind (REGISTER/CODE
+        # bits exclude them), so admitting it without the register gate
+        # is safe. The CODE-bit exclusion keeps absolute-target branches
+        # (``jmp 0x10D7C0`` etc.) routing through their own kind. This
+        # branch is the explicit exception to the "MUST involve at least
+        # one base/index register" rule documented above.
+        absolute_addressed_no_register_mem = (
+            operand_has_brackets
+            and bool(op_type & OperandType.ADDRESS)
+            and bool(op_type & OperandType.SCALAR)
+            and not (op_type & (OperandType.REGISTER | OperandType.CODE | OperandType.DYNAMIC))
+        )
+
+        is_memory = absolute_addressed_no_register_mem or (
+            bool(register_objs) and operand_has_brackets and (
+                dynamic_admits_memory
+                or bool(op_type & OperandType.INDIRECT)
+                or (
+                    bool(op_type & OperandType.ADDRESS)
+                    and bool(op_type & OperandType.SCALAR)
+                    and not (op_type & (OperandType.REGISTER | OperandType.CODE))
+                )
+                or (
+                    bool(op_type & OperandType.REGISTER)
+                    and bool(op_type & OperandType.ADDRESS)
+                    and not (op_type & OperandType.CODE)
+                    and scalar_in_objects
+                )
+                or (
+                    # ARM32 pre-indexed STORE: ``strb r9, [r8, #0x1]!`` op_type
+                    # is REGISTER-only (no ADDRESS, no DYNAMIC; Ghidra's
+                    # arm32 SLEIGH spec is asymmetric vs pre-indexed LOAD
+                    # which DOES carry ADDRESS). The disambiguator vs a
+                    # plain REGISTER operand is the Scalar in objects (the
+                    # pre-disp) plus the instruction-level rich-IR signal
+                    # that it accesses memory (LOAD/STORE in PCode). The
+                    # outer ``operand_has_brackets`` gate keeps this from
+                    # claiming non-bracketed register operands.
+                    bool(op_type & OperandType.REGISTER)
+                    and not (op_type & OperandType.CODE)
+                    and scalar_in_objects
+                    and instruction_has_mem_access
+                )
             )
         )
 
