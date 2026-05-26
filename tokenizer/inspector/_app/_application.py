@@ -45,6 +45,7 @@ from ._menu_bar import Alignment, MenuBar, MenuItem
 from ._node_path import CapturedExpandState
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
 from ._search_bar import SearchBar
+from ._search_match import iter_function_matches, next_match_index
 from ._status_bar import StatusBar
 from ._tree_widget import _InspectorTree
 
@@ -177,6 +178,21 @@ class InspectorApp(App[None]):
         # the :class:`SearchBar` widget. Escape handling lives on the
         # search bar itself (one-concern).
         Binding("s,slash", "open_search", "Search", show=True),
+        # ``n`` / ``shift+n`` step the tree cursor through every
+        # match of the most-recent saved search needle (the head of
+        # ``_search_history``). When the search bar is OPEN, the
+        # Input's printable-key handler swallows ``n`` before the
+        # binding dispatch reaches the App (see :class:`Input._on_key`
+        # in textual), so the action only fires while the tree has
+        # focus -- which is the only context where stepping makes
+        # sense anyway.
+        Binding("n", "search_next", "Next match", show=True),
+        # Capital ``N`` is the literal key Textual delivers when the
+        # user holds Shift; the binding system keys off the raw key
+        # string (terminals don't send a "shift+n" prefix for letter
+        # keys), so we register against ``N`` directly. Mirrors the
+        # vim ``N`` previous-search convention.
+        Binding("N", "search_prev", "Previous match", show=True),
         Binding("h", "open_help", "Help", show=True),
         Binding("o", "open_order_dialog", "Order", show=True),
         Binding("f", "open_filter_dialog", "Filter", show=True),
@@ -240,6 +256,14 @@ class InspectorApp(App[None]):
         # gating is handled in :meth:`_block_label_show_preview`, not
         # here -- this flag is the GLOBAL discriminator only.
         self._preview_enabled: bool = True
+        # Append-only history of needles the user pressed Enter on
+        # inside the :class:`SearchBar`. Each Enter (hit OR miss)
+        # appends -- the bar guards against a duplicate of the most-
+        # recent entry. Read by the bar's Tab / Up / Down handlers and
+        # by :meth:`action_search_next` / :meth:`action_search_prev`
+        # (the App-level ``n`` / ``shift+n`` walker). Lives on the App
+        # so the bar's open/close lifecycle does not lose it.
+        self._search_history: list[str] = []
 
     # --- compose ---------------------------------------------------
 
@@ -596,6 +620,60 @@ class InspectorApp(App[None]):
         widget's :meth:`SearchBar.open` API.
         """
         self.query_one("#search-bar", SearchBar).open()
+
+    def action_search_next(self) -> None:
+        """Step the tree cursor to the next match of the most-recent needle.
+
+        "Next" is the FunctionNode row immediately after the cursor
+        row in declared tree order; wraps to the first match when the
+        cursor sits on or past the last match. No-op when the search
+        history is empty (no needle to step through). Delegates the
+        FunctionNode iteration to :func:`iter_function_matches` so the
+        same matcher backs both the bar's live preview and this
+        walker.
+        """
+        self._step_search_match(forward=True)
+
+    def action_search_prev(self) -> None:
+        """Step the tree cursor to the previous match (mirror of ``n``).
+
+        "Previous" is the FunctionNode row immediately before the
+        cursor row in declared tree order; wraps to the last match
+        when the cursor sits on or before the first match. No-op when
+        the search history is empty.
+        """
+        self._step_search_match(forward=False)
+
+    def _step_search_match(self, *, forward: bool) -> None:
+        """Move the cursor one match forward or backward.
+
+        Reads the latest needle from :attr:`_search_history`, builds
+        the in-tree-order match list, and delegates the
+        "where-to-land" decision to :func:`next_match_index`
+        (which handles cursor-on-match vs cursor-on-non-match vs
+        cursor-on-root + wrap-around). No-op when history is empty
+        or the latest needle has no matches.
+        """
+        if not self._search_history:
+            return
+        needle = self._search_history[-1].strip().lower()
+        if not needle:
+            return
+        try:
+            tree = self.query_one("#tree", _InspectorTree)
+        except Exception:
+            return
+        matches = list(iter_function_matches(tree.root.children, needle))
+        if not matches:
+            return
+        cursor = tree.cursor_node
+        cursor_line = cursor._line if cursor is not None else -1
+        target_idx = next_match_index(
+            matches, cursor, cursor_line, forward=forward
+        )
+        tree.call_after_refresh(
+            tree.move_cursor, matches[target_idx], animate=False
+        )
 
     # --- order dialog ----------------------------------------------
 
