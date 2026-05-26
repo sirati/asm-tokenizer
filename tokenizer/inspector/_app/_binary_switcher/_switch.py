@@ -145,9 +145,6 @@ def perform_switch(app: "InspectorApp", target: SwitchTarget) -> None:
     app._current_provider = target.provider
     app._current_path = target.path
 
-    # Clear any pending auto-expand state from the previous binary.
-    app._pending_auto_expand.clear()
-
     # Reseed the tree with the new factory's handles.
     _reseed_tree(app)
 
