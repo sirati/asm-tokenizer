@@ -327,6 +327,18 @@ class GhidraMetadataLookup:
         func: Any = None
         section_name: Optional[str] = block_name if block is not None else None
 
+        # Containing-function lookup hoisted out of the symbol/no-symbol fork:
+        # Ghidra auto-creates ``LAB_*`` symbols at branch targets, so a jump
+        # destination strictly inside a function body has BOTH a symbol AND
+        # a containing function. Resolving the function once here lets both
+        # branches reach the LOCAL_FUNCTION range (entry / size from the
+        # body) instead of leaving the symbol branch with a zero-width range
+        # rooted at the raw address.
+        try:
+            containing_func = self._fm.getFunctionContaining(addr_obj)
+        except Exception:
+            containing_func = None
+
         # 1. Exact symbol match -- legacy bare ``"symbol"`` is replaced with
         #    a section-derived type. The symbol's name is preserved as-is.
         symbols = self._symbol_table.getSymbols(addr_obj)
@@ -334,33 +346,26 @@ class GhidraMetadataLookup:
             sym = symbols[0]
             name = str(sym.getName())
             # Derive type from the containing section (if any). For a symbol
-            # in ``.text`` whose Ghidra ``SymbolType`` is ``FUNCTION`` we
-            # tag it ``local_function``; everything else uses the section's
-            # natural type (``rodata`` / ``data`` / ``thread_local_data`` / ...).
+            # in ``.text`` we promote to ``local_function`` whenever the
+            # address lies inside any function body (FUNCTION-typed entry
+            # symbol OR a Ghidra-auto ``LAB_*`` at an interior jump target);
+            # everything else uses the section's natural type (``rodata`` /
+            # ``data`` / ``thread_local_data`` / ...).
             type_str = "unknown"
             if block is not None:
                 base_type = _section_type_from_block(block)
-                if base_type == "code":
-                    is_function_symbol = False
-                    try:
-                        st = sym.getSymbolType()
-                        # ``SymbolType.FUNCTION`` is the canonical enum value;
-                        # compare by name to avoid importing the enum class.
-                        is_function_symbol = str(st).upper() == "FUNCTION"
-                    except Exception:
-                        is_function_symbol = False
-                    type_str = "local_function" if is_function_symbol else base_type
+                if base_type == "code" and containing_func is not None:
+                    type_str = "local_function"
                 else:
                     type_str = base_type
             size = 0
             start_addr = addr
             end_addr = addr
-            # If the symbol is an actual function and we have its body, give
-            # the classifier accurate range bounds rather than a zero-width.
-            try:
-                func = self._fm.getFunctionAt(addr_obj)
-            except Exception:
-                func = None
+            # When we have a containing function, stamp accurate range bounds
+            # (entry offset + body size) rather than a zero-width range at
+            # the raw address. This is what lets ``_pred_block`` recognise
+            # interior jump targets as strictly-inside-function addresses.
+            func = containing_func
             if func is not None:
                 try:
                     body = func.getBody()
@@ -372,7 +377,7 @@ class GhidraMetadataLookup:
                     pass
         else:
             # 2. Function match (covers calls/jumps into known functions).
-            func = self._fm.getFunctionContaining(addr_obj)
+            func = containing_func
             if func is not None:
                 entry = int(func.getEntryPoint().getOffset())
                 body = func.getBody()
