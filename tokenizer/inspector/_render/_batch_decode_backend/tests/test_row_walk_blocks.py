@@ -112,14 +112,18 @@ def test_second_block_v2_inside_same_call_target_emits_inline_jump() -> None:
     only; inline jumps ride on :attr:`AsmLine.openables`. With an empty
     insn_runlength sidecar each slot is its own faux-instruction, so
     the BLOCK_V2 jump lands on a standalone AsmLine carrying just the
-    openable (empty text + 1-tuple openables).
+    openable (empty text + 1-tuple openables). The jump's target id is
+    deliberately the same as the surrounding block's id so the
+    post-walk openable resolvability gate (:mod:`.._jump_validity`)
+    preserves the entry -- a jump-to-self models the back-edge of a
+    loop and is the simplest in-scope target for this dispatch test.
     """
     blocks = _walk(
         tokens=np.asarray(
             [BLOCK_V2, INSTR_REP_TOKEN, BLOCK_V2, INSTR_REP_TOKEN, 0],
             dtype=np.uint16,
         ),
-        identities=np.asarray([0, 2], dtype=np.uint16),
+        identities=np.asarray([0, 0], dtype=np.uint16),
         n_axis=0, partial_cut_lengths=[4],
     )
     assert len(blocks) == 1
@@ -129,7 +133,7 @@ def test_second_block_v2_inside_same_call_target_emits_inline_jump() -> None:
     assert all(isinstance(item, AsmLine) for item in items)
     assert len(items) == 3
     # Middle AsmLine carries the InlineJumpEntry as an openable.
-    assert items[1].openables == (InlineJumpEntry(target_block_idx=2),)
+    assert items[1].openables == (InlineJumpEntry(target_block_idx=0),)
 
 
 def test_block_v2_inside_variant_prefix_raises_loud() -> None:

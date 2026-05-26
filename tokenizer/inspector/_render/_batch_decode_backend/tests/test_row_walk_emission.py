@@ -513,21 +513,25 @@ def test_inline_jump_label_appears_in_asm_line_text() -> None:
     routes through :func:`inline_jump_label`, so the AsmLine text reads
     ``"jump block: N"`` alongside the :class:`InlineJumpEntry`
     openable. Uses a one-instruction body whose second BLOCK_V2 is a
-    jump target (the first being the silent body-block header).
+    jump target (the first being the silent body-block header). The
+    jump target id matches the body block's own id so the post-walk
+    resolvability gate (:mod:`.._jump_validity`) preserves the
+    openable -- the gate's "unresolvable phantom target" path lives
+    in :mod:`.._jump_validity`'s own tests.
     """
     from tokenizer.inspector._render._protocol import InlineJumpEntry
 
     blocks = _walk(
         tokens=np.asarray([BLOCK_V2, BLOCK_V2, 0], dtype=np.uint16),
-        identities=np.asarray([0, 7], dtype=np.uint16),
+        identities=np.asarray([0, 0], dtype=np.uint16),
         # The leading BLOCK_V2 is the body-block header (silent); the
         # second BLOCK_V2 is the jump target landing on the in-flight
         # instruction's openables + text buffer.
     )
     line = blocks[0].items[0]
     assert isinstance(line, AsmLine)
-    assert line.text == "jump block: 7"
-    assert line.openables == (InlineJumpEntry(target_block_idx=7),)
+    assert line.text == "jump block: 0"
+    assert line.openables == (InlineJumpEntry(target_block_idx=0),)
 
 
 def test_unknown_fid_renders_question_mark_via_line_to_name_default() -> None:

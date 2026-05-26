@@ -61,15 +61,17 @@ from ._row_walk_fixtures import (
 def _walk_one_body_block_with_call_and_jump():
     """Synthesize the row + walk it; return the BODY section's items.
 
-    Tokens: ``[BLOCK_V2(c=0), LOCAL_FUNC(c=0), BLOCK_V2(c=5), 0]``.
+    Tokens: ``[BLOCK_V2(c=0), LOCAL_FUNC(c=0), BLOCK_V2(c=0), 0]``.
 
     * Slot 0: leading ``BLOCK_V2`` -- absorbed as the FUNCTION_ID
       -> BODY transition silent-header (block_idx=0).
     * Slots 1+2: ``LOCAL_FUNC`` (FID 42 -> ``my_func``) +
-      ``BLOCK_V2(c=5)`` (in-block jump; ``pending_header`` already
-      consumed by slot 0). Bundled into ONE 2-slot BODY instruction
-      via ``insn_runlength=[2]`` so both openables fold onto the
-      SAME emitted :class:`AsmLine`.
+      ``BLOCK_V2(c=0)`` (in-block jump back to block 0; the target
+      matches the only BODY section's block_idx so the jump
+      openable passes the row walker's post-walk resolvability
+      gate -- see :mod:`.._jump_validity`). Bundled into ONE 2-slot
+      BODY instruction via ``insn_runlength=[2]`` so both openables
+      fold onto the SAME emitted :class:`AsmLine`.
     """
     sig_default, se_default = EMPTY_NUMBERS
     blocks = render_row_blocks(
@@ -77,7 +79,7 @@ def _walk_one_body_block_with_call_and_jump():
             tokens_row=np.asarray(
                 [BLOCK_V2, LOCAL_FUNC, BLOCK_V2, 0], dtype=np.uint16,
             ),
-            identities=np.asarray([0, 0, 5], dtype=np.uint16),
+            identities=np.asarray([0, 0, 0], dtype=np.uint16),
             numbers_sig=sig_default,
             numbers_se=se_default,
             insn_runlength=np.asarray([2], dtype=np.uint32),
@@ -127,7 +129,7 @@ def test_row_walker_emits_one_asmline_with_call_and_jump_openables():
     assert call.kind is CallTargetType.LOCAL
     assert call.callee_name == "my_func"
     assert isinstance(jump, InlineJumpEntry)
-    assert jump.target_block_idx == 5
+    assert jump.target_block_idx == 0
 
 
 # ---------------------------------------------------------------------------
