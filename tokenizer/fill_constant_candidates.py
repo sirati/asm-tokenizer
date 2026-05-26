@@ -92,11 +92,27 @@ def _emit_jump_table_footer(
     (same ``Category.BLOCK`` cache, same typed ``int`` address key —
     matching ``ConstantHandler._emit_block``'s key form).
 
-    Dedup: footer-emit must be deterministic. When BOTH the provider
-    yields a table and a slot-classification call has registered the
-    same base addr, exactly ONE footer emits — the provider's (carries
-    targets). The fallback iterates ``id_maps[Category.JUMP_TABLE]`` and
-    skips any addr already emitted via the iter_switch_tables loop.
+    Dedup: footer-emit must be deterministic.
+
+    Canonical-yield coalescing: ``iter_switch_tables`` may yield the same
+    ``base_addr`` more than once — typically when a function has multiple
+    computed-jump dispatch instructions reading the same switch table
+    (Ghidra recovers the table from each dispatch site independently and
+    may resolve a different subset of slots at each site). Naively calling
+    ``_emit_jump_table_footer_for`` per yield would emit N separate
+    ``block_def jump_table <jt_id> ...`` blocks for the SAME ``jt_id`` (the
+    JUMP_TABLE identity cache returns the same id on every call), so we
+    UNION the target sets per base_addr before emitting. ``get_identity``
+    is then invoked EXACTLY ONCE per base_addr with the unioned target
+    list in ``jt_meta`` (calling it twice with different meta would
+    silently retain only the first-yield meta, since the cache hit ignores
+    ``meta``).
+
+    Canonical-vs-fallback union: when BOTH the provider yields a table
+    and a slot-classification call has registered the same base addr,
+    exactly ONE footer emits — the provider's (carries targets). The
+    fallback iterates ``id_maps[Category.JUMP_TABLE]`` and skips any
+    addr already emitted via the iter_switch_tables loop.
 
     No-ops when the vocab is v1 (the v2 ``Jump_Table`` / ``Block_V2``
     Inner classes assert ``format_version == 2``) or when neither source
@@ -105,11 +121,17 @@ def _emit_jump_table_footer(
     if getattr(vocab_manager, "format_version", 1) != 2:
         return
 
-    emitted_base_addrs: set[int] = set()
+    # Phase 1: accumulate target-set union per base_addr across all
+    # iter_switch_tables yields. Preserves first-seen ordering of both
+    # base_addrs (dict insertion order) and per-base targets (the
+    # ``ordered`` list grows in yield order, the ``seen`` set guards
+    # against re-adding the same target). Sorting would alter the
+    # encoded byte sequence and break determinism.
+    canonical_targets_by_base: dict[int, list[int]] = {}
+    canonical_seen_target: dict[int, set[int]] = {}
 
     if disasm_provider is not None:
         for table_addr, target_addrs in disasm_provider.iter_switch_tables(func):
-            base_addr = int(table_addr)
             if not target_addrs:
                 # Provider gave us a table with no resolved slots — nothing to
                 # emit (would produce a `block_def jump_table` with zero slots,
@@ -118,21 +140,37 @@ def _emit_jump_table_footer(
                 # below intentionally DOES emit a target-less declaration when
                 # the table is known only via slot classification.
                 continue
+            base_addr = int(table_addr)
+            seen = canonical_seen_target.setdefault(base_addr, set())
+            ordered = canonical_targets_by_base.setdefault(base_addr, [])
+            for target_addr in target_addrs:
+                target_addr_int = int(target_addr)
+                if target_addr_int not in seen:
+                    seen.add(target_addr_int)
+                    ordered.append(target_addr_int)
 
-            jt_meta = {
-                "jump_table_addr": hex(base_addr),
-                "target_block_addrs": [hex(int(a)) for a in target_addrs],
-            }
-            jt_id = resolver.get_identity(Category.JUMP_TABLE, base_addr, jt_meta)
-            _emit_jump_table_footer_for(
-                jt_id=jt_id,
-                base_addr=base_addr,
-                target_addrs=list(target_addrs),
-                func_tokens=func_tokens,
-                resolver=resolver,
-                vocab_manager=vocab_manager,
-            )
-            emitted_base_addrs.add(base_addr)
+    emitted_base_addrs: set[int] = set()
+
+    # Phase 2: emit one footer per coalesced base_addr. ``get_identity``
+    # is invoked here (not during accumulation) so the meta dict carries
+    # the UNIONED target list — calling it twice with different meta
+    # would silently keep the first call's meta because cache-hits
+    # ignore ``meta``.
+    for base_addr, targets in canonical_targets_by_base.items():
+        jt_meta = {
+            "jump_table_addr": hex(base_addr),
+            "target_block_addrs": [hex(t) for t in targets],
+        }
+        jt_id = resolver.get_identity(Category.JUMP_TABLE, base_addr, jt_meta)
+        _emit_jump_table_footer_for(
+            jt_id=jt_id,
+            base_addr=base_addr,
+            target_addrs=targets,
+            func_tokens=func_tokens,
+            resolver=resolver,
+            vocab_manager=vocab_manager,
+        )
+        emitted_base_addrs.add(base_addr)
 
     # Slot-classification fallback: pick up any JUMP_TABLE identity that
     # was registered by ``ConstantHandler._emit_jump_table_slot`` but
