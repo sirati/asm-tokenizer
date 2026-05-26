@@ -175,10 +175,27 @@ class InspectorApp(App[None]):
         *,
         factory: "BackendFactory",
         log_path: Path,
+        memmap_path: Optional[Path] = None,
+        csv_path: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self._factory = factory
         self._log = _setup_inspector_log(log_path)
+        # Current-source tracking for the binary-switcher dialog: the
+        # active provider (memmap vs csv) and the path the factory was
+        # opened against. ``__main__`` passes whichever ``--memmap-dir``
+        # / ``--csv-dir`` argument the user supplied; both being ``None``
+        # is the mock-factory-in-tests case where the switch dialog is
+        # not exercised against a real source. The current provider is
+        # inferred from which path is non-``None``.
+        from ._binary_switcher import LoaderProvider
+
+        self._current_memmap_path: Optional[Path] = memmap_path
+        self._current_csv_path: Optional[Path] = csv_path
+        self._current_provider: Optional[LoaderProvider] = (
+            LoaderProvider.MEMMAP if memmap_path is not None
+            else (LoaderProvider.CSV if csv_path is not None else None)
+        )
         # Current variant ordering + grouping. ``None`` means
         # "default-sorted, no grouping" -- mirrors the legacy
         # backend-order rendering until the user opens the Order modal
