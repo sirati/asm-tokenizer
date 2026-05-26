@@ -13,8 +13,12 @@ covering:
   the imported symbol name is the cross-binary-stable key (Ghidra's
   per-binary EXTERNAL placeholder offset would NOT be).
 * Local-target thunks (rare; hand-written aliases, IFUNCs) return
-  ``ThunkIdentity(LOCAL, hex_offset)`` — within-binary stable, the
-  legacy disambiguation behaviour preserved.
+  ``ThunkIdentity(LOCAL, target_name)`` when the target carries a
+  real symbol source (USER_DEFINED / IMPORTED / ANALYSIS) — cross-
+  binary stable on the target name. Fall back to
+  ``ThunkIdentity(LOCAL, hex_offset)`` only when the target itself is
+  DEFAULT-source (``FUN_xxx``-style placeholder) — within-binary
+  stable, the legacy disambiguation behaviour preserved.
 * Defensive fallbacks: missing ``getThunkedFunction`` attr,
   ``getThunkedFunction`` raising, the thunk returning ``None``, the
   external having a misbehaving address - all collapse to ``None``
@@ -42,14 +46,41 @@ class _MockAddress:
         return self._offset
 
 
+class _MockSymbol:
+    """The Symbol returned by ``thunked.getSymbol()`` for the local-
+    thunk source-kind probe.
+
+    The helper string-compares ``str(symbol.getSource())`` against
+    ``"DEFAULT"`` to decide whether the target name is real (cross-
+    binary stable) or a placeholder (binary-specific). The mock holds
+    the source string verbatim; ``None`` models a Ghidra Function
+    that has no primary Symbol.
+    """
+
+    def __init__(self, source: str) -> None:
+        self._source = source
+
+    def getSource(self) -> str:
+        return self._source
+
+
 class _MockExternalFunction:
     """The Function returned by ``ghidra_func.getThunkedFunction(True)``.
 
-    Carries the two axes the identity-key helper reads off a resolved
+    Carries the axes the identity-key helper reads off a resolved
     thunk target: ``isExternal()`` (the EXTERNAL-block discriminator),
-    ``getName()`` (the imported symbol name when external — the cross-
-    binary stable key), and ``getEntryPoint().getOffset()`` (the local
-    entry-point when the target is real code).
+    ``getName()`` (the imported symbol name when external, or the
+    target function name for named local thunks — the cross-binary
+    stable key in both cases), ``getEntryPoint().getOffset()`` (the
+    fallback within-binary stable key for unnamed local targets), and
+    ``getSymbol().getSource()`` (the source-kind probe that gates the
+    named-vs-offset choice for local targets). A ``symbol_source`` of
+    ``None`` (the safe default) models a Function whose
+    ``getSymbol()`` returns ``None``, which trips the offset-fallback
+    branch — most existing tests want that behaviour. Explicit
+    ``"USER_DEFINED"`` / ``"IMPORTED"`` / ``"ANALYSIS"`` covers the
+    named-target case; explicit ``"DEFAULT"`` covers the placeholder-
+    target case.
     """
 
     def __init__(
@@ -58,10 +89,12 @@ class _MockExternalFunction:
         is_external: bool,
         name: Optional[str] = None,
         entry_offset: int = 0,
+        symbol_source: Optional[str] = None,
     ) -> None:
         self._is_external = is_external
         self._name = name
         self._entry = _MockAddress(entry_offset)
+        self._symbol_source = symbol_source
 
     def isExternal(self) -> bool:
         return self._is_external
@@ -71,6 +104,11 @@ class _MockExternalFunction:
 
     def getEntryPoint(self) -> _MockAddress:
         return self._entry
+
+    def getSymbol(self) -> Optional[_MockSymbol]:
+        if self._symbol_source is None:
+            return None
+        return _MockSymbol(self._symbol_source)
 
 
 class _MockFunction:
@@ -136,12 +174,47 @@ def test_identity_key_external_thunk_uses_symbol_name() -> None:
     )
 
 
-def test_identity_key_local_thunk_uses_hex_offset() -> None:
-    """A local-target thunk (rare — hand-written assembly aliases,
-    IFUNCs, some toolchain trampolines) returns
-    ``ThunkIdentity(LOCAL, hex_offset)`` — within-binary stable,
-    matching the legacy disambiguation invariant."""
-    local = _MockExternalFunction(is_external=False, entry_offset=0x41E000)
+def test_identity_key_local_thunk_default_source_uses_hex_offset() -> None:
+    """A local-target thunk whose target is itself a DEFAULT-source
+    placeholder (``FUN_xxx``-style — Ghidra has no real name for it)
+    falls back to ``ThunkIdentity(LOCAL, hex_offset)`` — within-binary
+    stable, matching the legacy disambiguation invariant."""
+    local = _MockExternalFunction(
+        is_external=False, name="FUN_0041e000", entry_offset=0x41E000,
+        symbol_source="DEFAULT",
+    )
+    func = _MockFunction(is_thunk=True, thunked=local)
+    assert _ghidra_identity_key(func) == ThunkIdentity(
+        kind=ThunkTargetKind.LOCAL, key="41e000"
+    )
+
+
+def test_identity_key_local_thunk_named_target_uses_name() -> None:
+    """A local-target thunk whose target carries a real symbol source
+    (USER_DEFINED / IMPORTED / ANALYSIS — the common sub-case for
+    hand-written aliases and IFUNCs) keys on the target function
+    name. The name is cross-binary stable (Ghidra assigns the same
+    name to the same source function across binaries), so two
+    binaries' aliases to the same target dedup."""
+    for source in ("USER_DEFINED", "ANALYSIS", "IMPORTED"):
+        local = _MockExternalFunction(
+            is_external=False, name="gztell", entry_offset=0x41E000,
+            symbol_source=source,
+        )
+        func = _MockFunction(is_thunk=True, thunked=local)
+        assert _ghidra_identity_key(func) == ThunkIdentity(
+            kind=ThunkTargetKind.LOCAL, key="gztell"
+        ), f"source={source} should hit the named-target branch"
+
+
+def test_identity_key_local_thunk_missing_symbol_falls_back_to_offset() -> None:
+    """Defensive: a Function whose ``getSymbol()`` returns ``None``
+    has no source-kind to probe; the helper falls back to the offset
+    path rather than asserting a name it cannot verify."""
+    local = _MockExternalFunction(
+        is_external=False, name="ignored", entry_offset=0x41E000,
+        symbol_source=None,
+    )
     func = _MockFunction(is_thunk=True, thunked=local)
     assert _ghidra_identity_key(func) == ThunkIdentity(
         kind=ThunkTargetKind.LOCAL, key="41e000"

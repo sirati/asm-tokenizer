@@ -56,16 +56,21 @@ def test_thunk_identity_equality_requires_both_axes() -> None:
 
 def test_canonical_name_external_thunk_suffix_is_symbol_name() -> None:
     """``canonical_function_name`` renders an external-target
-    ``ThunkIdentity`` as ``<name>@thunk:<symbol_name>``."""
+    ``ThunkIdentity`` as ``thunk:<symbol_name>``. The ``name`` axis
+    is dropped: it carries no cross-binary signal in the thunk case
+    (it's either redundant with the key, or a per-binary placeholder
+    rename)."""
     ident = ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key="gzseek")
-    assert canonical_function_name("gzseek", None, ident) == "gzseek@thunk:gzseek"
+    assert canonical_function_name("gzseek", None, ident) == "thunk:gzseek"
 
 
 def test_canonical_name_local_thunk_suffix_is_hex_offset() -> None:
-    """Local-target thunks render with the hex offset key, preserving
-    within-binary disambiguation."""
+    """Local-target thunks render with the hex offset key when the
+    target is a DEFAULT-source placeholder. The ``name`` prefix is
+    dropped in the typed-identity path; within-binary disambiguation
+    survives via the key alone."""
     ident = ThunkIdentity(kind=ThunkTargetKind.LOCAL, key="41e000")
-    assert canonical_function_name("alias", None, ident) == "alias@thunk:41e000"
+    assert canonical_function_name("alias", None, ident) == "thunk:41e000"
 
 
 def test_canonical_name_external_thunk_suffix_sanitises_symbol_chars() -> None:
@@ -77,13 +82,47 @@ def test_canonical_name_external_thunk_suffix_sanitises_symbol_chars() -> None:
     out = canonical_function_name("glibc", None, ident)
     # ``@`` is outside the allow-list and collapses to ``_``; the
     # trailing version suffix survives via the ``.`` allow-list entry.
-    assert out == "glibc@thunk:glibc_GLIBC_2.2.5"
+    assert out == "thunk:glibc_GLIBC_2.2.5"
+
+
+def test_canonical_name_external_thunk_collapses_placeholder_name_prefix() -> None:
+    """An EXTERNAL thunk whose ``name`` is a per-binary placeholder
+    rename (``unnamed @<22-char-hash>``) MUST render identically across
+    binaries — the placeholder hash differs per binary but the
+    imported-symbol key does not. The collapsed form drops the prefix
+    entirely."""
+    ident = ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key="fwrite")
+    assert (
+        canonical_function_name("unnamed @cgcAeumj2X0XI6y8DWFdRQ", None, ident)
+        == "thunk:fwrite"
+    )
+
+
+def test_canonical_name_external_thunk_collapses_redundant_resolved_name_prefix() -> None:
+    """When Ghidra resolves the thunk name to the target symbol the
+    ``name`` and the key coincide; the legacy rendering produced the
+    redundant ``snprintf@thunk:snprintf``. The collapsed form drops the
+    duplicate prefix."""
+    ident = ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key="snprintf")
+    assert (
+        canonical_function_name("snprintf", None, ident) == "thunk:snprintf"
+    )
+
+
+def test_canonical_name_local_named_target_thunk_uses_name_key() -> None:
+    """A LOCAL thunk whose target has a real symbol source keys on the
+    target name (not the hex offset) — the new ``_ghidra_identity_key``
+    contract. The collapsed rendering keeps the result cross-binary
+    stable."""
+    ident = ThunkIdentity(kind=ThunkTargetKind.LOCAL, key="gztell")
+    assert canonical_function_name("gztell", None, ident) == "thunk:gztell"
 
 
 def test_canonical_name_legacy_integer_key_unchanged() -> None:
     """Backward-compat: callers passing a bare integer identity_key
-    still receive the historical ``str(int)`` rendering. The typed
-    dataclass form is an addition, not a replacement."""
+    still receive the historical ``<name>@thunk:<int>`` rendering —
+    the prefix-drop is gated on ``isinstance(ThunkIdentity)``
+    specifically, so pre-typed callers do not silently break."""
     assert canonical_function_name("strcmp", None, 0xDEAD) == "strcmp@thunk:57005"
 
 
@@ -110,7 +149,7 @@ def test_canonical_name_cross_binary_external_thunk_dedup() -> None:
         None,
         ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key="gzseek"),
     )
-    assert a == b == "gzseek@thunk:gzseek"
+    assert a == b == "thunk:gzseek"
 
 
 def test_deduper_folds_cross_binary_external_thunks() -> None:
