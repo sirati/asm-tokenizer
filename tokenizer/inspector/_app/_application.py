@@ -33,8 +33,9 @@ from tokenizer.inspector._tree_model import (
 )
 from tokenizer.variant_info import VariantIdentity
 
-from . import _order_hooks
+from . import _filter_hooks, _order_hooks
 from ._auto_expand import collapse_single_child_chains
+from ._filter import FilterConfig, FilterResult
 from ._help_dialog import HelpScreen
 from ._labels import _ERR_STYLE, _compose_label
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
@@ -165,6 +166,7 @@ class InspectorApp(App[None]):
         Binding("h", "open_help", "Help", show=True),
         Binding("escape", "hide_search", "Hide search", show=False),
         Binding("o", "open_order_dialog", "Order", show=True),
+        Binding("f", "open_filter_dialog", "Filter", show=True),
     ]
 
     def __init__(
@@ -182,6 +184,12 @@ class InspectorApp(App[None]):
         # at least once. One ``OrderConfig`` per binary (W3-21); no
         # per-function override.
         self._order_config: Optional[OrderConfig] = None
+        # Active filter config; ``None`` means "no filter" (the most
+        # common case — the filter modal hasn't been opened yet OR every
+        # value is enabled). The filter pass in
+        # :func:`_order_hooks.apply_grouping` short-circuits on ``None``
+        # so the variant tree's default path is untouched.
+        self._filter_config: Optional[FilterConfig] = None
         # Per-:class:`FunctionHandle` pending auto-expand set, populated
         # by :meth:`_rebuild_expanded_subtrees` capture-on-rebuild. The
         # dispatcher consumes the set after the FunctionNode re-expand
@@ -406,6 +414,24 @@ class InspectorApp(App[None]):
         """Dispatcher for the :class:`OrderDialog` result; delegates to
         :mod:`._order_hooks`."""
         _order_hooks.on_order_dialog_dismissed(self, result)
+
+    # --- filter dialog ---------------------------------------------
+
+    def action_open_filter_dialog(self) -> None:
+        """Open the Filter modal.
+
+        Heavy lifting (axis + value discovery, rebuild trigger) lives
+        in :mod:`._filter_hooks` so this module's single concern stays
+        the tree dispatcher.
+        """
+        _filter_hooks.open_filter_dialog(self)
+
+    def _on_filter_dialog_dismissed(
+        self, result: Optional[FilterResult]
+    ) -> None:
+        """Dispatcher for the :class:`FilterDialog` result; delegates to
+        :mod:`._filter_hooks`."""
+        _filter_hooks.on_filter_dialog_dismissed(self, result)
 
 
 # ---------------------------------------------------------------------------

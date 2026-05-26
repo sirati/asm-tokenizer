@@ -25,6 +25,7 @@ from tokenizer.inspector._tree_model import (
 )
 from tokenizer.variant_info import VariantIdentity
 
+from ._filter import FilterConfig, apply_filter
 from ._order import (
     OrderAccepted,
     OrderCancelled,
@@ -142,11 +143,25 @@ def apply_grouping(
     first = children[0]
     if not isinstance(first, VariantNode):
         return children
+    # Filter pass FIRST -- the order/group pass operates on the surviving
+    # set. A filter that drops every variant short-circuits here: the
+    # function row stays visible (the user can see the function exists)
+    # but the expand surfaces zero rows. Single concern: filter logic
+    # lives in :mod:`._filter._config`; the dispatcher just threads the
+    # active config through.
+    filter_config = getattr(app, "_filter_config", None)
+    rendered_by_variant = _rendered_by_variant_lookup(first.backend)
+    filtered_children = apply_filter(
+        list(children), rendered_by_variant, filter_config
+    )
+    if not filtered_children:
+        return []
     config = app._order_config
     if config is None:
-        return list(sort_variants_flat(children))  # type: ignore[arg-type]
-    rendered_by_variant = _rendered_by_variant_lookup(first.backend)
-    grouped = group_variants(list(children), rendered_by_variant, config)
+        return list(sort_variants_flat(filtered_children))  # type: ignore[arg-type]
+    grouped = group_variants(
+        list(filtered_children), rendered_by_variant, config
+    )
     return list(grouped)
 
 
