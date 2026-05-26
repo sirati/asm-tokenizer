@@ -31,6 +31,8 @@ __all__ = [
     "FolderScanResult",
     "binaries_in_folder",
     "is_loadable_for",
+    "is_loadable_for_any",
+    "list_child_directories",
     "scan_folder",
 ]
 
@@ -94,6 +96,22 @@ def is_loadable_for(path: Path, provider: LoaderProvider) -> bool:
     binaries tuple when only the boolean answer is needed.
     """
     return bool(binaries_in_folder(path, provider))
+
+
+def is_loadable_for_any(path: Path) -> bool:
+    """``True`` iff ``path`` is loadable for AT LEAST ONE provider.
+
+    Provider-agnostic predicate used by the folder picker once the
+    binary-switcher dialog lifted ``change path...`` out of per-provider
+    subtrees: the picker no longer knows which backend the user will
+    pick, so any-provider data suffices to mark a folder as worth
+    visiting. Short-circuits on the first match for cheap traversal of
+    cold subdirectories.
+    """
+    for provider in LoaderProvider:
+        if binaries_in_folder(path, provider):
+            return True
+    return False
 
 
 def list_child_directories(path: Path) -> List[Path]:

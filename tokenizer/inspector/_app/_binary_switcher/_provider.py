@@ -4,9 +4,12 @@ Single concern: typed pure-data records the binary-switcher dialog
 returns. The :class:`InspectorApp` side reads ``SwitchTarget.provider``
 to pick the right opener (memmap → :func:`make_batch_decode_factory`,
 csv → :func:`make_ftl_factory`), and ``SwitchTarget.binary`` to pick
-the binary name (``None`` means "auto-detect / multi-binary load all
-the directory's binaries" — represented as the ``[open this folder]``
-entry).
+the binary name. After the binary-first dialog refactor the dialog
+ALWAYS supplies a concrete binary name, so ``binary=None`` is reserved
+for programmatic callers (e.g. headless tests stubbing the opener
+table) and short-circuits to the resolver's auto-detect path — which
+raises :class:`SystemExit` on multi-binary directories. Surfacing
+``None`` from the UI is no longer possible.
 
 No string-typed discriminators cross the boundary: :class:`LoaderProvider`
 is an enum, and the App's switch dispatch table maps each enum value to
@@ -49,10 +52,10 @@ class SwitchTarget:
     directory the opener consumes (memmap dir or csv dir). ``binary``
     is the binary name to focus on; ``None`` means "no specific binary
     picked — let the opener auto-detect if it can, otherwise fail
-    loud". The dialog produces ``binary=None`` for the
-    ``[open this folder]`` entry of a single-binary directory (auto-
-    detect succeeds) and refuses to surface ``binary=None`` for multi-
-    binary directories.
+    loud". The binary-first dialog refactor closed the UI path that
+    used to surface ``binary=None`` (the old ``[open this folder]``
+    row), so end-user dismissals always carry a concrete name; ``None``
+    is only seen by programmatic / test callers.
     """
 
     provider: LoaderProvider
