@@ -1,30 +1,39 @@
-"""Binary switcher modal: provider tree + per-binary entries.
+"""Binary switcher modal: binary-first tree with provider children.
 
-Single concern: present a :class:`textual.widgets.Tree` rooted at two
-:class:`LoaderProvider`-discriminated children (memmap, csv), each
-showing the current path + the binaries discovered there + a
-``change path...`` entry, and dismiss with a :class:`SwitchTarget`
-(or ``None`` on cancel).
+Single concern: present a :class:`textual.widgets.Tree` whose top-level
+rows are (1) a header label echoing the current path, (2) one node per
+binary discovered under that path with two children (memmap / csv —
+each providing the corresponding loader stage), and (3) a
+``change path...`` row that opens the folder picker. Dismiss with a
+:class:`SwitchTarget` (or ``None`` on cancel).
 
-Layout (one provider):
+Layout::
 
-    ▼ memmap (stage 3)
-       └── <current-path>
-           ├── ▶ [open this folder]
-           ├── ▶ <binary-1>
-           ├── ▶ <binary-2>
-           └── ▶ change path...
+    ▼ Switch binary
+       ├── /tmp/<current path>          (label only)
+       ├── ▼ libz.so.1.2.11
+       │   ├── memmap (stage 3)
+       │   └── csv (stage 1)
+       ├── ▼ minigzip
+       │   ├── memmap (stage 3)
+       │   └── csv (stage 1)
+       └── change path...
 
-Green-marking: a folder containing loadable data is rendered in green
-text. The ``[open this folder]`` entry is green when the folder is
-loadable (auto-detect succeeds). Per-binary entries are always green
-(they only show up when the folder is loadable). ``change path...`` is
-default-styled — it opens the folder picker, not a switch.
+The header is non-actionable. Each binary node lists exactly the
+providers whose auto-detect finds that binary under the current path
+(so a memmap-only directory hides the ``csv`` child rather than
+producing a click that crashes at the resolver). ``change path...`` is
+a top-level sibling of the binary nodes — it never lives nested under
+a provider/binary — so the user can re-anchor before picking a binary.
 
-The dialog does NOT execute the switch — it only yields a typed
-:class:`SwitchTarget` that the App side consumes. Confirmation
-("Proceed? Work will not be saved") is the responsibility of the
-switch flow itself (this dialog dismisses immediately on accept).
+The dialog does NOT execute the switch — it yields a typed
+:class:`SwitchTarget` for the App side. There is no ``[open this
+folder]`` row at this level: in a multi-binary directory the prior row
+shape sent ``binary=None`` to the resolver which raised
+:class:`SystemExit` ("--binary not given and <dir> contains multiple
+binaries"). Binary-first ordering makes the picker unambiguous and
+removes the crash by construction; per-folder commits now live inside
+the folder picker only.
 """
 
 from __future__ import annotations
@@ -54,6 +63,14 @@ __all__ = [
 _GREEN_STYLE = "bold green"
 
 
+# Each provider's loader-stage label is a UI string keyed by the
+# typed discriminator — no string-typed if/elif at the dispatch site.
+_PROVIDER_STAGE_LABELS: dict[LoaderProvider, str] = {
+    LoaderProvider.MEMMAP: "stage 3",
+    LoaderProvider.CSV: "stage 1",
+}
+
+
 class _TreeNodePayload:
     """Marker class for the tree's data payload.
 
@@ -63,49 +80,32 @@ class _TreeNodePayload:
     """
 
 
-class _ProviderRoot(_TreeNodePayload):
-    """Tree-root payload for one provider (memmap / csv)."""
+class _PathHeaderRow(_TreeNodePayload):
+    """Tree row: the current path shown as a header (no-op when clicked)."""
 
-    __slots__ = ("provider",)
+    __slots__ = ("path",)
 
-    def __init__(self, provider: LoaderProvider) -> None:
-        self.provider = provider
-
-
-class _PathRow(_TreeNodePayload):
-    """Tree row: the current path under a provider."""
-
-    __slots__ = ("provider", "path", "scan")
-
-    def __init__(
-        self,
-        provider: LoaderProvider,
-        path: Path,
-        scan: FolderScanResult,
-    ) -> None:
-        self.provider = provider
+    def __init__(self, path: Path) -> None:
         self.path = path
-        self.scan = scan
 
 
-class _OpenFolderRow(_TreeNodePayload):
-    """Tree row: ``[open this folder]`` — picks all binaries in the path."""
+class _BinaryRoot(_TreeNodePayload):
+    """Tree row: one binary discovered under the current path.
 
-    __slots__ = ("provider", "path", "scan")
+    Children are :class:`_ProviderRow` instances (one per provider that
+    has data for this binary). Clicking the binary node itself is a
+    no-op; the user must drill into a provider child to commit.
+    """
 
-    def __init__(
-        self,
-        provider: LoaderProvider,
-        path: Path,
-        scan: FolderScanResult,
-    ) -> None:
-        self.provider = provider
+    __slots__ = ("path", "binary")
+
+    def __init__(self, path: Path, binary: str) -> None:
         self.path = path
-        self.scan = scan
+        self.binary = binary
 
 
-class _BinaryRow(_TreeNodePayload):
-    """Tree row: one per-binary entry under a loadable path."""
+class _ProviderRow(_TreeNodePayload):
+    """Tree row: one (binary, provider) leaf — clicking commits the switch."""
 
     __slots__ = ("provider", "path", "binary")
 
@@ -123,10 +123,7 @@ class _BinaryRow(_TreeNodePayload):
 class _ChangePathRow(_TreeNodePayload):
     """Tree row: ``change path...`` — opens the folder picker."""
 
-    __slots__ = ("provider",)
-
-    def __init__(self, provider: LoaderProvider) -> None:
-        self.provider = provider
+    __slots__ = ()
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +132,7 @@ class _ChangePathRow(_TreeNodePayload):
 
 
 class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
-    """Switch-binary modal — provider tree, dismisses with a target."""
+    """Switch-binary modal — binary-first tree, dismisses with a target."""
 
     CSS: ClassVar[str] = """
     BinarySwitcherDialog {
@@ -168,14 +165,12 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
         current_provider: Optional[LoaderProvider] = None,
     ) -> None:
         super().__init__()
-        # Both provider subtrees seed against the App's single
-        # ``current_path``; the user can re-point either independently
-        # via ``change path...`` within the dialog session. The home
-        # directory is a sensible fallback when no current path is
-        # known (the mock-factory test case).
-        anchor = current_path or Path.home()
-        self._memmap_path: Path = anchor
-        self._csv_path: Path = anchor
+        # Binary-first ordering means both providers share a single
+        # anchor path: every binary is discovered under THAT path and
+        # offers whichever providers have data for it there. The home
+        # directory is a sensible fallback when the App has no current
+        # path (mock-factory test case).
+        self._anchor_path: Path = current_path or Path.home()
         self._current_provider = current_provider
 
     # --- compose ---------------------------------------------------
@@ -185,93 +180,95 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
             "Switch binary", id="switcher-tree"
         )
         tree.root.expand()
-        self._build_provider_branch(
-            tree.root,
-            LoaderProvider.MEMMAP,
-            self._memmap_path,
-            stage_label="stage 3",
-        )
-        self._build_provider_branch(
-            tree.root,
-            LoaderProvider.CSV,
-            self._csv_path,
-            stage_label="stage 1",
-        )
+        self._populate_tree(tree)
         with Vertical(id="switcher-body"):
             yield tree
 
-    def _build_provider_branch(
+    def _populate_tree(self, tree: Tree[_TreeNodePayload]) -> None:
+        """Mount the binary-first contents under ``tree.root``.
+
+        Layout: a non-actionable path header, one collapsible node per
+        discovered binary (provider children attached), and the
+        ``change path...`` sibling. Per-provider scans run once each;
+        the cross-provider union drives binary enumeration so a binary
+        present in only one provider still appears (with just that
+        provider's child).
+        """
+        path = self._anchor_path
+        # Header: shows the user where the dialog is anchored. Not
+        # selectable because re-anchoring is via ``change path...``.
+        tree.root.add_leaf(
+            Text(str(path), style="bold"),
+            data=_PathHeaderRow(path),
+        )
+
+        scans = {
+            provider: scan_folder(path, provider)
+            for provider in LoaderProvider
+        }
+        binaries = sorted(
+            {b for scan in scans.values() for b in scan.binaries}
+        )
+        if binaries:
+            for binary in binaries:
+                self._mount_binary_node(tree.root, path, binary, scans)
+        else:
+            tree.root.add_leaf(
+                Text(
+                    "(no binaries detected — use 'change path...')",
+                    style="dim",
+                ),
+                data=None,
+            )
+
+        tree.root.add_leaf(
+            Text("change path...", style="cyan"),
+            data=_ChangePathRow(),
+        )
+
+    def _mount_binary_node(
         self,
         root: TreeNode[_TreeNodePayload],
-        provider: LoaderProvider,
-        path: Optional[Path],
-        *,
-        stage_label: str,
+        path: Path,
+        binary: str,
+        scans: dict[LoaderProvider, FolderScanResult],
     ) -> None:
-        """Mount one provider's subtree under ``root``.
+        """Add one binary subtree under ``root``.
 
-        Layout: ``<provider> (<stage_label>) -> <current-path>``; under
-        the path, ``[open this folder]`` (when loadable) + per-binary
-        rows + ``change path...``.
+        Each provider that has ``binary`` under ``path`` gets a child
+        leaf; the leaf label suffixes ``[current]`` when both the path
+        and provider match the App's currently-active selection so the
+        user can see "you are here" at a glance.
         """
-        suffix = self._provider_label_suffix(provider)
-        provider_label = Text(
-            f"{provider.value} ({stage_label}){suffix}", style="bold"
-        )
-        provider_node = root.add(
-            provider_label,
-            data=_ProviderRoot(provider),
+        binary_node = root.add(
+            Text(binary, style=_GREEN_STYLE),
+            data=_BinaryRoot(path, binary),
             expand=True,
         )
-        if path is None:
-            provider_node.add_leaf(
-                Text("(no path set — pick one below)", style="dim"),
-                data=None,
+        for provider in LoaderProvider:
+            if binary not in scans[provider].binaries:
+                continue
+            stage = _PROVIDER_STAGE_LABELS[provider]
+            suffix = self._current_marker(path, provider)
+            label = Text(
+                f"{provider.value} ({stage}){suffix}",
+                style=_GREEN_STYLE,
             )
-            provider_node.add_leaf(
-                Text("change path...", style="cyan"),
-                data=_ChangePathRow(provider),
+            binary_node.add_leaf(
+                label,
+                data=_ProviderRow(provider, path, binary),
             )
-            return
 
-        scan = scan_folder(path, provider)
-        path_label = self._format_path_label(path, scan.loadable)
-        path_node = provider_node.add(
-            path_label,
-            data=_PathRow(provider, path, scan),
-            expand=True,
-        )
-        if scan.loadable:
-            path_node.add_leaf(
-                Text("[open this folder]", style=_GREEN_STYLE),
-                data=_OpenFolderRow(provider, path, scan),
-            )
-            for binary in scan.binaries:
-                path_node.add_leaf(
-                    Text(binary, style=_GREEN_STYLE),
-                    data=_BinaryRow(provider, path, binary),
-                )
-        else:
-            path_node.add_leaf(
-                Text("(no loadable data in this folder)", style="dim"),
-                data=None,
-            )
-        path_node.add_leaf(
-            Text("change path...", style="cyan"),
-            data=_ChangePathRow(provider),
-        )
-
-    def _provider_label_suffix(self, provider: LoaderProvider) -> str:
-        """``" — current"`` marker for the provider the App is using now."""
-        if self._current_provider is provider:
+    def _current_marker(
+        self, path: Path, provider: LoaderProvider
+    ) -> str:
+        """``"  [current]"`` when (path, provider) match the App's state."""
+        if (
+            self._current_provider is provider
+            and self._anchor_path == path
+        ):
             return "  [current]"
         return ""
-
-    @staticmethod
-    def _format_path_label(path: Path, loadable: bool) -> Text:
-        """Green-styled path when loadable; default style otherwise."""
-        style = _GREEN_STYLE if loadable else ""
-        return Text(str(path), style=style)
 
     # --- event dispatch ----------------------------------------------
 
@@ -281,16 +278,7 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
         """Route the selected tree node through the payload-dispatch."""
         event.stop()
         data = event.node.data
-        if isinstance(data, _OpenFolderRow):
-            self.dismiss(
-                SwitchTarget(
-                    provider=data.provider,
-                    path=data.path,
-                    binary=None,
-                )
-            )
-            return
-        if isinstance(data, _BinaryRow):
+        if isinstance(data, _ProviderRow):
             self.dismiss(
                 SwitchTarget(
                     provider=data.provider,
@@ -300,57 +288,35 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
             )
             return
         if isinstance(data, _ChangePathRow):
-            self._open_folder_picker(data.provider)
+            self._open_folder_picker()
             return
-        # Provider-root / path / informational rows: no action.
+        # _PathHeaderRow / _BinaryRoot / None: collapse/expand handled
+        # by the Tree widget itself; no commit on selection.
 
     # --- folder picker integration -----------------------------------
 
-    def _open_folder_picker(self, provider: LoaderProvider) -> None:
-        """Push the folder picker; on confirm, rebuild this provider's
-        subtree against the new path."""
+    def _open_folder_picker(self) -> None:
+        """Push the folder picker; on confirm, re-anchor + rebuild."""
         from ._folder_picker import FolderPickerDialog
 
-        anchor = (
-            self._memmap_path
-            if provider is LoaderProvider.MEMMAP
-            else self._csv_path
-        )
         self.app.push_screen(
-            FolderPickerDialog(provider=provider, start_path=anchor),
-            lambda result: self._on_folder_picked(provider, result),
+            FolderPickerDialog(start_path=self._anchor_path),
+            self._on_folder_picked,
         )
 
-    def _on_folder_picked(
-        self, provider: LoaderProvider, new_path: Optional[Path]
-    ) -> None:
-        """Re-seed the dialog's tree against the newly-picked path.
+    def _on_folder_picked(self, new_path: Optional[Path]) -> None:
+        """Re-anchor the dialog's tree against the newly-picked path.
 
-        The picker returns ``None`` on cancel (no-op) or a directory
-        path. The dialog rebuilds its tree in place so the user can
-        keep browsing without re-opening the modal.
+        Both provider subtrees re-scan against the new path. The picker
+        returns ``None`` on cancel (no-op).
         """
         if new_path is None:
             return
-        if provider is LoaderProvider.MEMMAP:
-            self._memmap_path = new_path
-        else:
-            self._csv_path = new_path
-        # Rebuild the tree wholesale.
+        self._anchor_path = new_path
         tree = self.query_one("#switcher-tree", Tree)
         tree.clear()
-        self._build_provider_branch(
-            tree.root,
-            LoaderProvider.MEMMAP,
-            self._memmap_path,
-            stage_label="stage 3",
-        )
-        self._build_provider_branch(
-            tree.root,
-            LoaderProvider.CSV,
-            self._csv_path,
-            stage_label="stage 1",
-        )
+        tree.root.expand()
+        self._populate_tree(tree)
 
     # --- actions ---------------------------------------------------
 
