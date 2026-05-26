@@ -173,14 +173,18 @@ def enter_body_after_function_id(state: WalkSectionState) -> None:
 def enter_new_body_block(state: WalkSectionState) -> None:
     """Close the current BODY block and open a new BODY block.
 
-    Called by the walker at every in-CT runlength-derived block-start
-    trigger col (and at non-root CT boundaries). The new BODY block's
-    ``block_idx`` carries the encoded BLOCK identity counter once the
-    BLOCK_V2 header lands (via :func:`set_current_body_block_idx`);
-    pre-overwrite the block keeps the previously-seen ``block_idx``
-    so jump-table footer trailers (which never fire a BLOCK_V2) stay
-    addressable. Latches :attr:`pending_header` so the upcoming
-    header pair is consumed.
+    Called by the walker from :func:`._dispatch._handle_block` when a
+    BLOCK_V2 IDENTITY is consumed as a body-block header under
+    :attr:`pending_header`. The new BODY block's ``block_idx`` is
+    pre-set to the previously-seen value (so the section is
+    addressable even before :func:`set_current_body_block_idx`
+    overwrites it with the encoded counter) and re-latches
+    :attr:`pending_header` so the upcoming silent-header pair is
+    consumed -- mirrors the FUNCTION_ID -> BODY transition's latch.
+
+    For JUMP_TABLE-header sections see :func:`enter_new_jump_table_block`
+    (the parallel transition fired from
+    :func:`._dispatch._emit_identity`'s JUMP_TABLE branch).
     """
     prior_block_idx = state.current_block_idx
     close_current_section(state)
@@ -201,6 +205,34 @@ def set_current_body_block_idx(
     """
     if state.current_kind is BlockKind.BODY:
         state.current_block_idx = block_idx
+
+
+def enter_new_jump_table_block(
+    state: WalkSectionState, *, jt_id: int
+) -> None:
+    """Close the current section and open a JUMP_TABLE section.
+
+    Mirror of :func:`enter_new_body_block` for the jump-table footer
+    header path: a JUMP_TABLE IDENTITY consumed under
+    :attr:`pending_header` proves the upcoming section is a
+    writer-emitted jump-table footer block (see
+    :func:`tokenizer.fill_constant_candidates._emit_jump_table_footer_for`),
+    NOT a body block. Open a fresh :attr:`BlockKind.JUMP_TABLE`
+    section keyed on ``jt_id`` (the JUMP_TABLE identity namespace,
+    distinct from the BLOCK_V2 ids used by body blocks). Clears
+    :attr:`pending_header` since the header IDENTITY just landed
+    (the trailing BLOCK_V2 jump-target tokens MUST route as
+    :class:`InlineJumpEntry` openables, not be re-consumed as
+    silent headers).
+
+    The W3-16 ``inside_jump_table_footer_block`` flag is set by the
+    caller (:func:`_emit_identity`) AFTER this transition so the
+    section accumulator's "new section -> clear footer flag" reset
+    in :func:`open_section` does not undo it.
+    """
+    close_current_section(state)
+    open_section(state, kind=BlockKind.JUMP_TABLE, block_idx=jt_id)
+    state.pending_header = False
 
 
 def maybe_advance_call_target(state: WalkSectionState, *, col: int) -> None:

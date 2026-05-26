@@ -48,6 +48,7 @@ from .._fid_table import FidBaseTable
 from .._sections import (
     enter_body_after_function_id,
     enter_new_body_block,
+    enter_new_jump_table_block,
     set_current_body_block_idx,
 )
 from ._instruction import _consume_openable_slot, _consume_text_slot
@@ -294,9 +295,29 @@ def _emit_identity(
         )
         return
     if cat is Category.JUMP_TABLE:
-        # Footer begins: arm block-level flag so trailing Block_V2
-        # tokens route as InlineJumpEntry; arm per-instruction flag
-        # so finalize flips SILENT_HEADER -> JUMP_TABLE_FOOTER policy.
+        # Footer begins. Two cases distinguished by ``pending_header``:
+        #
+        # * ``pending_header=True`` -- runlength-derived block boundary
+        #   just latched + the upcoming insn was marked as silent-header
+        #   by ``_start_new_instruction``. The JUMP_TABLE IDENTITY is
+        #   structurally the section header (mirrors BLOCK_V2's role
+        #   in :func:`_handle_block`). Open a fresh
+        #   :attr:`BlockKind.JUMP_TABLE` section keyed on the JT
+        #   identity; the writer emits jump-table footers as full
+        #   block-runlength siblings of body blocks per
+        #   :func:`tokenizer.fill_constant_candidates._emit_jump_table_footer_for`.
+        # * ``pending_header=False`` -- defensive: a JUMP_TABLE
+        #   IDENTITY landed mid-instruction outside a runlength
+        #   boundary. The current section's kind is whatever the
+        #   walker had open; we still arm the per-block footer flag
+        #   so trailing BLOCK_V2 tokens route as InlineJumpEntry.
+        #
+        # In both cases arm the per-block + per-instruction flags so
+        # finalize flips SILENT_HEADER -> JUMP_TABLE_FOOTER policy and
+        # trailing Block_V2 tokens are routed as :class:`InlineJumpEntry`.
+        if state.pending_header:
+            enter_new_jump_table_block(state, jt_id=counter)
+            state.current_insn_in_silent_header = True
         state.inside_jump_table_footer_block = True
         state.saw_jump_table_this_insn = True
     _consume_text_slot(state, text=f"<{cat.name.lower()} {counter}>")

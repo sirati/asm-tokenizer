@@ -201,6 +201,62 @@ def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
     )
 
 
+def test_jump_table_footer_opens_jump_table_section_via_runlength_boundary() -> None:
+    """Writer-shaped jump-table footer: the footer is its OWN block in
+    ``block_runlength`` (see
+    :func:`tokenizer.fill_constant_candidates._emit_jump_table_footer_for`).
+    When the runlength-derived boundary fires + a JUMP_TABLE IDENTITY
+    follows (instead of a BLOCK_V2 header), the walker must open a
+    :attr:`BlockKind.JUMP_TABLE` section keyed on the JT identity --
+    NOT keep the footer folded into the prior body block.
+
+    Layout: body block ``BLOCK_V2(c=5)`` carrying one INSTR_REP insn,
+    then a footer block ``JUMP_TABLE(n=7)`` carrying 3 BLOCK_V2 jump
+    targets ``[10, 11, 12]``. ``block_runlength=[1, 1]`` (1 insn per
+    block); ``insn_runlength=[1, 4]`` (BODY insn = 1 slot,
+    JT-footer insn = 4 slots).
+    """
+    blocks = _walk(
+        tokens=np.asarray(
+            [
+                BLOCK_V2,           # body block header (c=5) -- 1 slot
+                INSTR_REP_TOKEN,    # body block insn      -- 1 slot
+                INSTR_REP_TOKEN,    # Block_Def for the footer  -- 1 slot (silent header)
+                JUMP_TABLE, BLOCK_V2, BLOCK_V2, BLOCK_V2,  # JT footer slots
+                0,
+            ],
+            dtype=np.uint16,
+        ),
+        identities=np.asarray([5, 7, 10, 11, 12], dtype=np.uint16),
+        n_axis=0, partial_cut_lengths=[7],
+        # block_runlength[0]=1 -> body block has 1 instruction.
+        # block_runlength[1]=1 -> footer block has 1 instruction.
+        block_runlength=np.asarray([1, 1], dtype=np.uint32),
+        # insn_runlength: body insn = 1 slot; footer insn = 5 slots
+        # (Block_Def silent-header carrier + JUMP_TABLE + 3 BLOCK_V2
+        # jump targets). The full insn lives in one
+        # ``slots_remaining_in_insn`` budget so the 3 BLOCK_V2 targets
+        # all ride on the SAME AsmLine.
+        insn_runlength=np.asarray([1, 5], dtype=np.uint32),
+    )
+
+    # Two sections: BODY(block_idx=5) + JUMP_TABLE(block_idx=7).
+    assert [(b.kind, b.block_idx) for b in blocks] == [
+        (BlockKind.BODY, 5),
+        (BlockKind.JUMP_TABLE, 7),
+    ]
+    # The JT footer section carries one AsmLine with the 3 jump-table
+    # targets routed as InlineJumpEntry openables.
+    footer = blocks[1]
+    asm_lines = [it for it in footer.items if isinstance(it, AsmLine)]
+    assert len(asm_lines) == 1
+    assert asm_lines[0].openables == (
+        InlineJumpEntry(target_block_idx=10),
+        InlineJumpEntry(target_block_idx=11),
+        InlineJumpEntry(target_block_idx=12),
+    )
+
+
 def test_jump_table_flag_resets_on_new_body_block() -> None:
     """A subsequent body-block transition clears
     :attr:`WalkSectionState.inside_jump_table_footer_block` so the

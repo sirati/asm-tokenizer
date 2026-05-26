@@ -67,10 +67,10 @@ __all__ = [
 
 
 class BlockKind(Enum):
-    """Discriminator for the three :class:`RenderedBlock` section kinds.
+    """Discriminator for the :class:`RenderedBlock` section kinds.
 
     Variant-level layout (BatchDecodeBackend, the only producer that
-    splits all three):
+    splits the variant-prefix kinds):
 
     * :attr:`VARIANT_HEADER` -- the variant_tokens prefix
       (``arch:/comp:/cver:/opt:`` rows). Spans cols ``[0, n_axis)``.
@@ -82,15 +82,25 @@ class BlockKind(Enum):
       header-pair content of the block; the ``Block_Def`` + ``block_v2``
       header pair is consumed silently by the walker so the section
       content starts at the first real instruction. ``block_idx`` is
-      the block index encoded by the consumed header.
+      the BLOCK_V2 identity encoded by the consumed header.
+    * :attr:`JUMP_TABLE` -- one section per jump-table footer block.
+      Writer-side these are emitted as full siblings of body blocks
+      (see :mod:`tokenizer.fill_constant_candidates`); the header pair
+      is ``[Block_Def, Jump_Table(N)]`` so the section is consumed via
+      the same gate that handles BLOCK_V2 headers. ``block_idx`` is
+      the JUMP_TABLE identity ``N`` (distinct namespace from BLOCK_V2
+      ids; the kind discriminates).
 
-    FtlBackend emits only :attr:`BODY` sections (no variant_tokens /
-    self-prepend at the FTL stream layer).
+    Both backends emit :attr:`BODY` + :attr:`JUMP_TABLE` per-block;
+    only BatchDecodeBackend additionally emits :attr:`VARIANT_HEADER`
+    / :attr:`FUNCTION_ID` (the FTL stream layer starts at the function
+    body so those sections do not exist there).
     """
 
     VARIANT_HEADER = "variant_header"
     FUNCTION_ID = "function_id"
     BODY = "body"
+    JUMP_TABLE = "jump_table"
 
 
 # ---------------------------------------------------------------------------
@@ -173,21 +183,26 @@ class RenderedVariant:
 class RenderedBlock:
     """Per-section metadata for tree-row labels.
 
-    Three section kinds are discriminated by :attr:`kind`
+    Section kinds are discriminated by :attr:`kind`
     (:class:`BlockKind`): a BatchDecodeBackend variant exposes
-    ``[VARIANT_HEADER, FUNCTION_ID, BODY*]`` so the variant_tokens
-    prefix, LOCAL_FUNC self-prepend, and per-block body each get a
-    semantically-correct tree section. FtlBackend emits only
-    :attr:`BlockKind.BODY` entries.
+    ``[VARIANT_HEADER, FUNCTION_ID, (BODY | JUMP_TABLE)*]`` so the
+    variant_tokens prefix, LOCAL_FUNC self-prepend, per-block bodies,
+    and jump-table footers each get a semantically-correct tree
+    section. FtlBackend emits only :attr:`BlockKind.BODY` +
+    :attr:`BlockKind.JUMP_TABLE` (no variant prefix / self-prepend at
+    the FTL stream layer).
 
     ``preview`` carries the raw asm-text head WITHOUT any UI
     truncation -- the UI layer (:func:`_label.block_preview`) owns
     the length policy (plan section 3, ``_label.py`` row).
 
     ``block_idx`` is the backend-internal block index threaded back
-    into :meth:`RenderBackend.render_block`; ``-1`` for the non-body
-    kinds (``VARIANT_HEADER`` / ``FUNCTION_ID``) where there is no
-    block to address.
+    into :meth:`RenderBackend.render_block`. For :attr:`BlockKind.BODY`
+    it carries the BLOCK_V2 identity ``N``; for
+    :attr:`BlockKind.JUMP_TABLE` it carries the JUMP_TABLE identity
+    (distinct namespace -- the kind discriminates). ``-1`` for the
+    non-block kinds (``VARIANT_HEADER`` / ``FUNCTION_ID``) where
+    there is no block to address.
     """
 
     kind: BlockKind
@@ -360,11 +375,13 @@ class RenderBackend(Protocol):
         """Materialise the per-section line-item stream.
 
         The ``(kind, block_idx)`` pair addresses one section produced
-        by :meth:`blocks`. :attr:`BlockKind.BODY` sections use the
-        real block index; :attr:`BlockKind.VARIANT_HEADER` and
-        :attr:`BlockKind.FUNCTION_ID` use ``block_idx == -1`` (the
-        kind discriminates between them so the sentinel never
-        collides). Returns an :class:`Iterable` (not a list) so
+        by :meth:`blocks`. :attr:`BlockKind.BODY` /
+        :attr:`BlockKind.JUMP_TABLE` sections use the real identity
+        index (BLOCK_V2 / JUMP_TABLE id respectively);
+        :attr:`BlockKind.VARIANT_HEADER` and :attr:`BlockKind.FUNCTION_ID`
+        use ``block_idx == -1`` (the kind discriminates between them
+        so the sentinel never collides). Returns an :class:`Iterable`
+        (not a list) so
         consumers cannot mutate cached state. Re-callable on the
         same coordinates. Raises on data-integrity violation; the
         UI's central dispatcher (``_app.py``) catches and renders
