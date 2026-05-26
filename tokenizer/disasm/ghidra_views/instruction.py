@@ -93,8 +93,11 @@ class _GhidraInstructionView:
         populates a passed-in _GhidraMemoryOperandView
       - ``decompose_arm_memory(insn, op_idx, reg_map)`` -> callback
       - ``decompose_base_disp_memory(insn, op_idx, reg_map)`` -> callback
-      - ``operand_spec(insn, op_idx, arch, base_mnemonic, reg_map)``
-        -> dict ready to pass as kwargs to ``_GhidraOperandView._advance``
+      - ``operand_spec(insn, op_idx, arch, base_mnemonic, reg_map, *,
+        instruction_has_mem_access)`` -> dict ready to pass as kwargs to
+        ``_GhidraOperandView._advance``
+      - ``has_load_store(insn)`` -> bool, cached at the cursor level
+        for ``InstructionView.has_load_store``
     """
 
     __slots__ = (
@@ -112,6 +115,7 @@ class _GhidraInstructionView:
         "_prefixes",
         "_operand_view",
         "_operands_view",
+        "_has_load_store",
     )
 
     def __init__(
@@ -139,6 +143,7 @@ class _GhidraInstructionView:
         self._prefixes = _GhidraPrefixesView()
         self._operand_view = _GhidraOperandView(arch, reg_map)
         self._operands_view = _GhidraOperandsView(self)
+        self._has_load_store: bool = False
 
     def _advance(self, ghidra_insn: Any) -> None:
         """Repoint at the next Ghidra Instruction.
@@ -197,6 +202,13 @@ class _GhidraInstructionView:
         from ghidra.program.model.lang import OperandType
         from tokenizer.disasm.types import OperandKind as _OperandKind
 
+        # Compute the per-instruction has-LOAD/STORE rich-IR signal ONCE,
+        # before the per-operand decode walk. The downstream resolved-
+        # target policy consults this via ``InstructionView.has_load_store``;
+        # caching here avoids the per-operand recompute the legacy decode
+        # path triggered inside ``operand_spec``.
+        self._has_load_store = self._decode.has_load_store(ghidra_insn)
+
         raw_specs = [
             self._decode.operand_spec(
                 ghidra_insn,
@@ -204,6 +216,7 @@ class _GhidraInstructionView:
                 self._arch,
                 self._base_mnemonic,
                 self._reg_map,
+                instruction_has_mem_access=self._has_load_store,
             )
             for i in range(num_ops)
         ]
@@ -271,6 +284,10 @@ class _GhidraInstructionView:
     def prefixes(self) -> PrefixesView:
         return self._prefixes
 
+    @property
+    def has_load_store(self) -> bool:
+        return self._has_load_store
+
     def __deepcopy__(self, memo) -> "_GhidraInstructionView":
         clone = _GhidraInstructionView(self._arch, self._program, self._reg_map, self._decode)
         clone._ghidra_insn = self._ghidra_insn
@@ -279,6 +296,7 @@ class _GhidraInstructionView:
         clone._base_mnemonic = self._base_mnemonic
         clone._op_str = self._op_str
         clone._operand_count = self._operand_count
+        clone._has_load_store = self._has_load_store
         # Carry the pre-computed (already pair-merged) operand specs so
         # the clone iterates the same operand sequence without re-decoding.
         # Spec dicts hold closures over the stable ghidra_insn Java handle

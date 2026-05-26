@@ -560,6 +560,20 @@ class _AngrInstructionView:
     def prefixes(self) -> PrefixesView:
         return self._prefixes_view
 
+    @property
+    def has_load_store(self) -> bool:
+        # Capstone does not surface PC-relative analyzer-resolved DATA
+        # refs on the angr path (see ``_AngrOperandView.resolved_target``
+        # sentinel — always ``None``), so the resolved-target keep/drop
+        # policy that this signal feeds is never consulted on the angr
+        # path. Returning ``False`` satisfies the typed-view protocol
+        # without paying the cost of reading ``cs_insn.groups`` for a
+        # signal nothing downstream consumes today. If a future angr
+        # CFG-resolution path starts emitting REG-side resolved targets,
+        # this returner should read CS_GRP_LOAD / CS_GRP_STORE from
+        # ``cs_insn.groups`` and pass the same suppression policy.
+        return False
+
     def __deepcopy__(self, memo) -> "_AngrInstructionView":
         clone = _AngrInstructionView(self._arch)
         clone._set(self._cs_insn)
