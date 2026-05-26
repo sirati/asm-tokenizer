@@ -57,8 +57,13 @@ class QuitConfirmScreen(ModalScreen[bool]):
         with Vertical(id="quit-body"):
             yield Label("Really quit?")
             with Horizontal(id="quit-buttons"):
-                yield Button("Accept", id="quit-accept", variant="primary")
-                yield Button("Cancel", id="quit-cancel")
+                yield Button("Accept", id="quit-accept")
+                yield Button("Cancel", id="quit-cancel", variant="primary")
+
+    def on_mount(self) -> None:
+        # Default-focus the safer choice so an accidental Enter stays
+        # in the inspector rather than dropping the user out.
+        self.query_one("#quit-cancel", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "quit-accept":
