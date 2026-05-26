@@ -12,6 +12,7 @@ from typing import Any, Hashable, Iterator, Optional
 from tokenizer.disasm.ghidra_views.block import _GhidraBlockView
 from tokenizer.disasm.ghidra_views.unnamed_rename import placeholder_renamed_name
 from tokenizer.disasm.types import Architecture, BlocksView
+from tokenizer.function_deduper import ThunkIdentity, ThunkTargetKind
 
 
 # ---------------------------------------------------------------------------
@@ -207,18 +208,30 @@ class _GhidraFunctionView:
 # ---------------------------------------------------------------------------
 # Identity-key extraction
 # ---------------------------------------------------------------------------
-def _ghidra_identity_key(ghidra_function: Any) -> Optional[Hashable]:
-    """Return a stable identity key when Ghidra recognises this function
-    as a thunk, else ``None``.
+def _ghidra_identity_key(ghidra_function: Any) -> Optional[ThunkIdentity]:
+    """Return a stable :class:`ThunkIdentity` when Ghidra recognises this
+    function as a thunk, else ``None``.
 
     Implements the ``FunctionView.identity_key`` contract (see
-    ``tokenizer/disasm/types.py``): for PLT-thunk functions the key is
-    the resolved external's entry-point offset
-    (``Function.getThunkedFunction(True).getEntryPoint().getOffset()``),
-    which is identical across every trampoline slot that resolves to
-    the same external symbol AND stable across ISA variants. For
-    non-thunk functions the provider declines to assert identity beyond
-    name and returns ``None`` (legacy disambiguation path).
+    ``tokenizer/disasm/types.py``). Two cases:
+
+    * External-target thunk (``thunked.isExternal()`` is True). The
+      resolved Function lives in Ghidra's per-binary EXTERNAL block;
+      its entry-point offset is a link-order-dependent PLACEHOLDER —
+      same source symbol gets a different placeholder offset across
+      binaries, so the offset is NOT cross-binary stable. The imported
+      symbol name (``thunked.getName()``) IS cross-binary stable for
+      the same source symbol; that is the identity key.
+    * Local-target thunk (``isExternal()`` is False — rare; hand-written
+      assembly aliases, IFUNCs, some toolchain trampolines). The
+      resolved Function lives in real code; its entry-point offset is
+      stable within the binary. Cross-binary stability is NOT claimed
+      (the offset would shift across binaries), but local-target thunks
+      are a small minority and the legacy within-binary disambiguation
+      is the only invariant downstream needs.
+
+    Non-thunk functions return ``None`` (legacy disambiguation path —
+    the provider declines to assert identity beyond name).
 
     Resilient to partially-populated Ghidra programs: any exception
     from the Java side is swallowed and the function falls back to
@@ -238,9 +251,22 @@ def _ghidra_identity_key(ghidra_function: Any) -> Optional[Hashable]:
     if thunked is None:
         return None
     try:
-        return int(thunked.getEntryPoint().getOffset())
+        is_external = bool(thunked.isExternal())
     except Exception:
         return None
+    if is_external:
+        # Imported-symbol name is cross-binary stable.
+        try:
+            name = str(thunked.getName())
+        except Exception:
+            return None
+        return ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key=name)
+    # Local-target thunk: offset is stable within binary.
+    try:
+        offset = int(thunked.getEntryPoint().getOffset())
+    except Exception:
+        return None
+    return ThunkIdentity(kind=ThunkTargetKind.LOCAL, key=f"{offset:x}")
 
 
 # ---------------------------------------------------------------------------

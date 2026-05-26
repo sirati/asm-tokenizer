@@ -101,11 +101,14 @@ class AddressMetadataView(Protocol):
     @property
     def identity_key(self) -> Optional[Hashable]: ...
     # Provider-supplied "stronger-than-name" identity for this function
-    # address. PLT thunks: the resolved external's entry-point offset
-    # (cross-ISA-stable). Non-thunk functions / non-function addresses:
-    # ``None``. The lookup populates this alongside ``name`` for the
-    # same reason ``comment`` is populated -- so consumers see the same
-    # canonical-name basis the FunctionDataManager uses.
+    # address. PLT thunks: a typed
+    # :class:`tokenizer.function_deduper.ThunkIdentity` keyed on the
+    # imported symbol name for external-target thunks (cross-binary
+    # stable) or on the hex entry-point offset for local-target thunks
+    # (within-binary stable). Non-thunk functions / non-function
+    # addresses: ``None``. The lookup populates this alongside ``name``
+    # for the same reason ``comment`` is populated -- so consumers see
+    # the same canonical-name basis the FunctionDataManager uses.
 
     @property
     def section_kind(self) -> SectionKind: ...
