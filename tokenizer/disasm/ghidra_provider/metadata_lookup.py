@@ -15,6 +15,9 @@ from __future__ import annotations
 
 from typing import Any, Hashable, Optional
 
+from tokenizer.disasm.ghidra_provider.jump_table_predicates import (
+    has_inbound_computed_jump,
+)
 from tokenizer.disasm.ghidra_provider.metadata_view import _GhidraAddressMetadataView
 from tokenizer.disasm.ghidra_provider.section_classify import (
     _encoding_from_string_datatype,
@@ -213,12 +216,32 @@ class GhidraMetadataLookup:
     def _is_jump_table_slot(self, addr_obj: Any, block: Any) -> bool:
         """Decide whether ``addr_obj`` is a slot in a Ghidra-recovered switch table.
 
-        First-pass implementation: check that the Data at/around the
-        address is a pointer-array element AND the containing block
-        is rodata-flavored. A precise cross-check against computed-jump
-        inbound references is feasible but expensive (per-address ref
-        walk); the function-level ``iter_switch_tables`` consumer below
-        does that more cheaply by walking from the dispatch site.
+        Two conditions must hold:
+
+        1. STRUCTURAL: the Data at/around the address is a Pointer (or
+           Array-of-Pointer) AND the containing memory block is
+           rodata-flavored (``.rodata``, ``.rodata1``, ``.data.rel.ro``,
+           ``.data.rel.ro.local``). Necessary but NOT sufficient — every
+           Pointer in ``.data.rel.ro`` (relro PLT GOT analogue under
+           ``-z relro -z now`` builds, C++ ``typeinfo`` pointers, vtable
+           component pointers stamped by GCC RTTI) trivially matches.
+
+        2. SEMANTIC: at least one inbound reference into the Data's
+           address range is of kind ``COMPUTED_JUMP``. Ghidra's analyser
+           populates these back-refs when it recovers a computed-jump
+           dispatch site that reads the table; their presence is the
+           authoritative evidence that this Data IS a switch table
+           (vs a coincidental pointer array). Without an inbound
+           computed-jump ref, the structural match alone is INSUFFICIENT
+           — the predicate must return False so the downstream
+           ``Category.JUMP_TABLE`` identity / target-less footer path is
+           not taken on hardened-relro PLT GOTs and similar
+           non-switch-table pointer arrays.
+
+        The semantic check is owned by
+        ``jump_table_predicates.has_inbound_computed_jump`` (sibling
+        module); this predicate composes the structural gate with that
+        single-concern helper.
         """
         if block is None:
             return False
@@ -233,27 +256,39 @@ class GhidraMetadataLookup:
             return False
         if dt is None:
             return False
-        # Pointer or Array-of-Pointer is the canonical jump-table shape.
-        # We check by class name to avoid a hard import of Ghidra DataType
-        # classes here; the type hierarchy in Ghidra has ``Pointer`` and
-        # ``Array`` as stable interface names.
+        # STRUCTURAL: Pointer or Array-of-Pointer is the canonical
+        # jump-table shape. We check by class name to avoid a hard
+        # import of Ghidra DataType classes here; the type hierarchy
+        # in Ghidra has ``Pointer`` and ``Array`` as stable interface
+        # names.
+        structurally_matches: bool
         try:
             from ghidra.program.model.data import Array, Pointer
 
             if isinstance(dt, Pointer):
-                return True
-            if isinstance(dt, Array):
+                structurally_matches = True
+            elif isinstance(dt, Array):
                 try:
                     inner = dt.getDataType()
-                    return isinstance(inner, Pointer)
+                    structurally_matches = isinstance(inner, Pointer)
                 except Exception:
                     return False
+            else:
+                structurally_matches = False
         except Exception:
             # Fallback if the Ghidra import fails for any reason
             tname = str(dt.getName()).lower()
-            if "pointer" in tname or tname.endswith("*"):
-                return True
-        return False
+            structurally_matches = "pointer" in tname or tname.endswith("*")
+        if not structurally_matches:
+            return False
+        # SEMANTIC: require an inbound COMPUTED_JUMP back-ref into the
+        # Data's address span. Without it, the structural match is
+        # coincidental (relro PLT GOT, vtable components, C++ typeinfo).
+        try:
+            ref_mgr = self._program.getReferenceManager()
+        except Exception:
+            return False
+        return has_inbound_computed_jump(ref_mgr, data)
 
     def _is_extern_synthetic(self, func: Any, block: Any) -> bool:
         """Detect Ghidra's analogue of CLE's synthetic-extern object.
