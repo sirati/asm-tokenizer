@@ -10,15 +10,18 @@ the same :class:`BackendFactory` the parent tree-open used; the
 matching variant's blocks are surfaced DIRECTLY (skipping the
 intermediate variant-list level, per plan decision D2) and the other
 variants are bundled under a :class:`ShowAllVariantsNode` sibling.
-The fallback path (no encoder-recorded pin for this call site,
-:data:`MISSING_VARIANT_INDEX`) surfaces every variant as a sibling,
-matching the pre-D2 contract.
+The fallback path (no encoder-recorded pin for this caller-variant,
+:data:`MISSING_VARIANT_INDEX`) surfaces an informational
+:class:`InlineCallMissingVariantLeaf` row + a sibling
+:class:`ShowAllVariantsNode` that lets the user drill into the full
+variant list manually -- the two-row shape signals the fallback nature
+explicitly instead of silently dumping every variant.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
@@ -63,6 +66,13 @@ class InlineCallNode:
     variant_idx: int
     provider: str | None
     is_failed: bool = False
+    # Message text for the :class:`InlineCallMissingVariantLeaf` row
+    # surfaced under the MISSING_VARIANT_INDEX fallback path. Kept as
+    # a class-level constant so the model layer owns the wording
+    # (not the UI), keeping :func:`_compose_label` a pure dispatcher.
+    _MISSING_PIN_MESSAGE: ClassVar[str] = (
+        "function not in data for this variant"
+    )
     # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.
     remembered_scroll_x: int = field(default=0, init=False)
 
@@ -100,15 +110,18 @@ class InlineCallNode:
 
         When the pin is :data:`MISSING_VARIANT_INDEX` (the
         dataloader recorded no specific callee-variant link for this
-        call site — e.g. EXTERN call_targets, inlined-callee call
-        sites whose section wasn't parsed into the dataloader's
-        intermediate state, or FtlBackend whose CSV stream carries
-        no per-call data), the fallback is to surface every variant
-        directly as VariantNode siblings, matching the pre-D2
-        contract.
+        caller-variant — e.g. a cross-arm call whose caller vkey
+        doesn't exist in the callee's variant table, EXTERN
+        call_targets, inlined-callee call sites whose section wasn't
+        parsed into the dataloader's intermediate state, or
+        FtlBackend whose CSV stream carries no per-call data), the
+        fallback is a two-row surface: an informational
+        :class:`InlineCallMissingVariantLeaf` flagging the missing
+        pin + a sibling :class:`ShowAllVariantsNode` carrying the
+        all-variants list so the user can still drill in manually.
         """
         from ._nodes_function import FunctionNode
-        from ._nodes_leaf import ShowAllVariantsNode
+        from ._nodes_leaf import InlineCallMissingVariantLeaf, ShowAllVariantsNode
 
         if self.callee_handle is None:
             raise RuntimeError(
@@ -119,7 +132,20 @@ class InlineCallNode:
         all_variants = callee.expand()
 
         if self.variant_idx == MISSING_VARIANT_INDEX:
-            return list(all_variants)
+            # No pin recorded for THIS caller-variant. Surface the
+            # missing-pin signal as a non-expandable error row plus a
+            # sibling that opens onto the full variant list, so the
+            # user sees the fallback explicitly instead of a silent
+            # all-variants dump.
+            return [
+                InlineCallMissingVariantLeaf(
+                    message=self._MISSING_PIN_MESSAGE
+                ),
+                ShowAllVariantsNode(
+                    label="show all variants",
+                    other_variants=tuple(all_variants),
+                ),
+            ]
         matched_idx_in_list = _find_matching_variant_index(
             all_variants, self.variant_idx
         )

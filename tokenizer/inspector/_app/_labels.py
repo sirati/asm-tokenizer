@@ -9,6 +9,7 @@ the Textual tree widget.
 
 from __future__ import annotations
 
+from rich.style import Style
 from rich.text import Text
 
 from tokenizer.inspector._label import (
@@ -22,6 +23,7 @@ from tokenizer.inspector._tree_model import (
     AsmLeaf,
     BlockNode,
     FunctionNode,
+    InlineCallMissingVariantLeaf,
     InlineCallNode,
     InlineJumpNode,
     Node,
@@ -33,7 +35,22 @@ from tokenizer.inspector._tree_model import (
 from ._order import VariantGroupNode, format_grouping_label
 
 
-__all__ = ["_compose_label", "_block_node_label", "_BLOCK_KIND_LABELS"]
+# Dim red style for informational error rows (e.g. the missing-pin
+# leaf under an :class:`InlineCallNode` fallback). Kept identical to
+# the dispatcher's ``_ERR_STYLE`` in :mod:`._application` so a model-
+# data shape issue surfaced as content and a caught-exception error
+# leaf paint the same red tint -- the two paths share the visual
+# vocabulary without sharing the ``is_failed`` flag (which carries
+# additional "re-run the failing expand on next click" semantics).
+_ERR_STYLE: Style = Style(color="red", dim=True)
+
+
+__all__ = [
+    "_BLOCK_KIND_LABELS",
+    "_ERR_STYLE",
+    "_block_node_label",
+    "_compose_label",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +116,13 @@ def _compose_label(node: Node) -> Text:
         return Text(node.text)
     if isinstance(node, NumberPrecisionLeaf):
         return Text(node.text)
+    if isinstance(node, InlineCallMissingVariantLeaf):
+        # The leaf is informational, not a caught exception, so the
+        # ``is_failed`` prefix-glyph dispatch in the tree widget does
+        # NOT fire here. We render a literal ``[*] `` glyph inline in
+        # the label text + the message body, both in dim red so the
+        # row reads as a fallback signal under the parent InlineCall.
+        return Text(f"[*] {node.message}", style=_ERR_STYLE)
     if isinstance(node, ShowAllVariantsNode):
         return Text(node.label)
     if isinstance(node, VariantGroupNode):

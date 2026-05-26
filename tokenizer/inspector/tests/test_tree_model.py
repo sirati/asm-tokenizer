@@ -31,6 +31,7 @@ from tokenizer.inspector._tree_model import (
     AsmLeaf,
     BlockNode,
     FunctionNode,
+    InlineCallMissingVariantLeaf,
     InlineCallNode,
     ShowAllVariantsNode,
     VariantNode,
@@ -482,11 +483,15 @@ def test_inline_call_expand_plt_yields_thunk_body_blocks():
     assert [c.block_idx for c in children] == [0, 1]
 
 
-def test_inline_call_expand_missing_variant_falls_back_to_all_variants():
-    """When the caller's variant_idx is not in the callee's surviving
-    set (e.g. :data:`MISSING_VARIANT_INDEX` -- the callee dropped that
-    variant), the fallback path surfaces EVERY callee variant as a
-    sibling :class:`VariantNode` -- matching the pre-D2 contract.
+def test_inline_call_expand_missing_variant_surfaces_error_leaf_plus_show_all():
+    """When the caller has no recorded per-variant pin for this call
+    site (:data:`MISSING_VARIANT_INDEX` -- e.g. a cross-arm call whose
+    caller vkey doesn't exist in the callee's variant table), the
+    fallback path surfaces TWO siblings: an informational
+    :class:`InlineCallMissingVariantLeaf` row flagging the missing pin
+    + a :class:`ShowAllVariantsNode` that lets the user open the full
+    variant list manually. The leaf is non-expandable; drilling into
+    the show-all sibling yields every callee variant.
     """
     from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
 
@@ -508,9 +513,54 @@ def test_inline_call_expand_missing_variant_falls_back_to_all_variants():
 
     children = node.expand()
 
-    assert len(children) == 3
-    assert all(isinstance(c, VariantNode) for c in children)
-    assert [c.variant_idx for c in children] == [0, 1, 2]
+    # Two-row fallback shape: [error leaf, show-all sibling].
+    assert len(children) == 2
+    assert isinstance(children[0], InlineCallMissingVariantLeaf)
+    assert isinstance(children[1], ShowAllVariantsNode)
+
+    # Leaf is non-expandable + carries the model-owned message text.
+    leaf = children[0]
+    assert leaf.can_expand is False
+    assert leaf.message == "function not in data for this variant"
+
+    # Show-all sibling expands onto every callee variant (the full
+    # fallback list lives behind the user's manual drill-in).
+    show_all = children[1]
+    assert show_all.can_expand is True
+    grandchildren = show_all.expand()
+    assert len(grandchildren) == 3
+    assert all(isinstance(c, VariantNode) for c in grandchildren)
+    assert [c.variant_idx for c in grandchildren] == [0, 1, 2]
+
+
+def test_inline_call_missing_variant_leaf_expand_raises():
+    """Contract: callers MUST gate on ``can_expand`` -- the terminal
+    leaf raises :class:`NotImplementedError` if expand is called."""
+    leaf = InlineCallMissingVariantLeaf(message="x")
+    assert leaf.can_expand is False
+    with pytest.raises(NotImplementedError):
+        leaf.expand()
+
+
+def test_inline_call_missing_variant_leaf_label_renders_red():
+    """The label dispatcher renders the missing-pin leaf with the
+    shared dim-red ``_ERR_STYLE`` + a literal ``[*] `` glyph in the
+    label text (since :attr:`is_failed` stays False here, the tree
+    widget's prefix-glyph dispatch does not fire and the glyph must
+    live in the label itself).
+    """
+    pytest.importorskip("textual")
+
+    from tokenizer.inspector._app._labels import _ERR_STYLE, _compose_label
+
+    leaf = InlineCallMissingVariantLeaf(
+        message="function not in data for this variant"
+    )
+
+    rendered = _compose_label(leaf)
+    assert rendered.plain == "[*] function not in data for this variant"
+    # Style on the whole label matches the shared dim-red constant.
+    assert rendered.style == _ERR_STYLE
 
 
 # ---------------------------------------------------------------------------

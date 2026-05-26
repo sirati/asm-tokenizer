@@ -4,9 +4,13 @@ Terminal nodes never expand into children; the UI gates expand on
 ``can_expand``. The leaves are :class:`AsmLeaf` (one rendered asm-like
 line, optionally carrying :data:`Openable` sidecar entries that produce
 child rows on expand), :class:`NumberPrecisionLeaf` (terminal
-full-precision display for a NUMBER row), and
+full-precision display for a NUMBER row),
 :class:`ShowAllVariantsNode` (the sibling shown under an inline-call
-when only some of the callee's variants matched the caller's pin).
+when only some of the callee's variants matched the caller's pin), and
+:class:`InlineCallMissingVariantLeaf` (the red ``[*]`` informational
+row shown under an inline-call when the dataloader recorded NO
+per-variant pin for this caller-variant -- a model-data shape issue,
+not an exception).
 
 ``AsmLeaf`` implements the 3-arm expand contract (per plan W3-2
 W4-amended):
@@ -52,6 +56,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AsmLeaf",
+    "InlineCallMissingVariantLeaf",
     "NumberPrecisionLeaf",
     "ShowAllVariantsNode",
 ]
@@ -263,6 +268,42 @@ class NumberPrecisionLeaf:
         """Terminal node -- callers must gate on ``can_expand``."""
         raise NotImplementedError(
             "NumberPrecisionLeaf is terminal; gate expansion on can_expand"
+        )
+
+
+@dataclass
+class InlineCallMissingVariantLeaf:
+    """Informational ``[*] <message>`` row under an InlineCallNode fallback.
+
+    Surfaced when :attr:`InlineCallNode.variant_idx` is
+    :data:`~tokenizer.aligned_data.matched_sections_bin.MISSING_VARIANT_INDEX`
+    -- i.e. the dataloader recorded NO per-variant pin for THIS
+    caller-variant (e.g. a cross-arm call whose caller vkey simply
+    doesn't exist in the callee's variant table). The leaf is a
+    cosmetic signal that the normal "pin -> matched variant blocks
+    spliced in" path could not be taken; a sibling
+    :class:`ShowAllVariantsNode` carries the all-variants fallback.
+
+    Distinct from :attr:`is_failed`: this leaf is NOT a caught
+    exception (``expand`` never raised). It's a model-data shape
+    issue surfaced as content; the label dispatcher in
+    :mod:`tokenizer.inspector._app._labels` styles it with the dim-
+    red ``_ERR_STYLE`` and prefixes a literal ``[*] `` glyph in the
+    label text (the tree's prefix-glyph dispatch keys on
+    ``is_failed``, which is False here).
+    """
+
+    message: str
+    can_expand: bool = field(default=False, init=False)
+    is_failed: bool = False
+    # Per-row horizontal scroll memory; see :class:`AsmLeaf`.
+    remembered_scroll_x: int = field(default=0, init=False)
+
+    def expand(self) -> list:
+        """Terminal node -- callers must gate on ``can_expand``."""
+        raise NotImplementedError(
+            "InlineCallMissingVariantLeaf is terminal; "
+            "gate expansion on can_expand"
         )
 
 
