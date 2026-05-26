@@ -52,24 +52,28 @@ def _open_memmap(path: Path, binary: Optional[str]) -> BackendFactory:
     Resolves ``binary=None`` via the canonical
     :mod:`tokenizer.inspector._args` resolver so single-binary
     directories auto-detect; raises :class:`SystemExit` on failure,
-    which the dialog surface catches and renders inline.
+    which the dialog surface catches and renders inline. The
+    resolver returns the EFFECTIVE dir (in-place or memmap-subdir),
+    threaded directly into :func:`make_batch_decode_factory` so the
+    loader reads from where the bins actually live.
     """
     from tokenizer.inspector._args import _resolve_binary_memmap
 
     resolved = _resolve_binary_memmap(path, binary)
-    return make_batch_decode_factory(path, resolved)
+    return make_batch_decode_factory(resolved.path, resolved.name)
 
 
 def _open_csv(path: Path, binary: Optional[str]) -> BackendFactory:
     """CSV opener entry point used by the switch action.
 
     Mirrors :func:`_open_memmap`; uses the CSV-side resolver so
-    ``binary=None`` succeeds for single-binary CSV directories.
+    ``binary=None`` succeeds for single-binary CSV directories. The
+    resolver returns the EFFECTIVE dir (in-place or csv-subdir).
     """
     from tokenizer.inspector._args import _resolve_binary_csv
 
     resolved = _resolve_binary_csv(path, binary)
-    return make_ftl_factory(path, resolved)
+    return make_ftl_factory(resolved.path, resolved.name)
 
 
 _OPENERS: dict[LoaderProvider, Callable[[Path, Optional[str]], BackendFactory]] = {
@@ -123,6 +127,13 @@ def perform_switch(app: "InspectorApp", target: SwitchTarget) -> None:
     user's grouping / sort choices survive. Tree cursors + expand
     state are dropped (the new binary's functions are fresh seeds).
 
+    Two-path semantics: ``target.path`` is the EFFECTIVE dir the
+    opener reads from (e.g. ``<corpus>/memmap/``); ``target.anchor_path``
+    is the user's browse anchor (e.g. ``<corpus>``). The App stores
+    the anchor as ``_current_path`` so the next dialog opens against
+    the corpus root, not the subdir; the opener gets the effective
+    dir directly.
+
     On opener failure (missing sidecar, malformed CSV, ...), the
     exception propagates to the dispatcher so the user sees the error
     inline; the previous factory remains closed and the App switches
@@ -144,7 +155,12 @@ def perform_switch(app: "InspectorApp", target: SwitchTarget) -> None:
 
     app._factory = new_factory
     app._current_provider = target.provider
-    app._current_path = target.path
+    # Track the anchor (where the user browsed to), not the effective
+    # subdir — so the next dialog open seeds the picker at the corpus
+    # root instead of one level down. ``anchor_path`` defaults to
+    # ``path`` in :class:`SwitchTarget` for legacy callers that don't
+    # know the split.
+    app._current_path = target.anchor_path or target.path
     app._current_binary = target.binary
 
     # Reseed the tree with the new factory's handles.

@@ -38,6 +38,9 @@ from tokenizer.inspector._app._binary_switcher import (
     SwitchTarget,
     perform_switch,
 )
+from tokenizer.inspector._app._binary_switcher._provider import (
+    resolve_provider_dirs,
+)
 from tokenizer.inspector._app._binary_switcher._scan import (
     FolderScanResult,
     binaries_in_folder,
@@ -582,3 +585,386 @@ def test_perform_switch_preserves_order_config():
                 _switch._OPENERS[LoaderProvider.MEMMAP] = original
 
     asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Subdir-fallback scan (corpus_root/memmap/<bins> + corpus_root/<csv-bins>)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_provider_dirs_lists_in_place_and_subdir():
+    """The candidate-dir helper returns (path, path/<provider.value>)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        memmap_candidates = resolve_provider_dirs(base, LoaderProvider.MEMMAP)
+        assert memmap_candidates == [base, base / "memmap"]
+        csv_candidates = resolve_provider_dirs(base, LoaderProvider.CSV)
+        assert csv_candidates == [base, base / "csv"]
+
+
+def test_scan_folder_finds_memmap_bins_in_subdir():
+    """When bins live under ``<corpus>/memmap/``, scanning the corpus
+    root for the memmap provider still discovers them, and the
+    effective dir is the subdir, not the root."""
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (memmap_subdir / "libz_function_names.txt").write_text("")
+        (memmap_subdir / "minigzip_function_names.txt").write_text("")
+        result = scan_folder(corpus, LoaderProvider.MEMMAP)
+        assert sorted(result.binaries) == ["libz", "minigzip"]
+        assert result.loadable
+        assert result.binary_to_dir["libz"] == memmap_subdir
+        assert result.binary_to_dir["minigzip"] == memmap_subdir
+
+
+def test_scan_folder_in_place_wins_over_subdir():
+    """When a binary lives BOTH in-place and in the subdir, the
+    in-place location wins (matches the unified-vocab gate's
+    explicit-copy-beats-inherited rule)."""
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        # Same binary name in both locations -> in-place wins.
+        (corpus / "shared_function_names.txt").write_text("")
+        (memmap_subdir / "shared_function_names.txt").write_text("")
+        # Subdir-only binary still surfaces.
+        (memmap_subdir / "only_in_subdir_function_names.txt").write_text("")
+        result = scan_folder(corpus, LoaderProvider.MEMMAP)
+        assert sorted(result.binaries) == ["only_in_subdir", "shared"]
+        assert result.binary_to_dir["shared"] == corpus
+        assert result.binary_to_dir["only_in_subdir"] == memmap_subdir
+
+
+def test_binaries_in_folder_returns_sorted_union():
+    """``binaries_in_folder`` returns the sorted name union across the
+    in-place dir and the provider subdir."""
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (corpus / "a_function_names.txt").write_text("")
+        (memmap_subdir / "z_function_names.txt").write_text("")
+        (memmap_subdir / "m_function_names.txt").write_text("")
+        names = binaries_in_folder(corpus, LoaderProvider.MEMMAP)
+        assert names == ["a", "m", "z"]
+
+
+def test_is_loadable_for_any_handles_subdir_fallback():
+    """The folder picker's green-marking predicate honors the
+    subdir-fallback so a corpus root whose data lives one level
+    down still lights up."""
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        assert not is_loadable_for_any(corpus)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (memmap_subdir / "x_function_names.txt").write_text("")
+        assert is_loadable_for_any(corpus)
+        assert is_loadable_for(corpus, LoaderProvider.MEMMAP)
+        assert not is_loadable_for(corpus, LoaderProvider.CSV)
+
+
+def test_binary_switcher_dialog_shows_both_providers_with_mixed_layout():
+    """User's reported failure case: ``<corpus>/memmap/<bins>`` plus
+    ``<corpus>/<csv-bins-direct>``. The switcher dialog must surface
+    BOTH provider rows per binary, and the memmap row's effective
+    path must point at the memmap subdir, not the corpus root."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            corpus = Path(td)
+            memmap_subdir = corpus / "memmap"
+            memmap_subdir.mkdir()
+            # Memmap bins live one level down.
+            (memmap_subdir / "libz_function_names.txt").write_text("")
+            # CSV bins live directly at the corpus root.
+            (corpus / "x64-gcc-13.2.0-O2_libz_output.csv").write_text("")
+            log_path = corpus / "tui.log"
+            app = _build_app(
+                log_path, path=corpus, provider=LoaderProvider.MEMMAP
+            )
+            async with app.run_test() as pilot:
+                await pilot.press("b")
+                await pilot.pause()
+                dialog = app.screen_stack[-1]
+                assert isinstance(dialog, BinarySwitcherDialog)
+                from textual.widgets import Tree
+                from tokenizer.inspector._app._binary_switcher._dialog import (
+                    _BinaryRoot,
+                    _ProviderRow,
+                )
+
+                tree = dialog.query_one("#switcher-tree", Tree)
+                bin_nodes = [
+                    n
+                    for n in tree.root.children
+                    if isinstance(n.data, _BinaryRoot)
+                ]
+                assert [n.data.binary for n in bin_nodes] == ["libz"]
+                provider_rows = [
+                    child.data
+                    for child in bin_nodes[0].children
+                    if isinstance(child.data, _ProviderRow)
+                ]
+                # Both providers visible — the corpus-root layout
+                # surfaces memmap (via subdir) AND csv (in-place).
+                by_provider = {row.provider: row for row in provider_rows}
+                assert LoaderProvider.MEMMAP in by_provider
+                assert LoaderProvider.CSV in by_provider
+                # Effective paths thread the right loader location.
+                assert by_provider[LoaderProvider.MEMMAP].path == memmap_subdir
+                assert by_provider[LoaderProvider.CSV].path == corpus
+                # Anchor stays at the corpus root for next-dialog seed.
+                assert (
+                    by_provider[LoaderProvider.MEMMAP].anchor_path == corpus
+                )
+                assert by_provider[LoaderProvider.CSV].anchor_path == corpus
+
+    asyncio.run(runner())
+
+
+def test_binary_switcher_dialog_with_both_providers_in_subdirs():
+    """Both providers' bins in their own subdirs:
+    ``<corpus>/memmap/<memmap-bins>`` + ``<corpus>/csv/<csv-bins>``.
+    Memmap discovery is non-recursive so its effective dir IS the
+    subdir; CSV discovery rglobs so the in-place anchor already
+    reaches into ``csv/`` (effective dir stays at the anchor by the
+    in-place-wins rule)."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            corpus = Path(td)
+            memmap_subdir = corpus / "memmap"
+            csv_subdir = corpus / "csv"
+            memmap_subdir.mkdir()
+            csv_subdir.mkdir()
+            (memmap_subdir / "minigzip_function_names.txt").write_text("")
+            (csv_subdir / "x64-gcc-13.2.0-O2_minigzip_output.csv").write_text("")
+            log_path = corpus / "tui.log"
+            app = _build_app(
+                log_path, path=corpus, provider=LoaderProvider.MEMMAP
+            )
+            async with app.run_test() as pilot:
+                await pilot.press("b")
+                await pilot.pause()
+                dialog = app.screen_stack[-1]
+                from textual.widgets import Tree
+                from tokenizer.inspector._app._binary_switcher._dialog import (
+                    _BinaryRoot,
+                    _ProviderRow,
+                )
+
+                tree = dialog.query_one("#switcher-tree", Tree)
+                bin_nodes = [
+                    n
+                    for n in tree.root.children
+                    if isinstance(n.data, _BinaryRoot)
+                ]
+                assert [n.data.binary for n in bin_nodes] == ["minigzip"]
+                provider_rows = [
+                    child.data
+                    for child in bin_nodes[0].children
+                    if isinstance(child.data, _ProviderRow)
+                ]
+                by_provider = {row.provider: row for row in provider_rows}
+                # Memmap effective path = subdir (non-recursive
+                # discovery needs the exact dir to find sidecars).
+                assert by_provider[LoaderProvider.MEMMAP].path == memmap_subdir
+                # CSV effective path = anchor (rglob from anchor
+                # already descends into ``csv/`` so the in-place
+                # candidate wins per the search policy).
+                assert by_provider[LoaderProvider.CSV].path == corpus
+                # Anchor stays the corpus root regardless.
+                assert (
+                    by_provider[LoaderProvider.MEMMAP].anchor_path == corpus
+                )
+                assert by_provider[LoaderProvider.CSV].anchor_path == corpus
+
+    asyncio.run(runner())
+
+
+def test_binary_switcher_dialog_shows_no_binaries_for_unrelated_dir():
+    """When ``path`` contains neither in-place nor subdir data, the
+    dialog renders the empty-state message instead of fabricating
+    binary rows."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            corpus = Path(td)
+            # An unrelated file + an unrelated subdir; no provider data.
+            (corpus / "README.md").write_text("hi")
+            (corpus / "logs").mkdir()
+            (corpus / "logs" / "run.log").write_text("noise")
+            log_path = corpus / "tui.log"
+            app = _build_app(
+                log_path, path=corpus, provider=LoaderProvider.MEMMAP
+            )
+            async with app.run_test() as pilot:
+                await pilot.press("b")
+                await pilot.pause()
+                dialog = app.screen_stack[-1]
+                from textual.widgets import Tree
+                from tokenizer.inspector._app._binary_switcher._dialog import (
+                    _BinaryRoot,
+                )
+
+                tree = dialog.query_one("#switcher-tree", Tree)
+                bin_nodes = [
+                    n
+                    for n in tree.root.children
+                    if isinstance(n.data, _BinaryRoot)
+                ]
+                assert bin_nodes == []
+
+
+def test_perform_switch_threads_effective_path_to_opener():
+    """``perform_switch`` calls the opener with ``target.path``
+    (effective) while storing ``target.anchor_path`` on the App so
+    re-opening the dialog still anchors at the corpus root."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            corpus = Path(td)
+            memmap_subdir = corpus / "memmap"
+            memmap_subdir.mkdir()
+            (memmap_subdir / "foo_function_names.txt").write_text("")
+            log_path = corpus / "tui.log"
+            app = _build_app(
+                log_path, path=corpus, provider=LoaderProvider.MEMMAP
+            )
+
+            captured: list[Path] = []
+            new_factory = MagicMock(spec=BackendFactory)
+            new_factory.handles = []
+            new_factory.close = MagicMock()
+
+            def fake_opener(path: Path, binary: str | None) -> BackendFactory:
+                captured.append(path)
+                return new_factory
+
+            from tokenizer.inspector._app._binary_switcher import _switch
+
+            original = _switch._OPENERS[LoaderProvider.MEMMAP]
+            _switch._OPENERS[LoaderProvider.MEMMAP] = fake_opener
+            try:
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    target = SwitchTarget(
+                        provider=LoaderProvider.MEMMAP,
+                        path=memmap_subdir,
+                        binary="foo",
+                        anchor_path=corpus,
+                    )
+                    perform_switch(app, target)
+                    await pilot.pause()
+                    # Opener saw the effective subdir.
+                    assert captured == [memmap_subdir]
+                    # App-side state tracks the anchor, not the subdir.
+                    assert app._current_path == corpus
+                    assert app._current_provider is LoaderProvider.MEMMAP
+            finally:
+                _switch._OPENERS[LoaderProvider.MEMMAP] = original
+
+    asyncio.run(runner())
+
+
+def test_switch_target_anchor_defaults_to_path():
+    """Legacy two-argument :class:`SwitchTarget` construction (no
+    ``anchor_path``) defaults the anchor to ``path`` so older callers
+    keep their pre-subdir semantics."""
+    target = SwitchTarget(
+        provider=LoaderProvider.MEMMAP,
+        path=Path("/tmp/foo"),
+        binary="x",
+    )
+    assert target.anchor_path == Path("/tmp/foo")
+
+
+# ---------------------------------------------------------------------------
+# CLI resolver subdir-fallback ($ python -m tokenizer.inspector PATH ...)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_binary_memmap_falls_back_to_memmap_subdir():
+    """``_resolve_binary_memmap`` returns the effective subdir when
+    bins live in ``<path>/memmap/`` and the user-supplied path is the
+    corpus root."""
+    from tokenizer.inspector._args import _resolve_binary_memmap
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (memmap_subdir / "bar_function_names.txt").write_text("")
+        resolved = _resolve_binary_memmap(corpus, "bar")
+        assert resolved.path == memmap_subdir
+        assert resolved.name == "bar"
+
+
+def test_resolve_binary_memmap_in_place_takes_precedence():
+    """When the binary lives BOTH in-place and in the subdir, the
+    in-place dir wins (matches the discovery union semantics)."""
+    from tokenizer.inspector._args import _resolve_binary_memmap
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (corpus / "dup_function_names.txt").write_text("")
+        (memmap_subdir / "dup_function_names.txt").write_text("")
+        resolved = _resolve_binary_memmap(corpus, "dup")
+        assert resolved.path == corpus
+
+
+def test_resolve_binary_memmap_auto_detect_in_subdir():
+    """``--binary`` omitted: a single binary in the memmap subdir
+    succeeds and returns its effective dir."""
+    from tokenizer.inspector._args import _resolve_binary_memmap
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (memmap_subdir / "only_function_names.txt").write_text("")
+        resolved = _resolve_binary_memmap(corpus, None)
+        assert resolved.path == memmap_subdir
+        assert resolved.name == "only"
+
+
+def test_resolve_binary_csv_handles_subdir_via_recursion():
+    """:func:`discover_binaries_csv` rglobs, so a CSV under
+    ``<corpus>/csv/`` is reachable from ``<corpus>`` directly — the
+    in-place candidate wins per the search policy and the resolver
+    returns ``<corpus>`` as the effective dir. The FTL loader rglobs
+    from there too, so passing the anchor IS the correct loader path.
+    """
+    from tokenizer.inspector._args import _resolve_binary_csv
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        csv_subdir = corpus / "csv"
+        csv_subdir.mkdir()
+        (csv_subdir / "x64-gcc-13.2.0-O2_qux_output.csv").write_text("")
+        resolved = _resolve_binary_csv(corpus, "qux")
+        assert resolved.path == corpus
+        assert resolved.name == "qux"
+
+
+def test_parse_args_populates_effective_path():
+    """The CLI's parse_args fills ``ns.effective_path`` with the
+    resolver-side dir so ``__main__`` can pass it to the factory
+    while keeping ``ns.path`` as the user's anchor."""
+    from tokenizer.inspector._args import parse_args
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td)
+        memmap_subdir = corpus / "memmap"
+        memmap_subdir.mkdir()
+        (memmap_subdir / "main_function_names.txt").write_text("")
+        ns = parse_args([str(corpus), "--memmap"])
+        assert ns.path == corpus
+        assert ns.effective_path == memmap_subdir
+        assert ns.binary == "main"

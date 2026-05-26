@@ -1,28 +1,27 @@
 """Filesystem-side detection of loadable data folders.
 
 Single concern: given a directory, answer "does this folder contain
-loadable data for provider X?" Two functions: one per
-:class:`LoaderProvider`. Both delegate to the canonical discovery
+loadable data for provider X?" Delegates to the canonical discovery
 helpers already living in :mod:`tokenizer.inspector._args` so the
 detection logic stays in lockstep with the CLI-side auto-detect.
 
-The scan walks only the directory's immediate children — recursion is
-the folder picker's concern (one level at a time, lazily expanded by
-the user). For CSV detection a single ``rglob`` is acceptable here
-because :func:`discover_binaries_csv` already covers both flat + nested
-layouts; without recursion we would miss the nested layout's outputs.
+The scan walks only the directory's immediate children + the
+provider's canonical subdir (per :func:`resolve_provider_dirs`) —
+arbitrary recursion is the folder picker's concern (one level at a
+time, lazily expanded by the user). For CSV detection a single
+``rglob`` is acceptable inside each candidate dir because
+:func:`discover_binaries_csv` already covers both flat + nested
+layouts; without it we would miss the nested layout's outputs.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from types import MappingProxyType
+from typing import List, Mapping
 
-from tokenizer.inspector._args import (
-    discover_binaries,
-    discover_binaries_csv,
-)
+from tokenizer.inspector._args import discover_binaries_with_paths
 
 from ._provider import LoaderProvider
 
@@ -42,15 +41,20 @@ class FolderScanResult:
     """Per-provider scan result for one folder.
 
     ``loadable`` is ``True`` when the folder contains at least one
-    binary discoverable by the provider's auto-detect; ``binaries`` is
-    the sorted list of discovered binary names (empty when not
-    loadable). Both backends emit deterministic sorted output so the
-    UI tree order is stable across re-scans.
+    binary discoverable by the provider's auto-detect (including the
+    provider-subdir fallback); ``binaries`` is the sorted list of
+    discovered binary names (empty when not loadable).
+    ``binary_to_dir`` maps each discovered binary name to the
+    effective dir it lives in (either ``path`` itself or
+    ``path/<provider.subdir_name>/``) so callers that commit a switch
+    can thread the loader-side path. Both backends emit deterministic
+    sorted output so the UI tree order is stable across re-scans.
     """
 
     provider: LoaderProvider
     path: Path
     binaries: tuple[str, ...]
+    binary_to_dir: Mapping[str, Path]
 
     @property
     def loadable(self) -> bool:
@@ -59,33 +63,35 @@ class FolderScanResult:
 
 
 def binaries_in_folder(path: Path, provider: LoaderProvider) -> List[str]:
-    """Discover binaries in ``path`` for the given provider.
+    """Discover binaries reachable from ``path`` for the given provider.
 
-    Delegates to the canonical discovery helpers in
-    :mod:`tokenizer.inspector._args` so the menu + the CLI auto-detect
-    share one source of truth. Returns the empty list when ``path``
-    does not exist, is not a directory, or contains no loadable data.
+    Walks both the in-place dir and the provider's canonical subdir
+    (``path/<provider.subdir_name>/``) — see
+    :func:`tokenizer.inspector._args.discover_binaries_with_paths` for
+    the full policy. Returns the sorted union of binary names; the
+    empty list when ``path`` is not a directory or carries no data
+    for ``provider`` in either candidate.
     """
     if not path.is_dir():
         return []
-    if provider is LoaderProvider.MEMMAP:
-        return discover_binaries(path)
-    if provider is LoaderProvider.CSV:
-        return discover_binaries_csv(path)
-    raise ValueError(f"unknown LoaderProvider: {provider!r}")
+    return sorted(discover_binaries_with_paths(path, provider))
 
 
 def scan_folder(path: Path, provider: LoaderProvider) -> FolderScanResult:
-    """Bundle ``binaries_in_folder`` + provider into a typed record.
+    """Bundle the subdir-aware scan + provider into a typed record.
 
     Convenience wrapper for the dialog's tree-build loop: one call per
     folder + provider yields the per-cell "is this green?" + "which
-    children?" answer.
+    children?" + "which effective dir do its files live in?" answer.
     """
+    binary_to_dir = (
+        discover_binaries_with_paths(path, provider) if path.is_dir() else {}
+    )
     return FolderScanResult(
         provider=provider,
         path=path,
-        binaries=tuple(binaries_in_folder(path, provider)),
+        binaries=tuple(sorted(binary_to_dir)),
+        binary_to_dir=MappingProxyType(dict(binary_to_dir)),
     )
 
 

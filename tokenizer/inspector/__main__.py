@@ -71,24 +71,33 @@ class _OpenedBackend:
 def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
     """Open the memmap-mode backend.
 
-    The factory owns its :class:`BinarySession` lifetime; we register
-    only ``factory.close`` so the caller's ``with stack:`` block
-    drives the single shutdown hook (mirrors the CSV-mode opener).
+    Two-path semantics: ``ns.path`` is the user-supplied anchor (used
+    as the dialog's seed + the log path), ``ns.effective_path`` is
+    where :func:`_resolve_binary_memmap` found the bins (the anchor
+    itself when bins live in-place, ``anchor/memmap/`` when they sit
+    in the provider subdir). The factory opens against the effective
+    dir; the App keeps the anchor as its ``_current_path`` so the
+    binary switcher dialog re-opens against the corpus root, not the
+    subdir. The factory owns its :class:`BinarySession` lifetime; we
+    register only ``factory.close`` so the caller's ``with stack:``
+    block drives the single shutdown hook (mirrors the CSV-mode opener).
     """
-    path: Path = ns.path
+    anchor: Path = ns.path
+    effective: Path = ns.effective_path
     binary_name: str = ns.binary
     _log.info(
-        "inspector: opening memmap backend for binary=%s in %s",
+        "inspector: opening memmap backend for binary=%s in %s (anchor=%s)",
         binary_name,
-        path,
+        effective,
+        anchor,
     )
-    factory = make_batch_decode_factory(path, binary_name)
+    factory = make_batch_decode_factory(effective, binary_name)
     stack = contextlib.ExitStack()
     stack.callback(factory.close)
     return _OpenedBackend(
         factory=factory,
         stack=stack,
-        path=path,
+        path=anchor,
         provider=LoaderProvider.MEMMAP,
         binary=binary_name,
     )
@@ -97,24 +106,29 @@ def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
 def _open_csv_backend(ns: argparse.Namespace) -> _OpenedBackend:
     """Open the FTL-CSV mode backend.
 
-    Constructs the per-binary :class:`CsvIndex`-backed factory; its
-    :meth:`close` is registered on the returned ExitStack so callers
-    release the parsed-record + vocab cache via ``with stack:``.
+    Mirrors :func:`_open_memmap_backend` on the two-path semantics:
+    ``ns.path`` is the user's anchor (App-side tracking),
+    ``ns.effective_path`` is where the CSVs actually live. Constructs
+    the per-binary :class:`CsvIndex`-backed factory; its :meth:`close`
+    is registered on the returned ExitStack so callers release the
+    parsed-record + vocab cache via ``with stack:``.
     """
-    path: Path = ns.path
+    anchor: Path = ns.path
+    effective: Path = ns.effective_path
     binary_name: str = ns.binary
     _log.info(
-        "inspector: opening csv backend for binary=%s in %s",
+        "inspector: opening csv backend for binary=%s in %s (anchor=%s)",
         binary_name,
-        path,
+        effective,
+        anchor,
     )
-    factory = make_ftl_factory(path, binary_name)
+    factory = make_ftl_factory(effective, binary_name)
     stack = contextlib.ExitStack()
     stack.callback(factory.close)
     return _OpenedBackend(
         factory=factory,
         stack=stack,
-        path=path,
+        path=anchor,
         provider=LoaderProvider.CSV,
         binary=binary_name,
     )
