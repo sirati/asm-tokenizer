@@ -32,6 +32,7 @@ from tokenizer.variant_tokens.prefixes import (
     OPT_PREFIX,
 )
 
+from ._block_header import block_v2_id, body_block_view
 from ._csv_index import CsvIndex
 from ._variant_state import VariantState, build_variant_state
 
@@ -147,6 +148,15 @@ class FtlBackend:
         function-body opening), so every emitted entry is
         :attr:`BlockKind.BODY`. The variant_header + function_id
         sections are a BatchDecodeBackend concern.
+
+        ``block_idx`` is read from each block's
+        ``[Block_Def, block_v2:N]`` opening pair via
+        :func:`block_v2_id` -- the sibling positional index only
+        matches N for the simplest straight-line functions, and the
+        UI label needs the authoritative N. The preview is taken from
+        a :class:`BodyBlockView` so the header pair stays absorbed
+        (mirrors BatchDecode's ``pending_header`` latch); the
+        rendered body never carries the ``_def block_v2:N`` text.
         """
         self._raise_if_closed()
         if variant_idx in self._blocks_cache:
@@ -157,10 +167,10 @@ class FtlBackend:
         rendered = [
             RenderedBlock(
                 kind=BlockKind.BODY,
-                block_idx=i,
-                preview=block_preview(blk),
+                block_idx=block_v2_id(blk),
+                preview=block_preview(body_block_view(blk)),
             )
-            for i, blk in enumerate(state.blocks)
+            for blk in state.blocks
         ]
         self._blocks_cache[variant_idx] = rendered
         return rendered
@@ -174,6 +184,13 @@ class FtlBackend:
         ``kind`` lands on a :class:`KeyError` so callers don't
         accidentally render an FTL "variant header" / "function id"
         section that doesn't exist in the FTL stream layer.
+
+        ``block_idx`` is the block_v2 N read from the header pair (see
+        :meth:`blocks`); we look up the matching block by N rather
+        than by sibling position so callers and jump targets address
+        blocks in the same N space. The block is wrapped in a
+        :class:`BodyBlockView` so the renderer's per-instruction walk
+        skips the opening ``[Block_Def, block_v2:N]`` pair.
         """
         self._raise_if_closed()
         if kind is not BlockKind.BODY:
@@ -182,20 +199,40 @@ class FtlBackend:
                 f"supported (FTL emits BODY sections only)"
             )
         state = self._ensure_variant_state(variant_idx)
-        block = state.blocks[block_idx]
+        block = self._block_for_v2_id(state, block_idx)
         # FtlBackend has no encoder-side per-call pin data (the CSV
         # stream carries no per_call_entries); every InlineCallEntry
         # emits with ``variant_idx == MISSING_VARIANT_INDEX`` so
         # :meth:`InlineCallNode.expand` falls through to the
         # all-variants surface.
         return render_block(
-            block=block,
+            block=body_block_view(block),
             section=state.view,
             kind_to_called_idx=state.kind_to_called_idx,
             variant_pins={},
             line_to_name=state.line_to_name,
             line_to_provider=state.line_to_provider,
             callee_arm_resolver=_no_callee_arm,
+        )
+
+    @staticmethod
+    def _block_for_v2_id(state: VariantState, block_idx: int):
+        """Locate the block whose ``block_v2:N`` header equals ``block_idx``.
+
+        Linear scan keeps the lookup self-describing (the cached
+        ``state.blocks`` is the single source of truth); typical block
+        counts per function are small enough that an index dict would
+        add complexity without measurable benefit. Raises
+        :class:`KeyError` on miss so a stale jump-target N surfaces
+        with the same diagnostic shape as the BatchDecodeBackend.
+        """
+        for blk in state.blocks:
+            if block_v2_id(blk) == block_idx:
+                return blk
+        raise KeyError(
+            f"FtlBackend.render_block: no block with block_v2 id "
+            f"{block_idx} (have "
+            f"{[block_v2_id(b) for b in state.blocks]})"
         )
 
     def close(self) -> None:
