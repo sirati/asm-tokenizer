@@ -697,6 +697,16 @@ class _AngrFunctionView:
 
     @property
     def name(self) -> str:
+        # angr / Capstone has no equivalent of Ghidra's
+        # ``Symbol.getSource()`` enum: every name angr surfaces comes
+        # from the loader (CLE) and is, by construction, either a real
+        # symbol or an angr-internal placeholder (``sub_<hex>``). There
+        # is no DEFAULT-vs-recovered axis to gate the
+        # ``unnamed @{hash}`` rename on (see
+        # ``tokenizer.disasm.ghidra_views.unnamed_rename``). Per the
+        # ``ghidra_default_provider`` policy, angr is best-effort: we
+        # emit angr's raw name verbatim and leave placeholder
+        # disambiguation to the Ghidra backend.
         return str(self._func.name) if self._func is not None else ""
 
     @property
