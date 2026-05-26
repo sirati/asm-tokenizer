@@ -143,6 +143,72 @@ def test_help_screen_renders_bindings_table():
     asyncio.run(runner())
 
 
+def test_help_modal_widget_paints_visible_binding_rows():
+    """The :class:`BindingsTable` widget paints a non-collapsed region
+    containing the App + tree binding descriptions.
+
+    Regression guard for the Container-wrapper auto-width collapse:
+    the previous design wrapped the widget in a ``Container { width:
+    auto; height: auto }`` parent. Textual's layout collapses such a
+    parent to width ~3 when the only child also has ``width: auto``,
+    leaving the painted modal visually empty even though the Rich
+    Table itself renders correctly out-of-band. Asserting on
+    :meth:`Widget.render_lines` exercises the full layout +
+    measurement + paint pipeline.
+    """
+
+    async def runner() -> None:
+        from textual.geometry import Region
+
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            app = _build_app(log_path)
+            # Generous viewport so the modal can show every active
+            # binding without clipping the bottom rows. The default
+            # 80x24 test size hides the rear half of the binding list
+            # behind the 90% max-height cap, which would race the
+            # description-coverage assertion below.
+            async with app.run_test(size=(140, 60)) as pilot:
+                await pilot.press("h")
+                await pilot.pause()
+
+                modal = app.screen_stack[-1]
+                assert isinstance(modal, HelpScreen)
+                table_widget = modal.query_one(_UnderlyingScreenBindingsTable)
+
+                # Widget MUST occupy a non-trivial region; the
+                # historical bug collapsed it to width=3.
+                assert table_widget.size.width >= 30, (
+                    f"BindingsTable widget collapsed to "
+                    f"{table_widget.size.width=}; expected ample width "
+                    "for the binding rows"
+                )
+                assert table_widget.size.height >= 10, (
+                    f"BindingsTable widget collapsed to "
+                    f"{table_widget.size.height=}"
+                )
+
+                # Concatenate every painted segment for the widget's
+                # full region and assert each app/tree binding
+                # description appears in the visible text.
+                paint_region = Region(
+                    0, 0, table_widget.region.width, table_widget.region.height
+                )
+                lines = table_widget.render_lines(paint_region)
+                painted = "\n".join(
+                    "".join(seg.text for seg in line) for line in lines
+                )
+
+                source = table_widget._source_screen()
+                for description in _collect_active_binding_descriptions(source):
+                    assert description in painted, (
+                        f"binding description {description!r} missing "
+                        "from the modal's painted output"
+                    )
+
+    asyncio.run(runner())
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
