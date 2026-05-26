@@ -35,7 +35,7 @@ the assert below — same tripwire discipline as the prefixes module.
 
 from __future__ import annotations
 
-from typing import Mapping, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.variant_tokens.prefixes import (
@@ -53,6 +53,7 @@ __all__ = [
     "variant_label_from_axes",
     "function_label",
     "block_preview",
+    "block_preview_from_asm_texts",
     "resolve_function_name_for_fid",
     "inline_call_label",
     "inline_jump_label",
@@ -276,10 +277,36 @@ def block_preview(block, max_chars: int = 80) -> str:
     Raw truncation only — returns the prefix without any trailing
     marker. The UI layer (the horizontal-scroll widget) decides
     whether to append ``>>`` based on viewport state, so this helper
-    stays renderer-agnostic.
+    stays renderer-agnostic. ``BlockTokenList.to_asm_like`` already
+    joins per-instruction with ``"; "`` (see :mod:`tokenizer.token_lists`),
+    so the resulting preview lists every instruction up to the cap.
     """
     asm = block.to_asm_like()
     return asm[:max_chars]
+
+
+def block_preview_from_asm_texts(
+    asm_texts: Iterable[str],
+    max_chars: int = 80,
+) -> str:
+    """Join per-instruction asm texts with ``"; "`` and truncate to ``max_chars``.
+
+    Sole producer of the block-preview string shape consumed by the
+    block-row label composer (:mod:`._app._labels`). Both rendering
+    backends materialise a stream of per-instruction asm-line texts
+    (the AsmLine.text values produced by the row walker / FTL renderer);
+    routing them through this helper guarantees the preview shown on a
+    collapsed block row corresponds to the EXACT items the block
+    yields on expand (single source of truth = the rendered AsmLine
+    text stream).
+
+    ``"; "`` mirrors :meth:`BlockTokenList.to_asm_like` so the visual
+    shape stays consistent across the FTL preview path
+    (:func:`block_preview` against ``BodyBlockView``) and the
+    BatchDecode preview path (this helper against the row walker's
+    AsmLine list).
+    """
+    return "; ".join(asm_texts)[:max_chars]
 
 
 def resolve_function_name_for_fid(
