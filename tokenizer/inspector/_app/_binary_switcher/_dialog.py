@@ -59,16 +59,23 @@ __all__ = [
 ]
 
 
-# CSS-friendly green style applied via Rich Text.
-_GREEN_STYLE = "bold green"
-
-
 # Each provider's loader-stage label is a UI string keyed by the
 # typed discriminator — no string-typed if/elif at the dispatch site.
 _PROVIDER_STAGE_LABELS: dict[LoaderProvider, str] = {
     LoaderProvider.MEMMAP: "stage 3",
     LoaderProvider.CSV: "stage 1",
 }
+
+# Pad the provider name to a uniform width so `(stage N)` lands at
+# the same column across siblings (csv -> 3 chars; memmap -> 6 chars
+# at the time of writing, so the wider one wins).
+_PROVIDER_NAME_WIDTH = max(len(p.value) for p in LoaderProvider)
+
+# Column at which the right-aligned `[current]` marker starts. The
+# dialog's body is 80 chars wide; subtract the border + padding + the
+# two indent levels (binary -> provider) for the provider row's
+# content area. 60 lands the marker comfortably near the right edge.
+_CURRENT_MARKER_COL = 60
 
 
 class _TreeNodePayload:
@@ -262,23 +269,22 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
         :class:`SwitchTarget` threads the loader-correct path while
         ``anchor_path`` stays at the user's browse position.
         """
+        is_current_binary = (
+            self._anchor_path == path and self._current_binary == binary
+        )
         binary_node = root.add(
-            Text(binary, style=_GREEN_STYLE),
+            Text(binary),
             data=_BinaryRoot(path, binary),
-            expand=True,
+            expand=is_current_binary,
         )
         for provider in LoaderProvider:
             effective = scans[provider].binary_to_dir.get(binary)
             if effective is None:
                 continue
             stage = _PROVIDER_STAGE_LABELS[provider]
-            suffix = self._current_marker(path, provider, binary)
-            label = Text(
-                f"{provider.value} ({stage}){suffix}",
-                style=_GREEN_STYLE,
-            )
+            is_current = self._is_current(path, provider, binary)
             binary_node.add_leaf(
-                label,
+                self._provider_label(provider, stage, is_current),
                 data=_ProviderRow(
                     provider=provider,
                     path=effective,
@@ -287,17 +293,35 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
                 ),
             )
 
-    def _current_marker(
+    def _is_current(
         self, path: Path, provider: LoaderProvider, binary: str
-    ) -> str:
-        """``"  [current]"`` when (anchor, provider, binary) match the App."""
-        if (
+    ) -> bool:
+        """True when (anchor, provider, binary) match the App's state."""
+        return (
             self._current_provider is provider
             and self._anchor_path == path
             and self._current_binary == binary
-        ):
-            return "  [current]"
-        return ""
+        )
+
+    def _provider_label(
+        self, provider: LoaderProvider, stage: str, is_current: bool
+    ) -> Text:
+        """``<provider> (stage X)`` with muted stage + right-aligned current.
+
+        The provider name is padded so ``(stage X)`` lands at the same
+        column across siblings; ``[current]`` (when applicable) is
+        right-padded to :data:`_CURRENT_MARKER_COL` and styled bold red.
+        """
+        label = Text(provider.value.ljust(_PROVIDER_NAME_WIDTH))
+        stage_text = f" ({stage})"
+        label.append(stage_text, style="dim")
+        if is_current:
+            current_text = "[current]"
+            used = _PROVIDER_NAME_WIDTH + len(stage_text)
+            pad = max(2, _CURRENT_MARKER_COL - used)
+            label.append(" " * pad)
+            label.append(current_text, style="bold red")
+        return label
 
     # --- event dispatch ----------------------------------------------
 
