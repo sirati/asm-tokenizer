@@ -253,7 +253,14 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         return addr_dict
 
     def create_metadata_lookup(self) -> MetadataLookup:
-        return GhidraMetadataLookup(self._program, self._fm)
+        # Thread the precomputed per-binary identity hash so the lookup
+        # applies the same ``SourceType.DEFAULT`` placeholder rename to
+        # ``meta.name`` that ``iter_functions`` already applies to the
+        # yielded ``name`` slot. Without this the JSON metadata column
+        # (``local_funcs[].name`` etc.) keeps raw Ghidra ``FUN_<hex>`` /
+        # ``LAB_<hex>`` placeholders, which the function-names sidecar
+        # then inherits via the per-CSV callee extractor.
+        return GhidraMetadataLookup(self._program, self._fm, self._binary_id_hash)
 
     def function_count(self) -> int:
         return int(self._fm.getFunctionCount())

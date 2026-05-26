@@ -30,6 +30,7 @@ from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.loader.session import BinarySession
 from tokenizer.aligned_data.loader.unified_vocab_gate import (
     load_and_validate_unified_vocab,
+    resolve_unified_vocab_path,
 )
 
 from ._batch_decode_backend import BatchDecodeBackend
@@ -234,7 +235,9 @@ def make_batch_decode_factory(
     ``== dataset.matched_count``), so the handle index is read
     unconditionally.
     """
-    vocab = load_and_validate_unified_vocab(memmap_dir / "unified_vocab.csv")
+    vocab = load_and_validate_unified_vocab(
+        resolve_unified_vocab_path(memmap_dir)
+    )
     dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab)
     sessions: dict[SectionKind, BinarySession] = {}
     matched_session = dataset.open_session()

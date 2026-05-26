@@ -2,19 +2,20 @@
 
 Single concern: present a tree rooted at a start path; lazy-expand
 sub-directories on demand; green-mark folders whose
-:func:`is_loadable_for` predicate is ``True`` for the provider the
-caller asked about. Dismiss with the user-confirmed :class:`Path` (or
-``None`` on cancel).
+:func:`is_loadable_for_any` predicate is ``True`` (i.e. the folder
+contains data for AT LEAST ONE provider — the picker is
+provider-agnostic, picked-binary-first ordering means provider choice
+happens later in the binary switcher dialog).
 
-Single click on a folder = expand. Double-click / Enter on a green
-folder = confirm + dismiss. Plain (non-green) folders never dismiss —
-they only browse, since the caller wants a path that contains data.
-
-Green-marking is per-provider: a memmap-loadable folder is green when
-opened via :attr:`LoaderProvider.MEMMAP`, a csv-loadable folder is
-green when opened via :attr:`LoaderProvider.CSV`. The picker does NOT
-discover both at once — the caller has already chosen which provider
-they are picking a path for.
+Each expandable folder exposes an ``[open this folder]`` child as its
+first entry: selecting it commits that folder back to the caller.
+Subfolders are listed below; expanding a subfolder recursively shows
+ITS own ``[open this folder]`` row + its subfolders. The user can
+drill arbitrarily deep, then commit whichever level they wanted via
+``[open this folder]``. Plain subfolder rows themselves never commit
+on click — they only browse — because the green-marking is the hint
+that helps the user spot promising drill-down targets, not a
+commit-on-click action.
 """
 
 from __future__ import annotations
@@ -31,8 +32,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Tree
 from textual.widgets._tree import TreeNode
 
-from ._provider import LoaderProvider
-from ._scan import is_loadable_for, list_child_directories
+from ._scan import is_loadable_for_any, list_child_directories
 
 
 __all__ = [
@@ -43,17 +43,33 @@ __all__ = [
 _GREEN_STYLE = "bold green"
 
 
-class _FolderRow:
-    """Tree-node payload: one filesystem directory."""
+class _PickerRow:
+    """Marker base for picker tree payloads."""
+
+
+class _FolderRow(_PickerRow):
+    """Tree-node payload: one filesystem directory.
+
+    ``loadable`` drives the green coloring (any-provider data
+    detected); ``_populated`` is the lazy-expand flag toggled on first
+    :class:`Tree.NodeExpanded`.
+    """
 
     __slots__ = ("path", "loadable", "_populated")
 
     def __init__(self, path: Path, loadable: bool) -> None:
         self.path = path
         self.loadable = loadable
-        # Children-populated flag — set ``True`` after the first
-        # :meth:`Tree.NodeExpanded` walks the directory's child dirs.
         self._populated = False
+
+
+class _OpenFolderRow(_PickerRow):
+    """Tree-node payload: ``[open this folder]`` — commits ``path``."""
+
+    __slots__ = ("path",)
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
 
 
 class FolderPickerDialog(ModalScreen[Optional[Path]]):
@@ -61,14 +77,14 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
 
     The tree expands sub-directories lazily on first
     :class:`textual.widgets.Tree.NodeExpanded` per node. Green-marking
-    is applied at child-mount time per :func:`is_loadable_for` against
-    the caller-supplied provider.
+    applies whenever :func:`is_loadable_for_any` reports the folder
+    holds data for at least one provider.
 
     Dismiss paths:
 
     * ``escape`` -> :class:`None` (cancel).
-    * Enter / select on a GREEN folder -> dismiss with that
-      folder's :class:`Path`.
+    * Select / Enter on an ``[open this folder]`` row -> dismiss
+      with the enclosing folder's :class:`Path`.
     """
 
     CSS: ClassVar[str] = """
@@ -99,11 +115,9 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
     def __init__(
         self,
         *,
-        provider: LoaderProvider,
         start_path: Path,
     ) -> None:
         super().__init__()
-        self._provider = provider
         # Resolve symlinks + ensure a directory.
         try:
             start_resolved = start_path.expanduser().resolve()
@@ -116,41 +130,56 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
     # --- compose --------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        tree: Tree[_FolderRow] = Tree(
-            f"Pick folder for {self._provider.value}",
+        tree: Tree[_PickerRow] = Tree(
+            "Pick folder",
             id="picker-tree",
         )
-        loadable = is_loadable_for(self._start_path, self._provider)
+        loadable = is_loadable_for_any(self._start_path)
         root_data = _FolderRow(self._start_path, loadable)
-        root_label = _format_folder_label(self._start_path, loadable)
-        # Replace the default root with our own labelled root.
-        tree.root.set_label(root_label)
+        # The root shows the absolute path so the user always knows
+        # where they're anchored.
+        tree.root.set_label(_format_folder_label(self._start_path, loadable, full=True))
         tree.root.data = root_data
         tree.root.allow_expand = True
         tree.root.expand()
+        # Eagerly populate the root so the [open this folder] row is
+        # visible without the user expanding the root first.
+        self._populate_folder(tree.root)
         with Vertical(id="picker-body"):
             yield tree
 
     # --- event dispatch ------------------------------------------
 
     def on_tree_node_expanded(
-        self, event: Tree.NodeExpanded[_FolderRow]
+        self, event: Tree.NodeExpanded[_PickerRow]
     ) -> None:
         """Populate the expanded node's children on first expand.
 
-        Walks one directory level via :func:`list_child_directories`
-        and adds one child node per sub-directory; each child gets
-        ``allow_expand=True`` so the user can drill deeper. Idempotent:
+        Walks one directory level via :func:`list_child_directories`,
+        prepending an ``[open this folder]`` row so the user can commit
+        the current level without drilling further. Idempotent:
         re-expand after collapse does not duplicate children.
         """
         event.stop()
-        node = event.node
+        self._populate_folder(event.node)
+
+    def _populate_folder(self, node: TreeNode[_PickerRow]) -> None:
+        """Idempotent child-mount: ``[open this folder]`` + subfolders."""
         data = node.data
-        if data is None or data._populated:
+        if not isinstance(data, _FolderRow) or data._populated:
             return
         data._populated = True
+        # [open this folder] is always the first child so its position
+        # is predictable for keyboard navigation; styling is green when
+        # the folder itself is loadable (matches the parent label's
+        # color hint).
+        open_style = _GREEN_STYLE if data.loadable else "cyan"
+        node.add_leaf(
+            Text("[open this folder]", style=open_style),
+            data=_OpenFolderRow(data.path),
+        )
         for sub in list_child_directories(data.path):
-            sub_loadable = is_loadable_for(sub, self._provider)
+            sub_loadable = is_loadable_for_any(sub)
             node.add(
                 _format_folder_label(sub, sub_loadable),
                 data=_FolderRow(sub, sub_loadable),
@@ -158,19 +187,20 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
             )
 
     def on_tree_node_selected(
-        self, event: Tree.NodeSelected[_FolderRow]
+        self, event: Tree.NodeSelected[_PickerRow]
     ) -> None:
-        """Selecting a green folder dismisses with its path.
+        """``[open this folder]`` commits; folder rows only browse.
 
-        Non-green folders are no-op on selection — the user can still
-        expand them via Textual's built-in expand binding to browse
-        deeper.
+        The user's mental model: green folders are worth drilling INTO
+        and worth committing FROM (via their ``[open this folder]``
+        child). Plain folders are still browseable but never commit.
         """
         event.stop()
         data = event.node.data
-        if data is None or not data.loadable:
+        if isinstance(data, _OpenFolderRow):
+            self.dismiss(data.path)
             return
-        self.dismiss(data.path)
+        # _FolderRow / None: expand/collapse handled by the Tree widget.
 
     # --- actions --------------------------------------------------
 
@@ -178,26 +208,23 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         self.dismiss(None)
 
     def action_pick_highlighted(self) -> None:
-        """Enter-key handler: pick the cursor's folder if it is green."""
+        """Enter-key handler: pick the cursor's row if it is committable."""
         tree = self.query_one("#picker-tree", Tree)
         cursor = tree.cursor_node
         if cursor is None:
             return
         data = cursor.data
-        if data is None or not data.loadable:
-            return
-        self.dismiss(data.path)
+        if isinstance(data, _OpenFolderRow):
+            self.dismiss(data.path)
 
 
-def _format_folder_label(path: Path, loadable: bool) -> Text:
-    """Folder label: green if loadable, default-styled otherwise.
+def _format_folder_label(path: Path, loadable: bool, *, full: bool = False) -> Text:
+    """Folder label: green when loadable, default-styled otherwise.
 
-    Shows the basename only — the full path is implicit from the
-    parent chain in the tree. The root node carries the absolute
-    path string so the user always knows where they are anchored;
-    that is handled by the caller (via :meth:`Tree.root.set_label`),
-    not this helper.
+    ``full=True`` renders the absolute path (used for the picker root
+    so the user always sees the anchor); otherwise the basename
+    suffices since the parent chain in the tree carries the prefix.
     """
-    display = path.name or str(path)
+    display = str(path) if full else (path.name or str(path))
     style = _GREEN_STYLE if loadable else ""
     return Text(display, style=style)

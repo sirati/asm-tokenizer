@@ -66,6 +66,40 @@ def test_missing_unified_vocab_raises_value_error(tmp_path: Path) -> None:
     assert "unified_vocab.csv" in str(exc_info.value)
 
 
+def test_unified_vocab_resolved_from_parent_when_bins_in_subdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end resolver use: dataloader pointed at ``<root>/memmap/``
+    must pick up the vocab at ``<root>/unified_vocab.csv``.
+
+    This is the layout the user runs with — memmap bins live in a
+    ``memmap/`` subdir of the corpus root, and the unified vocab sits
+    one level up at the corpus root. Without the parent-dir fallback
+    in the search policy this construction would raise.
+    """
+    corpus_root = tmp_path / "corpus"
+    memmap_dir = corpus_root / "memmap"
+    memmap_dir.mkdir(parents=True)
+    # Stage the vocab at the corpus root (one level up from memmap_dir).
+    stage_v1_unified_vocab(corpus_root)
+
+    ledger: List[str] = []
+    patch_binary_dataset_factory(
+        monkeypatch,
+        layouts={
+            "binA": {"matched": [], "unmatched": [], "matched_length": 16},
+        },
+        session_ledger=ledger,
+    )
+
+    loader = AlignedDataLoader(
+        base_path=memmap_dir,
+        binary_names=["binA"],
+    )
+    assert loader.unified_vocab_path == corpus_root / "unified_vocab.csv"
+    assert loader.vocab_manager.format_version == 1
+
+
 def test_explicit_unified_vocab_path_overrides_default(
     tmp_path: Path,
 ) -> None:

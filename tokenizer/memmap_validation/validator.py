@@ -30,7 +30,10 @@ from typing import Dict, List, Optional
 import contextlib
 
 from ..aligned_data.loader import BinaryDataset
-from ..aligned_data.loader.unified_vocab_gate import load_and_validate_unified_vocab
+from ..aligned_data.loader.unified_vocab_gate import (
+    load_and_validate_unified_vocab,
+    resolve_unified_vocab_path,
+)
 from ..aligned_data.parsed_record_iter import (
     Matched,
     Unmatched,
@@ -72,10 +75,12 @@ class VersionInfo:
 class ValidatorConfig:
     """Configuration for memmap validation.
 
-    ``unified_vocab_path`` defaults to ``<output_dir>/unified_vocab.csv``
-    (mirrors ``AlignedDataLoader``'s convention) so the CLI does not need
-    to thread an extra arg; an explicit override is supported for tests
-    and out-of-tree vocab layouts.
+    ``unified_vocab_path`` defaults to the first candidate that exists
+    via :func:`resolve_unified_vocab_path` (alongside the bins or one
+    level up at the corpus root — mirrors ``AlignedDataLoader``'s
+    convention) so the CLI does not need to thread an extra arg; an
+    explicit override is supported for tests and out-of-tree vocab
+    layouts.
     """
 
     versions: List[VersionInfo]
@@ -121,7 +126,7 @@ def validate_memmap_output(config: ValidatorConfig) -> ValidationStats:
     vocab_path = (
         config.unified_vocab_path
         if config.unified_vocab_path is not None
-        else config.output_dir / "unified_vocab.csv"
+        else resolve_unified_vocab_path(config.output_dir)
     )
     vocab_manager = load_and_validate_unified_vocab(vocab_path)
     logger.info(
