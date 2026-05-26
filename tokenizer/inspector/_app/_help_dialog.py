@@ -39,6 +39,7 @@ from rich.text import Text
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
+from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets._key_panel import BindingsTable
 
@@ -55,12 +56,10 @@ class _UnderlyingScreenBindingsTable(BindingsTable):
 
     DEFAULT_CSS: ClassVar[str] = """
     _UnderlyingScreenBindingsTable {
-        max-width: 90%;
-        max-height: 90%;
+        width: 100%;
+        height: auto;
         padding: 1 2;
-        border: thick $primary;
         background: $surface;
-        overflow-y: auto;
     }
     """
 
@@ -155,6 +154,13 @@ class HelpScreen(ModalScreen[None]):
     HelpScreen {
         align: center middle;
     }
+    HelpScreen > #help-scroll {
+        width: 90%;
+        max-width: 120;
+        height: 90%;
+        border: thick $primary;
+        background: $surface;
+    }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -164,4 +170,5 @@ class HelpScreen(ModalScreen[None]):
     BINDING_GROUP_TITLE: ClassVar[str] = "Help"
 
     def compose(self) -> ComposeResult:
-        yield _UnderlyingScreenBindingsTable()
+        with VerticalScroll(id="help-scroll"):
+            yield _UnderlyingScreenBindingsTable()
