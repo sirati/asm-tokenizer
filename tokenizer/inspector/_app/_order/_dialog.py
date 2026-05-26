@@ -171,8 +171,10 @@ class OrderDialog(ModalScreen[OrderResult]):
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("escape", "cancel", "Cancel", show=True),
-        Binding("ctrl+s", "accept", "Accept", show=True),
+        Binding("escape", "cancel", "[u]C[/]ancel", show=True),
+        Binding("alt+c", "cancel", "[u]C[/]ancel", show=True),
+        Binding("ctrl+s", "accept", "[u]A[/]ccept", show=True),
+        Binding("alt+a", "accept", "[u]A[/]ccept", show=True),
     ]
 
     def __init__(
@@ -240,8 +242,8 @@ class OrderDialog(ModalScreen[OrderResult]):
         with Vertical(id="order-body"):
             yield sel_list
             with Horizontal(id="order-buttons"):
-                yield Button("Accept", id="accept", variant="primary")
-                yield Button("Cancel", id="cancel")
+                yield Button("[u]A[/]ccept", id="accept", variant="primary")
+                yield Button("[u]C[/]ancel", id="cancel")
 
     # --- actions ---------------------------------------------------
 

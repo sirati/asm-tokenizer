@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Sequence, Union
 
 from tokenizer.inspector._render._protocol import RenderedVariant
-from tokenizer.inspector._tree_model import VariantNode
+from tokenizer.inspector._tree_model import FunctionNode, VariantNode
 
 from .._order import AxisDescriptor, extract_axis_value
 
@@ -40,6 +40,7 @@ __all__ = [
     "FilterCancelled",
     "FilterResult",
     "apply_filter",
+    "function_has_passing_variants",
     "missing_value_token",
     "MISSING_VALUE_TOKEN",
 ]
@@ -212,3 +213,48 @@ def _variant_passes(rv: RenderedVariant, config: FilterConfig) -> bool:
         if value in disabled_values:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Function-level predicate
+# ---------------------------------------------------------------------------
+
+
+def function_has_passing_variants(
+    fn_node: FunctionNode, config: Optional[FilterConfig]
+) -> bool:
+    """``True`` iff at least one of ``fn_node``'s variants survives ``config``.
+
+    Single concern: the "is this function row still meaningful under the
+    active filter?" predicate. Used by the tree-row mount path to decide
+    between an expandable + normal-styled :class:`FunctionNode` label and
+    a non-expandable + dim-styled one (mirrors the same
+    :func:`_variant_passes` codepath :func:`apply_filter` uses, so the
+    predicate cannot diverge from the visible filter behaviour).
+
+    No-filter / empty-filter short-circuits to ``True`` so callers can
+    thread an :class:`Optional` config without ``is None`` branches.
+
+    Backend lifecycle: a function that has been expanded before reuses
+    its cached :attr:`FunctionNode._backend`; an unexpanded function gets
+    a transient backend opened via :meth:`BackendFactory.make` and closed
+    before return so :meth:`FunctionNode.expand` is free to open a fresh
+    one on the next user expand (plan section 4 -- no backend reuse
+    across collapse/re-expand).
+    """
+    if config is None or config.is_empty():
+        return True
+    if fn_node._backend is not None:
+        backend = fn_node._backend
+        owned = False
+    else:
+        backend = fn_node.factory.make(fn_node.handle)
+        owned = True
+    try:
+        for rv in backend.variants():
+            if _variant_passes(rv, config):
+                return True
+        return False
+    finally:
+        if owned:
+            backend.close()
