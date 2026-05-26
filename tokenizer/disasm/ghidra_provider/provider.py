@@ -28,6 +28,9 @@ from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
     _ghidra_processor_to_architecture,
 )
+from tokenizer.disasm.ghidra_provider.switch_table_walker import (
+    walk_switch_tables_for_function,
+)
 from tokenizer.disasm.ghidra_views.unnamed_rename import (
     compute_binary_identity_hash,
     placeholder_renamed_name,
@@ -435,6 +438,11 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         function); calling ``iter_switch_tables`` without first
         iterating ``iter_functions`` on the same provider returns an
         empty iterator.
+
+        The actual body walk lives in
+        ``tokenizer.disasm.ghidra_provider.switch_table_walker``; this
+        method's concern is resolving the ``function.entry`` ->
+        Ghidra ``Function`` handle and delegating.
         """
         if function is None:
             return
@@ -445,99 +453,6 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         ghidra_function = self._funcs_by_entry.get(entry)
         if ghidra_function is None:
             return
-        try:
-            if ghidra_function.isThunk():
-                # PLT trampolines emit ``ldr pc, [GOT_slot]`` / ``jmp [GOT_slot]``
-                # whose Ghidra reference graph is structurally identical to a
-                # 1-target switch-table dispatch (computed-jump flow + DATA-READ
-                # to the GOT slot + COMPUTED_JUMP to PLT0). Thunks don't carry
-                # switch tables; their indirect-call semantics surface via the
-                # thunk-target path, so skip them here.
-                return
-        except Exception:
-            # Defensive: malformed Function handle. Treat as "no thunk info"
-            # rather than crashing the iter loop.
-            pass
-
-        from ghidra.program.model.symbol import RefType
-
-        body = ghidra_function.getBody()
-        insn_iter = self._listing.getInstructions(body, True)
-        while insn_iter.hasNext():
-            insn = insn_iter.next()
-            try:
-                flow_type = insn.getFlowType()
-                if not (flow_type.isJump() and flow_type.isComputed()):
-                    continue
-            except Exception:
-                continue
-
-            # Outbound references from the dispatch instruction. Computed
-            # jumps surface their resolved targets as COMPUTED_JUMP refs.
-            try:
-                refs_from = list(insn.getReferencesFrom() or ())
-            except Exception:
-                refs_from = []
-
-            targets: list[int] = []
-            table_addr: Optional[int] = None
-            for ref in refs_from:
-                try:
-                    rtype = ref.getReferenceType()
-                except Exception:
-                    continue
-                # READ references typically point at the table base in rodata.
-                try:
-                    if rtype.isData() and rtype.isRead():
-                        to_addr = int(ref.getToAddress().getOffset())
-                        if table_addr is None:
-                            table_addr = to_addr
-                        continue
-                except Exception:
-                    pass
-                # COMPUTED_JUMP / CONDITIONAL_COMPUTED_JUMP / COMPUTED_CALL
-                # references list the resolved target blocks.
-                try:
-                    if rtype.isJump() and rtype.isComputed():
-                        to_addr = int(ref.getToAddress().getOffset())
-                        targets.append(to_addr)
-                        continue
-                except Exception:
-                    pass
-                # ``RefType.COMPUTED_JUMP`` direct comparison as a fallback
-                # for older Ghidra versions where the predicates above
-                # are missing.
-                try:
-                    if rtype == RefType.COMPUTED_JUMP:
-                        to_addr = int(ref.getToAddress().getOffset())
-                        targets.append(to_addr)
-                except Exception:
-                    pass
-
-            if not targets:
-                continue
-
-            # If we did not find a READ reference, fall back to scanning
-            # the instruction's data-typed operand for a memory-base address.
-            if table_addr is None:
-                try:
-                    num_ops = insn.getNumOperands()
-                except Exception:
-                    num_ops = 0
-                for i in range(num_ops):
-                    try:
-                        for obj in insn.getOpObjects(i) or ():
-                            # ghidra.program.model.address.Address has getOffset()
-                            if hasattr(obj, "getOffset"):
-                                table_addr = int(obj.getOffset())
-                                break
-                    except Exception:
-                        continue
-                    if table_addr is not None:
-                        break
-
-            if table_addr is None:
-                # No locatable table base; skip rather than emit a synthetic.
-                continue
-
-            yield table_addr, targets
+        yield from walk_switch_tables_for_function(
+            ghidra_function, self._listing
+        )
