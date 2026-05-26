@@ -13,20 +13,59 @@ the Data is the target of a computed-jump dispatch site, which is the
 definition of a switch table. If no, the structural match is coincidental
 and must NOT be classified as ``JUMP_TABLE_SLOT``.
 
-This module owns ONLY the back-reference walk; the predicate caller
+This module owns ONLY the back-reference walk and the per-``RefType``
+``COMPUTED_JUMP`` predicate; the predicate caller
 (``GhidraMetadataLookup._is_jump_table_slot``) keeps ownership of the
 structural check + the rodata-block-name gate. API surface:
 
     has_inbound_computed_jump(reference_manager, data) -> bool
+    is_computed_jump_reftype(rt) -> bool
 
 Callers learn nothing about the ReferenceManager iterator protocol, the
 RefType import path, or the address-range walk; they pass the resolved
-ReferenceManager + Data and receive a boolean.
+ReferenceManager + Data and receive a boolean. The ``RefType`` predicate
+helper is reused by the outbound-ref walk in
+``tokenizer.disasm.ghidra_provider.switch_table_walker`` so the
+``isJump()+isComputed()`` modern check + ``RefType.COMPUTED_JUMP`` legacy
+fallback live in one place.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+
+def is_computed_jump_reftype(rt: Any) -> bool:
+    """Return ``True`` iff ``rt`` is a Ghidra ``RefType`` for a computed jump.
+
+    Two checks combined: the modern ``isJump() and isComputed()`` predicate
+    AND the legacy ``rt == RefType.COMPUTED_JUMP`` direct comparison
+    (preserved for older Ghidra versions where the predicates above don't
+    fire). Defensive against partially-populated Ghidra objects: any
+    JPype exception returns ``False`` rather than crashing the caller's
+    iteration loop.
+
+    ``rt`` is the object returned by ``Reference.getReferenceType()``;
+    this helper is intentionally NOT applicable to ``Instruction.getFlowType()``
+    (``FlowType`` is a structurally distinct Ghidra class — its
+    ``isJump()`` / ``isComputed()`` methods share names but the
+    legacy-fallback constant ``RefType.COMPUTED_JUMP`` is meaningless
+    for that hierarchy).
+    """
+    if rt is None:
+        return False
+    try:
+        if rt.isJump() and rt.isComputed():
+            return True
+    except Exception:
+        pass
+    try:
+        from ghidra.program.model.symbol import RefType
+        if rt == RefType.COMPUTED_JUMP:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def has_inbound_computed_jump(reference_manager: Any, data: Any) -> bool:
@@ -52,10 +91,6 @@ def has_inbound_computed_jump(reference_manager: Any, data: Any) -> bool:
     """
     if reference_manager is None or data is None:
         return False
-    try:
-        from ghidra.program.model.symbol import RefType
-    except Exception:
-        RefType = None  # noqa: N806 — best-effort fallback below
     try:
         min_addr = data.getMinAddress()
         max_addr = data.getMaxAddress()
@@ -95,17 +130,6 @@ def has_inbound_computed_jump(reference_manager: Any, data: Any) -> bool:
                 rt = ref.getReferenceType()
             except Exception:
                 continue
-            if rt is None:
-                continue
-            try:
-                if rt.isJump() and rt.isComputed():
-                    return True
-            except Exception:
-                pass
-            if RefType is not None:
-                try:
-                    if rt == RefType.COMPUTED_JUMP:
-                        return True
-                except Exception:
-                    pass
+            if is_computed_jump_reftype(rt):
+                return True
     # Unreachable; the loop exits via explicit returns above.
