@@ -123,21 +123,15 @@ def test_asmleaf_single_inline_call_produces_inline_call_node():
     assert call.callee_handle.name == "callee"
 
 
-def test_asmleaf_single_inline_call_threads_caller_variant_identity():
-    """The :attr:`InlineCallEntry.caller_variant_identity` field is
-    threaded through to the resulting
-    :class:`InlineCallNode.caller_variant_identity` so
-    :meth:`InlineCallNode.expand`'s caller-fallback path activates
-    and matches the callee's variants by canonical-4 build axes
-    (instead of by the opaque per-section ``variant_idx``).
+def test_asmleaf_single_inline_call_threads_variant_idx():
+    """The :attr:`InlineCallEntry.variant_idx` (the dataloader-
+    recorded per-call-site pin read off
+    :attr:`VariantBlock.per_call_entries`) is threaded through to
+    :class:`InlineCallNode.variant_idx`. The expand path uses this
+    to splice the matching callee variant's blocks in directly (D2);
+    a :data:`MISSING_VARIANT_INDEX` value would surface every variant.
     """
-    from tokenizer.variant_info import VariantIdentity
-
     factory = MagicMock(spec=BackendFactory)
-    caller_identity = VariantIdentity(
-        arch="arm32", compiler="clang", compiler_version="5.0", opt="O0",
-        pkg="caller_pkg", variant_id=0,
-    )
     entry = InlineCallEntry(
         kind=CallTargetType.LOCAL,
         counter_id=0,
@@ -145,9 +139,8 @@ def test_asmleaf_single_inline_call_threads_caller_variant_identity():
         callee_section_pointer=SectionPointerSpec(
             arm=SectionKind.MATCHED, idx=7
         ),
-        variant_idx=0,
+        variant_idx=4,
         provider=None,
-        caller_variant_identity=caller_identity,
     )
     leaf = AsmLeaf(
         text="call foo", openables=(entry,), factory=factory
@@ -158,7 +151,7 @@ def test_asmleaf_single_inline_call_threads_caller_variant_identity():
     assert len(children) == 1
     call = children[0]
     assert isinstance(call, InlineCallNode)
-    assert call.caller_variant_identity == caller_identity
+    assert call.variant_idx == 4
 
 
 def test_asmleaf_single_inline_jump_produces_inline_jump_node():
