@@ -45,9 +45,18 @@ from ._order import VariantGroupNode, format_grouping_label
 _ERR_STYLE: Style = Style(color="red", dim=True)
 
 
+# Muted style for the per-block-row asm preview suffix appended after
+# the ``"Block: <i>"`` / ``"Jump table: <i>"`` prefix. ``dim`` lets the
+# user visually distinguish the canonical row label (block index) from
+# the asm-text preview that sits beside it -- the preview is auxiliary
+# context, not the row's identity.
+_BLOCK_PREVIEW_STYLE: Style = Style(dim=True)
+
+
 __all__ = [
     "_BLOCK_KIND_INDEXED_PREFIXES",
     "_BLOCK_KIND_LABELS",
+    "_BLOCK_PREVIEW_STYLE",
     "_ERR_STYLE",
     "_block_node_label",
     "_compose_label",
@@ -85,28 +94,46 @@ _BLOCK_KIND_INDEXED_PREFIXES: dict[BlockKind, str] = {
 }
 
 
-def _block_node_label(node: "BlockNode") -> str:
-    """Compose the row text for a :class:`BlockNode`.
+def _block_node_label(node: "BlockNode", *, show_preview: bool = True) -> Text:
+    """Compose the row text for a :class:`BlockNode` as styled ``Text``.
 
     Dispatches off :attr:`BlockNode.kind`: the non-indexed kinds
     (variant prefix / function id) render their fixed section name;
-    the indexed kinds (body block / jump-table footer) compose
-    ``"<prefix>: <idx>   <preview>"`` with the per-kind prefix.
+    the indexed kinds (body block / jump-table footer) compose a
+    ``"<prefix>: <idx>"`` base with -- when ``show_preview`` is True
+    AND the preview is non-empty -- a ``"   <preview>"`` muted-style
+    suffix appended in :data:`_BLOCK_PREVIEW_STYLE`. ``show_preview``
+    is False on already-expanded block rows (the user is looking at
+    the content; the preview is redundant) and globally toggleable
+    via the App-level ``p`` binding -- the per-row branch lives here
+    so the label composer's single concern stays "translate node to
+    Text".
     """
     fixed = _BLOCK_KIND_LABELS.get(node.kind)
     if fixed is not None:
-        return fixed
+        return Text(fixed)
     prefix = _BLOCK_KIND_INDEXED_PREFIXES[node.kind]
-    return f"{prefix}: {node.block_idx}   {node.preview}"
+    text = Text(f"{prefix}: {node.block_idx}")
+    if show_preview and node.preview:
+        text.append("   ")
+        text.append(node.preview, style=_BLOCK_PREVIEW_STYLE)
+    return text
 
 
-def _compose_label(node: Node) -> Text:
+def _compose_label(node: Node, *, show_block_preview: bool = True) -> Text:
     """Translate one model node into its visible label text.
 
     Dispatch is by ``isinstance`` on the seven concrete node types
     (no string compares on type names). The BlockNode label composes
     its two model fields (``block_idx`` + ``preview``) into the row
     text here on the UI side -- the model deliberately splits them.
+
+    ``show_block_preview`` is forwarded to :func:`_block_node_label`
+    when the node is a :class:`BlockNode`. Other node types ignore
+    it (they have no preview concept). Callers set it to False on
+    already-expanded block rows OR when the App-level preview toggle
+    is off; defaults to True so callers that don't care preserve the
+    legacy "always show preview" behaviour.
     """
     if isinstance(node, FunctionNode):
         return Text(function_label(node.name))
@@ -120,7 +147,7 @@ def _compose_label(node: Node) -> Text:
             return Text(node.aligned_label)
         return Text(variant_label_from_axes(node.label_axes))
     if isinstance(node, BlockNode):
-        return Text(_block_node_label(node))
+        return _block_node_label(node, show_preview=show_block_preview)
     if isinstance(node, InlineCallNode):
         return Text(
             inline_call_label(

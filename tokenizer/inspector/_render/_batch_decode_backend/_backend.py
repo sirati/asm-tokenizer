@@ -365,18 +365,29 @@ def _build_variant_pins_per_ct(
 
 
 def _preview_for_section(section: RowSection) -> str:
-    """First :class:`AsmLine`'s text in the section, or empty string.
+    """Joined :class:`AsmLine` texts for the section's preview.
 
-    Mirrors the FtlBackend's preview contract (the
-    :func:`tokenizer.inspector._label.block_preview` helper truncates
-    as the UI policy layer); this backend feeds the raw asm-text head
-    so the truncation policy applies uniformly across backends. The
-    FUNCTION_ID section commonly carries no AsmLines (its single
+    Routes every AsmLine in the section's item stream through
+    :func:`tokenizer.inspector._label.block_preview_from_asm_texts`
+    so the preview lists every instruction (``"; "``-joined), capped
+    at the helper's ``max_chars`` policy. Same single source of truth
+    the FTL backend's :func:`block_preview` against
+    :class:`BodyBlockView` consumes; both backends emit the same
+    visual preview shape.
+
+    Crucially, this reads the SAME ``section.items`` list that
+    :meth:`BatchDecodeBackend.render_block` returns on expansion --
+    the preview text is guaranteed to correspond to the items the
+    user sees when they open the block row (Fix #1: no off-by-one
+    or variant-threading drift between the label and the expansion).
+
+    The FUNCTION_ID section commonly carries no AsmLines (its single
     entry is an :class:`InlineCallEntry` for the self-prepend), so
     the preview falls through to empty -- the UI labels that section
     with a fixed string, not a preview.
     """
-    for item in section.items:
-        if isinstance(item, AsmLine):
-            return item.text
-    return ""
+    from tokenizer.inspector._label import block_preview_from_asm_texts
+
+    return block_preview_from_asm_texts(
+        item.text for item in section.items if isinstance(item, AsmLine)
+    )

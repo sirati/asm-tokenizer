@@ -30,6 +30,7 @@ from textual.widgets import Tree
 from shared.logging_utils import setup_file_logger
 from tokenizer.inspector._label import aligned_variant_labels
 from tokenizer.inspector._tree_model import (
+    BlockNode,
     FunctionNode,
     Node,
     VariantNode,
@@ -180,6 +181,7 @@ class InspectorApp(App[None]):
         Binding("o", "open_order_dialog", "Order", show=True),
         Binding("f", "open_filter_dialog", "Filter", show=True),
         Binding("b", "open_binary_switcher", "Switch binary", show=True),
+        Binding("p", "toggle_preview", "Toggle block preview", show=True),
     ]
 
     def __init__(
@@ -231,6 +233,13 @@ class InspectorApp(App[None]):
         # rebuilds. ``None`` means "no rebuild pending"; see
         # :mod:`._node_path` for the per-kind key dispatch.
         self._captured_expand_state: Optional[CapturedExpandState] = None
+        # Global block-row preview toggle: when True (default) collapsed
+        # body / jump-table-footer rows carry the muted-style asm preview
+        # suffix; toggled off via the ``p`` action so the user can hide
+        # all previews simultaneously. Per-row "is the block expanded?"
+        # gating is handled in :meth:`_block_label_show_preview`, not
+        # here -- this flag is the GLOBAL discriminator only.
+        self._preview_enabled: bool = True
 
     # --- compose ---------------------------------------------------
 
@@ -364,10 +373,19 @@ class InspectorApp(App[None]):
 
         for child in children:
             node.add(
-                _compose_label(child),
+                self._compose_child_label(child, is_expanded=False),
                 data=child,
                 allow_expand=getattr(child, "can_expand", False),
             )
+
+        # Refresh the JUST-expanded node's own label: when ``node.data``
+        # is a :class:`BlockNode`, dropping the preview suffix now that
+        # the content is visible. Per Fix #3 (user directive): "when a
+        # block has been opened that we can disable the preview, as we
+        # are now looking at the content." The flip is one-way -- the
+        # mirror NodeCollapsed handler restores the preview suffix when
+        # the user re-collapses the row.
+        self._refresh_block_label(node)
 
         # Capture-on-rebuild expand-state + cursor restoration. A
         # prior rebuild may have stashed a typed :class:`NodePath`
@@ -377,6 +395,104 @@ class InspectorApp(App[None]):
         # the deeper level), and moves the cursor when the matching
         # tree node lands.
         _order_hooks.consume_node_path_post_mount(self, node, model)
+
+    @on(Tree.NodeCollapsed, "#tree")
+    def _on_node_collapsed(self, event: Tree.NodeCollapsed[Node]) -> None:
+        """Restore the block-row preview suffix when the user re-collapses
+        a :class:`BlockNode` row.
+
+        Mirror of the JUST-expanded refresh inside :meth:`_on_node_expanded`:
+        the preview is hidden while the block's content is being viewed and
+        restored once the row collapses. No-op for non-Block nodes.
+        """
+        # Do NOT call ``event.stop`` -- Textual's default collapse handler
+        # still needs to fire to actually fold the children. We only
+        # piggyback to refresh the label.
+        self._refresh_block_label(event.node)
+
+    # --- block-preview policy --------------------------------------
+
+    def _block_label_show_preview(self, *, is_expanded: bool) -> bool:
+        """Single-source policy for the BlockNode preview suffix.
+
+        Two gates compose: the GLOBAL :attr:`_preview_enabled` flag
+        (toggled by ``p``) AND the PER-ROW expansion state (an
+        already-expanded block hides its own preview -- the content is
+        visible below the row). Both gates must be True for the
+        preview to render; either being False elides it. Centralising
+        the policy keeps every call site agreeing without per-call
+        branching.
+        """
+        return self._preview_enabled and not is_expanded
+
+    def _compose_child_label(
+        self, child: "Node", *, is_expanded: bool
+    ) -> Text:
+        """Compose the label for a newly-mounted child row.
+
+        Threads the per-row expansion state + the App's global preview
+        flag through :func:`_compose_label`. Non-BlockNode children
+        ignore the ``show_block_preview`` argument (per the helper's
+        contract); routing it through here uniformly keeps the call
+        site free of node-type branching.
+        """
+        return _compose_label(
+            child,
+            show_block_preview=self._block_label_show_preview(
+                is_expanded=is_expanded
+            ),
+        )
+
+    def _refresh_block_label(self, tree_node: "TreeNode[Node]") -> None:
+        """Recompose a tree node's label when its expansion state changes.
+
+        No-op for non-BlockNode payloads. Reads the tree node's
+        current ``is_expanded`` state + the App's global preview flag
+        and writes the recomposed :class:`Text` back onto the row.
+        Centralising the refresh keeps the per-row policy in lockstep
+        with :meth:`_compose_child_label`.
+        """
+        model = tree_node.data
+        if not isinstance(model, BlockNode):
+            return
+        tree_node.set_label(
+            _compose_label(
+                model,
+                show_block_preview=self._block_label_show_preview(
+                    is_expanded=tree_node.is_expanded
+                ),
+            )
+        )
+
+    def action_toggle_preview(self) -> None:
+        """Flip the global block-preview flag + repaint every visible
+        :class:`BlockNode` row.
+
+        Walks the tree and recomposes every BlockNode row's label;
+        already-expanded blocks stay preview-less regardless of the
+        flag (the per-row gate in :meth:`_block_label_show_preview`
+        keeps that policy in one place).
+        """
+        self._preview_enabled = not self._preview_enabled
+        try:
+            tree = self.query_one("#tree", _InspectorTree)
+        except Exception:
+            return
+        self._refresh_all_block_labels(tree.root)
+
+    def _refresh_all_block_labels(self, root: "TreeNode[Node]") -> None:
+        """Recurse into ``root`` and refresh every BlockNode row's label.
+
+        Iterative DFS over the tree's existing children -- the App
+        only mounts tree nodes during expansion, so the walk reaches
+        exactly the rows currently visible to the user. Non-Block
+        rows are skipped silently by :meth:`_refresh_block_label`.
+        """
+        stack: list["TreeNode[Node]"] = list(root.children)
+        while stack:
+            node = stack.pop()
+            self._refresh_block_label(node)
+            stack.extend(node.children)
 
     def _safe_expand_one(self, model: "Node") -> "Optional[list[Node]]":
         """Wrapper-level ``model.expand`` with the dispatcher's error policy.
