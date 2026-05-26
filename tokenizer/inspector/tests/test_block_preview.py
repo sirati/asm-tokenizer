@@ -185,23 +185,25 @@ def test_preview_for_section_skips_function_id_section_with_no_asmlines():
 
 def test_block_preview_from_asm_texts_joins_with_semicolon_space():
     """Multi-instruction join contract: ``"; "`` separator matches
-    :meth:`BlockTokenList.to_asm_like` (FTL preview) so both backends'
-    previews share the same visual shape."""
-    out = block_preview_from_asm_texts(
-        ["mov eax 0", "add eax 1", "ret"], max_chars=80
-    )
+    :meth:`BlockTokenList.to_asm_like` so both backends' previews
+    share the same visual shape."""
+    out = block_preview_from_asm_texts(["mov eax 0", "add eax 1", "ret"])
     assert out == "mov eax 0; add eax 1; ret"
 
 
-def test_block_preview_from_asm_texts_truncates_to_max_chars():
-    """The 80-char cap policy lives in :mod:`tokenizer.inspector._label`
-    (single source of truth across backends); inputs that exceed it
-    truncate without an overflow marker (the UI's
-    :func:`apply_truncation_marker` owns the ``>>`` suffix)."""
+def test_block_preview_from_asm_texts_no_fixed_char_cap():
+    """The preview returns the FULL joined string -- no fixed-char
+    truncation. The tree widget's per-row horizontal-scroll feature
+    (:mod:`tokenizer.inspector._app._tree_widget`) is the sole
+    overflow policy; a cap here would strip the scrollable content
+    before the user can pan to it (the bug behind the user-observed
+    "block preview cuts off and won't scroll" report)."""
     texts = ["instr" + str(i) for i in range(100)]
-    out = block_preview_from_asm_texts(texts, max_chars=80)
-    assert len(out) == 80
-    assert ">>" not in out
+    out = block_preview_from_asm_texts(texts)
+    expected = "; ".join(texts)
+    assert out == expected
+    # Longer than the legacy 80-char cap -- the cap is gone.
+    assert len(out) > 80
 
 
 def test_block_preview_from_asm_texts_empty_iterable_returns_empty():

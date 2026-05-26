@@ -30,10 +30,13 @@ API surface crossing the boundary:
   pairs and :attr:`BlockKind.JUMP_TABLE` for
   ``[BLOCK_DEF, JUMP_TABLE:N]`` pairs. Any other shape raises --
   the gate accepts those two kinds and only those two.
-* :func:`body_block_view` -- wrap a block so ``iter_insn`` /
-  ``to_asm_like`` skip the header instruction. The renderer + the
-  :func:`tokenizer.inspector._label.block_preview` helper both consume
-  this view; neither knows about the underlying header pair. The
+* :func:`body_block_view` -- wrap a block so ``iter_insn`` skips
+  the header instruction. The shared row renderer
+  (:func:`tokenizer.inspector._render._render_block.render_block`)
+  consumes this view through ``iter_insn``; both the FTL backend's
+  expand path AND its block-preview path route through that single
+  walker so the preview text matches the expanded body byte-for-byte
+  (including :func:`substitute_display_chars` substitutions). The
   view works identically for body + jump-table-footer blocks (both
   open with a 1-insn header that must be absorbed).
 """
@@ -112,10 +115,9 @@ class BodyBlockView:
     Duck-typed to satisfy the slice of
     :class:`BlockTokenList` that
     :func:`tokenizer.inspector._render._render_block.render_block`
-    and :func:`tokenizer.inspector._label.block_preview` consume
-    (``iter_insn`` + ``to_asm_like``). The wrapper holds a reference
-    to the inner :class:`BlockTokenList`; lifetime + read-only
-    semantics carry through unchanged.
+    consumes (``iter_insn``). The wrapper holds a reference to the
+    inner :class:`BlockTokenList`; lifetime + read-only semantics
+    carry through unchanged.
 
     Mirrors BatchDecode's silent-header policy
     (:attr:`WalkSectionState.pending_header`): the section content
@@ -124,6 +126,15 @@ class BodyBlockView:
     works for both BLOCK_V2 + JUMP_TABLE headers (the structural
     discriminator is :func:`block_header`'s job; absorption is
     kind-agnostic).
+
+    Intentionally does NOT expose a ``to_asm_like`` method: every
+    asm-text production in the inspector flows through the shared
+    row walker
+    (:func:`tokenizer.inspector._render._render_block.render_block`)
+    so MEM-bracket / register-list display substitution is applied
+    in ONE place. A second raw-token join here would skip that
+    substitution and re-introduce the ``mem[`` / ``]mem`` shape into
+    the preview.
     """
 
     __slots__ = ("_inner",)
@@ -139,17 +150,6 @@ class BodyBlockView:
                 first = False
                 continue
             yield insn
-
-    def to_asm_like(self) -> str:
-        """Re-implement :meth:`BlockTokenList.to_asm_like` over the body.
-
-        Matches the production join (``"; "``) so the preview text the
-        UI sees is identical to a header-less block's
-        :meth:`to_asm_like` output -- only the leading
-        ``"_def block_v2:N"`` / ``"_def jump_table:N"`` fragment is
-        missing.
-        """
-        return "; ".join(t.to_asm_like() for t in self.iter_insn(True))
 
 
 def body_block_view(block: BlockTokenList) -> BodyBlockView:

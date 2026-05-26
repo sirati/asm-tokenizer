@@ -157,7 +157,7 @@ def test_block_header_error_message_lists_accepted_kinds() -> None:
 
 
 # ---------------------------------------------------------------------------
-# BodyBlockView (iter_insn + to_asm_like absorption)
+# BodyBlockView (iter_insn header absorption)
 # ---------------------------------------------------------------------------
 
 
@@ -190,53 +190,6 @@ def test_body_block_view_absorbs_jump_table_header_too() -> None:
     blk = _build_jump_table_footer_block(vm, jt_id=4, target_ns=[1, 2])
     view = body_block_view(blk)
     assert list(view.iter_insn(transient=False)) == []
-
-
-def test_body_block_view_to_asm_like_omits_header_text() -> None:
-    """``to_asm_like`` must not include the ``_def block_v2:N`` fragment."""
-    vm = _vm()
-    blk = _build_block_with_header(
-        vm,
-        n=4,
-        body_insns=[("nop", [vm.Block_Def()])],
-    )
-    asm = body_block_view(blk).to_asm_like()
-    # Single body insn carrying a BLOCK_DEF token -> renders as "_def"
-    # but the header's "_def block_v2:4" is gone. (The body insn's
-    # "_def" content here is just a placeholder; the assertion is that
-    # ``block_v2:4`` does NOT appear at all because the header was the
-    # only carrier of the BLOCK_V2 token.)
-    assert "block_v2:" not in asm
-
-
-def test_body_block_view_to_asm_like_omits_jump_table_header_text() -> None:
-    """Mirror of the BLOCK_V2 absorption test for the JUMP_TABLE
-    header kind: ``to_asm_like`` on a jump-table footer must not leak
-    the ``_def jump_table:N`` fragment.
-    """
-    vm = _vm()
-    blk = _build_jump_table_footer_block(vm, jt_id=9, target_ns=[1])
-    asm = body_block_view(blk).to_asm_like()
-    assert "jump_table:" not in asm
-
-
-def test_body_block_view_is_duck_compatible_with_block_preview() -> None:
-    """The renderer-agnostic :func:`block_preview` reads only
-    ``to_asm_like``; a BodyBlockView must satisfy that slice so the
-    inspector's preview path stays one-concern."""
-    from tokenizer.inspector._label import block_preview
-
-    vm = _vm()
-    blk = _build_block_with_header(
-        vm,
-        n=9,
-        body_insns=[("nop", [vm.Block_Def()])],
-    )
-    preview = block_preview(body_block_view(blk))
-    # Same omission contract as the to_asm_like test, but routed via
-    # the production preview helper so the wrapper's duck-typed shape
-    # stays pinned.
-    assert "block_v2:9" not in preview
 
 
 def test_body_block_view_holds_bodyblockview_type() -> None:

@@ -52,7 +52,6 @@ __all__ = [
     "variant_label",
     "variant_label_from_axes",
     "function_label",
-    "block_preview",
     "block_preview_from_asm_texts",
     "resolve_function_name_for_fid",
     "inline_call_label",
@@ -271,42 +270,28 @@ def function_label(name: str | None) -> str:
     return f"local function {name}"
 
 
-def block_preview(block, max_chars: int = 80) -> str:
-    """First ``max_chars`` chars of ``block.to_asm_like()``.
-
-    Raw truncation only — returns the prefix without any trailing
-    marker. The UI layer (the horizontal-scroll widget) decides
-    whether to append ``>>`` based on viewport state, so this helper
-    stays renderer-agnostic. ``BlockTokenList.to_asm_like`` already
-    joins per-instruction with ``"; "`` (see :mod:`tokenizer.token_lists`),
-    so the resulting preview lists every instruction up to the cap.
-    """
-    asm = block.to_asm_like()
-    return asm[:max_chars]
-
-
-def block_preview_from_asm_texts(
-    asm_texts: Iterable[str],
-    max_chars: int = 80,
-) -> str:
-    """Join per-instruction asm texts with ``"; "`` and truncate to ``max_chars``.
+def block_preview_from_asm_texts(asm_texts: Iterable[str]) -> str:
+    """Join per-instruction asm texts with ``"; "`` -- no length cap.
 
     Sole producer of the block-preview string shape consumed by the
-    block-row label composer (:mod:`._app._labels`). Both rendering
-    backends materialise a stream of per-instruction asm-line texts
-    (the AsmLine.text values produced by the row walker / FTL renderer);
-    routing them through this helper guarantees the preview shown on a
-    collapsed block row corresponds to the EXACT items the block
-    yields on expand (single source of truth = the rendered AsmLine
-    text stream).
+    block-row label composer (:mod:`._app._labels`). BOTH rendering
+    backends materialise the same stream of per-instruction asm-line
+    texts (the post-substitution :attr:`AsmLine.text` values produced
+    by the shared row walker / FTL renderer); routing them through
+    this helper guarantees the preview shown on a collapsed block row
+    corresponds to the EXACT items the block yields on expand --
+    single source of truth = the rendered AsmLine text stream.
+
+    Length policy: the FULL joined string is returned. Overflow is
+    handled at the UI layer by the tree widget's per-row horizontal-
+    scroll feature (see :mod:`tokenizer.inspector._app._tree_widget`)
+    so collapsing a long preview into a fixed-char prefix here would
+    strip the scrollable content before the user can pan to it.
 
     ``"; "`` mirrors :meth:`BlockTokenList.to_asm_like` so the visual
-    shape stays consistent across the FTL preview path
-    (:func:`block_preview` against ``BodyBlockView``) and the
-    BatchDecode preview path (this helper against the row walker's
-    AsmLine list).
+    shape stays consistent across both backends' preview paths.
     """
-    return "; ".join(asm_texts)[:max_chars]
+    return "; ".join(asm_texts)
 
 
 def resolve_function_name_for_fid(

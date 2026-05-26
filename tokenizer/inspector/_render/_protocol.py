@@ -192,9 +192,13 @@ class RenderedBlock:
     :attr:`BlockKind.JUMP_TABLE` (no variant prefix / self-prepend at
     the FTL stream layer).
 
-    ``preview`` carries the raw asm-text head WITHOUT any UI
-    truncation -- the UI layer (:func:`_label.block_preview`) owns
-    the length policy (plan section 3, ``_label.py`` row).
+    ``preview`` carries the FULL ``"; "``-joined per-instruction asm
+    text for the block. There is no fixed-char cap here -- the tree
+    widget's per-row horizontal-scroll feature (see
+    :mod:`tokenizer.inspector._app._tree_widget`) is the sole
+    overflow policy, so collapsing the string to a prefix at this
+    layer would strip the scrollable content before the user can pan
+    to it.
 
     ``block_idx`` is the backend-internal block index threaded back
     into :meth:`RenderBackend.render_block`. For :attr:`BlockKind.BODY`
