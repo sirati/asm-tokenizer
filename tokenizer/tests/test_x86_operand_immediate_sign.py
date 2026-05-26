@@ -254,6 +254,14 @@ def test_intra_function_jump_target_emits_block_v2(handler, vm):
     pre-classification, handing both intra-function and cross-function
     targets to the constant_handler with ``is_arithmetic=False`` so the
     predicate dispatch decides.
+
+    SCOPE: this is a UNIT test of the x86 operands-side routing — the
+    stub lookup hands the constant_handler a pre-classified
+    ``AddressKind.LOCAL_FUNCTION`` view, bypassing
+    ``GhidraMetadataLookup._classify_address``. A separate integration
+    test (``test_metadata_lookup_classify_address.py``) drives the real
+    classifier and pins the end-to-end ``LAB_*`` -> LOCAL_FUNCTION
+    promotion that this stub presupposes.
     """
     func_start = 0x1000
     func_end = 0x2000

@@ -33,6 +33,8 @@ change is mechanical because this helper is the single seam.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 _OUTPUT_CSV_SUFFIX = "_output.csv"
 
@@ -84,3 +86,25 @@ def format_output_csv_filename(
     phase emits and the build_memmap phase looks for.
     """
     return f"{format_output_basename(arch, compiler, compiler_version, opt, pkg, variant_id)}{_OUTPUT_CSV_SUFFIX}"
+
+
+def derive_sidecar_path(csv_path: Path, suffix: str) -> Path:
+    """Derive a sibling sidecar path from the per-binary CSV path.
+
+    The CSV ends in ``_output.csv`` (see ``_OUTPUT_CSV_SUFFIX``); each
+    sidecar shares the same ``<base>`` prefix and appends its own
+    suffix (e.g. ``_strings.bin``, ``_function_ranges.txt``).
+    Defensive fallback (CSV path that doesn't end in the canonical
+    suffix): strip a trailing extension only.
+
+    Single source of truth so every sidecar file uses the same
+    ``<base>``-derivation rule; consumers should never re-implement the
+    suffix-strip dance locally.
+    """
+    csv_path = Path(csv_path)
+    name = csv_path.name
+    if name.endswith(_OUTPUT_CSV_SUFFIX):
+        base = name[: -len(_OUTPUT_CSV_SUFFIX)]
+    else:
+        base = csv_path.stem
+    return csv_path.with_name(f"{base}{suffix}")
