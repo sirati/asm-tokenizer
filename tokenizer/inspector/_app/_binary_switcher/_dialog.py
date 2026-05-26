@@ -164,18 +164,18 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
     def __init__(
         self,
         *,
-        current_memmap_path: Optional[Path] = None,
-        current_csv_path: Optional[Path] = None,
+        current_path: Optional[Path] = None,
         current_provider: Optional[LoaderProvider] = None,
     ) -> None:
         super().__init__()
-        # Default paths for providers the App has never opened. Home
-        # is a sensible "browse from here" anchor for memmap; CSV
-        # without a prior path stays ``None`` (the change-path entry
-        # is still surfaced so the user can pick a location).
-        home = Path.home()
-        self._memmap_path = current_memmap_path or home
-        self._csv_path = current_csv_path
+        # Both provider subtrees seed against the App's single
+        # ``current_path``; the user can re-point either independently
+        # via ``change path...`` within the dialog session. The home
+        # directory is a sensible fallback when no current path is
+        # known (the mock-factory test case).
+        anchor = current_path or Path.home()
+        self._memmap_path: Path = anchor
+        self._csv_path: Path = anchor
         self._current_provider = current_provider
 
     # --- compose ---------------------------------------------------
@@ -314,7 +314,7 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
         anchor = (
             self._memmap_path
             if provider is LoaderProvider.MEMMAP
-            else (self._csv_path or Path.home())
+            else self._csv_path
         )
         self.app.push_screen(
             FolderPickerDialog(provider=provider, start_path=anchor),

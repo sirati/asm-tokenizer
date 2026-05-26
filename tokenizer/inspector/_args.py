@@ -6,20 +6,29 @@ discovery glob backing ``--binary`` auto-detection -- every other
 concern (opening files, building the session, rendering) lives
 elsewhere.
 
-Two mutually exclusive input sources are supported:
+CLI shape: one positional ``PATH`` argument identifies the directory
+to open; a mutually-exclusive provider flag picks the backend that
+reads it.
 
-* ``--memmap-dir`` -- per-binary memmap artefacts (sections.bin,
-  data.bin, ...). The auto-detect anchor is
-  ``<binary>_function_names.txt``: every binary in a memmap directory
-  has exactly one such sidecar (the function-names registry).
-* ``--csv-dir`` -- per-variant ``<base>_output.csv`` files. The
-  auto-detect anchor is :func:`VariantInfo.from_csv`'s ``pkg`` field:
-  every CSV's filename encodes the binary name as the ``pkg`` axis.
+* ``--memmap`` (alias ``--stage3``) -- read ``PATH`` as a per-binary
+  memmap directory (``*_sections.bin``, ``*_data.bin``,
+  ``*_function_names.txt``, ``unified_vocab.csv``). The auto-detect
+  anchor is ``<binary>_function_names.txt``: every binary in a memmap
+  directory has exactly one such sidecar (the function-names registry).
+* ``--stage1`` -- read ``PATH`` as a per-variant ``<base>_output.csv``
+  tree. The auto-detect anchor is :func:`VariantInfo.from_csv`'s
+  ``pkg`` field: every CSV's filename encodes the binary name as the
+  ``pkg`` axis.
 
-Anchoring on those files rather than e.g. ``_sections.bin`` keeps
+Anchoring on those files rather than e.g. ``*_sections.bin`` keeps
 detection robust against the empty-arm edge case where one of the data
 bins might be absent (memmap mode), and against accidental cross-binary
-CSV mixing (csv mode).
+CSV mixing (stage-1 mode).
+
+The parsed Namespace carries a typed :class:`LoaderProvider`
+discriminator (see :mod:`._app._binary_switcher._provider`) so
+downstream consumers route off the enum rather than a string-typed
+flag.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ import argparse
 from pathlib import Path
 from typing import List
 
+from tokenizer.inspector._app._binary_switcher._provider import LoaderProvider
 from tokenizer.variant_info import VariantInfo
 
 
@@ -52,26 +62,39 @@ def build_parser() -> argparse.ArgumentParser:
             "blocks, and inline calls."
         ),
     )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument(
-        "--memmap-dir",
+    parser.add_argument(
+        "path",
         type=Path,
         metavar="PATH",
         help=(
-            "Directory containing the per-binary memmap artefacts "
-            "(*_sections.bin, *_data.bin, *_variants.bin, "
-            "*_function_names.txt, unified_vocab.csv). Mutually "
-            "exclusive with --csv-dir."
+            "Directory to open. Interpreted by the backend selected "
+            "via --memmap/--stage3 (per-binary memmap artefacts) or "
+            "--stage1 (per-variant <base>_output.csv tree)."
         ),
     )
-    source.add_argument(
-        "--csv-dir",
-        type=Path,
-        metavar="PATH",
+    provider = parser.add_mutually_exclusive_group(required=True)
+    provider.add_argument(
+        "--memmap",
+        "--stage3",
+        dest="provider",
+        action="store_const",
+        const=LoaderProvider.MEMMAP,
         help=(
-            "Directory containing per-variant <base>_output.csv "
-            "files (flat or nested layout). Mutually exclusive with "
-            "--memmap-dir."
+            "Read PATH as a memmap directory (stage-3 artefacts: "
+            "*_sections.bin, *_data.bin, *_variants.bin, "
+            "*_function_names.txt, unified_vocab.csv). Mutually "
+            "exclusive with --stage1."
+        ),
+    )
+    provider.add_argument(
+        "--stage1",
+        dest="provider",
+        action="store_const",
+        const=LoaderProvider.CSV,
+        help=(
+            "Read PATH as a per-variant <base>_output.csv tree "
+            "(flat or nested layout). Mutually exclusive with "
+            "--memmap/--stage3."
         ),
     )
     parser.add_argument(
@@ -81,9 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Name of the binary to inspect. In memmap mode this is "
             "the prefix used in per-binary sidecars (e.g. 'nmap' for "
-            "'nmap_sections.bin'). In csv mode it is the ``pkg`` "
+            "'nmap_sections.bin'). In stage-1 mode it is the ``pkg`` "
             "field of each variant CSV. Omit to auto-detect when "
-            "exactly one binary lives in the chosen source directory."
+            "exactly one binary lives in PATH."
         ),
     )
     return parser
@@ -139,7 +162,7 @@ def discover_binaries_csv(csv_dir: Path) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Per-source binary resolution
+# Per-provider binary resolution
 # ---------------------------------------------------------------------------
 
 
@@ -219,21 +242,25 @@ def resolve_binary(memmap_dir: Path, requested: str | None) -> str:
     return _resolve_binary_memmap(memmap_dir, requested)
 
 
+# ---------------------------------------------------------------------------
+# Provider -> resolver dispatch (typed, no string-typed if/elif)
+# ---------------------------------------------------------------------------
+
+
+_RESOLVERS = {
+    LoaderProvider.MEMMAP: _resolve_binary_memmap,
+    LoaderProvider.CSV: _resolve_binary_csv,
+}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse + resolve. Returns a namespace whose ``binary`` is set.
 
-    The mutex group guarantees exactly one of ``ns.memmap_dir`` /
-    ``ns.csv_dir`` is non-``None``; the per-source resolver is
-    selected off whichever one is set.
+    The mutex group guarantees ``ns.provider`` is set to a
+    :class:`LoaderProvider`; the resolver is selected off that enum.
     """
     parser = build_parser()
     ns = parser.parse_args(argv)
-    if ns.memmap_dir is not None:
-        ns.binary = _resolve_binary_memmap(ns.memmap_dir, ns.binary)
-    else:
-        assert ns.csv_dir is not None, (
-            "argparse mutex group should guarantee csv_dir is set when "
-            "memmap_dir is not"
-        )
-        ns.binary = _resolve_binary_csv(ns.csv_dir, ns.binary)
+    resolver = _RESOLVERS[ns.provider]
+    ns.binary = resolver(ns.path, ns.binary)
     return ns

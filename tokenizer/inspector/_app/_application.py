@@ -51,6 +51,8 @@ if TYPE_CHECKING:
         BackendFactory,
     )
 
+    from ._binary_switcher._provider import LoaderProvider
+
 
 __all__ = ["InspectorApp", "run_inspector"]
 
@@ -178,27 +180,26 @@ class InspectorApp(App[None]):
         *,
         factory: "BackendFactory",
         log_path: Path,
-        memmap_path: Optional[Path] = None,
-        csv_path: Optional[Path] = None,
+        path: Optional[Path] = None,
+        provider: "Optional[LoaderProvider]" = None,
     ) -> None:
         super().__init__()
         self._factory = factory
         self._log = _setup_inspector_log(log_path)
         # Current-source tracking for the binary-switcher dialog: the
         # active provider (memmap vs csv) and the path the factory was
-        # opened against. ``__main__`` passes whichever ``--memmap-dir``
-        # / ``--csv-dir`` argument the user supplied; both being ``None``
-        # is the mock-factory-in-tests case where the switch dialog is
-        # not exercised against a real source. The current provider is
-        # inferred from which path is non-``None``.
-        from ._binary_switcher import LoaderProvider
-
-        self._current_memmap_path: Optional[Path] = memmap_path
-        self._current_csv_path: Optional[Path] = csv_path
-        self._current_provider: Optional[LoaderProvider] = (
-            LoaderProvider.MEMMAP if memmap_path is not None
-            else (LoaderProvider.CSV if csv_path is not None else None)
-        )
+        # opened against. ``__main__`` passes the typed pair the CLI
+        # consumed (positional ``PATH`` + ``--memmap``/``--stage1``).
+        # Both being ``None`` is the mock-factory-in-tests case where
+        # the switch dialog is not exercised against a real source.
+        if (path is None) != (provider is None):
+            raise ValueError(
+                "InspectorApp: path and provider must be supplied "
+                "together (both None for the mock-factory test case, "
+                "both set otherwise)."
+            )
+        self._current_path: Optional[Path] = path
+        self._current_provider: "Optional[LoaderProvider]" = provider
         # Current variant ordering + grouping. ``None`` means
         # "default-sorted, no grouping" -- mirrors the legacy
         # backend-order rendering until the user opens the Order modal
@@ -564,23 +565,24 @@ def run_inspector(
     *,
     factory: "BackendFactory",
     log_path: Path,
-    memmap_path: Optional[Path] = None,
-    csv_path: Optional[Path] = None,
+    path: Optional[Path] = None,
+    provider: "Optional[LoaderProvider]" = None,
 ) -> int:
     """Construct + run the app; return ``0`` on clean quit.
 
     Every backend the factory mints is opened lazily on first
     ``FunctionNode.expand`` call; the caller (``__main__``) owns the
     factory + any session it wraps via ``with stack:``. The optional
-    ``memmap_path`` / ``csv_path`` arguments seed the binary-switcher
-    dialog's "current path" indicator — pass whichever
-    ``--memmap-dir`` / ``--csv-dir`` flag the CLI consumed.
+    ``path`` / ``provider`` arguments seed the binary-switcher
+    dialog's "current path" / "current provider" indicators -- pass
+    the same typed pair the CLI's ``PATH`` positional +
+    ``--memmap``/``--stage1`` flag yielded.
     """
     app = InspectorApp(
         factory=factory,
         log_path=log_path,
-        memmap_path=memmap_path,
-        csv_path=csv_path,
+        path=path,
+        provider=provider,
     )
     app.run()
     return 0

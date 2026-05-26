@@ -50,8 +50,8 @@ from tokenizer.inspector._render._protocol import (
 def _build_app(
     log_path: Path,
     *,
-    memmap_path: Path | None = None,
-    csv_path: Path | None = None,
+    path: Path | None = None,
+    provider: LoaderProvider | None = None,
 ) -> InspectorApp:
     handles = [FunctionHandle(arm=SectionKind.MATCHED, idx=0, name="main")]
     factory = MagicMock(spec=BackendFactory)
@@ -66,8 +66,8 @@ def _build_app(
     return InspectorApp(
         factory=factory,
         log_path=log_path,
-        memmap_path=memmap_path,
-        csv_path=csv_path,
+        path=path,
+        provider=provider,
     )
 
 
@@ -129,7 +129,9 @@ def test_binary_switcher_b_opens_dialog():
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
-            app = _build_app(log_path, memmap_path=Path(td))
+            app = _build_app(
+                log_path, path=Path(td), provider=LoaderProvider.MEMMAP
+            )
             async with app.run_test() as pilot:
                 await pilot.press("b")
                 await pilot.pause()
@@ -150,7 +152,9 @@ def test_binary_switcher_lists_loadable_binaries():
             (path / "ncat_function_names.txt").write_text("")
             (path / "nmap_function_names.txt").write_text("")
             log_path = path / "tui.log"
-            app = _build_app(log_path, memmap_path=path)
+            app = _build_app(
+                log_path, path=path, provider=LoaderProvider.MEMMAP
+            )
             async with app.run_test() as pilot:
                 await pilot.press("b")
                 await pilot.pause()
@@ -189,7 +193,9 @@ def test_binary_switcher_dismiss_with_target_on_binary_select():
             path = Path(td)
             (path / "ncat_function_names.txt").write_text("")
             log_path = path / "tui.log"
-            app = _build_app(log_path, memmap_path=path)
+            app = _build_app(
+                log_path, path=path, provider=LoaderProvider.MEMMAP
+            )
             async with app.run_test() as pilot:
                 await pilot.press("b")
                 await pilot.pause()
@@ -246,7 +252,9 @@ def test_folder_picker_green_marks_loadable_subdir():
             empty = base / "without_data"
             empty.mkdir()
             log_path = base / "tui.log"
-            app = _build_app(log_path, memmap_path=base)
+            app = _build_app(
+                log_path, path=base, provider=LoaderProvider.MEMMAP
+            )
             async with app.run_test() as pilot:
                 dialog = FolderPickerDialog(
                     provider=LoaderProvider.MEMMAP, start_path=base
@@ -285,7 +293,9 @@ def test_folder_picker_dismiss_on_green_selection():
             loadable.mkdir()
             (loadable / "foo_function_names.txt").write_text("")
             log_path = base / "tui.log"
-            app = _build_app(log_path, memmap_path=base)
+            app = _build_app(
+                log_path, path=base, provider=LoaderProvider.MEMMAP
+            )
             async with app.run_test() as pilot:
                 dialog = FolderPickerDialog(
                     provider=LoaderProvider.MEMMAP, start_path=base
@@ -320,7 +330,9 @@ def test_binary_switcher_open_this_folder_yields_no_binary():
             path = Path(td)
             (path / "ncat_function_names.txt").write_text("")
             log_path = path / "tui.log"
-            app = _build_app(log_path, memmap_path=path)
+            app = _build_app(
+                log_path, path=path, provider=LoaderProvider.MEMMAP
+            )
             async with app.run_test() as pilot:
                 await pilot.press("b")
                 await pilot.pause()
@@ -378,7 +390,9 @@ def test_perform_switch_preserves_order_config():
             path2.mkdir()
             (path2 / "bar_function_names.txt").write_text("")
             log_path = Path(td) / "tui.log"
-            app = _build_app(log_path, memmap_path=path1)
+            app = _build_app(
+                log_path, path=path1, provider=LoaderProvider.MEMMAP
+            )
 
             # Set an order config so we can verify preservation.
             axis = AxisDescriptor(
@@ -414,7 +428,7 @@ def test_perform_switch_preserves_order_config():
                     assert app._order_config is not None
                     assert app._order_config.ordered_axes == (axis,)
                     assert app._factory is new_factory
-                    assert app._current_memmap_path == path2
+                    assert app._current_path == path2
                     assert app._current_provider is LoaderProvider.MEMMAP
             finally:
                 _switch._OPENERS[LoaderProvider.MEMMAP] = original
