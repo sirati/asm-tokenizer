@@ -1,15 +1,15 @@
 """``python -m tokenizer.inspector`` entry point.
 
 Single concern: parse CLI args via :mod:`._args`, build a
-:class:`BackendFactory` for the chosen source (``--memmap-dir`` or
-``--csv-dir``) via the openers in
+:class:`BackendFactory` for the chosen provider (memmap or stage-1
+CSV) against the unified ``PATH`` argument via the openers in
 :mod:`tokenizer.inspector._render._backend_factory`, and hand the
 factory off to the Textual app entry
 (:func:`tokenizer.inspector._app.run_inspector`).
 
-The factory dispatch is a typed dict-of-callable: no string-typed
-``--backend`` flag, no inline ``if/elif`` ladder -- which source the
-user picked is the discriminator that the openers consume.
+The factory dispatch is a typed dict-of-callable keyed by the
+:class:`LoaderProvider` enum carried on the parsed namespace: no
+string-typed flag, no inline ``if/elif`` ladder.
 
 ``_app`` is the only module that imports :mod:`textual`; this file
 imports it lazily inside :func:`main` so unit tests that import
@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict
 
+from tokenizer.inspector._app._binary_switcher._provider import LoaderProvider
 from tokenizer.inspector._render._backend_factory import (
     make_batch_decode_factory,
     make_ftl_factory,
@@ -39,27 +40,26 @@ _log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Per-source opener return type
+# Per-provider opener return type
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class _OpenedBackend:
-    """Bundle yielded by every per-source opener.
+    """Bundle yielded by every per-provider opener.
 
     ``factory`` is the live :class:`BackendFactory`; ``stack`` owns
-    its shutdown (the caller drives ``with stack:``). ``log_dir`` is
-    the source directory used for the inspector log path.
-    ``memmap_path`` / ``csv_path`` carry the source path so the
-    binary-switcher dialog knows which provider was opened (exactly
-    one is set; the other is ``None``).
+    its shutdown (the caller drives ``with stack:``). ``path`` is
+    the source directory used for the inspector log path AND seeds
+    the binary-switcher dialog's "current path" indicator.
+    ``provider`` is the typed discriminator the App stores so the
+    switcher dialog renders the right provider as ``[current]``.
     """
 
     factory: BackendFactory
     stack: contextlib.ExitStack
-    log_dir: Path
-    memmap_path: Path | None = None
-    csv_path: Path | None = None
+    path: Path
+    provider: LoaderProvider
 
 
 # ---------------------------------------------------------------------------
@@ -74,21 +74,21 @@ def _open_memmap_backend(ns: argparse.Namespace) -> _OpenedBackend:
     only ``factory.close`` so the caller's ``with stack:`` block
     drives the single shutdown hook (mirrors the CSV-mode opener).
     """
-    memmap_dir: Path = ns.memmap_dir
+    path: Path = ns.path
     binary_name: str = ns.binary
     _log.info(
         "inspector: opening memmap backend for binary=%s in %s",
         binary_name,
-        memmap_dir,
+        path,
     )
-    factory = make_batch_decode_factory(memmap_dir, binary_name)
+    factory = make_batch_decode_factory(path, binary_name)
     stack = contextlib.ExitStack()
     stack.callback(factory.close)
     return _OpenedBackend(
         factory=factory,
         stack=stack,
-        log_dir=memmap_dir,
-        memmap_path=memmap_dir,
+        path=path,
+        provider=LoaderProvider.MEMMAP,
     )
 
 
@@ -99,47 +99,41 @@ def _open_csv_backend(ns: argparse.Namespace) -> _OpenedBackend:
     :meth:`close` is registered on the returned ExitStack so callers
     release the parsed-record + vocab cache via ``with stack:``.
     """
-    csv_dir: Path = ns.csv_dir
+    path: Path = ns.path
     binary_name: str = ns.binary
     _log.info(
         "inspector: opening csv backend for binary=%s in %s",
         binary_name,
-        csv_dir,
+        path,
     )
-    factory = make_ftl_factory(csv_dir, binary_name)
+    factory = make_ftl_factory(path, binary_name)
     stack = contextlib.ExitStack()
     stack.callback(factory.close)
     return _OpenedBackend(
         factory=factory,
         stack=stack,
-        log_dir=csv_dir,
-        csv_path=csv_dir,
+        path=path,
+        provider=LoaderProvider.CSV,
     )
 
 
-# Typed dispatch: which mutex-group flag is set drives the opener.
-# Mirrors the ``MetadataLookup`` dict-of-callable pattern -- no
-# inline if/elif at this layer.
-_OPENERS: Dict[str, Callable[[argparse.Namespace], _OpenedBackend]] = {
-    "memmap_dir": _open_memmap_backend,
-    "csv_dir": _open_csv_backend,
+# Typed dispatch: ``ns.provider`` drives the opener. Mirrors the
+# ``MetadataLookup`` dict-of-callable pattern -- no inline if/elif at
+# this layer.
+_OPENERS: Dict[LoaderProvider, Callable[[argparse.Namespace], _OpenedBackend]] = {
+    LoaderProvider.MEMMAP: _open_memmap_backend,
+    LoaderProvider.CSV: _open_csv_backend,
 }
 
 
 def _open_backend(ns: argparse.Namespace) -> _OpenedBackend:
-    """Dispatch to the per-source opener.
+    """Dispatch to the per-provider opener.
 
-    The argparse mutex group guarantees exactly one of
-    ``ns.memmap_dir`` / ``ns.csv_dir`` is set; the matching key in
-    :data:`_OPENERS` selects the concrete opener.
+    The argparse mutex group guarantees ``ns.provider`` is set to a
+    :class:`LoaderProvider`; the matching key in :data:`_OPENERS`
+    selects the concrete opener.
     """
-    for key, opener in _OPENERS.items():
-        if getattr(ns, key) is not None:
-            return opener(ns)
-    raise SystemExit(
-        "internal error: argparse mutex group reported no source flag "
-        "set; this should be unreachable."
-    )
+    return _OPENERS[ns.provider](ns)
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +155,12 @@ def main(argv: list[str] | None = None) -> int:
     from ._app import run_inspector
 
     with opened.stack:
-        log_path = opened.log_dir / ".tui-inspector.log"
+        log_path = opened.path / ".tui-inspector.log"
         return run_inspector(
             factory=opened.factory,
             log_path=log_path,
-            memmap_path=opened.memmap_path,
-            csv_path=opened.csv_path,
+            path=opened.path,
+            provider=opened.provider,
         )
 
 

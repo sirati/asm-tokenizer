@@ -86,16 +86,15 @@ _OPENERS: dict[LoaderProvider, Callable[[Path, Optional[str]], BackendFactory]] 
 def open_binary_switcher(app: "InspectorApp") -> None:
     """Push the :class:`BinarySwitcherDialog` modal against the App state.
 
-    The dialog reads the App's current paths + provider so the
-    "memmap" / "output.csv" trees seed against the right initial
+    The dialog reads the App's current path + provider so the
+    "memmap" / "stage-1" trees seed against the right initial
     directory. Result handling is dispatched to
     :func:`_on_binary_switcher_dismissed` once the dialog dismisses.
     """
     from ._dialog import BinarySwitcherDialog
 
     dialog = BinarySwitcherDialog(
-        current_memmap_path=app._current_memmap_path,
-        current_csv_path=app._current_csv_path,
+        current_path=app._current_path,
         current_provider=app._current_provider,
     )
     app.push_screen(dialog, lambda r: _on_binary_switcher_dismissed(app, r))
@@ -144,10 +143,7 @@ def perform_switch(app: "InspectorApp", target: SwitchTarget) -> None:
 
     app._factory = new_factory
     app._current_provider = target.provider
-    if target.provider is LoaderProvider.MEMMAP:
-        app._current_memmap_path = target.path
-    else:
-        app._current_csv_path = target.path
+    app._current_path = target.path
 
     # Clear any pending auto-expand state from the previous binary.
     app._pending_auto_expand.clear()
