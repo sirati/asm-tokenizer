@@ -28,6 +28,7 @@ from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.inspector._app import InspectorApp
 from tokenizer.inspector._app._binary_switcher import (
     BinarySwitcherDialog,
+    FolderPickerDialog,
     LoaderProvider,
     SwitchTarget,
 )
@@ -223,6 +224,89 @@ def test_binary_switcher_dismiss_with_target_on_binary_select():
                 assert target.provider is LoaderProvider.MEMMAP
                 assert target.binary == "ncat"
                 assert target.path == path
+
+    asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# FolderPickerDialog
+# ---------------------------------------------------------------------------
+
+
+def test_folder_picker_green_marks_loadable_subdir():
+    """A subdir containing function-names sidecar gets a green label."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            loadable = base / "with_data"
+            loadable.mkdir()
+            (loadable / "foo_function_names.txt").write_text("")
+            empty = base / "without_data"
+            empty.mkdir()
+            log_path = base / "tui.log"
+            app = _build_app(log_path, memmap_path=base)
+            async with app.run_test() as pilot:
+                dialog = FolderPickerDialog(
+                    provider=LoaderProvider.MEMMAP, start_path=base
+                )
+                await app.push_screen(dialog)
+                await pilot.pause()
+                from textual.widgets import Tree
+                from tokenizer.inspector._app._binary_switcher._folder_picker import (
+                    _FolderRow,
+                )
+
+                tree = dialog.query_one("#picker-tree", Tree)
+                loadable_node = None
+                empty_node = None
+                for child in tree.root.children:
+                    if isinstance(child.data, _FolderRow):
+                        if child.data.path == loadable:
+                            loadable_node = child
+                        elif child.data.path == empty:
+                            empty_node = child
+                assert loadable_node is not None
+                assert empty_node is not None
+                assert loadable_node.data.loadable is True
+                assert empty_node.data.loadable is False
+
+    asyncio.run(runner())
+
+
+def test_folder_picker_dismiss_on_green_selection():
+    """Selecting a green subdir dismisses with that path."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            loadable = base / "with_data"
+            loadable.mkdir()
+            (loadable / "foo_function_names.txt").write_text("")
+            log_path = base / "tui.log"
+            app = _build_app(log_path, memmap_path=base)
+            async with app.run_test() as pilot:
+                dialog = FolderPickerDialog(
+                    provider=LoaderProvider.MEMMAP, start_path=base
+                )
+                await app.push_screen(dialog)
+                await pilot.pause()
+                from textual.widgets import Tree
+                from tokenizer.inspector._app._binary_switcher._folder_picker import (
+                    _FolderRow,
+                )
+
+                tree = dialog.query_one("#picker-tree", Tree)
+                loadable_node = next(
+                    child for child in tree.root.children
+                    if isinstance(child.data, _FolderRow) and child.data.path == loadable
+                )
+                results: list = []
+                dialog.dismiss = lambda v: results.append(v)  # type: ignore
+                from textual.widgets import Tree as TreeWidget
+                event = TreeWidget.NodeSelected(loadable_node)
+                dialog.on_tree_node_selected(event)
+                assert results == [loadable]
 
     asyncio.run(runner())
 

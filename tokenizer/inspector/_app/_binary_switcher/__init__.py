@@ -7,6 +7,7 @@ Single concern: present the user a way to pick a different binary
 * :mod:`._provider` — typed discriminator + switch-target dataclass.
 * :mod:`._scan` — filesystem-side detection of loadable data folders.
 * :mod:`._dialog` — :class:`BinarySwitcherDialog` modal screen.
+* :mod:`._folder_picker` — :class:`FolderPickerDialog` modal screen.
 
 The package boundary keeps each submodule below the 400 LOC cap and
 keeps :mod:`textual`-dependent code behind the PEP 562 lazy
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING
 
 __all__ = [
     "BinarySwitcherDialog",
+    "FolderPickerDialog",
     "LoaderProvider",
     "SwitchTarget",
     "open_binary_switcher",
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
     from tokenizer.inspector._app._application import InspectorApp
 
     from ._dialog import BinarySwitcherDialog
+    from ._folder_picker import FolderPickerDialog
     from ._provider import LoaderProvider, SwitchTarget
 
 
@@ -85,6 +88,10 @@ def __getattr__(name: str) -> object:
         from ._dialog import BinarySwitcherDialog
 
         return BinarySwitcherDialog
+    if name == "FolderPickerDialog":
+        from ._folder_picker import FolderPickerDialog
+
+        return FolderPickerDialog
     raise AttributeError(
         f"module {__name__!r} has no attribute {name!r}"
     )

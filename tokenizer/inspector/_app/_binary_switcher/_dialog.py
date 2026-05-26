@@ -307,17 +307,49 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
     # --- folder picker integration -----------------------------------
 
     def _open_folder_picker(self, provider: LoaderProvider) -> None:
-        """Stub: the folder-picker modal lands in a follow-up commit.
+        """Push the folder picker; on confirm, rebuild this provider's
+        subtree against the new path."""
+        from ._folder_picker import FolderPickerDialog
 
-        Surface a notification so the user sees the click registered;
-        the real picker (filesystem tree + green-mark data folders)
-        ships separately so each commit stays below the file-size cap
-        and the dialog tree lands first as a reviewable unit.
+        anchor = (
+            self._memmap_path
+            if provider is LoaderProvider.MEMMAP
+            else (self._csv_path or Path.home())
+        )
+        self.app.push_screen(
+            FolderPickerDialog(provider=provider, start_path=anchor),
+            lambda result: self._on_folder_picked(provider, result),
+        )
+
+    def _on_folder_picked(
+        self, provider: LoaderProvider, new_path: Optional[Path]
+    ) -> None:
+        """Re-seed the dialog's tree against the newly-picked path.
+
+        The picker returns ``None`` on cancel (no-op) or a directory
+        path. The dialog rebuilds its tree in place so the user can
+        keep browsing without re-opening the modal.
         """
-        self.app.notify(
-            "Folder picker coming soon — pass --memmap-dir / --csv-dir "
-            "to switch directories.",
-            title="Change path",
+        if new_path is None:
+            return
+        if provider is LoaderProvider.MEMMAP:
+            self._memmap_path = new_path
+        else:
+            self._csv_path = new_path
+        # Rebuild the tree wholesale.
+        tree = self.query_one("#switcher-tree", Tree)
+        tree.clear()
+        self._build_provider_branch(
+            tree.root,
+            LoaderProvider.MEMMAP,
+            self._memmap_path,
+            stage_label="stage 3",
+        )
+        self._build_provider_branch(
+            tree.root,
+            LoaderProvider.CSV,
+            self._csv_path,
+            stage_label="stage 1",
         )
 
     # --- actions ---------------------------------------------------
