@@ -165,6 +165,15 @@ def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
     the footer instruction emits a real AsmLine; the trailing BLOCK_V2
     tokens route as :class:`InlineJumpEntry` openables on THAT same
     AsmLine, NOT as new block headers.
+
+    The placeholder ``jump block: N`` atoms ALWAYS land in the
+    AsmLine's text (so the row's diagnostic content survives); the
+    post-walk resolvability gate (:mod:`.._jump_validity`) only
+    filters the openables tuple when a target id has no addressable
+    BODY section in this row. Here body block_idx=5 is the only BODY
+    section, so targets 10/11/12 are phantom (writer-side: switch-
+    table addresses with no body block in this variant) and the gate
+    drops all three openables -- the text stays put.
     """
     blocks = _walk(
         tokens=np.asarray(
@@ -185,8 +194,10 @@ def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
     block = blocks[0]
     assert block.kind is BlockKind.BODY
     assert block.block_idx == 5  # the leading BLOCK_V2(c=5) header
-    # One AsmLine for the footer instruction; its openables carry the
-    # 3 jump-table targets (the silent-header BLOCK_V2 emitted no row).
+    # One AsmLine for the footer instruction; the dispatch path routed
+    # the 3 trailing BLOCK_V2 tokens through the JUMP_TABLE_FOOTER
+    # branch -- text fragments land verbatim, openables filtered by
+    # the validity gate (no body block_idx 10/11/12 in this row).
     items = block.items
     assert len(items) == 1
     line = items[0]
@@ -194,11 +205,8 @@ def test_jump_table_footer_block_v2_targets_emit_inline_jump_entries() -> None:
     assert line.text == (
         "<jump_table 7> jump block: 10 jump block: 11 jump block: 12"
     )
-    assert line.openables == (
-        InlineJumpEntry(target_block_idx=10),
-        InlineJumpEntry(target_block_idx=11),
-        InlineJumpEntry(target_block_idx=12),
-    )
+    # All 3 targets are unresolvable -- filtered by the post-walk gate.
+    assert line.openables == ()
 
 
 def test_jump_table_footer_opens_jump_table_section_via_runlength_boundary() -> None:
@@ -245,16 +253,17 @@ def test_jump_table_footer_opens_jump_table_section_via_runlength_boundary() -> 
         (BlockKind.BODY, 5),
         (BlockKind.JUMP_TABLE, 7),
     ]
-    # The JT footer section carries one AsmLine with the 3 jump-table
-    # targets routed as InlineJumpEntry openables.
+    # The JT footer section carries one AsmLine; the dispatch routed
+    # the 3 trailing BLOCK_V2 tokens through the jump-table-footer
+    # branch (text fragments land verbatim). Targets 10/11/12 are
+    # phantom (no BODY block with those ids in this row) so the
+    # post-walk resolvability gate (:mod:`.._jump_validity`) drops the
+    # openables; the text remains so the diagnostic content stays
+    # visible to the UI.
     footer = blocks[1]
     asm_lines = [it for it in footer.items if isinstance(it, AsmLine)]
     assert len(asm_lines) == 1
-    assert asm_lines[0].openables == (
-        InlineJumpEntry(target_block_idx=10),
-        InlineJumpEntry(target_block_idx=11),
-        InlineJumpEntry(target_block_idx=12),
-    )
+    assert asm_lines[0].openables == ()
 
 
 def test_jump_table_flag_resets_on_new_body_block() -> None:

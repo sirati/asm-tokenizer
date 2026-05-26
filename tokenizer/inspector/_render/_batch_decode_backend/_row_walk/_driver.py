@@ -34,6 +34,7 @@ from tokenizer.token_manager import VocabularyManager
 from .._band import Band, classify_shifted_id
 from .._band_emitters import emit_instr_rep, emit_number
 from .._fid_table import FidBaseTable
+from .._jump_validity import filter_unresolvable_jump_openables
 from .._sections import (
     RowSection,
     close_current_section,
@@ -272,4 +273,12 @@ def render_row_blocks(
     # surviving slot's content is not silently dropped.
     _finalize_instruction(state, end_of_row=True)
     close_current_section(state)
-    return state.completed
+    # Inline-jump openable validity gate: writer-side BLOCK identities
+    # are a superset of body-block ids (jump-table targets may name
+    # addresses with no body block in this variant -- see
+    # :mod:`.._jump_validity` for the writer-side root cause).
+    # Filtering at emit time (post-walk, before the sections leave the
+    # row walker) means the tree model never constructs an
+    # :class:`InlineJumpNode` for an unresolvable target — no defensive
+    # try/except around :meth:`RenderBackend.render_block` needed.
+    return filter_unresolvable_jump_openables(state.completed)
