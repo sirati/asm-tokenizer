@@ -669,6 +669,253 @@ def test_order_binding_opens_dialog():
 # ---------------------------------------------------------------------------
 
 
+def _make_factory_with_multi_block_rvs(
+    *,
+    name: str,
+    rvs: list[RenderedVariant],
+) -> MagicMock:
+    """Factory whose backend returns TWO body blocks per variant.
+
+    The single-child-chain collapse policy folds away a parent whose
+    sole expandable descendant is one wrapper level; giving the
+    variant TWO blocks defeats that collapse so the
+    :class:`VariantNode` tree row stays mounted and a per-block
+    expand path can be exercised end-to-end. The ``render_block``
+    side returns an empty iterable so block expansion yields zero
+    children (no inline call / jump sidecars) -- enough to verify
+    the block row stays expanded across the regroup.
+    """
+    handle = FunctionHandle(arm=SectionKind.MATCHED, idx=0, name=name)
+    factory = MagicMock(spec=BackendFactory)
+    factory.handles = [handle]
+    backend = MagicMock(spec=RenderBackend)
+    backend.handle = handle
+    backend.closed = False
+    backend.variants.return_value = rvs
+    backend.blocks.return_value = [
+        RenderedBlock(kind=BlockKind.BODY, block_idx=0, preview="b0"),
+        RenderedBlock(kind=BlockKind.BODY, block_idx=1, preview="b1"),
+    ]
+    backend.render_block.return_value = ()
+    factory.make.return_value = backend
+    return factory
+
+
+def test_cursor_preserved_across_regroup_onto_grouped_variant():
+    """The cursor row survives a regroup: it lands on the same
+    :class:`VariantIdentity`-keyed row even though that row now sits
+    under a new :class:`VariantGroupNode` ancestor.
+
+    Logical-path cursor matching is the source of truth -- group
+    ancestry is elided so the cursor's identity (variant) is the
+    invariant across regroup.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            rvs = [
+                _make_rv(variant_idx=0, arch="x64", compiler="clang"),
+                _make_rv(variant_idx=1, arch="arm64", compiler="gcc"),
+                _make_rv(variant_idx=2, arch="arm64", compiler="clang"),
+            ]
+            factory = _make_factory_with_multi_block_rvs(name="main", rvs=rvs)
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                tree, fn_tree_node = _root_tree_node(app)
+                fn_tree_node.expand()
+                await pilot.pause()
+                # Cursor lands on the v1 variant (arm64/gcc) -- pick
+                # variant_idx=1 from the freshly-mounted set.
+                target_variant_tree_node = next(
+                    c for c in fn_tree_node.children
+                    if isinstance(c.data, VariantNode)
+                    and c.data.variant_idx == 1
+                )
+                tree.move_cursor(target_variant_tree_node, animate=False)
+                assert tree.cursor_node is target_variant_tree_node
+
+                # Regroup by arch -- the cursor row's parent moves
+                # under a new VariantGroupNode.
+                axes = build_canonical_axes()
+                arch_axis = next(
+                    a for a in axes
+                    if a.kind is AxisKind.POSITIONAL and a.key == ARCH_PREFIX
+                )
+                new_config = OrderConfig(
+                    ordered_axes=axes, grouping_axes=frozenset({arch_axis})
+                )
+                app._on_order_dialog_dismissed(OrderAccepted(config=new_config))
+                await pilot.pause()
+
+                # Cursor must point to the SAME logical row (variant_idx=1),
+                # now nested under its new arm64 group ancestor.
+                new_cursor = tree.cursor_node
+                assert new_cursor is not None
+                assert isinstance(new_cursor.data, VariantNode)
+                assert new_cursor.data.variant_idx == 1
+
+    asyncio.run(runner())
+
+
+def test_deep_expand_state_preserved_function_variant_block_chain():
+    """All four levels (function, variant, block) re-expand across a
+    regroup -- the captured :class:`NodePath` set drives a chained
+    auto-expand walk through each level.
+
+    Four variants are used so EACH group (arm64, x64) holds two
+    variants -- the single-child-chain collapse would otherwise
+    fold the lone variant away when the group has only one child,
+    and the variant tree-node would never get a row of its own.
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            rvs = [
+                _make_rv(variant_idx=0, arch="x64", compiler="clang"),
+                _make_rv(variant_idx=1, arch="arm64", compiler="gcc"),
+                _make_rv(variant_idx=2, arch="arm64", compiler="clang"),
+                _make_rv(variant_idx=3, arch="x64", compiler="gcc"),
+            ]
+            factory = _make_factory_with_multi_block_rvs(name="main", rvs=rvs)
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                tree, fn_tree_node = _root_tree_node(app)
+                fn_tree_node.expand()
+                await pilot.pause()
+                # The function has 2 variants (each with 2 blocks --
+                # multi-block defeats the lone-child collapse).
+                target_variant_tree_node = next(
+                    c for c in fn_tree_node.children
+                    if isinstance(c.data, VariantNode)
+                    and c.data.variant_idx == 1
+                )
+                target_variant_tree_node.expand()
+                await pilot.pause()
+                # Variant must have its 2 body blocks mounted (no
+                # collapse) -- otherwise the test setup itself is wrong.
+                assert all(
+                    c.data.__class__.__name__ == "BlockNode"
+                    for c in target_variant_tree_node.children
+                )
+                target_block_tree_node = target_variant_tree_node.children[0]
+                target_block_tree_node.expand()
+                await pilot.pause()
+                assert target_block_tree_node.is_expanded
+
+                # Apply a regroup. The captured NodePath set must
+                # carry the function + variant + block entries; the
+                # post-mount consumer walks each level.
+                axes = build_canonical_axes()
+                arch_axis = next(
+                    a for a in axes
+                    if a.kind is AxisKind.POSITIONAL and a.key == ARCH_PREFIX
+                )
+                new_config = OrderConfig(
+                    ordered_axes=axes, grouping_axes=frozenset({arch_axis})
+                )
+                app._on_order_dialog_dismissed(OrderAccepted(config=new_config))
+                await pilot.pause()
+
+                # Function still expanded.
+                assert fn_tree_node.is_expanded
+                # Locate the arm64 group hosting variant_idx=1.
+                arm_group_tree_node = next(
+                    g for g in fn_tree_node.children
+                    if isinstance(g.data, VariantGroupNode)
+                    and g.data.axis_value == "arm64"
+                )
+                assert arm_group_tree_node.is_expanded, (
+                    "arm64 group hosting the previously-opened variant "
+                    "must auto-expand"
+                )
+                # Variant survives under its new group ancestor and is
+                # still expanded.
+                new_variant_tree_node = next(
+                    c for c in arm_group_tree_node.children
+                    if isinstance(c.data, VariantNode)
+                    and c.data.variant_idx == 1
+                )
+                assert new_variant_tree_node.is_expanded, (
+                    "previously-opened variant must remain expanded "
+                    "across the regroup"
+                )
+                # Block survives under the variant and is still
+                # expanded.
+                new_block_tree_node = next(
+                    c for c in new_variant_tree_node.children
+                    if c.data.__class__.__name__ == "BlockNode"
+                    and c.data.block_idx == 0
+                )
+                assert new_block_tree_node.is_expanded, (
+                    "previously-opened block must remain expanded "
+                    "across the regroup"
+                )
+
+    asyncio.run(runner())
+
+
+def test_unrelated_group_not_spuriously_expanded_across_regroup():
+    """Sibling groups that don't wrap any captured row must NOT
+    auto-expand -- regression for the "logical-path equal at
+    function level matches every group child" over-match."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            rvs = [
+                _make_rv(variant_idx=0, arch="x64", compiler="clang"),
+                _make_rv(variant_idx=1, arch="arm64", compiler="gcc"),
+                _make_rv(variant_idx=2, arch="arm64", compiler="clang"),
+            ]
+            factory = _make_factory_with_multi_block_rvs(name="main", rvs=rvs)
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                tree, fn_tree_node = _root_tree_node(app)
+                fn_tree_node.expand()
+                await pilot.pause()
+                # Open only variant_idx=1 (arm64/gcc).
+                target_variant_tree_node = next(
+                    c for c in fn_tree_node.children
+                    if isinstance(c.data, VariantNode)
+                    and c.data.variant_idx == 1
+                )
+                target_variant_tree_node.expand()
+                await pilot.pause()
+
+                axes = build_canonical_axes()
+                arch_axis = next(
+                    a for a in axes
+                    if a.kind is AxisKind.POSITIONAL and a.key == ARCH_PREFIX
+                )
+                new_config = OrderConfig(
+                    ordered_axes=axes, grouping_axes=frozenset({arch_axis})
+                )
+                app._on_order_dialog_dismissed(OrderAccepted(config=new_config))
+                await pilot.pause()
+
+                # arm64 group hosts the captured variant -> expanded.
+                arm_group = next(
+                    g for g in fn_tree_node.children
+                    if isinstance(g.data, VariantGroupNode)
+                    and g.data.axis_value == "arm64"
+                )
+                assert arm_group.is_expanded
+                # x64 group does NOT host any captured variant -> stays collapsed.
+                x64_group = next(
+                    g for g in fn_tree_node.children
+                    if isinstance(g.data, VariantGroupNode)
+                    and g.data.axis_value == "x64"
+                )
+                assert not x64_group.is_expanded, (
+                    "x64 group has no captured descendants; it must "
+                    "remain collapsed (no false-positive auto-expand)"
+                )
+
+    asyncio.run(runner())
+
+
 def test_expand_state_preserved_across_regroup():
     """Open a variant row, accept a new OrderConfig that flips
     grouping_axes on -- the previously-open variant survives the

@@ -31,12 +31,12 @@ from tokenizer.inspector._tree_model import (
     Node,
     VariantNode,
 )
-from tokenizer.variant_info import VariantIdentity
 
 from . import _order_hooks
 from ._auto_expand import collapse_single_child_chains
 from ._help_dialog import HelpScreen
 from ._labels import _ERR_STYLE, _compose_label
+from ._node_path import CapturedExpandState
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
 from ._tree_widget import _InspectorTree
 
@@ -46,7 +46,6 @@ if TYPE_CHECKING:
 
     from tokenizer.inspector._render._protocol import (
         BackendFactory,
-        FunctionHandle,
     )
 
 
@@ -182,16 +181,16 @@ class InspectorApp(App[None]):
         # at least once. One ``OrderConfig`` per binary (W3-21); no
         # per-function override.
         self._order_config: Optional[OrderConfig] = None
-        # Per-:class:`FunctionHandle` pending auto-expand set, populated
-        # by :meth:`_rebuild_expanded_subtrees` capture-on-rebuild. The
-        # dispatcher consumes the set after the FunctionNode re-expand
-        # mounts its children so previously-open variant rows surface
-        # under their new group ancestors. The same set is also
-        # consulted whenever a descendant :class:`VariantGroupNode`
-        # mounts its children (the group's expand posts a NodeExpanded
-        # asynchronously), so the chain auto-expands across the
-        # potentially-many-deep group tree without polling.
-        self._pending_auto_expand: dict["FunctionHandle", "set[VariantIdentity]"] = {}
+        # Captured typed :class:`CapturedExpandState` driving capture-
+        # on-rebuild: every expanded row's :class:`NodePath` lands in
+        # ``full_paths`` (group-bearing) + ``logical_paths`` (group-
+        # elided) and the cursor's path in ``cursor_path``. The
+        # dispatcher consults this state post-mount on every freshly-
+        # mounted parent so the chain auto-expands + the cursor lands
+        # on the same logical row across arbitrarily-deep regroup
+        # rebuilds. ``None`` means "no rebuild pending"; see
+        # :mod:`._node_path` for the per-kind key dispatch.
+        self._captured_expand_state: Optional[CapturedExpandState] = None
 
     # --- compose ---------------------------------------------------
 
@@ -298,14 +297,14 @@ class InspectorApp(App[None]):
                 allow_expand=getattr(child, "can_expand", False),
             )
 
-        # Capture-on-rebuild expand-state restoration: a prior
-        # rebuild may have stashed an auto-expand identity set for
-        # this FunctionNode. The set is consulted post-mount HERE
-        # (on the FunctionNode itself) AND on every descendant
-        # :class:`VariantGroupNode` mount (the group's expand posts a
-        # NodeExpanded asynchronously, so the walk descends across the
-        # potentially-many-deep group tree without polling).
-        _order_hooks.consume_auto_expand_post_mount(self, node, model)
+        # Capture-on-rebuild expand-state + cursor restoration. A
+        # prior rebuild may have stashed a typed :class:`NodePath`
+        # set + cursor path; the consumer matches each freshly-
+        # mounted child against the captured set, auto-expands hits
+        # (whose own :class:`Tree.NodeExpanded` re-enters here for
+        # the deeper level), and moves the cursor when the matching
+        # tree node lands.
+        _order_hooks.consume_node_path_post_mount(self, node, model)
 
     def _safe_expand_one(self, model: "Node") -> "Optional[list[Node]]":
         """Wrapper-level ``model.expand`` with the dispatcher's error policy.

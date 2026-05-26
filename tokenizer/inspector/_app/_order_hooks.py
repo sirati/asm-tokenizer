@@ -2,11 +2,17 @@
 
 Single concern: every Order-modal-specific code path the
 :class:`InspectorApp` invokes -- dialog construction, result
-dispatch, grouping pass, capture-on-rebuild expand-state. The
-:class:`InspectorApp` exposes thin method shims that delegate here;
-the heavy lifting (axis discovery, recursive auto-expand walk,
-sub-tree rebuild) lives at module scope so :mod:`._application` stays
-focused on the tree dispatcher + search.
+dispatch, grouping pass, capture-on-rebuild expand-state +
+cursor restoration. The :class:`InspectorApp` exposes thin method
+shims that delegate here; the heavy lifting (axis discovery,
+recursive auto-expand walk, sub-tree rebuild) lives at module scope
+so :mod:`._application` stays focused on the tree dispatcher + search.
+
+Capture-on-rebuild keys on the typed :class:`NodePath` defined in
+:mod:`._node_path` -- one set of paths covers every expanded tree
+node (function-level, variant-level, block-level, inline-call-level,
+...) and a separate captured path drives cursor restoration. See
+:mod:`._node_path` for the per-kind key dispatch.
 
 The functions take the live :class:`InspectorApp` instance + the
 relevant Textual / tree-model handles explicitly so unit tests can
@@ -23,8 +29,15 @@ from tokenizer.inspector._tree_model import (
     Node,
     VariantNode,
 )
-from tokenizer.variant_info import VariantIdentity
 
+from ._node_path import (
+    CapturedExpandState,
+    NodePath,
+    capture_expand_state,
+    logical_path_of,
+    node_path_for,
+    should_expand_for_capture,
+)
 from ._order import (
     OrderAccepted,
     OrderCancelled,
@@ -56,7 +69,7 @@ __all__ = [
     "open_order_dialog",
     "on_order_dialog_dismissed",
     "apply_grouping",
-    "consume_auto_expand_post_mount",
+    "consume_node_path_post_mount",
 ]
 
 
@@ -150,53 +163,68 @@ def apply_grouping(
     return list(grouped)
 
 
-def consume_auto_expand_post_mount(
+def consume_node_path_post_mount(
     app: "InspectorApp",
     mounted_node: "TreeNode[Node]",
     model: Node,
 ) -> None:
-    """If a capture-on-rebuild set is pending for this subtree, walk
-    the freshly-mounted children + expand the matching ones.
+    """Re-expand + reposition the cursor against the captured state.
 
-    Fires on both :class:`FunctionNode` and :class:`VariantGroupNode`
-    mounts so the chain descends across an arbitrarily-deep group
-    tree -- each :class:`VariantGroupNode` expand posts a
-    :class:`Tree.NodeExpanded` that re-enters the dispatcher, which
-    re-enters this function for the nested level.
+    Fires on every freshly-mounted parent (called from the
+    dispatcher AFTER ``add(child, ...)`` for the parent's children).
+    Each child is matched against the captured
+    :class:`CapturedExpandState` via :func:`should_expand_for_capture`:
+
+    * **Content rows** (variants, blocks, calls, ...) match by
+      logical-path equality (group ancestry elided), so a regroup
+      that re-routes a row under a different group still
+      auto-expands it.
+    * **Group rows** match by full-path equality OR by the
+      "ancestor of a captured logical path" rule, both gated on a
+      model-descendancy check so unrelated sibling groups do not
+      auto-expand.
+
+    Auto-expanding a child posts a :class:`Tree.NodeExpanded` that
+    re-enters the dispatcher + re-enters this consumer for the
+    deeper level. The cursor path is restored when the matching
+    tree node lands (logical-path match for the same regroup-
+    robustness).
     """
-    fn_tree_node = _enclosing_function_tree_node(mounted_node)
-    if fn_tree_node is None:
+    captured = app._captured_expand_state
+    if captured is None:
         return
-    fn_model = fn_tree_node.data
-    if not isinstance(fn_model, FunctionNode):
-        return
-    pending = app._pending_auto_expand.get(fn_model.handle)
-    if not pending:
-        return
-    backend = getattr(fn_model, "_backend", None)
-    if backend is None:
-        return
-    idx_to_identity: Mapping[int, VariantIdentity] = {
-        rv.variant_idx: rv.variant_identity for rv in backend.variants()
-    }
 
     for child in mounted_node.children:
-        data = child.data
-        if isinstance(data, VariantNode):
-            identity = idx_to_identity.get(data.variant_idx)
-            if identity is not None and identity in pending:
-                if not child.is_expanded:
-                    child.expand()
-                pending.discard(identity)
-        elif isinstance(data, VariantGroupNode):
-            if _group_contains_target(data, pending, idx_to_identity):
-                if not child.is_expanded:
-                    # The group's expand posts NodeExpanded; the
-                    # dispatcher fires for it next, re-entering this
-                    # consumer to handle the nested level.
-                    child.expand()
-    if not pending:
-        app._pending_auto_expand.pop(fn_model.handle, None)
+        if should_expand_for_capture(child, captured):
+            if not child.is_expanded:
+                child.expand()
+        if captured.cursor_path is not None:
+            child_full = node_path_for(child)
+            if child_full is not None and _cursor_matches(
+                child_full, captured.cursor_path
+            ):
+                _restore_cursor_to(app, child)
+                # Clear the cursor path so subsequent mounts don't
+                # re-position; the rest of the expand pass still
+                # runs against the same captured state.
+                app._captured_expand_state = CapturedExpandState(
+                    full_paths=captured.full_paths,
+                    logical_paths=captured.logical_paths,
+                    cursor_path=None,
+                )
+                captured = app._captured_expand_state
+
+
+def _cursor_matches(child_full: "NodePath", cursor_path: "NodePath") -> bool:
+    """``True`` iff ``child_full`` is the cursor's captured target.
+
+    Match by full path first (exact regroup-preserved row) then
+    by logical projection (regroup-rewrap-aware -- the cursor
+    survives moves into / out of group wrappers).
+    """
+    if child_full == cursor_path:
+        return True
+    return logical_path_of(child_full) == logical_path_of(cursor_path)
 
 
 # ---------------------------------------------------------------------------
@@ -246,79 +274,47 @@ def _iter_expanded_function_tree_nodes(
 
 
 def _rebuild_expanded_subtrees(app: "InspectorApp") -> None:
-    """Capture expand-state, collapse + re-expand every
-    currently-expanded :class:`FunctionNode` subtree. The dispatcher's
-    grouping integration + :func:`consume_auto_expand_post_mount` walk
-    handle the rest."""
+    """Capture the typed :class:`CapturedExpandState`, collapse +
+    re-expand every currently-expanded :class:`FunctionNode` subtree.
+
+    The dispatcher's grouping integration +
+    :func:`consume_node_path_post_mount` handle the rest: each newly-
+    mounted child whose :class:`NodePath` matches the captured state
+    is auto-expanded, propagating through the chain via subsequent
+    :class:`Tree.NodeExpanded` events. The cursor is moved to the
+    captured cursor-path's tree node as soon as that node mounts.
+    """
     from ._tree_widget import _InspectorTree
 
     tree = app.query_one("#tree", _InspectorTree)
+    app._captured_expand_state = capture_expand_state(
+        tree.root, tree.cursor_node
+    )
     for fn_tree_node in list(_iter_expanded_function_tree_nodes(tree.root)):
         fn_model = fn_tree_node.data
         if not isinstance(fn_model, FunctionNode):
             continue
-        identities = _snapshot_expanded_variants(fn_tree_node)
-        if identities:
-            app._pending_auto_expand[fn_model.handle] = identities
         fn_tree_node.collapse()
         fn_tree_node.expand()
 
 
-def _snapshot_expanded_variants(
-    fn_tree_node: "TreeNode[Node]",
-) -> "set[VariantIdentity]":
-    """Every currently-expanded :class:`VariantNode`'s
-    :class:`VariantIdentity`."""
-    fn_model = fn_tree_node.data
-    if not isinstance(fn_model, FunctionNode):
-        return set()
-    backend = getattr(fn_model, "_backend", None)
-    if backend is None:
-        return set()
-    idx_to_identity: dict[int, VariantIdentity] = {
-        rv.variant_idx: rv.variant_identity for rv in backend.variants()
-    }
-    identities: set[VariantIdentity] = set()
-    for variant_tree_node in _iter_variant_tree_nodes(fn_tree_node):
-        if not variant_tree_node.is_expanded:
-            continue
-        v_model = variant_tree_node.data
-        if not isinstance(v_model, VariantNode):
-            continue
-        identity = idx_to_identity.get(v_model.variant_idx)
-        if identity is not None:
-            identities.add(identity)
-    return identities
+def _restore_cursor_to(
+    app: "InspectorApp", target_node: "TreeNode[Node]"
+) -> None:
+    """Move the inspector tree's cursor to ``target_node``.
 
+    Deferred via :meth:`MessagePump.call_after_refresh`: Textual's
+    :meth:`Tree.move_cursor` reads the node's :attr:`_line` attribute
+    which is ``-1`` until the next render pass. Calling ``move_cursor``
+    during the dispatcher's mount loop -- before the new tree lines
+    are rendered -- silently positions the cursor at the root.
+    Deferring the move until after the next refresh lets Textual
+    compute the target's line number first.
+    """
+    from ._tree_widget import _InspectorTree
 
-def _iter_variant_tree_nodes(
-    fn_tree_node: "TreeNode[Node]",
-) -> "list[TreeNode[Node]]":
-    """DFS over the subtree; returns every :class:`VariantNode` tree
-    node. Stops at variants -- deeper layers aren't part of the
-    capture set."""
-    out: list = []
-    stack = list(fn_tree_node.children)
-    while stack:
-        node = stack.pop()
-        if isinstance(node.data, VariantNode):
-            out.append(node)
-            continue
-        if isinstance(node.data, VariantGroupNode):
-            stack.extend(node.children)
-    return out
-
-
-def _enclosing_function_tree_node(
-    tree_node: "TreeNode[Node]",
-) -> "Optional[TreeNode[Node]]":
-    """Walk up until a :class:`FunctionNode` ancestor is found."""
-    cursor = tree_node
-    while cursor is not None:
-        if isinstance(cursor.data, FunctionNode):
-            return cursor
-        cursor = cursor.parent
-    return None
+    tree = app.query_one("#tree", _InspectorTree)
+    tree.call_after_refresh(tree.move_cursor, target_node, animate=False)
 
 
 def _rendered_by_variant_lookup(
@@ -326,24 +322,3 @@ def _rendered_by_variant_lookup(
 ) -> Mapping[int, "RenderedVariant"]:
     """Map ``variant_idx -> RenderedVariant`` off ``backend.variants()``."""
     return {rv.variant_idx: rv for rv in backend.variants()}
-
-
-def _group_contains_target(
-    group: VariantGroupNode,
-    targets: "set[VariantIdentity]",
-    idx_to_identity: Mapping[int, "VariantIdentity"],
-) -> bool:
-    """Does this group (or any nested subgroup) wrap a target identity?
-
-    Reads off the in-memory model -- no tree-node lookup, so it works
-    BEFORE the group's tree node has been expanded. Used to decide
-    whether the auto-expand walk should descend into this branch.
-    """
-    for child in group.children:
-        if isinstance(child, VariantNode):
-            if idx_to_identity.get(child.variant_idx) in targets:
-                return True
-        elif isinstance(child, VariantGroupNode):
-            if _group_contains_target(child, targets, idx_to_identity):
-                return True
-    return False
