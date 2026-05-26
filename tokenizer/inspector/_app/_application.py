@@ -3,11 +3,14 @@
 Single concern: wire the tree widget to the tree-model ``expand``
 calls and centralise the expand-time error policy. Hosts the
 :class:`InspectorApp` (textual ``App[None]``), the expand dispatcher
-that wraps every model ``expand()`` call, the ``/`` search input, and
-the file-only ``ERROR``-level inspector logger.
+that wraps every model ``expand()`` call, the ``s`` / ``/`` action
+shim that opens the inline :class:`SearchBar`, and the file-only
+``ERROR``-level inspector logger.
 
 The tree widget itself lives in :mod:`tokenizer.inspector._app._tree_widget`;
-Node-typed label composition lives in :mod:`tokenizer.inspector._app._labels`.
+Node-typed label composition lives in :mod:`tokenizer.inspector._app._labels`;
+the inline search-bar widget lives in
+:mod:`tokenizer.inspector._app._search_bar`.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.widgets import Input, Tree
+from textual.widgets import Tree
 
 from shared.logging_utils import setup_file_logger
 from tokenizer.inspector._label import aligned_variant_labels
@@ -40,6 +43,7 @@ from ._labels import _ERR_STYLE, _compose_label
 from ._menu_bar import Alignment, MenuBar, MenuItem
 from ._node_path import CapturedExpandState
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
+from ._search_bar import SearchBar
 from ._status_bar import StatusBar
 from ._tree_widget import _InspectorTree
 
@@ -139,11 +143,12 @@ def _collect_suppressed_axes(
 
 
 class InspectorApp(App[None]):
-    """Inspector app: tree + search input.
+    """Inspector app: tree + inline search bar.
 
-    Vertical layout: tree (a ``ScrollView`` by inheritance) + a one-
-    line search input hidden by default, revealed on ``/``. Horizontal-
-    scroll actions delegate to the tree's built-in ``scroll_*`` methods.
+    Vertical layout: tree (a ``ScrollView`` by inheritance) + a
+    :class:`SearchBar` widget hidden by default, revealed on ``s``
+    (or the legacy ``/`` alias). Horizontal-scroll actions delegate
+    to the tree's built-in ``scroll_*`` methods.
 
     The app holds ONE :class:`BackendFactory` reference; every root
     :class:`FunctionNode` is constructed against that factory + the
@@ -154,8 +159,6 @@ class InspectorApp(App[None]):
     Screen { layout: vertical; }
     #menubar { height: 1; }
     #tree { height: 1fr; }
-    #search { display: none; height: 3; }
-    #search.visible { display: block; }
     #status-bar { height: 1; }
     """
 
@@ -167,9 +170,13 @@ class InspectorApp(App[None]):
         # widget that owns the cursor + viewport) so the action runs
         # before the ScrollableContainer's built-in pan-only bindings
         # would otherwise capture ``left`` / ``right``.
-        Binding("slash", "focus_search", "Search"),
+        # ``s`` is the documented hotkey; ``/`` is kept as a legacy
+        # alias so existing muscle memory + test coverage stay green.
+        # Both route to :meth:`action_open_search`, which delegates to
+        # the :class:`SearchBar` widget. Escape handling lives on the
+        # search bar itself (one-concern).
+        Binding("s,slash", "open_search", "Search", show=True),
         Binding("h", "open_help", "Help", show=True),
-        Binding("escape", "hide_search", "Hide search", show=False),
         Binding("o", "open_order_dialog", "Order", show=True),
         Binding("f", "open_filter_dialog", "Filter", show=True),
         Binding("b", "open_binary_switcher", "Switch binary", show=True),
@@ -241,7 +248,12 @@ class InspectorApp(App[None]):
             )
         tree.root.expand()
         yield tree
-        yield Input(placeholder="/ search function name", id="search")
+        # Inline search bar -- hidden by default, revealed by the ``s``
+        # binding. Lives BETWEEN the tree and the status bar (the
+        # search bar's CSS docks itself to the bottom; the status bar
+        # also docks to the bottom but is composed last so it lands
+        # below the search bar in the dock order).
+        yield SearchBar(id="search-bar")
         status_bar = StatusBar(id="status-bar")
         status_bar.set_tree(tree)
         yield status_bar
@@ -448,40 +460,15 @@ class InspectorApp(App[None]):
 
     # --- search ----------------------------------------------------
 
-    def action_focus_search(self) -> None:
-        search = self.query_one("#search", Input)
-        search.add_class("visible")
-        search.focus()
+    def action_open_search(self) -> None:
+        """Reveal the inline :class:`SearchBar` + focus its Input.
 
-    def action_hide_search(self) -> None:
-        search = self.query_one("#search", Input)
-        search.remove_class("visible")
-        search.value = ""
-        self.query_one("#tree", _InspectorTree).focus()
-
-    @on(Input.Submitted, "#search")
-    def _on_search_submitted(self, event: Input.Submitted) -> None:
-        """Jump-to-function-by-name-substring.
-
-        First substring hit against the composed function-row label
-        becomes the cursor row + is auto-expanded. Subsequent
-        searches start scanning anew from the top (no "find next"
-        cursor in this Phase).
+        The bar owns the Escape binding, the Input.Submitted handler,
+        and the cursor-jump logic; this method is the one-line shim
+        that bridges the App-level ``s`` / ``/`` BINDINGS to the
+        widget's :meth:`SearchBar.open` API.
         """
-        needle = event.value.strip().lower()
-        if not needle:
-            return
-        tree = self.query_one("#tree", _InspectorTree)
-        for child in tree.root.children:
-            model = child.data
-            if not isinstance(model, FunctionNode):
-                continue
-            label_plain = _compose_label(model).plain.lower()
-            if needle in label_plain:
-                tree.move_cursor(child)
-                child.expand()
-                self.action_hide_search()
-                return
+        self.query_one("#search-bar", SearchBar).open()
 
     # --- order dialog ----------------------------------------------
 

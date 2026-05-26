@@ -274,17 +274,23 @@ def test_left_arrow_at_scroll_zero_moves_cursor_to_parent():
 
 
 def test_search_input_focus_and_clear():
-    """``/`` reveals the search Input and ``escape`` hides it again."""
+    """``/`` reveals the :class:`SearchBar` and ``escape`` hides it again.
+
+    Legacy alias coverage: the ``/`` binding still routes through the
+    same ``action_open_search`` shim as the documented ``s`` binding,
+    so the visibility toggle on the search bar widget MUST behave
+    identically.
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "tui.log"
             app = _build_app(["main"], log_path)
             async with app.run_test() as pilot:
-                from textual.widgets import Input
+                from tokenizer.inspector._app._search_bar import SearchBar
 
-                search = app.query_one("#search", Input)
-                # Hidden by default per the inspector CSS.
+                search = app.query_one("#search-bar", SearchBar)
+                # Hidden by default per the SearchBar widget CSS.
                 assert "visible" not in search.classes
 
                 await pilot.press("slash")
