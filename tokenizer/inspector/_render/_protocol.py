@@ -238,26 +238,22 @@ class InlineCallEntry:
     resolve, and for every Phase-1 BatchDecodeBackend entry (plan
     decision 10). ``variant_idx`` equals :data:`MISSING_VARIANT_INDEX`
     when no per-variant pin exists (EXTERN, FtlBackend per decision
-    24, Phase-1 BatchDecodeBackend, or callee lacks a vkey match).
+    24, or the dataloader recorded no specific callee-variant link
+    for this call site); :class:`InlineCallNode.expand` then surfaces
+    the full variant list rather than splicing one in directly.
     ``kind`` is the wire-format :class:`CallTargetType`; the
     rendering layer routes per-kind label words off this enum so no
     string-typed discriminator crosses the boundary. ``provider`` is
     the library name appended after ``@`` for EXTERN rows; ``None``
     for LOCAL/PLT and for EXTERN rows whose provider is unknown.
-    ``caller_variant_identity`` is the typed
-    :class:`VariantIdentity` of the row that emitted this entry —
-    :class:`InlineCallNode.expand` falls back to it (matching the
-    callee's variants on the canonical-4 axes ``arch / compiler /
-    compiler_version / opt``) when :attr:`variant_idx` equals
-    :data:`MISSING_VARIANT_INDEX` (e.g. Function-ID self-references,
-    or callees whose vkey did not match) so the inline-call defaults
-    to a variant that shares the caller's build axes instead of
-    surfacing the full variant list. The raw per-section
-    ``variant_idx`` cannot be reused here: it is opaque (same numeric
-    index refers to a DIFFERENT variant across MATCHED vs UNMATCHED
-    sections, or across arches), so a numeric match would land on
-    arch-incompatible content. ``None`` means "no caller pin known"
-    (test fixtures that don't thread it).
+
+    For the BatchDecodeBackend ``variant_idx`` carries the
+    encoder-recorded per-call-site pin read directly from the
+    caller's :class:`VariantBlock.per_call_entries` (the direct
+    caller-call-site -> callee-variant link the dataloader resolves
+    via ``callee_vkey`` matching at writer time). No content-similarity
+    matching anywhere in the inspector: an unset pin means "no link",
+    which falls through to the all-variants surface.
     """
 
     kind: CallTargetType
@@ -266,7 +262,6 @@ class InlineCallEntry:
     callee_section_pointer: Optional[SectionPointerSpec]
     variant_idx: int
     provider: Optional[str]
-    caller_variant_identity: Optional[VariantIdentity] = None
 
 
 @dataclass(frozen=True)

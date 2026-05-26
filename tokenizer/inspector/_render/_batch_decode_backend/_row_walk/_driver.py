@@ -30,7 +30,6 @@ from tokenizer.inspector._render._protocol import (
     BlockKind,
 )
 from tokenizer.token_manager import VocabularyManager
-from tokenizer.variant_info import VariantIdentity
 
 from .._band import Band, classify_shifted_id
 from .._band_emitters import emit_instr_rep, emit_number
@@ -159,7 +158,8 @@ def render_row_blocks(
     *,
     result: BatchDecodeResult,
     row: int,
-    caller_variant_identity: Optional[VariantIdentity] = None,
+    row_variant_idx: int = 0,
+    variant_pins_per_ct: Optional[Sequence[Mapping[int, int]]] = None,
     n_axis: int,
     partial_cut_lengths: list[int],
     call_targets_per_ct: Sequence[Sequence[CallTarget]],
@@ -191,9 +191,17 @@ def render_row_blocks(
     against THEIR table; ``callee_arm_resolver`` returns ``None`` for
     cross-arm/missing; EXTERN call_targets always carry ``None``.
     """
+    # ``variant_pins_per_ct`` defaults to one empty pin table per CT —
+    # matches the FtlBackend test path (no encoder-side per-call data)
+    # and the BatchDecode tests that don't thread real pins. The
+    # BatchDecode backend builds the real per-CT table from the
+    # dataloader's :class:`VariantBlock.per_call_entries`.
+    if variant_pins_per_ct is None:
+        variant_pins_per_ct = [{} for _ in call_targets_per_ct]
     state, sidecars = _init_walk_state(
         result=result, row=row, n_axis=n_axis,
-        caller_variant_identity=caller_variant_identity,
+        row_variant_idx=row_variant_idx,
+        variant_pins_per_ct=variant_pins_per_ct,
         partial_cut_lengths=partial_cut_lengths,
         call_targets_per_ct=call_targets_per_ct,
     )

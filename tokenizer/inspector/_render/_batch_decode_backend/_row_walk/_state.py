@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -36,7 +36,6 @@ from tokenizer.inspector._render._render_block import (
     partition_call_target_kinds,
 )
 from tokenizer.tokens import Category
-from tokenizer.variant_info import VariantIdentity
 
 from .._boundaries import call_target_starts, header_trigger_cols
 from .._sections import WalkSectionState
@@ -138,15 +137,24 @@ class _WalkState(WalkSectionState):
 
     row: int = 0
     n_axis: int = 0
-    # Typed :class:`VariantIdentity` of the row being walked; threaded
-    # onto every emitted :class:`InlineCallEntry`'s
-    # ``caller_variant_identity`` so InlineCallNode.expand can match
-    # the callee's variants on the canonical-4 build axes when the
-    # callee's vkey pin is :data:`MISSING_VARIANT_INDEX` (e.g.
-    # Function-ID self-references). ``None`` means "no caller identity
-    # known" — tests / callers that don't thread it fall through to
-    # the all-variants surface.
-    caller_variant_identity: Optional[VariantIdentity] = None
+    # The dataloader-resolved variant_idx of the row being walked.
+    # The FUNCTION_ID synthetic section's LOCAL_FUNC self-prepend does
+    # NOT exist in any :class:`VariantBlock.per_call_entries` table
+    # (the encoder doesn't emit a per-call entry for a function's
+    # reference to its own ID — by construction the call site
+    # resolves to the same variant), so the row walker stamps this
+    # value as the InlineCallEntry's ``variant_idx`` for the self-
+    # prepend slot. All other call sites read from
+    # :attr:`variant_pins_per_ct`.
+    row_variant_idx: int = 0
+    # Per-call-target ``called_idx -> section_variant_index`` pin
+    # table read off the dataloader's
+    # :class:`VariantBlock.per_call_entries`. Indexed by
+    # :attr:`WalkSectionState.current_call_target_idx`; only the root
+    # CT (index 0) carries real pins (the inlined-callee sections are
+    # not parsed into Stage 1's intermediate state). Missing pins
+    # default to :data:`MISSING_VARIANT_INDEX` at the lookup site.
+    variant_pins_per_ct: Sequence[Mapping[int, int]] = field(default_factory=list)
     id_cursor: int = 0
     num_cursor: int = 0
     current_col: int = 0
@@ -191,7 +199,8 @@ def _init_walk_state(
     *,
     result: BatchDecodeResult,
     row: int,
-    caller_variant_identity: Optional[VariantIdentity],
+    row_variant_idx: int,
+    variant_pins_per_ct: Sequence[Mapping[int, int]],
     n_axis: int,
     partial_cut_lengths: list[int],
     call_targets_per_ct: Sequence[Sequence[CallTarget]],
@@ -236,7 +245,8 @@ def _init_walk_state(
             insn_runlength_row=result.insn_runlength[i_lo:i_hi],
         ),
         row=row, n_axis=n_axis,
-        caller_variant_identity=caller_variant_identity,
+        row_variant_idx=row_variant_idx,
+        variant_pins_per_ct=variant_pins_per_ct,
     )
     sidecars = _RowSidecars(
         tokens_row=result.tokens[row],

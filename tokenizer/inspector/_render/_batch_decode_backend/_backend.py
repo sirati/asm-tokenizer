@@ -264,24 +264,18 @@ class BatchDecodeBackend:
         cached = self._row_sections_by_variant.get(variant_idx)
         if cached is not None:
             return cached
-        # variants() populates _variant_row_index AND _variants_cache;
-        # idempotent. We look the variant_identity up from the cached
-        # :class:`RenderedVariant` list rather than re-projecting here
-        # so the typed-identity construction lives in ONE place
-        # (:func:`_project_variant`).
-        rendered_variants = self.variants()
+        # variants() populates _variant_row_index; idempotent.
+        self.variants()
         row = self._variant_row_index.get(variant_idx)
         if row is None:
             raise KeyError(
                 f"BatchDecodeBackend: unknown variant_idx {variant_idx}; "
                 f"valid={sorted(self._variant_row_index)}"
             )
-        caller_variant_identity = _lookup_variant_identity(
-            rendered_variants, variant_idx
-        )
         stage1 = self._result.intermediate.stage2.stage1
         stage2_section = self._result.intermediate.stage2.sections[0]
-        stage1_variant = stage1.sections[0].variants[variant_idx]
+        stage1_section = stage1.sections[0]
+        stage1_variant = stage1_section.variants[variant_idx]
         stage2_variant = stage2_section.variants[variant_idx]
         n_axis = int(stage1_variant.variant_tokens.shape[0])
         # Per-CT slot budget the row writer actually emitted (post-cut).
@@ -299,6 +293,20 @@ class BatchDecodeBackend:
         call_targets_per_ct = [
             ct.call_targets_section for ct in stage1_variant.call_targets
         ]
+        # Per-CT variant-pin tables read directly off the dataloader's
+        # intermediate state. The root CT's section (Stage 1 loads only
+        # the requested section) carries per_call_entries on its
+        # :class:`VariantBlock`; inlined callees' sections are not
+        # parsed into Stage 1 so their pin tables are empty here —
+        # those call sites fall through to MISSING_VARIANT_INDEX and
+        # :meth:`InlineCallNode.expand`'s all-variants surface. NO
+        # content-similarity matching anywhere; the pin is either a
+        # direct caller-call-site -> callee-variant link from
+        # ``per_call_entries`` or it is genuinely absent.
+        variant_pins_per_ct = _build_variant_pins_per_ct(
+            stage1_section.section.variants[variant_idx],
+            n_call_targets=len(call_targets_per_ct),
+        )
         # Arch-prefix tuple for INSTR_REP display elision. Read the raw
         # ``arch`` value out of the runtime metadata dict directly so
         # the missing-key collapse to ``""`` (empty-tuple no-op for
@@ -313,7 +321,8 @@ class BatchDecodeBackend:
         walked = render_row_blocks(
             result=self._result,
             row=row,
-            caller_variant_identity=caller_variant_identity,
+            row_variant_idx=variant_idx,
+            variant_pins_per_ct=variant_pins_per_ct,
             n_axis=n_axis,
             partial_cut_lengths=pcl,
             call_targets_per_ct=call_targets_per_ct,
@@ -328,25 +337,31 @@ class BatchDecodeBackend:
         return walked
 
 
-def _lookup_variant_identity(
-    rendered_variants: Sequence[RenderedVariant], variant_idx: int,
-) -> VariantIdentity:
-    """Linear lookup of a variant's typed identity by ``variant_idx``.
+def _build_variant_pins_per_ct(
+    root_variant_block,
+    *,
+    n_call_targets: int,
+) -> List[Mapping[int, int]]:
+    """Per-CT ``called_idx -> section_variant_index`` pin tables.
 
-    The variant list is short (per-function, not corpus-wide) so an
-    O(N) sweep is cheaper than maintaining a parallel dict. Single
-    source of truth for the variant_idx -> :class:`VariantIdentity`
-    projection on this backend; threaded into the row walker so every
-    emitted :class:`InlineCallEntry` carries the caller's typed
-    identity instead of the opaque per-section ``variant_idx``.
+    The root CT (index 0) is the section the dataloader actually
+    parsed, so its pin table reads directly off
+    :attr:`VariantBlock.per_call_entries`. Inlined callees (indices
+    >= 1) are NOT parsed into Stage 1's intermediate state, so their
+    pin tables are empty here — the row walker emits those call
+    sites with :data:`MISSING_VARIANT_INDEX` and
+    :meth:`InlineCallNode.expand` falls through to the all-variants
+    surface. Single source of truth for the per-call pin: the
+    dataloader's :class:`VariantBlock`; nothing else.
     """
-    for rv in rendered_variants:
-        if rv.variant_idx == variant_idx:
-            return rv.variant_identity
-    raise KeyError(
-        f"BatchDecodeBackend: variant_idx {variant_idx} not in "
-        f"rendered_variants ({len(rendered_variants)} entries)"
-    )
+    root_pins: Mapping[int, int] = {
+        int(called_idx): int(section_variant_index)
+        for called_idx, section_variant_index in root_variant_block.per_call_entries
+    }
+    pins: List[Mapping[int, int]] = [root_pins]
+    for _ in range(1, n_call_targets):
+        pins.append({})
+    return pins
 
 
 def _preview_for_section(section: RowSection) -> str:

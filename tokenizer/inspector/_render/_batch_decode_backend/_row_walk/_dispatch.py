@@ -165,14 +165,21 @@ def _handle_function_category(
         ],
         callee_arm_resolver=callee_arm_resolver,
     )
+    variant_idx = _resolve_call_site_variant_idx(
+        state=state,
+        call_kind=call_kind,
+        counter=counter,
+        kind_to_called_idx=kind_to_called_idx_per_ct[
+            state.current_call_target_idx
+        ],
+    )
     _consume_openable_slot(
         state,
         openable=InlineCallEntry(
             kind=call_kind, counter_id=counter, callee_name=callee_name,
             callee_section_pointer=callee_section_pointer,
-            variant_idx=MISSING_VARIANT_INDEX,
+            variant_idx=variant_idx,
             provider=provider,
-            caller_variant_identity=state.caller_variant_identity,
         ),
         placeholder_text=inline_call_label(
             kind=call_kind,
@@ -188,6 +195,49 @@ def _handle_function_category(
         # AsmLine carrying this InlineCallEntry lands in the right
         # section before current_items resets to the BODY block.
         _finalize_and_transition_to_body(state)
+
+
+def _resolve_call_site_variant_idx(
+    *,
+    state: _WalkState,
+    call_kind: CallTargetType,
+    counter: int,
+    kind_to_called_idx: Mapping[CallTargetType, list[int]],
+) -> int:
+    """Per-call-site variant_idx: dataloader pin or self-reference.
+
+    Two paths, NO content-similarity fallback:
+
+    * FUNCTION_ID self-prepend (``state.current_kind is FUNCTION_ID``):
+      a function's own ID always resolves to the SAME variant the row
+      represents, by construction — the encoder never emits a
+      per-call entry for it. The row walker stamps
+      :attr:`_WalkState.row_variant_idx` directly.
+    * Every other call site (LOCAL/PLT/EXTERN inline calls in the
+      body of any CT): look up the encoder-recorded pin in
+      ``variant_pins_per_ct[state.current_call_target_idx]``. A miss
+      (kind/counter out of range, no pin, or no per-CT entry —
+      tests may supply empty call-target tables; inlined-callee CTs
+      have no pins in Stage 1's intermediate state) returns
+      :data:`MISSING_VARIANT_INDEX`; :meth:`InlineCallNode.expand`
+      falls through to the all-variants surface.
+
+    EXTERN call_targets are never present in
+    :attr:`VariantBlock.per_call_entries` (the encoder filters them
+    out — no callee section exists), so they fall through to the
+    miss path naturally; no special-case branch.
+    """
+    if state.current_kind is BlockKind.FUNCTION_ID:
+        return state.row_variant_idx
+    indices_for_kind = kind_to_called_idx.get(call_kind)
+    if indices_for_kind is None or counter >= len(indices_for_kind):
+        return MISSING_VARIANT_INDEX
+    called_idx = indices_for_kind[counter]
+    if state.current_call_target_idx >= len(state.variant_pins_per_ct):
+        return MISSING_VARIANT_INDEX
+    return state.variant_pins_per_ct[state.current_call_target_idx].get(
+        called_idx, MISSING_VARIANT_INDEX,
+    )
 
 
 def _finalize_and_transition_to_body(state: _WalkState) -> None:
