@@ -697,3 +697,73 @@ def test_filter_dialog_accept_button_label_has_underlined_a():
                 await pilot.pause()
 
     asyncio.run(runner())
+
+
+# ---------------------------------------------------------------------------
+# Small-viewport responsive layout: no minimum size on the dialog AND the
+# buttons sit INSIDE the scrollable area so they remain reachable via scroll
+# when the terminal can't fit content + button row at the same time.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_dialog_buttons_inside_scroll_container():
+    """The Accept/Cancel button row is a descendant of the scroll
+    container so a short terminal scrolls the buttons into view
+    instead of clipping them at the dialog's bottom edge."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test() as pilot:
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86",)})
+                app.push_screen(dialog)
+                await pilot.pause()
+
+                from textual.containers import VerticalScroll
+                from textual.widgets import Button
+
+                scroll = dialog.query_one("#filter-scroll", VerticalScroll)
+                accept_btn = dialog.query_one("#filter-accept", Button)
+                cancel_btn = dialog.query_one("#filter-cancel", Button)
+                # Both buttons must be descendants of the scroll
+                # container, not siblings of it.
+                scroll_descendants = set(scroll.walk_children(with_self=False))
+                assert accept_btn in scroll_descendants
+                assert cancel_btn in scroll_descendants
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+    asyncio.run(runner())
+
+
+def test_filter_dialog_opens_at_ten_line_terminal_without_error():
+    """A 10-line viewport (too small for content + buttons stacked)
+    must still mount the dialog and let the screen-level Accept
+    binding fire -- the dialog must not enforce a min-height floor
+    that overflows the terminal."""
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "tui.log"
+            factory = _make_factory_with_rvs(name="main", rvs=[])
+            app = InspectorApp(factory=factory, log_path=log_path)
+            async with app.run_test(size=(80, 10)) as pilot:
+                results: list = []
+                arch_axis = build_canonical_axes()[0]
+                dialog = FilterDialog(axis_values={arch_axis: ("x86", "arm32")})
+                app.push_screen(dialog, results.append)
+                await pilot.pause()
+                # The screen-level Accept binding works even on the
+                # tiny viewport (the button-press path is exercised
+                # via Pilot.click in a separate test; this test guards
+                # the no-runtime-error + binding-still-fires invariant).
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                assert len(results) == 1
+                assert isinstance(results[0], FilterAccepted)
+
+    asyncio.run(runner())

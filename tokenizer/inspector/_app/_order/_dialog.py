@@ -26,7 +26,7 @@ from typing import ClassVar, List, Optional, Sequence
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, SelectionList
 from textual.widgets._selection_list import Selection
@@ -159,10 +159,12 @@ class OrderDialog(ModalScreen[OrderResult]):
         height: auto;
         max-height: 80%;
     }
+    OrderDialog #order-scroll {
+        height: auto;
+        max-height: 24;
+    }
     OrderDialog #order-list {
         height: auto;
-        max-height: 20;
-        min-height: 5;
     }
     OrderDialog #order-buttons {
         height: 3;
@@ -239,11 +241,19 @@ class OrderDialog(ModalScreen[OrderResult]):
             ),
             id="order-list",
         )
+        # Button row lives INSIDE the scrollable area so the dialog
+        # adapts to any terminal height: at large heights the
+        # ``height: auto`` outer body shrinks to its content and the
+        # buttons sit just below the list (no scroll needed); at small
+        # heights the scroll caps at the modal max-height and the
+        # buttons scroll into view rather than getting clipped at the
+        # dialog's bottom edge.
         with Vertical(id="order-body"):
-            yield sel_list
-            with Horizontal(id="order-buttons"):
-                yield Button("[u]A[/]ccept", id="accept", variant="primary")
-                yield Button("[u]C[/]ancel", id="cancel")
+            with VerticalScroll(id="order-scroll"):
+                yield sel_list
+                with Horizontal(id="order-buttons"):
+                    yield Button("[u]A[/]ccept", id="accept", variant="primary")
+                    yield Button("[u]C[/]ancel", id="cancel")
 
     # --- actions ---------------------------------------------------
 
