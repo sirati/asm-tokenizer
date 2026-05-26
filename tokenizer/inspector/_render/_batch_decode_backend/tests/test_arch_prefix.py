@@ -63,6 +63,16 @@ def test_arch_prefix_tuple_empty_label_yields_empty_tuple() -> None:
     assert arch_prefix_tuple("") == ()
 
 
+def test_arch_prefix_tuple_unknown_label_yields_empty_tuple() -> None:
+    """Unmatched-arm :class:`FunctionData.metadata` carries the literal
+    sentinel ``"unknown"`` (per
+    ``_session_parsers.build_unmatched_function_data``); the helper
+    MUST return an empty tuple so the cross-arm navigation to an
+    unmatched callee does not blow up with ``ValueError`` from
+    :func:`arch_to_platform`."""
+    assert arch_prefix_tuple("unknown") == ()
+
+
 @pytest.mark.parametrize(
     "arch_label,raw,expected",
     [

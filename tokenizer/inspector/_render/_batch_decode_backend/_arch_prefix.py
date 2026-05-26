@@ -65,11 +65,14 @@ def arch_prefix_tuple(arch_label: str) -> tuple[str, ...]:
     3. Unified-promoted prefix: ``<unified>_`` (e.g. ``unified_x86_``,
        ``unified_arm_``).
 
-    Returns an empty tuple if ``arch_label`` is the empty string --
-    convenient for backends that haven't plumbed the arch through yet
-    (no stripping happens; tokens pass through unchanged).
+    Returns an empty tuple if ``arch_label`` is the empty string or the
+    sentinel ``"unknown"`` (the unmatched-arm
+    :class:`FunctionData.metadata` carrier per
+    ``_session_parsers.build_unmatched_function_data``) -- the unmatched
+    arm's tokens are emitted on the UNIFIED vocab without an ISA-specific
+    prefix, so there is nothing to strip.
     """
-    if not arch_label:
+    if not arch_label or arch_label == "unknown":
         return ()
     platform = arch_to_platform(arch_label)
     family = PLATFORM_FAMILY[platform]
