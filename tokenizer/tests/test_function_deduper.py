@@ -21,6 +21,7 @@ from tokenizer.function_deduper import (
     DedupResolution,
     FunctionDeduper,
     canonical_function_name,
+    logical_function_name,
 )
 
 
@@ -407,3 +408,48 @@ def test_canonical_name_is_deterministic() -> None:
     a = canonical_function_name("foo", "C::m()", 0xDEAD)
     b = canonical_function_name("foo", "C::m()", 0xDEAD)
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# ``logical_function_name`` -- the inverse used by the inspector function
+# list to collapse PLT-thunk variants whose resolved-extern offset
+# differs across ELF builds.
+# ---------------------------------------------------------------------------
+
+
+def test_logical_name_strips_thunk_suffix() -> None:
+    """``@thunk:<digits>`` is the only suffix logical-name peels off; it
+    is the one canonical suffix that is NOT cross-ISA-stable in practice
+    (Ghidra's resolved-extern entry offset varies per binary)."""
+    assert logical_function_name("gzseek@thunk:1056296") == "gzseek"
+    assert logical_function_name("adler32_combine@thunk:1105632") == "adler32_combine"
+
+
+def test_logical_name_preserves_plain_name() -> None:
+    """Names without the suffix pass through verbatim; no fast-path
+    branching needed at the call site."""
+    assert logical_function_name("gzseek") == "gzseek"
+    assert logical_function_name("main") == "main"
+
+
+def test_logical_name_preserves_comment_suffix() -> None:
+    """The ``@<sanitised_signature>`` suffix from
+    :func:`canonical_function_name` is the demangled C++ signature and
+    IS deterministic across builds; logical-name must keep it so two
+    methods sharing an unqualified name stay distinct."""
+    canon = canonical_function_name(
+        "reset", "ARPHeader::reset(NetworkLayerElement*)", None
+    )
+    assert "@" in canon
+    assert logical_function_name(canon) == canon
+
+
+def test_logical_name_thunk_pairs_collapse_across_offsets() -> None:
+    """The corpus symptom: multiple binaries report the same source
+    symbol with different ``@thunk:<offset>`` because the resolved
+    extern lives at different placeholder addresses per ELF. Logical
+    name must collapse them to the underlying symbol."""
+    a = canonical_function_name("gzseek", None, 1056296)
+    b = canonical_function_name("gzseek", None, 1056324)
+    assert a != b
+    assert logical_function_name(a) == logical_function_name(b) == "gzseek"
