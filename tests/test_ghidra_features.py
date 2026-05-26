@@ -660,3 +660,137 @@ def test_negative_disp_arm32_value_negative_postfix(
         f"expected single <digit_04> magnitude byte, got {digit_slots} "
         f"in window {matched_window}"
     )
+
+
+# ---------- 8. Absolute-addressed x86 mem operand routes through MEM ----
+
+_X64_ZLIB_BINARY = _ARM32_ZLIB_SRC / "x64-gcc-9-O2_minigzip"
+
+
+def test_absolute_addressed_x86_mem_routes_as_mem_x64_zlibversion() -> None:
+    """x64-gcc-9-O2_minigzip's ``zlibVersion`` is a one-liner
+    ``lea rax, [0x10D7C0]; ret`` — the source operand is the absolute
+    address of the version literal in .rodata (Ghidra has folded the
+    rip-relative displacement into a literal Address). Ghidra surfaces
+    that operand with op_type = ADDRESS|SCALAR and NO Register in
+    getOpObjects.
+
+    The ``decode_helper.operand_spec`` classifier must route it through
+    ``OperandKind.MEM`` (so the downstream ``tokenize_operand_memory``
+    + ``process_constant_v2(meta=STRING)`` chain fires); routing it as
+    ``OperandKind.IMM`` lands the value on the ``lea``-in-
+    ``arithmetic_instructions`` short-circuit which emits
+    ``is_arithmetic=True`` and bypasses every address-classification
+    precedence step (the operand collapses to a bare
+    ``valued_const_v2`` instead of ``string_ptr``).
+
+    This pin guards the ``absolute_addressed_no_register_mem`` is_memory
+    branch in ``decode_helper.operand_spec`` — without it the operand
+    falls through to the no-register Scalar/Address branch and becomes
+    IMM.
+    """
+    if not _X64_ZLIB_BINARY.is_file():
+        pytest.skip(f"x64 fixture missing at {_X64_ZLIB_BINARY}")
+
+    from tokenizer.disasm import get_disassembly_provider
+    from tokenizer.disasm.types import OperandKind
+
+    provider = get_disassembly_provider("ghidra", _X64_ZLIB_BINARY)
+    provider.build_cfg()
+    try:
+        zlib_version = None
+        for _addr, name, function in provider.iter_functions():
+            if name == "zlibVersion":
+                zlib_version = function
+                break
+        assert zlib_version is not None, "zlibVersion function not found in x64 fixture"
+
+        lea_source_kinds: list[OperandKind] = []
+        lea_source_disps: list[int] = []
+        for block in zlib_version.blocks:
+            for insn in block.instructions:
+                if insn.base_mnemonic != "lea":
+                    continue
+                # lea has two operands: dest REG, source absolute-mem.
+                ops_seen = 0
+                for op in insn.operands:
+                    if ops_seen == 1:
+                        lea_source_kinds.append(op.kind)
+                        if op.kind == OperandKind.MEM:
+                            lea_source_disps.append(int(op.mem.disp))
+                    ops_seen += 1
+
+        assert lea_source_kinds, (
+            "no lea instruction found in zlibVersion; binary layout has "
+            "drifted from the expected `lea rax, [0x10D7C0]; ret` shape"
+        )
+        assert all(k == OperandKind.MEM for k in lea_source_kinds), (
+            f"lea source operand must classify as MEM (got {lea_source_kinds}); "
+            f"a result of IMM means the absolute-addressed-no-register "
+            f"branch in decode_helper.operand_spec did not fire. The "
+            f"value would then bypass STRING classification via the "
+            f"is_arithmetic short-circuit on lea."
+        )
+        assert 0x10D7C0 in lea_source_disps, (
+            f"expected lea source disp 0x10D7C0 (version literal in "
+            f".rodata); observed disps: {[hex(d) for d in lea_source_disps]}"
+        )
+    finally:
+        provider.close()
+
+
+@pytest.mark.slow
+def test_absolute_addressed_x86_mem_emits_string_ptr_x64_zlibversion(
+    fresh_ghidra_csv,
+) -> None:
+    """End-to-end shape: after the operand routes through MEM (test 8a),
+    ``tokenize_operand_memory``'s ``force_opaque`` branch calls
+    ``process_constant_v2(meta=STRING, is_arithmetic=False)`` for the
+    out-of-func absolute disp, which precedence step 7 routes to
+    ``_emit_string_ptr``. The emitted token must therefore be a
+    ``string_ptr`` identity inside the mem brackets — not a bare
+    ``valued_const_v2``.
+
+    This is the integration counterpart to the provider-direct probe
+    above; together they cover the full producer chain from raw
+    operand-kind classification to emitted token.
+    """
+    if not _X64_ZLIB_BINARY.is_file():
+        pytest.skip(f"x64 fixture missing at {_X64_ZLIB_BINARY}")
+
+    csv_path = fresh_ghidra_csv(_X64_ZLIB_BINARY.name, _ARM32_ZLIB_SRC)
+    _, names = _function_tokens(csv_path, "zlibVersion")
+
+    # The post-fix shape is roughly:
+    #   block_v2 <0x00> x64_lea x64_rax x64_qword_ptr MEM_OPEN_BRACKET
+    #   string_ptr <id-bytes> ... MEM_CLOSE_BRACKET x64_ret
+    # Pre-fix it would have been a bare valued_const_v2 in place of
+    # string_ptr.
+    assert "string_ptr" in names, (
+        f"zlibVersion token stream lacks string_ptr identity (the "
+        f"absolute-addressed source operand of `lea rax, [...]` should "
+        f"emit string_ptr because the target is a typed string in "
+        f".rodata): {names}"
+    )
+    # The bare-valued-const-v2 inside the mem brackets is the pre-fix
+    # regression signature. After the fix, valued_const_v2 might still
+    # appear elsewhere in the stream (digit-byte payload of another
+    # identity) but NOT immediately following MEM_OPEN_BRACKET preceded
+    # by the lea sequence. Walk the bracket windows and confirm at
+    # least one carries the string_ptr token (the lea's source).
+    has_string_ptr_inside_brackets = False
+    open_idx = -1
+    for i, n in enumerate(names):
+        if n == "MEM_OPEN_BRACKET":
+            open_idx = i
+            continue
+        if n == "MEM_CLOSE_BRACKET" and open_idx >= 0:
+            window = names[open_idx + 1 : i]
+            if "string_ptr" in window:
+                has_string_ptr_inside_brackets = True
+                break
+            open_idx = -1
+    assert has_string_ptr_inside_brackets, (
+        f"expected at least one MEM bracket window in zlibVersion to "
+        f"contain string_ptr (the rodata version literal); got: {names}"
+    )
