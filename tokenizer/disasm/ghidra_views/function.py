@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Hashable, Iterator, Optional
 
 from tokenizer.disasm.ghidra_views.block import _GhidraBlockView
+from tokenizer.disasm.ghidra_views.unnamed_rename import placeholder_renamed_name
 from tokenizer.disasm.types import Architecture, BlocksView
 
 
@@ -53,6 +54,7 @@ class _GhidraFunctionView:
         "_decode",
         "_block_model",
         "_monitor",
+        "_binary_id_hash",
         "_ghidra_function",
         "_entry",
         "_name",
@@ -74,6 +76,7 @@ class _GhidraFunctionView:
         decode: Any,
         block_model: Any,
         monitor: Any,
+        binary_id_hash: bytes,
     ) -> None:
         self._arch = arch
         self._program = program
@@ -82,6 +85,11 @@ class _GhidraFunctionView:
         self._decode = decode
         self._block_model = block_model
         self._monitor = monitor
+        # Precomputed 16-byte per-binary identity hash; the
+        # placeholder-rename helper XORs the per-function name hash
+        # with this constant on every ``_advance`` over a
+        # SourceType.DEFAULT function.
+        self._binary_id_hash: bytes = binary_id_hash
         self._ghidra_function: Optional[Any] = None
         self._entry: int = 0
         self._name: str = ""
@@ -98,10 +106,28 @@ class _GhidraFunctionView:
 
         ``block_count`` is precomputed by the provider's iter_functions
         loop (so ``len(blocks_view)`` is O(1)).
+
+        Placeholder rename: Ghidra emits
+        ``FUN_<hex>`` / ``LAB_<hex>`` / ``thunk_FUN_<hex>`` etc. for any
+        function whose name was not recovered from a real symbol
+        table, demangler hit, or analysis pass — the catch-all
+        ``Symbol.getSource() == SourceType.DEFAULT`` branch. Those raw
+        names embed the function's entry address, which shifts across
+        re-runs / variants and conflates two unrelated placeholders
+        whenever their entry offsets happen to match. The rename
+        helper replaces every DEFAULT-source name with a
+        deterministic + binary-scoped + collision-free opaque label;
+        real symbol names pass through unchanged. See
+        :mod:`tokenizer.disasm.ghidra_views.unnamed_rename` for the
+        layered design (per-binary identity hash precomputed at
+        provider construction, per-function hash XOR-combined on the
+        hot path).
         """
         self._ghidra_function = ghidra_function
         self._entry = int(ghidra_function.getEntryPoint().getOffset())
-        self._name = str(ghidra_function.getName())
+        raw_name = str(ghidra_function.getName())
+        source = ghidra_function.getSymbol().getSource()
+        self._name = placeholder_renamed_name(raw_name, source, self._binary_id_hash)
         self._block_count = block_count
         # Lazy fields: compute on first property access. Reset the cache
         # flags so the next access reruns _ghidra_identity_key /
@@ -165,6 +191,7 @@ class _GhidraFunctionView:
             self._decode,
             self._block_model,
             self._monitor,
+            self._binary_id_hash,
         )
         clone._ghidra_function = self._ghidra_function
         clone._entry = self._entry

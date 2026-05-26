@@ -28,6 +28,7 @@ from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
     _ghidra_processor_to_architecture,
 )
+from tokenizer.disasm.ghidra_views.unnamed_rename import compute_binary_identity_hash
 from tokenizer.disasm.types import FpType
 
 
@@ -101,6 +102,14 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # duplicate-function-metadata pickle; the orchestrator module
         # owns the file write + parent-mkdir.
         self._duplicate_function_dump_path: Path | None = duplicate_function_dump_path
+        # 16-byte per-binary identity hash. Computed ONCE here (folding
+        # the binary path + dataset sidecar JSON content when present);
+        # threaded into every ``_GhidraFunctionView`` so the placeholder
+        # rename helper pays a single XOR + b64encode on each
+        # DEFAULT-source function. See
+        # ``tokenizer.disasm.ghidra_views.unnamed_rename`` for the
+        # rationale + scheme.
+        self._binary_id_hash: bytes = compute_binary_identity_hash(binary_path)
 
         # pyghidra defaults `project_location` to the binary's parent
         # directory, which is the read-only `--source-already-staged`
@@ -282,6 +291,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             decode=decode,
             block_model=block_model,
             monitor=monitor,
+            binary_id_hash=self._binary_id_hash,
         )
         self._function_view = function_view
 
