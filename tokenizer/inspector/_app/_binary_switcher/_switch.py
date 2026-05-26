@@ -96,6 +96,7 @@ def open_binary_switcher(app: "InspectorApp") -> None:
     dialog = BinarySwitcherDialog(
         current_path=app._current_path,
         current_provider=app._current_provider,
+        current_binary=app._current_binary,
     )
     app.push_screen(dialog, lambda r: _on_binary_switcher_dismissed(app, r))
 
@@ -144,6 +145,7 @@ def perform_switch(app: "InspectorApp", target: SwitchTarget) -> None:
     app._factory = new_factory
     app._current_provider = target.provider
     app._current_path = target.path
+    app._current_binary = target.binary
 
     # Reseed the tree with the new factory's handles.
     _reseed_tree(app)

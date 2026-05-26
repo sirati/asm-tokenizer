@@ -163,6 +163,7 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
         *,
         current_path: Optional[Path] = None,
         current_provider: Optional[LoaderProvider] = None,
+        current_binary: Optional[str] = None,
     ) -> None:
         super().__init__()
         # Binary-first ordering means both providers share a single
@@ -172,6 +173,7 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
         # path (mock-factory test case).
         self._anchor_path: Path = current_path or Path.home()
         self._current_provider = current_provider
+        self._current_binary = current_binary
 
     # --- compose ---------------------------------------------------
 
@@ -249,7 +251,7 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
             if binary not in scans[provider].binaries:
                 continue
             stage = _PROVIDER_STAGE_LABELS[provider]
-            suffix = self._current_marker(path, provider)
+            suffix = self._current_marker(path, provider, binary)
             label = Text(
                 f"{provider.value} ({stage}){suffix}",
                 style=_GREEN_STYLE,
@@ -260,12 +262,13 @@ class BinarySwitcherDialog(ModalScreen[Optional[SwitchTarget]]):
             )
 
     def _current_marker(
-        self, path: Path, provider: LoaderProvider
+        self, path: Path, provider: LoaderProvider, binary: str
     ) -> str:
-        """``"  [current]"`` when (path, provider) match the App's state."""
+        """``"  [current]"`` when (path, provider, binary) match the App."""
         if (
             self._current_provider is provider
             and self._anchor_path == path
+            and self._current_binary == binary
         ):
             return "  [current]"
         return ""
