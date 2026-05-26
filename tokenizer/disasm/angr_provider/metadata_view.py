@@ -46,6 +46,7 @@ class _AngrAddressMetadataView:
         "_string_encoding",
         "_string_bytes",
         "_name",
+        "_identity_key",
         "_start_addr",
         "_end_addr",
         "_size",
@@ -61,6 +62,7 @@ class _AngrAddressMetadataView:
         self._string_encoding: Encoding = Encoding.UNKNOWN
         self._string_bytes: Optional[bytes] = None
         self._name: Optional[str] = None
+        self._identity_key: Optional[Hashable] = None
         self._start_addr: Optional[int] = None
         self._end_addr: Optional[int] = None
         self._size: Optional[int] = None
@@ -77,6 +79,7 @@ class _AngrAddressMetadataView:
         string_encoding: Encoding,
         string_bytes: Optional[bytes],
         name: Optional[str],
+        identity_key: Optional[Hashable],
         start_addr: Optional[int],
         end_addr: Optional[int],
         size: Optional[int],
@@ -90,9 +93,13 @@ class _AngrAddressMetadataView:
 
         ``name`` is the CANONICAL function name (already passed through
         :func:`tokenizer.function_deduper.canonical_function_name` by the
-        lookup); on the angr path the helper is a no-op because angr has
-        no demangler hook and no thunk-identity surface (so the two
-        axes ``comment`` / ``identity_key`` are always ``None`` here).
+        lookup). ``identity_key`` is the thunk-identity axis the lookup
+        fed to that helper (a :class:`ThunkIdentity` for PLT stubs and
+        SimProcedures — see
+        :func:`tokenizer.disasm.angr_provider.function_identity._angr_identity_key`
+        — or ``None`` for non-thunk angr functions). angr has no
+        demangler hook, so ``comment`` is unconditionally ``None`` on
+        this path.
         """
         self._kind = kind
         self._section_kind = section_kind
@@ -100,6 +107,7 @@ class _AngrAddressMetadataView:
         self._string_encoding = string_encoding
         self._string_bytes = string_bytes
         self._name = name
+        self._identity_key = identity_key
         self._start_addr = start_addr
         self._end_addr = end_addr
         self._size = size
@@ -165,8 +173,12 @@ class _AngrAddressMetadataView:
 
     @property
     def identity_key(self) -> Optional[Hashable]:
-        # angr has no thunk-identity surface (see angr_limitations.md).
-        return None
+        # Populated by the lookup with a :class:`ThunkIdentity` keyed on
+        # the imported symbol name for PLT stubs / SimProcedures (cross-
+        # binary stable, matching the Ghidra provider's
+        # ``isExternal()``-true branch). ``None`` for non-thunk angr
+        # functions and non-function addresses.
+        return self._identity_key
 
     @property
     def slot_target(self) -> Optional[AddressMetadataView]:
@@ -190,6 +202,7 @@ class _AngrAddressMetadataView:
         # bytes is immutable; safe to share
         clone._string_bytes = self._string_bytes
         clone._name = self._name
+        clone._identity_key = self._identity_key
         clone._start_addr = self._start_addr
         clone._end_addr = self._end_addr
         clone._size = self._size

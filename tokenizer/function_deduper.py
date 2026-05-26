@@ -14,8 +14,11 @@ four-way AND of:
    surface as same-``name`` Ghidra ``Function``s with *different*
    plate comments; the comment is the natural disambiguator.
 3. Same ``identity_key`` — the provider-supplied "stronger-than-name"
-   identity (today: the thunked-function entry-point offset for PLT
-   thunks). ``None`` when the provider declines.
+   identity. For PLT thunks the providers (Ghidra ``isExternal()``
+   thunks, angr PLT stubs / SimProcedures) emit a
+   :class:`ThunkIdentity` keyed on the imported symbol name — cross-
+   binary stable for the same source symbol. ``None`` when the
+   provider declines.
 4. Same ``tokens_base64`` body — the emitted token-body string. When
    ``comment`` AND ``identity_key`` are both ``None`` we still merge
    same-named functions whose body matches (the LTO-clone case: same
@@ -63,7 +66,62 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Dict, Hashable, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Thunk-identity domain type (typed, self-describing)
+# ---------------------------------------------------------------------------
+# Cross-binary-stable identity for PLT thunks. The provider extracts a
+# ``ThunkIdentity`` from each thunk Function it sees; the deduper hashes
+# it as part of the identity tuple; ``canonical_function_name`` renders
+# its ``key`` field as the ``@thunk:<...>`` suffix. The ``kind`` axis
+# distinguishes external- vs local-target thunks in equality so a local
+# offset that happens to lexically equal an external symbol name cannot
+# collide.
+#
+# Why two kinds:
+#  * EXTERNAL: the thunked target lives in Ghidra's per-binary EXTERNAL
+#    namespace; its entry-point offset is a link-order-dependent
+#    placeholder (NOT cross-binary stable). The imported symbol name IS
+#    cross-binary stable for the same source symbol -- that's the key.
+#  * LOCAL: the thunked target lives in real code (e.g. hand-written
+#    assembly aliases, IFUNCs). The entry-point offset IS within-binary
+#    stable; cross-binary stability isn't claimed (the offset would shift
+#    across binaries, but local-target thunks are rare and the legacy
+#    within-binary disambiguation is the only invariant the caller needs).
+
+
+class ThunkTargetKind(IntEnum):
+    """Discriminator for :class:`ThunkIdentity` — what kind of function
+    the thunk resolves to."""
+
+    EXTERNAL = 1
+    LOCAL = 2
+
+
+@dataclass(frozen=True)
+class ThunkIdentity:
+    """Provider-supplied stable identity for a thunk function.
+
+    Hashable (frozen dataclass); used by :class:`FunctionDeduper` as the
+    third identity axis and by :func:`canonical_function_name` as the
+    ``@thunk:<key>`` suffix source. Both axes (``kind``, ``key``) are
+    part of equality so two thunks with the same key but different
+    target kinds (e.g. EXTERNAL ``"calloc"`` vs LOCAL ``"calloc"``)
+    correctly count as distinct identities.
+
+    The ``key`` is the canonical-suffix source and is rendered verbatim
+    into the on-disk name (after the standard sanitisation that
+    :func:`canonical_function_name` applies to all suffixes). It is the
+    caller's job to make ``key`` cross-binary stable for the EXTERNAL
+    case (the imported symbol name) and within-binary stable for the
+    LOCAL case (a hex render of the entry-point offset).
+    """
+
+    kind: ThunkTargetKind
+    key: str
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +133,16 @@ from typing import Dict, Hashable, Optional, Tuple
 # so EVERY caller that needs a final function name (the FDM, the metadata
 # lookup, any inspector) calls one function and gets one answer.
 #
-# Cross-ISA stability follows directly: the demangled C++ comment and the
-# thunked-entry-offset identity_key are ISA-invariant by construction
-# (the demangler emits the same signature for the same source-level symbol
-# regardless of ISA; the thunked-function entry offset is the resolved
-# external's address, identical across all trampoline slots that resolve
-# to it AND identical across ISA-variant re-disassemblies of the same
-# external).
+# Cross-binary stability follows directly: the demangled C++ comment is
+# ISA-invariant by construction (the demangler emits the same signature
+# for the same source-level symbol regardless of ISA). For PLT thunks the
+# provider-emitted :class:`ThunkIdentity` keys EXTERNAL-target thunks on
+# the imported symbol name (cross-binary stable for the same source
+# symbol — the Ghidra-side EXTERNAL placeholder offset is NOT cross-
+# binary stable because it shifts with link order, which is the bug the
+# typed identity replaces). LOCAL-target thunks key on a hex offset
+# (within-binary stable; cross-binary stability isn't claimed for the
+# rare local-target case).
 #
 # Sanitisation rule:
 # - The comment is the C++ signature in human-readable form (e.g.
@@ -142,6 +203,25 @@ def _sanitize_comment_suffix(comment: str) -> str:
     return suffix
 
 
+def _identity_key_suffix(identity_key: Hashable) -> str:
+    """Render an identity_key as a CSV/filename-safe thunk-suffix string.
+
+    The canonical thunk-suffix source lives on the identity_key itself
+    (the provider knows what counts as cross-binary stable for its
+    disassembly model). :class:`ThunkIdentity` carries an explicit
+    ``key`` field; legacy callers passing a bare integer keep the
+    historical ``str(int)`` rendering. In both cases the result passes
+    through :func:`_sanitize_comment_suffix` so symbol names that carry
+    characters outside the allow-list (e.g. ``glibc@@GLIBC_2.2.5``) end
+    up CSV / filesystem safe.
+    """
+    if isinstance(identity_key, ThunkIdentity):
+        raw = identity_key.key
+    else:
+        raw = str(identity_key)
+    return _sanitize_comment_suffix(raw)
+
+
 def canonical_function_name(
     name: str,
     comment: Optional[str],
@@ -149,7 +229,7 @@ def canonical_function_name(
 ) -> str:
     """Produce the final on-disk function name from the three identity axes.
 
-    Deterministic + cross-ISA-stable:
+    Deterministic + cross-binary-stable (for the populated-axis branches):
 
     * ``comment`` populated -> ``f"{name}@{sanitised_comment}"``. C++
       demangled signatures collide on unqualified ``name`` (e.g.
@@ -157,10 +237,12 @@ def canonical_function_name(
       Ghidra ``Function``s with ``name=='reset'``); the demangled
       signature is the natural cross-ISA-stable disambiguator.
     * ``comment`` is None AND ``identity_key`` populated ->
-      ``f"{name}@thunk:{identity_key}"``. PLT thunks share the resolved
-      external's name; the resolved-entry-offset
-      (``Function.getThunkedFunction(True).getEntryPoint().getOffset()``)
-      is the cross-ISA-stable identity.
+      ``f"{name}@thunk:{sanitised_key}"``. PLT thunks share the
+      resolved target's name; the suffix comes from the
+      :class:`ThunkIdentity` ``key`` field (the imported symbol name
+      for external-target thunks — cross-binary stable; a hex offset
+      for local-target thunks — within-binary stable). Legacy callers
+      passing a bare integer fall through to ``str(int)``.
     * Both None -> ``name`` verbatim. The deduper's body-divergence
       diagnostic and the FDM's positional ``_N`` allocator are the only
       callers that touch this branch's downstream disambiguation (which
@@ -178,7 +260,7 @@ def canonical_function_name(
         suffix = _sanitize_comment_suffix(comment)
         return f"{name}@{suffix}"
     if identity_key is not None:
-        return f"{name}@thunk:{identity_key}"
+        return f"{name}@thunk:{_identity_key_suffix(identity_key)}"
     return name
 
 
@@ -296,4 +378,10 @@ class FunctionDeduper:
         )
 
 
-__all__ = ("DedupResolution", "FunctionDeduper", "canonical_function_name")
+__all__ = (
+    "DedupResolution",
+    "FunctionDeduper",
+    "ThunkIdentity",
+    "ThunkTargetKind",
+    "canonical_function_name",
+)

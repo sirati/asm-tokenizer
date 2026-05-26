@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Hashable, Iterator, Optional
 
+from tokenizer.disasm.angr_provider.function_identity import _angr_identity_key
 from tokenizer.disasm.angr_provider.op_classify import (
     _CAPSTONE_ARM_SHIFT_TO_KIND,
     _capstone_op_type_to_operand_kind,
@@ -715,12 +716,21 @@ class _AngrFunctionView:
 
     @property
     def identity_key(self) -> Optional[Hashable]:
-        # angr/Capstone does not perform thunk-resolution at decode time;
-        # the angr-backed view never asserts a stronger-than-name
-        # identity. Returning ``None`` puts every angr-path function on
-        # the legacy disambiguation path (see ``FunctionView.identity_key``
+        # PLT stubs and angr SimProcedures resolve to imported symbols;
+        # angr surfaces the imported name on the Function itself
+        # (``func.name``) and exposes the two flags (``is_plt``,
+        # ``is_simprocedure``) on every ISA angr supports (x86/x86_64,
+        # AArch64, ARM32, MIPS, PPC ELFv2 — see ``angr_limitations.md``).
+        # When either flag is set we surface a cross-binary stable
+        # ``ThunkIdentity`` keyed on the imported symbol name. This
+        # mirrors the Ghidra provider's ``isExternal()`` branch and
+        # keeps cross-provider canonical-name parity for the same
+        # source symbol.
+        #
+        # Non-thunk angr functions return ``None`` (legacy
+        # disambiguation path — see ``FunctionView.identity_key``
         # contract in ``tokenizer/disasm/types.py``).
-        return None
+        return _angr_identity_key(self._func)
 
     @property
     def comment(self) -> Optional[str]:
