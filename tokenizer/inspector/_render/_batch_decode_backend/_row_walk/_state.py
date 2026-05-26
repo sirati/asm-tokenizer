@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -29,7 +29,6 @@ from tokenizer.aligned_data.loader.decoded._number_render_collector import (
     _NumberAccumulator,
 )
 from tokenizer.aligned_data.matched_sections_bin import (
-    MISSING_VARIANT_INDEX,
     CallTarget,
 )
 from tokenizer.inspector._render._protocol import BlockKind, Openable
@@ -37,6 +36,7 @@ from tokenizer.inspector._render._render_block import (
     partition_call_target_kinds,
 )
 from tokenizer.tokens import Category
+from tokenizer.variant_info import VariantIdentity
 
 from .._boundaries import call_target_starts, header_trigger_cols
 from .._sections import WalkSectionState
@@ -138,12 +138,15 @@ class _WalkState(WalkSectionState):
 
     row: int = 0
     n_axis: int = 0
-    # variant_idx of the row being walked; threaded onto every emitted
-    # :class:`InlineCallEntry`'s ``caller_variant_idx`` so InlineCall
-    # expand can default to the caller's variant when the callee's
-    # vkey pin is :data:`MISSING_VARIANT_INDEX` (e.g. Function-ID
-    # self-references).
-    caller_variant_idx: int = MISSING_VARIANT_INDEX
+    # Typed :class:`VariantIdentity` of the row being walked; threaded
+    # onto every emitted :class:`InlineCallEntry`'s
+    # ``caller_variant_identity`` so InlineCallNode.expand can match
+    # the callee's variants on the canonical-4 build axes when the
+    # callee's vkey pin is :data:`MISSING_VARIANT_INDEX` (e.g.
+    # Function-ID self-references). ``None`` means "no caller identity
+    # known" — tests / callers that don't thread it fall through to
+    # the all-variants surface.
+    caller_variant_identity: Optional[VariantIdentity] = None
     id_cursor: int = 0
     num_cursor: int = 0
     current_col: int = 0
@@ -188,7 +191,7 @@ def _init_walk_state(
     *,
     result: BatchDecodeResult,
     row: int,
-    caller_variant_idx: int,
+    caller_variant_identity: Optional[VariantIdentity],
     n_axis: int,
     partial_cut_lengths: list[int],
     call_targets_per_ct: Sequence[Sequence[CallTarget]],
@@ -233,7 +236,7 @@ def _init_walk_state(
             insn_runlength_row=result.insn_runlength[i_lo:i_hi],
         ),
         row=row, n_axis=n_axis,
-        caller_variant_idx=caller_variant_idx,
+        caller_variant_identity=caller_variant_identity,
     )
     sidecars = _RowSidecars(
         tokens_row=result.tokens[row],

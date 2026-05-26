@@ -183,15 +183,42 @@ class FtlBackend:
             )
         state = self._ensure_variant_state(variant_idx)
         block = state.blocks[block_idx]
+        # Look up the typed :class:`VariantIdentity` from the cached
+        # :class:`RenderedVariant` list (idempotent; built once by
+        # :meth:`variants`). The renderer threads it onto every
+        # :class:`InlineCallEntry`'s ``caller_variant_identity`` so
+        # callee-side variant matching uses canonical-4 build axes
+        # rather than the opaque per-section ``variant_idx``.
+        caller_variant_identity = self._caller_identity(variant_idx)
         return render_block(
             block=block,
             section=state.view,
             kind_to_called_idx=state.kind_to_called_idx,
             variant_pins={},
-            caller_variant_idx=variant_idx,
+            caller_variant_identity=caller_variant_identity,
             line_to_name=state.line_to_name,
             line_to_provider=state.line_to_provider,
             callee_arm_resolver=_no_callee_arm,
+        )
+
+    def _caller_identity(self, variant_idx: int):
+        """Look up the typed identity of one variant from
+        :meth:`variants`'s cached list.
+
+        Linear scan (variant lists are short) and single source of
+        truth for the per-variant identity projection on this backend
+        — the underlying canonical projection lives in
+        :meth:`VariantInfo.identity` so this helper never re-implements
+        axis extraction. Raises :class:`KeyError` when the
+        ``variant_idx`` was never reported by :meth:`variants` (a
+        contract violation by the caller).
+        """
+        for rv in self.variants():
+            if rv.variant_idx == variant_idx:
+                return rv.variant_identity
+        raise KeyError(
+            f"FtlBackend: variant_idx {variant_idx} not in variants "
+            f"({len(self.variants())} entries)"
         )
 
     def close(self) -> None:

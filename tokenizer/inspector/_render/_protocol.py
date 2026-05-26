@@ -244,14 +244,20 @@ class InlineCallEntry:
     string-typed discriminator crosses the boundary. ``provider`` is
     the library name appended after ``@`` for EXTERN rows; ``None``
     for LOCAL/PLT and for EXTERN rows whose provider is unknown.
-    ``caller_variant_idx`` is the variant_idx of the row that emitted
-    this entry — :class:`InlineCallNode.expand` falls back to it when
-    :attr:`variant_idx` equals :data:`MISSING_VARIANT_INDEX` (e.g.
-    Function-ID self-references, or callees whose vkey did not match)
-    so the inline-call defaults to the caller's variant instead of
-    surfacing the full variant list. :data:`MISSING_VARIANT_INDEX`
-    here means "no caller pin known" (FtlBackend's Phase-1 default,
-    test fixtures that don't thread it).
+    ``caller_variant_identity`` is the typed
+    :class:`VariantIdentity` of the row that emitted this entry —
+    :class:`InlineCallNode.expand` falls back to it (matching the
+    callee's variants on the canonical-4 axes ``arch / compiler /
+    compiler_version / opt``) when :attr:`variant_idx` equals
+    :data:`MISSING_VARIANT_INDEX` (e.g. Function-ID self-references,
+    or callees whose vkey did not match) so the inline-call defaults
+    to a variant that shares the caller's build axes instead of
+    surfacing the full variant list. The raw per-section
+    ``variant_idx`` cannot be reused here: it is opaque (same numeric
+    index refers to a DIFFERENT variant across MATCHED vs UNMATCHED
+    sections, or across arches), so a numeric match would land on
+    arch-incompatible content. ``None`` means "no caller pin known"
+    (test fixtures that don't thread it).
     """
 
     kind: CallTargetType
@@ -260,7 +266,7 @@ class InlineCallEntry:
     callee_section_pointer: Optional[SectionPointerSpec]
     variant_idx: int
     provider: Optional[str]
-    caller_variant_idx: int = MISSING_VARIANT_INDEX
+    caller_variant_identity: Optional[VariantIdentity] = None
 
 
 @dataclass(frozen=True)
