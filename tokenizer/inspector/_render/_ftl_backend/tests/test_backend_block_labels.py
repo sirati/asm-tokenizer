@@ -26,6 +26,7 @@ from tokenizer.inspector._render._ftl_backend._ftl_section_view import (
 )
 from tokenizer.inspector._render._ftl_backend._variant_state import (
     VariantState,
+    body_block_idxs_for_blocks,
 )
 from tokenizer.inspector._render._protocol import (
     AsmLine,
@@ -69,15 +70,17 @@ def _stub_variant_state(blocks: List[BlockTokenList]) -> VariantState:
     minimum-surface stand-ins; the tests only assert on per-block
     labels + the body-text stream.
     """
+    block_tuple = tuple(blocks)
     return VariantState(
         record=MagicMock(name="parsed_record"),
         vocab=MagicMock(name="vocab"),
         ftl=MagicMock(name="function_token_list"),
         view=FtlSectionView(call_targets=()),
-        blocks=tuple(blocks),
+        blocks=block_tuple,
         kind_to_called_idx={k: [] for k in CallTargetType},
         line_to_name={},
         line_to_provider={},
+        body_block_idxs=body_block_idxs_for_blocks(block_tuple),
     )
 
 
