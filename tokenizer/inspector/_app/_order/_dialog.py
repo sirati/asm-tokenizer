@@ -32,7 +32,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, SelectionList
+from textual.widgets import Button, Label, SelectionList
 from textual.widgets._selection_list import Selection
 
 from ._axes import (
@@ -81,8 +81,8 @@ class _ReorderableSelectionList(SelectionList[int]):
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("alt+up", "move_up", "Move up", show=False),
-        Binding("alt+down", "move_down", "Move down", show=False),
+        Binding("shift+up", "move_up", "Move up", show=False),
+        Binding("shift+down", "move_down", "Move down", show=False),
     ]
 
     def action_move_up(self) -> None:
@@ -170,6 +170,10 @@ class OrderDialog(ModalScreen[OrderResult]):
     OrderDialog #order-list {
         height: auto;
     }
+    OrderDialog #order-hint {
+        color: $text-muted;
+        padding: 0 1;
+    }
     OrderDialog #order-buttons {
         height: 3;
         align-horizontal: right;
@@ -255,6 +259,7 @@ class OrderDialog(ModalScreen[OrderResult]):
         with Vertical(id="order-body"):
             with VerticalScroll(id="order-scroll"):
                 yield sel_list
+                yield Label("Ordering: SHIFT + ↓↑", id="order-hint")
                 with Horizontal(id="order-buttons"):
                     yield Button("[u]A[/]ccept", id="accept", variant="primary")
                     yield Button("[u]C[/]ancel", id="cancel")
