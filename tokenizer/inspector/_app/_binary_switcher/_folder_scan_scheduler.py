@@ -222,10 +222,13 @@ class FolderScanScheduler:
         """Drain :attr:`_queue` FIFO, yielding every batch.
 
         Each entry is a ``(node, path)`` pair: the worker probes
-        ``path``, updates the caches, and calls :attr:`_on_result` so
-        the dialog can repaint the node. Yields every
-        :data:`_SCAN_BATCH_SIZE` probes so keystroke / scroll events
-        run between batches.
+        ``path`` via :func:`asyncio.to_thread` (the underlying
+        :func:`is_loadable_for_any` is a fully-blocking ``rglob`` walk
+        — on a directory like ``/tmp`` a single probe can take seconds,
+        so it MUST run off the event loop), updates the caches, and
+        calls :attr:`_on_result` on the UI thread once the verdict
+        lands. Yields every :data:`_SCAN_BATCH_SIZE` probes so
+        keystroke / scroll events run between batches.
         """
         batch = 0
         while True:
@@ -234,7 +237,9 @@ class FolderScanScheduler:
                 if path in self._known_green:
                     loadable = True
                 else:
-                    loadable = is_loadable_for_any(path)
+                    loadable = await asyncio.to_thread(
+                        is_loadable_for_any, path
+                    )
                     if loadable:
                         self._known_green.add(path)
                 self._on_result(node, path, loadable)

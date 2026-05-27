@@ -183,18 +183,14 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         the user navigates up via ``[parent folder]``. Idempotent for the
         latter: ``tree.clear()`` zeroes the prior children before reseed.
 
-        The root's loadable verdict is probed synchronously (single
-        call, not the per-child fan-out) so the root label + the root's
-        ``[open this folder]`` row are correct on the first frame. The
-        scheduler's cache short-circuits the probe on
-        rebase-down-then-back-up.
+        The root's loadable verdict starts at the cached value when
+        present, otherwise ``False`` plus an enqueued worker probe.
+        Probing the root inline would hang the UI on a directory like
+        ``/tmp`` whose ``rglob`` walks millions of files; the scheduler
+        runs that off the event loop and re-paints the root label +
+        injects the ``[open this folder]`` row when the verdict lands.
         """
-        if self._scan_scheduler.is_known_green(self._start_path):
-            loadable = True
-        else:
-            loadable = is_loadable_for_any(self._start_path)
-            if loadable:
-                self._scan_scheduler.remember_green(self._start_path)
+        loadable = self._scan_scheduler.is_known_green(self._start_path)
         root_data = _FolderRow(self._start_path, loadable)
         tree.root.set_label(
             _format_folder_label(self._start_path, loadable, full=True)
@@ -205,6 +201,11 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         # Eagerly populate so the [parent folder] + [open this folder]
         # rows are visible without the user expanding the root first.
         self._populate_folder(tree.root)
+        # Probe the root off-thread when the verdict isn't already
+        # cached. The scheduler's `on_result` callback handles the late
+        # label flip + open-row injection via :meth:`_apply_root_result`.
+        if not loadable:
+            self._scan_scheduler.enqueue(tree.root, self._start_path)
 
     # --- event dispatch ------------------------------------------
 
@@ -299,6 +300,11 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         was already user-expanded (``_populated``), inject the
         ``[open this folder]`` row that :meth:`_populate_folder` had
         skipped at expand time.
+
+        The root node's label is rendered with the absolute path
+        (``full=True``); non-root child labels use the basename. The
+        ``full`` flag is derived from the node's identity so a
+        deferred root probe doesn't clobber the anchor display.
         """
         data = node.data
         if not isinstance(data, _FolderRow) or data.path != path:
@@ -306,7 +312,8 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         if data.loadable == loadable:
             return
         data.loadable = loadable
-        node.set_label(_format_folder_label(path, loadable))
+        is_root = node is self._tree.root
+        node.set_label(_format_folder_label(path, loadable, full=is_root))
         if loadable and data._populated:
             self._inject_open_row(node, path)
 
