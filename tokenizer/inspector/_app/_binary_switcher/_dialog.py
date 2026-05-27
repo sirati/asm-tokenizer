@@ -73,9 +73,11 @@ _PROVIDER_NAME_WIDTH = max(len(p.value) for p in LoaderProvider)
 
 # Column at which the right-aligned `[current]` marker starts. The
 # dialog's body is 80 chars wide; subtract the border + padding + the
-# two indent levels (binary -> provider) for the provider row's
-# content area. 60 lands the marker comfortably near the right edge.
-_CURRENT_MARKER_COL = 60
+# two indent levels (binary -> provider) the tree renders for the
+# provider row's content area, leaving ~64 chars. 50 lands the marker
+# near the right edge without overflowing into the tree's
+# horizontal-scroll regime.
+_CURRENT_MARKER_COL = 50
 
 
 class _TreeNodePayload:
