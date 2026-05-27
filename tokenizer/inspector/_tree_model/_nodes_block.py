@@ -10,7 +10,7 @@ variant.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 
 from tokenizer.inspector._render._protocol import BlockKind
@@ -48,6 +48,18 @@ class BlockNode:
     kind: BlockKind
     block_idx: int
     preview: str
+    # Pre-computed sibling-aware column width for the ``"<prefix>: <idx>"``
+    # portion of the row label; set by the UI layer's sibling-set stamp
+    # in :mod:`tokenizer.inspector._app._application` when constructing
+    # a variant's full block child set so ``Block: 12`` and ``Block: 521``
+    # rows render their preview chunk at the same column. ``None`` for
+    # nodes constructed outside a sibling-set context (e.g. single-block
+    # unit tests) — the label dispatcher falls back to the unpadded
+    # ``"<prefix>: <idx>"`` form, preserving backward compatibility.
+    # Width counts the FIXED indexed kinds only (BODY / JUMP_TABLE); the
+    # non-indexed VARIANT_HEADER / FUNCTION_ID rows carry their own
+    # fixed labels and ignore this field.
+    aligned_prefix_width: Optional[int] = None
     is_failed: bool = False
     can_expand: bool = field(default=True, init=False)
     # Per-row horizontal scroll memory; see :mod:`tokenizer.inspector._app._tree_widget`.

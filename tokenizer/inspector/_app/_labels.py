@@ -120,12 +120,23 @@ def _block_node_label(node: "BlockNode", *, show_preview: bool = True) -> Text:
     via the App-level ``p`` binding -- the per-row branch lives here
     so the label composer's single concern stays "translate node to
     Text".
+
+    When :attr:`BlockNode.aligned_prefix_width` is set (stamped by the
+    App-side sibling-set pass in
+    :func:`tokenizer.inspector._app._application._stamp_aligned_block_prefix_width`),
+    the ``"<prefix>: <idx>"`` chunk is left-padded to that width so the
+    preview suffix of every indexed sibling row starts at the same
+    column. ``None`` falls back to the unpadded form (single-block
+    unit tests, non-indexed kinds).
     """
     fixed = _BLOCK_KIND_LABELS.get(node.kind)
     if fixed is not None:
         return Text(fixed)
     prefix = _BLOCK_KIND_INDEXED_PREFIXES[node.kind]
-    text = Text(f"{prefix}: {node.block_idx}")
+    base = f"{prefix}: {node.block_idx}"
+    if node.aligned_prefix_width is not None:
+        base = base.ljust(node.aligned_prefix_width)
+    text = Text(base)
     if show_preview and node.preview:
         text.append("   ")
         text.append(node.preview, style=_BLOCK_PREVIEW_STYLE)

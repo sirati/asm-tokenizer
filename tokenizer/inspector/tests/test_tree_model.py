@@ -709,3 +709,176 @@ def test_function_expand_via_dispatcher_stamps_aligned_variant_labels():
     # trailing column unpadded. See aligned_variant_labels unit tests.
     assert captured[0].aligned_label == "arm32 gcc   v5 -O0"
     assert captured[1].aligned_label == "x86   clang v7 -O3"
+
+
+# ---------------------------------------------------------------------------
+# Sibling-set column alignment: the dispatcher stamps
+# ``aligned_prefix_width`` on the BlockNode siblings returned by
+# VariantNode.expand so the ``"Block: <i>"`` / ``"Jump table: <i>"``
+# prefix column-aligns across the indexed sibling set, regardless of
+# numeric suffix width.
+# ---------------------------------------------------------------------------
+
+
+def test_variant_expand_via_dispatcher_stamps_aligned_block_prefix_width():
+    """A VariantNode with blocks 0, 12, and 521 flows through the
+    central expand dispatcher; every indexed BlockNode child carries
+    ``aligned_prefix_width = len("Block: 521") = 10`` so the rendered
+    label's preview chunk starts at the same column across siblings.
+    Mirror of the variant-axis stamp pilot above."""
+    pytest.importorskip("textual")
+
+    from pathlib import Path
+    import tempfile
+
+    from tokenizer.inspector._app import InspectorApp
+    from tokenizer.inspector._app._labels import _block_node_label
+
+    rendered_blocks = [
+        RenderedBlock(kind=BlockKind.BODY, block_idx=0, preview="nop"),
+        RenderedBlock(kind=BlockKind.BODY, block_idx=12, preview="mvn r0 v1"),
+        RenderedBlock(
+            kind=BlockKind.JUMP_TABLE,
+            block_idx=521,
+            preview="ldr r0 [r11 + v20]",
+        ),
+    ]
+    backend = MagicMock(spec=RenderBackend)
+    backend.handle = _make_handle()
+    backend.closed = False
+    backend.blocks.return_value = rendered_blocks
+    factory = _make_factory(backend)
+
+    variant = VariantNode(
+        factory=factory,
+        backend=backend,
+        variant_idx=0,
+        label_axes=_make_label_axes(),
+    )
+
+    captured: list = []
+
+    tree_node = MagicMock(name="TreeNode")
+    tree_node.data = variant
+    tree_node.parent = None
+    tree_node.is_expanded = True
+    tree_node.add = lambda _label, data, allow_expand: captured.append(data)
+    event = MagicMock(name="NodeExpanded")
+    event.node = tree_node
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "inspector.log"
+        app = InspectorApp(factory=factory, log_path=log_path)
+        app._on_node_expanded(event)
+
+    assert len(captured) == 3
+    assert all(isinstance(b, BlockNode) for b in captured)
+    # Widest indexed prefix: "Jump table: 521" = 15 chars; the body
+    # blocks ("Block: 0", "Block: 12") share that width via ljust.
+    expected_width = len("Jump table: 521")
+    assert expected_width == 15
+    assert [b.aligned_prefix_width for b in captured] == [
+        expected_width,
+        expected_width,
+        expected_width,
+    ]
+
+    # End-to-end: every rendered label's plain text places the
+    # 3-space gap + preview at the same column index. Pick the
+    # boundary after the aligned prefix and confirm the preview
+    # boundary aligns across siblings.
+    labels = [_block_node_label(b, show_preview=True) for b in captured]
+    plains = [t.plain for t in labels]
+    # Every label starts with the per-kind prefix padded to width 15
+    # then three spaces then the preview.
+    for plain, block in zip(plains, captured):
+        assert plain.startswith(
+            f"Block: {block.block_idx}".ljust(expected_width)
+            if block.kind is BlockKind.BODY
+            else f"Jump table: {block.block_idx}".ljust(expected_width)
+        )
+        # Preview chunk boundary -- column index 15 + 3 = 18.
+        assert plain[expected_width : expected_width + 3] == "   "
+    # All three preview chunks start at the same column index.
+    preview_col = expected_width + 3
+    assert plains[0][preview_col:] == "nop"
+    assert plains[1][preview_col:] == "mvn r0 v1"
+    assert plains[2][preview_col:] == "ldr r0 [r11 + v20]"
+
+
+def test_stamp_aligned_block_prefix_width_skips_non_indexed_kinds():
+    """VARIANT_HEADER / FUNCTION_ID rows carry fixed-string labels and
+    are NOT padded — they keep ``aligned_prefix_width = None``. The
+    indexed siblings still compute their width across ONLY the indexed
+    set, so mixed VARIANT_HEADER + BODY + JUMP_TABLE expand handles
+    correctly."""
+    pytest.importorskip("textual")
+
+    from tokenizer.inspector._app._application import (
+        _stamp_aligned_block_prefix_width,
+    )
+
+    backend = MagicMock(spec=RenderBackend)
+    backend.handle = _make_handle()
+    backend.closed = False
+    factory = _make_factory(backend)
+
+    def _block(kind: BlockKind, idx: int) -> BlockNode:
+        return BlockNode(
+            factory=factory,
+            backend=backend,
+            variant_idx=0,
+            kind=kind,
+            block_idx=idx,
+            preview="",
+        )
+
+    children: list = [
+        _block(BlockKind.VARIANT_HEADER, -1),
+        _block(BlockKind.FUNCTION_ID, -1),
+        _block(BlockKind.BODY, 7),
+        _block(BlockKind.BODY, 521),
+        _block(BlockKind.JUMP_TABLE, 13),
+    ]
+    _stamp_aligned_block_prefix_width(children)
+
+    # Non-indexed rows are untouched.
+    assert children[0].aligned_prefix_width is None
+    assert children[1].aligned_prefix_width is None
+    # Widest indexed prefix is "Block: 521" = 10 chars.
+    expected_width = len("Block: 521")
+    assert expected_width == 10
+    assert children[2].aligned_prefix_width == expected_width
+    assert children[3].aligned_prefix_width == expected_width
+    assert children[4].aligned_prefix_width == expected_width
+
+
+def test_stamp_aligned_block_prefix_width_empty_or_heterogeneous_noop():
+    """Empty sibling sets + sets with NO indexed BlockNode rows are a
+    no-op (the helper short-circuits)."""
+    pytest.importorskip("textual")
+
+    from tokenizer.inspector._app._application import (
+        _stamp_aligned_block_prefix_width,
+    )
+
+    # Empty: no error, no mutation.
+    _stamp_aligned_block_prefix_width([])
+
+    # Only non-block siblings (e.g. variants under a function): no-op.
+    backend = MagicMock(spec=RenderBackend)
+    backend.handle = _make_handle()
+    backend.closed = False
+    factory = _make_factory(backend)
+    variants = [
+        VariantNode(
+            factory=factory,
+            backend=backend,
+            variant_idx=i,
+            label_axes=_make_label_axes(),
+        )
+        for i in range(2)
+    ]
+    _stamp_aligned_block_prefix_width(list(variants))
+    # No BlockNode field exists on VariantNode -- the helper's
+    # ``isinstance`` filter guards against the mutation.
