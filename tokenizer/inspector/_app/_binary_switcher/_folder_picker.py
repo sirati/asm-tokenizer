@@ -16,6 +16,16 @@ drill arbitrarily deep, then commit whichever level they wanted via
 on click — they only browse — because the green-marking is the hint
 that helps the user spot promising drill-down targets, not a
 commit-on-click action.
+
+Per-folder loadable probes are I/O-bound (one ``rglob`` per provider
+per child directory), so a folder with many children (e.g. ``/tmp``)
+would freeze the UI if scanned inline. :meth:`_populate_folder`
+therefore mounts every child synchronously with ``loadable=False``
+(or a cached green from the scheduler's session caches) and pushes
+unknown children onto the :class:`FolderScanScheduler`; the scheduler
+runs the probes on a Textual worker BFS-style and notifies us via
+:meth:`_apply_scan_result` when each verdict lands. See the
+scheduler module for the queue + cache details.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Tree
 from textual.widgets._tree import TreeNode
 
+from ._folder_scan_scheduler import FolderScanScheduler
 from ._scan import is_loadable_for_any, list_child_directories
 
 
@@ -136,6 +147,13 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         if not start_resolved.is_dir():
             start_resolved = Path.home()
         self._start_path = start_resolved
+        # Off-thread per-child loadable-probe scheduler. The dialog
+        # tells the scheduler which paths to probe and reads its
+        # session caches at mount time; the scheduler calls back via
+        # :meth:`_apply_scan_result` when each verdict lands.
+        self._scan_scheduler = FolderScanScheduler(
+            host=self, on_result=self._apply_scan_result
+        )
 
     # --- compose --------------------------------------------------
 
@@ -149,14 +167,34 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         with Vertical(id="picker-body"):
             yield tree
 
+    def on_mount(self) -> None:
+        """Spawn the scheduler's drain worker.
+
+        Deferred from ``__init__`` because Textual's ``run_worker``
+        needs an active app on ``self`` (the worker is bound to the
+        widget's app lifecycle).
+        """
+        self._scan_scheduler.start()
+
     def _seed_root(self, tree: Tree[_PickerRow]) -> None:
         """Wire the tree's root to ``self._start_path`` (re-root entry).
 
         Called from :meth:`compose` and again from :meth:`_rebase` when
         the user navigates up via ``[parent folder]``. Idempotent for the
         latter: ``tree.clear()`` zeroes the prior children before reseed.
+
+        The root's loadable verdict is probed synchronously (single
+        call, not the per-child fan-out) so the root label + the root's
+        ``[open this folder]`` row are correct on the first frame. The
+        scheduler's cache short-circuits the probe on
+        rebase-down-then-back-up.
         """
-        loadable = is_loadable_for_any(self._start_path)
+        if self._scan_scheduler.is_known_green(self._start_path):
+            loadable = True
+        else:
+            loadable = is_loadable_for_any(self._start_path)
+            if loadable:
+                self._scan_scheduler.remember_green(self._start_path)
         root_data = _FolderRow(self._start_path, loadable)
         tree.root.set_label(
             _format_folder_label(self._start_path, loadable, full=True)
@@ -189,8 +227,18 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         ``[parent folder]`` appears only on the picker's root and only
         when a parent exists (i.e. we are not already at the filesystem
         root). ``[open this folder]`` appears only when the folder
-        actually holds data for at least one provider — committing a
+        actually holds data for at least one provider -- committing a
         non-loadable folder would just crash the loader downstream.
+
+        Per-child loadable verdicts are NOT probed inline (would freeze
+        the UI for directories with hundreds of children such as
+        ``/tmp``). Instead every child is mounted with
+        ``loadable=False`` (or the cached verdict from the scheduler)
+        and the unknown ones are pushed onto
+        :class:`FolderScanScheduler` for the background worker to
+        probe. If the scheduler already saw EVERY child of this folder
+        in this dialog session, the enqueue step is skipped and labels
+        reflect the cache directly.
         """
         data = node.data
         if not isinstance(data, _FolderRow) or data._populated:
@@ -208,13 +256,88 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
                 Text("[open this folder]", style=_GREEN_STYLE),
                 data=_OpenFolderRow(data.path),
             )
+        scheduler = self._scan_scheduler
+        already_full = scheduler.is_fully_checked(data.path)
+        unknown_count = 0
         for sub in list_child_directories(data.path):
-            sub_loadable = is_loadable_for_any(sub)
-            node.add(
+            sub_loadable = scheduler.is_known_green(sub)
+            child_node = node.add(
                 _format_folder_label(sub, sub_loadable),
                 data=_FolderRow(sub, sub_loadable),
                 allow_expand=True,
             )
+            # Skip enqueue when the path's verdict is already known.
+            # ``is_fully_checked`` means the previous scan examined
+            # every child; any not in ``known_green`` is therefore
+            # known non-loadable for the dialog session.
+            if sub_loadable or already_full:
+                continue
+            scheduler.enqueue(child_node, sub)
+            unknown_count += 1
+        # Folders with no unknown children promote into
+        # ``_fully_checked`` immediately (cache short-circuit for
+        # empty / fully-cached folders). The scheduler handles the
+        # asynchronous case via its per-parent counter.
+        if unknown_count == 0 and not already_full:
+            scheduler.mark_fully_checked(data.path)
+
+    def _apply_scan_result(
+        self,
+        node: TreeNode[_PickerRow],
+        path: Path,
+        loadable: bool,
+    ) -> None:
+        """Scheduler callback: reflect a freshly-probed loadable verdict.
+
+        Guards against the node having been recycled by a tear-down
+        (``_rebase`` clears the tree before re-mounting -- the
+        scheduler cancels in-flight work first but a probe completing
+        on the same tick can still land here). The data identity
+        check ensures we only mutate nodes still tied to this path.
+
+        When a previously non-loadable node flips to loadable AND it
+        was already user-expanded (``_populated``), inject the
+        ``[open this folder]`` row that :meth:`_populate_folder` had
+        skipped at expand time.
+        """
+        data = node.data
+        if not isinstance(data, _FolderRow) or data.path != path:
+            return
+        if data.loadable == loadable:
+            return
+        data.loadable = loadable
+        node.set_label(_format_folder_label(path, loadable))
+        if loadable and data._populated:
+            self._inject_open_row(node, path)
+
+    def _inject_open_row(
+        self,
+        node: TreeNode[_PickerRow],
+        path: Path,
+    ) -> None:
+        """Insert ``[open this folder]`` at the head of ``node``'s
+        children, after a ``[parent folder]`` row when present.
+
+        Late insertion happens when the worker flips ``loadable`` from
+        ``False`` to ``True`` on an already-populated node; the user
+        would otherwise have no commit row even though the green flag
+        promises one.
+        """
+        # Skip when already present (defensive against double-insert
+        # if a flip-back-and-forth ever occurs).
+        for child in node.children:
+            if isinstance(child.data, _OpenFolderRow):
+                return
+        insert_index = 0
+        for child in node.children:
+            if isinstance(child.data, _ParentFolderRow):
+                insert_index = 1
+                break
+        node.add_leaf(
+            Text("[open this folder]", style=_GREEN_STYLE),
+            data=_OpenFolderRow(path),
+            before=insert_index,
+        )
 
     def on_tree_node_selected(
         self, event: Tree.NodeSelected[_PickerRow]
@@ -262,11 +385,31 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
             self._rebase(parent)
 
     def _rebase(self, new_root: Path) -> None:
-        """Reseed the tree at ``new_root`` (used by parent-folder nav)."""
+        """Reseed the tree at ``new_root`` (used by parent-folder nav).
+
+        Cancels the scheduler's worker first + flushes its queue so
+        probes targeting the now-cleared subtree do not race the
+        re-mount. The scheduler's path caches survive the rebase so
+        navigation back to a previously-scanned subtree paints cached
+        greens immediately without re-probing.
+        """
         self._start_path = new_root
         tree = self._tree
+        # Cancel + flush BEFORE clearing so an in-flight probe cannot
+        # write a stale label onto a node that we are about to
+        # detach.
+        self._scan_scheduler.cancel_and_reset()
         tree.clear()
         self._seed_root(tree)
+        self._scan_scheduler.start()
+
+    def dismiss(  # type: ignore[override]
+        self,
+        result: Optional[Path] = None,
+    ):
+        """Dismiss the modal, tearing the scan scheduler down first."""
+        self._scan_scheduler.shutdown()
+        return super().dismiss(result)
 
 
 def _format_folder_label(path: Path, loadable: bool, *, full: bool = False) -> Text:
