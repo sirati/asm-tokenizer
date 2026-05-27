@@ -405,11 +405,18 @@ def test_folder_picker_green_marks_loadable_subdir():
 def test_folder_picker_open_this_folder_present_at_root():
     """The picker root shows an ``[open this folder]`` row before any
     subfolders, so the user can commit the current level without
-    drilling."""
+    drilling. The row is gated on the root being loadable (see commit
+    ``16f0cae``: ``[open this folder]`` only mounts when the folder
+    actually holds data), so the test seeds a function-names sidecar
+    to satisfy :func:`is_loadable_for_any`.
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
+            # Make ``base`` itself loadable so the [open this folder]
+            # row is present at root.
+            (base / "foo_function_names.txt").write_text("")
             (base / "sub_a").mkdir()
             log_path = base / "tui.log"
             app = _build_app(
@@ -422,25 +429,31 @@ def test_folder_picker_open_this_folder_present_at_root():
                 from textual.widgets import Tree
                 from tokenizer.inspector._app._binary_switcher._folder_picker import (
                     _OpenFolderRow,
+                    _ParentFolderRow,
                 )
 
                 tree = dialog.query_one("#picker-tree", Tree)
                 children = list(tree.root.children)
                 assert len(children) >= 2
-                # First child is [open this folder].
-                assert isinstance(children[0].data, _OpenFolderRow)
-                assert children[0].data.path == base
+                # Layout: [parent folder] (root has a parent) then
+                # [open this folder] then the subfolders.
+                assert isinstance(children[0].data, _ParentFolderRow)
+                assert isinstance(children[1].data, _OpenFolderRow)
+                assert children[1].data.path == base
 
     asyncio.run(runner())
 
 
 def test_folder_picker_open_this_folder_dismisses_with_path():
     """Selecting ``[open this folder]`` dismisses with the enclosing
-    folder's path."""
+    folder's path. The row only mounts when the folder is loadable,
+    so the test seeds a sidecar to materialise it.
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
+            (base / "foo_function_names.txt").write_text("")
             log_path = base / "tui.log"
             app = _build_app(
                 log_path, path=base, provider=LoaderProvider.MEMMAP
@@ -472,13 +485,22 @@ def test_folder_picker_open_this_folder_dismisses_with_path():
 
 def test_folder_picker_subfolder_expansion_recursively_offers_open():
     """Expanding a subfolder shows ITS own ``[open this folder]`` row
-    + its subfolders, so the user can drill arbitrarily deep."""
+    + its subfolders, so the user can drill arbitrarily deep. ``mid``
+    needs to be loadable for the row to mount (post-``16f0cae``), so
+    a sidecar is seeded under it.
+    """
 
     async def runner() -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             mid = base / "mid"
             mid.mkdir()
+            # Make ``mid`` loadable so its [open this folder] row is
+            # materialised. The worker may flip ``mid.loadable`` from
+            # False to True asynchronously -- ``pilot.pause()`` drains
+            # the scan queue so the row is mounted by the time we
+            # inspect ``mid_node.children``.
+            (mid / "foo_function_names.txt").write_text("")
             inner = mid / "inner"
             inner.mkdir()
             log_path = base / "tui.log"
@@ -515,6 +537,214 @@ def test_folder_picker_subfolder_expansion_recursively_offers_open():
                     if isinstance(c.data, _FolderRow) and c.data.path == inner
                 ]
                 assert len(inner_rows) == 1
+
+    asyncio.run(runner())
+
+
+def test_folder_picker_children_mounted_before_loadable_probe():
+    """Per-child ``loadable`` flags are probed asynchronously: the
+    tree-mount step lands every child with ``loadable=False`` BEFORE
+    the scan worker flips them, so a slow probe cannot freeze the UI.
+
+    Patches the scheduler's :func:`is_loadable_for_any` binding to
+    return ``False`` while gated; the picker's row-mount step uses
+    the scheduler's cache so children appear non-green even though
+    the real verdict for ``with_data`` is loadable. Opening the gate
+    + forcing a re-scan flips the real verdict in.
+    """
+    from unittest.mock import patch
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            loadable = base / "with_data"
+            loadable.mkdir()
+            (loadable / "foo_function_names.txt").write_text("")
+            empty = base / "without_data"
+            empty.mkdir()
+            log_path = base / "tui.log"
+            app = _build_app(
+                log_path, path=base, provider=LoaderProvider.MEMMAP
+            )
+
+            gate = asyncio.Event()
+            from tokenizer.inspector._app._binary_switcher import (
+                _folder_scan_scheduler as sched_mod,
+            )
+            real_probe = sched_mod.is_loadable_for_any
+
+            def _gated_probe(path: Path) -> bool:
+                if not gate.is_set():
+                    return False  # behave as not-loadable while gated
+                return real_probe(path)
+
+            with patch.object(sched_mod, "is_loadable_for_any", _gated_probe):
+                async with app.run_test() as pilot:
+                    dialog = FolderPickerDialog(start_path=base)
+                    await app.push_screen(dialog)
+                    # Immediately inspect: children should be mounted
+                    # but every loadable flag still False (worker has
+                    # not yet flipped them; gate keeps the verdict
+                    # ``False``).
+                    await pilot.pause()
+                    from textual.widgets import Tree
+                    from tokenizer.inspector._app._binary_switcher._folder_picker import (
+                        _FolderRow,
+                    )
+
+                    tree = dialog.query_one("#picker-tree", Tree)
+                    children_by_path = {
+                        child.data.path: child
+                        for child in tree.root.children
+                        if isinstance(child.data, _FolderRow)
+                    }
+                    assert loadable in children_by_path
+                    assert empty in children_by_path
+                    # Gate is closed: every child mounted as not
+                    # loadable irrespective of the real verdict.
+                    assert children_by_path[loadable].data.loadable is False
+                    assert children_by_path[empty].data.loadable is False
+
+                    # Open the gate. Force a fresh populate by
+                    # clearing the cache the worker built up and re-
+                    # enqueueing via :meth:`_rebase` to the same root.
+                    gate.set()
+                    dialog._scan_scheduler._known_green.clear()
+                    dialog._scan_scheduler._fully_checked.clear()
+                    dialog._rebase(base)
+                    await pilot.pause()
+
+                    tree2 = dialog.query_one("#picker-tree", Tree)
+                    children_by_path = {
+                        child.data.path: child
+                        for child in tree2.root.children
+                        if isinstance(child.data, _FolderRow)
+                    }
+                    assert children_by_path[loadable].data.loadable is True
+                    assert children_by_path[empty].data.loadable is False
+
+    asyncio.run(runner())
+
+
+def test_folder_picker_known_green_cache_survives_rebase():
+    """``_known_green`` survives :meth:`_rebase`: navigating up to a
+    parent then back down to the original root paints the cached
+    green child without re-probing.
+
+    Uses a nested temp dir so the rebase-up parent has a small,
+    bounded child set (otherwise rebasing to ``/tmp`` would race the
+    scheduler's drain against the test's ``pilot.pause``).
+    """
+    from unittest.mock import patch
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as outer_td:
+            outer = Path(outer_td)
+            base = outer / "picker_root"
+            base.mkdir()
+            child = base / "data_child"
+            child.mkdir()
+            (child / "foo_function_names.txt").write_text("")
+            log_path = outer / "tui.log"
+            app = _build_app(
+                log_path, path=base, provider=LoaderProvider.MEMMAP
+            )
+
+            from tokenizer.inspector._app._binary_switcher import (
+                _folder_picker as picker_mod,
+                _folder_scan_scheduler as sched_mod,
+            )
+            calls_picker: list[Path] = []
+            calls_sched: list[Path] = []
+            real_probe_picker = picker_mod.is_loadable_for_any
+            real_probe_sched = sched_mod.is_loadable_for_any
+
+            def _counting_probe_picker(path: Path) -> bool:
+                calls_picker.append(path)
+                return real_probe_picker(path)
+
+            def _counting_probe_sched(path: Path) -> bool:
+                calls_sched.append(path)
+                return real_probe_sched(path)
+
+            with (
+                patch.object(picker_mod, "is_loadable_for_any", _counting_probe_picker),
+                patch.object(sched_mod, "is_loadable_for_any", _counting_probe_sched),
+            ):
+                async with app.run_test() as pilot:
+                    dialog = FolderPickerDialog(start_path=base)
+                    await app.push_screen(dialog)
+                    await pilot.pause()
+                    # First scan probed ``child`` via the scheduler;
+                    # assert the scheduler's session cache recorded it.
+                    assert dialog._scan_scheduler.is_known_green(child)
+                    probes_child_initial = [p for p in calls_sched if p == child]
+                    assert len(probes_child_initial) >= 1
+
+                    # Rebase up + back down to ``base``: the cache
+                    # should mount ``child`` as green WITHOUT a fresh
+                    # probe of ``child`` from either probe site.
+                    parent = base.parent
+                    if parent == base:
+                        return  # filesystem root: skip
+                    calls_picker.clear()
+                    calls_sched.clear()
+                    dialog._rebase(parent)
+                    await pilot.pause()
+                    dialog._rebase(base)
+                    await pilot.pause()
+
+                    # No probe of ``child`` should have run during
+                    # the rebase round-trip (cache hit).
+                    assert child not in calls_picker
+                    assert child not in calls_sched
+
+                    # Look up the freshly-mounted child node.
+                    from textual.widgets import Tree
+                    from tokenizer.inspector._app._binary_switcher._folder_picker import (
+                        _FolderRow,
+                    )
+                    tree = dialog.query_one("#picker-tree", Tree)
+                    child_node = next(
+                        c
+                        for c in tree.root.children
+                        if isinstance(c.data, _FolderRow)
+                        and c.data.path == child
+                    )
+                    # Cache made it green at mount time, no re-probe
+                    # needed.
+                    assert child_node.data.loadable is True
+
+    asyncio.run(runner())
+
+
+def test_folder_picker_caches_cleared_on_dismiss():
+    """:meth:`dismiss` drops both session caches so the next dialog
+    starts cold (filesystem may have changed in between).
+    """
+
+    async def runner() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            child = base / "data_child"
+            child.mkdir()
+            (child / "foo_function_names.txt").write_text("")
+            log_path = base / "tui.log"
+            app = _build_app(
+                log_path, path=base, provider=LoaderProvider.MEMMAP
+            )
+            async with app.run_test() as pilot:
+                dialog = FolderPickerDialog(start_path=base)
+                await app.push_screen(dialog)
+                await pilot.pause()
+                scheduler = dialog._scan_scheduler
+                assert scheduler.is_known_green(child)
+                assert scheduler._worker is not None
+                dialog.dismiss(None)
+                # Caches dropped; worker cancelled.
+                assert scheduler._known_green == set()
+                assert scheduler._fully_checked == set()
+                assert scheduler._worker is None
 
     asyncio.run(runner())
 
