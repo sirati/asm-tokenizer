@@ -29,7 +29,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container
-from textual.widgets import Input
+from textual.widgets import Input, Label
 
 from ._search_match import first_function_match
 
@@ -86,12 +86,18 @@ class SearchBar(Container):
         # lives on this widget; resets on each :meth:`open` call.
         Binding("up", "history_prev", "Previous history entry", show=False),
         Binding("down", "history_next", "Next history entry", show=False),
+        # ctrl+n / ctrl+shift+n cycle matches while the bar is focused;
+        # plain n / shift+n would conflict with typeable text in the
+        # Input. The App-level bindings accept both forms when the bar
+        # is closed.
+        Binding("ctrl+n", "search_next", "Next match", show=True),
+        Binding("ctrl+shift+n", "search_prev", "Previous match", show=True),
     ]
 
     DEFAULT_CSS: ClassVar[str] = """
     SearchBar {
         display: none;
-        height: 3;
+        height: 4;
         dock: bottom;
         background: $panel;
     }
@@ -100,6 +106,11 @@ class SearchBar(Container):
     }
     SearchBar > Input {
         height: 3;
+    }
+    SearchBar > #search-hint {
+        color: $text-muted;
+        height: 1;
+        padding: 0 1;
     }
     """
 
@@ -122,6 +133,10 @@ class SearchBar(Container):
         yield Input(
             placeholder="search function name (Enter to jump, Esc to cancel)",
             id=_SEARCH_INPUT_ID,
+        )
+        yield Label(
+            "Ctrl+N next match  Ctrl+Shift+N previous  (n / N also work outside the search)",
+            id="search-hint",
         )
 
     # --- public API: called from the App's action shim -----------------
@@ -216,6 +231,18 @@ class SearchBar(Container):
             # Already at the oldest entry -- no-op.
             return
         self._set_input_value(history[self._history_index])
+
+    def action_search_next(self) -> None:
+        """Bound to ctrl+n: cycle to the next search match (App helper)."""
+        action = getattr(self.app, "action_search_next", None)
+        if callable(action):
+            action()
+
+    def action_search_prev(self) -> None:
+        """Bound to ctrl+shift+n: cycle to the previous match (App helper)."""
+        action = getattr(self.app, "action_search_prev", None)
+        if callable(action):
+            action()
 
     def action_history_next(self) -> None:
         """Bound to Down: replace the Input with the next (newer) entry.

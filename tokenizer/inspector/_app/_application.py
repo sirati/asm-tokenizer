@@ -227,13 +227,14 @@ class InspectorApp(App[None]):
         # in textual), so the action only fires while the tree has
         # focus -- which is the only context where stepping makes
         # sense anyway.
-        Binding("n", "search_next", "Next match", show=True),
+        Binding("n,ctrl+n", "search_next", "Next match", show=True),
         # Capital ``N`` is the literal key Textual delivers when the
         # user holds Shift; the binding system keys off the raw key
         # string (terminals don't send a "shift+n" prefix for letter
         # keys), so we register against ``N`` directly. Mirrors the
-        # vim ``N`` previous-search convention.
-        Binding("N", "search_prev", "Previous match", show=True),
+        # vim ``N`` previous-search convention. ``ctrl+shift+n`` is
+        # the ctrl variant for symmetry with the search-bar bindings.
+        Binding("N,ctrl+shift+n", "search_prev", "Previous match", show=True),
         Binding("h", "open_help", "Help", show=True),
         Binding("o", "open_order_dialog", "Order", show=True),
         Binding("f", "open_filter_dialog", "Filter", show=True),
