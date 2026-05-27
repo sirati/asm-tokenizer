@@ -19,15 +19,17 @@ construction time -- the per-variant CSV's own vocab travels with the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Tuple
+from typing import Dict, FrozenSet, Mapping, Tuple
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.parsed_record_iter import ParsedRecord
 from tokenizer.function_token_list import FunctionTokenList
+from tokenizer.inspector._render._protocol import BlockKind
 from tokenizer.inspector._render._render_block import partition_call_target_kinds
 from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
 
+from ._block_header import block_header
 from ._ftl_section_view import (
     FtlSectionView,
     build_section_view_from_record,
@@ -36,6 +38,7 @@ from ._ftl_section_view import (
 
 __all__ = [
     "VariantState",
+    "body_block_idxs_for_blocks",
     "build_variant_state",
 ]
 
@@ -71,6 +74,15 @@ class VariantState:
     name. ``line_to_provider`` maps the 1-indexed EXTERN slot (matching
     ``FtlCallTarget.function_section_ptr`` for EXTERN entries) to its
     library string; LOCAL / PLT slots are absent.
+
+    ``body_block_idxs`` is the set of :attr:`BlockKind.BODY` header
+    Ns across ``blocks`` -- the addressable jump-target namespace for
+    this variant. Cached at parse time alongside ``blocks`` so the
+    inline-jump resolvability gate
+    (:mod:`tokenizer.inspector._render._jump_validity`) reads it as a
+    typed argument rather than re-walking the headers on every
+    :meth:`FtlBackend.render_block` call (mirrors how
+    ``kind_to_called_idx`` is precomputed once per variant).
     """
 
     record: ParsedRecord
@@ -81,6 +93,7 @@ class VariantState:
     kind_to_called_idx: Mapping[CallTargetType, list[int]]
     line_to_name: Mapping[int, str]
     line_to_provider: Mapping[int, str]
+    body_block_idxs: FrozenSet[int]
 
 
 def build_variant_state(
@@ -116,6 +129,7 @@ def build_variant_state(
         vocab_manager=vocab,
     )
     blocks = tuple(ftl.iter_blocks(transient=False))
+    body_block_idxs = body_block_idxs_for_blocks(blocks)
     line_to_name: Dict[int, str] = {
         flat_idx: name for flat_idx, (name, _ct) in enumerate(record.called_funcs)
     }
@@ -131,7 +145,28 @@ def build_variant_state(
         kind_to_called_idx=kind_to_called_idx,
         line_to_name=line_to_name,
         line_to_provider=line_to_provider,
+        body_block_idxs=body_block_idxs,
     )
+
+
+def body_block_idxs_for_blocks(
+    blocks: Tuple[BlockTokenList, ...],
+) -> FrozenSet[int]:
+    """Collect the addressable :attr:`BlockKind.BODY` header Ns.
+
+    A jump target is resolvable iff its ``target_block_idx`` appears
+    here -- :meth:`FtlBackend.render_block` looks up by
+    ``(BlockKind.BODY, block_idx)`` against the same set of headers
+    and only succeeds on a match. JUMP_TABLE-kind blocks live in a
+    distinct identity namespace (the JUMP_TABLE Ns) and never serve
+    as :class:`InlineJumpEntry` targets, so they are excluded.
+    """
+    body_ns: set[int] = set()
+    for blk in blocks:
+        kind, n = block_header(blk)
+        if kind is BlockKind.BODY:
+            body_ns.add(n)
+    return frozenset(body_ns)
 
 
 def _build_line_to_provider(

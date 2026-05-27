@@ -25,6 +25,9 @@ from tokenizer.inspector._render._protocol import (
     RenderedBlock,
     RenderedVariant,
 )
+from tokenizer.inspector._render._jump_validity import (
+    filter_unresolvable_jump_openables_in_lines,
+)
 from tokenizer.inspector._render._render_block import render_block
 from tokenizer.variant_info import VariantInfo
 from tokenizer.variant_tokens.prefixes import (
@@ -247,7 +250,7 @@ class FtlBackend:
         # emits with ``variant_idx == MISSING_VARIANT_INDEX`` so
         # :meth:`InlineCallNode.expand` falls through to the
         # all-variants surface.
-        return render_block(
+        lines = render_block(
             block=body_block_view(block),
             section=state.view,
             kind_to_called_idx=state.kind_to_called_idx,
@@ -255,6 +258,21 @@ class FtlBackend:
             line_to_name=state.line_to_name,
             line_to_provider=state.line_to_provider,
             callee_arm_resolver=_no_callee_arm,
+        )
+        # Inline-jump openable validity gate: writer-side BLOCK
+        # identities are a superset of body-block ids (jump-table
+        # targets may name addresses with no body block in this
+        # variant -- see
+        # :mod:`tokenizer.inspector._render._jump_validity` for the
+        # writer-side root cause). Filtering at the render boundary
+        # means the tree model never constructs an
+        # :class:`InlineJumpNode` for an unresolvable target -- no
+        # defensive try/except around the openable expand path
+        # needed. Mirrors the BatchDecodeBackend's
+        # :func:`._batch_decode_backend._jump_validity.filter_unresolvable_jump_openables`
+        # post-walk pass.
+        return filter_unresolvable_jump_openables_in_lines(
+            lines, state.body_block_idxs,
         )
 
     @staticmethod
