@@ -40,7 +40,12 @@ from . import _filter_hooks, _order_hooks
 from ._auto_expand import collapse_single_child_chains
 from ._filter import FilterConfig, FilterResult, function_has_passing_variants
 from ._help_dialog import HelpScreen
-from ._labels import _ERR_STYLE, _compose_label, _compose_label_filtered_out
+from ._labels import (
+    _BLOCK_KIND_INDEXED_PREFIXES,
+    _ERR_STYLE,
+    _compose_label,
+    _compose_label_filtered_out,
+)
 from ._menu_bar import Alignment, MenuBar, MenuItem
 from ._node_path import CapturedExpandState
 from ._order import AxisKind, OrderConfig, OrderResult, VariantGroupNode
@@ -106,6 +111,42 @@ def _stamp_aligned_variant_labels(
     )
     for variant, label in zip(variants, aligned):
         variant.aligned_label = label
+
+
+def _stamp_aligned_block_prefix_width(children: list[Node]) -> None:
+    """Stamp ``BlockNode.aligned_prefix_width`` across a sibling set.
+
+    Single concern: when an expand handler hands back a sibling set
+    containing :class:`BlockNode` rows of the indexed kinds (BODY /
+    JUMP_TABLE), compute the maximum width of the
+    ``"<prefix>: <idx>"`` chunk across the indexed siblings and stamp
+    it onto each indexed node so the label composer left-pads to that
+    width — guaranteeing every row's preview suffix starts at the
+    same column. Heterogeneous sibling sets are tolerated: the
+    non-indexed kinds (VARIANT_HEADER / FUNCTION_ID) carry their own
+    fixed-string labels and are skipped here (they keep
+    ``aligned_prefix_width = None``).
+
+    Threading the width through a node-side typed int field keeps the
+    label composer (:func:`_block_node_label`) per-node and unaware of
+    the sibling set — preserving its single-concern shape (mirror of
+    the variant-axis :func:`_stamp_aligned_variant_labels` pattern).
+
+    Empty or all-non-indexed sibling sets are a no-op.
+    """
+    indexed_blocks = [
+        c
+        for c in children
+        if isinstance(c, BlockNode) and c.kind in _BLOCK_KIND_INDEXED_PREFIXES
+    ]
+    if not indexed_blocks:
+        return
+    width = max(
+        len(f"{_BLOCK_KIND_INDEXED_PREFIXES[b.kind]}: {b.block_idx}")
+        for b in indexed_blocks
+    )
+    for block in indexed_blocks:
+        block.aligned_prefix_width = width
 
 
 def _collect_suppressed_axes(
@@ -395,6 +436,16 @@ class InspectorApp(App[None]):
         children = _order_hooks.apply_grouping(self, model, children)
         suppressed_axes = _collect_suppressed_axes(node)
         _stamp_aligned_variant_labels(children, suppressed_axes)
+        # Block-row sibling-set column alignment: when ``model`` is a
+        # :class:`VariantNode` its expand hands back a mix of block
+        # kinds; the indexed kinds (BODY / JUMP_TABLE) carry numeric
+        # suffixes of variable width. Stamping the per-sibling-set max
+        # width onto each indexed node lets the label composer left-
+        # pad the ``"<prefix>: <idx>"`` chunk so every row's preview
+        # suffix starts at the same column. Mirrors the variant-axis
+        # stamp above; the helper is a no-op for non-block / non-
+        # indexed sibling sets.
+        _stamp_aligned_block_prefix_width(children)
 
         for child in children:
             node.add(
