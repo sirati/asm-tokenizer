@@ -129,6 +129,12 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         Binding("escape", "cancel", "Cancel", show=True),
         Binding("enter", "pick_highlighted", "Pick", show=True),
         Binding("backspace", "go_up", "Parent folder", show=True),
+        Binding(
+            "shift+down", "jump_green_next", "Next green sibling", show=True
+        ),
+        Binding(
+            "shift+up", "jump_green_prev", "Previous green sibling", show=True
+        ),
     ]
 
     BINDING_GROUP_TITLE: ClassVar[str] = "Folder picker"
@@ -390,6 +396,53 @@ class FolderPickerDialog(ModalScreen[Optional[Path]]):
         parent = self._start_path.parent
         if parent != self._start_path:
             self._rebase(parent)
+
+    def action_jump_green_next(self) -> None:
+        """shift+down: move cursor to the next green sibling at this level."""
+        self._jump_green(offset=1)
+
+    def action_jump_green_prev(self) -> None:
+        """shift+up: move cursor to the previous green sibling at this level."""
+        self._jump_green(offset=-1)
+
+    def _jump_green(self, *, offset: int) -> None:
+        """Move the cursor to the next/prev loadable sibling at the same level.
+
+        Walks the cursor's parent's children list in the given direction;
+        the first :class:`_FolderRow` whose ``loadable`` flag is ``True``
+        becomes the new cursor target. No-op when no green sibling exists
+        in the chosen direction; non-folder cursor positions
+        (``[parent folder]`` / ``[open this folder]``) anchor to the
+        root's children for the walk so the binding stays useful from
+        the top of the dialog.
+        """
+        tree = self._tree
+        cursor = tree.cursor_node
+        if cursor is None:
+            return
+        # The cursor's siblings == its parent's children. For a cursor on
+        # the root's [parent folder] / [open this folder] meta-rows the
+        # siblings are still the root's children (folder rows + meta);
+        # the filter below skips the meta-rows so the walk only visits
+        # _FolderRow entries.
+        parent = cursor.parent if cursor is not tree.root else tree.root
+        if parent is None:
+            return
+        siblings = list(parent.children)
+        try:
+            start = siblings.index(cursor)
+        except ValueError:
+            return
+        i = start + offset
+        while 0 <= i < len(siblings):
+            sibling = siblings[i]
+            data = sibling.data
+            if isinstance(data, _FolderRow) and data.loadable:
+                tree.call_after_refresh(
+                    tree.move_cursor, sibling, animate=False
+                )
+                return
+            i += offset
 
     def _rebase(self, new_root: Path) -> None:
         """Reseed the tree at ``new_root`` (used by parent-folder nav).
