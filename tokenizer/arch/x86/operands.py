@@ -260,14 +260,9 @@ def tokenize_operand_memory(
                 fp_postfix_type=fp_postfix,
             )
             tokens.extend(disp_token)
-        # For larger displacements, check if pointing to known constant or code or opaque
-        # NOTE: this mirrors the pre-D.3 behavior verbatim (a second emission
-        # path runs unconditionally below). The double-emission for
-        # ``force_opaque`` displacements is a pre-existing quirk; D.3 only
-        # migrates the lookup return type.
-        meta = lookup.lookup(classified_value)
+        # For larger displacements, check if pointing to known constant or code or opaque.
         # Check if displacement is in text section or outside function bounds
-        if (text_start <= classified_value < text_end) or (classified_value < func_min_addr or classified_value > func_max_addr):
+        elif (text_start <= classified_value < text_end) or (classified_value < func_min_addr or classified_value > func_max_addr):
             disp_token = constant_handler.process_constant_v2(
                 classified_value,
                 meta=meta,
