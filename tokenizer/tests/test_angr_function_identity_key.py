@@ -96,7 +96,7 @@ def test_identity_key_external_when_both_flags_true() -> None:
 def test_identity_key_none_when_imported_name_is_empty() -> None:
     """Defensive: a PLT stub with an empty-string name (a CLE edge
     case for stripped binaries) declines to assert identity — an
-    empty suffix would produce ``<raw_name>@thunk:`` which is not a
+    empty suffix would produce ``<raw_name>@:thunk`` which is not a
     useful disambiguator."""
     func = _MockAngrFunction(name="", is_plt=True)
     assert _angr_identity_key(func) is None

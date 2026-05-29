@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import angr
 
 from tokenizer.disasm import DisassemblyProvider, MetadataLookup
+from tokenizer.disasm.angr_provider.function_identity import _angr_identity_key
 from tokenizer.disasm.angr_provider.op_classify import _resolve_architecture
 from tokenizer.disasm.angr_provider.views import _AngrFunctionView
 from tokenizer.disasm.types import Architecture, FunctionView
+from tokenizer.function_deduper import canonical_function_name
 
 
 # Re-exports of the angr-side MetadataLookup. The lookup class itself is
@@ -117,7 +119,20 @@ class AngrDisassemblyProvider(DisassemblyProvider):
         ``copy.deepcopy(view)`` the snapshot.
         """
         assert self.cfg is not None, "CFG not built yet -- call build_cfg() first"
-        for func_addr, func in sorted(self.cfg.functions.items(), key=lambda item: item[1].name):
+        # Sort by the CANONICAL name (the same string main_loop derives
+        # from the view's three identity axes), not the raw angr name: a
+        # thunk's canonical name is its identity key, which the raw name
+        # does not track. The view mirrors these axes — its ``name`` is
+        # ``str(func.name)``, its ``comment`` is unconditionally None, and
+        # its ``identity_key`` is ``_angr_identity_key(func)`` — so the
+        # key below reproduces the canonical main_loop will recompute.
+        def _canonical_sort_key(item: tuple[int, Any]) -> str:
+            func = item[1]
+            return canonical_function_name(
+                str(func.name), None, _angr_identity_key(func)
+            )
+
+        for func_addr, func in sorted(self.cfg.functions.items(), key=_canonical_sort_key):
             func_name = func.name
             if func_name in ("UnresolvableCallTarget", "UnresolvableJumpTarget"):
                 continue

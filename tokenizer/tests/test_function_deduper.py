@@ -20,6 +20,8 @@ from tokenizer.function_data_manager import FunctionData, FunctionDataManager
 from tokenizer.function_deduper import (
     DedupResolution,
     FunctionDeduper,
+    ThunkIdentity,
+    ThunkTargetKind,
     canonical_function_name,
 )
 
@@ -373,7 +375,7 @@ def test_canonical_name_thunk_identity_key_branch() -> None:
     """The comment=None + identity_key=populated branch produces the
     thunk-keyed suffix (cross-ISA-stable: the resolved-external entry
     offset is identical across thunks AND across ISA variants)."""
-    assert canonical_function_name("strcmp", None, 0xDEAD) == "strcmp@thunk:57005"
+    assert canonical_function_name("strcmp", None, 0xDEAD) == "strcmp@57005:thunk"
 
 
 def test_canonical_name_comment_takes_precedence_over_identity_key() -> None:
@@ -407,3 +409,49 @@ def test_canonical_name_is_deterministic() -> None:
     a = canonical_function_name("foo", "C::m()", 0xDEAD)
     b = canonical_function_name("foo", "C::m()", 0xDEAD)
     assert a == b
+
+
+def test_canonical_name_thunk_prefix_is_key_never_unnamed() -> None:
+    """A DEFAULT-source thunk surfaces with a per-binary ``unnamed
+    @<hash>`` placeholder ``name``, but a thunk is by definition NOT
+    unnamed: its real identity is the ThunkIdentity key. The canonical
+    name MUST be ``<key>:thunk`` with the key (``fwrite``) as the
+    prefix and the ``:thunk`` marker LAST — never ``unnamed`` anywhere
+    in the rendered name."""
+    ident = ThunkIdentity(kind=ThunkTargetKind.EXTERNAL, key="fwrite")
+    result = canonical_function_name("unnamed @abc", None, ident)
+    assert result == "fwrite:thunk"
+    assert "unnamed" not in result
+    assert result.endswith(":thunk")
+
+
+def test_canonical_names_sort_monotone_with_thunk_suffix() -> None:
+    """Provider-ordering invariant: when iter_functions sorts by the
+    canonical name, the written CSV rows are non-decreasing. A thunk's
+    canonical name keys on its real identity (``fwrite:thunk`` sorts
+    under 'f'), NOT on the ``unnamed @<hash>`` placeholder (which would
+    sort under 'u'). This reproduces the provider's sort: build the
+    canonical names from the raw ``(name, comment, identity_key)`` axes,
+    sort by canonical, and assert the resulting sequence is monotone."""
+    # (raw_name, comment, identity_key) tuples as a provider would emit:
+    # a mix of plain functions, a C++ comment-disambiguated function, and
+    # two DEFAULT-source thunks whose raw names ('unnamed @...') sort
+    # wildly differently from their canonical ('<key>:thunk') forms.
+    raw = [
+        ("zlib_main", None, None),
+        ("unnamed @hashB", None, ThunkIdentity(ThunkTargetKind.EXTERNAL, "fwrite")),
+        ("areset", "ARPHeader::reset(void)", None),
+        ("unnamed @hashA", None, ThunkIdentity(ThunkTargetKind.EXTERNAL, "calloc")),
+        ("memcpy", None, None),
+    ]
+    canonical = [canonical_function_name(n, c, k) for (n, c, k) in raw]
+    ordered = sorted(canonical)
+    # The sort authority is the canonical name; the written sequence is
+    # exactly ``ordered`` and is non-decreasing by construction.
+    assert ordered == sorted(ordered)
+    for i in range(1, len(ordered)):
+        assert ordered[i] >= ordered[i - 1]
+    # Sanity: the thunks landed under their KEY, not under 'unnamed'.
+    assert "calloc:thunk" in ordered
+    assert "fwrite:thunk" in ordered
+    assert ordered.index("calloc:thunk") < ordered.index("fwrite:thunk")

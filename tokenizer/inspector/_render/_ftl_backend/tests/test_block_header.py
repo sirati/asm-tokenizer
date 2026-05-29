@@ -96,7 +96,7 @@ def test_block_header_reads_kind_and_n_from_body_block_header_pair() -> None:
 
 
 def test_block_header_reads_jump_table_kind_and_id() -> None:
-    """User-observed crash on real arm32 exit@thunk:exit:
+    """User-observed crash on real arm32 exit@exit:thunk:
     ``ValueError("block does not open with [BLOCK_DEF, BLOCK_V2] ...")``
     fired because the gate rejected jump-table footer blocks. The
     gate must accept both BLOCK_V2 + JUMP_TABLE as valid second-token

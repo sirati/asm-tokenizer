@@ -129,7 +129,7 @@ def test_ghidra_view_name_is_canonical_when_identity_key_set() -> None:
         name="strcmp",
         identity_key=0xDEAD,
     )
-    assert view.name == "strcmp@thunk:57005"
+    assert view.name == "strcmp@57005:thunk"
     assert view.comment is None
     assert view.identity_key == 0xDEAD
 

@@ -76,7 +76,8 @@ from typing import Dict, Hashable, Optional, Tuple
 # Cross-binary-stable identity for PLT thunks. The provider extracts a
 # ``ThunkIdentity`` from each thunk Function it sees; the deduper hashes
 # it as part of the identity tuple; ``canonical_function_name`` renders
-# its ``key`` field as the ``@thunk:<...>`` suffix. The ``kind`` axis
+# its ``key`` field as the ``<key>:thunk`` name (key first, marker last).
+# The ``kind`` axis
 # distinguishes external- vs local-target thunks in equality so a local
 # offset that happens to lexically equal an external symbol name cannot
 # collide.
@@ -107,7 +108,8 @@ class ThunkIdentity:
 
     Hashable (frozen dataclass); used by :class:`FunctionDeduper` as the
     third identity axis and by :func:`canonical_function_name` as the
-    ``@thunk:<key>`` suffix source. Both axes (``kind``, ``key``) are
+    ``<key>:thunk`` name source (the ``key`` is the rendered prefix; the
+    ``:thunk`` marker trails it). Both axes (``kind``, ``key``) are
     part of equality so two thunks with the same key but different
     target kinds (e.g. EXTERNAL ``"calloc"`` vs LOCAL ``"calloc"``)
     correctly count as distinct identities.
@@ -237,19 +239,21 @@ def canonical_function_name(
       Ghidra ``Function``s with ``name=='reset'``); the demangled
       signature is the natural cross-ISA-stable disambiguator.
     * ``comment`` is None AND ``identity_key`` populated ->
-      ``f"thunk:{sanitised_key}"`` when the identity is a typed
+      ``f"{sanitised_key}:thunk"`` when the identity is a typed
       :class:`ThunkIdentity`. The ``name`` axis carries no cross-
       binary signal in the thunk case (it's either the resolved
       target's name — redundant with the key, or a per-binary
       placeholder rename — actively destabilising), so it is dropped.
-      The suffix comes from the :class:`ThunkIdentity` ``key`` field
+      The prefix comes from the :class:`ThunkIdentity` ``key`` field
       (the imported symbol name for external-target thunks — cross-
       binary stable; the target function name for named local-target
       thunks — also cross-binary stable; a hex offset for unnamed
-      local targets — within-binary stable only). Legacy callers
-      passing a bare integer fall through to ``f"{name}@thunk:{int}"``
-      — they pre-date the typed identity and the prefix-drop is
-      gated on the dataclass isinstance check.
+      local targets — within-binary stable only). The ``:thunk``
+      marker trails the key so the name sorts under the thunk's real
+      identity (a thunk is never ``unnamed``). Legacy callers passing
+      a bare integer fall through to ``f"{name}@{int}:thunk"`` — they
+      pre-date the typed identity and the prefix-drop is gated on the
+      dataclass isinstance check.
     * Both None -> ``name`` verbatim. The deduper's body-divergence
       diagnostic and the FDM's positional ``_N`` allocator are the only
       callers that touch this branch's downstream disambiguation (which
@@ -273,14 +277,21 @@ def canonical_function_name(
             # axis is either redundant (Ghidra resolved name = target
             # name), uninformative (per-binary ``unnamed @<hash>``
             # placeholder rename), or a custom alias preserved
-            # separately on the deduper's identity tuple. Collapsing
-            # here makes thunk renderings cross-binary stable provided
-            # the :class:`ThunkIdentity` itself is — the provider's
-            # contract for EXTERNAL and named-target LOCAL thunks.
-            return f"thunk:{suffix}"
+            # separately on the deduper's identity tuple. The
+            # :class:`ThunkIdentity` ``key`` is the thunk's TRUE
+            # identity (the imported symbol, a named local target, or a
+            # hex offset — never ``unnamed``), so it becomes the name
+            # prefix and the ``:thunk`` marker trails it. This makes
+            # thunk renderings cross-binary stable provided the
+            # :class:`ThunkIdentity` itself is — the provider's contract
+            # for EXTERNAL and named-target LOCAL thunks — and keeps them
+            # sorted under their real identity, not under the ``unnamed``
+            # placeholder.
+            return f"{suffix}:thunk"
         # Legacy bare-int identity_key path (pre-typed callers;
-        # preserved for back-compat).
-        return f"{name}@thunk:{suffix}"
+        # preserved for back-compat). The marker trails the ``name@key``
+        # body to match the typed suffix form.
+        return f"{name}@{suffix}:thunk"
     return name
 
 
