@@ -147,6 +147,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-cargo-vendor": {
+      "locked": {
+        "lastModified": 1779560665,
+        "narHash": "sha256-tpyBcxPpcQb8ukyNF7DoCwfSY3VPsxHoYwj00Cayv5o=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "64c08a7ca051951c8eae34e3e3cb1e202fe36786",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "nixpkgs_2": {
       "locked": {
         "lastModified": 1767313136,
@@ -185,7 +201,8 @@
         "dynamic-runner": "dynamic-runner",
         "gitignore": "gitignore",
         "nix-docker-layered-image": "nix-docker-layered-image",
-        "nixpkgs": "nixpkgs_3"
+        "nixpkgs": "nixpkgs_3",
+        "nixpkgs-cargo-vendor": "nixpkgs-cargo-vendor"
       }
     },
     "rust-overlay": {
