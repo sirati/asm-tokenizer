@@ -91,6 +91,21 @@
         });
       };
 
+      # crates.io began returning HTTP 403 for the default `python-requests/*`
+      # User-Agent that this nixpkgs pin's `fetch-cargo-vendor-util` sends, so
+      # the dynamic-runner wheel's `rustPlatform.fetchCargoVendor` staging
+      # download fails for every crate (rust-lang/crates.io#13482). The fix
+      # (set an identifying UA, nixpkgs PR #512735) hadn't reached this pin
+      # (nor nixos-unstable at the time); bumping nixpkgs would cascade into
+      # the ghidra-12.0/angr/pyghidra pins this flake deliberately holds.
+      # Instead override `fetchCargoVendor` to use a local copy of the vendor
+      # helper carrying the one-line UA patch.
+      cargoVendorUserAgentOverlay = final: prev: {
+        rustPlatform = prev.rustPlatform // {
+          fetchCargoVendor = prev.buildPackages.callPackage ./nix/fetch-cargo-vendor/fetch-cargo-vendor.nix { };
+        };
+      };
+
       pkgsFor =
         system:
         import nixpkgs {
@@ -98,6 +113,7 @@
           overlays = [
             pyghidraOverlay
             ghidraOverlay
+            cargoVendorUserAgentOverlay
             # Injects `dynamic-runner` into every Python package set,
             # so `pkgs.python314.pkgs.dynamic-runner` is in scope.
             dynamic-runner.overlays.default
