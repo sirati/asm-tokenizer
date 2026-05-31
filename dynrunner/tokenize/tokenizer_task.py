@@ -260,6 +260,11 @@ class TokenizerTask:
                     compiler=variant.compiler,
                     version=variant.compiler_version,
                     opt_level=variant.opt,
+                    # The variant discriminator: sidecar builds sharing
+                    # the canonical-5 differ only here, so it's required
+                    # to keep `identifier_key()` (→ task_id) unique —
+                    # the same `variant_id` the output filename uses.
+                    variant_id=variant.variant_id,
                 )
                 yield TaskInfo(
                     path=wire_path,

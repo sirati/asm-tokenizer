@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tokenizer.variant_info import format_variant_id_suffix
+
 
 _OUTPUT_CSV_SUFFIX = "_output.csv"
 
@@ -67,9 +69,7 @@ def format_output_basename(
     byte (legacy output paths stay invariant).
     """
     base = f"{arch}-{compiler}-{compiler_version}-{opt}_{pkg}"
-    if variant_id == 0:
-        return base
-    return f"{base}__{variant_id:08x}"
+    return f"{base}{format_variant_id_suffix(variant_id)}"
 
 
 def format_output_csv_filename(

@@ -385,6 +385,23 @@ def _coerce_extra_value(value: Any) -> str:
     return str(value)
 
 
+def format_variant_id_suffix(variant_id: int) -> str:
+    """Render the optional ``__<8hex>`` variant suffix.
+
+    Forward-pair of :func:`split_variant_id_suffix` and the single
+    source of truth for the suffix's rendered form. ``variant_id == 0``
+    (legacy / non-sidecar binaries) renders to the empty string so those
+    identities stay byte-for-byte invariant; a non-zero ``variant_id``
+    (sidecar variants sharing the canonical-4 axes) renders
+    ``__<variant_id:08x>``. Both the output-filename basename and the
+    per-task ``identifier_key`` append this, so a task id and its output
+    files carry the SAME variant discriminator.
+    """
+    if variant_id == 0:
+        return ""
+    return f"__{variant_id:08x}"
+
+
 def split_variant_id_suffix(binary_name: str) -> tuple[str, int]:
     """Peel the optional ``__<8hex>`` variant suffix.
 
