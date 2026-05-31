@@ -32,15 +32,13 @@ from tokenizer.disasm.ghidra_provider.switch_table_walker import (
     walk_switch_tables_for_function,
 )
 from tokenizer.disasm.ghidra_views.function import (
-    _ghidra_function_comment,
-    _ghidra_identity_key,
+    FunctionIdentity,
+    _derive_function_identity,
 )
 from tokenizer.disasm.ghidra_views.unnamed_rename import (
     compute_binary_identity_hash,
-    placeholder_renamed_name,
 )
 from tokenizer.disasm.types import FpType
-from tokenizer.function_deduper import canonical_function_name
 
 
 # ---------------------------------------------------------------------------
@@ -309,43 +307,31 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             decode=decode,
             block_model=block_model,
             monitor=monitor,
-            binary_id_hash=self._binary_id_hash,
         )
         self._function_view = function_view
 
-        # Collect + sort by canonical name. The DEFAULT-source
-        # placeholder rename is applied here so the same name flows
-        # through every downstream channel — the
-        # ``duplicate_function_dump`` collision detector, the yielded
-        # tuple's ``name`` slot, and ``function_view.name``. The sort key
-        # itself is the CANONICAL name (built below into
-        # ``canonical_by_addr``), not the raw renamed name: a thunk's
-        # canonical name is its real identity key, which the raw name
-        # does not track, so a raw-name sort would emit CSV rows out of
-        # alphabetical order. See
-        # ``tokenizer.disasm.ghidra_views.unnamed_rename`` for the
-        # rename rationale + scheme.
+        # Collect + sort by canonical name. This loop is the SINGLE site
+        # that derives a function's identity axes: the DEFAULT-source
+        # placeholder rename (``FUN_<hex>`` → opaque ``unnamed @<hash>``;
+        # see ``tokenizer.disasm.ghidra_views.unnamed_rename``), the plate
+        # comment, the thunk identity_key, and the canonical name built
+        # from those three. The sort MUST key on the canonical name, not
+        # the raw renamed name: a thunk's canonical name is its real
+        # identity key, which the raw name does not track, so a raw-name
+        # sort would emit CSV rows out of alphabetical order.
+        #
+        # The derived ``FunctionIdentity`` is threaded into the reused
+        # view via ``_advance`` and read back by ``main_loop`` as
+        # ``func.canonical_name`` — there is ONE canonical string, so the
+        # sort key and the name written to CSV column 0 are the same
+        # object by construction (no second derivation to keep in sync).
         funcs: list[tuple[int, str, Any]] = []
-        # Canonical name per entry-point, derived from the SAME three
-        # identity axes ``main_loop`` will feed ``canonical_function_name``
-        # (the placeholder-renamed name, the plate comment, the thunk
-        # identity_key). The yielded tuple keeps the raw renamed ``name``
-        # slot unchanged; this side map only drives the sort below so the
-        # written CSV rows land in canonical-name order (a thunk's
-        # canonical name is its real key, which the raw name does NOT
-        # track — hence the sort must key on the canonical, not the raw
-        # name). main_loop recomputes the identical canonical from the
-        # view, so the order it writes matches this sort exactly.
-        canonical_by_addr: dict[int, str] = {}
+        identity_by_addr: dict[int, FunctionIdentity] = {}
         for func in self._fm.getFunctions(True):
-            raw_name = str(func.getName())
-            source = func.getSymbol().getSource()
-            name = placeholder_renamed_name(raw_name, source, self._binary_id_hash)
             addr = int(func.getEntryPoint().getOffset())
-            comment = _ghidra_function_comment(func)
-            identity_key = _ghidra_identity_key(func)
-            canonical_by_addr[addr] = canonical_function_name(name, comment, identity_key)
-            funcs.append((addr, name, func))
+            identity = _derive_function_identity(func, self._binary_id_hash)
+            identity_by_addr[addr] = identity
+            funcs.append((addr, identity.name, func))
 
         # Optional debug dump: when the provider was constructed with a
         # ``duplicate_function_dump_path``, hand the collected funcs
@@ -368,7 +354,9 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # re-iterate get a fresh map, no stale entries).
         self._funcs_by_entry = {}
 
-        for addr, name, ghidra_func in sorted(funcs, key=lambda t: canonical_by_addr[t[0]]):
+        for addr, name, ghidra_func in sorted(
+            funcs, key=lambda t: identity_by_addr[t[0]].canonical_name
+        ):
             body = ghidra_func.getBody()
             block_iter = block_model.getCodeBlocksContaining(body, monitor)
 
@@ -383,14 +371,13 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             if block_count == 0:
                 continue
 
-            function_view._advance(ghidra_func, block_count)
+            function_view._advance(ghidra_func, block_count, identity_by_addr[addr])
             self._funcs_by_entry[addr] = ghidra_func
             # ``name`` is the post-``placeholder_renamed_name`` value
-            # collected above, so the yielded tuple's ``name`` slot
-            # matches ``function_view.name`` — both downstream channels
-            # (``main_loop`` -> ``canonical_function_name`` reads the
-            # tuple slot; the view reads its cursor) see the same
-            # rename.
+            # collected above (== ``function_view.name`` == the
+            # ``identity_by_addr`` record's ``name``). main_loop reads the
+            # already-derived ``function_view.canonical_name``; the raw
+            # ``name`` slot is kept for log / diagnostic call sites only.
             yield addr, name, function_view
 
     # ----------------------------------------------------------------------

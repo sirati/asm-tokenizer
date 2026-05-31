@@ -695,15 +695,17 @@ class _AngrFunctionView:
     ``tokenizer/disasm/types.py``).
     """
 
-    __slots__ = ("_func", "_arch", "_blocks")
+    __slots__ = ("_func", "_arch", "_blocks", "_canonical_name")
 
     def __init__(self, arch: Architecture) -> None:
         self._func: Any = None
         self._arch: Architecture = arch
         self._blocks = _AngrBlocksView(_AngrBlockView(arch))
+        self._canonical_name: str = ""
 
-    def _set(self, func: Any) -> None:
+    def _set(self, func: Any, canonical_name: str) -> None:
         self._func = func
+        self._canonical_name = canonical_name
         self._blocks._set(func)
 
     @property
@@ -755,7 +757,14 @@ class _AngrFunctionView:
         # ``tokenizer/disasm/types.py``).
         return None
 
+    @property
+    def canonical_name(self) -> str:
+        # Derived once by the provider's iter_functions (to sort by it)
+        # and threaded in via ``_set`` — see ``FunctionView.canonical_name``
+        # contract in ``tokenizer/disasm/types.py``.
+        return self._canonical_name
+
     def __deepcopy__(self, memo) -> "_AngrFunctionView":
         clone = _AngrFunctionView(self._arch)
-        clone._set(self._func)
+        clone._set(self._func, self._canonical_name)
         return clone

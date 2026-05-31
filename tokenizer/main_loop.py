@@ -14,7 +14,7 @@ from dynrunner.tokenize import TokenizerPhase
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
-from tokenizer.function_deduper import FunctionDeduper, canonical_function_name
+from tokenizer.function_deduper import FunctionDeduper
 from tokenizer.function_filter import FunctionFilter
 from tokenizer.function_range_sidecar import FunctionRangeSidecar
 from tokenizer.function_token_list import FunctionTokenList
@@ -356,19 +356,20 @@ def main_loop(
                     tokens_base64 = ndarray_to_base64(tokenized_instructions)
                     block_base64 = ndarray_to_base64(block_run_lengths)
                     insn_base64 = ndarray_to_base64(insn_run_lengths)
-                    # Canonical-name derivation (cross-ISA-stable): the
-                    # CSV column 0, the occurrence sentinel, and the
-                    # function-names sidecar all consume the canonical
-                    # name produced from the same three identity axes
-                    # the deduper consults. ``func_name`` (the raw
-                    # provider name) is preserved only for log /
-                    # diagnostic call sites below; never written to the
-                    # output.
+                    # Canonical-name (cross-ISA-stable) for CSV column 0,
+                    # the occurrence sentinel, and the function-names
+                    # sidecar. The provider already derived it (from the
+                    # same three identity axes) to sort by it, and threaded
+                    # it onto the view — read it back rather than
+                    # recomputing, so the sort key and the written name are
+                    # the SAME string by construction. ``comment`` /
+                    # ``identity_key`` are still read for the deduper's
+                    # identity tuple below; ``func_name`` (the raw provider
+                    # name) is preserved only for log / diagnostic call
+                    # sites; never written to the output.
                     identity_key = getattr(func, "identity_key", None)
                     comment = getattr(func, "comment", None)
-                    canonical_name = canonical_function_name(
-                        func_name, comment, identity_key
-                    )
+                    canonical_name = func.canonical_name
                     if prev_func_name == canonical_name:
                         occurence += 1
                     else:

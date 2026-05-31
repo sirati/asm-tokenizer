@@ -119,22 +119,27 @@ class AngrDisassemblyProvider(DisassemblyProvider):
         ``copy.deepcopy(view)`` the snapshot.
         """
         assert self.cfg is not None, "CFG not built yet -- call build_cfg() first"
-        # Sort by the CANONICAL name (the same string main_loop derives
-        # from the view's three identity axes), not the raw angr name: a
-        # thunk's canonical name is its identity key, which the raw name
-        # does not track. The view mirrors these axes — its ``name`` is
-        # ``str(func.name)``, its ``comment`` is unconditionally None, and
-        # its ``identity_key`` is ``_angr_identity_key(func)`` — so the
-        # key below reproduces the canonical main_loop will recompute.
-        def _canonical_sort_key(item: tuple[int, Any]) -> str:
-            func = item[1]
-            return canonical_function_name(
+        # Derive each function's CANONICAL name ONCE — the provider must,
+        # to sort by it: a thunk's canonical name is its identity key,
+        # which the raw angr name does not track, so a raw-name sort would
+        # emit CSV rows out of alphabetical order. The angr view mirrors
+        # the three identity axes (``name`` = ``str(func.name)``,
+        # ``comment`` unconditionally None, ``identity_key`` =
+        # ``_angr_identity_key(func)``). The derived string is threaded
+        # onto the cursor via ``_set`` and read back by ``main_loop`` as
+        # ``func.canonical_name`` — one string, sort key == written name.
+        canonical_by_addr: dict[int, str] = {
+            func_addr: canonical_function_name(
                 str(func.name), None, _angr_identity_key(func)
             )
+            for func_addr, func in self.cfg.functions.items()
+        }
 
-        for func_addr, func in sorted(self.cfg.functions.items(), key=_canonical_sort_key):
+        for func_addr, func in sorted(
+            self.cfg.functions.items(), key=lambda item: canonical_by_addr[item[0]]
+        ):
             func_name = func.name
             if func_name in ("UnresolvableCallTarget", "UnresolvableJumpTarget"):
                 continue
-            self._function_cursor._set(func)
+            self._function_cursor._set(func, canonical_by_addr[func_addr])
             yield func_addr, func_name, self._function_cursor

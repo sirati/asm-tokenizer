@@ -31,7 +31,10 @@ from typing import Any
 
 import pytest
 
-from tokenizer.disasm.ghidra_views.function import _GhidraFunctionView
+from tokenizer.disasm.ghidra_views.function import (
+    _GhidraFunctionView,
+    _derive_function_identity,
+)
 from tokenizer.disasm.ghidra_views.unnamed_rename import (
     PLACEHOLDER_PREFIX,
     placeholder_renamed_name,
@@ -102,14 +105,14 @@ class _MockFunction:
         return self._entry
 
 
-def _make_view(binary_id_hash: bytes) -> _GhidraFunctionView:
+def _make_view() -> _GhidraFunctionView:
     """Construct a function view skeleton with stubbed provider state.
 
-    The fields the rename code path touches are ``_binary_id_hash``,
-    ``_ghidra_function``, ``_entry``, ``_name``; the block-iteration
-    machinery is not exercised here. ``program/listing/reg_map/...``
-    can be ``None`` because ``_advance`` does not touch them on the
-    rename hot path.
+    The view is now a pure carrier: ``_advance`` stores the pre-derived
+    :class:`FunctionIdentity` and touches only ``_ghidra_function`` /
+    ``_entry`` / ``_block_count``. ``program/listing/reg_map/...`` can be
+    ``None`` because they are only read by the block-iteration machinery,
+    not exercised here.
     """
     return _GhidraFunctionView(
         arch=None,  # type: ignore[arg-type]
@@ -119,7 +122,6 @@ def _make_view(binary_id_hash: bytes) -> _GhidraFunctionView:
         decode=None,
         block_model=None,
         monitor=None,
-        binary_id_hash=binary_id_hash,
     )
 
 
@@ -212,52 +214,66 @@ def test_collision_with_real_symbol_structurally_impossible() -> None:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: ``_GhidraFunctionView._advance`` applies the rename.
+# End-to-end: the provider derives the rename via
+# ``_derive_function_identity`` and threads it into the view, which
+# surfaces it verbatim as ``view.name`` / ``view.canonical_name``.
 # ---------------------------------------------------------------------------
 
 
 def test_view_advance_renames_default_source_function() -> None:
-    """The view-layer integration: a DEFAULT-source function backing
-    the cursor surfaces the renamed label as ``view.name``."""
-    view = _make_view(_HASH_A)
+    """A DEFAULT-source function backing the cursor surfaces the renamed
+    label as ``view.name`` (derived once by the provider step,
+    threaded through ``_advance``)."""
+    view = _make_view()
     func = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
-    view._advance(func, block_count=1)
+    view._advance(func, 1, _derive_function_identity(func, _HASH_A))
     assert view.name.startswith(PLACEHOLDER_PREFIX)
     assert view.entry == 0x10000
 
 
 def test_view_advance_preserves_real_symbol_name() -> None:
-    """The view-layer integration: a real-symbol function passes
-    through with its name intact."""
-    view = _make_view(_HASH_A)
+    """A real-symbol function passes through with its name intact."""
+    view = _make_view()
     func = _MockFunction(name="memcpy", source=_IMPORTED, entry=0x401000)
-    view._advance(func, block_count=1)
+    view._advance(func, 1, _derive_function_identity(func, _HASH_A))
     assert view.name == "memcpy"
 
 
 def test_view_advance_same_view_two_default_functions_distinct() -> None:
     """Re-advance the cursor over two DEFAULT-source functions in
     the same binary: two distinct names."""
-    view = _make_view(_HASH_A)
+    view = _make_view()
     func_a = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
     func_b = _MockFunction(name="FUN_00020000", source=_DEFAULT, entry=0x20000)
-    view._advance(func_a, block_count=1)
+    view._advance(func_a, 1, _derive_function_identity(func_a, _HASH_A))
     name_a = view.name
-    view._advance(func_b, block_count=1)
+    view._advance(func_b, 1, _derive_function_identity(func_b, _HASH_A))
     name_b = view.name
     assert name_a != name_b
 
 
 def test_view_advance_cross_binary_same_default_function_distinct() -> None:
-    """Two view instances bound to two different binaries (different
-    identity hashes) see two different renamed labels for the same
-    raw placeholder."""
-    view_a = _make_view(_HASH_A)
-    view_b = _make_view(_HASH_B)
+    """The same raw placeholder derived against two different binary
+    identity hashes yields two different renamed labels."""
+    view_a = _make_view()
+    view_b = _make_view()
     func = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
-    view_a._advance(func, block_count=1)
-    view_b._advance(func, block_count=1)
+    view_a._advance(func, 1, _derive_function_identity(func, _HASH_A))
+    view_b._advance(func, 1, _derive_function_identity(func, _HASH_B))
     assert view_a.name != view_b.name
+
+
+def test_view_carries_canonical_name_from_identity() -> None:
+    """The view surfaces ``canonical_name`` from the threaded
+    :class:`FunctionIdentity` verbatim — it does NOT recompute. For a
+    non-thunk DEFAULT placeholder (no comment, no identity_key) the
+    canonical name IS the renamed name."""
+    view = _make_view()
+    func = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
+    identity = _derive_function_identity(func, _HASH_A)
+    view._advance(func, 1, identity)
+    assert view.canonical_name == identity.canonical_name
+    assert view.canonical_name == view.name == identity.name
 
 
 # ---------------------------------------------------------------------------

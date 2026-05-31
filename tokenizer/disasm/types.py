@@ -512,6 +512,17 @@ class FunctionView(Protocol):
     # for C/asm symbols). The angr/Capstone path lacks the demangler
     # hook and returns ``None`` unconditionally.
 
+    @property
+    def canonical_name(self) -> str: ...
+    # The cross-ISA-stable on-disk function name, derived from the three
+    # identity axes above via
+    # :func:`tokenizer.function_deduper.canonical_function_name`. The
+    # PROVIDER derives this once (it must, to sort its functions by it)
+    # and threads it onto the view; consumers (``main_loop``'s CSV
+    # column 0 / occurrence sentinel / function-names sidecar) read it
+    # rather than recomputing, so the provider's sort order and the
+    # written name are the same string by construction.
+
     def __deepcopy__(self, memo) -> "FunctionView": ...
 
 

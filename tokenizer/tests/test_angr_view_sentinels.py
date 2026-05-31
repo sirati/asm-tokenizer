@@ -41,7 +41,10 @@ class _MockAngrFunction:
 
 def _make_view_with_func(func: Any) -> _AngrFunctionView:
     view = _AngrFunctionView(Architecture.X86)
-    view._set(func)
+    # ``canonical_name`` is derived + threaded by the provider; these
+    # sentinel tests exercise entry/name/identity_key/comment, so any
+    # placeholder is fine here.
+    view._set(func, canonical_name="")
     return view
 
 
