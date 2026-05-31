@@ -67,7 +67,6 @@
     "loope",
     "loopne",
     "mov",
-    "lea",
     "push",
     "pop",
     "cmp",
