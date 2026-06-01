@@ -4,6 +4,7 @@ from typing import List
 from tokenizer.arch.operands_base import tokenize_operand_immediate_generic, tokenize_operand_memory_base_disp
 from tokenizer.arch.provider import ArchitectureProvider
 from tokenizer.constant_handler import ConstantHandler
+from tokenizer.disasm.resolved_target_policy import should_honor_resolved_target
 from tokenizer.disasm.types import InstructionView, OperandKind
 from tokenizer.instruction_sets import InstructionSets
 from tokenizer.token_manager import VocabularyManager
@@ -49,6 +50,31 @@ class RISCVProvider(ArchitectureProvider):
             if op.kind == OperandKind.REG:
                 reg = op.reg
                 insn_tokens.append(vocab_manager.get_registry_token(reg.name, reg.id))
+                # RISC-V ``lui``/``addi`` high+low halves build an
+                # absolute address; Ghidra attaches the combined resolved
+                # data target as a DATA ref on the ``addi`` terminal's
+                # destination REG operand. The keep/drop policy
+                # (``resolved_target_policy``) owns the per-ISA pair-
+                # terminal allow-list; mirror the arm32 REG-side consumer.
+                resolved_target = op.resolved_target
+                if resolved_target is not None:
+                    meta = lookup.lookup(resolved_target)
+                    if should_honor_resolved_target(
+                        meta=meta,
+                        resolved_target=resolved_target,
+                        func_min_addr=func_min_addr,
+                        func_max_addr=func_max_addr,
+                        arch=reg.arch,
+                        base_mnemonic=insn.base_mnemonic,
+                        has_load_store=insn.has_load_store,
+                    ):
+                        insn_tokens.extend(
+                            constant_handler.process_constant_v2(
+                                resolved_target,
+                                meta=meta,
+                                is_arithmetic=False,
+                            )
+                        )
             elif op.kind == OperandKind.IMM:
                 insn_tokens.extend(
                     tokenize_operand_immediate_generic(
