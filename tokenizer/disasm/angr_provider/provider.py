@@ -9,7 +9,6 @@ to avoid a module-load cycle).
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -57,47 +56,6 @@ class AngrDisassemblyProvider(DisassemblyProvider):
             if section.name == ".text":
                 return section.vaddr, section.vaddr + section.memsize
         return 0, 0
-
-    def parse_data_sections(
-        self,
-        sections: list[str] | None = None,
-        output_csv_path: str | None = None,
-    ) -> dict[str, list[str]]:
-        if sections is None:
-            sections = [".rodata"]
-
-        all_entries = []
-        addr_dict: dict[str, list[str]] = {}
-
-        for sec in self.project.loader.main_object.sections:
-            if sec.name not in sections:
-                continue
-            if sec.name == ".rodata" and sec.is_readable and sec.memsize > 0:
-                data = self.project.loader.memory.load(sec.vaddr, sec.memsize)
-                for match in re.finditer(b"[\x20-\x7e]{4,}\x00", data):
-                    s = match.group().rstrip(b"\x00").decode("utf-8", errors="ignore")
-                    start = sec.vaddr + match.start()
-                    entry = {
-                        "section": ".rodata",
-                        "start": hex(start),
-                        "end": hex(start + len(s) + 1),
-                        "value": f'"{s}"',
-                    }
-                    all_entries.append(entry)
-                    addr_dict[entry["start"]] = [entry["end"], entry["section"], entry["value"]]
-
-        if output_csv_path:
-            csv_path = Path(output_csv_path)
-            consts_path = csv_path.parent / f"{csv_path.stem.replace('_output', '')}_consts.txt"
-        else:
-            consts_path = Path("parsed_constants.txt")
-
-        with open(consts_path, "w") as f:
-            for e in all_entries:
-                f.write(f"{e['start']} - {e['end']}: {e['section']}: {e['value']}\n")
-
-        print(f"Parsed {len(all_entries)} .rodata constants with exact addresses into {consts_path}")
-        return addr_dict
 
     def create_metadata_lookup(self) -> MetadataLookup:
         # Lazy import keeps the ``angr_provider`` <-> ``address_meta_data_lookup``

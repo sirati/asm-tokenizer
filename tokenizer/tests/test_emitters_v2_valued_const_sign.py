@@ -6,7 +6,7 @@ values become ``[Valued_Const_V2(|v|), Value_Negative()]`` (plus an
 optional FP postfix); non-negative values become ``[Valued_Const_V2(v)]``.
 
 These tests construct a minimal handler (no ``TokenResolver`` /
-``constant_dict`` / ``block_ranges``) because the fallback emitter only
+``block_ranges``) because the fallback emitter only
 touches ``self.vocab_manager`` and the (inherited) ``_postfix_fp_annotation``
 helper — no resolver state, no block ranges. Bypassing
 ``ConstantHandler.__init__`` via ``__new__`` keeps the fixture surface

@@ -57,9 +57,8 @@ def handler(vm: VocabularyManager) -> ConstantHandler:
     being removed, so the full v2 entry point must remain reachable for
     the test to exercise the post-refactor path end-to-end."""
     resolver = TokenResolver()
-    constant_dict: dict[str, list[str]] = {}
     block_ranges = np.empty((0, 2), dtype=np.uint64)
-    return ConstantHandler(vm, resolver, constant_dict, block_ranges)
+    return ConstantHandler(vm, resolver, block_ranges)
 
 
 class _UnknownLookup:

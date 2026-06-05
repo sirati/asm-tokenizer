@@ -8,7 +8,6 @@ surface (stubs that raise ``NotImplementedError``). Composed into
 The mixin assumes the composed subclass exposes:
 - ``self.vocab_manager`` (``VocabularyManager``)
 - ``self.resolver`` (``TokenResolver``)
-- ``self.constant_dict`` (``Dict[str, List[str]]``)
 - ``self.block_ranges`` (``numpy.ndarray``)
 - ``self.opaque_const_tokens`` / ``self.opaque_const_usage`` /
   ``self.opaque_metadata`` (v1 in-memory state).
@@ -77,7 +76,7 @@ class _V1LegacyMixin:
             is_arithmetic = True
 
         # Small-constant / arithmetic short-circuit (legacy 0..0xFF rule).
-        if is_arithmetic or 0x00 <= value <= 0xFF or value in self.constant_dict:
+        if is_arithmetic or 0x00 <= value <= 0xFF:
             return [self.vocab_manager.Valued_Const(value)]
 
         match_mask = (self.block_ranges[:, 0] <= value) & (value < self.block_ranges[:, 1])

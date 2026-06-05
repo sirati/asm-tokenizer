@@ -58,12 +58,10 @@ class ConstantHandler(_V1LegacyMixin, _V2EmittersMixin):
         self,
         vocab_manager: VocabularyManager,
         resolver: TokenResolver,
-        constant_dict: Dict[str, List[str]],
         block_ranges: np.ndarray,
     ):
         self.vocab_manager = vocab_manager
         self.resolver = resolver
-        self.constant_dict = constant_dict
         self.block_ranges = block_ranges
 
         # v1 legacy state -- kept until Phase 1.C.3 migrates all callers

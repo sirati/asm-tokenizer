@@ -19,10 +19,9 @@ from tokenizer.disasm.metadata import (
 )
 from tokenizer.function_deduper import canonical_function_name
 
-# ASCII printable run of length >=4 terminated by NUL byte.
-# Mirrors the heuristic in tokenizer/disasm/angr_provider.py:parse_data_sections;
-# v2's string sidecar is built there, but the metadata-lookup also needs
-# per-address `is_string` membership so the classifier can emit `string_ptr`
+# ASCII printable run of length >=4 terminated by NUL byte. The
+# metadata-lookup owns this heuristic: it provides per-address
+# `is_string` membership so the classifier can emit `string_ptr`
 # at precedence step 7 on the angr path. UTF-16 / Pascal / non-ASCII strings
 # are out of scope here per `tokenizer/disasm/angr_limitations.md`.
 _ASCII_STRING_RE = re.compile(rb"[\x20-\x7e]{4,}\x00")

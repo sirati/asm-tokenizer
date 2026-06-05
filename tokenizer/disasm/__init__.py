@@ -79,13 +79,6 @@ class DisassemblyProvider(ABC):
     def get_text_section_bounds(self) -> tuple[int, int]: ...
 
     @abstractmethod
-    def parse_data_sections(
-        self,
-        sections: list[str] | None = None,
-        output_csv_path: str | None = None,
-    ) -> dict[str, list[str]]: ...
-
-    @abstractmethod
     def create_metadata_lookup(self) -> MetadataLookup: ...
 
     @abstractmethod

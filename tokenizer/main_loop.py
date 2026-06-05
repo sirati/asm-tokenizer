@@ -170,7 +170,6 @@ def build_vocab_tokenize_and_index(
 def main_loop(
     instr_sets,
     provider,
-    constant_list,
     func_addr_range,
     func_disas,
     func_disas_token,
@@ -279,7 +278,6 @@ def main_loop(
                         func_addr=func_addr,
                         func=func,
                         instr_sets=instr_sets,
-                        constant_dict=constant_list,
                         lookup=lookup,
                         text_start=text_start,
                         text_end=text_end,

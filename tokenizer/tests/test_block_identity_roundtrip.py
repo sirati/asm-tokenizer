@@ -81,7 +81,7 @@ def test_block_def_and_intra_function_jump_share_identity():
     # Empty block_ranges: ConstantHandler only consults it from the
     # legacy v1 path; the v2 precedence walk under test does not.
     block_ranges = np.empty((0, 2), dtype=np.uint64)
-    handler = ConstantHandler(vm, resolver, {}, block_ranges)
+    handler = ConstantHandler(vm, resolver, block_ranges)
 
     # The block's typed address. Production code at
     # ``fill_constant_candidates.py`` now reads ``block.addr`` (an int)
@@ -191,7 +191,6 @@ def test_fill_constant_candidates_block_def_uses_int_cache_key():
         func_addr=block_a_addr,
         func=func,
         instr_sets=None,
-        constant_dict={},
         lookup=None,
         text_start=0,
         text_end=0x10000,
@@ -219,7 +218,7 @@ def test_fill_constant_candidates_block_def_uses_int_cache_key():
     # body and != start_addr, so ``_pred_block`` (precedence step 4)
     # fires -> ``_emit_block``.
     block_ranges = np.empty((0, 2), dtype=np.uint64)
-    handler = ConstantHandler(vm, resolver, {}, block_ranges)
+    handler = ConstantHandler(vm, resolver, block_ranges)
     ref_tokens = handler.process_constant_v2(
         block_b_addr,
         meta=_make_local_function_meta(func_start=block_a_addr),
@@ -259,7 +258,7 @@ def test_jump_table_target_shares_identity_with_intra_function_jump():
     vm = VocabularyManager(platform="x86_64", format_version=2)
     resolver = TokenResolver()
     block_ranges = np.empty((0, 2), dtype=np.uint64)
-    handler = ConstantHandler(vm, resolver, {}, block_ranges)
+    handler = ConstantHandler(vm, resolver, block_ranges)
 
     target_addr = 0x2200
 

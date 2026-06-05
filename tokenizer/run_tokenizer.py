@@ -48,8 +48,8 @@ def _write_meta_sidecar(
     """Persist the per-variant metadata next to the staged CSV.
 
     The file is written into the staging dir so ``staged_publish``'s
-    rglob picks it up alongside the CSV + ``_consts.txt`` and atomic-
-    publishes all three under one transaction. ``output_basename`` is
+    rglob picks it up alongside the CSV and atomic-publishes both
+    under one transaction. ``output_basename`` is
     the canonical-format shared prefix produced by
     ``tokenizer.output_filename.format_output_basename``; the meta
     filename is ``<base>_meta.json`` — paired with ``<base>_output.csv``
@@ -77,7 +77,6 @@ def disassemble_to_tokens(
     binary_name: str,
     platform: Platform,
     provider: DisassemblyProvider,
-    constant_list: dict[str, list[str]],
     csv_path: Path,
     binary_path: Path,
     pickle_mainloop_file_path: Path,
@@ -110,7 +109,6 @@ def disassemble_to_tokens(
         kwargs = dict(
             block_runlength_dict=block_runlength_dict,
             provider=provider,
-            constant_list=constant_list,
             func_addr_range=func_addr_range,
             func_disas=func_disas,
             func_disas_token=func_disas_token,
@@ -128,7 +126,7 @@ def disassemble_to_tokens(
             save_pickle(pickle_mainloop_file_path, kwargs)
 
     else:
-        kwargs.update(dict(provider=provider, constant_list=constant_list))
+        kwargs.update(dict(provider=provider))
         func_names = kwargs["func_names"]
 
     # Wire-format version is selected via the
@@ -383,7 +381,7 @@ def run_tokenizer(
             if kvargs is not None:
                 logger.info(f"Pickle loading time: {time.time() - start_time:.2f} seconds")
 
-    # Stage every output file (CSV + sidecar `_consts.txt`) under
+    # Stage every output file under
     # `/app/out-tmp/<rel>/` and atomic-publish to `out_folder` only
     # after a fully successful tokenization. If the worker is killed
     # mid-write (SLURM time-out, OOM, container SIGKILL), the stage
@@ -418,12 +416,6 @@ def run_tokenizer(
                     file_path,
                     duplicate_function_dump_path=duplicate_function_dump_path,
                 )
-                # `_consts.txt` is derived from `csv_path.parent /
-                # f"{stem.replace('_output', '')}_consts.txt"` in both
-                # providers — by passing the staged csv path here, the
-                # consts.txt lands inside `stage_dir` and gets published
-                # alongside the CSV on clean exit.
-                constants: dict[str, list[str]] = provider.parse_data_sections(output_csv_path=str(csv_path))
                 try:
                     provider.build_cfg()
                 except (IndexError, AssertionError, NotImplementedError) as e:
@@ -439,7 +431,7 @@ def run_tokenizer(
                         f"{type(e).__name__}: {e}"
                     ) from e
 
-                kvargs = dict(provider=provider, constant_list=constants)
+                kvargs = dict(provider=provider)
                 logger.info(f"Preparation stage 1 time: {time.time() - start_time:.2f} seconds")
                 start_time = time.time()
                 if do_pickles:
@@ -483,7 +475,7 @@ def run_tokenizer(
             # build_memmap phase can reconstruct VariantInfo for
             # `_versions.json`. Lives inside `staged_publish` so the
             # rglob-walk picks it up and atomic-publishes it together
-            # with the CSV + `_consts.txt`. Written after a successful
+            # with the CSV. Written after a successful
             # `disassemble_to_tokens` only — partial runs have no
             # metadata sidecar, matching the staging contract that
             # nothing reaches the durable destination on failure.
