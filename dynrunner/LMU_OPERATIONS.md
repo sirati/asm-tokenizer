@@ -14,6 +14,8 @@ If you are a fresh subagent or a future-me reading this after some weeks: read `
 
 ### Setup deadline auto-scales — do NOT pass `--slurm-setup-deadline-secs`
 
+> **9ea95143+ (NOT yet pinned — see "dynamic_runner pin policy" below):** `--slurm-setup-deadline-secs` and the `setup_deadline_secs` kwarg are **removed** (both were already no-ops). The replacement is `unconfigured_deadline_secs` (default **600 s**, the secondary's pre-operational timeout). It is unverified whether the `max(60, jobs*15)` auto-scale below survives the one-mesh refactor or is replaced by the flat 600 s default — **verify during the Tier-0/1 bump validation**, then update this section. asm-tokenizer sets no deadline knob, so current LMU dispatches are unaffected either way.
+
 Since `ba889cd`, the framework auto-computes the per-secondary setup deadline as `max(60, num_secondaries * 15)` (`crates/dynrunner-slurm/src/pipeline.rs::compute_setup_deadline_secs`). The 15s/secondary slope was calibrated against LMU Krater empirical observation. For `--jobs 15` you get 225s automatically; for `--jobs 32` you get 480s. The 60s floor covers `--jobs 1..4`.
 
 Override with `--slurm-setup-deadline-secs N` ONLY if you're on a cluster slower than LMU (or running a probe that intentionally needs to wait longer). On LMU Krater the auto-scaled value is the validated default; do not pass the flag.
@@ -56,6 +58,8 @@ ssh -i ~/.ssh/id_ed25519 kruppb@remote.cip.ifi.lmu.de true
 If `ssh-add -L` says "no identities" that is the 1Password agent's design — auth still works via per-prompt approval. Do not pass `--ssh-identity-file` on LMU — that flag is for slurm-test-env's per-instance keypairs (see "Do NOT confuse" table above).
 
 ## Watching a running dispatch (60s LOCAL wake-tick + sacct fallback)
+
+> **9ea95143+ (not yet pinned):** the local-progress filter grep in step 1 below is for the **current pin**. On 9ea95143+ the dispatcher must run with `--important-stdio-only` (sparse LLM-wake stdout; full log → `DYNRUNNER_FULL_LOG_FILE`; ~10-min periodic status summary), and you arm a persistent **UNFILTERED** Monitor on that stdout instead of grepping (a filter would drop the sparse wake lines). The 60s local wake-tick + one-SSH-`sacct`-on-no-progress liveness logic (steps 3-5) is unchanged. Report regressions to dynrunner-owner with `DYNRUNNER_FULL_LOG_FILE` excerpted.
 
 The watcher runs a 60-second wake-tick loop. The tick itself is **local** — a plain `sleep 60`, NOT an SSH-poll loop (per-tick SSH would thrash the 1Password agent):
 
@@ -158,6 +162,7 @@ The asm-tokenizer flake input `dynamic-runner` is bare (`github:sirati/dynamic-r
 - **`328a78e`** (2026-05-15) — first Tier-3 GREEN end-to-end on LMU Krater `--jobs 15`. Includes the 11-commit fix lineage: sync-walk-aware discovery (`be3e2e9`), args-forwarding through phase chain (`1670e7a`), scale-aware setup-deadline (`ba889cd`), SSH-tunnel stagger + retry on MaxStartups (`d4ad1b7`), chain-gate (`76fe930`), peer-bus ClusterMutation arm (`ad71e83`), peer-repoll on PromotePrimary (`cd729fe`), originator flush rendezvous (`328a78e`). See memory `tier3_green_at_328a78e.md`.
 - **`8ecd382`** (post-rebase) — upstream rebased/re-merged the DAG; `328a78e` is no longer a literal ancestor of main, but `8ecd382` is the equivalent merge (same merge title "Merge handoff/fix-runcomplete-writer-flush-race", same tree hash `834f643a036eec15dc315aa955c12e7fb362d345`). Functionally identical.
 - **`2552f7c`** (2026-05-15) — current main tip at last check. Beyond `8ecd382` it adds: PyO3 codec migration (`2a31304`), secondary subprocess lifecycle migration (`365b649`), PodmanExecWorkerFactory migration (`8315a13`), SLURM submit_job + preparation migration (`612cfe3`, `01849ca`), ErrorType::Unfulfillable wire variant (`a581939`). **Not yet validated on LMU end-to-end** (as of 2026-05-15) — asm-dataset-nix is the canary.
+- **`9ea95143`** (2026-06-03) — one-mesh + typed-secondary-lifecycle refactor (72 commits): submitter folded into one peer mesh (uplink + `ColocatedPrimaryTransport` deleted), role-blind transport, typed `Destination`, role-tagged keepalives, typed `SecondaryLifecycle` FSM, failover unified on the `PrimaryChanged` apply hook (`PromotePrimary` frame retired). **Pin `9ea95143` directly** — a brief same-day stale-cargoHash HOLD was lifted: `Cargo.lock` is byte-identical to the prior `main`, so `cargoDeps`/`cargoHash` is unchanged and a full `nix build .#dynamic-runner` passes; no hash-fix follow-up is coming. Consumer-facing: `--slurm-setup-deadline-secs` / `setup_deadline_secs` removed → `unconfigured_deadline_secs` (default 600 s); asm-tokenizer sets neither. New required test protocol: `--important-stdio-only` + persistent unfiltered Monitor (see `SLURM_RUNBOOK.md` "Pending bump"). `full-primary-on-any-peer` still landing (next publish); bootstrap unchanged until then. Bump tracked as task #102, deferred until the local z3 run finishes. (Note: the actual `flake.lock` pin at time of writing is `26613122`, ahead of `2552f7c`; this history lists lineage markers, not every intermediate bump.)
 
 ### Lineage check rule of thumb
 

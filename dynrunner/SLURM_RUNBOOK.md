@@ -4,33 +4,51 @@ Recipe for running `dynrunner.tokenize` (and `dynrunner.build_memmap`) end-to-en
 
 The intended audience is a fresh subagent or a future-you returning to this after a few weeks. **Follow the commands verbatim.** Do not re-explore the codebase to "figure out" the dispatch flags; this document is the source of truth, and if it disagrees with the framework that's a bug to file (see "When the runbook is wrong" at the end).
 
+## `dynamic_runner` pin: `835f269c` (9ea95143 lineage + 2026-06-05 SLURM-lifecycle fixes)
+
+> `flake.lock` pins `dynamic-runner` at **`835f269c`**. Lineage: `9ea95143 → 6374a2c9 → 347c3b83 → 86e43e6f → 47f4b386 → 835f269c`. The recipe below reflects it.
+>
+> - **Pinned at `835f269c`** (validated on slurm-test-env 2026-06-05): the promoted/co-located secondary-0 self-exits cleanly on run-complete; durable per-role runner logs land at `--log-dir/<secondary_id>/primary.log` + `secondary.log`; PID-safe orphan reaper; submitter-local `--important-stdio-only` scope. Bump with `nix flake update dynamic-runner`.
+> - **Removed knob:** `--slurm-setup-deadline-secs` / `setup_deadline_secs` are gone (were silent no-ops); replaced by `unconfigured_deadline_secs` (default **600 s**). asm-tokenizer sets neither — do not pass the removed flag.
+> - **Required watch protocol (every dynrunner run):** pass **`--important-stdio-only`** (only wake-worthy events hit stdout; the verbose log goes to the `--full-log-file`/`--full-log-dir` targets — the `DYNRUNNER_*` env vars are removed, flags only; a status summary lands on a ~10-min cadence). Because stdout is sparse, **run the dispatch itself, BARE, as the Monitor's command** — its stdout IS the event stream. Wrapping it in anything is forbidden; see "Run the dispatch bare" under "The dispatch command" + the forbidden anti-patterns in "Watching a running dispatch".
+> - **Topology:** under `--source-already-staged` the submitter promotes a setup-secondary to primary and demotes itself to observer — you'll see `primary changed primary=secondary-0`, after which **the submitter exits `rc=0` before cluster-side tokenization finishes** and its stdout goes quiet (post-promotion narration moves to the relocated primary → `--log-dir/secondary-0/primary.log`). **Confirm completion by the gateway output files, not the submitter's exit.**
+
 ## Prerequisites
 
-- Working `nix develop` shell from `/home/sirati/devel/python/asm-tokenizer`. All commands run inside `nix develop --command bash -c "..."` unless explicitly stated otherwise.
+- Working `nix develop` shell from `/home/sirati/devel/python/asm-tokenizer`. The dispatch runs DIRECTLY via `nix develop --command python -m dynrunner …` — **never** wrapped (no `bash -c "…"`, no `cd`, no env-var prefix, no pipe/`tee`, no `timeout`). See "Run the dispatch bare — wrappers are forbidden" under "The dispatch command".
 - `~/.ssh/config` has the `lmu` host alias (or just use `kruppb@remote.cip.ifi.lmu.de` directly). 1Password SSH agent must be unlocked — if the gateway returns `signing failed for ED25519 "LMU CIP SSH Key" from agent: communication with agent failed`, the agent is locked and only the user can unlock it.
-- `flake.lock` pinned to a `dynamic-runner` revision that contains the SLURM-path bug fixes (A–G + 1-9 from the 2026-05-04 lineage; current minimum is `8da909d` from 2026-05-04). Bump with `nix flake update dynamic-runner` and rebuild with `nix build --no-link .#dockerImage`.
+- `flake.lock` pinned to `dynamic-runner` `835f269c` or later (see the pin box above). Bump with `nix flake update dynamic-runner`; the dispatch rebuilds + uploads the image automatically.
 - Image is rebuilt locally (`nix path-info .#dockerImage` → store path of the tar.gz). The runner uploads it via layered-blob transfer; only changed layers re-upload, so this is fast on iteration.
 
 ## The dispatch command
 
-Canonical small-batch dispatch against cluster-resident data (filtered to `minigzipsh` across all 6 platforms / all compilers / all opts; ~235 binaries on the LMU `Dataset-1/zlib/` corpus):
+> ### Run the dispatch BARE — wrappers are forbidden
+>
+> The dispatch is `nix develop --command python -m dynrunner …`, run **DIRECTLY**. When watching it, that exact invocation **IS** the Monitor's command (see "Watching a running dispatch"). NEVER wrap the dispatch in anything:
+> - ❌ `bash -c "…"` / `sh -c` / a `cd &&` prefix
+> - ❌ an env-var prefix (e.g. `DYNRUNNER_*=… python -m dynrunner …`) — those logging env vars are **removed**; use the `--full-log-file` / `--full-log-dir` flags
+> - ❌ `| tee`, any pipe, or `>`/`2>&1` redirect
+> - ❌ `timeout …`
+> - ❌ backgrounding (`&`) + a separate `tail -f` Monitor, or any `while/until … sleep` babysitter / single-fire waiter loop
+>
+> Run it bare; verify after with a ONE-SHOT check (gateway output files + `ps`/`squeue`), never a timed/polling loop. (NB: the framework's own `dynrunner-slurm-wrapper` binary is an internal component the dispatcher uploads — unrelated to this; "no wrappers" means no scaffolding around YOUR `python -m dynrunner` invocation.)
+
+Canonical small-batch dispatch against cluster-resident data (filtered to `minigzipsh` across all 6 platforms / all compilers / all opts; ~235 binaries on the LMU `Dataset-1/zlib/` corpus). Bare, with `--important-stdio-only` — this whole line is what you put in the Monitor:
 
 ```bash
-nix develop --command bash -c '
-  python -m dynrunner --task tokenize \
-    --multi-computer slurm \
-    --packaging podman \
-    --gateway ssh://kruppb@remote.cip.ifi.lmu.de \
-    --slurm-root-folder /home/k/kruppb/BIG/slurm \
-    --source-already-staged /home/k/kruppb/BIG/Dataset-1/zlib \
-    --source /tmp \
-    --output ~/.cache/asm-tokenizer-out-slurm \
-    --name-regex minigzipsh \
-    --platform x86 x64 arm32 arm64 mips32 mips64 \
-    --jobs 1 \
-    --slurm-time-limit 30 \
-    --raw-logs
-' 2>&1 | tee /tmp/dispatch-$(date +%s).log
+nix develop --command python -m dynrunner --task tokenize \
+  --multi-computer slurm \
+  --packaging podman \
+  --gateway ssh://kruppb@remote.cip.ifi.lmu.de \
+  --slurm-root-folder /home/k/kruppb/BIG/slurm \
+  --source-already-staged /home/k/kruppb/BIG/Dataset-1/zlib \
+  --source /tmp \
+  --output ~/.cache/asm-tokenizer-out-slurm \
+  --name-regex minigzipsh \
+  --platform x86 x64 arm32 arm64 mips32 mips64 \
+  --jobs 1 \
+  --slurm-time-limit 30 \
+  --important-stdio-only
 ```
 
 ### Flag-by-flag rationale (do not omit any)
@@ -76,22 +94,43 @@ If your data lives only on your local machine (rare), the framework's `StageFile
 
 ## Watching a running dispatch
 
-The dispatcher emits structured log lines prefixed `INFO | HH:MM:SS |P|` (primary) and `|S0|` (secondary 0). Useful greps for a Monitor (do NOT tail the raw log into your context):
+**The Monitor's command IS the dispatch, run DIRECTLY — nothing wraps it.** Put
+the exact bare `nix develop --command python -m dynrunner … --important-stdio-only`
+invocation from "The dispatch command" above into the Monitor, verbatim — no
+env-var prefix, no `bash -c`/`cd`, no `| tee` or any pipe, no `timeout`, no
+surrounding scaffolding (the full forbidden list is in "Run the dispatch bare"
+above). `--important-stdio-only` makes stdout carry only wake-worthy events
+(`all secondaries connected`, `primary changed`, completion, failures) plus a
+~10-min summary; each line is one Monitor event, and the process exits on its
+own.
 
-```bash
-# Filter monitor — emit only state transitions and clear failure modes
-tail -f /tmp/dispatch-*.log | \
-  grep -E --line-buffered \
-    'Phase [0-9]|Job submitted|Secondary connected|Worker [0-9]+|TaskCompleted|TaskFailed|NonRecoverable|Traceback|connection refused|Completed:'
-```
+When an event needs context, **`Read` the gateway per-role log**
+(`--log-dir/<secondary_id>/primary.log` + `secondary.log`) — never stream a log
+as events. To confirm the run produced results: under `--source-already-staged`
+the submitter is promoted away and **exits `rc=0` at `primary changed`, before
+tokenization finishes on the cluster**, and its final summary/exit is not
+authoritative — so do a ONE-SHOT check of the gateway output dir
+(`*_output.csv` + `*_meta.json` per binary) plus `ps`/`squeue`. **Never** a
+waiter loop, polling Monitor, or `timeout`.
 
-Cluster-side liveness check from a wake-up script (every 60s):
+### Forbidden — every one of these is wrong; do not do them
 
-```bash
-ssh kruppb@remote.cip.ifi.lmu.de \
-  "sacct -u kruppb --starttime $TEST_START_ISO --format JobID,State,Elapsed,ExitCode -P" \
-  | head -20
-```
+- **Backgrounding the dispatch and pointing a *separate* Monitor at its log**
+  (`Bash run_in_background …` + `Monitor 'tail -f out.log'`). Two moving parts
+  where one suffices — the Monitor must BE the dispatch.
+- **Wrapping the Monitor command in a babysitter loop** — no
+  `while true; do squeue/sacct/ps …; sleep N; done`, no `until` loops, no
+  `tee`/`echo`-marker/dedup scaffolding around it. The dispatch's
+  `--important-stdio-only` stdout already IS the event stream.
+- **A `squeue`/`sacct` poll-loop Monitor to "watch teardown."** The promoted
+  secondary owns teardown; if you must confirm it, one-shot `squeue` after the
+  fact — never a looping Monitor.
+- **Omitting `--important-stdio-only`** then monitoring the raw verbose stdout
+  — it floods the event stream and the Monitor auto-stops.
+- **Any scaffolding around the bare dispatch** — env-var prefixes, `bash -c`/`cd`,
+  `timeout`, `| tee`/pipes, OR a separate single-fire waiter loop to detect
+  teardown. Run the dispatch bare; verify after with a one-shot check, never a
+  timed or polling loop.
 
 ## Inspecting a running secondary
 
@@ -119,7 +158,7 @@ pkill -f 'ssh.*-J kruppb.*-R'                                    # local stray r
 pkill -f 'python.*-m dynrunner.tokenize'                         # local primary if it didn't exit
 ```
 
-`scancel` on the controller does NOT propagate a kill to the podman container on the compute node — observed bug, scope unclear (might be cluster-side, might be wrapper-side). After scancel, also:
+If a `scancel`'d job ever leaves a container behind on a node, kill it there:
 
 ```bash
 ssh -A -J kruppb@remote.cip.ifi.lmu.de kruppb@${NODE}.cip.ifi.lmu.de \
@@ -130,74 +169,11 @@ ssh -A -J kruppb@remote.cip.ifi.lmu.de kruppb@${NODE}.cip.ifi.lmu.de \
 
 If the dispatch errors out with a message that contradicts what's documented here, the bug is one of:
 
-1. **Framework regression in `dynamic_runner`** — file:line + legacy diff (`git show cab668ba^:dynamic_batch/<path>` in this repo) → bug report to peer Claude on `dryrunner-tokenizer` channel. Bugs A–G all came from the 2026-04-28 Rust port + packaging refactor; further regressions of the same shape are likely.
+1. **Framework regression in `dynamic_runner`** — capture the file:line + the dispatch error → bug report to dynrunner-owner via claude-comm.
 2. **Recipe drift here** — flag was renamed, default changed, etc. Update this file alongside the bumped commit.
 3. **Cluster-side change** — wrapper script regenerated, BIG paths moved, podman version changed. Re-derive the gateway layout via `ssh kruppb@remote.cip.ifi.lmu.de 'ls ~/BIG/slurm/'` and update.
 
 In all three cases the fix is durable: update the runbook (or upstream) so the next person doesn't repeat the diagnosis.
-
-## Bug history (for context — do not re-debug)
-
-| Bug | Symptom | Fix commit (in `dynamic_runner`) |
-|-----|---------|-----------------------------------|
-| A | Rust URL parser rejected hostnames in secondary connect address | `070f015` |
-| B | tilde paths shlex-quoted preventing bash expansion | `070f015` |
-| C | `pipeline.py` skipped `gateway.setup_port_forwarding()` | `b07f5e7` |
-| D | SSH tunnel direction `-L` (legacy was `-R`) + filename + format mismatches | `cf0b6ca` |
-| E | Rust primary bound `127.0.0.1:0` instead of caller-supplied `primary_quic_port` | `c009339` |
-| F | `in_docker` checked `/.dockerenv` (docker-only); podman has `/run/.containerenv`; fix uses `/app/src-network` mountpoint as runtime-agnostic sentinel | `0d91947` |
-| G | `_collect_binaries` and `_drive_rust_primary` independently called `find_matching_binaries`, possibly disagreeing → "Queued 0 StageFile notifications" with non-empty corpus | `edde265` |
-| H-B | `setup.rs:130 handle_initial_assignment` lacked the `dispatch.rs:50` fail-loud guard for `resolved_path.is_none()`; cache miss silently passed primary's local path to the worker → first-attempt Recoverable, second-attempt NonRecoverable through the operational loop. Fixed by factoring the predicate into `report_unresolvable_task` and calling from both setup.rs and dispatch.rs. | `76500ac` |
-| H-A / K | `secondary/setup.rs:wait_for_setup` had no `MessageType::StageFile` match arm — StageFile messages arriving between PeerInfo and InitialAssignment fell to `other =>` and were silently dropped. Fixed by inlining `staged_files` records into the `InitialAssignment` message; the secondary now registers staged files atomically with the assignment batch, eliminating the ordering hazard category-wide rather than just the specific arm. (The deeper fix; Option 1 from the H-A note.) | `1cc3b69` |
-| J | `pipeline.py` calls `notify_stage_file(rel, rel)` but never uploads binaries; legacy's `_distribute_files` ZIP-batched + SCP'd. ~~**Resolved by clarifying the contract**~~ — auto-upload was later reintroduced (`pipeline.py:248` calls `upload_source_binaries` unconditionally when not `--source-already-staged`). That restoration carries a Python twin of Bug B; see "2026-05-08 upload-resolve" section below. | _won't fix (then reintroduced — see post-2026-05-08)_ |
-| L | Cross-run tunnel cleanup `pkill -f 'ssh.*-L.*localhost'` matched nothing after Bug D's `-L`→`-R` flip. Trivial two-character fix to use `-R`. | `5848803` |
-| M | `StageFile.file_hash` field carries `compute_task_hash` (DefaultHasher on path+identifier, 16-char hex) but `staging.rs` verifies via `compute_file_hash` (SHA256 of contents, 64-char hex). Hash schemes never match → every stage fails "hash mismatch". Fix: split the wire field into `file_hash` (task identity) + `content_hash` (SHA256). | `86887b9` |
-| N | New `compute_file_content_hash` PyO3 function registered on `_native` but not re-exported in `python/dynamic_runner/__init__.py`. `pipeline.py` does `import dynamic_runner as _rs` and accesses `_rs.compute_file_content_hash` → AttributeError → primary aborts before sbatch submission. Trivial one-line fix in `__init__.py`. | _pending peer_ |
-
-(N1) **Resolved 2026-05-04** — outputs DO land in the durable `/app/out-network` mount; earlier "rm-rf'd into /app/out-tmp" diagnosis was stale post-`fb1df86`. `8da909d` additionally fixed the directory-mirroring (worker's `--source` now matches the bind-mount root, so `relative_to(source_dir)` succeeds and outputs mirror the source layout under `<slurm-root>/out/`). (N2) `--secondary-quic-port` argv flag is parsed but ignored — the secondary unconditionally binds `0.0.0.0:0`; peers learn the real port via `CertExchange`.
-
-All bugs above were introduced by the 2026-04-28 packaging refactor (`1f8d0a1`). Pre-refactor working baseline is `cab668ba^:dynamic_batch/...`.
-
-## 2026-05-04 dispatch-path bug lineage (post-PR3 `--source-already-staged`)
-
-PR3 (`eb69a80 feat(slurm): --source-already-staged`) shipped underspecified — the feature path had multiple unexercised dispatch sites. Eight follow-up bugs landed within the same day; recipe in this runbook reflects the post-fix state:
-
-| # | Commit | Symptom | Root cause |
-|---|--------|---------|------------|
-| 1 | `144b9da` | `find: unknown predicate -L` on SSH discovery | GNU `find` requires `-L` *before* the path, not after. |
-| 2 | `bf1ce02` | "not pre-staged" + hash-machinery 16-char vs SHA256 64-char mismatch | Pre-staged mode skips `StageFile` so cache is empty; secondary's hash-based resolver couldn't match. New `resolve_pre_staged` path. |
-| 3 | `a344b0e` | "not pre-staged at /home/...gateway-abs/..." even after bf1ce02 | Wire's `local_path` was the gateway-absolute path; secondary's `src_network.join(local_path)` dropped LHS (Path::join with absolute RHS). Primary now strips `source_pre_staged_root` before wire emit. |
-| 4 | `059f132` | `TypeError: source_pre_staged kwarg unexpected` | `pipeline.py` passed `source_pre_staged=bool(...)` but Rust pyclass had renamed to `source_pre_staged_root: Option<PathBuf>`. |
-| 5 | `76d074a` | `cargoHash` mismatch in `nix/wheel.nix` | `38596aa`'s test-fixture commit added `tempfile` to `Cargo.lock` without bumping the recorded hash. |
-| 6 | `796feff` | `NameError: slurm_config` in `_drive_rust_primary` | `059f132`'s patch referenced a variable not in scope. |
-| 7 | `217093c` | Initial-batch tasks fail NonRecoverable while operational-loop tasks resolve correctly | `primary/assignment.rs:127` didn't use `wire_local_path`; only `task.rs` and `lifecycle.rs` were patched in `a344b0e`. |
-| 8 | `8658c5b` | 219/235 Recoverable "Not a valid binary file" with gateway-abs paths | SLURM-promoted-secondary's self-assign path (`secondary/slurm.rs:224-236`) called the hash-verifying resolver instead of branching on `pre_staged_mode`. Refactor extracted `resolve_for_dispatch` helper called from all 4 dispatch sites. |
-| 9 | `8da909d` | Outputs land at `<slurm-root>/out/src-network/<file>` instead of mirroring source layout | `_dispatch_secondary` passed `cfg.src_tmp` (not `cfg.src_network`) as worker's `--source`; worker's `relative_to(source_dir)` fell through to the parent-name fallback. |
-
-End-to-end dispatch confirmed green at `8da909d` against 235 minigzipsh on `/home/k/kruppb/BIG/Dataset-1/zlib/` — 1-secondary 235/235 (run-5 reference); 2-secondary cross-node fan-out 235/235 (run-6).
-
-## 2026-05-08 upload-resolve bug (post-Bug-J auto-upload restoration)
-
-After Bug J's "won't fix" verdict the auto-upload mechanism was restored: `pipeline.py:248` now calls `upload_source_binaries` unconditionally when `--source-already-staged` is not given. The restored implementation carries a Python twin of the Rust Bug B (`relative_to` resolved against the wrong root):
-
-| # | Symptom | Root cause | Status |
-|---|---------|------------|--------|
-| 10 | `Source-binary upload complete (0/3103 files)` despite full StageFile enumeration → every task `java.io.IOException: File not found: /app/src-network/<rel>` Recoverable, eventually NonRecoverable. | `dynamic_runner/packaging/job_manager.py:upload_source_binaries` lines 92-103: `Path(binary.path).resolve()` resolves relative `binary.path` against `os.getcwd()` (dispatcher CWD) instead of `src_root`, so every `relative_to(src_root)` throws `ValueError` and falls into the "skipping upload" branch. The tokenizer task emits 100% relative paths (per the documented contract at `dynrunner/tokenize/tokenizer_task.py:304-326` "Emit RELATIVE-to-source-root paths…"), so all binaries trip this. | Fixed at `d5d0604` (now on main, see merged-tip below). 3103/3103 upload confirmed on the patched re-dispatch (run-8). |
-| 11 | Wrapper-script "command relay" subshell CPU-spins to the tune of ~16 K iter/sec after the wrapper's EXIT trap removes the FIFO it was reading from. ~1.4 GB/h of identical `cmd.sock: No such file or directory` lines into slurm-stderr; SLURM job already returned 0 so no upstream notices. Confirmed leaked across both `tokenizer` (13 GB) and `ds-test` (186 GB) instances independently. | `dynamic_runner/packaging/job_manager.py:305-340` emits a backgrounded `while true; do read -r CMD < "$cmd_socket"; ...; done &`. Under normal operation `read` blocks on the FIFO (kernel-event-driven, no CPU spin). When the EXIT trap deletes `$RNDTMP` (and thus the FIFO), the redirect fails with ENOENT immediately on every iteration → busy-spin. Trap removes the lifecycle anchor without signaling its reader. | Fixed at `90ba235` (now on main): cleanup trap kills `$CMD_RELAY_PID` BEFORE `rm -rf`; loop changed to `while [ -p "$cmd_socket" ]` for defense-in-depth. |
-| 12 | Wrapper aborts on `podman load` failure but the .out file shows no error indication — it just stops mid-Phase-1 between "Loading image into container runtime..." and "Cleaning up temporary directory" with no clue why. Symptom: the secondary never starts, primary times out 10 min later with `0/1 sent SecondaryWelcome`. | `set -e` IS triggering correctly (load returned non-zero), but the load command's stderr was being swallowed and no explicit error marker was logged before the trap fired. Diagnostic regression, not behavioural — abort happens at the right point, just invisibly. | Fixed at `733559c` (now on main): load wrapped in `if ! <load>; then echo ERROR; exit 1; fi`, surfaces visible "ERROR: image load failed" marker before trap. Root cause of why load failed (storage exhaustion / layer corruption / podman version mismatch / something else) is consumer-side investigation when next triggered. |
-
-End-to-end re-dispatch on `733559c` (= main tip) is queued; will mark this section closed once a clean run confirms upload + image-load + secondary handshake + completion + clean teardown all pass.
-
-Adjacent (non-blocking) findings from the same dispatch:
-- **Misleading log message** at `job_manager.py:97-102` — printed `local` (pre-resolve, the relative path) but compared `local.resolve()` (CWD-rooted), so users see `Binary zlib/foo is not under --source root /home/.../src` — looks impossible. Patch `d5d0604` also prints both raw and resolved paths.
-- **conmon-detached scancel leak** extends runbook line 122. Not just "scancel doesn't propagate to nested podman" — conmon's by-design double-fork reparents to host systemd (e.g. PPID `11137`), so the nested asm-tokenizer container survives both `scancel` AND the dispatcher's SIGTERM. Fixed at `a12f84a` (in main via `eedd7da`/`733559c`): wrapper now spawns a `setsid -f` detached watchdog that polls `squeue -j $SLURM_JOB_ID` once/sec and runs `podman kill`+`rm -f` against the container by name when the job disappears.
-- **Disconnect-race warning at gateway exit** ("Control socket connect: No such file or directory" at `ssh_gateway.py:144-145`). Root cause: `pkill -f 'ssh.*-R.*localhost'` was matching the master because per-secondary forwards use `-R 0.0.0.0:port:localhost:port`. Fixed at `c399f5a` (in main via `eedd7da`/`733559c`): reorder + tighten regex to `ssh.*-R [0-9]+:localhost`.
-- **`ssh_gateway.py:96` connect-failure error message** now hints at `--ssh-config` — fixed at `178a3af` (in main).
-- **`ssh_gateway.py:275-277` dead "(can be made configurable)" comment** removed at `d53d4fe` (in main).
-
-## Open framework issues observed in run-7
-
-- **Heartbeat clock not reset at connection-establishment.** Primary's heartbeat monitor checks `last_seen_s` against a fixed clock that started at primary startup, not at each secondary's connection. Containers that take >threshold to start + handshake (~38s for the LMU SLURM wrapper) are dropped immediately when the operational loop begins, with their in-flight tasks requeued to peers. The dropped secondary still completes its already-assigned batch independently before being isolated. Not blocking for our test (sec-0 picked up the requeue), but production-relevant for larger clusters with staggered scheduling. Filed with peer.
 
 ## slurm-test-env vs LMU CIP — differences worth knowing
 
@@ -212,6 +188,6 @@ The differences below are "things that look the same but aren't quite" — usefu
 - **I5 — Accounting.** Test-env disables `slurmdbd` (`sacct` returns empty); LMU CIP has it. Frameworks that poll `sacct` need a non-`sacct` fallback for test-env mode — confirmed working in this campaign (we used `squeue` polling instead).
 - **I6 — Munge key.** Test-env bakes a fixed key at image build; LMU CIP rotates. Anything that caches auth state across rotations is LMU-specific.
 - **I7 — SSH key path.** Test-env uses per-instance keypairs via `--ssh-identity-file`; LMU CIP uses a 1Password agent (locked-agent failure modes are LMU-only). Both go through the same `--ssh-config` / `--ssh-identity-file` framework primitives.
-- **I8 — Image-load latency.** Test-env podman load is rootless + slow: ~50–90 s per worker, sequential because each worker reads the same 1.5 GB tarball from the shared `/home` bind-mount. LMU CIP is faster (warm-cached, real NFS bandwidth). The framework auto-scales the per-secondary setup deadline as `max(60, jobs * 15)` (memory `LMU_OPERATIONS.md` companion doc, "Setup deadline auto-scales" section) — on test-env with `--jobs 4` you get 60 s, which is shorter than the slowest worker's image load. The first-to-connect secondary then sees its setup deadline elapse with "no primary, no peers" while the primary is healthy but still waiting for the other 3 secondaries to register; it cold-exits, then the primary's later setup-bootstrap broadcast fails for that dead secondary with `channel closed` and the whole coordinator aborts. Result: `Completed: 0  Failed: 0  Stranded: 0`, exit code 0, empty output. Validated 2026-05-17 against `9427d0b/536cba1` on `consts-smoke` instance. **Always pass `--slurm-setup-deadline-secs 600` on test-env smokes** to avoid this race; LMU CIP doesn't need the override (the auto-scaled value covers its faster image load).
+- **I8 — Image-load latency.** Test-env podman load is rootless + slow: ~50–90 s per worker, sequential (each reads the same ~1.5 GB tarball from the shared `/home` bind-mount), so secondaries connect later than on LMU CIP. The `unconfigured_deadline_secs` default (600 s) covers it — no override needed.
 
 In practice: iterate locally on `slurm-test-env` (with the I8 override), then do a small-`--jobs 1` confirmation run on LMU CIP before scaling up. The local→cluster delta is small enough that this is a sanity check, not a redo.
