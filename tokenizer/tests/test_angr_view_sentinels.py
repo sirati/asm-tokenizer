@@ -12,6 +12,13 @@ Ghidra path's ``isExternal()`` thunks.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip(
+    "tokenizer.disasm.angr_provider",
+    reason="angr disassembler backend unavailable",
+)
+
 from typing import Any
 
 from tokenizer.disasm.angr_provider.views import _AngrFunctionView

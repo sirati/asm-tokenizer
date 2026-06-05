@@ -11,6 +11,13 @@ of ``test_ghidra_function_identity_key.py``.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip(
+    "tokenizer.disasm.angr_provider",
+    reason="angr disassembler backend unavailable",
+)
+
 from typing import Any
 
 from tokenizer.disasm.angr_provider.function_identity import _angr_identity_key

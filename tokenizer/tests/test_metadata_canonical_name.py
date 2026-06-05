@@ -20,9 +20,6 @@ file checks the typed-view boundary in isolation.
 
 from __future__ import annotations
 
-from tokenizer.disasm.angr_provider.metadata_view import (
-    _AngrAddressMetadataView,
-)
 from tokenizer.disasm.ghidra_provider.metadata_view import (
     _GhidraAddressMetadataView,
 )
@@ -32,6 +29,7 @@ from tokenizer.disasm.metadata import (
     SectionKind,
 )
 from tokenizer.function_deduper import canonical_function_name
+from tokenizer.tests._provider_support import requires_angr
 
 
 # ---------------------------------------------------------------------------
@@ -39,17 +37,27 @@ from tokenizer.function_deduper import canonical_function_name
 # ---------------------------------------------------------------------------
 
 
+@requires_angr
 def test_angr_view_comment_property_is_none() -> None:
     """The angr path has no demangler hook (see
     ``angr_limitations.md``); the ``comment`` property is the
     unconditional None sentinel."""
+    from tokenizer.disasm.angr_provider.metadata_view import (
+        _AngrAddressMetadataView,
+    )
+
     view = _AngrAddressMetadataView()
     assert view.comment is None
 
 
+@requires_angr
 def test_angr_view_identity_key_property_is_none() -> None:
     """The angr path has no thunk-identity surface; the
     ``identity_key`` property is the unconditional None sentinel."""
+    from tokenizer.disasm.angr_provider.metadata_view import (
+        _AngrAddressMetadataView,
+    )
+
     view = _AngrAddressMetadataView()
     assert view.identity_key is None
 
