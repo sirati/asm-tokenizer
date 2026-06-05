@@ -2,21 +2,20 @@
   description = "Python 3.14 development environment for asm-tokenizer";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/e4bae1bd10c9c57b2cf517953ab70060a828ee6f";
-    # Focused second nixpkgs pin used ONLY to source the upstream-fixed
-    # `rustPlatform.fetchCargoVendor` (see `cargoVendorUserAgentOverlay`).
-    # Post-2026-04-26 nixos-unstable carries nixpkgs PR #512735, which sets
-    # an identifying User-Agent and switches crate downloads to the
-    # static.crates.io CDN; the held `nixpkgs` pin (2026-01-16) predates it.
-    # NO `follows` here — that would defeat the purpose by collapsing this
-    # back onto the held pin that lacks the fix.
-    nixpkgs-cargo-vendor.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Previous-working nixpkgs rev, used ONLY to source the prebuilt
+    # `python314Packages.angr`. Unstable's angr-9.2.193 grows a Rust
+    # extension (pyxdia) needing setuptools-rust + cargoDeps this flake
+    # does not wire (nixpkgs PR #487341 territory); rather than recompile
+    # angr we pin the last-good build from this rev.
+    nixpkgs-angr.url = "github:NixOS/nixpkgs/e4bae1bd10c9c57b2cf517953ab70060a828ee6f";
     # External runner: provides `python3Packages.dynamic-runner` via its
     # overlay (replaces the previous in-tree `dynamic-batch-rs` path-flake).
     dynamic-runner.url = "github:sirati/dynamic-runner";
     # Generic semantic-layering helpers + extract-layer-assignment tool
     # (replaces the in-tree `nix/semantic-layering.nix` import).
     nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
+    nix-docker-layered-image.inputs.nixpkgs.follows = "nixpkgs";
     # In-tree pyo3 extension providing the `u64 -> u32` primary dedup
     # map used by `tokenizer.memmap_builder`. Lives in its own
     # subfolder + flake (maturin is scoped there, not in the outer
@@ -35,7 +34,7 @@
     {
       self,
       nixpkgs,
-      nixpkgs-cargo-vendor,
+      nixpkgs-angr,
       dynamic-runner,
       nix-docker-layered-image,
       dedup-hashmap,
@@ -100,28 +99,21 @@
         });
       };
 
-      # crates.io began returning HTTP 403 for the default `python-requests/*`
-      # User-Agent that the held `nixpkgs` pin's (2026-01-16)
-      # `fetch-cargo-vendor-util` sends, so the dynamic-runner wheel's
-      # `rustPlatform.fetchCargoVendor` staging download fails for every crate
-      # (rust-lang/crates.io#13482). The complete upstream fix is nixpkgs
-      # PR #512735 (merged into master 2026-04-26): it sets an identifying
-      # User-Agent (`nixpkgs-fetchCargoVendor/2`) AND switches crate downloads
-      # to the un-gated `static.crates.io` CDN. Bumping the held `nixpkgs`
-      # pin would cascade into the ghidra-12.0/angr/pyghidra pins this flake
-      # deliberately holds, so instead we source ONLY `fetchCargoVendor` from
-      # a focused second pin (`nixpkgs-cargo-vendor`, post-2026-04-26
-      # nixos-unstable) that carries the fix. The fixed fetcher's call
-      # surface (`{ name, hash, nativeBuildInputs, ... }@args` → `-vendor`
-      # FOD) is identical to the held pin's, so it composes cleanly with the
-      # held `buildRustPackage`.
-      cargoVendorUserAgentOverlay = final: prev: {
-        rustPlatform = prev.rustPlatform // {
-          fetchCargoVendor =
-            (import nixpkgs-cargo-vendor {
-              inherit (prev.stdenv.hostPlatform) system;
-            }).rustPlatform.fetchCargoVendor;
-        };
+      # Pin ONLY angr to the previous-working build (see `nixpkgs-angr`).
+      # Composed onto the existing python314 packageOverrides so it does NOT
+      # clobber pyghidraOverlay's `pyghidra`.
+      angrPinOverlay = final: prev: {
+        python314 = prev.python314.override (old: {
+          packageOverrides = prev.lib.composeExtensions (old.packageOverrides or (_: _: { })) (
+            pyFinal: pyPrev: {
+              angr = pyFinal.toPythonModule (
+                (import nixpkgs-angr {
+                  inherit (prev.stdenv.hostPlatform) system;
+                }).python314Packages.angr
+              );
+            }
+          );
+        });
       };
 
       pkgsFor =
@@ -131,7 +123,7 @@
           overlays = [
             pyghidraOverlay
             ghidraOverlay
-            cargoVendorUserAgentOverlay
+            angrPinOverlay
             # Injects `dynamic-runner` into every Python package set,
             # so `pkgs.python314.pkgs.dynamic-runner` is in scope.
             dynamic-runner.overlays.default

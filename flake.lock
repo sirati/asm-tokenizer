@@ -24,11 +24,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1779744234,
-        "narHash": "sha256-Hikf54BIaASyQS1RddumbKB0UfLWbm0DF6n76fL3m6k=",
+        "lastModified": 1780635012,
+        "narHash": "sha256-jjxeLRtajetVkFr7ByrXOv/7Eme+uramB4BVolvcmUc=",
         "owner": "sirati",
         "repo": "dynamic-runner",
-        "rev": "26613122f8d58f5e89593492fafa377f8a36cf74",
+        "rev": "98d340b6e8ef47908eabc6526c7afe0e23f38934",
         "type": "github"
       },
       "original": {
@@ -114,7 +114,9 @@
     "nix-docker-layered-image": {
       "inputs": {
         "flake-utils": "flake-utils_3",
-        "nixpkgs": "nixpkgs_2"
+        "nixpkgs": [
+          "nixpkgs"
+        ]
       },
       "locked": {
         "lastModified": 1777419040,
@@ -147,39 +149,7 @@
         "type": "github"
       }
     },
-    "nixpkgs-cargo-vendor": {
-      "locked": {
-        "lastModified": 1779560665,
-        "narHash": "sha256-tpyBcxPpcQb8ukyNF7DoCwfSY3VPsxHoYwj00Cayv5o=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "64c08a7ca051951c8eae34e3e3cb1e202fe36786",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixos-unstable",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
-    "nixpkgs_2": {
-      "locked": {
-        "lastModified": 1767313136,
-        "narHash": "sha256-16KkgfdYqjaeRGBaYsNrhPRRENs0qzkQVUooNHtoy2w=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "ac62194c3917d5f474c1a844b6fd6da2db95077d",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixos-25.05",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
-    "nixpkgs_3": {
+    "nixpkgs-angr": {
       "locked": {
         "lastModified": 1768564909,
         "narHash": "sha256-Kell/SpJYVkHWMvnhqJz/8DqQg2b6PguxVWOuadbHCc=",
@@ -195,14 +165,30 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1780243769,
+        "narHash": "sha256-x5UQuRsH3MqI0U9afaXSNqzTPSeZlRLvFAav2Ux1pNw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "331800de5053fcebacf6813adb5db9c9dca22a0c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "dedup-hashmap": "dedup-hashmap",
         "dynamic-runner": "dynamic-runner",
         "gitignore": "gitignore",
         "nix-docker-layered-image": "nix-docker-layered-image",
-        "nixpkgs": "nixpkgs_3",
-        "nixpkgs-cargo-vendor": "nixpkgs-cargo-vendor"
+        "nixpkgs": "nixpkgs_2",
+        "nixpkgs-angr": "nixpkgs-angr"
       }
     },
     "rust-overlay": {
