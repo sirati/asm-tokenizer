@@ -83,6 +83,18 @@ def _route_args(args: Namespace, route: PhaseRoute) -> Namespace:
     routed = Namespace(**vars(args))
     routed.source = str(route.source_dir)
     routed.resolved_output_root = str(route.output_dir)
+    # `_route_args` is only used to materialise the DERIVED downstream
+    # phases (unify-vocab, build-memmap) in `_spawn_phase_items`. Those
+    # are aggregate artifacts of the WHOLE tokenize output, not per-
+    # binary-idempotent work — so they must always regenerate after a
+    # fresh tokenize phase. Inheriting the user's `--skip-existing`
+    # (meant for the per-binary tokenize step) would make them short-
+    # circuit on their own done-marker (`unified_vocab.csv` /
+    # already-built memmaps) and silently leave newly-tokenized binaries
+    # out of the vocab + reference a stale vocab from the old memmaps.
+    # Phase 1 (tokenize) still honours skip-existing via the direct
+    # `discover_items` path; only the routed phase-2/3 clone clears it.
+    routed.skip_existing = False
     return routed
 
 
