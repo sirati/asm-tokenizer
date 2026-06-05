@@ -8,12 +8,16 @@ sbatch wave under SLURM, one Docker-image upload, one mesh
 formation round.
 """
 
+from __future__ import annotations
+
+import sys
+
 from dynamic_runner import TaskDeploymentSpec, run
 
 from .full_pipeline_task import FullPipelineTask
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     run(
         task=FullPipelineTask(),
         deployment=TaskDeploymentSpec(
@@ -25,6 +29,7 @@ def main() -> None:
             "driven as a single framework dispatch (persistent mesh; "
             "one sbatch wave under SLURM)."
         ),
+        argv=argv if argv is not None else sys.argv[1:],
     )
 
 

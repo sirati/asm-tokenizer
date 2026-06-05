@@ -8,12 +8,16 @@ exactly one TaskInfo, dispatched to one worker on one secondary;
 phase 1 and phase 3 retain their multi-worker parallelism.
 """
 
+from __future__ import annotations
+
+import sys
+
 from dynamic_runner import TaskDeploymentSpec, run
 
 from .vocab_unifier_task import VocabUnifierTask
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     run(
         task=VocabUnifierTask(),
         deployment=TaskDeploymentSpec(
@@ -25,6 +29,7 @@ def main() -> None:
             "per-binary mapping files from the per-binary CSVs the "
             "tokenize phase produced."
         ),
+        argv=argv if argv is not None else sys.argv[1:],
     )
 
 

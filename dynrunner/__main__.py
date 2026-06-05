@@ -85,8 +85,11 @@ def _ensure_full_platform_default(rest: list[str]) -> list[str]:
 def _dispatch(task: str, rest: list[str]) -> None:
     module_name = _TASK_TO_MODULE[task]
     module = importlib.import_module(module_name + ".__main__")
-    sys.argv = [f"python -m {module_name}", *rest]
-    module.main()
+    # Thread the remaining argv to the task entry point explicitly; the
+    # framework's run() no longer reads process-global sys.argv. (The
+    # task module is also the secondary entry point — there main(argv=None)
+    # falls back to sys.argv[1:] for the framework-forwarded argv.)
+    module.main(argv=rest)
 
 
 def main() -> None:
