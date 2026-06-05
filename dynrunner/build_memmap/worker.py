@@ -336,7 +336,16 @@ def _on_args(args: argparse.Namespace) -> None:
         Path(args.vocab_source).resolve() if args.vocab_source else _SOURCE_DIR
     )
     _OUTPUT_DIR = Path(args.output).resolve()
-    _UNIFIED_VOCAB_PATH = Path(args.unified_vocab).resolve()
+    # `--unified-vocab` is resolved relative to the source root — the tree
+    # the unify_vocab phase wrote the corpus vocab into, which is also
+    # build_memmap's `source_dir` per the pipeline routing — mirroring how
+    # each per-task `csv_path`/`mapping_path` is joined to
+    # `source_dir`/`vocab_dir` in `_process_payload`. An absolute value
+    # passes through unchanged (pathlib `/` keeps an absolute right-hand
+    # side), so standalone callers may still hand an absolute location; a
+    # relative value (e.g. `unified_vocab.csv`) binds to the source tree
+    # regardless of the worker's CWD inside the container.
+    _UNIFIED_VOCAB_PATH = (_SOURCE_DIR / args.unified_vocab).resolve()
 
     # Fail fast at worker startup if the unified vocab isn't reachable —
     # every task in this dispatch will hit the same miss inside
