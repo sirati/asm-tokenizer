@@ -12,13 +12,15 @@ If you are a fresh subagent or a future-me reading this after some weeks: read `
 | `--jobs 15` | `15` (kruppb cap) | kruppb has a 15-parallel-task quota across all kruppb SLURM jobs at LMU. This is shared with asm-dataset-nix (compiler_suit_runner). Pre-flight orphan-scan is mandatory or the next run won't get full quota. |
 | `--slurm-time-limit 10080` | `10080` minutes (= 1 week) | sbatch `--time` in minutes. Production corpus-scale dispatches **must** use the 1-week ceiling. A SLURM TIMEOUT mid-Phase-1 triggers the framework's orphan-conmon bug (2026-05-17 LMU incident: `proctrack/cgroup` reaps the wrapper + its watchdog, but rootless-podman conmon lives in `user.slice` outside the SLURM cgroup and survives — leaving 14 orphan containers writing to NFS for 30+ min post-TIMEOUT). Until the framework's shutdown-manager rearchitecture lands (forwarded to `dynrunner-owner` on 2026-05-17), TIMEOUT is **not** a safe terminator on LMU; the only safe way out of a runaway dispatch is `scancel` (also affected, but with bounded blast radius — see `scancel` notes below). Short smokes can use 240 (4h); never go below that on real LMU. |
 
-### Setup deadline auto-scales — do NOT pass `--slurm-setup-deadline-secs`
+### Setup deadlines are a flat 600 s — no per-jobs scaling, and `--slurm-setup-deadline-secs` is gone
 
-> **9ea95143+ (NOT yet pinned — see "dynamic_runner pin policy" below):** `--slurm-setup-deadline-secs` and the `setup_deadline_secs` kwarg are **removed** (both were already no-ops). The replacement is `unconfigured_deadline_secs` (default **600 s**, the secondary's pre-operational timeout). It is unverified whether the `max(60, jobs*15)` auto-scale below survives the one-mesh refactor or is replaced by the flat 600 s default — **verify during the Tier-0/1 bump validation**, then update this section. asm-tokenizer sets no deadline knob, so current LMU dispatches are unaffected either way.
-
-Since `ba889cd`, the framework auto-computes the per-secondary setup deadline as `max(60, num_secondaries * 15)` (`crates/dynrunner-slurm/src/pipeline.rs::compute_setup_deadline_secs`). The 15s/secondary slope was calibrated against LMU Krater empirical observation. For `--jobs 15` you get 225s automatically; for `--jobs 32` you get 480s. The 60s floor covers `--jobs 1..4`.
-
-Override with `--slurm-setup-deadline-secs N` ONLY if you're on a cluster slower than LMU (or running a probe that intentionally needs to wait longer). On LMU Krater the auto-scaled value is the validated default; do not pass the flag.
+> **Confirmed against trunk `3461d704` (2026-06-05, dynrunner-owner):** the old `max(60, jobs*15)` per-secondary auto-scale was **deliberately removed** (commit `7d9129c7`). Setup timing is now a **flat 600 s** default on three independent knobs:
+>
+> - `unconfigured_deadline_secs` — cold-start secondary wait (supersedes the old 60 s `setup_deadline`; override with `--unconfigured-deadline-secs`).
+> - `setup_promote_deadline_secs` — the demoted submitter's wait for the promoted secondary to take over.
+> - the SLURM tunnel-gather timeout.
+>
+> `--slurm-setup-deadline-secs` / the `setup_deadline_secs` kwarg are **removed**. There is **no per-jobs scaling anywhere** now. asm-tokenizer sets none of the three knobs, so LMU dispatches just take the 600 s defaults — which comfortably cover Krater's fast NFS image load (the slow-shared-FS case is the test-env's; see I8 in `SLURM_RUNBOOK.md`).
 
 ## Do NOT confuse with slurm-test-env mandates
 
