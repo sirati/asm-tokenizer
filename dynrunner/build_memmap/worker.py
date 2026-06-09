@@ -29,7 +29,7 @@ from dynamic_runner.worker import Task, WorkerOutput, run, task_function
 
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
-from tokenizer.output_staging import staged_publish
+from tokenizer.output_staging import UNIFY_VOCAB_SCOPE, published_path, staged_publish
 from tokenizer.variant_info import VariantInfo
 
 logger = logging.getLogger(__name__)
@@ -336,16 +336,21 @@ def _on_args(args: argparse.Namespace) -> None:
         Path(args.vocab_source).resolve() if args.vocab_source else _SOURCE_DIR
     )
     _OUTPUT_DIR = Path(args.output).resolve()
-    # `--unified-vocab` is resolved relative to the source root — the tree
-    # the unify_vocab phase wrote the corpus vocab into, which is also
-    # build_memmap's `source_dir` per the pipeline routing — mirroring how
-    # each per-task `csv_path`/`mapping_path` is joined to
-    # `source_dir`/`vocab_dir` in `_process_payload`. An absolute value
-    # passes through unchanged (pathlib `/` keeps an absolute right-hand
-    # side), so standalone callers may still hand an absolute location; a
-    # relative value (e.g. `unified_vocab.csv`) binds to the source tree
-    # regardless of the worker's CWD inside the container.
-    _UNIFIED_VOCAB_PATH = (_SOURCE_DIR / args.unified_vocab).resolve()
+    # `--unified-vocab` is resolved against the source root the same
+    # mode-aware way the unify_vocab phase PUBLISHED it: that phase writes
+    # the corpus vocab via `staged_publish(scope=UNIFY_VOCAB_SCOPE)`, which
+    # lands the file at `<root>/<scope>/<name>` under container deployment
+    # but flat at `<root>/<name>` standalone. `published_path` is the
+    # inverse of that layout decision, so a bare-basename chain arg binds
+    # to wherever the co-deployed unify worker actually placed the vocab —
+    # `_SOURCE_DIR` being build_memmap's source root per the pipeline
+    # routing. An absolute value (a standalone `--task build-memmap`
+    # caller handing an explicit location) passes through unchanged
+    # (pathlib `/` keeps an absolute right-hand side), so the standalone
+    # path keeps working in both branches.
+    _UNIFIED_VOCAB_PATH = published_path(
+        _SOURCE_DIR, UNIFY_VOCAB_SCOPE, args.unified_vocab
+    ).resolve()
 
     # Fail fast at worker startup if the unified vocab isn't reachable —
     # every task in this dispatch will hit the same miss inside

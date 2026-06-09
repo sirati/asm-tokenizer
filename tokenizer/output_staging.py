@@ -46,6 +46,15 @@ from dynamic_runner.worker import Task
 
 _SLURM_OUT_TMP = Path("/app/out-tmp")
 
+# Scope sentinel for the unify_vocab phase's single-task worker. Owned
+# here — next to ``published_path``, which encodes the scope → on-disk
+# layout rule — so the publishing side (``unify_vocab`` worker's
+# ``staged_publish(..., scope=...)``) and the reading side
+# (``build_memmap`` worker resolving ``--unified-vocab`` via
+# ``published_path``) share one literal. Neither worker imports the
+# other; both depend only on this staging module's contract.
+UNIFY_VOCAB_SCOPE = "unify_vocab"
+
 
 def is_container_deployment() -> bool:
     """True when the SLURM-wrapper-provided ephemeral mount is
@@ -54,6 +63,27 @@ def is_container_deployment() -> bool:
     publish API in this mode.
     """
     return _SLURM_OUT_TMP.exists()
+
+
+def published_path(output_root: Path, scope: str, filename: str) -> Path:
+    """Where a ``staged_publish(scope=...)`` write of ``filename`` lands
+    under ``output_root``, in the current deployment mode.
+
+    The inverse of ``staged_publish``'s layout decision: container mode
+    stages under ``<scope>/`` and republishes mirroring that subdir, so
+    the file appears at ``<output_root>/<scope>/<filename>``; standalone
+    mode writes to ``output_root`` directly, so it appears at
+    ``<output_root>/<filename>`` (scope ignored). A reader resolving a
+    scoped-publish artifact joins through here to stay mode-symmetric
+    with the writer without knowing which mode produced the file.
+
+    ``filename`` may be absolute (a standalone caller handing an
+    explicit location); pathlib's ``/`` keeps an absolute right-hand
+    side, so it passes through unchanged in both branches.
+    """
+    if is_container_deployment():
+        return output_root / scope / filename
+    return output_root / filename
 
 
 @contextmanager
