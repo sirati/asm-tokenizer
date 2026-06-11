@@ -78,6 +78,14 @@ class VariantGate:
                 f"min_variants={self.min_variants!r} (unsatisfiable gate)"
             )
 
+    def passes_batch(self, *, n_total, n_unique):
+        """Vectorized :meth:`passes`: elementwise ``bool[...]`` verdicts
+        over parallel count arrays (the scalar method remains the
+        contract's source of truth)."""
+        return (n_total >= self.min_variants) & (
+            n_unique >= self.min_variants_unique
+        )
+
     def passes(self, *, n_total: int, n_unique: int) -> bool:
         """Whether a section with these top-level counts is emitted.
 

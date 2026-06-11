@@ -106,6 +106,97 @@ class LengthReduction:
         assert self.percentile is not None
         return f"p{self.percentile:02d}"
 
+    def reduce_segmented(
+        self, values: np.ndarray, seg_offsets: np.ndarray
+    ) -> np.ndarray:
+        """Vectorized :meth:`reduce` over CSR segments.
+
+        ``values`` is the concatenated per-variant lengths;
+        ``seg_offsets`` (``int64[S + 1]``, exclusive prefix sums) ties
+        each segment (= section) to its slice. Returns ``int64[S]``
+        with one reduced key per segment; empty segments yield 0 --
+        exactly :meth:`reduce`'s contract, applied per segment (the
+        scalar method remains the source of truth; the equivalence
+        test pins the two).
+        """
+        counts = np.diff(seg_offsets)
+        out = np.zeros(counts.size, dtype=np.int64)
+        nonempty = counts > 0
+        if not bool(nonempty.any()):
+            return out
+        starts = seg_offsets[:-1][nonempty]
+        if self.kind is ReductionKind.MAX:
+            # Consecutive non-empty starts span exactly their own
+            # elements (empty segments hold none), so reduceat over the
+            # non-empty starts is safe.
+            out[nonempty] = np.maximum.reduceat(values, starts)
+            return out
+        assert self.percentile is not None
+        seg_ids = np.repeat(np.arange(counts.size, dtype=np.int64), counts)
+        ordered = values[np.lexsort((values, seg_ids))]
+        # np.percentile(..., method="lower"): index = floor((n-1) * q/100).
+        pick = np.floor(
+            (counts[nonempty] - 1) * (self.percentile / 100.0)
+        ).astype(np.int64)
+        out[nonempty] = ordered[starts + pick]
+        return out
+
+    def reduce_grouped_segmented(
+        self,
+        values: np.ndarray,
+        group_keys: np.ndarray,
+        seg_offsets: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized :meth:`reduce_groups` over CSR segments.
+
+        Within each segment, items sharing a ``group_keys`` value form
+        one duplicate-group; each group collapses to its representative
+        (group max for MAX, group mean for PERCENTILE -- mirroring
+        :meth:`_group_representative`), then the representatives reduce
+        per segment like :meth:`reduce_segmented`. Returns
+        ``int64[S]``; empty segments yield 0.
+        """
+        counts = np.diff(seg_offsets)
+        n_seg = counts.size
+        if values.size == 0:
+            return np.zeros(n_seg, dtype=np.int64)
+        seg_ids = np.repeat(np.arange(n_seg, dtype=np.int64), counts)
+        order = np.lexsort((group_keys, seg_ids))
+        sv = values[order].astype(np.float64)
+        sk = group_keys[order]
+        ss = seg_ids[order]
+        is_group_start = np.ones(sv.size, dtype=bool)
+        is_group_start[1:] = (sk[1:] != sk[:-1]) | (ss[1:] != ss[:-1])
+        group_starts = np.nonzero(is_group_start)[0]
+        group_seg = ss[group_starts]
+        if self.kind is ReductionKind.MAX:
+            reps = np.maximum.reduceat(sv, group_starts)
+        else:
+            sums = np.add.reduceat(sv, group_starts)
+            group_counts = np.diff(
+                np.concatenate([group_starts, [sv.size]])
+            )
+            reps = sums / group_counts
+        groups_per_seg = np.bincount(group_seg, minlength=n_seg)
+        rep_offsets = np.zeros(n_seg + 1, dtype=np.int64)
+        np.cumsum(groups_per_seg, out=rep_offsets[1:])
+        out = np.zeros(n_seg, dtype=np.int64)
+        nonempty = groups_per_seg > 0
+        starts = rep_offsets[:-1][nonempty]
+        if self.kind is ReductionKind.MAX:
+            # int(float_max) truncates toward zero, same as astype.
+            out[nonempty] = np.maximum.reduceat(reps, starts).astype(
+                np.int64
+            )
+            return out
+        assert self.percentile is not None
+        ordered = reps[np.lexsort((reps, group_seg))]
+        pick = np.floor(
+            (groups_per_seg[nonempty] - 1) * (self.percentile / 100.0)
+        ).astype(np.int64)
+        out[nonempty] = ordered[starts + pick].astype(np.int64)
+        return out
+
     def reduce(self, lengths: np.ndarray) -> int:
         """Collapse a vector of per-variant lengths to one int key.
 

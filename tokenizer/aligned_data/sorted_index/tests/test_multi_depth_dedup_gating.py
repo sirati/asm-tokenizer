@@ -29,7 +29,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.matched_sections_bin import iter_sections_bin
 from tokenizer.aligned_data.sorted_index import (
     DEDUP_BY_DATA_POINTER,
@@ -126,17 +125,20 @@ def test_max_depth_length_equals_total_surviving_count(tmp_path: Path) -> None:
         LARGE_CONTEXT_LEN,
     )
 
+    from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
+
     base = build_combined_fixture(tmp_path)
-    dataset, section_info = _open(base)
+    data_u8, section_info = _open(base)
     spec = IndexSpec(reduction=_MAX, depth=3)
 
-    with dataset.open_session() as session:
-        result = compute_reduced_lengths(
-            session, section_info=section_info, depths=[3], reductions=[_MAX]
-        )[spec]
+    result = compute_reduced_lengths(
+        section_info, data_u8, depths=[3], reductions=[_MAX]
+    )[spec]
 
-        # multi_fn is section[2] (4 variants); oracle a fresh walk over
-        # it and reduce the per-variant ``total_surviving_token_count``.
+    # multi_fn is section[2] (4 variants); oracle a fresh LEGACY walk
+    # over it and reduce the per-variant ``total_surviving_token_count``.
+    dataset = BinaryDataset(base, _BINARY_NAME, vocab_manager=None)
+    with dataset.open_session() as session:
         rng = np.random.default_rng(0)
         stage1 = walk_sections(
             session,
@@ -289,8 +291,10 @@ def test_gate_negative_rejected(kwargs) -> None:
 
 
 def _open(base: Path):
-    dataset = BinaryDataset(base, _BINARY_NAME, vocab_manager=None)
-    return dataset, read_section_variant_info(base, _BINARY_NAME)
+    data_u8 = np.memmap(
+        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
+    )
+    return data_u8, read_section_variant_info(base, _BINARY_NAME)
 
 
 def test_gating_stamps_zero_on_failing_sections(tmp_path: Path) -> None:
@@ -303,20 +307,19 @@ def test_gating_stamps_zero_on_failing_sections(tmp_path: Path) -> None:
     the exact length the ungated build produced.
     """
     base = build_combined_fixture(tmp_path)
-    dataset, section_info = _open(base)
+    data_u8, section_info = _open(base)
     spec = IndexSpec(reduction=_MAX, depth=3)
 
-    with dataset.open_session() as session:
-        ungated = compute_reduced_lengths(
-            session, section_info=section_info, depths=[3], reductions=[_MAX]
-        )[spec]
-        gated = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[3],
-            reductions=[_MAX],
-            gate=VariantGate(min_variants=2),
-        )[spec]
+    ungated = compute_reduced_lengths(
+        section_info, data_u8, depths=[3], reductions=[_MAX]
+    )[spec]
+    gated = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[3],
+        reductions=[_MAX],
+        gate=VariantGate(min_variants=2),
+    )[spec]
 
     counts = section_info.counts
     for i in range(counts.size):
@@ -343,7 +346,7 @@ def test_gating_unique_excludes_duplicate_heavy_section(tmp_path: Path) -> None:
     the real per-variant pointers.
     """
     base = build_combined_fixture(tmp_path)
-    dataset, section_info = _open(base)
+    data_u8, section_info = _open(base)
     spec = IndexSpec(reduction=_MAX, depth=3)
 
     # Oracle: distinct data pointers per section == total variant count
@@ -351,14 +354,13 @@ def test_gating_unique_excludes_duplicate_heavy_section(tmp_path: Path) -> None:
     for i in range(section_info.counts.size):
         assert section_info.unique_count(i) == int(section_info.counts[i])
 
-    with dataset.open_session() as session:
-        gated = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[3],
-            reductions=[_MAX],
-            gate=VariantGate(min_variants_unique=3),
-        )[spec]
+    gated = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[3],
+        reductions=[_MAX],
+        gate=VariantGate(min_variants_unique=3),
+    )[spec]
 
     for i in range(section_info.counts.size):
         if section_info.unique_count(i) >= 3:
@@ -380,7 +382,7 @@ def test_prepass_data_pointers_match_oracle(tmp_path: Path) -> None:
     is provably the parsed BIN field, not a stale or wrong column.
     """
     base = build_combined_fixture(tmp_path)
-    _dataset, section_info = _open(base)
+    _data_u8, section_info = _open(base)
     num_matched = section_info.counts.size
 
     oracle_pointers = []
@@ -396,10 +398,11 @@ def test_prepass_data_pointers_match_oracle(tmp_path: Path) -> None:
             )
         )
 
-    assert len(section_info.data_pointers) == num_matched
+    cols = section_info.cols
     for i in range(num_matched):
+        lo, hi = int(cols.var_offsets[i]), int(cols.var_offsets[i + 1])
         np.testing.assert_array_equal(
-            section_info.data_pointers[i], oracle_pointers[i]
+            cols.var_data_offset_shifted[lo:hi], oracle_pointers[i]
         )
 
 
@@ -418,23 +421,22 @@ def test_adjust_for_duplicates_noop_on_distinct_pointers(tmp_path: Path) -> None
     end-to-end (not just in the unit test).
     """
     base = build_combined_fixture(tmp_path)
-    dataset, section_info = _open(base)
+    data_u8, section_info = _open(base)
 
-    with dataset.open_session() as session:
-        plain = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[3],
-            reductions=[_MAX, _P50, _P95],
-            duplicate_handling=PLAIN,
-        )
-        dedup = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[3],
-            reductions=[_MAX, _P50, _P95],
-            duplicate_handling=DEDUP_BY_DATA_POINTER,
-        )
+    plain = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[3],
+        reductions=[_MAX, _P50, _P95],
+        duplicate_handling=PLAIN,
+    )
+    dedup = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[3],
+        reductions=[_MAX, _P50, _P95],
+        duplicate_handling=DEDUP_BY_DATA_POINTER,
+    )
 
     assert set(plain.keys()) == set(dedup.keys())
     for spec in plain:

@@ -30,7 +30,6 @@ from unittest.mock import patch
 
 import numpy as np
 
-from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.sorted_index import (
     IndexSpec,
     LengthReduction,
@@ -72,10 +71,6 @@ _FILENAME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
-def _open_dataset(base: Path) -> BinaryDataset:
-    return BinaryDataset(base, _BINARY_NAME, vocab_manager=None)
-
-
 def _oracle_bytes(
     base: Path, reductions: List[LengthReduction], depth: int
 ) -> dict:
@@ -87,14 +82,15 @@ def _oracle_bytes(
     a self-consistent-but-wrong dict.
     """
     section_info = read_section_variant_info(base, _BINARY_NAME)
-    dataset = _open_dataset(base)
-    with dataset.open_session() as session:
-        per_spec_lengths = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[depth],
-            reductions=reductions,
-        )
+    data_u8 = np.memmap(
+        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
+    )
+    per_spec_lengths = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[depth],
+        reductions=reductions,
+    )
     return {
         red: encode_sorted_index(
             per_spec_lengths[IndexSpec(reduction=red, depth=depth)]
@@ -111,13 +107,11 @@ def _oracle_bytes(
 def test_build_returns_one_blob_per_reduction(tmp_path: Path) -> None:
     """Returned dict has exactly the requested reductions as keys."""
     base = build_combined_fixture(tmp_path)
-    dataset = _open_dataset(base)
-    with dataset.open_session() as session:
-        out = build_sorted_index_bytes(
-            session, base, _BINARY_NAME,
-            reductions=[_MAX, _P50, _P95],
-            depths=[_DEPTH],
-        )
+    out = build_sorted_index_bytes(
+        base, _BINARY_NAME,
+        reductions=[_MAX, _P50, _P95],
+        depths=[_DEPTH],
+    )
     assert set(out.keys()) == {_spec(_MAX), _spec(_P50), _spec(_P95)}
     for blob in out.values():
         assert isinstance(blob, (bytes, bytearray))
@@ -126,13 +120,11 @@ def test_build_returns_one_blob_per_reduction(tmp_path: Path) -> None:
 def test_build_blobs_parse_clean(tmp_path: Path) -> None:
     """Every blob is parseable by :func:`parse_header` without raising."""
     base = build_combined_fixture(tmp_path)
-    dataset = _open_dataset(base)
-    with dataset.open_session() as session:
-        out = build_sorted_index_bytes(
-            session, base, _BINARY_NAME,
-            reductions=[_MAX, _P50, _P95],
-            depths=[_DEPTH],
-        )
+    out = build_sorted_index_bytes(
+        base, _BINARY_NAME,
+        reductions=[_MAX, _P50, _P95],
+        depths=[_DEPTH],
+    )
     for blob in out.values():
         min_length, counts, body_offset = parse_header(blob)
         assert body_offset == 8 + 4 * counts.size
@@ -148,13 +140,11 @@ def test_build_bytes_match_oracle(tmp_path: Path) -> None:
     pre-pass, wrong reduction list, wrong encoder) surfaces here.
     """
     base = build_combined_fixture(tmp_path)
-    dataset = _open_dataset(base)
-    with dataset.open_session() as session:
-        out = build_sorted_index_bytes(
-            session, base, _BINARY_NAME,
-            reductions=[_MAX, _P50, _P95],
-            depths=[_DEPTH],
-        )
+    out = build_sorted_index_bytes(
+        base, _BINARY_NAME,
+        reductions=[_MAX, _P50, _P95],
+        depths=[_DEPTH],
+    )
     oracle = _oracle_bytes(base, [_MAX, _P50, _P95], depth=_DEPTH)
     for red in [_MAX, _P50, _P95]:
         assert bytes(out[_spec(red)]) == bytes(oracle[red]), (
@@ -177,19 +167,20 @@ def test_build_reader_round_trip(tmp_path: Path) -> None:
     # reuse them for both the builder call (via the inline oracle) AND
     # the reader-side bincount comparison.
     section_info = read_section_variant_info(base, _BINARY_NAME)
-    dataset = _open_dataset(base)
-    with dataset.open_session() as session:
-        per_spec_lengths = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[_DEPTH],
-            reductions=[_MAX, _P50, _P95],
-        )
-        out = build_sorted_index_bytes(
-            session, base, _BINARY_NAME,
-            reductions=[_MAX, _P50, _P95],
-            depths=[_DEPTH],
-        )
+    data_u8 = np.memmap(
+        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
+    )
+    per_spec_lengths = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[_DEPTH],
+        reductions=[_MAX, _P50, _P95],
+    )
+    out = build_sorted_index_bytes(
+        base, _BINARY_NAME,
+        reductions=[_MAX, _P50, _P95],
+        depths=[_DEPTH],
+    )
 
     for red in [_MAX, _P50, _P95]:
         path = tmp_path / f"rt_{red.filename_tag()}.idx"
@@ -217,13 +208,12 @@ def test_build_reader_round_trip(tmp_path: Path) -> None:
 def test_build_multi_mode_single_compute_call(tmp_path: Path) -> None:
     """``build_sorted_index_bytes`` invokes ``compute_reduced_lengths`` once.
 
-    Plan §D8 amortisation: K reductions share ONE Stage 1+2 walk.  This
+    Plan §D8 amortisation: K reductions share ONE length compute.  This
     test pins the *builder*'s contract -- the underlying compute
     function is called exactly once across all requested reductions,
     NOT once per reduction.
     """
     base = build_combined_fixture(tmp_path)
-    dataset = _open_dataset(base)
 
     real_compute = compute_reduced_lengths
     call_counter = {"n": 0}
@@ -236,12 +226,11 @@ def test_build_multi_mode_single_compute_call(tmp_path: Path) -> None:
         "tokenizer.aligned_data.sorted_index._builder.compute_reduced_lengths",
         side_effect=_counting_compute,
     ):
-        with dataset.open_session() as session:
-            build_sorted_index_bytes(
-                session, base, _BINARY_NAME,
-                reductions=[_MAX, _P50, _P95],
-                depths=[_DEPTH],
-            )
+        build_sorted_index_bytes(
+            base, _BINARY_NAME,
+            reductions=[_MAX, _P50, _P95],
+            depths=[_DEPTH],
+        )
     assert call_counter["n"] == 1, (
         f"expected 1 compute_reduced_lengths call for 3 reductions; "
         f"got {call_counter['n']}"
@@ -251,17 +240,15 @@ def test_build_multi_mode_single_compute_call(tmp_path: Path) -> None:
 def test_build_empty_reductions_returns_empty_dict(tmp_path: Path) -> None:
     """Empty reductions list short-circuits to an empty dict (no walk)."""
     base = build_combined_fixture(tmp_path)
-    dataset = _open_dataset(base)
 
     with patch(
         "tokenizer.aligned_data.sorted_index._builder.compute_reduced_lengths",
     ) as mock_compute:
-        with dataset.open_session() as session:
-            out = build_sorted_index_bytes(
-                session, base, _BINARY_NAME,
-                reductions=[],
-                depths=[_DEPTH],
-            )
+        out = build_sorted_index_bytes(
+            base, _BINARY_NAME,
+            reductions=[],
+            depths=[_DEPTH],
+        )
     assert out == {}
     mock_compute.assert_not_called()
 
@@ -317,13 +304,11 @@ def test_write_explicit_output_dir(tmp_path: Path) -> None:
 def test_write_bytes_match_build_output(tmp_path: Path) -> None:
     """Written file bytes are byte-equal to :func:`build_sorted_index_bytes`."""
     base = build_combined_fixture(tmp_path)
-    dataset = _open_dataset(base)
-    with dataset.open_session() as session:
-        in_memory = build_sorted_index_bytes(
-            session, base, _BINARY_NAME,
-            reductions=[_MAX, _P50, _P95],
-            depths=[_DEPTH],
-        )
+    in_memory = build_sorted_index_bytes(
+        base, _BINARY_NAME,
+        reductions=[_MAX, _P50, _P95],
+        depths=[_DEPTH],
+    )
     out_dir = tmp_path / "out"
     written = write_sorted_index_files(
         base, _BINARY_NAME,
@@ -353,7 +338,7 @@ def test_write_creates_output_dir(tmp_path: Path) -> None:
 
 
 def test_write_empty_reductions(tmp_path: Path) -> None:
-    """Empty reductions list: no files, no session opened."""
+    """Empty reductions list: no files written, nothing opened."""
     base = build_combined_fixture(tmp_path)
     out_dir = tmp_path / "out"
     written = write_sorted_index_files(

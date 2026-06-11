@@ -1,23 +1,25 @@
 """Per-binary sorted-index build entry (plan §"Module layout").
 
-Single concern: glue the already-shipped pre-pass + length compute +
-wire encode into one per-binary call, and offer a thin file-writing
-wrapper that opens a :class:`BinarySession` and stamps the canonical
+Single concern: glue the catalog pre-pass + the walk-free length
+compute + wire encode into one per-binary call, and offer a thin
+file-writing wrapper that stamps the canonical
 ``<binary>_sorted_<mode>_d<depth>.idx`` filenames.
 
 Boundary contract (the design-first sentence):
 
-  *Given an open :class:`BinarySession` + the memmap directory + a
-  binary name + a list of reductions + a depth, run ONE shared Stage
-  1+2 walk per chunk via :func:`compute_reduced_lengths` and return
-  one wire-encoded blob per requested reduction.  The file-writing
-  wrapper layers session lifecycle + filename construction on top --
-  it owns no compute logic.*
+  *Given the memmap directory + a binary name + reductions + depths,
+  read the catalog once, memmap the data bin read-only, compute every
+  (reduction, depth) length array via
+  :func:`compute_reduced_lengths`, and return one wire-encoded blob
+  per pair. The file-writing wrapper layers filename construction on
+  top -- it owns no compute logic.*
 
-No CLI parsing here; no string-typed modes; no batch-decode imports
-beyond the typed parameters already consumed by
-:mod:`._length_compute`.  Callers wanting CLI / multi-binary fan-out
-go through :mod:`.__main__`.
+No :class:`BinarySession` involvement: the build reads exactly three
+sidecars (``_index.bin`` locator, ``_sections.bin`` catalog,
+``_data.bin`` record headers + token regions) and none of the
+session's metadata machinery. No CLI parsing here; no string-typed
+modes. Callers wanting CLI / multi-binary fan-out go through
+:mod:`.__main__`.
 """
 
 from __future__ import annotations
@@ -25,8 +27,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
-from tokenizer.aligned_data.loader.session import BinarySession
+import numpy as np
+
+from tokenizer.aligned_data.memmap_format import (
+    DATA_BIN_PRELUDE_SIZE,
+    assert_data_bin_prelude,
+)
 
 from ._dedup import PLAIN, DuplicateHandling
 from ._gating import VariantGate
@@ -40,7 +46,6 @@ __all__ = ["build_sorted_index_bytes", "write_sorted_index_files"]
 
 
 def build_sorted_index_bytes(
-    session: BinarySession,
     base_path: Path,
     binary_name: str,
     *,
@@ -51,65 +56,66 @@ def build_sorted_index_bytes(
 ) -> Dict[IndexSpec, bytes]:
     """Build per-(mode, depth) sorted-index bytes for one binary.
 
-    Runs the cheap pre-pass (:func:`read_section_variant_info`) to
-    recover the matched-arm variant counts + data-bin pointers, then
-    performs ONE Stage 1+2 walk per chunk -- at ``max(depths)`` -- across
-    ALL requested reductions AND depths via
-    :func:`compute_reduced_lengths` (the cost-amortising property named
-    in plan §D8: the walk is NOT repeated per reduction or per depth).
-    Each per-(mode, depth) ``u32[num_sections]`` length array is then
-    wire-encoded via :func:`encode_sorted_index`.
+    Runs the columnar pre-pass (:func:`read_section_variant_info`),
+    memmaps ``<binary>_data.bin`` read-only (prelude-validated), and
+    computes EVERY requested ``(reduction, depth)`` from one graph
+    traversal via :func:`compute_reduced_lengths` (plan §D8: the
+    heavy work is not repeated per reduction or per depth). Each
+    resulting ``u32[num_sections]`` array is wire-encoded via
+    :func:`encode_sorted_index`.
 
     Parameters
     ----------
-    session
-        Open :class:`BinarySession` for ``binary_name``.  Must remain
-        live for the duration of the call -- Stage 1 loads variant
-        bodies through it.
     base_path
-        Memmap directory containing ``<binary>_sections.bin`` /
-        ``<binary>_index.bin`` etc.  The pre-pass reads through this
-        path; the session was opened from a :class:`BinaryDataset`
-        rooted at the same directory.
+        Memmap directory containing the ``<binary>_*`` sidecars.
     binary_name
-        The binary's name (the ``<binary>`` prefix on the per-binary
-        sidecars).
-    reductions
-        :class:`LengthReduction` modes to compute.  Empty list is
-        permitted and returns an empty dict (no walk runs).
-    depths
-        Splice depths to materialise (one output per ``(reduction,
-        depth)`` pair).  Empty list returns an empty dict (no walk).
-    gate
-        Top-level minimum-variant emission gate (defaults to disabled).
-    duplicate_handling
-        Top-level duplicate strategy (defaults to :data:`PLAIN`).
+        The binary's ``<binary>`` prefix.
+    reductions / depths
+        The modes / splice depths to compute. Either list empty ->
+        empty dict (nothing is opened).
+    gate / duplicate_handling
+        Top-level minimum-variant gate + duplicate strategy.
 
     Returns
     -------
     Dict[IndexSpec, bytes]
-        ``{IndexSpec(reduction, depth) -> bytes}``.  Each value is the
-        wire-encoded sorted index per :mod:`._wire` (LE u32 throughout).
+        ``{IndexSpec(reduction, depth) -> wire bytes}``.
     """
     if not reductions or not depths:
         return {}
 
-    # Pre-pass (plan ALG-7): per-section variant counts + data-bin
-    # pointers.  Counts drive the 0-variant pre-filter; pointers drive
-    # the duplicate / minimum-variant feature.  ONE read of sections.bin.
+    base_path = Path(base_path)
     section_info = read_section_variant_info(base_path, binary_name)
+    if section_info.counts.size == 0:
+        # No matched arm: every output is the canonical empty index.
+        return {
+            IndexSpec(reduction=red, depth=d): encode_sorted_index(
+                np.zeros(0, dtype=np.uint32)
+            )
+            for red in reductions
+            for d in depths
+        }
 
-    # ONE shared Stage 1+2 walk for all (mode, depth) pairs (plan §D8).
-    per_spec_lengths = compute_reduced_lengths(
-        session,
-        section_info=section_info,
-        depths=depths,
-        reductions=reductions,
-        gate=gate,
-        duplicate_handling=duplicate_handling,
-    )
+    data_path = base_path / f"{binary_name}_data.bin"
+    data_u8 = np.memmap(str(data_path), dtype=np.uint8, mode="r")
+    try:
+        assert_data_bin_prelude(
+            bytes(data_u8[:DATA_BIN_PRELUDE_SIZE]), path=str(data_path)
+        )
+        per_spec_lengths = compute_reduced_lengths(
+            section_info,
+            data_u8,
+            depths=depths,
+            reductions=reductions,
+            gate=gate,
+            duplicate_handling=duplicate_handling,
+        )
+    finally:
+        # np.memmap owns an mmap handle; close it deterministically
+        # rather than waiting on GC (the CLI loops over many binaries).
+        if data_u8._mmap is not None:  # pragma: no branch
+            data_u8._mmap.close()
 
-    # Per-(mode, depth) wire encode.  Each call is independent.
     return {
         spec: encode_sorted_index(lengths)
         for spec, lengths in per_spec_lengths.items()
@@ -126,46 +132,22 @@ def write_sorted_index_files(
     duplicate_handling: DuplicateHandling = PLAIN,
     output_dir: Optional[Path] = None,
 ) -> Dict[IndexSpec, Path]:
-    """Open a session, build per-(mode, depth) bytes, write filenames.
+    """Build per-(mode, depth) bytes and write canonical filenames.
 
     The canonical filename grammar (plan §D5, regex-locked in
     :mod:`._reader`)::
 
         <binary>_sorted_<mode>_d<depth>.idx
 
-    where ``<mode>`` is :meth:`LengthReduction.filename_tag` (``"max"``
-    or ``"p<NN>"`` with zero-padded percentile) and ``<depth>`` is
-    zero-padded to three digits so files lexsort by depth. The gating +
-    duplicate parameters affect file CONTENT only; the filename scheme
-    is unchanged (a consumer reading the ``.idx`` does not need to know
-    which gate / duplicate policy produced it).
+    where ``<mode>`` is :meth:`LengthReduction.filename_tag` and
+    ``<depth>`` is zero-padded to three digits. The gating + duplicate
+    parameters affect file CONTENT only; the filename scheme is
+    unchanged.
 
-    Parameters
-    ----------
-    memmap_dir
-        Per-binary memmap directory -- the source of the session's
-        sidecar files (sections.bin / index.bin / etc.).
-    binary_name
-        The binary's ``<binary>`` prefix.
-    reductions
-        :class:`LengthReduction` modes to write.  Empty list returns an
-        empty dict (no session is opened).
-    depths
-        Splice depths to write (one file per ``(reduction, depth)``
-        pair).  Empty list returns an empty dict (no session opened).
-    gate
-        Top-level minimum-variant emission gate (defaults to disabled).
-    duplicate_handling
-        Top-level duplicate strategy (defaults to :data:`PLAIN`).
-    output_dir
-        Directory to write the ``.idx`` files into.  Defaults to
-        ``memmap_dir`` (the conventional placement next to the other
-        per-binary sidecars).  Created if it does not exist.
-
-    Returns
-    -------
-    Dict[IndexSpec, Path]
-        ``{IndexSpec(reduction, depth) -> path}`` for every written file.
+    Parameters mirror :func:`build_sorted_index_bytes`;
+    ``output_dir`` defaults to ``memmap_dir`` (the conventional
+    placement next to the other per-binary sidecars) and is created if
+    missing. Returns ``{IndexSpec -> written path}``.
     """
     if not reductions or not depths:
         return {}
@@ -173,17 +155,14 @@ def write_sorted_index_files(
     target_dir = Path(output_dir) if output_dir is not None else Path(memmap_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=None)
-    with dataset.open_session() as session:
-        per_spec_bytes = build_sorted_index_bytes(
-            session,
-            Path(memmap_dir),
-            binary_name,
-            reductions=reductions,
-            depths=depths,
-            gate=gate,
-            duplicate_handling=duplicate_handling,
-        )
+    per_spec_bytes = build_sorted_index_bytes(
+        Path(memmap_dir),
+        binary_name,
+        reductions=reductions,
+        depths=depths,
+        gate=gate,
+        duplicate_handling=duplicate_handling,
+    )
 
     written: Dict[IndexSpec, Path] = {}
     for spec, blob in per_spec_bytes.items():

@@ -26,7 +26,6 @@ from typing import List
 import numpy as np
 import pytest
 
-from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.sorted_index import (
     IndexSpec,
     LengthReduction,
@@ -75,14 +74,15 @@ def _independent_recompute(
     length arrays without re-running the (expensive) compute walk.
     """
     section_info = read_section_variant_info(base, binary_name)
-    dataset = BinaryDataset(base, binary_name, vocab_manager=None)
-    with dataset.open_session() as session:
-        per_spec_lengths = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[depth],
-            reductions=reductions,
-        )
+    data_u8 = np.memmap(
+        str(base / f"{binary_name}_data.bin"), dtype=np.uint8, mode="r"
+    )
+    per_spec_lengths = compute_reduced_lengths(
+        section_info,
+        data_u8,
+        depths=[depth],
+        reductions=reductions,
+    )
     return {
         red: (
             encode_sorted_index(

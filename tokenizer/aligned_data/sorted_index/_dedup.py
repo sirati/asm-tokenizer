@@ -92,6 +92,30 @@ class DuplicateHandling:
             _group_by_pointer(lengths, data_pointers)
         )
 
+    def reduce_segmented(
+        self,
+        reduction: LengthReduction,
+        *,
+        lengths: np.ndarray,
+        data_pointers: np.ndarray,
+        seg_offsets: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized :meth:`reduce_section` over CSR segments.
+
+        ``lengths`` / ``data_pointers`` are the concatenated per-variant
+        columns; ``seg_offsets`` (``int64[n_sections + 1]``) ties each
+        section to its slice. PLAIN ignores the pointers
+        (:meth:`LengthReduction.reduce_segmented`); the dedup strategy
+        groups by pointer within each segment
+        (:meth:`LengthReduction.reduce_grouped_segmented`). Returns
+        ``int64[n_sections]``.
+        """
+        if not self._adjusts:
+            return reduction.reduce_segmented(lengths, seg_offsets)
+        return reduction.reduce_grouped_segmented(
+            lengths, data_pointers, seg_offsets
+        )
+
 
 #: Historical behaviour: no top-level dedup (``--adjust-for-duplicates``
 #: off). Byte-for-byte identical to the pre-feature reduction path.

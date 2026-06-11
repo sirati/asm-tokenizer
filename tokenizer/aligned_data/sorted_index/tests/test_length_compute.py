@@ -1,24 +1,20 @@
-"""Tests for :mod:`sorted_index._length_compute`.
+"""Tests for :mod:`sorted_index._length_compute` (walk-free pipeline).
 
-Covers the ALG-7 pre-pass + ALG-1 multi-mode shared walk:
+Covers the columnar pre-pass + the vectorized multi-mode compute:
 
-* :func:`_count_variants_per_section` returns the correct per-section
-  count on every Phase 0c fixture, oracle-checked against a direct
-  :func:`iter_sections_bin` walk.
+* :func:`read_section_variant_info` counts match a direct
+  :func:`iter_sections_bin` oracle on every Phase 0c fixture.
 * :func:`compute_reduced_lengths` produces the expected per-mode
   reductions on the combined fixture: 0-variant stays 0, 1-variant
-  collapses to the one length, multi-variant max equals the per-variant
-  max, multi-variant p50 equals :func:`numpy.percentile` (method=lower).
-* The MISSING_VARIANT_INDEX fixture does not crash; some length is
-  produced for the caller section.
-* All requested reductions come from a single Stage 1+2 walk per chunk
-  (asserted via :func:`unittest.mock.patch` on ``walk_sections``).
-* Deterministic: two back-to-back invocations on the same fixture
-  produce byte-identical result arrays.
-* The plan D-2.2 cut-fired assertion is asserted via a small
-  :func:`unittest.mock.patch` of :func:`predict_lengths` that returns
-  a synthetic :class:`Stage2Batch` whose variant carries
-  ``cut_call_target_index != len(call_targets)``.
+  collapses to the one length, multi-variant MAX / P50 agree with a
+  LEGACY Stage 1+2 walk oracle (the strongest cross-check: the old
+  machinery still exists in the loader and must agree).
+* The MISSING_VARIANT_INDEX fixture does not crash.
+* All (mode, depth) outputs come from ONE graph traversal (asserted
+  via :func:`unittest.mock.patch` on ``compute_node_lengths``).
+* Deterministic: two invocations produce byte-identical arrays.
+* The plan D-2.2 budget guard raises when a spliced length reaches
+  ``LARGE_CONTEXT_LEN``.
 """
 
 from __future__ import annotations
@@ -30,7 +26,6 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.matched_sections_bin import iter_sections_bin
 from tokenizer.aligned_data.sorted_index import (
     IndexSpec,
@@ -41,7 +36,6 @@ from tokenizer.aligned_data.sorted_index import (
 )
 from tokenizer.aligned_data.sorted_index._length_compute import (
     LARGE_CONTEXT_LEN,
-    _count_variants_per_section,
 )
 
 from .fixtures import (
@@ -66,14 +60,7 @@ _P95 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=95)
 
 
 def _oracle_variant_counts(base: Path, num_matched: int) -> np.ndarray:
-    """Count matched-section variants by re-parsing ``sections.bin`` directly.
-
-    Walks the same iterator the implementation uses but reads the
-    length of ``section.variants`` straight out of the parsed
-    :class:`Section`. The implementation does the same thing in a
-    bounded ndarray; the oracle keeps the comparison value
-    independent of the implementation's loop structure.
-    """
+    """Count matched-section variants via a direct scalar BIN walk."""
     counts = []
     for i, section in enumerate(
         iter_sections_bin(base / f"{_BINARY_NAME}_sections.bin")
@@ -81,17 +68,37 @@ def _oracle_variant_counts(base: Path, num_matched: int) -> np.ndarray:
         if i >= num_matched:
             break
         counts.append(len(section.variants))
-    return np.array(counts, dtype=np.uint32)
+    return np.array(counts, dtype=np.int64)
 
 
-def _open(base: Path) -> Tuple[BinaryDataset, int]:
-    """Open the dataset and return ``(dataset, num_matched_sections)``."""
-    dataset = BinaryDataset(base, _BINARY_NAME, vocab_manager=None)
-    return dataset, len(dataset.matched_bin_starts)
+def _data_bytes(base: Path) -> np.ndarray:
+    return np.memmap(
+        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
+    )
+
+
+def _compute_on(base: Path, *, reductions, depth: int = 3):
+    """Run pre-pass + ``compute_reduced_lengths``; unwrap one depth.
+
+    Returns ``(results, counts)`` where ``results`` maps each
+    reduction to its ``u32[num_sections]`` array at ``depth``.
+    """
+    section_info = read_section_variant_info(base, _BINARY_NAME)
+    per_spec = compute_reduced_lengths(
+        section_info,
+        _data_bytes(base),
+        depths=[depth],
+        reductions=reductions,
+    )
+    results = {
+        red: per_spec[IndexSpec(reduction=red, depth=depth)]
+        for red in reductions
+    }
+    return results, section_info.counts
 
 
 # ---------------------------------------------------------------------------
-# _count_variants_per_section
+# Pre-pass variant counts
 # ---------------------------------------------------------------------------
 
 
@@ -107,28 +114,20 @@ def _open(base: Path) -> Tuple[BinaryDataset, int]:
         (build_missing_variant_index_fixture, [1, 2]),
     ],
 )
-def test_count_variants_matches_oracle(
+def test_prepass_counts_match_oracle(
     tmp_path: Path, builder, expected_counts
 ) -> None:
-    """Per-section variant count matches a direct ``iter_sections_bin`` oracle.
-
-    Also asserts the absolute counts line up with each fixture's
-    documented spec order -- the fixture docstrings name the per-
-    section variant counts, so this catches both fixture drift and
-    implementation drift in one assertion.
-    """
+    """Pre-pass per-section counts match the scalar BIN-walk oracle."""
     base = builder(tmp_path)
-    dataset, num_matched = _open(base)
-    assert num_matched == len(expected_counts), (
+    info = read_section_variant_info(base, _BINARY_NAME)
+    assert info.counts.size == len(expected_counts), (
         f"{builder.__name__}: expected {len(expected_counts)} matched "
-        f"sections per spec; matched_index.bin has {num_matched}"
+        f"sections per spec; got {info.counts.size}"
     )
-    counts = _count_variants_per_section(base, _BINARY_NAME)
-    assert counts.dtype == np.uint32
-    oracle = _oracle_variant_counts(base, num_matched)
-    np.testing.assert_array_equal(counts, oracle)
+    oracle = _oracle_variant_counts(base, info.counts.size)
+    np.testing.assert_array_equal(info.counts, oracle)
     np.testing.assert_array_equal(
-        counts, np.array(expected_counts, dtype=np.uint32)
+        info.counts, np.array(expected_counts, dtype=np.int64)
     )
 
 
@@ -137,66 +136,29 @@ def test_count_variants_matches_oracle(
 # ---------------------------------------------------------------------------
 
 
-def _compute_on(
-    base: Path, *, reductions, depth: int = 3
-):
-    """Run the full open-session + ``compute_reduced_lengths`` pipeline.
-
-    Returns ``(results, counts)``. ``results`` is the per-mode dict
-    (unwrapped from the per-:class:`IndexSpec` output at the single
-    requested ``depth`` so the assertions stay focused on the per-mode
-    result shape); ``counts`` is the upstream variant-count array.
-    """
-    dataset, _num_matched = _open(base)
-    section_info = read_section_variant_info(base, _BINARY_NAME)
-    with dataset.open_session() as session:
-        per_spec = compute_reduced_lengths(
-            session,
-            section_info=section_info,
-            depths=[depth],
-            reductions=reductions,
-        )
-    results = {
-        red: per_spec[IndexSpec(reduction=red, depth=depth)]
-        for red in reductions
-    }
-    return results, section_info.counts
-
-
 def test_combined_fixture_shape_and_dtype(tmp_path: Path) -> None:
-    """Result arrays are ``u32[num_sections]`` with no negative entries."""
+    """Result arrays are ``u32[num_sections]``."""
     base = build_combined_fixture(tmp_path)
-    _, num_matched = _open(base)
-    results, _ = _compute_on(base, reductions=[_MAX, _P50, _P95])
+    results, counts = _compute_on(base, reductions=[_MAX, _P50, _P95])
     assert set(results.keys()) == {_MAX, _P50, _P95}
     for red, arr in results.items():
         assert arr.dtype == np.uint32, f"{red}: wrong dtype {arr.dtype}"
-        assert arr.shape == (num_matched,), (
-            f"{red}: wrong shape {arr.shape} vs {num_matched}"
+        assert arr.shape == (counts.size,), (
+            f"{red}: wrong shape {arr.shape} vs {counts.size}"
         )
 
 
 def test_combined_fixture_zero_variant_stamps_zero(tmp_path: Path) -> None:
-    """0-variant sections collapse to 0 under every reduction.
-
-    ``func_zero`` is section[0] in the combined fixture spec order.
-    Every requested mode must stamp 0 there: the result must NOT depend
-    on the reduction kind for a 0-variant section.
-    """
+    """0-variant sections collapse to 0 under every reduction."""
     base = build_combined_fixture(tmp_path)
     results, counts = _compute_on(base, reductions=[_MAX, _P50, _P95])
-    # Sanity: spec-order index 0 is the 0-variant section.
     assert counts[0] == 0
     for red, arr in results.items():
         assert arr[0] == 0, f"{red}: 0-variant section[0] stamped {arr[0]}"
 
 
 def test_combined_fixture_one_variant_collapses(tmp_path: Path) -> None:
-    """1-variant sections agree across MAX / PERCENTILE -- the per-variant length.
-
-    ``solo_a`` (section[1]) has exactly one variant; every reduction
-    must read that variant's ``total_surviving_token_count``.
-    """
+    """1-variant sections agree across MAX / PERCENTILE."""
     base = build_combined_fixture(tmp_path)
     results, counts = _compute_on(base, reductions=[_MAX, _P50, _P95])
     assert counts[1] == 1
@@ -209,19 +171,13 @@ def test_combined_fixture_one_variant_collapses(tmp_path: Path) -> None:
 
 
 def test_combined_fixture_many_variant_max_vs_p50(tmp_path: Path) -> None:
-    """Multi-variant MAX/P50 agree with a per-variant oracle.
+    """Multi-variant MAX/P50 agree with the LEGACY Stage 1+2 oracle.
 
-    ``multi_fn`` (section[2]) carries four variants. Re-run the walk
-    via stage 1+2 directly and assert the per-variant
-    ``total_surviving_token_count`` vector reduces to the same values
-    the implementation returned for MAX (max) and P50
-    (``np.percentile(..., 50, method="lower")``).
+    ``multi_fn`` (section[2]) carries four variants. The legacy walk
+    machinery still exists in the loader; running it on section[2]
+    must produce per-variant ``total_surviving_token_count`` values
+    whose max / p50 equal the new pipeline's outputs.
     """
-    base = build_combined_fixture(tmp_path)
-    results, counts = _compute_on(base, reductions=[_MAX, _P50])
-    assert counts[2] == 4
-
-    # Oracle: run stage 1+2 on just section[2] under the same params.
     from tokenizer.aligned_data.loader.batch_decode._length_predict import (
         predict_lengths,
     )
@@ -232,9 +188,14 @@ def test_combined_fixture_many_variant_max_vs_p50(tmp_path: Path) -> None:
         SectionPointerSpec,
         VariantPadding,
     )
+    from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
     from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 
-    dataset, _ = _open(base)
+    base = build_combined_fixture(tmp_path)
+    results, counts = _compute_on(base, reductions=[_MAX, _P50])
+    assert counts[2] == 4
+
+    dataset = BinaryDataset(base, _BINARY_NAME, vocab_manager=None)
     rng = np.random.default_rng(0)
     with dataset.open_session() as session:
         stage1 = walk_sections(
@@ -259,78 +220,51 @@ def test_combined_fixture_many_variant_max_vs_p50(tmp_path: Path) -> None:
 
 
 def test_missing_variant_index_does_not_crash(tmp_path: Path) -> None:
-    """The MISSING-slot caller section produces a length without crashing.
-
-    The walker must treat a per-call slot whose
-    ``section_variant_index == MISSING_VARIANT_INDEX`` as "no inlined
-    callee body" rather than indexing into the callee's variant
-    array. We do not pin a specific length value -- the caller has
-    one variant, so the result is the caller's
-    ``total_surviving_token_count`` after the missing slot was
-    skipped; pinning the absolute number couples the test to internal
-    splice walk semantics. Smoke that the call completes and stamps a
-    non-zero length suffices.
-    """
+    """The MISSING-slot caller section produces a length without crashing."""
     base = build_missing_variant_index_fixture(tmp_path)
     results, counts = _compute_on(base, reductions=[_MAX])
-    # caller_fn is section[0] with one variant per fixture docstring.
     assert counts[0] == 1
     assert results[_MAX][0] > 0
-    # callee_fn is section[1] with two variants.
     assert counts[1] == 2
     assert results[_MAX][1] > 0
 
 
 # ---------------------------------------------------------------------------
-# Multi-mode shared walk: ONE stage 1+2 pass per chunk
+# Multi-mode amortisation: ONE graph traversal for all (mode, depth) pairs
 # ---------------------------------------------------------------------------
 
 
-def test_multi_mode_runs_one_walk_per_chunk(tmp_path: Path) -> None:
-    """Three reductions share a single walk per chunk (plan ALG-1 amortisation).
-
-    The combined fixture has 4 populated matched sections, well under
-    :data:`CHUNK_SIZE` (64), so exactly one ``walk_sections`` call
-    must back the whole compute regardless of how many reductions
-    were requested.
-    """
+def test_multi_mode_runs_one_graph_traversal(tmp_path: Path) -> None:
+    """Three reductions x two depths share one ``compute_node_lengths``."""
     base = build_combined_fixture(tmp_path)
-    dataset, _num_matched = _open(base)
     section_info = read_section_variant_info(base, _BINARY_NAME)
 
-    real_walk_sections = __import__(
-        "tokenizer.aligned_data.sorted_index._length_compute",
-        fromlist=["walk_sections"],
-    ).walk_sections
+    from tokenizer.aligned_data.sorted_index._graph_lengths import (
+        compute_node_lengths as real_compute,
+    )
 
     call_counter = {"n": 0}
 
-    def _counting_walk(*args, **kwargs):
+    def _counting(*args, **kwargs):
         call_counter["n"] += 1
-        return real_walk_sections(*args, **kwargs)
+        return real_compute(*args, **kwargs)
 
     with patch(
-        "tokenizer.aligned_data.sorted_index._length_compute.walk_sections",
-        side_effect=_counting_walk,
+        "tokenizer.aligned_data.sorted_index._length_compute."
+        "compute_node_lengths",
+        side_effect=_counting,
     ):
-        with dataset.open_session() as session:
-            results = compute_reduced_lengths(
-                session,
-                section_info=section_info,
-                depths=[3],
-                reductions=[_MAX, _P50, _P95],
-            )
+        results = compute_reduced_lengths(
+            section_info,
+            _data_bytes(base),
+            depths=[1, 3],
+            reductions=[_MAX, _P50, _P95],
+        )
 
     assert call_counter["n"] == 1, (
-        f"expected 1 walk_sections call for a single-chunk fixture; "
-        f"got {call_counter['n']}"
+        f"expected 1 compute_node_lengths call; got {call_counter['n']}"
     )
-    # And the three reductions must still produce per-(mode, depth) arrays.
-    assert set(results.keys()) == {
-        IndexSpec(reduction=_MAX, depth=3),
-        IndexSpec(reduction=_P50, depth=3),
-        IndexSpec(reduction=_P95, depth=3),
-    }
+    assert len(results) == 6  # 3 reductions x 2 depths
 
 
 # ---------------------------------------------------------------------------
@@ -339,13 +273,7 @@ def test_multi_mode_runs_one_walk_per_chunk(tmp_path: Path) -> None:
 
 
 def test_deterministic_across_runs(tmp_path: Path) -> None:
-    """Two back-to-back invocations produce byte-identical result arrays.
-
-    The deterministic RNG seed (:data:`numpy.random.default_rng(0)`)
-    has zero effect under :data:`LARGE_VARIANT_CAP`, so the result is
-    a pure function of the input bytes. Drift here flags accidental
-    non-determinism in the walk.
-    """
+    """Two invocations produce byte-identical result arrays."""
     base = build_combined_fixture(tmp_path)
     first, _ = _compute_on(base, reductions=[_MAX, _P50, _P95])
     second, _ = _compute_on(base, reductions=[_MAX, _P50, _P95])
@@ -356,123 +284,92 @@ def test_deterministic_across_runs(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Empty / all-zero edge cases
+# Empty / invalid-parameter edge cases
 # ---------------------------------------------------------------------------
 
 
-def test_all_zero_variant_short_circuits(tmp_path: Path) -> None:
-    """A binary whose whole matched arm is 0-variant returns all-zero arrays.
+def test_all_zero_variant_stamps_all_zero(tmp_path: Path) -> None:
+    """A matched arm whose every section is 0-variant returns all-zeros.
 
-    Constructed by hand from
-    :func:`build_0_variant_section_fixture` -- only the func_zero
-    section. The pre-filter short-circuits before any walk runs;
-    every reduction stamps zero.
+    Built from the 0-variant fixture by slicing the catalog down to
+    just the ``func_zero`` section (section[0]).
     """
-    from tokenizer.aligned_data.sorted_index import SectionVariantInfo
-
     base = build_0_variant_section_fixture(tmp_path)
-    dataset, num_matched = _open(base)
-    # Force the all-zero path by zeroing every count (the fixture has
-    # func_zero + func_one; we want the pre-filter exercised when
-    # populated_idx.size == 0). Pointer arrays match the zeroed counts.
-    zeroed = SectionVariantInfo(
-        counts=np.zeros(num_matched, dtype=np.uint32),
-        data_pointers=[np.zeros(0, dtype=np.uint32) for _ in range(num_matched)],
+    info = read_section_variant_info(base, _BINARY_NAME)
+    sliced = read_section_variant_info(base, _BINARY_NAME)
+    # Reparse bounded to ONLY the 0-variant section.
+    from tokenizer.aligned_data.matched_sections_columnar import (
+        parse_sections_columnar,
     )
-    with dataset.open_session() as session:
-        results = compute_reduced_lengths(
-            session,
-            section_info=zeroed,
-            depths=[3],
-            reductions=[_MAX, _P50],
-        )
+    from tokenizer.aligned_data.sorted_index._prepass import (
+        SectionVariantInfo,
+    )
+
+    blob = np.fromfile(base / f"{_BINARY_NAME}_sections.bin", dtype=np.uint8)
+    zero_only = SectionVariantInfo(
+        cols=parse_sections_columnar(blob, info.section_offsets[:1]),
+        section_offsets=info.section_offsets[:1],
+    )
+    assert zero_only.counts.tolist() == [0]
+    del sliced
+    results = compute_reduced_lengths(
+        zero_only,
+        _data_bytes(base),
+        depths=[3],
+        reductions=[_MAX, _P50],
+    )
     for _spec, arr in results.items():
-        np.testing.assert_array_equal(arr, np.zeros(num_matched, dtype=np.uint32))
+        np.testing.assert_array_equal(arr, np.zeros(1, dtype=np.uint32))
 
 
 def test_empty_depths_raises(tmp_path: Path) -> None:
-    """An empty ``depths`` list is a hard fail (no depth to materialise)."""
     base = build_combined_fixture(tmp_path)
-    dataset, _num_matched = _open(base)
     section_info = read_section_variant_info(base, _BINARY_NAME)
-    with dataset.open_session() as session:
-        with pytest.raises(ValueError, match="depths must be a non-empty"):
-            compute_reduced_lengths(
-                session,
-                section_info=section_info,
-                depths=[],
-                reductions=[_MAX],
-            )
+    with pytest.raises(ValueError, match="depths must be a non-empty"):
+        compute_reduced_lengths(
+            section_info, _data_bytes(base), depths=[], reductions=[_MAX]
+        )
 
 
 def test_negative_depth_raises(tmp_path: Path) -> None:
-    """A negative depth is a hard fail (the walk's max_depth must be >= 0)."""
     base = build_combined_fixture(tmp_path)
-    dataset, _num_matched = _open(base)
     section_info = read_section_variant_info(base, _BINARY_NAME)
-    with dataset.open_session() as session:
-        with pytest.raises(ValueError, match="depths must all be >= 0"):
-            compute_reduced_lengths(
-                session,
-                section_info=section_info,
-                depths=[1, -1],
-                reductions=[_MAX],
-            )
+    with pytest.raises(ValueError, match="depths must all be >= 0"):
+        compute_reduced_lengths(
+            section_info,
+            _data_bytes(base),
+            depths=[1, -1],
+            reductions=[_MAX],
+        )
 
 
 # ---------------------------------------------------------------------------
-# D-2.2: cut-fired assertion
+# D-2.2: budget guard
 # ---------------------------------------------------------------------------
 
 
-def test_cut_fired_raises(tmp_path: Path) -> None:
-    """Stage 2 cut-fired raises with a useful message (plan D-2.2).
+def test_budget_guard_raises(tmp_path: Path) -> None:
+    """Lengths reaching LARGE_CONTEXT_LEN refuse to under-report.
 
-    Patches :func:`predict_lengths` to return a synthetic
-    :class:`Stage2Batch` whose variant carries
-    ``cut_call_target_index != len(call_targets)``. The compute MUST
-    refuse to silently under-report and raise
-    :class:`AssertionError` instead.
+    Patches the bulk own-length step to claim every record is at the
+    budget; the compute MUST raise rather than emit a clipped u32.
     """
-    from dataclasses import replace as _dc_replace
-
-    from tokenizer.aligned_data.loader.batch_decode._length_predict import (
-        predict_lengths as real_predict_lengths,
-    )
-
     base = build_combined_fixture(tmp_path)
-    dataset, _num_matched = _open(base)
     section_info = read_section_variant_info(base, _BINARY_NAME)
 
-    def _cut_predict(stage1, *, context_len):
-        real = real_predict_lengths(stage1, context_len=context_len)
-        # Mutate the first populated variant of the first section to
-        # report a cut firing inside it (cut_call_target_index < n).
-        mutated_sections = []
-        injected = False
-        for st2_sec in real.sections:
-            if not injected and st2_sec.variants:
-                v0 = st2_sec.variants[0]
-                if len(v0.call_targets) >= 1:
-                    bad = _dc_replace(v0, cut_call_target_index=0)
-                    new_section = _dc_replace(
-                        st2_sec, variants=[bad, *st2_sec.variants[1:]]
-                    )
-                    mutated_sections.append(new_section)
-                    injected = True
-                    continue
-            mutated_sections.append(st2_sec)
-        return _dc_replace(real, sections=mutated_sections)
+    def _huge(cols, data_u8):
+        return np.full(
+            cols.var_n_calls.size, LARGE_CONTEXT_LEN, dtype=np.int64
+        )
 
     with patch(
-        "tokenizer.aligned_data.sorted_index._length_compute.predict_lengths",
-        side_effect=_cut_predict,
+        "tokenizer.aligned_data.sorted_index._graph_lengths._own_lengths",
+        side_effect=_huge,
     ):
-        with dataset.open_session() as session:
-            with pytest.raises(AssertionError, match="cut fired"):
-                compute_reduced_lengths(
-                    session,
-                    section_info=section_info,
-                    depths=[3],
-                    reductions=[_MAX],
-                )
+        with pytest.raises(AssertionError, match="LARGE_CONTEXT_LEN"):
+            compute_reduced_lengths(
+                section_info,
+                _data_bytes(base),
+                depths=[3],
+                reductions=[_MAX],
+            )

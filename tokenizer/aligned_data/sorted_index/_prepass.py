@@ -1,42 +1,38 @@
-"""Matched-section variant pre-pass (plan ALG-7, extended).
+"""Matched-section catalog pre-pass for the sorted-index build.
 
-Single concern: ONE read of ``<binary>_sections.bin`` that recovers,
-per matched section, the data needed to (a) pre-filter the Stage 1+2
-walk and (b) drive the top-level duplicate / minimum-variant logic --
-the per-section variant count AND the per-section variant data-bin
-pointers (``data_offset_shifted``). Both come from the same parsed
-:class:`VariantBlock` records, so reading them together avoids a second
-pass over the catalog (no parallel cache: the pointers ARE the parsed
-bytes, surfaced once for the downstream consumers that the no-reparse
-rule otherwise forces to re-walk).
+Single concern: ONE columnar read of the matched region of
+``<binary>_sections.bin`` (bounded by the ``<binary>_index.bin``
+locator), surfacing everything the build consumes downstream -- the
+per-section variant counts (0-variant pre-filter + minimum-variant
+gate), the per-variant data-bin pointers (duplicate grouping + own
+lengths), the call-target tables and per-call entries (the splice
+graph) -- as flat numpy columns via
+:class:`~tokenizer.aligned_data.matched_sections_columnar.
+ColumnarSections`.
 
 Boundary contract (the design-first sentence):
 
   *Given the memmap directory + a binary name, return a
-  :class:`SectionVariantInfo` carrying the per-section top-level
-  variant counts and the per-section variant ``data_offset_shifted``
-  vectors -- the single source the 0-variant pre-filter, the
-  duplicate-aware reduction grouping, and the minimum-variant gate all
-  read from.*
-
-``data_offset_shifted`` equality is the "same content" relation: two
-variants of one section sharing a ``data_offset_shifted`` point at the
-same ``_data.bin`` record (identical body tokens), which is exactly the
-top-level duplicate relation the feature defines.
+  :class:`SectionVariantInfo` carrying the columnar matched-section
+  catalog + the locator offsets -- the single parsed source every
+  downstream sorted-index stage (gating, dedup, graph lengths) reads
+  from, so nothing re-parses the BIN.*
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
 
 import numpy as np
 
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
-from tokenizer.aligned_data.matched_sections_bin import iter_sections_bin
+from tokenizer.aligned_data.matched_sections_columnar import (
+    ColumnarSections,
+    parse_sections_columnar,
+)
 
 
 __all__ = ["SectionVariantInfo", "read_section_variant_info"]
@@ -44,37 +40,59 @@ __all__ = ["SectionVariantInfo", "read_section_variant_info"]
 
 @dataclass(frozen=True)
 class SectionVariantInfo:
-    """Per matched-section top-level variant metadata from one BIN pass.
+    """Columnar matched-section catalog + locator offsets, one BIN pass.
 
-    Parallel-indexed by matched-section index (the index space
-    :meth:`BinarySession.load_matched` uses). ``counts[i]`` is the
-    top-level variant count of section ``i``; ``data_pointers[i]`` is
-    the ``u32`` vector of that section's variant ``data_offset_shifted``
-    values, in on-disk variant order (length ``counts[i]``).
+    ``cols`` is indexed by matched-section position (the index space
+    :meth:`BinarySession.load_matched` uses); ``section_offsets`` is
+    the locator's parallel byte-offset column (the values call-target
+    ``function_section_ptr`` fields point at).
     """
 
-    counts: np.ndarray
-    """``u32[num_matched_sections]`` -- top-level variant count per
-    section."""
+    cols: ColumnarSections
+    section_offsets: np.ndarray
+    """``int64[num_matched_sections]`` -- BIN byte offset per section."""
 
-    data_pointers: List[np.ndarray]
-    """Per-section ``u32`` ``data_offset_shifted`` vectors;
-    ``len(data_pointers) == counts.size`` and
-    ``data_pointers[i].size == counts[i]``."""
+    @property
+    def counts(self) -> np.ndarray:
+        """``i64[num_matched_sections]`` top-level variant counts."""
+        return self.cols.n_variants
+
+    def unique_counts(self) -> np.ndarray:
+        """Distinct ``data_offset_shifted`` count per section.
+
+        The number of top-level duplicate-GROUPS -- what the
+        ``--min-variants-unique`` gate measures.
+        """
+        cols = self.cols
+        n_sections = cols.n_variants.size
+        total = cols.var_data_offset_shifted.size
+        if total == 0:
+            return np.zeros(n_sections, dtype=np.int64)
+        seg = np.repeat(
+            np.arange(n_sections, dtype=np.int64), cols.n_variants
+        )
+        order = np.lexsort((cols.var_data_offset_shifted, seg))
+        sp = cols.var_data_offset_shifted[order]
+        ss = seg[order]
+        first = np.ones(total, dtype=bool)
+        first[1:] = (sp[1:] != sp[:-1]) | (ss[1:] != ss[:-1])
+        return np.bincount(ss[first], minlength=n_sections)
 
     def unique_count(self, section_idx: int) -> int:
-        """Distinct ``data_offset_shifted`` values in section ``section_idx``.
-
-        The count of top-level duplicate-GROUPS -- i.e. the number of
-        UNIQUE variants the ``--min-variants-unique`` gate measures.
-        """
-        return int(np.unique(self.data_pointers[section_idx]).size)
+        """Scalar convenience over :meth:`unique_counts`."""
+        lo = int(self.cols.var_offsets[section_idx])
+        hi = int(self.cols.var_offsets[section_idx + 1])
+        return int(
+            np.unique(self.cols.var_data_offset_shifted[lo:hi]).size
+        )
 
 
 def _empty() -> SectionVariantInfo:
     return SectionVariantInfo(
-        counts=np.zeros(0, dtype=np.uint32),
-        data_pointers=[],
+        cols=parse_sections_columnar(
+            np.zeros(0, dtype=np.uint8), np.zeros(0, dtype=np.int64)
+        ),
+        section_offsets=np.zeros(0, dtype=np.int64),
     )
 
 
@@ -82,38 +100,26 @@ def read_section_variant_info(
     base_path: Path,
     binary_name: str,
 ) -> SectionVariantInfo:
-    """Read per-matched-section variant counts + data pointers in one pass.
+    """One columnar read of the matched region of ``sections.bin``.
 
-    Reads ``<binary>_sections.bin`` via :func:`iter_sections_bin`,
-    bounded to the matched region recovered from
-    ``<binary>_index.bin`` (the matched-arm locator). Index ``i``
-    corresponds to the i-th MATCHED section in iteration order, matching
-    :meth:`BinarySession.load_matched`'s index space.
-
-    Returns an empty :class:`SectionVariantInfo` when the binary has no
-    matched arm.
+    Bounded to the matched region recovered from ``<binary>_index.bin``
+    (the matched-arm locator); index ``i`` corresponds to the i-th
+    MATCHED section, matching :meth:`BinarySession.load_matched`'s
+    index space. Returns an empty :class:`SectionVariantInfo` when the
+    binary has no matched arm.
     """
     base_path = Path(base_path)
     pair = read_csv_section_index_arrays(base_path / f"{binary_name}_index.bin")
     if pair is None:
         return _empty()
-    matched_bin_starts, _matched_bin_lengths = pair
-    num_matched = len(matched_bin_starts)
-    if num_matched == 0:
+    starts, lengths = pair
+    if len(starts) == 0:
         return _empty()
-
-    sections_path = base_path / f"{binary_name}_sections.bin"
-    counts = np.zeros(num_matched, dtype=np.uint32)
-    data_pointers: List[np.ndarray] = []
-    for i, section in enumerate(iter_sections_bin(sections_path)):
-        if i >= num_matched:
-            break
-        counts[i] = len(section.variants)
-        data_pointers.append(
-            np.fromiter(
-                (v.data_offset_shifted for v in section.variants),
-                dtype=np.uint32,
-                count=len(section.variants),
-            )
-        )
-    return SectionVariantInfo(counts=counts, data_pointers=data_pointers)
+    blob = np.fromfile(
+        base_path / f"{binary_name}_sections.bin", dtype=np.uint8
+    )
+    starts = np.asarray(starts, dtype=np.int64)
+    return SectionVariantInfo(
+        cols=parse_sections_columnar(blob, starts, lengths),
+        section_offsets=starts,
+    )
