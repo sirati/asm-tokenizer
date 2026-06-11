@@ -333,14 +333,18 @@ class FunctionDeduper:
     __slots__ = ("_seen", "_next_slot_id")
 
     def __init__(self) -> None:
-        # (name, comment, identity_key) -> (canonical_slot_id, body)
+        # (name, comment, identity_key) -> (canonical_slot_id, body_digest)
         # of the first accepted function with that identity tuple.
-        # Subsequent matching-body calls fold into ``canonical_slot_id``
-        # (return is_duplicate=True). Divergent-body calls surface a
-        # warning and spawn a fresh ``slot_id`` (no fold).
+        # ``body_digest`` is the SHA-256 digest of the body's
+        # ``tokens_base64`` string (32 bytes) — storing the full encoded
+        # body retained every unique function body for the whole binary
+        # while equality checking was its only use; body equality is now
+        # digest equality. Subsequent matching-body calls fold into
+        # ``canonical_slot_id`` (return is_duplicate=True). Divergent-body
+        # calls surface a warning and spawn a fresh ``slot_id`` (no fold).
         self._seen: Dict[
             Tuple[str, Optional[str], Optional[Hashable]],
-            Tuple[int, str],
+            Tuple[int, bytes],
         ] = {}
         # Monotonic counter; slot_id allocation is the only ordering
         # signal the deduper exposes. Encounter-order across binaries
@@ -372,8 +376,8 @@ class FunctionDeduper:
                 identity (e.g. thunked-offset for PLT thunks; ``None``
                 otherwise).
             tokens_base64: The function's emitted token body, already
-                serialised for the CSV row. Used verbatim as the body
-                equality key.
+                serialised for the CSV row. Its SHA-256 digest is the
+                body equality key (the full body is not retained).
         """
         # Normalise empty comment to None so callers can pass either
         # shape without semantic difference (the demangler may emit
@@ -382,16 +386,20 @@ class FunctionDeduper:
             comment = None
 
         key = (func_name, comment, identity_key)
+        # Body equality is digest-based: a SHA-256 match IS the body
+        # match (32 bytes retained per identity tuple instead of the
+        # full encoded body).
+        body_digest = hashlib.sha256(tokens_base64.encode()).digest()
         recorded = self._seen.get(key)
         if recorded is None:
             # First sighting under this identity tuple.
             slot_id = self._next_slot_id
             self._next_slot_id += 1
-            self._seen[key] = (slot_id, tokens_base64)
+            self._seen[key] = (slot_id, body_digest)
             return DedupResolution(slot_id=slot_id, is_duplicate=False)
 
-        recorded_slot, recorded_body = recorded
-        if recorded_body == tokens_base64:
+        recorded_slot, recorded_digest = recorded
+        if recorded_digest == body_digest:
             # Four-way match — fold into the canonical record.
             return DedupResolution(slot_id=recorded_slot, is_duplicate=True)
 

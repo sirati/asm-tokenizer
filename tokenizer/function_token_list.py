@@ -27,13 +27,13 @@ class FunctionTokenList:
             insn_size = num_blocks * 4 + 2  # ~4 instructions per block
 
             # Token-level arrays (level 0)
-            self.token_ids = np.zeros(token_ids_size, dtype=np.int16)
-            self.metatoken_type_ids = np.zeros(type_lookup_size, dtype=np.int8)
+            self.token_ids = np.zeros(token_ids_size, dtype=np.int32)
+            self.metatoken_type_ids = np.zeros(type_lookup_size, dtype=np.int32)
             self.metatoken_start_lookup = np.zeros(type_lookup_size, dtype=np.int32)
 
             # Instruction-level arrays (level 1)
-            self.insn_metatoken_run_lengths = np.zeros(insn_size, dtype=np.int8)
-            self.insn_idx_run_lengths = np.zeros(insn_size, dtype=np.int8)
+            self.insn_metatoken_run_lengths = np.zeros(insn_size, dtype=np.int32)
+            self.insn_idx_run_lengths = np.zeros(insn_size, dtype=np.int32)
             self.insn_strs = np.zeros(insn_size, dtype=object)
 
             # Block-level arrays (level 2)
@@ -63,7 +63,7 @@ class FunctionTokenList:
         #     token_types = vocab_manager.id_to_token_type[tokens]
 
         # Token-level arrays (level 0)
-        result.token_ids = tokens.astype(np.int16)
+        result.token_ids = tokens.astype(np.int32)
 
         # Derive metatoken run lengths + the first-token id of each
         # metatoken. The rule depends on the wire-format version held by
@@ -90,10 +90,10 @@ class FunctionTokenList:
             num_metatokens = boundary_positions.size
             # Run lengths = gaps between successive boundary positions,
             # with the final gap running to the end of the stream.
-            metatoken_idx_run_length = np.empty(num_metatokens, dtype=np.uint8)
+            metatoken_idx_run_length = np.empty(num_metatokens, dtype=np.int32)
             if num_metatokens > 0:
-                metatoken_idx_run_length[:-1] = (boundary_positions[1:] - boundary_positions[:-1]).astype(np.uint8)
-                metatoken_idx_run_length[-1] = np.uint8(len(tokens) - int(boundary_positions[-1]))
+                metatoken_idx_run_length[:-1] = (boundary_positions[1:] - boundary_positions[:-1]).astype(np.int32)
+                metatoken_idx_run_length[-1] = np.int32(len(tokens) - int(boundary_positions[-1]))
             metatoken_first_idx = tokens[boundary_positions]
         else:
             metatoken_idx_run_length, metatoken_first_idx = run_length_and_last_type(
@@ -148,6 +148,55 @@ class FunctionTokenList:
         """Set the vocabulary manager for token reconstruction"""
         self.vocab_manager = vocab_manager
 
+    def reset(self):
+        """Reset the logical state for reuse on the next function WITHOUT
+        shrinking or reallocating any array (grow-only buffer reuse).
+
+        Invalidation invariant: ALL views previously handed out over this
+        instance's arrays — everything returned by ``get_used_arrays`` /
+        ``get_used_token_ids``, the wrappers yielded by ``iter_blocks`` /
+        ``iter_insns``, and any ``view()`` child — are invalidated by
+        ``reset()``. A retained view silently reads (or corrupts) the
+        NEXT function's data; consumers that must keep token data past
+        the producer's next reset take an explicit ``snapshot()``.
+
+        Object arrays (``insn_strs``, ``block_addrs``) are nulled over
+        their FULL capacity, not just the used range: an abandoned
+        ``view()`` child (e.g. an exception mid-function) may have
+        written label objects beyond the committed counters, and stale
+        references would otherwise pin provider-side memory until the
+        slot happens to be overwritten.
+        """
+        self.insn_strs[:] = None
+        self.block_addrs[:] = None
+        self.last_index = 0
+        self.insn_count = 0
+        self.block_count = 0
+        self.view_child = None
+
+    def snapshot(self) -> "FunctionTokenList":
+        """Deep-copy the buffer into an independent ``FunctionTokenList``.
+
+        For consumers that retain token data past the producer's next
+        ``reset()`` (e.g. main_loop's VERIFICATION debug retention).
+        Numeric arrays are copied at full capacity; object arrays are
+        copied shallowly (label objects are stash-safe).
+        """
+        result = FunctionTokenList(num_blocks=-1, vocab_manager=self.vocab_manager, init=False)
+        result.token_ids = self.token_ids.copy()
+        result.metatoken_type_ids = self.metatoken_type_ids.copy()
+        result.metatoken_start_lookup = self.metatoken_start_lookup.copy()
+        result.insn_metatoken_run_lengths = self.insn_metatoken_run_lengths.copy()
+        result.insn_idx_run_lengths = self.insn_idx_run_lengths.copy()
+        result.insn_strs = self.insn_strs.copy()
+        result.block_insn_run_lengths = self.block_insn_run_lengths.copy()
+        result.block_metatoken_run_lengths = self.block_metatoken_run_lengths.copy()
+        result.block_addrs = self.block_addrs.copy()
+        result.last_index = self.last_index
+        result.insn_count = self.insn_count
+        result.block_count = self.block_count
+        return result
+
     def view(self) -> "BlockTokenList":
         """Create a view child BlockTokenList that uses the remaining buffer of this FunctionTokenList"""
         if self.view_child is not None:
@@ -182,6 +231,12 @@ class FunctionTokenList:
             raise RuntimeError("Cannot add block while view child is active")
 
         if block_token_list.last_index == 0:
+            # An EMPTY view child still holds the buffer lease — release
+            # it, or the next ``view()`` call raises "already has an
+            # active view child" even though nothing was written.
+            if block_token_list.view_parent is self:
+                block_token_list.readonly = True
+                self.view_child = None
             return
 
         (new_token_ids, new_token_type_ids, new_token_start_lookup, new_insn_run_lengths, new_insn_strs) = (

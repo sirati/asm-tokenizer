@@ -110,9 +110,9 @@ def _make_view() -> _GhidraFunctionView:
 
     The view is now a pure carrier: ``_advance`` stores the pre-derived
     :class:`FunctionIdentity` and touches only ``_ghidra_function`` /
-    ``_entry`` / ``_block_count``. ``program/listing/reg_map/...`` can be
-    ``None`` because they are only read by the block-iteration machinery,
-    not exercised here.
+    ``_entry`` (the block count computes lazily on first ``len(blocks)``
+    ask). ``program/listing/reg_map/...`` can be ``None`` because they
+    are only read by the block-iteration machinery, not exercised here.
     """
     return _GhidraFunctionView(
         arch=None,  # type: ignore[arg-type]
@@ -226,7 +226,7 @@ def test_view_advance_renames_default_source_function() -> None:
     threaded through ``_advance``)."""
     view = _make_view()
     func = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
-    view._advance(func, 1, _derive_function_identity(func, _HASH_A))
+    view._advance(func, _derive_function_identity(func, _HASH_A))
     assert view.name.startswith(PLACEHOLDER_PREFIX)
     assert view.entry == 0x10000
 
@@ -235,7 +235,7 @@ def test_view_advance_preserves_real_symbol_name() -> None:
     """A real-symbol function passes through with its name intact."""
     view = _make_view()
     func = _MockFunction(name="memcpy", source=_IMPORTED, entry=0x401000)
-    view._advance(func, 1, _derive_function_identity(func, _HASH_A))
+    view._advance(func, _derive_function_identity(func, _HASH_A))
     assert view.name == "memcpy"
 
 
@@ -245,9 +245,9 @@ def test_view_advance_same_view_two_default_functions_distinct() -> None:
     view = _make_view()
     func_a = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
     func_b = _MockFunction(name="FUN_00020000", source=_DEFAULT, entry=0x20000)
-    view._advance(func_a, 1, _derive_function_identity(func_a, _HASH_A))
+    view._advance(func_a, _derive_function_identity(func_a, _HASH_A))
     name_a = view.name
-    view._advance(func_b, 1, _derive_function_identity(func_b, _HASH_A))
+    view._advance(func_b, _derive_function_identity(func_b, _HASH_A))
     name_b = view.name
     assert name_a != name_b
 
@@ -258,8 +258,8 @@ def test_view_advance_cross_binary_same_default_function_distinct() -> None:
     view_a = _make_view()
     view_b = _make_view()
     func = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
-    view_a._advance(func, 1, _derive_function_identity(func, _HASH_A))
-    view_b._advance(func, 1, _derive_function_identity(func, _HASH_B))
+    view_a._advance(func, _derive_function_identity(func, _HASH_A))
+    view_b._advance(func, _derive_function_identity(func, _HASH_B))
     assert view_a.name != view_b.name
 
 
@@ -271,7 +271,7 @@ def test_view_carries_canonical_name_from_identity() -> None:
     view = _make_view()
     func = _MockFunction(name="FUN_00010000", source=_DEFAULT, entry=0x10000)
     identity = _derive_function_identity(func, _HASH_A)
-    view._advance(func, 1, identity)
+    view._advance(func, identity)
     assert view.canonical_name == identity.canonical_name
     assert view.canonical_name == view.name == identity.name
 

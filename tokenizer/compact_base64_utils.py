@@ -24,68 +24,41 @@ def _pack_bits_vec(
     bits: int,
     prefix: Sequence[Tuple[int, int]] | None = None,
 ) -> bytes:
-    values = values.astype(np.uint64, copy=False)
-    n = values.size
+    """Vectorised MSB-first bit packer — byte-identical to the scalar
+    fallback in ``_pack_bits`` for every width 1..64.
 
-    assert bits <= 12, "This one is bugged for larger bits :/"
+    Strategy mirrors the vectorised decoder (``base64_to_ndarray_vec``):
+    instead of scattering shifted values into 32-bit words (the historical
+    approach, which corrupted widths straddling word boundaries — exactly
+    11 and everything above 12), each value is expanded to its ``bits``
+    MSB-first bits as an ``(n, bits)`` bit matrix, the prefix bits are
+    prepended, and ``np.packbits`` folds the stream back into bytes
+    (zero-padding the tail byte, exactly like the scalar writer).
+    """
+    values = values.astype(np.uint64, copy=False).ravel()
 
-    # compute total bits and allocate a byte array padded to 4-byte boundary
+    # --- prefix bit stream (MSB-first) ------------------------------------
     pfx_bits = sum(nb for _, nb in prefix) if prefix else 0
-    total_bits = pfx_bits + n * bits
-    n_bytes = (total_bits + 7) // 8
-    n_bytes_padded = ((n_bytes + 3) // 4) * 4
-    out8 = np.zeros(n_bytes_padded, dtype=np.uint8)
-
-    # view as little-endian uint32 for MSB-first math,
-    # then byteswap back at the end
-    out32_le = out8.view(dtype=np.dtype("<u4"))
-
-    # payload bit positions (after prefix)
-    bitpos = pfx_bits + np.arange(n, dtype=np.uint64) * bits
-    word_idx = bitpos >> 5
-    bit_off = (bitpos & 31).astype(np.uint8)
-
-    # values fully within one 32-bit word
-    fits = bit_off + bits <= 32
-    if np.any(fits):
-        shift = 32 - bits - bit_off[fits]
-        part = (values[fits] << shift) & 0xFFFFFFFF
-        np.bitwise_or.at(out32_le, word_idx[fits], part.astype(np.uint32))
-
-    # values crossing the 32-bit boundary
-    cross = ~fits
-    if np.any(cross):
-        lo_bits = 32 - bit_off[cross]
-        hi_bits = bits - lo_bits
-
-        # low part in this word
-        lo_part = (values[cross] >> hi_bits) & ((1 << lo_bits) - 1)
-        # lo_part already aligned since lo_bits + start_offset == 32
-        np.bitwise_or.at(out32_le, word_idx[cross], lo_part.astype(np.uint32))
-
-        # high part in the next word
-        hi_part = values[cross] & ((1 << hi_bits) - 1)
-        hi_part <<= 32 - hi_bits
-        np.bitwise_or.at(out32_le, word_idx[cross] + 1, hi_part.astype(np.uint32))
-
-    # byteswap our working LE view back to BE
-    out32_le.byteswap(inplace=True)
-
-    # write prefix bits into the first pfx_bits
     if prefix:
         p_val = 0
         for val, nb in prefix:
             if val >= (1 << nb):
-                raise ValueError(f"{val} won’t fit in {nb} bits")
+                raise ValueError(f"{val} will not fit in {nb} bits")
             p_val = (p_val << nb) | val
-
         p_bytes = (pfx_bits + 7) // 8
-        shift = 8 * p_bytes - pfx_bits
-        p_val <<= shift
         pfx_arr = np.frombuffer(p_val.to_bytes(p_bytes, "big"), dtype=np.uint8)
-        out8[:p_bytes] |= pfx_arr
+        # ``p_val`` sits right-aligned in its byte string; keep only the
+        # last ``pfx_bits`` of the unpacked stream.
+        pfx_bit_stream = np.unpackbits(pfx_arr)[8 * p_bytes - pfx_bits :]
+    else:
+        pfx_bit_stream = np.empty(0, dtype=np.uint8)
 
-    return out8[:n_bytes].tobytes()
+    # --- payload bit matrix: row i = value i, MSB first --------------------
+    shifts = np.arange(bits - 1, -1, -1, dtype=np.uint64)
+    payload_bits = ((values[:, None] >> shifts) & np.uint64(1)).astype(np.uint8)
+
+    stream = np.concatenate([pfx_bit_stream, payload_bits.reshape(-1)])
+    return np.packbits(stream).tobytes()
 
 
 def _pack_bits(
@@ -97,11 +70,12 @@ def _pack_bits(
     Packs *prefix* bits (list of `(value, n_bits)` tuples) **followed by**
     `values` (each `bits_per_val` wide) into a byte-aligned buffer.
     """
-    # ``_pack_bits_vec`` has a corruption bug at exactly ``bits_per_val == 11``
-    # (the 11-bit cross-word-boundary path drops the value's high bit before
-    # write; round-trips at bits 2-10 and 12 are clean). Route 11-bit packs
-    # through the scalar path until the vec code can be repaired.
-    if bits_per_val <= 12 and bits_per_val != 11:
+    # The vec path is byte-identical to the scalar writer below for every
+    # width 1..64 (round-trip-pinned in
+    # ``tests/test_compact_base64_pack_vec.py``), which covers the whole
+    # 2..33 range the compact header can express. The scalar writer stays
+    # as the out-of-range fallback / executable reference.
+    if 1 <= bits_per_val <= 64:
         return _pack_bits_vec(values, bits_per_val, prefix)
 
     buf = 0

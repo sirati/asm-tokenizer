@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from tqdm import tqdm
 
 from dynamic_runner.worker import Task
 
@@ -15,7 +14,6 @@ from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_bas
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
 from tokenizer.function_deduper import FunctionDeduper
-from tokenizer.function_filter import FunctionFilter
 from tokenizer.function_range_sidecar import FunctionRangeSidecar
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.opaque_remapping import (
@@ -23,6 +21,7 @@ from tokenizer.opaque_remapping import (
     apply_opaque_mapping_raw_optimized,
 )
 from tokenizer.output_filename import derive_sidecar_path
+from tokenizer.progress import log_progress, log_stage
 from tokenizer.string_sidecar import StringSidecar
 from tokenizer.tokens import Category, TokenResolver
 from tokenizer.vocab_unifier import save_vocabulary
@@ -170,7 +169,6 @@ def build_vocab_tokenize_and_index(
 def main_loop(
     instr_sets,
     provider,
-    func_addr_range,
     func_disas,
     func_disas_token,
     func_name_addr,
@@ -188,8 +186,6 @@ def main_loop(
 ) -> tuple[FunctionDataManager, int]:
     logger.info("Preparing main loop")
 
-    filter = FunctionFilter(logger)
-
     total_functions = provider.function_count()
     function_manager = FunctionDataManager(total_functions) if VERIFICATION else FunctionDataManager(0)
     # Semantic-merge gate consulted before every CSV row write + every
@@ -197,8 +193,22 @@ def main_loop(
     # ``tokenizer/function_deduper.py``). Per-binary state; instantiated
     # once here so the same gate covers the whole iter_functions pass.
     function_deduper = FunctionDeduper()
+    # Grow-only token buffer reused across ALL functions of this binary:
+    # constructed once, threaded into ``fill_constant_candidates`` (which
+    # resets it on entry and fills it via in-place ``view()`` blocks). It
+    # grows only when a larger function than any seen before arrives and
+    # never shrinks. Per ``FunctionTokenList.reset()``'s invalidation
+    # invariant, every per-iteration consumer below copies its data out
+    # before the next iteration (the base64 encodes); the VERIFICATION
+    # retention path stashes an explicit ``snapshot()``.
+    reused_func_tokens = FunctionTokenList(num_blocks=64, vocab_manager=vocab_manager)
 
     exceptions = []
+    # Accounting slot threaded out to the worker protocol
+    # (``WorkerOutput.filtered``). Always 0 today: the per-function
+    # ``FunctionFilter`` call was removed because its contract was never
+    # implemented (``filter_fns`` had no reachable ``return True``, so the
+    # value was always 0 anyway — see ``tokenizer/function_filter.py``).
     filtered_count = 0
     last_keepalive_time = time.time()
 
@@ -256,10 +266,11 @@ def main_loop(
         task.set_phase(TokenizerPhase.TOKENIZATION.value)
 
         try:
-            pbar = tqdm(
-                iterable=provider.iter_functions(),
+            pbar = log_progress(
+                provider.iter_functions(),
                 total=total_functions,
                 desc="Retrieving data from alllll functions. Like a big boy.",
+                logger=logger,
             )
             for i, (func_addr, func_name, func) in enumerate(pbar):
                 current_time = time.time()
@@ -284,6 +295,7 @@ def main_loop(
                         resolver=resolver,
                         vocab_manager=vocab_manager,
                         arch_provider=arch_provider,
+                        func_tokens=reused_func_tokens,
                         disasm_provider=provider,
                     )
                 except Exception as e:
@@ -296,15 +308,11 @@ def main_loop(
 
                 (
                     temp_bbs,
-                    block_list,
-                    block_dict,
                     constant_handler,
                     func_tokens,
                     func_min_addr,
                     func_max_addr,
                 ) = function_analysis
-
-                func_addr_range[func_addr] = sorted(block_list, key=lambda d: list(d.values())[0][0])
 
                 # v1: legacy frequency-sort remapping pass. v2 identities
                 # are monotonic at allocation time (no global re-sort), so
@@ -373,10 +381,6 @@ def main_loop(
                     else:
                         occurence = 0
                     writer = csv.writer(csvfile, lineterminator='\n')
-                    if filter.filter_fns(func_tokens, func_name, vocab_manager):
-                        occurence -= 1
-                        filtered_count += 1
-                        continue
 
                     # Semantic-merge gate: the deduper consumes the
                     # four-axis identity tuple ``(name, comment,
@@ -462,6 +466,12 @@ def main_loop(
                         assert np.all(base64_to_ndarray_vec(insn_base64) == insn_run_lengths), (
                             "Base64 conversion failed for instruction run lengths"
                         )
+                        # Retention past this row: the reusable buffer is
+                        # reset on the next iteration, so the VERIFICATION
+                        # consumers (FunctionData / FunctionDataManager /
+                        # func_disas_token) get an independent snapshot.
+                        # Production (VERIFICATION=False) pays nothing.
+                        func_tokens = func_tokens.snapshot()
                         function_data = FunctionData(
                             tokens=func_tokens,
                             tokens_base64=tokens_base64,
@@ -508,16 +518,17 @@ def main_loop(
 
         task.keepalive()
 
-        save_vocabulary(vocab_manager, writer)
-        csvfile.flush()
+        with log_stage(logger, "output finalization (vocab save + CSV flush + sidecar close)"):
+            save_vocabulary(vocab_manager, writer)
+            csvfile.flush()
 
-        # v2 sidecar close — paired with the open at the top of this
-        # ``with`` block. Idempotent if already closed.
-        if sidecar is not None:
-            sidecar.close()
-        # Function-range sidecar close — paired with the open at the
-        # top of this ``with`` block. Always present (not v2-gated).
-        range_sidecar.close()
+            # v2 sidecar close — paired with the open at the top of this
+            # ``with`` block. Idempotent if already closed.
+            if sidecar is not None:
+                sidecar.close()
+            # Function-range sidecar close — paired with the open at the
+            # top of this ``with`` block. Always present (not v2-gated).
+            range_sidecar.close()
 
     if len(exceptions) > 0:
         # Per-function errors were already log+continue (see inner

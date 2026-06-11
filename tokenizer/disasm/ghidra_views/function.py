@@ -53,6 +53,9 @@ class _GhidraBlocksView:
 
     NOT a list. ``__iter__`` walks the function's Ghidra block iterator
     and yields the same reused ``_GhidraBlockView`` per block.
+    ``__len__`` computes lazily (one block-model walk, cached per
+    cursor position) — no production consumer asks, so the per-function
+    pre-count walk the provider used to pay is gone.
     """
 
     __slots__ = ("_function",)
@@ -61,7 +64,7 @@ class _GhidraBlocksView:
         self._function = function
 
     def __len__(self) -> int:
-        return self._function._block_count
+        return self._function._ensure_block_count()
 
     def __iter__(self) -> Iterator["_GhidraBlockView"]:
         return self._function._iter_blocks()
@@ -116,7 +119,9 @@ class _GhidraFunctionView:
         self._ghidra_function: Optional[Any] = None
         self._entry: int = 0
         self._name: str = ""
-        self._block_count: int = 0
+        # Lazily-counted (``None`` = not counted for the current cursor
+        # position; see ``_ensure_block_count``).
+        self._block_count: Optional[int] = None
         self._identity_key: Optional[Hashable] = None
         self._comment: Optional[str] = None
         self._canonical_name: str = ""
@@ -124,12 +129,13 @@ class _GhidraFunctionView:
         self._blocks_view = _GhidraBlocksView(self)
 
     def _advance(
-        self, ghidra_function: Any, block_count: int, identity: FunctionIdentity
+        self, ghidra_function: Any, identity: FunctionIdentity
     ) -> None:
         """Repoint at the next Ghidra Function.
 
-        ``block_count`` is precomputed by the provider's iter_functions
-        loop (so ``len(blocks_view)`` is O(1)).
+        The block count is NOT precomputed: ``len(blocks_view)``
+        computes lazily via ``_ensure_block_count`` on first ask
+        (cached until the next ``_advance``); the hot path never asks.
 
         ``identity`` carries the four identity axes the provider already
         derived to sort by canonical name (see :class:`FunctionIdentity`).
@@ -143,11 +149,29 @@ class _GhidraFunctionView:
         """
         self._ghidra_function = ghidra_function
         self._entry = int(ghidra_function.getEntryPoint().getOffset())
-        self._block_count = block_count
+        self._block_count = None
         self._name = identity.name
         self._comment = identity.comment
         self._identity_key = identity.identity_key
         self._canonical_name = identity.canonical_name
+
+    def _ensure_block_count(self) -> int:
+        """Count the function's code blocks lazily (cached per cursor).
+
+        Backs ``len(func.blocks)`` — the provider no longer pre-walks
+        the block model per function just to stamp a count nobody on
+        the production path reads.
+        """
+        if self._block_count is None:
+            count = 0
+            if self._ghidra_function is not None:
+                body = self._ghidra_function.getBody()
+                block_iter = self._block_model.getCodeBlocksContaining(body, self._monitor)
+                while block_iter.hasNext():
+                    block_iter.next()
+                    count += 1
+            self._block_count = count
+        return self._block_count
 
     def _iter_blocks(self) -> Iterator[_GhidraBlockView]:
         if self._ghidra_function is None:
@@ -157,15 +181,7 @@ class _GhidraFunctionView:
         view = self._block_view
         while block_iter.hasNext():
             gblock = block_iter.next()
-            # Precount instructions for O(1) __len__ on InstructionsView.
-            insn_iter = self._listing.getInstructions(gblock, True)
-            count = 0
-            while insn_iter.hasNext():
-                ghidra_insn = insn_iter.next()
-                if not body.contains(ghidra_insn.getAddress()):
-                    continue
-                count += 1
-            view._advance(gblock, count)
+            view._advance(gblock)
             yield view
 
     @property

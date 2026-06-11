@@ -24,6 +24,10 @@ class _GhidraInstructionsView:
 
     NOT a list. ``__iter__`` walks the block's Ghidra instruction iterator
     and yields the same reused ``_GhidraInstructionView`` per instruction.
+    ``__len__`` computes lazily (one Listing walk, cached per cursor
+    position) — the hot path iterates instead of asking for the length,
+    so the per-block instruction pre-count walk the function wrapper
+    used to pay is gone.
     """
 
     __slots__ = ("_block",)
@@ -32,7 +36,7 @@ class _GhidraInstructionsView:
         self._block = block
 
     def __len__(self) -> int:
-        return self._block._instruction_count
+        return self._block._ensure_instruction_count()
 
     def __iter__(self) -> Iterator["_GhidraInstructionView"]:
         return self._block._iter_instructions()
@@ -84,21 +88,46 @@ class _GhidraBlockView:
         self._ghidra_block: Optional[Any] = None
         self._addr: int = 0
         self._size: int = 0
-        self._instruction_count: int = 0
+        # Lazily-counted (``None`` = not counted for the current cursor
+        # position; see ``_ensure_instruction_count``).
+        self._instruction_count: Optional[int] = None
         self._instruction_view = _GhidraInstructionView(arch, program, reg_map, decode)
         self._instructions_view = _GhidraInstructionsView(self)
 
-    def _advance(self, ghidra_block: Any, instruction_count: int) -> None:
+    def _advance(self, ghidra_block: Any) -> None:
         """Repoint at the next CodeBlock.
 
-        ``instruction_count`` is precomputed by the parent function
-        wrapper at iter_blocks time (single Listing walk so __len__ on
-        InstructionsView is O(1) without re-iterating).
+        The instruction count is NOT precomputed: ``len(instructions)``
+        computes lazily via ``_ensure_instruction_count`` on first ask
+        (cached until the next ``_advance``). The hot path materialises
+        token rows by iterating, never by asking for the length, so the
+        former per-block full-Listing pre-walk is gone.
         """
         self._ghidra_block = ghidra_block
         self._addr = int(ghidra_block.getMinAddress().getOffset())
         self._size = int(ghidra_block.getMaxAddress().getOffset()) - self._addr + 1
-        self._instruction_count = instruction_count
+        self._instruction_count = None
+
+    def _ensure_instruction_count(self) -> int:
+        """Count the block's body-contained instructions lazily (cached
+        per cursor position). Same walk + ``body.contains`` filter as
+        ``_iter_instructions`` minus the per-instruction decode."""
+        if self._instruction_count is None:
+            count = 0
+            if self._ghidra_block is not None:
+                body = (
+                    self._function._ghidra_function.getBody()
+                    if self._function._ghidra_function is not None
+                    else None
+                )
+                insn_iter = self._listing.getInstructions(self._ghidra_block, True)
+                while insn_iter.hasNext():
+                    ghidra_insn = insn_iter.next()
+                    if body is not None and not body.contains(ghidra_insn.getAddress()):
+                        continue
+                    count += 1
+            self._instruction_count = count
+        return self._instruction_count
 
     def _iter_instructions(self) -> Iterator["_GhidraInstructionView"]:
         if self._ghidra_block is None:

@@ -16,16 +16,21 @@ from tokenizer.disasm.ghidra_provider.decode_helper.decompose_callbacks import (
     decompose_mem_callback,
     decompose_reg_list_callback,
 )
+from tokenizer.disasm.ghidra_provider import jvm_types
 from tokenizer.disasm.ghidra_provider.mem_decompose import (
     _compute_resolved_target,
-    _infer_mem_access_size,
 )
 from tokenizer.disasm.ghidra_provider.mnemonic import _RegisterMap
-from tokenizer.disasm.ghidra_provider.pcode_inspect import operand_is_bracketed
+from tokenizer.disasm.ghidra_provider.pcode_inspect import (
+    InstructionPcodeSummary,
+    find_shift_on_register,
+    operand_is_bracketed,
+)
 from tokenizer.disasm.ghidra_provider.prefix_build import _compute_fp_type
 from tokenizer.disasm.types import (
     Architecture,
     OperandKind,
+    ShiftKind as _ShiftKind,
 )
 
 
@@ -37,7 +42,7 @@ def operand_spec(
     base_mnemonic: str,
     reg_map: "_RegisterMap",
     *,
-    instruction_has_mem_access: bool,
+    pcode_summary: InstructionPcodeSummary,
 ) -> dict:
     """Return a kwargs dict for ``_GhidraOperandView._advance``.
 
@@ -54,15 +59,17 @@ def operand_spec(
     ``decompose_reg_map`` is the helper-cached map threaded into the
     lazy decompose callbacks (the original ``self._reg_map``).
 
-    ``instruction_has_mem_access`` is the per-instruction PCode
-    LOAD/STORE signal, computed ONCE by the instruction-view cursor
-    in ``_advance`` and threaded through here to avoid the
-    per-operand re-computation the legacy decode path performed.
+    ``pcode_summary`` is the per-instruction one-pass PCode signal
+    bundle (LOAD/STORE presence, FLOAT_* signature, mem-access size),
+    computed ONCE by the instruction-view cursor in ``_advance`` and
+    threaded through here to avoid the per-operand PCode re-walks the
+    legacy decode path performed (has_load_store + FP scan + mem-size
+    scan each re-iterated ``getPcode()`` per operand).
     """
-    from ghidra.program.model.address import Address
-    from ghidra.program.model.lang import OperandType, Register
-    from ghidra.program.model.scalar import Scalar
-    from tokenizer.disasm.types import ShiftKind as _ShiftKind
+    Address = jvm_types.Address
+    OperandType = jvm_types.OperandType
+    Register = jvm_types.Register
+    Scalar = jvm_types.Scalar
 
     try:
         objects = ghidra_insn.getOpObjects(op_idx)
@@ -128,12 +135,11 @@ def operand_spec(
     #    rich-typed Character via isinstance + charValue without
     #    string parsing.
     scalar_in_objects = any(isinstance(o, Scalar) for o in objects or ())
-    operand_has_brackets = operand_is_bracketed(ghidra_insn, op_idx, arch)
 
     arm_family = arch in (Architecture.ARM32, Architecture.AARCH64)
     dynamic_admits_memory = (
         bool(op_type & OperandType.DYNAMIC)
-        and (not arm_family or instruction_has_mem_access)
+        and (not arm_family or pcode_summary.has_load_store)
     )
 
     # x86 absolute-addressed memory operand: ``lea rax, [0x10D7C0]``
@@ -147,15 +153,26 @@ def operand_spec(
     # (``jmp 0x10D7C0`` etc.) routing through their own kind. This
     # branch is the explicit exception to the "MUST involve at least
     # one base/index register" rule documented above.
+    #
+    # NOTE on the bracket factor: every memory shape below ALSO requires
+    # the syntactic bracket marker. The bracket check
+    # (``operand_is_bracketed``) reads the operand's representation list
+    # — a JVM round-trip per operand — so it is FACTORED OUT of the two
+    # original conjunctions and evaluated LAST, only when one of the
+    # cheap structural shapes matched. Boolean identity (brackets is a
+    # pure predicate):
+    #     (br ∧ abs_shape) ∨ (regs ∧ br ∧ rest)
+    #   = br ∧ (abs_shape ∨ (regs ∧ rest))
+    # REG / IMM operands short-circuit on the structural side and never
+    # pay the representation-list fetch.
     absolute_addressed_no_register_mem = (
-        operand_has_brackets
-        and bool(op_type & OperandType.ADDRESS)
+        bool(op_type & OperandType.ADDRESS)
         and bool(op_type & OperandType.SCALAR)
         and not (op_type & (OperandType.REGISTER | OperandType.CODE | OperandType.DYNAMIC))
     )
 
-    is_memory = absolute_addressed_no_register_mem or (
-        bool(register_objs) and operand_has_brackets and (
+    memory_shape = absolute_addressed_no_register_mem or (
+        bool(register_objs) and (
             dynamic_admits_memory
             or bool(op_type & OperandType.INDIRECT)
             or (
@@ -177,17 +194,19 @@ def operand_spec(
                 # plain REGISTER operand is the Scalar in objects (the
                 # pre-disp) plus the instruction-level rich-IR signal
                 # that it accesses memory (LOAD/STORE in PCode). The
-                # outer ``operand_has_brackets`` gate keeps this from
+                # trailing ``operand_is_bracketed`` gate keeps this from
                 # claiming non-bracketed register operands.
                 bool(op_type & OperandType.REGISTER)
                 and not (op_type & OperandType.CODE)
                 and scalar_in_objects
-                and instruction_has_mem_access
+                and pcode_summary.has_load_store
             )
         )
     )
 
-    fp_type = _compute_fp_type(ghidra_insn, op_idx, arch, base_mnemonic)
+    is_memory = memory_shape and operand_is_bracketed(ghidra_insn, op_idx, arch)
+
+    fp_type = _compute_fp_type(objects, op_type, arch, base_mnemonic, pcode_summary)
 
     # Default spec - filled per kind below.
     spec = dict(
@@ -234,15 +253,10 @@ def operand_spec(
     if is_memory:
         spec["kind"] = OperandKind.MEM
         # Memory access size: derived from SLEIGH-emitted PCode
-        # LOAD/STORE varnode sizes. This is the only reliable
-        # oracle - the legacy sibling-register-width heuristic
-        # conflated pointer-width address-computation regs (e.g.
-        # x64 r14 = 8B) with value regs, breaking 0x66 operand-
-        # size-override and MOVZX/MOVSX byte/word -> wider dest.
-        # ARM / MIPS / PPC / RISC-V consumers do not look at
-        # ``op.size`` for MEM operands so the value is harmless on
-        # non-x86 ISAs.
-        spec["size"] = _infer_mem_access_size(ghidra_insn, op_idx)
+        # LOAD/STORE varnode sizes (see the rationale on
+        # ``InstructionPcodeSummary.mem_access_size``), precomputed
+        # once per instruction by the one-pass PCode walk.
+        spec["size"] = pcode_summary.mem_access_size
         spec["decompose_mem"] = decompose_mem_callback(
             decompose_reg_map, ghidra_insn, op_idx, arch
         )
@@ -269,10 +283,6 @@ def operand_spec(
             arch in (Architecture.ARM32, Architecture.AARCH64)
             and scalar_in_objects
         ):
-            from tokenizer.disasm.ghidra_provider.pcode_inspect import (
-                find_shift_on_register,
-            )
-
             kind, amount = find_shift_on_register(ghidra_insn, first)
             spec["shift_kind"] = kind
             spec["shift_amount"] = amount

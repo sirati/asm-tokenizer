@@ -20,6 +20,7 @@ from tokenizer.hash_checked_pickles import (
 from tokenizer.main_loop import main_loop
 from tokenizer.output_filename import format_output_basename
 from tokenizer.output_staging import staged_publish
+from tokenizer.progress import log_stage
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
 from tokenizer.variant_info import VariantInfo
@@ -96,11 +97,11 @@ def disassemble_to_tokens(
 
         opaque_const_meta: dict[str, list[str]] = {}
 
-        func_addr_range: dict[int, list[dict[str, tuple[str, str]]]] = {}
         func_disas: dict[str, list[dict[str, list[str]]]] = {}
 
         text_start, text_end = provider.get_text_section_bounds()
-        lookup = provider.create_metadata_lookup()
+        with log_stage(logger, f"metadata-lookup construction for {binary_name}"):
+            lookup = provider.create_metadata_lookup()
 
         func_disas_token: dict[str, list[dict[str, list[str]]]] = {}
 
@@ -109,7 +110,6 @@ def disassemble_to_tokens(
         kwargs = dict(
             block_runlength_dict=block_runlength_dict,
             provider=provider,
-            func_addr_range=func_addr_range,
             func_disas=func_disas,
             func_disas_token=func_disas_token,
             func_name_addr=func_name_addr,
@@ -123,7 +123,8 @@ def disassemble_to_tokens(
         )
 
         if do_pickles:
-            save_pickle(pickle_mainloop_file_path, kwargs)
+            with log_stage(logger, f"mainloop pickle save for {binary_name}"):
+                save_pickle(pickle_mainloop_file_path, kwargs)
 
     else:
         kwargs.update(dict(provider=provider))
@@ -155,7 +156,8 @@ def disassemble_to_tokens(
 
     resolver = TokenResolver()
     arch_provider = get_provider(platform, backend)
-    instr_sets = arch_provider.load_instruction_sets()
+    with log_stage(logger, f"instruction-set load for {platform}"):
+        instr_sets = arch_provider.load_instruction_sets()
 
     kwargs.update(
         dict(resolver=resolver, instr_sets=instr_sets, arch_provider=arch_provider, csv_path=csv_path, logger=logger)
@@ -178,6 +180,7 @@ def run_tokenizer(
     source_relative_path: Path | None = None,
     output_basename: str | None = None,
     dump_duplicate_function_metadata: bool = False,
+    debug_render: bool = False,
 ) -> tuple[int, int]:
     """Tokenize one binary; return ``(warnings, filtered)``.
 
@@ -351,7 +354,9 @@ def run_tokenizer(
         # would be treated as done and propagate through the unifier
         # as None (see vocab_unifier.unifier: "Probably incomplete
         # from crashed stage-1").
-        if load_vocab_manager(csv_final_path) is not None:
+        with log_stage(logger, f"skip-existing CSV completeness check for {binary_name}"):
+            existing_vocab = load_vocab_manager(csv_final_path)
+        if existing_vocab is not None:
             logger.info(f"File {f'{binary_path.name}_output.csv'} already exists: {csv_final_path}.")
             return (-1, -1)
         else:
@@ -411,13 +416,16 @@ def run_tokenizer(
                     if dump_duplicate_function_metadata
                     else None
                 )
-                provider = get_disassembly_provider(
-                    backend,
-                    file_path,
-                    duplicate_function_dump_path=duplicate_function_dump_path,
-                )
+                with log_stage(logger, f"{backend} project import of {binary_name}"):
+                    provider = get_disassembly_provider(
+                        backend,
+                        file_path,
+                        duplicate_function_dump_path=duplicate_function_dump_path,
+                        debug_render=debug_render,
+                    )
                 try:
-                    provider.build_cfg()
+                    with log_stage(logger, f"{backend} auto-analysis of {binary_name}"):
+                        provider.build_cfg()
                 except (IndexError, AssertionError, NotImplementedError) as e:
                     # Known angr CFG-resolver bugs (e.g. arm_elf_fast.py:89
                     # IndexError on certain ARM ELF indirect jumps; the

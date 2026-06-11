@@ -84,3 +84,4 @@ pyvex_ffi_parser_cache*
 # automatically by PodmanPackaging after each successful build).
 /.docker-layer-cache.json
 /.docker-layer-cache.json.partial
+corpus_stats.db

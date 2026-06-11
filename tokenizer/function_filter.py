@@ -1,7 +1,18 @@
+"""Trivial-function filter — CURRENTLY UNUSED.
+
+``FunctionFilter.filter_fns`` documents "returns true if function contains
+only one jump instruction" but the filter contract was never implemented:
+there is no reachable ``return True`` (the candidate paths only log
+warnings), so a caller can never actually filter anything. The per-function
+call in ``tokenizer/main_loop.py`` was removed because it burned two
+``TokenPattern.match`` passes per function for an always-``False`` result.
+Kept so the filter can be revived deliberately (with an implemented
+contract) later.
+"""
+
 import logging
 
-import numpy as np
-
+from tokenizer.disasm.types import InsnDebugLabel
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.patterns import (
     Block,
@@ -73,10 +84,23 @@ class FunctionFilter:
         if fn_tokens.block_count == 1:
             arr = fn_tokens.insn_strs[1 : fn_tokens.last_index]
 
-            allowed = ["nop ", "hlt ", "ret "]
-            is_padding = np.isin(arr, allowed)
+            # Typed padding gate: an entry counts as padding iff it is a
+            # bare (operand-less) nop/hlt/ret instruction label. Keyed on
+            # the ``InsnDebugLabel`` typed fields rather than the rendered
+            # ``"<mnemonic> <op_str>"`` string — the legacy string compare
+            # (``insn_str == "nop "`` ⟺ mnemonic "nop" + empty op_str)
+            # forced the per-operand text render in production. Non-label
+            # entries (block/jump-table rows, unused-slack zeros) are not
+            # padding, matching the legacy compare's False on those.
+            allowed = ("nop", "hlt", "ret")
+            is_padding = [
+                isinstance(entry, InsnDebugLabel)
+                and entry.operand_count == 0
+                and entry.mnemonic in allowed
+                for entry in arr
+            ]
 
-            if np.all(is_padding):
+            if all(is_padding):
                 self.logger.warning(
                     f"RETURN_ONLY func {func_name}: {fn_tokens.to_asm_original()} / {fn_tokens.to_asm_like()}"
                 )

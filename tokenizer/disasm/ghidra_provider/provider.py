@@ -12,6 +12,7 @@ Requirements:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -22,6 +23,9 @@ from tokenizer.disasm.ghidra_provider.mnemonic import (
     _GHIDRA_MNEMONIC_ALIASES,
     _RegisterMap,
     _split_ghidra_mnemonic,
+)
+from tokenizer.disasm.ghidra_provider.pcode_inspect import (
+    collect_instruction_pcode_summary,
 )
 from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
@@ -38,6 +42,9 @@ from tokenizer.disasm.ghidra_views.unnamed_rename import (
     compute_binary_identity_hash,
 )
 from tokenizer.disasm.types import FpType
+from tokenizer.progress import log_stage
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +102,7 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         self,
         binary_path: Path,
         duplicate_function_dump_path: Path | None = None,
+        debug_render: bool = False,
     ) -> None:
         import jpype.config
         import pyghidra
@@ -105,6 +113,13 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         _ensure_jvm_started()
 
         self.binary_path = binary_path
+        # Run-scoped debug-rendering mode (``--debug`` CLI runs only):
+        # threaded into the decode helper so instruction views attach
+        # operand-text render thunks to their debug labels. In
+        # production (False) the per-instruction
+        # ``getDefaultOperandRepresentation`` JVM round-trips are
+        # skipped entirely.
+        self._debug_render = debug_render
         # ``None`` -> dump disabled (zero work in iter_functions). When
         # set, the path is the absolute destination for the per-binary
         # duplicate-function-metadata pickle; the orchestrator module
@@ -243,7 +258,9 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # is rebuilt per ``iter_functions`` call so each call gets a
         # fresh cursor (defensive: callers that re-enter mid-iteration
         # would otherwise share cursor state).
-        decode = _GhidraDecodeHelper(self._program, self._reg_map)
+        decode = _GhidraDecodeHelper(
+            self._program, self._reg_map, debug_render=self._debug_render
+        )
         block_model = SimpleBlockModel(self._program)
         monitor = TaskMonitor.DUMMY
         from tokenizer.disasm.ghidra_views import _GhidraFunctionView
@@ -274,53 +291,56 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # ``func.canonical_name`` — there is ONE canonical string, so the
         # sort key and the name written to CSV column 0 are the same
         # object by construction (no second derivation to keep in sync).
-        funcs: list[tuple[int, str, Any]] = []
-        identity_by_addr: dict[int, FunctionIdentity] = {}
-        for func in self._fm.getFunctions(True):
-            addr = int(func.getEntryPoint().getOffset())
-            identity = _derive_function_identity(func, self._binary_id_hash)
-            identity_by_addr[addr] = identity
-            funcs.append((addr, identity.name, func))
+        with log_stage(
+            logger,
+            f"function listing + identity derivation for {self.binary_path.name}",
+        ):
+            funcs: list[tuple[int, str, Any]] = []
+            identity_by_addr: dict[int, FunctionIdentity] = {}
+            for func in self._fm.getFunctions(True):
+                addr = int(func.getEntryPoint().getOffset())
+                identity = _derive_function_identity(func, self._binary_id_hash)
+                identity_by_addr[addr] = identity
+                funcs.append((addr, identity.name, func))
 
-        # Optional debug dump: when the provider was constructed with a
-        # ``duplicate_function_dump_path``, hand the collected funcs
-        # list to the orchestrator before sorting so it can detect
-        # name-collisions and snapshot each colliding function's
-        # 5-layer-deep Ghidra metadata. The hook is gated on the path
-        # being non-None - zero work when off.
-        if self._duplicate_function_dump_path is not None:
-            from tokenizer.disasm.ghidra_provider.duplicate_function_dump import (
-                write_duplicate_function_dump,
-            )
+            # Optional debug dump: when the provider was constructed with a
+            # ``duplicate_function_dump_path``, hand the collected funcs
+            # list to the orchestrator before sorting so it can detect
+            # name-collisions and snapshot each colliding function's
+            # 5-layer-deep Ghidra metadata. The hook is gated on the path
+            # being non-None - zero work when off.
+            if self._duplicate_function_dump_path is not None:
+                from tokenizer.disasm.ghidra_provider.duplicate_function_dump import (
+                    write_duplicate_function_dump,
+                )
 
-            write_duplicate_function_dump(
-                funcs,
-                binary_name=self.binary_path.name,
-                output_path=self._duplicate_function_dump_path,
+                write_duplicate_function_dump(
+                    funcs,
+                    binary_name=self.binary_path.name,
+                    output_path=self._duplicate_function_dump_path,
+                )
+
+            sorted_funcs = sorted(
+                funcs, key=lambda t: identity_by_addr[t[0]].canonical_name
             )
 
         # Reset the entry-point map for this iter call (callers that
         # re-iterate get a fresh map, no stale entries).
         self._funcs_by_entry = {}
 
-        for addr, name, ghidra_func in sorted(
-            funcs, key=lambda t: identity_by_addr[t[0]].canonical_name
-        ):
+        for addr, name, ghidra_func in sorted_funcs:
             body = ghidra_func.getBody()
             block_iter = block_model.getCodeBlocksContaining(body, monitor)
 
-            # Count code blocks so the reused FunctionView can expose an
-            # O(1) ``len(blocks)`` once we advance it. Functions with zero
-            # code blocks are skipped.
-            block_count = 0
-            while block_iter.hasNext():
-                block_iter.next()
-                block_count += 1
-
-            if block_count == 0:
+            # Functions with zero code blocks are skipped — a single
+            # ``hasNext()`` answers that. The block COUNT is no longer
+            # pre-walked here: ``len(func.blocks)`` computes lazily on
+            # the view (and no production consumer asks; the hot path
+            # materialises block snapshots by iteration).
+            if not block_iter.hasNext():
                 continue
 
-            function_view._advance(ghidra_func, block_count, identity_by_addr[addr])
+            function_view._advance(ghidra_func, identity_by_addr[addr])
             self._funcs_by_entry[addr] = ghidra_func
             # ``name`` is the post-``placeholder_renamed_name`` value
             # collected above (== ``function_view.name`` == the
@@ -371,7 +391,21 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
             raw_mnemonic = ""
         base_mnemonic, _, _ = _split_ghidra_mnemonic(raw_mnemonic)
         base_mnemonic = _GHIDRA_MNEMONIC_ALIASES.get(base_mnemonic, base_mnemonic)
-        return _compute_fp_type(ghidra_insn, operand_index, arch, base_mnemonic)
+        # ``_compute_fp_type`` is a pure reader over the operand's
+        # fetched objects/op_type and the instruction's one-pass PCode
+        # summary (the hot decode path fetches these once per operand /
+        # instruction; this public wrapper is the non-hot direct-call
+        # surface, so it fetches them itself).
+        try:
+            objects = ghidra_insn.getOpObjects(operand_index)
+        except Exception:
+            objects = ()
+        try:
+            op_type = ghidra_insn.getOperandType(operand_index)
+        except Exception:
+            op_type = 0
+        summary = collect_instruction_pcode_summary(ghidra_insn)
+        return _compute_fp_type(objects, op_type, arch, base_mnemonic, summary)
 
     # ----------------------------------------------------------------------
     # Switch-table recovery

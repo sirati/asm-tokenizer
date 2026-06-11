@@ -176,6 +176,7 @@ def test_derive_sidecar_path_defensive_fallback(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 from tokenizer.fill_constant_candidates import fill_constant_candidates
+from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenResolver
 from tokenizer.tests.test_block_identity_roundtrip import (
@@ -209,6 +210,7 @@ def test_fill_constant_candidates_returns_function_range() -> None:
         resolver=resolver,
         vocab_manager=vm,
         arch_provider=None,
+        func_tokens=FunctionTokenList(num_blocks=4, vocab_manager=vm),
         disasm_provider=None,
     )
     assert result is not None
@@ -247,6 +249,9 @@ def test_sidecar_records_match_fill_constant_candidates(tmp_path: Path) -> None:
 
     expected: list[tuple[int, int]] = []
     sidecar = FunctionRangeSidecar(tmp_path / "demo_function_ranges.txt")
+    # One buffer reused across both functions — mirrors main_loop's
+    # grow-only reuse (fill_constant_candidates resets it on entry).
+    func_tokens = FunctionTokenList(num_blocks=4, vocab_manager=vm)
     for entry, blocks in functions:
         result = fill_constant_candidates(
             func_addr=entry,
@@ -258,6 +263,7 @@ def test_sidecar_records_match_fill_constant_candidates(tmp_path: Path) -> None:
             resolver=resolver,
             vocab_manager=vm,
             arch_provider=None,
+            func_tokens=func_tokens,
             disasm_provider=None,
         )
         assert result is not None

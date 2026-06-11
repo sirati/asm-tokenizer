@@ -10,14 +10,40 @@ from __future__ import annotations
 
 from typing import Any, Iterator, Optional
 
+from functools import partial
+
 from tokenizer.disasm.ghidra_views.operand import _GhidraOperandView
 from tokenizer.disasm.types import (
     Architecture,
+    InsnDebugLabel,
     InstructionPrefixView,
     OperandsView,
     OperandView,
     PrefixesView,
 )
+
+
+def _render_op_str(ghidra_insn: Any) -> str:
+    """Render the comma-joined per-operand default representation.
+
+    One ``getDefaultOperandRepresentation`` JVM round-trip per operand —
+    debug-only cost: called lazily from the ``op_str`` property /
+    ``InsnDebugLabel`` thunk, never from the production decode path.
+    ``ghidra_insn`` is the stable per-instruction Java handle, so a
+    stashed label renders the instruction it was created for even after
+    the cursor advanced.
+    """
+    try:
+        num_ops = int(ghidra_insn.getNumOperands())
+    except Exception:
+        num_ops = 0
+    op_strs: list[str] = []
+    for i in range(num_ops):
+        try:
+            op_strs.append(str(ghidra_insn.getDefaultOperandRepresentation(i)))
+        except Exception:
+            op_strs.append("")
+    return ", ".join(op_strs)
 
 
 # ---------------------------------------------------------------------------
@@ -87,17 +113,19 @@ class _GhidraInstructionView:
       - ``split_mnemonic(raw)`` -> (base, suffix_prefix_name, suffix_prefix_byte)
       - ``alias_mnemonic(base)`` -> canonical base
       - ``architecture(program)`` -> Architecture (cached on the view)
-      - ``compute_fp_type(insn, op_idx, arch, base_mnemonic)`` -> Optional[FpType]
       - ``build_prefixes(insn, arch)`` -> list[InstructionPrefixView]
       - ``decompose_x86_memory(insn, op_idx, reg_map)`` -> callback that
         populates a passed-in _GhidraMemoryOperandView
       - ``decompose_arm_memory(insn, op_idx, reg_map)`` -> callback
       - ``decompose_base_disp_memory(insn, op_idx, reg_map)`` -> callback
       - ``operand_spec(insn, op_idx, arch, base_mnemonic, reg_map, *,
-        instruction_has_mem_access)`` -> dict ready to pass as kwargs to
+        pcode_summary)`` -> dict ready to pass as kwargs to
         ``_GhidraOperandView._advance``
-      - ``has_load_store(insn)`` -> bool, cached at the cursor level
-        for ``InstructionView.has_load_store``
+      - ``is_sleigh_split_disp_base_pair(disp_spec, base_spec)`` -> bool,
+        the SLEIGH-split disp+base pair predicate for the merge loop
+      - ``pcode_summary(insn)`` -> InstructionPcodeSummary, the one-pass
+        per-instruction PCode signal bundle; ``has_load_store`` is
+        cached at the cursor level for ``InstructionView.has_load_store``
     """
 
     __slots__ = (
@@ -133,7 +161,9 @@ class _GhidraInstructionView:
         self._address: int = 0
         self._mnemonic: str = ""
         self._base_mnemonic: str = ""
-        self._op_str: str = ""
+        # Lazily-rendered operand text; ``None`` = not rendered for the
+        # current cursor position (see the ``op_str`` property).
+        self._op_str: Optional[str] = None
         self._operand_count: int = 0
         # Per-instruction operand specs, computed eagerly in ``_advance``
         # so we can pair-merge SLEIGH-split disp+base operands before
@@ -174,18 +204,16 @@ class _GhidraInstructionView:
             base_mnemonic, _cc = self._decode.strip_arm_cc(base_mnemonic)
         self._base_mnemonic = base_mnemonic
 
-        # op_str: comma-joined per-operand default representation
+        # op_str: comma-joined per-operand default representation —
+        # rendered LAZILY (one getDefaultOperandRepresentation JVM
+        # round-trip per operand) by the ``op_str`` property on first
+        # access. Production consumers never read it; only the debug /
+        # warning paths do.
+        self._op_str = None
         try:
             num_ops = int(ghidra_insn.getNumOperands())
         except Exception:
             num_ops = 0
-        op_strs: list[str] = []
-        for i in range(num_ops):
-            try:
-                op_strs.append(str(ghidra_insn.getDefaultOperandRepresentation(i)))
-            except Exception:
-                op_strs.append("")
-        self._op_str = ", ".join(op_strs)
 
         # Eager operand-spec decode + SLEIGH disp+base pair merge. Done
         # here (rather than lazily inside ``_iter_operands``) because the
@@ -199,15 +227,20 @@ class _GhidraInstructionView:
         # reports the disp scalar and the base register as adjacent
         # flat operands (op[1]=DYNAMIC scalar 0x8, op[2]=REGISTER sp)
         # instead of bundling them into one composite memory operand.
-        from ghidra.program.model.lang import OperandType
-        from tokenizer.disasm.types import OperandKind as _OperandKind
+        # The pair PREDICATE lives behind the decode facade
+        # (``is_sleigh_split_disp_base_pair``) so this view stays free
+        # of JVM-class imports; only the list reshaping happens here.
 
-        # Compute the per-instruction has-LOAD/STORE rich-IR signal ONCE,
-        # before the per-operand decode walk. The downstream resolved-
-        # target policy consults this via ``InstructionView.has_load_store``;
-        # caching here avoids the per-operand recompute the legacy decode
-        # path triggered inside ``operand_spec``.
-        self._has_load_store = self._decode.has_load_store(ghidra_insn)
+        # Walk the instruction's PCode ONCE, before the per-operand
+        # decode loop. The summary bundles every instruction-level
+        # PCode-derived signal (LOAD/STORE presence, FLOAT_* signature,
+        # mem-access size); the legacy decode path re-walked
+        # ``getPcode()`` per OPERAND for each of those signals, which
+        # multiplied JVM round-trips by the operand count. The
+        # downstream resolved-target policy consults the LOAD/STORE
+        # signal via ``InstructionView.has_load_store``.
+        pcode_summary = self._decode.pcode_summary(ghidra_insn)
+        self._has_load_store = pcode_summary.has_load_store
 
         raw_specs = [
             self._decode.operand_spec(
@@ -216,7 +249,7 @@ class _GhidraInstructionView:
                 self._arch,
                 self._base_mnemonic,
                 self._reg_map,
-                instruction_has_mem_access=self._has_load_store,
+                pcode_summary=pcode_summary,
             )
             for i in range(num_ops)
         ]
@@ -226,9 +259,9 @@ class _GhidraInstructionView:
             cur = raw_specs[i]
             if (
                 i + 1 < len(raw_specs)
-                and cur["kind"] == _OperandKind.IMM
-                and bool(int(cur["type_int"]) & OperandType.DYNAMIC)
-                and raw_specs[i + 1]["kind"] == _OperandKind.REG
+                and self._decode.is_sleigh_split_disp_base_pair(
+                    cur, raw_specs[i + 1]
+                )
             ):
                 merged_specs.append(
                     self._decode.synthesize_disp_base_mem_spec(
@@ -274,7 +307,38 @@ class _GhidraInstructionView:
 
     @property
     def op_str(self) -> str:
+        """Rendered operand text — LAZY: the per-operand
+        ``getDefaultOperandRepresentation`` JVM round-trips run on first
+        access for the current cursor position (cached until the next
+        ``_advance``). Production decode never reads this; the debug /
+        warning call sites that do pay the render only when they fire.
+        """
+        if self._op_str is None:
+            self._op_str = (
+                _render_op_str(self._ghidra_insn) if self._ghidra_insn is not None else ""
+            )
         return self._op_str
+
+    def debug_label(self) -> InsnDebugLabel:
+        """Stash-safe diagnostic label (see ``InsnDebugLabel``).
+
+        ``mnemonic`` / ``operand_count`` are captured from already-
+        computed cursor state (zero JVM calls). The operand-text render
+        thunk is attached ONLY when the provider was constructed in
+        debug-render mode; in production the label never renders (its
+        ``str()`` form degrades to ``"<mnemonic> "``). The thunk binds
+        the stable per-instruction Java handle, so a stashed label
+        renders correctly after the cursor advances.
+        """
+        return InsnDebugLabel(
+            self._mnemonic,
+            self._operand_count,
+            render_op_str=(
+                partial(_render_op_str, self._ghidra_insn)
+                if self._decode.debug_render and self._ghidra_insn is not None
+                else None
+            ),
+        )
 
     @property
     def operands(self) -> OperandsView:
@@ -294,6 +358,9 @@ class _GhidraInstructionView:
         clone._address = self._address
         clone._mnemonic = self._mnemonic
         clone._base_mnemonic = self._base_mnemonic
+        # ``None`` (not yet rendered) carries over: the clone holds the
+        # same stable ghidra_insn handle, so its ``op_str`` property can
+        # still render lazily on demand.
         clone._op_str = self._op_str
         clone._operand_count = self._operand_count
         clone._has_load_store = self._has_load_store

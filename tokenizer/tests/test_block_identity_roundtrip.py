@@ -174,6 +174,7 @@ def test_fill_constant_candidates_block_def_uses_int_cache_key():
     shared.
     """
     from tokenizer.fill_constant_candidates import fill_constant_candidates
+    from tokenizer.function_token_list import FunctionTokenList
 
     vm = VocabularyManager(platform="x86_64", format_version=2)
     resolver = TokenResolver()
@@ -197,6 +198,7 @@ def test_fill_constant_candidates_block_def_uses_int_cache_key():
         resolver=resolver,
         vocab_manager=vm,
         arch_provider=None,  # never called: blocks have no instructions
+        func_tokens=FunctionTokenList(num_blocks=2, vocab_manager=vm),
         disasm_provider=None,  # no switch tables -> footer pass is a no-op
     )
     assert result is not None, "fill_constant_candidates returned None for non-empty func"

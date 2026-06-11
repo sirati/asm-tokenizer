@@ -26,7 +26,7 @@ from pathlib import Path
 from dynamic_runner.worker import NonRecoverableError, Task, WorkerOutput, run, task_function
 
 from shared import remove_stream_handlers
-from tokenizer.output_staging import staged_publish
+from tokenizer.output_staging import UNIFY_VOCAB_SCOPE, staged_publish
 from tokenizer.vocab_unifier.unifier import unify_vocab
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ def _process_payload(
     # file; the staged_publish layer then mirrors that subdir layout
     # into `output_dir` so build_memmap can pair `<rel>/<binary>_output.csv`
     # with `<rel>/<binary>_output.mapping.b64c` by relative path.
-    with staged_publish(task, output_dir, scope="unify_vocab") as stage_dir:
+    with staged_publish(task, output_dir, scope=UNIFY_VOCAB_SCOPE) as stage_dir:
         unify_vocab(
             csv_files,
             stage_dir / unified_vocab_filename,

@@ -132,6 +132,7 @@ def get_disassembly_provider(
     backend: str,
     binary_path: Path,
     duplicate_function_dump_path: Path | None = None,
+    debug_render: bool = False,
 ) -> DisassemblyProvider:
     """Return a ``DisassemblyProvider`` for ``backend`` on ``binary_path``.
 
@@ -144,6 +145,15 @@ def get_disassembly_provider(
     cross-ISA-stable disambiguator, and Ghidra is the default
     provider for that pathway per ``ghidra_default_provider`` in
     project memory).
+
+    ``debug_render`` is the run-scoped debug-rendering mode (set by the
+    ``--debug`` CLI entry point): when True, instruction views attach
+    operand-text render thunks to their ``InsnDebugLabel``s so debug
+    output shows the full ``"<mnemonic> <op_str>"`` text. Ghidra-only
+    cost knob: on Ghidra the rendering is a per-operand JVM round-trip,
+    so production (False) skips it entirely; angr's Capstone rendering
+    is a plain attribute read, so the angr provider captures the
+    operand text unconditionally and ignores the parameter.
     """
     if backend == "angr":
         from tokenizer.disasm.angr_provider import AngrDisassemblyProvider
@@ -155,5 +165,6 @@ def get_disassembly_provider(
         return GhidraDisassemblyProvider(
             binary_path,
             duplicate_function_dump_path=duplicate_function_dump_path,
+            debug_render=debug_render,
         )
     raise ValueError(f"Unsupported disassembly backend: {backend}")
