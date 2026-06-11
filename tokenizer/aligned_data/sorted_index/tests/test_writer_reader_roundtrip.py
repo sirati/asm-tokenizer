@@ -28,15 +28,14 @@ import pytest
 
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.sorted_index import (
+    IndexSpec,
     LengthReduction,
     ReductionKind,
     SortedIndexReader,
     compute_reduced_lengths,
     encode_sorted_index,
+    read_section_variant_info,
     write_sorted_index_files,
-)
-from tokenizer.aligned_data.sorted_index._length_compute import (
-    _count_variants_per_section,
 )
 
 from .fixtures import build_combined_fixture
@@ -75,19 +74,22 @@ def _independent_recompute(
     reader-side bucket-distribution check below can reuse the same
     length arrays without re-running the (expensive) compute walk.
     """
-    section_variant_counts = _count_variants_per_section(base, binary_name)
-    num_sections = int(section_variant_counts.size)
+    section_info = read_section_variant_info(base, binary_name)
     dataset = BinaryDataset(base, binary_name, vocab_manager=None)
     with dataset.open_session() as session:
-        per_mode_lengths = compute_reduced_lengths(
+        per_spec_lengths = compute_reduced_lengths(
             session,
-            num_sections=num_sections,
-            section_variant_counts=section_variant_counts,
-            depth=depth,
+            section_info=section_info,
+            depths=[depth],
             reductions=reductions,
         )
     return {
-        red: (encode_sorted_index(per_mode_lengths[red]), per_mode_lengths[red])
+        red: (
+            encode_sorted_index(
+                per_spec_lengths[IndexSpec(reduction=red, depth=depth)]
+            ),
+            per_spec_lengths[IndexSpec(reduction=red, depth=depth)],
+        )
         for red in reductions
     }
 
@@ -134,7 +136,7 @@ def test_written_bytes_match_independent_recompute(
     write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=reductions,
-        depth=_DEPTH,
+        depths=[_DEPTH],
     )
     expected = _independent_recompute(base, _BINARY_NAME, reductions, _DEPTH)
     for red in reductions:
@@ -171,7 +173,7 @@ def test_reader_metadata_matches_recomputed_lengths(
     write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=reductions,
-        depth=_DEPTH,
+        depths=[_DEPTH],
     )
     expected = _independent_recompute(base, _BINARY_NAME, reductions, _DEPTH)
 

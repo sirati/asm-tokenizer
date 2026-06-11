@@ -132,7 +132,7 @@ def test_e2e_writer_through_batch_helper(tmp_path: Path) -> None:
         write_sorted_index_files(
             memmap_dir, binary_name,
             reductions=[_MAX, _P95],
-            depth=_DEPTH,
+            depths=[_DEPTH],
         )
 
     # ---- 3. Canonical-grammar filenames land on disk. ----

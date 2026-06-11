@@ -44,9 +44,6 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.csv_section_index import (
-    read_csv_section_index_arrays,
-)
 from tokenizer.aligned_data.loader.batch_decode._length_predict import (
     predict_lengths,
 )
@@ -64,9 +61,11 @@ from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.loader.session import BinarySession
-from tokenizer.aligned_data.matched_sections_bin import iter_sections_bin
 
-from ._types import LengthReduction
+from ._dedup import PLAIN, DuplicateHandling
+from ._gating import VariantGate
+from ._prepass import SectionVariantInfo, read_section_variant_info
+from ._types import IndexSpec, LengthReduction
 
 
 __all__ = [
@@ -127,45 +126,65 @@ def _count_variants_per_section(
        parsing its body. This pre-pass is therefore O(num_sections *
        small_constant); fast in absolute terms (sections.bin is small,
        megabytes per binary) but not O(num_sections * O(1)).
-    """
-    base_path = Path(base_path)
-    matched_index = base_path / f"{binary_name}_index.bin"
-    pair = read_csv_section_index_arrays(matched_index)
-    if pair is None:
-        # No matched arm. Return empty array; downstream consumers see
-        # zero-length matched index and stamp nothing.
-        return np.zeros(0, dtype=np.uint32)
-    matched_bin_starts, _matched_bin_lengths = pair
-    num_matched = len(matched_bin_starts)
-    if num_matched == 0:
-        return np.zeros(0, dtype=np.uint32)
 
-    sections_path = base_path / f"{binary_name}_sections.bin"
-    counts = np.zeros(num_matched, dtype=np.uint32)
-    for i, section in enumerate(iter_sections_bin(sections_path)):
-        if i >= num_matched:
-            break
-        counts[i] = len(section.variants)
-    return counts
+    This is the counts-only view of :func:`read_section_variant_info`;
+    callers that also need the per-variant data-bin pointers (the
+    duplicate / minimum-variant feature) consume the richer
+    :class:`SectionVariantInfo` directly.
+    """
+    return read_section_variant_info(base_path, binary_name).counts
+
+
+def _variant_lengths_at_depth(stage2_variant, depth: int) -> int:
+    """Sum the surviving-token counts of one variant's call_targets at depth.
+
+    A call_target belongs to the depth-``depth`` expansion iff its DFS
+    ``path_depth`` is ``<= depth`` (the depth-cap makes the depth-``k``
+    tree an exact prefix of every deeper walk -- see
+    :attr:`Stage1CallTarget.path_depth`). The variant's depth-``depth``
+    length is the sum of the surviving-token counts over exactly those
+    call_targets. Under :data:`LARGE_CONTEXT_LEN` no cutoff fires, so
+    each call_target's ``surviving_token_count`` equals its full length.
+    """
+    return int(
+        sum(
+            st2_ct.surviving_token_count
+            for st2_ct in stage2_variant.call_targets
+            if st2_ct.stage1.path_depth <= depth
+        )
+    )
 
 
 def compute_reduced_lengths(
     session: BinarySession,
     *,
-    num_sections: int,
-    section_variant_counts: np.ndarray,
-    depth: int,
+    section_info: SectionVariantInfo,
+    depths: List[int],
     reductions: List[LengthReduction],
-) -> Dict[LengthReduction, np.ndarray]:
-    """Per-mode reduced per-section length, computed in ONE Stage 1+2 walk.
+    gate: VariantGate = VariantGate(),
+    duplicate_handling: DuplicateHandling = PLAIN,
+) -> Dict[IndexSpec, np.ndarray]:
+    """Per-(mode, depth) reduced per-section length, from ONE Stage 1+2 walk.
 
-    Returns ``{reduction -> u32[num_sections]}``. Each output array's
-    ``[i]`` is the reduced key length for matched section ``i``.
+    Returns ``{IndexSpec(reduction, depth) -> u32[num_sections]}``. Each
+    output array's ``[i]`` is the reduced key length for matched section
+    ``i`` at that ``(reduction, depth)``. The single walk runs at
+    ``max(depths)``; every shallower depth is recovered as the exact
+    prefix of call_targets whose ``path_depth <= depth`` (no extra
+    walks).
 
-    0-variant sections (``section_variant_counts[i] == 0``) are STAMPED
+    0-variant sections (``section_info.counts[i] == 0``) are STAMPED
     DIRECTLY with 0 in every output array and excluded from the Stage
     1+2 walk -- :func:`_select_variant_indices` raises on
     ``n_variants <= 0`` (plan audit C1).
+
+    Sections failing the top-level minimum-variant ``gate`` are likewise
+    stamped 0 across every output -- the same length-0 representation a
+    0-variant section takes (a length-0 bucket is never drawn at a real
+    training target length, so this excludes the section without
+    touching the wire format / filename / reader). The gate inspects
+    only top-level (depth-0) variant counts, so a gated-out section is
+    excluded uniformly across every ``(reduction, depth)``.
 
     The walk runs ``num_variants_per_section = LARGE_VARIANT_CAP``
     under :attr:`VariantPadding.RAGGED` so every real variant of every
@@ -180,27 +199,29 @@ def compute_reduced_lengths(
         Open :class:`BinarySession` for the binary; the session's
         memmap handles must be live for the call's duration (Stage 1
         loads variant bodies through it).
-    num_sections
-        Number of MATCHED sections in the binary. Must equal
-        ``section_variant_counts.size``.
-    section_variant_counts
-        ``u32[num_sections]`` per-section variant count, as produced
-        by :func:`_count_variants_per_section`.
-    depth
-        Maximum splice depth fed to :func:`walk_sections` (the index's
-        ``_d<NNN>`` filename tag).
+    section_info
+        :class:`SectionVariantInfo` from :func:`read_section_variant_info`
+        -- the per-section top-level variant counts + data-bin pointers.
+        ``counts.size`` is the number of matched sections.
+    depths
+        Splice depths to materialise. One output array per
+        ``(reduction, depth)`` pair; the walk's ``max_depth`` is
+        ``max(depths)``. Must be non-empty with every entry ``>= 0``.
     reductions
         The :class:`LengthReduction` modes to compute. The walk
-        executes ONCE for all modes (the cost-amortising property
-        named in the plan); each mode's result array is collapsed from
-        the same per-section variant-length vector.
+        executes ONCE for all (mode, depth) pairs (the cost-amortising
+        property named in the plan).
+    gate
+        Top-level minimum-variant emission gate. Defaults to the
+        disabled gate (every section emitted).
+    duplicate_handling
+        Top-level duplicate strategy. Defaults to :data:`PLAIN` (no
+        dedup; byte-identical to the pre-feature reduction).
 
     Returns
     -------
-    Dict[LengthReduction, np.ndarray]
-        One ``u32[num_sections]`` array per requested reduction. Key
-        identity matches the input ``reductions`` list -- callers may
-        index by their own :class:`LengthReduction` instances.
+    Dict[IndexSpec, np.ndarray]
+        One ``u32[num_sections]`` array per ``(reduction, depth)`` pair.
 
     Raises
     ------
@@ -208,23 +229,45 @@ def compute_reduced_lengths(
         If Stage 2's cutoff fires on any variant (per plan D-2.2).
         The message identifies the offending section + variant index
         and points at :data:`LARGE_CONTEXT_LEN`.
+    ValueError
+        If ``depths`` is empty or carries a negative entry.
     """
-    if section_variant_counts.shape != (num_sections,):
-        raise ValueError(
-            f"section_variant_counts.shape={section_variant_counts.shape!r} "
-            f"does not match num_sections={num_sections}"
-        )
+    if not depths:
+        raise ValueError("depths must be a non-empty list")
+    if any(d < 0 for d in depths):
+        raise ValueError(f"depths must all be >= 0; got {depths!r}")
 
-    # Preallocate per-mode result arrays; defaults are 0 so 0-variant
-    # sections need no further write.
-    results: Dict[LengthReduction, np.ndarray] = {
-        red: np.zeros(num_sections, dtype=np.uint32) for red in reductions
+    counts = section_info.counts
+    num_sections = int(counts.size)
+    max_depth = max(depths)
+
+    # Preallocate per-(mode, depth) result arrays; defaults are 0 so
+    # 0-variant AND gated-out sections need no further write.
+    specs = [
+        IndexSpec(reduction=red, depth=d) for red in reductions for d in depths
+    ]
+    results: Dict[IndexSpec, np.ndarray] = {
+        spec: np.zeros(num_sections, dtype=np.uint32) for spec in specs
     }
 
-    # Pre-filter 0-variant sections (plan audit C1 fix).
-    populated_idx = np.nonzero(section_variant_counts > 0)[0]
+    # Pre-filter 0-variant sections (plan audit C1 fix) AND gated-out
+    # sections: both stay at the zero default and are excluded from the
+    # walk. The gate reads ONLY top-level counts (depth-independent).
+    emitted = np.fromiter(
+        (
+            counts[i] > 0
+            and gate.passes(
+                n_total=int(counts[i]),
+                n_unique=section_info.unique_count(i),
+            )
+            for i in range(num_sections)
+        ),
+        dtype=bool,
+        count=num_sections,
+    )
+    populated_idx = np.nonzero(emitted)[0]
     if populated_idx.size == 0:
-        # Whole binary is 0-variant; every result stays zero.
+        # Nothing emitted; every result stays zero.
         return results
 
     # Deterministic but ZERO EFFECT: under LARGE_VARIANT_CAP every
@@ -250,7 +293,7 @@ def compute_reduced_lengths(
                 session,
                 section_pointers,
                 num_variants_per_section=LARGE_VARIANT_CAP,
-                max_depth=depth,
+                max_depth=max_depth,
                 variant_padding=VariantPadding.RAGGED,
                 inlined_equivalent_call_targets_only=False,
                 rng=rng,
@@ -272,8 +315,8 @@ def compute_reduced_lengths(
             global_idx = int(chunk_idxs[chunk_offset])
             n_variants = len(stage2_section.variants)
             if n_variants == 0:
-                # Belt-and-braces. The 0-variant pre-filter above
-                # already excluded this index; keep the zero default.
+                # Belt-and-braces. The pre-filter above already excluded
+                # this index; keep the zero default.
                 continue
 
             # Plan D-2.2: assert no cutoff fired. Under
@@ -292,15 +335,29 @@ def compute_reduced_lengths(
                         f"raise LARGE_CONTEXT_LEN beyond {LARGE_CONTEXT_LEN}"
                     )
 
-            variant_lengths = np.fromiter(
-                (
-                    stage2_variant.total_surviving_token_count
-                    for stage2_variant in stage2_section.variants
-                ),
-                dtype=np.uint32,
-                count=n_variants,
-            )
-            for red in reductions:
-                results[red][global_idx] = np.uint32(red.reduce(variant_lengths))
+            # Top-level data-bin pointers for this section, parallel to
+            # ``stage2_section.variants`` (RAGGED selects every variant
+            # in on-disk order, matching the pre-pass's pointer order).
+            data_pointers = section_info.data_pointers[global_idx]
+
+            for depth in depths:
+                variant_lengths = np.fromiter(
+                    (
+                        _variant_lengths_at_depth(stage2_variant, depth)
+                        for stage2_variant in stage2_section.variants
+                    ),
+                    dtype=np.uint32,
+                    count=n_variants,
+                )
+                for red in reductions:
+                    results[IndexSpec(reduction=red, depth=depth)][
+                        global_idx
+                    ] = np.uint32(
+                        duplicate_handling.reduce_section(
+                            red,
+                            lengths=variant_lengths,
+                            data_pointers=data_pointers,
+                        )
+                    )
 
     return results

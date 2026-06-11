@@ -32,6 +32,7 @@ import numpy as np
 
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.sorted_index import (
+    IndexSpec,
     LengthReduction,
     ReductionKind,
     SortedIndexReader,
@@ -39,20 +40,23 @@ from tokenizer.aligned_data.sorted_index import (
     compute_reduced_lengths,
     encode_sorted_index,
     parse_header,
+    read_section_variant_info,
     write_sorted_index_files,
-)
-from tokenizer.aligned_data.sorted_index._length_compute import (
-    _count_variants_per_section,
 )
 
 from .fixtures import build_combined_fixture
 
 
 _BINARY_NAME = "sortbin"
+_DEPTH = 3
 
 _MAX = LengthReduction(kind=ReductionKind.MAX)
 _P50 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=50)
 _P95 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=95)
+
+
+def _spec(red: LengthReduction, depth: int = _DEPTH) -> IndexSpec:
+    return IndexSpec(reduction=red, depth=depth)
 
 
 # Canonical filename grammar (plan §D5).  Mirrored here intentionally so
@@ -82,19 +86,20 @@ def _oracle_bytes(
     reduction or shuffles arrays surfaces as a byte-mismatch instead of
     a self-consistent-but-wrong dict.
     """
-    section_variant_counts = _count_variants_per_section(base, _BINARY_NAME)
-    num_sections = int(section_variant_counts.size)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
     dataset = _open_dataset(base)
     with dataset.open_session() as session:
-        per_mode_lengths = compute_reduced_lengths(
+        per_spec_lengths = compute_reduced_lengths(
             session,
-            num_sections=num_sections,
-            section_variant_counts=section_variant_counts,
-            depth=depth,
+            section_info=section_info,
+            depths=[depth],
             reductions=reductions,
         )
     return {
-        red: encode_sorted_index(per_mode_lengths[red]) for red in reductions
+        red: encode_sorted_index(
+            per_spec_lengths[IndexSpec(reduction=red, depth=depth)]
+        )
+        for red in reductions
     }
 
 
@@ -111,9 +116,9 @@ def test_build_returns_one_blob_per_reduction(tmp_path: Path) -> None:
         out = build_sorted_index_bytes(
             session, base, _BINARY_NAME,
             reductions=[_MAX, _P50, _P95],
-            depth=3,
+            depths=[_DEPTH],
         )
-    assert set(out.keys()) == {_MAX, _P50, _P95}
+    assert set(out.keys()) == {_spec(_MAX), _spec(_P50), _spec(_P95)}
     for blob in out.values():
         assert isinstance(blob, (bytes, bytearray))
 
@@ -126,7 +131,7 @@ def test_build_blobs_parse_clean(tmp_path: Path) -> None:
         out = build_sorted_index_bytes(
             session, base, _BINARY_NAME,
             reductions=[_MAX, _P50, _P95],
-            depth=3,
+            depths=[_DEPTH],
         )
     for blob in out.values():
         min_length, counts, body_offset = parse_header(blob)
@@ -148,11 +153,13 @@ def test_build_bytes_match_oracle(tmp_path: Path) -> None:
         out = build_sorted_index_bytes(
             session, base, _BINARY_NAME,
             reductions=[_MAX, _P50, _P95],
-            depth=3,
+            depths=[_DEPTH],
         )
-    oracle = _oracle_bytes(base, [_MAX, _P50, _P95], depth=3)
+    oracle = _oracle_bytes(base, [_MAX, _P50, _P95], depth=_DEPTH)
     for red in [_MAX, _P50, _P95]:
-        assert bytes(out[red]) == bytes(oracle[red]), f"{red}: byte-mismatch"
+        assert bytes(out[_spec(red)]) == bytes(oracle[red]), (
+            f"{red}: byte-mismatch"
+        )
 
 
 def test_build_reader_round_trip(tmp_path: Path) -> None:
@@ -169,28 +176,26 @@ def test_build_reader_round_trip(tmp_path: Path) -> None:
     # Compute per-mode length arrays once via the oracle path and
     # reuse them for both the builder call (via the inline oracle) AND
     # the reader-side bincount comparison.
-    section_variant_counts = _count_variants_per_section(base, _BINARY_NAME)
-    num_sections = int(section_variant_counts.size)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
     dataset = _open_dataset(base)
     with dataset.open_session() as session:
-        per_mode_lengths = compute_reduced_lengths(
+        per_spec_lengths = compute_reduced_lengths(
             session,
-            num_sections=num_sections,
-            section_variant_counts=section_variant_counts,
-            depth=3,
+            section_info=section_info,
+            depths=[_DEPTH],
             reductions=[_MAX, _P50, _P95],
         )
         out = build_sorted_index_bytes(
             session, base, _BINARY_NAME,
             reductions=[_MAX, _P50, _P95],
-            depth=3,
+            depths=[_DEPTH],
         )
 
     for red in [_MAX, _P50, _P95]:
         path = tmp_path / f"rt_{red.filename_tag()}.idx"
-        path.write_bytes(out[red])
-        rdr = SortedIndexReader(path, reduction=red, depth=3)
-        lengths = per_mode_lengths[red]
+        path.write_bytes(out[_spec(red)])
+        rdr = SortedIndexReader(path, reduction=red, depth=_DEPTH)
+        lengths = per_spec_lengths[_spec(red)]
         if lengths.size == 0:
             assert rdr.total_sections() == 0
             continue
@@ -235,7 +240,7 @@ def test_build_multi_mode_single_compute_call(tmp_path: Path) -> None:
             build_sorted_index_bytes(
                 session, base, _BINARY_NAME,
                 reductions=[_MAX, _P50, _P95],
-                depth=3,
+                depths=[_DEPTH],
             )
     assert call_counter["n"] == 1, (
         f"expected 1 compute_reduced_lengths call for 3 reductions; "
@@ -255,7 +260,7 @@ def test_build_empty_reductions_returns_empty_dict(tmp_path: Path) -> None:
             out = build_sorted_index_bytes(
                 session, base, _BINARY_NAME,
                 reductions=[],
-                depth=3,
+                depths=[_DEPTH],
             )
     assert out == {}
     mock_compute.assert_not_called()
@@ -272,19 +277,19 @@ def test_write_default_output_dir_is_input_dir(tmp_path: Path) -> None:
     written = write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=[_MAX, _P95],
-        depth=3,
+        depths=[_DEPTH],
     )
-    assert set(written.keys()) == {_MAX, _P95}
-    for red, path in written.items():
+    assert set(written.keys()) == {_spec(_MAX), _spec(_P95)}
+    for spec, path in written.items():
         assert path.parent == base, (
-            f"{red}: wrote to {path.parent}, expected {base}"
+            f"{spec}: wrote to {path.parent}, expected {base}"
         )
         assert path.is_file()
         m = _FILENAME_RE.match(path.name)
-        assert m is not None, f"{red}: filename {path.name} fails grammar"
+        assert m is not None, f"{spec}: filename {path.name} fails grammar"
         assert m.group("binary") == _BINARY_NAME
         assert m.group("depth") == "003"
-        assert m.group("mode") == red.filename_tag()
+        assert m.group("mode") == spec.reduction.filename_tag()
 
 
 def test_write_explicit_output_dir(tmp_path: Path) -> None:
@@ -294,12 +299,12 @@ def test_write_explicit_output_dir(tmp_path: Path) -> None:
     written = write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=[_MAX, _P50],
-        depth=3,
+        depths=[_DEPTH],
         output_dir=out_dir,
     )
-    for red, path in written.items():
+    for spec, path in written.items():
         assert path.parent == out_dir, (
-            f"{red}: wrote to {path.parent}, expected {out_dir}"
+            f"{spec}: wrote to {path.parent}, expected {out_dir}"
         )
         assert path.is_file()
     # Affirmative check: no .idx files in the memmap dir itself.
@@ -317,17 +322,17 @@ def test_write_bytes_match_build_output(tmp_path: Path) -> None:
         in_memory = build_sorted_index_bytes(
             session, base, _BINARY_NAME,
             reductions=[_MAX, _P50, _P95],
-            depth=3,
+            depths=[_DEPTH],
         )
     out_dir = tmp_path / "out"
     written = write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=[_MAX, _P50, _P95],
-        depth=3,
+        depths=[_DEPTH],
         output_dir=out_dir,
     )
     for red in [_MAX, _P50, _P95]:
-        assert written[red].read_bytes() == bytes(in_memory[red]), (
+        assert written[_spec(red)].read_bytes() == bytes(in_memory[_spec(red)]), (
             f"{red}: file bytes diverge from build_sorted_index_bytes"
         )
 
@@ -340,11 +345,11 @@ def test_write_creates_output_dir(tmp_path: Path) -> None:
     written = write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=[_MAX],
-        depth=3,
+        depths=[_DEPTH],
         output_dir=out_dir,
     )
     assert out_dir.is_dir()
-    assert written[_MAX].is_file()
+    assert written[_spec(_MAX)].is_file()
 
 
 def test_write_empty_reductions(tmp_path: Path) -> None:
@@ -354,7 +359,7 @@ def test_write_empty_reductions(tmp_path: Path) -> None:
     written = write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=[],
-        depth=3,
+        depths=[_DEPTH],
         output_dir=out_dir,
     )
     assert written == {}
@@ -374,9 +379,9 @@ def test_write_depth_zero_padding(tmp_path: Path) -> None:
     written = write_sorted_index_files(
         base, _BINARY_NAME,
         reductions=[_MAX],
-        depth=7,
+        depths=[7],
     )
-    path = written[_MAX]
+    path = written[_spec(_MAX, depth=7)]
     assert path.name.endswith("_d007.idx"), (
         f"depth zero-pad regression: {path.name}"
     )

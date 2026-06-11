@@ -13,7 +13,7 @@ per-row ``binary_id`` numbering is stable across runs.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -70,15 +70,26 @@ class MultiBinarySortedIndexSampler:
         """Pool size at ``target_length`` summed over every binary."""
         return sum(r.count_at(target_length) for r in self._readers.values())
 
+    def count_in_band(self, lo: int, hi: int) -> int:
+        """Pool size for lengths in ``[lo, hi]`` summed over every binary."""
+        return sum(r.count_in_band(lo, hi) for r in self._readers.values())
+
     def sample_section_pointers(
         self,
         target_length: int,
         count: int,
         rng: np.random.Generator,
+        *,
+        band: Optional[Tuple[int, int]] = None,
     ) -> List[MultiBinarySectionPointer]:
-        """Delegate to :func:`sample_section_pointers` with our readers."""
+        """Delegate to :func:`sample_section_pointers` with our readers.
+
+        When ``band=(lo, hi)`` is provided, eligible sections are those
+        whose index key falls in ``[lo, hi]`` rather than exactly at
+        ``target_length`` (length-band sampling).
+        """
         return sample_section_pointers(
-            self._readers, target_length, count, rng,
+            self._readers, target_length, count, rng, band=band,
         )
 
 
@@ -87,6 +98,8 @@ def sample_section_pointers(
     target_length: int,
     count: int,
     rng: np.random.Generator,
+    *,
+    band: Optional[Tuple[int, int]] = None,
 ) -> List[MultiBinarySectionPointer]:
     """Reading-A unbiased sample over per-binary urns.
 
@@ -113,10 +126,22 @@ def sample_section_pointers(
     ``readers`` is iterated in dict-insertion order; callers wanting
     stable cross-run output should pass an alphabetically-canonical
     dict (:class:`MultiBinarySortedIndexSampler` does so internally).
+
+    When ``band=(lo, hi)`` is provided, sections with index key in
+    ``[lo, hi]`` (inclusive) are eligible rather than exactly
+    ``target_length``.  The per-binary urn sizes use
+    :meth:`SortedIndexReader.count_in_band`; sampling draws via
+    :meth:`SortedIndexReader.sample_section_indices_in_band`.
     """
-    per_binary_counts = {
-        name: rdr.count_at(target_length) for name, rdr in readers.items()
-    }
+    if band is not None:
+        lo, hi = band
+        per_binary_counts = {
+            name: rdr.count_in_band(lo, hi) for name, rdr in readers.items()
+        }
+    else:
+        per_binary_counts = {
+            name: rdr.count_at(target_length) for name, rdr in readers.items()
+        }
     total = sum(per_binary_counts.values())
     if total == 0:
         return []
@@ -133,9 +158,15 @@ def sample_section_pointers(
         draw_int = int(draw)
         if draw_int == 0:
             continue
-        idxs = readers[name].sample_section_indices(
-            target_length, draw_int, rng,
-        )
+        if band is not None:
+            lo, hi = band
+            idxs = readers[name].sample_section_indices_in_band(
+                lo, hi, draw_int, rng,
+            )
+        else:
+            idxs = readers[name].sample_section_indices(
+                target_length, draw_int, rng,
+            )
         out.extend(
             MultiBinarySectionPointer(
                 binary_name=name,

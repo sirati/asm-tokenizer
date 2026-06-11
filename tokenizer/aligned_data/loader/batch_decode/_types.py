@@ -180,6 +180,16 @@ class Stage1CallTarget:
     """This function's global FID (function-name pointer in the names
     sidecar). Used at stage 4 for FUNCTION-category dedup keying."""
 
+    path_depth: int = 0
+    """DFS path-depth from the root: ``0`` for the root body, ``k`` for a
+    callee reached after ``k`` descent steps. This is the splice tree's
+    topology depth (NOT recoverable from ``parent_call_target_index``,
+    which indexes the parent's call-target table rather than the output
+    row), so the walker threads it through directly. Depth-capped multi-
+    depth consumers select the call_targets with ``path_depth <= d`` to
+    reconstruct the depth-``d`` expansion as an exact prefix of the
+    depth-``max`` walk."""
+
 
 @dataclass(frozen=True)
 class Stage1Variant:

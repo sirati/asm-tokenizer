@@ -160,6 +160,7 @@ def walk_callees_pending(
         encounter_category=Category.LOCAL_FUNC,
         parent_call_target_index=None,
         function_name_ptr=root_function_name_ptr,
+        path_depth=0,
         collector=collector,
     )
 
@@ -234,6 +235,10 @@ def _walk_recursive(
             ct=ct,
             visited=visited,
             inlining_flag=inlining_flag,
+            # The callee emitted here sits one descent step below the
+            # parent: ``current_depth`` is the parent's path-depth, so
+            # the callee's path-depth is ``current_depth + 1``.
+            callee_path_depth=current_depth + 1,
             collector=collector,
         )
         if callee_entry is None:
@@ -274,6 +279,7 @@ def _try_resolve_callee(
     ct: CallTarget,
     visited: Set[Tuple[SectionKind, int]],
     inlining_flag: bool,
+    callee_path_depth: int,
     collector: BucketedRunLengthCollector,
 ) -> Optional[Tuple[PendingCallTarget, Section, int]]:
     """Resolve one call_target row to a (PendingCT, callee Section,
@@ -346,6 +352,7 @@ def _try_resolve_callee(
         encounter_category=_CALL_TARGET_TYPE_TO_ENCOUNTER_CATEGORY[ct.type],
         parent_call_target_index=called_idx,
         function_name_ptr=int(ct.function_name_ptr),
+        path_depth=callee_path_depth,
         collector=collector,
     )
     return callee_pending, callee_section, callee_variant_idx

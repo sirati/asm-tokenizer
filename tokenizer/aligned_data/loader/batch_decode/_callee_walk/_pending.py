@@ -90,6 +90,7 @@ class PendingCallTarget:
     encounter_category: Category
     parent_call_target_index: Optional[int]
     function_name_ptr: int
+    path_depth: int
 
 
 def build_pending_call_target(
@@ -100,6 +101,7 @@ def build_pending_call_target(
     encounter_category: Category,
     parent_call_target_index: Optional[int],
     function_name_ptr: int,
+    path_depth: int,
     collector: BucketedRunLengthCollector,
 ) -> PendingCallTarget:
     """Compute the cheap per-position masks + stage the two
@@ -134,6 +136,7 @@ def build_pending_call_target(
         encounter_category=encounter_category,
         parent_call_target_index=parent_call_target_index,
         function_name_ptr=function_name_ptr,
+        path_depth=path_depth,
     )
 
 
@@ -190,6 +193,7 @@ def finalise_pending_call_targets(
                 encounter_category=row.encounter_category,
                 parent_call_target_index=row.parent_call_target_index,
                 function_name_ptr=row.function_name_ptr,
+                path_depth=row.path_depth,
             )
         )
     return out

@@ -28,11 +28,11 @@ from typing import Dict, List, Optional
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.session import BinarySession
 
-from ._length_compute import (
-    _count_variants_per_section,
-    compute_reduced_lengths,
-)
-from ._types import LengthReduction
+from ._dedup import PLAIN, DuplicateHandling
+from ._gating import VariantGate
+from ._length_compute import compute_reduced_lengths
+from ._prepass import read_section_variant_info
+from ._types import IndexSpec, LengthReduction
 from ._wire import encode_sorted_index
 
 
@@ -45,17 +45,20 @@ def build_sorted_index_bytes(
     binary_name: str,
     *,
     reductions: List[LengthReduction],
-    depth: int,
-) -> Dict[LengthReduction, bytes]:
-    """Build per-mode sorted-index bytes for one binary.
+    depths: List[int],
+    gate: VariantGate = VariantGate(),
+    duplicate_handling: DuplicateHandling = PLAIN,
+) -> Dict[IndexSpec, bytes]:
+    """Build per-(mode, depth) sorted-index bytes for one binary.
 
-    Runs the cheap pre-pass (``_count_variants_per_section``) to recover
-    the matched-arm variant counts, then performs ONE Stage 1+2 walk
-    per chunk across ALL requested reductions via
+    Runs the cheap pre-pass (:func:`read_section_variant_info`) to
+    recover the matched-arm variant counts + data-bin pointers, then
+    performs ONE Stage 1+2 walk per chunk -- at ``max(depths)`` -- across
+    ALL requested reductions AND depths via
     :func:`compute_reduced_lengths` (the cost-amortising property named
-    in plan §D8 -- ``compute_reduced_lengths`` is NOT called once per
-    reduction).  Each per-mode ``u32[num_sections]`` length array is
-    then wire-encoded via :func:`encode_sorted_index`.
+    in plan §D8: the walk is NOT repeated per reduction or per depth).
+    Each per-(mode, depth) ``u32[num_sections]`` length array is then
+    wire-encoded via :func:`encode_sorted_index`.
 
     Parameters
     ----------
@@ -74,40 +77,42 @@ def build_sorted_index_bytes(
     reductions
         :class:`LengthReduction` modes to compute.  Empty list is
         permitted and returns an empty dict (no walk runs).
-    depth
-        Maximum splice depth fed to the Stage 1+2 walk.  Encoded
-        in the output filename as ``_d<depth:03d>`` by
-        :func:`write_sorted_index_files`.
+    depths
+        Splice depths to materialise (one output per ``(reduction,
+        depth)`` pair).  Empty list returns an empty dict (no walk).
+    gate
+        Top-level minimum-variant emission gate (defaults to disabled).
+    duplicate_handling
+        Top-level duplicate strategy (defaults to :data:`PLAIN`).
 
     Returns
     -------
-    Dict[LengthReduction, bytes]
-        ``{reduction -> bytes}``.  Key identity matches the input
-        ``reductions`` list -- callers may index by their own
-        :class:`LengthReduction` instances.  Each value is the wire-
-        encoded sorted index per :mod:`._wire` (LE u32 throughout).
+    Dict[IndexSpec, bytes]
+        ``{IndexSpec(reduction, depth) -> bytes}``.  Each value is the
+        wire-encoded sorted index per :mod:`._wire` (LE u32 throughout).
     """
-    if not reductions:
+    if not reductions or not depths:
         return {}
 
-    # Pre-pass (plan ALG-7): per-section variant counts.  Required for
-    # the 0-variant pre-filter inside ``compute_reduced_lengths``.
-    section_variant_counts = _count_variants_per_section(base_path, binary_name)
-    num_sections = int(section_variant_counts.size)
+    # Pre-pass (plan ALG-7): per-section variant counts + data-bin
+    # pointers.  Counts drive the 0-variant pre-filter; pointers drive
+    # the duplicate / minimum-variant feature.  ONE read of sections.bin.
+    section_info = read_section_variant_info(base_path, binary_name)
 
-    # ONE shared Stage 1+2 walk for all reductions (plan §D8).
-    per_mode_lengths = compute_reduced_lengths(
+    # ONE shared Stage 1+2 walk for all (mode, depth) pairs (plan §D8).
+    per_spec_lengths = compute_reduced_lengths(
         session,
-        num_sections=num_sections,
-        section_variant_counts=section_variant_counts,
-        depth=depth,
+        section_info=section_info,
+        depths=depths,
         reductions=reductions,
+        gate=gate,
+        duplicate_handling=duplicate_handling,
     )
 
-    # Per-mode wire encode.  Each call is independent.
+    # Per-(mode, depth) wire encode.  Each call is independent.
     return {
-        reduction: encode_sorted_index(per_mode_lengths[reduction])
-        for reduction in reductions
+        spec: encode_sorted_index(lengths)
+        for spec, lengths in per_spec_lengths.items()
     }
 
 
@@ -116,10 +121,12 @@ def write_sorted_index_files(
     binary_name: str,
     *,
     reductions: List[LengthReduction],
-    depth: int,
+    depths: List[int],
+    gate: VariantGate = VariantGate(),
+    duplicate_handling: DuplicateHandling = PLAIN,
     output_dir: Optional[Path] = None,
-) -> Dict[LengthReduction, Path]:
-    """Open a session, build per-mode bytes, write canonical filenames.
+) -> Dict[IndexSpec, Path]:
+    """Open a session, build per-(mode, depth) bytes, write filenames.
 
     The canonical filename grammar (plan §D5, regex-locked in
     :mod:`._reader`)::
@@ -128,7 +135,10 @@ def write_sorted_index_files(
 
     where ``<mode>`` is :meth:`LengthReduction.filename_tag` (``"max"``
     or ``"p<NN>"`` with zero-padded percentile) and ``<depth>`` is
-    zero-padded to three digits so files lexsort by depth.
+    zero-padded to three digits so files lexsort by depth. The gating +
+    duplicate parameters affect file CONTENT only; the filename scheme
+    is unchanged (a consumer reading the ``.idx`` does not need to know
+    which gate / duplicate policy produced it).
 
     Parameters
     ----------
@@ -140,9 +150,13 @@ def write_sorted_index_files(
     reductions
         :class:`LengthReduction` modes to write.  Empty list returns an
         empty dict (no session is opened).
-    depth
-        Splice depth.  Forwarded to :func:`build_sorted_index_bytes`
-        and encoded in the filename.
+    depths
+        Splice depths to write (one file per ``(reduction, depth)``
+        pair).  Empty list returns an empty dict (no session opened).
+    gate
+        Top-level minimum-variant emission gate (defaults to disabled).
+    duplicate_handling
+        Top-level duplicate strategy (defaults to :data:`PLAIN`).
     output_dir
         Directory to write the ``.idx`` files into.  Defaults to
         ``memmap_dir`` (the conventional placement next to the other
@@ -150,10 +164,10 @@ def write_sorted_index_files(
 
     Returns
     -------
-    Dict[LengthReduction, Path]
-        ``{reduction -> path}`` for every written file.
+    Dict[IndexSpec, Path]
+        ``{IndexSpec(reduction, depth) -> path}`` for every written file.
     """
-    if not reductions:
+    if not reductions or not depths:
         return {}
 
     target_dir = Path(output_dir) if output_dir is not None else Path(memmap_dir)
@@ -161,21 +175,23 @@ def write_sorted_index_files(
 
     dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=None)
     with dataset.open_session() as session:
-        per_mode_bytes = build_sorted_index_bytes(
+        per_spec_bytes = build_sorted_index_bytes(
             session,
             Path(memmap_dir),
             binary_name,
             reductions=reductions,
-            depth=depth,
+            depths=depths,
+            gate=gate,
+            duplicate_handling=duplicate_handling,
         )
 
-    written: Dict[LengthReduction, Path] = {}
-    for reduction, blob in per_mode_bytes.items():
+    written: Dict[IndexSpec, Path] = {}
+    for spec, blob in per_spec_bytes.items():
         filename = (
-            f"{binary_name}_sorted_{reduction.filename_tag()}"
-            f"_d{depth:03d}.idx"
+            f"{binary_name}_sorted_{spec.reduction.filename_tag()}"
+            f"_d{spec.depth:03d}.idx"
         )
         path = target_dir / filename
         path.write_bytes(blob)
-        written[reduction] = path
+        written[spec] = path
     return written

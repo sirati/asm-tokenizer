@@ -33,9 +33,11 @@ import pytest
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.matched_sections_bin import iter_sections_bin
 from tokenizer.aligned_data.sorted_index import (
+    IndexSpec,
     LengthReduction,
     ReductionKind,
     compute_reduced_lengths,
+    read_section_variant_info,
 )
 from tokenizer.aligned_data.sorted_index._length_compute import (
     LARGE_CONTEXT_LEN,
@@ -140,21 +142,25 @@ def _compute_on(
 ):
     """Run the full open-session + ``compute_reduced_lengths`` pipeline.
 
-    Returns ``(results, counts)``. ``results`` is the per-mode dict;
-    ``counts`` is the upstream variant-count array. Centralised so the
-    individual assertions stay focused on the result shape.
+    Returns ``(results, counts)``. ``results`` is the per-mode dict
+    (unwrapped from the per-:class:`IndexSpec` output at the single
+    requested ``depth`` so the assertions stay focused on the per-mode
+    result shape); ``counts`` is the upstream variant-count array.
     """
-    dataset, num_matched = _open(base)
-    counts = _count_variants_per_section(base, _BINARY_NAME)
+    dataset, _num_matched = _open(base)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
     with dataset.open_session() as session:
-        results = compute_reduced_lengths(
+        per_spec = compute_reduced_lengths(
             session,
-            num_sections=num_matched,
-            section_variant_counts=counts,
-            depth=depth,
+            section_info=section_info,
+            depths=[depth],
             reductions=reductions,
         )
-    return results, counts
+    results = {
+        red: per_spec[IndexSpec(reduction=red, depth=depth)]
+        for red in reductions
+    }
+    return results, section_info.counts
 
 
 def test_combined_fixture_shape_and_dtype(tmp_path: Path) -> None:
@@ -289,8 +295,8 @@ def test_multi_mode_runs_one_walk_per_chunk(tmp_path: Path) -> None:
     were requested.
     """
     base = build_combined_fixture(tmp_path)
-    dataset, num_matched = _open(base)
-    counts = _count_variants_per_section(base, _BINARY_NAME)
+    dataset, _num_matched = _open(base)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
 
     real_walk_sections = __import__(
         "tokenizer.aligned_data.sorted_index._length_compute",
@@ -310,9 +316,8 @@ def test_multi_mode_runs_one_walk_per_chunk(tmp_path: Path) -> None:
         with dataset.open_session() as session:
             results = compute_reduced_lengths(
                 session,
-                num_sections=num_matched,
-                section_variant_counts=counts,
-                depth=3,
+                section_info=section_info,
+                depths=[3],
                 reductions=[_MAX, _P50, _P95],
             )
 
@@ -320,8 +325,12 @@ def test_multi_mode_runs_one_walk_per_chunk(tmp_path: Path) -> None:
         f"expected 1 walk_sections call for a single-chunk fixture; "
         f"got {call_counter['n']}"
     )
-    # And the three reductions must still produce per-mode arrays.
-    assert set(results.keys()) == {_MAX, _P50, _P95}
+    # And the three reductions must still produce per-(mode, depth) arrays.
+    assert set(results.keys()) == {
+        IndexSpec(reduction=_MAX, depth=3),
+        IndexSpec(reduction=_P50, depth=3),
+        IndexSpec(reduction=_P95, depth=3),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -359,40 +368,54 @@ def test_all_zero_variant_short_circuits(tmp_path: Path) -> None:
     section. The pre-filter short-circuits before any walk runs;
     every reduction stamps zero.
     """
+    from tokenizer.aligned_data.sorted_index import SectionVariantInfo
+
     base = build_0_variant_section_fixture(tmp_path)
     dataset, num_matched = _open(base)
-    counts = _count_variants_per_section(base, _BINARY_NAME)
-    # Force the all-zero path by zeroing the count for the companion
-    # section (the fixture has func_zero + func_one; we want the
-    # pre-filter exercised when populated_idx.size == 0).
-    zeroed = np.zeros_like(counts)
+    # Force the all-zero path by zeroing every count (the fixture has
+    # func_zero + func_one; we want the pre-filter exercised when
+    # populated_idx.size == 0). Pointer arrays match the zeroed counts.
+    zeroed = SectionVariantInfo(
+        counts=np.zeros(num_matched, dtype=np.uint32),
+        data_pointers=[np.zeros(0, dtype=np.uint32) for _ in range(num_matched)],
+    )
     with dataset.open_session() as session:
         results = compute_reduced_lengths(
             session,
-            num_sections=num_matched,
-            section_variant_counts=zeroed,
-            depth=3,
+            section_info=zeroed,
+            depths=[3],
             reductions=[_MAX, _P50],
         )
-    for red, arr in results.items():
+    for _spec, arr in results.items():
         np.testing.assert_array_equal(arr, np.zeros(num_matched, dtype=np.uint32))
 
 
-def test_shape_mismatch_raises(tmp_path: Path) -> None:
-    """``section_variant_counts.size != num_sections`` is a hard fail.
-
-    Catches the most likely caller bug (passing the wrong array)
-    early with a clear message instead of silently mis-indexing.
-    """
+def test_empty_depths_raises(tmp_path: Path) -> None:
+    """An empty ``depths`` list is a hard fail (no depth to materialise)."""
     base = build_combined_fixture(tmp_path)
-    dataset, num_matched = _open(base)
+    dataset, _num_matched = _open(base)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
     with dataset.open_session() as session:
-        with pytest.raises(ValueError, match="section_variant_counts.shape"):
+        with pytest.raises(ValueError, match="depths must be a non-empty"):
             compute_reduced_lengths(
                 session,
-                num_sections=num_matched,
-                section_variant_counts=np.zeros(num_matched + 1, dtype=np.uint32),
-                depth=3,
+                section_info=section_info,
+                depths=[],
+                reductions=[_MAX],
+            )
+
+
+def test_negative_depth_raises(tmp_path: Path) -> None:
+    """A negative depth is a hard fail (the walk's max_depth must be >= 0)."""
+    base = build_combined_fixture(tmp_path)
+    dataset, _num_matched = _open(base)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
+    with dataset.open_session() as session:
+        with pytest.raises(ValueError, match="depths must all be >= 0"):
+            compute_reduced_lengths(
+                session,
+                section_info=section_info,
+                depths=[1, -1],
                 reductions=[_MAX],
             )
 
@@ -418,8 +441,8 @@ def test_cut_fired_raises(tmp_path: Path) -> None:
     )
 
     base = build_combined_fixture(tmp_path)
-    dataset, num_matched = _open(base)
-    counts = _count_variants_per_section(base, _BINARY_NAME)
+    dataset, _num_matched = _open(base)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
 
     def _cut_predict(stage1, *, context_len):
         real = real_predict_lengths(stage1, context_len=context_len)
@@ -449,8 +472,7 @@ def test_cut_fired_raises(tmp_path: Path) -> None:
             with pytest.raises(AssertionError, match="cut fired"):
                 compute_reduced_lengths(
                     session,
-                    num_sections=num_matched,
-                    section_variant_counts=counts,
-                    depth=3,
+                    section_info=section_info,
+                    depths=[3],
                     reductions=[_MAX],
                 )
