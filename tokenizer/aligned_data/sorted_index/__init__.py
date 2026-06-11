@@ -11,6 +11,11 @@ reader, sampler, batch helper) lands in later phases.
 from __future__ import annotations
 
 from ._builder import build_sorted_index_bytes, write_sorted_index_files
+from ._collection import (
+    CollectionMember,
+    IndexedMemmapCollection,
+    MissingIndexPolicy,
+)
 from ._dedup import DEDUP_BY_DATA_POINTER, PLAIN, DuplicateHandling
 from ._gating import VariantGate
 from ._length_compute import compute_reduced_lengths
@@ -32,10 +37,13 @@ from ._types import (
 from ._wire import encode_sorted_index, parse_header
 
 __all__ = [
+    "CollectionMember",
     "DEDUP_BY_DATA_POINTER",
     "DuplicateHandling",
     "IndexSpec",
+    "IndexedMemmapCollection",
     "LengthReduction",
+    "MissingIndexPolicy",
     "MultiBinaryBatchDecodeResult",
     "MultiBinarySectionPointer",
     "MultiBinarySortedIndexSampler",
