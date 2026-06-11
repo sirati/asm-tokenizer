@@ -250,3 +250,113 @@ def test_monte_carlo_class_path_matches(tmp_path: Path) -> None:
         f"class-path chi-squared = {chi2:.3f}, "
         f"expected < {_CHI2_CRIT_DF2_ALPHA_05}; counts={counts.tolist()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Length-band sampling (sample_section_pointers(band=...))
+# ---------------------------------------------------------------------------
+
+
+_CHI2_CRIT_DF1_ALPHA_05 = 3.841
+
+
+def _band_two_binary_pool(tmp_path: Path) -> Dict[str, SortedIndexReader]:
+    """2 readers with known band-pool sizes for the band ``[3, 4]``.
+
+    Band ``[3, 4]`` pools -> {alpha: 8, beta: 4}; total = 12. Lengths
+    outside the band (9 on alpha, 7 on beta) must never be drawn when a
+    band is supplied, even though they inflate the exact-bucket
+    ``count_at`` totals.
+    """
+    alpha = _make_reader(
+        tmp_path, "alpha", np.array(
+            [3, 3, 3, 4, 4, 4, 4, 4, 9], dtype=np.uint32,
+        ),
+    )
+    beta = _make_reader(
+        tmp_path, "beta", np.array(
+            [3, 3, 4, 4, 7], dtype=np.uint32,
+        ),
+    )
+    return {"alpha": alpha, "beta": beta}
+
+
+def test_band_pool_aggregates_across_binaries(tmp_path: Path) -> None:
+    sampler = MultiBinarySortedIndexSampler(_band_two_binary_pool(tmp_path))
+    assert sampler.count_in_band(3, 4) == 12
+    # A band entirely outside both readers' ranges is empty.
+    assert sampler.count_in_band(100, 200) == 0
+
+
+def test_band_sample_only_draws_in_band_indices(tmp_path: Path) -> None:
+    """Every sampled section index must live in a band ``[3, 4]`` bucket.
+
+    The out-of-band lengths (9 on alpha at section index 8, 7 on beta at
+    section index 4) must never appear in the drawn pointers.
+    """
+    readers = _band_two_binary_pool(tmp_path)
+    rng = np.random.default_rng(3)
+    # Draw the whole band pool so every in-band index is forced out.
+    pointers = sample_section_pointers(
+        readers, target_length=999, count=12, rng=rng, band=(3, 4),
+    )
+    assert len(pointers) == 12
+    # alpha's out-of-band section is original index 8; beta's is 4.
+    drawn = {(p.binary_name, p.section_pointer.idx) for p in pointers}
+    assert ("alpha", 8) not in drawn
+    assert ("beta", 4) not in drawn
+    # The full in-band pool (alpha idx 0..7, beta idx 0..3) is exactly
+    # recovered when count >= pool size.
+    expected = {("alpha", i) for i in range(8)} | {
+        ("beta", i) for i in range(4)
+    }
+    assert drawn == expected
+
+
+def test_band_sample_ignores_target_length(tmp_path: Path) -> None:
+    """When a band is given, ``target_length`` is irrelevant.
+
+    The same seeded draw with two wildly different ``target_length``
+    values but the same band must produce identical pointer sets.
+    """
+    readers = _band_two_binary_pool(tmp_path)
+    a = sample_section_pointers(
+        readers, target_length=0, count=5,
+        rng=np.random.default_rng(11), band=(3, 4),
+    )
+    b = sample_section_pointers(
+        readers, target_length=9_999, count=5,
+        rng=np.random.default_rng(11), band=(3, 4),
+    )
+    assert a == b
+
+
+def test_monte_carlo_band_draw_matches_band_pool_share(
+    tmp_path: Path,
+) -> None:
+    """Per-binary band draw frequency must track each binary's band pool.
+
+    Band ``[3, 4]`` pools: alpha=8, beta=4 (total 12); expected per-draw
+    probabilities (2/3, 1/3). 6000 single-draw trials -> expected
+    counts (4000, 2000), checked against the chi-squared df=1 alpha=0.05
+    critical value 3.841.
+    """
+    readers = _band_two_binary_pool(tmp_path)
+    binary_to_idx = {name: i for i, name in enumerate(sorted(readers))}
+    expected_probs = np.array([8.0 / 12.0, 4.0 / 12.0])
+    n_trials = 6000
+    counts = np.zeros(2, dtype=np.int64)
+    rng = np.random.default_rng(2024)
+    for _ in range(n_trials):
+        pointers = sample_section_pointers(
+            readers, target_length=999, count=1, rng=rng, band=(3, 4),
+        )
+        assert len(pointers) == 1
+        counts[binary_to_idx[pointers[0].binary_name]] += 1
+    expected = expected_probs * n_trials
+    chi2 = float(np.sum((counts - expected) ** 2 / expected))
+    assert chi2 < _CHI2_CRIT_DF1_ALPHA_05, (
+        f"band-sampling chi-squared = {chi2:.3f}, "
+        f"expected < {_CHI2_CRIT_DF1_ALPHA_05}; counts={counts.tolist()}, "
+        f"expected={expected.tolist()}"
+    )
