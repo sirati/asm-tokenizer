@@ -132,6 +132,69 @@ class SortedIndexReader:
             return 0
         return int(self._counts[length_idx])
 
+    def count_in_band(self, lo: int, hi: int) -> int:
+        """Total bucket count for all lengths in ``[lo, hi]`` (inclusive).
+
+        Sums the per-length ``_counts`` slice for the overlap of
+        ``[lo, hi]`` with the reader's valid range
+        ``[min_length, max_length]``.  Returns 0 when the band is
+        entirely out of range or the overlap is empty.
+        """
+        lo_idx = max(0, lo - self._min_length)
+        hi_idx = min(self._counts.size - 1, hi - self._min_length)
+        if lo_idx > hi_idx:
+            return 0
+        return int(self._counts[lo_idx : hi_idx + 1].sum())
+
+    def sample_section_indices_in_band(
+        self,
+        lo: int,
+        hi: int,
+        count: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Uniform sample without replacement from all buckets in ``[lo, hi]``.
+
+        Concatenates every section index from every length-bucket in the
+        range ``[lo, hi]`` (intersected with the reader's valid range)
+        into a single pool, then draws ``min(count, pool_size)`` entries
+        uniformly without replacement via ``rng.choice``.
+
+        Returns a fresh ``u32`` ndarray (never a view of the blob).
+        Returns an empty array when the band pool is empty.
+        """
+        lo_idx = max(0, lo - self._min_length)
+        hi_idx = min(self._counts.size - 1, hi - self._min_length)
+        if lo_idx > hi_idx:
+            return np.empty(0, dtype=np.uint32)
+
+        # Collect all section indices from every bucket in the band.
+        parts = []
+        for idx in range(lo_idx, hi_idx + 1):
+            bc = int(self._counts[idx])
+            if bc == 0:
+                continue
+            body_offset = int(self._bucket_body_offsets[idx])
+            bucket = np.frombuffer(
+                self._blob,
+                dtype=np.uint32,
+                count=bc,
+                offset=body_offset,
+            )
+            # Copy so the pool array is independent of the blob.
+            parts.append(bucket.copy())
+
+        if not parts:
+            return np.empty(0, dtype=np.uint32)
+
+        pool = np.concatenate(parts)
+        pool_size = pool.size
+        k = min(count, pool_size)
+        if k == pool_size:
+            return pool
+        chosen = rng.choice(pool_size, size=k, replace=False)
+        return pool[chosen].astype(np.uint32, copy=False)
+
     def sample_section_indices(
         self,
         target_length: int,

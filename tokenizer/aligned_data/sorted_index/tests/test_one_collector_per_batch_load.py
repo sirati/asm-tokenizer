@@ -38,9 +38,7 @@ from tokenizer.aligned_data.sorted_index import (
     compute_reduced_lengths,
     encode_sorted_index,
     open_length_bucketed_batch,
-)
-from tokenizer.aligned_data.sorted_index._length_compute import (
-    _count_variants_per_section,
+    read_section_variant_info,
 )
 
 from .fixtures import build_combined_fixture
@@ -225,8 +223,7 @@ def test_compute_reduced_lengths_uses_one_collector_per_call(
     """
     base = build_combined_fixture(tmp_path)
     dataset = BinaryDataset(base, "sortbin", vocab_manager=None)
-    counts = _count_variants_per_section(base, "sortbin")
-    num_matched = len(counts)
+    section_info = read_section_variant_info(base, "sortbin")
 
     counting = _CountingCollectorFactory()
     with patch(
@@ -240,9 +237,8 @@ def test_compute_reduced_lengths_uses_one_collector_per_call(
         with dataset.open_session() as session:
             compute_reduced_lengths(
                 session,
-                num_sections=num_matched,
-                section_variant_counts=counts,
-                depth=3,
+                section_info=section_info,
+                depths=[3],
                 reductions=[
                     LengthReduction(kind=ReductionKind.MAX),
                     LengthReduction(

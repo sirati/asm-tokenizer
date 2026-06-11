@@ -31,6 +31,8 @@ from typing import List, Optional, Sequence
 from tools.batch_smoke._discovery import discover_binaries, filter_binaries
 
 from ._builder import write_sorted_index_files
+from ._dedup import DEDUP_BY_DATA_POINTER, PLAIN
+from ._gating import VariantGate
 from ._modes import parse_reduction
 from ._types import LengthReduction
 
@@ -72,9 +74,48 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--depth",
+        action="append",
         type=int,
         required=True,
-        help="Splice depth fed to the Stage 1+2 walk.",
+        dest="depth",
+        metavar="DEPTH",
+        help=(
+            "Splice depth (repeatable). One shared Stage 1+2 walk runs "
+            "at max(depths); every shallower depth is recovered as an "
+            "exact prefix, producing one .idx per (mode, depth) pair."
+        ),
+    )
+    parser.add_argument(
+        "--min-variants",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Emit a section only if it has at least N top-level "
+            "variants (duplicates included). 0 (default) disables."
+        ),
+    )
+    parser.add_argument(
+        "--min-variants-unique",
+        type=int,
+        default=0,
+        metavar="M",
+        help=(
+            "Emit a section only if at least M of its top-level "
+            "variants are UNIQUE (distinct data-bin pointer). Composes "
+            "with --min-variants (requires M <= N). 0 (default) "
+            "disables."
+        ),
+    )
+    parser.add_argument(
+        "--adjust-for-duplicates",
+        action="store_true",
+        help=(
+            "Collapse top-level variants sharing a data-bin pointer "
+            "into one item before reduction (PERCENTILE uses the group "
+            "average, MAX the group max). Affects file content only, "
+            "not the filename."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -117,6 +158,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     reductions: List[LengthReduction] = list(args.mode)
+    depths: List[int] = list(args.depth)
+
+    # VariantGate's __post_init__ validates the minimums (M <= N when
+    # both set, non-negative); surface a bad combination as a CLI error.
+    try:
+        gate = VariantGate(
+            min_variants=args.min_variants,
+            min_variants_unique=args.min_variants_unique,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    duplicate_handling = (
+        DEDUP_BY_DATA_POINTER if args.adjust_for_duplicates else PLAIN
+    )
 
     discovered = discover_binaries(args.input_dir)
     selected = filter_binaries(
@@ -130,7 +185,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.input_dir,
             binary_name,
             reductions=reductions,
-            depth=args.depth,
+            depths=depths,
+            gate=gate,
+            duplicate_handling=duplicate_handling,
             output_dir=args.output_dir,
         )
         for path in written.values():

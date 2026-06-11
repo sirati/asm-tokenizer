@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -37,6 +37,7 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
 __all__ = [
     "ReductionKind",
     "LengthReduction",
+    "IndexSpec",
     "MultiBinarySectionPointer",
     "MultiBinaryBatchDecodeResult",
 ]
@@ -118,6 +119,77 @@ class LengthReduction:
         # __post_init__ guarantees percentile is not None for PERCENTILE.
         assert self.percentile is not None
         return int(np.percentile(lengths, self.percentile, method="lower"))
+
+    def _group_representative(self, group: np.ndarray) -> float:
+        """Collapse one duplicate-group to its single representative length.
+
+        The duplicate-aware path (``--adjust-for-duplicates``) treats a
+        set of variants sharing one data-bin pointer as ONE item; this
+        method is the per-kind rule for that item's representative
+        length:
+
+        * :attr:`ReductionKind.MAX` -> the group MAX.
+        * :attr:`ReductionKind.PERCENTILE` -> the group AVERAGE (may be
+          fractional; the final cast to ``int`` happens in
+          :meth:`reduce_groups`).
+
+        A singleton group's representative is its lone value under both
+        rules, so :meth:`reduce_groups` over singleton groups is
+        identical to :meth:`reduce` over the flat vector.
+        """
+        if self.kind is ReductionKind.MAX:
+            return float(group.max())
+        return float(group.mean())
+
+    def reduce_groups(self, groups: Sequence[np.ndarray]) -> int:
+        """Collapse duplicate-grouped per-variant lengths to one int key.
+
+        Each entry in ``groups`` is the length vector of one
+        duplicate-group (variants sharing a data-bin pointer). Every
+        group collapses to a single representative via
+        :meth:`_group_representative`; the representatives are then
+        reduced the same way :meth:`reduce` reduces a flat vector.
+
+        When every group is a singleton (no duplicates), the result is
+        identical to :meth:`reduce` over the concatenated lengths -- so
+        the duplicate-aware path is a strict generalisation of the plain
+        path, not a parallel code branch.
+
+        Empty input (no groups, or every group empty) -> ``0``.
+        """
+        representatives = np.fromiter(
+            (
+                self._group_representative(group)
+                for group in groups
+                if group.size > 0
+            ),
+            dtype=np.float64,
+        )
+        if representatives.size == 0:
+            return 0
+        if self.kind is ReductionKind.MAX:
+            return int(representatives.max())
+        # __post_init__ guarantees percentile is not None for PERCENTILE.
+        assert self.percentile is not None
+        return int(
+            np.percentile(representatives, self.percentile, method="lower")
+        )
+
+
+@dataclass(frozen=True)
+class IndexSpec:
+    """One ``(reduction, depth)`` output identity for the sorted index.
+
+    Replaces the ad-hoc ``(LengthReduction, depth)`` tuple used to key
+    the multi-(mode, depth) compute results + to drive one ``.idx``
+    filename per pair. ``reduction`` is the per-section length
+    aggregator; ``depth`` is the splice depth encoded in the filename's
+    ``_d<NNN>`` tag. Hashable + frozen so it can key the result dict and
+    round-trip through :func:`._builder.write_sorted_index_files`.
+    """
+
+    reduction: LengthReduction
+    depth: int
 
 
 @dataclass(frozen=True)

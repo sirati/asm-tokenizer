@@ -18,6 +18,8 @@ import re
 from pathlib import Path
 from typing import List
 
+import pytest
+
 from tokenizer.aligned_data.sorted_index.__main__ import main as cli_main
 
 from .fixtures import (
@@ -212,3 +214,97 @@ def test_cli_announces_files_on_stdout(
         str(base / f"{_BINARY_NAME}_sorted_p95_d003.idx"),
     }
     assert set(captured) == expected
+
+
+# ---------------------------------------------------------------------------
+# Multi-depth + gating + dedup CLI flags
+# ---------------------------------------------------------------------------
+
+
+def test_cli_multiple_depths_produce_one_file_per_pair(tmp_path: Path) -> None:
+    """K --mode x M --depth flags produce K*M .idx files in one invocation."""
+    base = build_combined_fixture(tmp_path)
+    rc = cli_main([
+        "--input-dir", str(base),
+        "--mode", "max",
+        "--mode", "p95",
+        "--depth", "1",
+        "--depth", "3",
+    ])
+    assert rc == 0
+    written = {p.name for p in base.glob("*_sorted_*.idx")}
+    assert written == {
+        f"{_BINARY_NAME}_sorted_max_d001.idx",
+        f"{_BINARY_NAME}_sorted_max_d003.idx",
+        f"{_BINARY_NAME}_sorted_p95_d001.idx",
+        f"{_BINARY_NAME}_sorted_p95_d003.idx",
+    }
+
+
+def test_cli_min_variants_shrinks_index(tmp_path: Path) -> None:
+    """``--min-variants`` excludes failing sections (length-0 bucket).
+
+    The combined fixture has sections with variant counts {0,1,4,1,2}.
+    With ``--min-variants 2`` only the 4- and 2-variant sections keep a
+    real (>0) length; the others fall into the length-0 bucket. The
+    bucket at length 0 therefore grows relative to the ungated build.
+    """
+    from tokenizer.aligned_data.sorted_index import (
+        LengthReduction,
+        ReductionKind,
+        SortedIndexReader,
+    )
+
+    base = build_combined_fixture(tmp_path)
+    ungated_dir = tmp_path / "ungated"
+    gated_dir = tmp_path / "gated"
+    common = ["--input-dir", str(base), "--mode", "max", "--depth", "3"]
+    assert cli_main([*common, "--output-dir", str(ungated_dir)]) == 0
+    assert cli_main(
+        [*common, "--output-dir", str(gated_dir), "--min-variants", "2"]
+    ) == 0
+
+    red = LengthReduction(kind=ReductionKind.MAX)
+    fname = f"{_BINARY_NAME}_sorted_max_d003.idx"
+    ungated = SortedIndexReader(ungated_dir / fname, reduction=red, depth=3)
+    gated = SortedIndexReader(gated_dir / fname, reduction=red, depth=3)
+    # Both index all 5 sections; the gate moves the 3 failing ones into
+    # the length-0 bucket (func_zero already there, solo_a + caller_fn
+    # join it).
+    assert ungated.total_sections() == 5
+    assert gated.total_sections() == 5
+    assert gated.count_at(0) == 3
+    assert ungated.count_at(0) == 1
+
+
+def test_cli_adjust_for_duplicates_smoke(tmp_path: Path) -> None:
+    """``--adjust-for-duplicates`` runs end-to-end and writes a valid index."""
+    base = build_combined_fixture(tmp_path)
+    rc = cli_main([
+        "--input-dir", str(base),
+        "--mode", "p50",
+        "--depth", "3",
+        "--adjust-for-duplicates",
+    ])
+    assert rc == 0
+    assert (base / f"{_BINARY_NAME}_sorted_p50_d003.idx").is_file()
+
+
+def test_cli_min_unique_greater_than_min_variants_errors(
+    tmp_path: Path,
+) -> None:
+    """``--min-variants-unique`` > ``--min-variants`` is a CLI error.
+
+    :func:`argparse.ArgumentParser.error` exits with code 2; the
+    unsatisfiable-gate message originates from :class:`VariantGate`.
+    """
+    base = build_combined_fixture(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli_main([
+            "--input-dir", str(base),
+            "--mode", "max",
+            "--depth", "3",
+            "--min-variants", "4",
+            "--min-variants-unique", "6",
+        ])
+    assert exc.value.code == 2
