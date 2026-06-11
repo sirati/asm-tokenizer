@@ -39,6 +39,7 @@ from tokenizer.disasm.types import (
     BlocksView,
     CrxFieldView,
     FpType,
+    InsnDebugLabel,
     InstructionsView,
     InstructionView,
     MemoryOperandView,
@@ -551,6 +552,20 @@ class _AngrInstructionView:
     @property
     def op_str(self) -> str:
         return str(self._cs_insn.op_str) if self._cs_insn is not None else ""
+
+    def debug_label(self) -> InsnDebugLabel:
+        """Stash-safe diagnostic label (see ``types.InsnDebugLabel``).
+
+        Capstone's ``op_str`` is a plain attribute read (no expensive
+        backend rendering), so the angr provider captures the operand
+        text eagerly regardless of debug mode — the label's text is
+        always the full ``"<mnemonic> <op_str>"`` on this backend.
+        """
+        return InsnDebugLabel(
+            self.mnemonic,
+            len(self._operands),
+            op_str=self.op_str,
+        )
 
     @property
     def operands(self) -> OperandsView:

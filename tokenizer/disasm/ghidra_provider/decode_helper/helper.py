@@ -12,9 +12,10 @@ exposes are delegated to focused submodules:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from tokenizer.disasm.ghidra_provider.decode_helper.decompose_callbacks import (
+    is_sleigh_split_disp_base_pair,
     synthesize_disp_base_mem_spec,
 )
 from tokenizer.disasm.ghidra_provider.decode_helper.operand_classify import (
@@ -26,16 +27,17 @@ from tokenizer.disasm.ghidra_provider.mnemonic import (
     _split_ghidra_mnemonic,
     _strip_arm_cc_suffix,
 )
-from tokenizer.disasm.ghidra_provider.pcode_inspect import has_load_store
+from tokenizer.disasm.ghidra_provider.pcode_inspect import (
+    InstructionPcodeSummary,
+    collect_instruction_pcode_summary,
+)
 from tokenizer.disasm.ghidra_provider.prefix_build import (
-    _compute_fp_type,
     _ghidra_processor_to_architecture,
     _prefix_builder_for_arch,
 )
 from tokenizer.disasm.types import (
     Architecture,
     ArmConditionCode,
-    FpType,
 )
 
 
@@ -55,9 +57,10 @@ class _GhidraDecodeHelper:
     The helper centralizes:
       - mnemonic split + alias canonicalization
       - architecture detection (cached per program)
-      - per-instruction has-LOAD/STORE PCode signal (computed once,
-        cached at the cursor level via ``InstructionView.has_load_store``)
-      - per-operand FP-type computation
+      - per-instruction one-pass PCode summary (``pcode_summary``:
+        LOAD/STORE presence + FLOAT_* signature + mem-access size,
+        computed once per cursor advance and threaded into every
+        ``operand_spec`` call)
       - per-instruction typed-prefix list build
       - per-operand decompose-mem callback construction (lazy: returns a
         zero-arg callable that, when invoked, populates a passed
@@ -66,16 +69,31 @@ class _GhidraDecodeHelper:
         ``_GhidraOperandView._advance``)
     """
 
-    __slots__ = ("_program", "_reg_map", "_arch")
+    __slots__ = ("_program", "_reg_map", "_arch", "_debug_render")
 
-    def __init__(self, program: Any, reg_map: "_RegisterMap") -> None:
+    def __init__(
+        self, program: Any, reg_map: "_RegisterMap", debug_render: bool = False
+    ) -> None:
         self._program = program
         self._reg_map = reg_map
         self._arch: Architecture = _ghidra_processor_to_architecture(program)
+        self._debug_render = debug_render
 
     @property
     def arch(self) -> Architecture:
         return self._arch
+
+    @property
+    def debug_render(self) -> bool:
+        """Run-scoped debug-rendering mode (``--debug`` CLI runs).
+
+        When False (production), the instruction views withhold the
+        per-instruction operand-text rendering entirely: ``debug_label``
+        hands out non-rendering labels and the per-operand
+        ``getDefaultOperandRepresentation`` JVM round-trips never run on
+        the decode path.
+        """
+        return self._debug_render
 
     def split_mnemonic(self, raw: str) -> tuple[str, str | None, int | None]:
         return _split_ghidra_mnemonic(raw)
@@ -87,14 +105,16 @@ class _GhidraDecodeHelper:
         """Strip the Ghidra ARM/AArch64 cc-suffix from ``mnemonic``."""
         return _strip_arm_cc_suffix(mnemonic)
 
-    def has_load_store(self, ghidra_insn: Any) -> bool:
-        """Return ``True`` when the instruction's PCode contains a LOAD or
-        STORE op. Cached at the ``_GhidraInstructionView`` cursor level
-        (``InstructionView.has_load_store``); the per-instruction signal
-        feeds both the operand-classifier inside ``operand_spec`` and
-        the downstream resolved-target keep/drop policy.
+    def pcode_summary(self, ghidra_insn: Any) -> InstructionPcodeSummary:
+        """Walk the instruction's PCode ONCE and return the bundled
+        instruction-level signals (LOAD/STORE presence, FLOAT_*
+        signature, mem-access size). Computed once per cursor advance
+        by ``_GhidraInstructionView._advance`` and threaded into every
+        ``operand_spec`` call; ``summary.has_load_store`` also feeds
+        ``InstructionView.has_load_store`` for the downstream
+        resolved-target keep/drop policy.
         """
-        return has_load_store(ghidra_insn)
+        return collect_instruction_pcode_summary(ghidra_insn)
 
     def alias_mnemonic(self, base: str) -> str:
         # Ghidra's MIPS SLEIGH spec emits `_sra` / `_li` / ... for the
@@ -110,17 +130,20 @@ class _GhidraDecodeHelper:
     def architecture(self, _program: Any) -> Architecture:
         return self._arch
 
-    def compute_fp_type(
-        self,
-        ghidra_insn: Any,
-        operand_index: int,
-        arch: Architecture,
-        base_mnemonic: str,
-    ) -> Optional[FpType]:
-        return _compute_fp_type(ghidra_insn, operand_index, arch, base_mnemonic)
-
     def build_prefixes(self, ghidra_insn: Any, arch: Architecture) -> list[Any]:
         return _prefix_builder_for_arch(arch)(ghidra_insn)
+
+    def is_sleigh_split_disp_base_pair(
+        self,
+        disp_spec: dict,
+        base_spec: dict,
+    ) -> bool:
+        """True iff two ADJACENT operand specs are the SLEIGH-split
+        disp(base) pair ``synthesize_disp_base_mem_spec`` fuses. Keeps
+        the ``OperandType`` bitmask knowledge behind the decode facade
+        so the instruction cursor's merge loop stays JVM-class-free.
+        """
+        return is_sleigh_split_disp_base_pair(disp_spec, base_spec)
 
     def synthesize_disp_base_mem_spec(
         self,
@@ -144,7 +167,7 @@ class _GhidraDecodeHelper:
         base_mnemonic: str,
         reg_map: "_RegisterMap",
         *,
-        instruction_has_mem_access: bool,
+        pcode_summary: InstructionPcodeSummary,
     ) -> dict:
         """Return a kwargs dict for ``_GhidraOperandView._advance``.
 
@@ -160,5 +183,5 @@ class _GhidraDecodeHelper:
             arch,
             base_mnemonic,
             reg_map,
-            instruction_has_mem_access=instruction_has_mem_access,
+            pcode_summary=pcode_summary,
         )

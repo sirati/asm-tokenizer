@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from tokenizer.disasm.ghidra_provider import jvm_types
 from tokenizer.disasm.ghidra_provider.mnemonic import _SEGMENT_REGISTERS, _RegisterMap
 from tokenizer.disasm.ghidra_provider.pcode_inspect import (
     classify_memory_addressing,
@@ -150,7 +151,7 @@ def _inspect_arm_index_shift(
     Returns ``(kind, amount)``; ``(ShiftKind.NONE, 0)`` when no shift
     modifier is present.
     """
-    from ghidra.program.model.lang import Register
+    Register = jvm_types.Register
 
     try:
         objects = ghidra_insn.getOpObjects(op_idx)
@@ -183,7 +184,7 @@ def _inspect_arm_mem_addressing(
     The base register is the FIRST Register in ``getOpObjects(op_idx)``
     per the Ghidra SLEIGH operand convention.
     """
-    from ghidra.program.model.lang import Register
+    Register = jvm_types.Register
 
     try:
         objects = ghidra_insn.getOpObjects(op_idx)
@@ -194,44 +195,6 @@ def _inspect_arm_mem_addressing(
         return (False, False, False)
     base_reg = regs[0]
     return classify_memory_addressing(ghidra_insn, base_reg)
-
-
-def _infer_mem_access_size(ghidra_insn: Any, op_idx: int, default: int = 8) -> int:
-    """Return the memory-access size in bytes for operand ``op_idx``.
-
-    Reads SLEIGH-emitted PCode ``LOAD`` output-varnode size and ``STORE``
-    value-input size. This is the only reliable oracle - sibling-
-    register width conflates address-computation regs (pointer-width,
-    e.g. r14 = 8B on x64) with value regs (actual memory-access width),
-    breaking 0x66 operand-size-override (``or word ptr [r14+...], ax``
-    seen as qword) and MOVZX/MOVSX byte/word -> wider destination.
-
-    ``op_idx`` is currently unused (x86 mem-operand instructions have
-    exactly one LOAD/STORE per operand), but kept in the signature to
-    future-proof against multi-mem-operand instructions (string ops)
-    where the access size could differ per operand.
-    """
-    from ghidra.program.model.pcode import PcodeOp
-
-    sizes: set[int] = set()
-    for pop in ghidra_insn.getPcode():
-        opcode = pop.getOpcode()
-        if opcode == PcodeOp.LOAD:
-            out = pop.getOutput()
-            if out is not None:
-                sizes.add(int(out.getSize()))
-        elif opcode == PcodeOp.STORE:
-            inputs = pop.getInputs()
-            # STORE: (space_id_const, addr_varnode, value_varnode)
-            if len(inputs) >= 3:
-                sizes.add(int(inputs[2].getSize()))
-    nonzero = {s for s in sizes if s > 0}
-    if not nonzero:
-        return default
-    # x86 mem-operand instructions have exactly one LOAD/STORE per
-    # operand. When multiple distinct sizes appear (rare; string ops),
-    # the value-side width is the smallest non-zero.
-    return min(nonzero)
 
 
 def _compute_x86_memory_components(
@@ -260,9 +223,9 @@ def _compute_x86_memory_components(
     carries 3 Registers in ``getOpObjects()`` (e.g.
     ``NOP word ptr CS:[RAX + RAX*0x1]``).
     """
-    from ghidra.program.model.address import Address
-    from ghidra.program.model.lang import Register
-    from ghidra.program.model.scalar import Scalar
+    Address = jvm_types.Address
+    Register = jvm_types.Register
+    Scalar = jvm_types.Scalar
 
     objects = ghidra_insn.getOpObjects(op_idx)
 
@@ -348,9 +311,9 @@ def _compute_arm_memory_components(
     family); the assert at the end of the object-walk enforces that
     invariant.
     """
-    from ghidra.program.model.address import Address
-    from ghidra.program.model.lang import Register
-    from ghidra.program.model.scalar import Scalar
+    Address = jvm_types.Address
+    Register = jvm_types.Register
+    Scalar = jvm_types.Scalar
 
     objects = ghidra_insn.getOpObjects(op_idx)
 
@@ -431,9 +394,9 @@ def _compute_base_disp_memory_components(
     most 1 Register; the assert below enforces the invariant (and would
     catch a Ghidra SLEIGH-spec quirk on a future ISA addition).
     """
-    from ghidra.program.model.address import Address
-    from ghidra.program.model.lang import Register
-    from ghidra.program.model.scalar import Scalar
+    Address = jvm_types.Address
+    Register = jvm_types.Register
+    Scalar = jvm_types.Scalar
 
     objects = ghidra_insn.getOpObjects(op_idx)
 

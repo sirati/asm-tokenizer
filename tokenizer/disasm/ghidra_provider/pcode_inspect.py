@@ -22,9 +22,11 @@ Design notes:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from tokenizer.disasm.types import Architecture, ShiftKind
+from tokenizer.disasm.ghidra_provider import jvm_types
 
 
 # Per-ISA bracket-open characters. The presence of this rich-typed
@@ -69,7 +71,7 @@ def operand_is_bracketed(ghidra_insn: Any, op_idx: int, arch: Architecture) -> b
         repr_list = ghidra_insn.getDefaultOperandRepresentationList(op_idx) or ()
     except Exception:
         return False
-    from java.lang import Character as JavaCharacter
+    JavaCharacter = jvm_types.JavaCharacter
 
     for item in repr_list:
         if isinstance(item, JavaCharacter):
@@ -90,7 +92,7 @@ def _ensure_shift_table() -> dict[int, ShiftKind]:
     global _PCODE_SHIFT_OPCODE_TO_KIND
     if _PCODE_SHIFT_OPCODE_TO_KIND:
         return _PCODE_SHIFT_OPCODE_TO_KIND
-    from ghidra.program.model.pcode import PcodeOp
+    PcodeOp = jvm_types.PcodeOp
 
     _PCODE_SHIFT_OPCODE_TO_KIND = {
         int(PcodeOp.INT_LEFT): ShiftKind.LSL,
@@ -178,7 +180,7 @@ def register_is_addressing_mode_written(
         pcode_ops = list(ghidra_insn.getPcode() or ())
     except Exception:
         return False
-    from ghidra.program.model.pcode import PcodeOp
+    PcodeOp = jvm_types.PcodeOp
 
     propagated: set[tuple[str, int, int]] = {register_key}
     for _ in range(max_iter):
@@ -209,25 +211,205 @@ def register_is_addressing_mode_written(
     return False
 
 
-def has_load_store(ghidra_insn: Any) -> bool:
-    """True iff the instruction's PCode contains any LOAD or STORE op.
+# ---------------------------------------------------------------------------
+# FLOAT_* p-code opcode classification
+# ---------------------------------------------------------------------------
+# The set of FP-semantic p-code opcodes (resolved to integer opcode values
+# on first use via ``_resolve_float_pcode_sets``), partitioned by which
+# side of the op carries integer-typed data:
+#
+#   - ``_FLOAT_PCODE_OPCODES``: every FLOAT_* opcode (the master scan set).
+#   - ``_FLOAT_PCODE_INT_INPUT_OPCODES``: opcodes whose input varnode is
+#     integer-typed (``FLOAT_INT2FLOAT``: integer source -> FP destination).
+#     The output is still FP.
+#   - ``_FLOAT_PCODE_INT_OUTPUT_OPCODES``: opcodes whose output varnode is
+#     integer-typed (``FLOAT_TRUNC`` truncate-to-int; the boolean
+#     comparison opcodes ``FLOAT_EQUAL`` / ``FLOAT_NOTEQUAL`` /
+#     ``FLOAT_LESS`` / ``FLOAT_LESSEQUAL`` / ``FLOAT_NAN`` produce a
+#     1-byte bool). The inputs are still FP.
+#
+# Binding to integer opcode values (rather than ``PcodeOp.getMnemonic``
+# strings) is mandatory: Ghidra's mnemonic strings drop the ``FLOAT_``
+# prefix for several conversion/rounding opcodes (``INT2FLOAT``,
+# ``FLOAT2FLOAT``, ``TRUNC``, ``CEIL``, ``FLOOR``, ``ROUND``) even though
+# the class constants are named ``FLOAT_INT2FLOAT`` / ``FLOAT_FLOAT2FLOAT``
+# / ``FLOAT_TRUNC`` / etc. The class constants are the only stable handle.
+_FLOAT_PCODE_OPCODES: frozenset[int] = frozenset()
+_FLOAT_PCODE_INT_INPUT_OPCODES: frozenset[int] = frozenset()
+_FLOAT_PCODE_INT_OUTPUT_OPCODES: frozenset[int] = frozenset()
 
-    Used to gate ARM/AArch64 is-memory classification: ARM shifted-register
-    operands (``r1, lsl #2`` in arithmetic instructions like ``add``/``sbc``)
-    have the same ``OperandType.DYNAMIC`` bit as memory operands but produce
-    NO LOAD/STORE in PCode. The instruction-level presence of LOAD/STORE
-    is the rich-IR discriminator.
+
+def _resolve_float_pcode_sets() -> tuple[frozenset[int], frozenset[int], frozenset[int]]:
+    """Resolve the FLOAT_* PcodeOp class-constant names to integer opcode
+    values; cache on the module globals so the lookup runs once.
+
+    Lazy because importing ``ghidra.program.model.pcode`` at module load
+    would require Ghidra to be started -- the import here happens on
+    first use, mirroring ``_ensure_shift_table``'s lazy initialisation
+    pattern in this module.
     """
-    from ghidra.program.model.pcode import PcodeOp
+    global _FLOAT_PCODE_OPCODES, _FLOAT_PCODE_INT_INPUT_OPCODES, _FLOAT_PCODE_INT_OUTPUT_OPCODES
+    if _FLOAT_PCODE_OPCODES:
+        return (
+            _FLOAT_PCODE_OPCODES,
+            _FLOAT_PCODE_INT_INPUT_OPCODES,
+            _FLOAT_PCODE_INT_OUTPUT_OPCODES,
+        )
+    PcodeOp = jvm_types.PcodeOp
 
-    try:
-        for pop in ghidra_insn.getPcode():
-            opc = pop.getOpcode()
-            if opc == PcodeOp.LOAD or opc == PcodeOp.STORE:
-                return True
-    except Exception:
-        return False
-    return False
+    # Master FLOAT_* set: enumerate the class-constant names directly so
+    # adding a new FLOAT_* opcode upstream (e.g. FLOAT_HALF support)
+    # would surface here without code changes if the constant follows
+    # the FLOAT_ prefix convention.
+    master = frozenset(
+        getattr(PcodeOp, name)
+        for name in dir(PcodeOp)
+        if name.startswith("FLOAT_") and isinstance(getattr(PcodeOp, name, None), int)
+    )
+    int_input = frozenset({PcodeOp.FLOAT_INT2FLOAT})
+    int_output = frozenset({
+        PcodeOp.FLOAT_TRUNC,
+        PcodeOp.FLOAT_EQUAL,
+        PcodeOp.FLOAT_NOTEQUAL,
+        PcodeOp.FLOAT_LESS,
+        PcodeOp.FLOAT_LESSEQUAL,
+        PcodeOp.FLOAT_NAN,
+    })
+    _FLOAT_PCODE_OPCODES = master
+    _FLOAT_PCODE_INT_INPUT_OPCODES = int_input
+    _FLOAT_PCODE_INT_OUTPUT_OPCODES = int_output
+    return master, int_input, int_output
+
+
+# ---------------------------------------------------------------------------
+# Per-instruction one-pass PCode summary
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class InstructionPcodeSummary:
+    """Instruction-level signals extracted from ONE walk of ``getPcode()``.
+
+    Computed once per instruction by the cursor's ``_advance`` (via the
+    decode helper) and threaded into every per-operand classification
+    call. Replaces the legacy per-operand re-walks: ``has_load_store``,
+    the FLOAT_* signature scan (``fp_keys`` / ``fp_width``), the
+    LOAD/STORE-routed FP attribution scan (``fp_touches_load_store``)
+    and the MEM-access-size scan (``mem_access_size``) each used to
+    re-iterate the instruction's PCode independently — on a JPype
+    backend every op/varnode accessor is a JVM round-trip, so the
+    per-operand multiplication dominated the decode hot path.
+
+    Fields:
+
+    - ``has_load_store``: the instruction's PCode contains a LOAD or
+      STORE op. Gates ARM/AArch64 is-memory classification (ARM
+      shifted-register operands carry ``OperandType.DYNAMIC`` like
+      memory operands but emit no LOAD/STORE) and feeds the downstream
+      resolved-target keep/drop policy via
+      ``InstructionView.has_load_store``.
+    - ``fp_keys``: set of ``(address_string, size)`` tuples covered by
+      FP-typed sides of every ``FLOAT_*`` p-code op (skipping the
+      int-input side of ``FLOAT_INT2FLOAT`` and the int-output side of
+      ``FLOAT_TRUNC`` / comparison opcodes). The stringified address
+      key avoids relying on ``Address`` hashability across pyghidra;
+      the pair uniquely identifies the register slice or temp the
+      FLOAT_* op touches. Empty when no FLOAT_* opcode fires.
+    - ``fp_width``: smallest nonzero size among the FP-typed varnodes
+      (0 if none) — the operand FP width oracle.
+    - ``fp_touches_load_store``: any LOAD output varnode or STORE
+      value-input varnode participates in ``fp_keys``. Captures
+      register-indirect FP loads (``addsd xmm0, qword ptr [rax]``)
+      where SLEIGH emits a separate LOAD feeding the FLOAT_* op. The
+      signal is instruction-level (not per-operand) by design: x86
+      instructions with FP semantics have at most one memory operand;
+      multi-MEM instructions (string ops) do not emit FLOAT_* p-code.
+    - ``mem_access_size``: memory-access size in bytes, derived from
+      SLEIGH-emitted PCode LOAD output-varnode size / STORE value-input
+      size (smallest nonzero; ``default_mem_size`` when none). This is
+      the only reliable oracle — the legacy sibling-register-width
+      heuristic conflated pointer-width address-computation regs (e.g.
+      x64 r14 = 8B) with value regs, breaking 0x66 operand-size-override
+      and MOVZX/MOVSX byte/word -> wider dest. The value is keyed per
+      instruction, not per operand: x86 mem-operand instructions have
+      exactly one LOAD/STORE per operand. ARM / MIPS / PPC / RISC-V
+      consumers do not read ``op.size`` on MEM operands so the value is
+      harmless on non-x86 ISAs.
+    """
+
+    has_load_store: bool
+    fp_keys: set
+    fp_width: int
+    fp_touches_load_store: bool
+    mem_access_size: int
+
+
+def collect_instruction_pcode_summary(
+    ghidra_insn: Any, default_mem_size: int = 8
+) -> InstructionPcodeSummary:
+    """Walk ``insn.getPcode()`` ONCE and extract every instruction-level
+    signal the per-operand classifiers consume (see
+    :class:`InstructionPcodeSummary`).
+
+    Faithfully merges the legacy ``has_load_store`` scan, the
+    ``_collect_fp_pcode_signature`` scan, the LOAD/STORE-routed half of
+    ``_operand_touches_fp_pcode`` and the ``_infer_mem_access_size``
+    scan into a single pass: per p-code op the opcode is read once;
+    inputs/outputs are only touched for FLOAT_* / LOAD / STORE ops
+    (exactly the ops the legacy scans touched them for).
+    """
+    PcodeOp = jvm_types.PcodeOp
+
+    float_ops, int_input_ops, int_output_ops = _resolve_float_pcode_sets()
+    load_op = PcodeOp.LOAD
+    store_op = PcodeOp.STORE
+
+    has_load_store = False
+    fp_keys: set = set()
+    fp_sizes: set[int] = set()
+    # LOAD output / STORE value-input varnode keys: feed both the FP
+    # LOAD/STORE attribution (key-set intersection with ``fp_keys``) and
+    # the mem-access-size derivation (their sizes).
+    load_store_value_keys: set = set()
+
+    for pop in ghidra_insn.getPcode():
+        opcode = pop.getOpcode()
+        if opcode == load_op:
+            has_load_store = True
+            out = pop.getOutput()
+            if out is not None:
+                load_store_value_keys.add((str(out.getAddress()), int(out.getSize())))
+        elif opcode == store_op:
+            has_load_store = True
+            inputs = pop.getInputs()
+            # STORE = (space_id_const, addr_varnode, value_varnode)
+            if len(inputs) >= 3:
+                v = inputs[2]
+                load_store_value_keys.add((str(v.getAddress()), int(v.getSize())))
+        elif opcode in float_ops:
+            # FP-typed sides per the int-input/int-output classification.
+            int_input = opcode in int_input_ops
+            int_output = opcode in int_output_ops
+            if not int_input:
+                for v in pop.getInputs():
+                    size = int(v.getSize())
+                    if size <= 0:
+                        continue
+                    fp_keys.add((str(v.getAddress()), size))
+                    fp_sizes.add(size)
+            out = pop.getOutput()
+            if out is not None and not int_output:
+                size = int(out.getSize())
+                if size > 0:
+                    fp_keys.add((str(out.getAddress()), size))
+                    fp_sizes.add(size)
+
+    nonzero_mem_sizes = {s for (_addr, s) in load_store_value_keys if s > 0}
+    return InstructionPcodeSummary(
+        has_load_store=has_load_store,
+        fp_keys=fp_keys,
+        fp_width=min(fp_sizes) if fp_sizes else 0,
+        fp_touches_load_store=not fp_keys.isdisjoint(load_store_value_keys),
+        mem_access_size=min(nonzero_mem_sizes) if nonzero_mem_sizes else default_mem_size,
+    )
 
 
 def find_shift_on_register(
@@ -264,7 +446,7 @@ def find_shift_on_register(
     # Step 1: reflexive transitive closure over COPYs starting from register.
     # `propagated` is the set of varnode-keys that semantically carry the
     # register's value.
-    from ghidra.program.model.pcode import PcodeOp
+    PcodeOp = jvm_types.PcodeOp
 
     propagated: set[tuple[str, int, int]] = set()
     if register_key is not None:
@@ -378,7 +560,7 @@ def classify_memory_addressing(
     if not register_is_addressing_mode_written(ghidra_insn, base_register):
         return (False, False, False)
 
-    from ghidra.program.model.pcode import PcodeOp
+    PcodeOp = jvm_types.PcodeOp
 
     pcode_ops = list(ghidra_insn.getPcode() or ())
 

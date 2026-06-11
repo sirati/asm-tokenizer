@@ -38,7 +38,7 @@ saving the reference does NOT preserve a snapshot of the data.
 
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import Hashable, Iterator, Optional, Protocol, runtime_checkable
+from typing import Callable, Hashable, Iterator, Optional, Protocol, runtime_checkable
 
 
 # ---- ENUMS ----
@@ -390,6 +390,61 @@ class PrefixesView(Protocol):
     def __getitem__(self, idx: int) -> InstructionPrefixView: ...
 
 
+# ---- INSTRUCTION DEBUG LABEL ----
+class InsnDebugLabel:
+    """Stash-safe, lazily-rendered ``"<mnemonic> <op_str>"`` debug label.
+
+    The per-instruction label stored alongside token rows
+    (``BlockTokenList.insn_strs``) is purely diagnostic: it feeds
+    ``to_asm_original()`` debug renders, log warnings, and the
+    function-filter padding gate. Rendering the operand text eagerly per
+    instruction is the wrong cost model on backends where the rendering
+    is expensive (Ghidra: ``getDefaultOperandRepresentation`` is a JVM
+    round-trip per operand), so providers hand out THIS value object
+    instead of a pre-rendered string:
+
+    - ``mnemonic`` / ``operand_count`` are typed fields captured eagerly
+      from already-computed cursor state (zero extra provider calls).
+      Consumers that only need typed discrimination (the padding gate)
+      read these and never trigger a render.
+    - ``str(label)`` produces the full ``"<mnemonic> <op_str>"`` text.
+      The operand text comes from ``op_str`` when the provider captured
+      it eagerly (cheap backends / debug mode), else from the
+      ``render_op_str`` thunk on first access (cached), else renders as
+      ``"<mnemonic> "`` when the provider withheld rendering entirely
+      (production mode: per-instruction debug rendering disabled).
+
+    Unlike the cursor views, the label is STASH-SAFE: it captures only
+    immutable values plus (optionally) a thunk bound to the provider's
+    stable per-instruction handle, so it stays valid after the cursor
+    advances.
+    """
+
+    __slots__ = ("mnemonic", "operand_count", "_render_op_str", "_op_str")
+
+    def __init__(
+        self,
+        mnemonic: str,
+        operand_count: int,
+        op_str: Optional[str] = None,
+        render_op_str: Optional[Callable[[], str]] = None,
+    ) -> None:
+        self.mnemonic = mnemonic
+        self.operand_count = operand_count
+        self._op_str = op_str
+        self._render_op_str = render_op_str
+
+    def __str__(self) -> str:
+        op_str = self._op_str
+        if op_str is None:
+            op_str = self._render_op_str() if self._render_op_str is not None else ""
+            self._op_str = op_str
+        return f"{self.mnemonic} {op_str}"
+
+    def __repr__(self) -> str:
+        return f"InsnDebugLabel({str(self)!r})"
+
+
 # ---- INSTRUCTION ----
 @runtime_checkable
 class InstructionView(Protocol):
@@ -425,6 +480,15 @@ class InstructionView(Protocol):
     # confidence kinds (RO_DATA_PTR / UNKNOWN / etc.) trust the
     # resolved_target only when the instruction is a real LOAD/STORE OR
     # the mnemonic matches a per-ISA pair-terminal allow-list entry.
+
+    def debug_label(self) -> InsnDebugLabel: ...
+    # Stash-safe diagnostic label for this instruction (see
+    # ``InsnDebugLabel``). Unlike ``op_str`` (a cursor property that may
+    # lazily render through the provider), the label is safe to store
+    # across cursor advances. Providers whose operand rendering is
+    # expensive (Ghidra) withhold the rendering entirely unless
+    # constructed in debug-render mode; the typed ``mnemonic`` /
+    # ``operand_count`` fields are always populated.
 
     def __deepcopy__(self, memo) -> "InstructionView": ...
 

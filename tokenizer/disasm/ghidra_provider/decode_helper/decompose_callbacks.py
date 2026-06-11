@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from tokenizer.disasm.ghidra_provider import jvm_types
 from tokenizer.disasm.ghidra_provider.mem_decompose import (
     _compute_arm_memory_components,
     _compute_base_disp_memory_components,
@@ -28,6 +29,7 @@ from tokenizer.disasm.ghidra_provider.pcode_inspect import (
 from tokenizer.disasm.types import (
     Architecture,
     OperandKind,
+    ShiftKind as _ShiftKind,
 )
 
 if TYPE_CHECKING:
@@ -108,7 +110,7 @@ def decompose_reg_list_callback(
     ``cs_insn.writeback`` flag. No string parsing of the rendered
     representation list required.
     """
-    from ghidra.program.model.lang import Register
+    Register = jvm_types.Register
 
     def _populate(reg_list_view) -> None:
         try:
@@ -146,6 +148,31 @@ def decompose_reg_list_callback(
         )
 
     return _populate
+
+
+def is_sleigh_split_disp_base_pair(disp_spec: dict, base_spec: dict) -> bool:
+    """True iff two ADJACENT operand specs are a SLEIGH-split
+    disp(base) memory-operand pair: a DYNAMIC-typed IMM (the disp
+    scalar) immediately followed by a REG (the base register).
+
+    This is the pair-detection predicate for
+    ``synthesize_disp_base_mem_spec`` (RISC-V compressed-instruction
+    encodings like ``c.sdsp ra, 0x8(sp)``, which Ghidra's SLEIGH spec
+    reports as adjacent flat operands instead of one composite memory
+    operand). Adjacency is the CALLER's responsibility — the cursor's
+    merge loop only asks about ``raw_specs[i]`` / ``raw_specs[i+1]``.
+
+    Owning the predicate here (next to the fusion builder, behind the
+    decode-helper facade) keeps the ``OperandType`` bitmask knowledge
+    out of the view layer: the instruction cursor performs the list
+    reshaping but never touches a JVM class.
+    """
+    OperandType = jvm_types.OperandType
+    return (
+        disp_spec["kind"] == OperandKind.IMM
+        and bool(int(disp_spec["type_int"]) & OperandType.DYNAMIC)
+        and base_spec["kind"] == OperandKind.REG
+    )
 
 
 def synthesize_disp_base_mem_spec(
@@ -193,8 +220,6 @@ def synthesize_disp_base_mem_spec(
     # Mirror the default spec shape from ``operand_spec`` so the
     # consumer's ``_GhidraOperandView._advance(**spec)`` accepts
     # every kwarg without surprise.
-    from tokenizer.disasm.types import ShiftKind as _ShiftKind
-
     spec = dict(
         kind=OperandKind.MEM,
         reg_name="",
