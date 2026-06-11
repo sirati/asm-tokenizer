@@ -4,20 +4,17 @@ Recipe for running `dynrunner.tokenize` (and `dynrunner.build_memmap`) end-to-en
 
 The intended audience is a fresh subagent or a future-you returning to this after a few weeks. **Follow the commands verbatim.** Do not re-explore the codebase to "figure out" the dispatch flags; this document is the source of truth, and if it disagrees with the framework that's a bug to file (see "When the runbook is wrong" at the end).
 
-## `dynamic_runner` pin: `835f269c` (9ea95143 lineage + 2026-06-05 SLURM-lifecycle fixes)
+## Framework pin + watch protocol
 
-> `flake.lock` pins `dynamic-runner` at **`835f269c`**. Lineage: `9ea95143 → 6374a2c9 → 347c3b83 → 86e43e6f → 47f4b386 → 835f269c`. The recipe below reflects it.
+> `flake.lock` pins the `dynamic-runner` flake input; the recipe below reflects the pinned head. Bump with `nix flake update dynamic-runner` — the dispatch rebuilds + uploads the image automatically.
 >
-> - **Pinned at `835f269c`** (validated on slurm-test-env 2026-06-05): the promoted/co-located secondary-0 self-exits cleanly on run-complete; durable per-role runner logs land at `--log-dir/<secondary_id>/primary.log` + `secondary.log`; PID-safe orphan reaper; submitter-local `--important-stdio-only` scope. Bump with `nix flake update dynamic-runner`.
-> - **Removed knob:** `--slurm-setup-deadline-secs` / `setup_deadline_secs` are gone (were silent no-ops); replaced by `unconfigured_deadline_secs` (default **600 s**). asm-tokenizer sets neither — do not pass the removed flag.
-> - **Required watch protocol (every dynrunner run):** pass **`--important-stdio-only`** (only wake-worthy events hit stdout; the verbose log goes to the `--full-log-file`/`--full-log-dir` targets — the `DYNRUNNER_*` env vars are removed, flags only; a status summary lands on a ~10-min cadence). Because stdout is sparse, **run the dispatch itself, BARE, as the Monitor's command** — its stdout IS the event stream. Wrapping it in anything is forbidden; see "Run the dispatch bare" under "The dispatch command" + the forbidden anti-patterns in "Watching a running dispatch".
+> - **Required watch protocol (every dynrunner run):** pass **`--important-stdio-only`** (only wake-worthy events hit stdout; the verbose log goes to the `--full-log-file`/`--full-log-dir` targets; a status summary lands on a ~10-min cadence). Because stdout is sparse, **run the dispatch itself, BARE, as the Monitor's command** — its stdout IS the event stream. Wrapping it in anything is forbidden; see "Run the dispatch bare" under "The dispatch command" + the forbidden anti-patterns in "Watching a running dispatch".
 > - **Topology:** under `--source-already-staged` the submitter promotes a setup-secondary to primary and demotes itself to observer — you'll see `primary changed primary=secondary-0`, after which **the submitter exits `rc=0` before cluster-side tokenization finishes** and its stdout goes quiet (post-promotion narration moves to the relocated primary → `--log-dir/secondary-0/primary.log`). **Confirm completion by the gateway output files, not the submitter's exit.**
 
 ## Prerequisites
 
 - Working `nix develop` shell from `/home/sirati/devel/python/asm-tokenizer`. The dispatch runs DIRECTLY via `nix develop --command python -m dynrunner …` — **never** wrapped (no `bash -c "…"`, no `cd`, no env-var prefix, no pipe/`tee`, no `timeout`). See "Run the dispatch bare — wrappers are forbidden" under "The dispatch command".
 - `~/.ssh/config` has the `lmu` host alias (or just use `kruppb@remote.cip.ifi.lmu.de` directly). 1Password SSH agent must be unlocked — if the gateway returns `signing failed for ED25519 "LMU CIP SSH Key" from agent: communication with agent failed`, the agent is locked and only the user can unlock it.
-- `flake.lock` pinned to `dynamic-runner` `835f269c` or later (see the pin box above). Bump with `nix flake update dynamic-runner`; the dispatch rebuilds + uploads the image automatically.
 - Image is rebuilt locally (`nix path-info .#dockerImage` → store path of the tar.gz). The runner uploads it via layered-blob transfer; only changed layers re-upload, so this is fast on iteration.
 
 ## The dispatch command
@@ -40,8 +37,8 @@ nix develop --command python -m dynrunner --task tokenize \
   --multi-computer slurm \
   --packaging podman \
   --gateway ssh://kruppb@remote.cip.ifi.lmu.de \
-  --slurm-root-folder /home/k/kruppb/BIG/slurm \
-  --source-already-staged /home/k/kruppb/BIG/Dataset-1/zlib \
+  --slurm-root-folder /home/k/kruppb/BIG/slurm/tokenizer \
+  --source-already-staged /home/k/kruppb/BIG/slurm/corpus-v2/zlib \
   --source /tmp \
   --output ~/.cache/asm-tokenizer-out-slurm \
   --name-regex minigzipsh \
@@ -58,7 +55,7 @@ nix develop --command python -m dynrunner --task tokenize \
 | `--multi-computer slurm` | Selects the SLURM dispatch pipeline. Don't use the deprecated `--slurm` flag. |
 | `--packaging podman` | Required for SLURM; the cluster's wrapper uses rootless podman, not docker. |
 | `--gateway ssh://kruppb@remote.cip.ifi.lmu.de` | Always this hostname; never substitute the per-session FQDN (`beryll`, `amazonit`, …) the load balancer happens to land you on. |
-| `--slurm-root-folder /home/k/kruppb/BIG/slurm` | The gateway-side root for image, out, log subfolders. Absolute path from gateway perspective. |
+| `--slurm-root-folder /home/k/kruppb/BIG/slurm/tokenizer` | The gateway-side root for asm-tokenizer's `image_bin/`, `out/`, `log/` subfolders. **Per-consumer root** — each dynrunner consumer owns its own subdir under `BIG/slurm/` (asm-tokenizer → `…/tokenizer`; asm-dataset-nix → `…/gen-binary-dataset`) so their `out/` trees never collide. The shared corpus source lives at `BIG/slurm/corpus-v2` — that goes to `--source-already-staged`, NOT here. Absolute path from gateway perspective. |
 | `--source-already-staged <gateway-abs>` | The gateway-side directory containing your binaries (e.g. cluster NFS). Discovery walks this remotely via SSH; the wrapper bind-mounts it into each secondary container at `/app/src-network` (read-only); no rsync, no zip-copy, no `StageFile` round-trip via the primary. |
 | `--source /tmp` | Vestigial — the framework's local `--source` validation is skipped when `--source-already-staged` is set, but argparse still expects the flag. Pass any existing local dir; `/tmp` is fine. |
 | `--output <local cache>` | Where the local primary mirrors completion telemetry. Actual CSV/PKL outputs land on the gateway under `<slurm-root>/out/<file>`. |
@@ -86,7 +83,9 @@ For data that already lives on cluster NFS (typical for LMU's `~/BIG/Dataset-1/`
 2. Skip the primary's `StageFile` pass entirely (no transfer through the local primary).
 3. Bind-mount the same path into each secondary container at `/app/src-network` (read-only) when the SLURM wrapper script launches.
 
-Outputs land flat under `<slurm-root>/out/<filename>` mirroring the relative layout under `--source-already-staged`. If you point `--source-already-staged` at `Dataset-1` (one level up) you'll get `<slurm-root>/out/<package>/<file>`; pointing at `Dataset-1/zlib` (one level into a single package) gives flat `<slurm-root>/out/<file>`.
+Outputs land under `<slurm-root>/out/` (for asm-tokenizer, `BIG/slurm/tokenizer/out/`) mirroring the relative layout under `--source-already-staged`. If you point `--source-already-staged` at `corpus-v2` (one level up) you'll get `<slurm-root>/out/<package>/<file>` (e.g. `tokenizer/out/zlib/<file>_output.csv`); pointing at `corpus-v2/zlib` (one level into a single package) gives flat `<slurm-root>/out/<file>`.
+
+**`--skip-existing` matches on this exact resolved path**, so the source granularity AND the slurm-root must be consistent across runs — otherwise a re-run won't see the prior outputs and will silently re-tokenize the whole corpus. Always use the per-consumer root.
 
 ### Legacy: pushing a local-only corpus
 
@@ -182,12 +181,13 @@ In all three cases the fix is durable: update the runbook (or upstream) so the n
 The differences below are "things that look the same but aren't quite" — useful for interpreting results, not blockers on declaring green:
 
 - **I1 — Partitions.** Test-env has only `debug`; LMU CIP has `All`, `AMD`, `NvidiaAll`, `Krater`, `Abaki`. Frameworks must pass `--slurm-partition debug` for test-env (LMU's default is `All`).
-- **I2 — Scale.** Test-env runs 4 workers (ceiling 16); LMU CIP has 131 nodes. Race conditions or arithmetic that only manifests at scale (e.g. the run-7 heartbeat-clock issue documented above) is unlikely to surface locally.
+- **I2 — Scale.** Test-env runs 4 workers (ceiling 16); LMU CIP has 131 nodes. Race conditions or arithmetic that only manifests at scale is unlikely to surface locally.
 - **I3 — `/home` backing.** Test-env's `/home` is a host bind-mount; LMU CIP's is NFS. Strong-consistency operations behave the same; NFS-specific failure modes (`ESTALE`, soft-mount recovery, lock-daemon issues) are NFS-only.
 - **I4 — SSH topology.** LMU CIP requires `-J kruppb@gateway-fqdn` for compute-node access; test-env exposes workers on a podman network with direct routability. Frameworks that consistently use `-J` work both places; anything that hardcodes direct compute-node ssh would fail on real cluster.
-- **I5 — Accounting.** Test-env disables `slurmdbd` (`sacct` returns empty); LMU CIP has it. Frameworks that poll `sacct` need a non-`sacct` fallback for test-env mode — confirmed working in this campaign (we used `squeue` polling instead).
+- **I5 — Accounting.** Test-env disables `slurmdbd` (`sacct` returns empty); LMU CIP has it. Frameworks that poll `sacct` need a non-`sacct` fallback (`squeue`) for test-env mode.
 - **I6 — Munge key.** Test-env bakes a fixed key at image build; LMU CIP rotates. Anything that caches auth state across rotations is LMU-specific.
 - **I7 — SSH key path.** Test-env uses per-instance keypairs via `--ssh-identity-file`; LMU CIP uses a 1Password agent (locked-agent failure modes are LMU-only). Both go through the same `--ssh-config` / `--ssh-identity-file` framework primitives.
 - **I8 — Image-load latency.** Test-env podman load is rootless + slow: ~50–90 s per worker, sequential (each reads the same ~1.5 GB tarball from the shared `/home` bind-mount), so secondaries connect later than on LMU CIP. The `unconfigured_deadline_secs` default (600 s) covers it — no override needed.
+- **I9 — polkit / linger self-enable.** Both environments run active polkit whose stock policy grants unprivileged `loginctl enable-linger`. A test-env cluster brought up on an older node image fails linger — re-`nix run .#up` to rebuild from the flake. To exercise the polkit-DENY branch on a test-env node, see the parity section in slurm-test-env/README.md.
 
 In practice: iterate locally on `slurm-test-env` (with the I8 override), then do a small-`--jobs 1` confirmation run on LMU CIP before scaling up. The local→cluster delta is small enough that this is a sanity check, not a redo.

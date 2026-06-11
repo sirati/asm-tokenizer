@@ -55,9 +55,24 @@ ssh kruppb@remote.cip.ifi.lmu.de "scancel -u kruppb"
 
 # 3. Verify the gateway can reach your authorized key
 ssh -i ~/.ssh/id_ed25519 kruppb@remote.cip.ifi.lmu.de true
+
+# 4. MANDATORY linger sweep — pre-enable linger for the run user on EVERY
+#    Krater node it could land on, or the dispatch fails (see below).
+for n in $(ssh kruppb@remote.cip.ifi.lmu.de "sinfo -h -p Krater -N -o %N" | sort -u); do
+  ssh -J kruppb@remote.cip.ifi.lmu.de "kruppb@${n}.cip.ifi.lmu.de" "loginctl enable-linger kruppb" \
+    && echo "linger ON: $n" || echo "LINGER FAILED: $n"
+done
 ```
 
 If `ssh-add -L` says "no identities" that is the 1Password agent's design — auth still works via per-prompt approval. Do not pass `--ssh-identity-file` on LMU — that flag is for slurm-test-env's per-instance keypairs (see "Do NOT confuse" table above).
+
+### Mandatory linger pre-flight (firm — added 2026-06-09)
+
+**Every LMU dispatch MUST pre-enable linger for `kruppb` on all Krater nodes before dispatching** (step 4 above). Why it's not optional: rootless-podman's conmon scope parks under `user@<uid>.service` (the wrapper's slurmstepd cgroup-adopt is Permission-denied on Krater), so with `Linger=no` a transient submitter↔cluster ssh blip → `systemd --user` tears down the user instance → SIGTERMs the podman scope → podman signal-proxies it to PID1 → **fan-kills every non-primary secondary at once** (the conmon-SIGTERM-on-link-loss teardown; see memory `lmu_wrapper_sighup_teardown_bug`). #29 hit this twice (2026-06-09).
+
+The framework wrapper (dynamic-runner ≥ `c2e2dfc5`) tries to self-enable linger at launch but **cannot in the SLURM batch context** — `loginctl enable-linger` ENXIOs ("No such device or address": no user D-Bus/logind in a batch job). It only honors a **pre-set** linger (its check returns `AlreadyOn` → skips the failing enable → proceeds). A missed sweep then means: on `c2e2dfc5` a clean **fail-fast** (aborts before container launch, exit `3:0`); on later revs a **WARN-PROCEED** that launches *exposed* (worse). So the pre-set sweep is the real protection on every rev.
+
+`enable-linger` works unprivileged from an **interactive ssh login** (Krater polkit is active → case-ii self-enable permitted); it is persistent (survives reboot) + idempotent. The cleaner long-term fix is a **root SLURM prolog** running `enable-linger` (gateway-admin side). Verify post-sweep: `loginctl show-user kruppb -p Linger` → `Linger=yes`. NB: a manual `enable-linger` over interactive ssh succeeds even when the wrapper's batch-context one fails — don't mistake the interactive success for "the wrapper will self-heal" (it won't).
 
 ## Watching a running dispatch (60s LOCAL wake-tick + sacct fallback)
 
@@ -134,14 +149,20 @@ ssh -J kruppb@remote.cip.ifi.lmu.de "kruppb@<node>.cip.ifi.lmu.de" '
 
 The wrapper's own pre-flight scan also catches these on the *next* dispatch's startup — but only the node that the next dispatch happens to land on, so manual recovery is still required for the rest. Keep TIMEOUT off the table (large `--slurm-time-limit`) and reserve `scancel` for genuine aborts.
 
-## Shared `/home/k/kruppb/BIG/slurm/out/` convention
+## Per-consumer slurm-root subdirs + shared `corpus-v2` source
 
-The gateway-side `<slurm-root>/out/` directory is shared between dynrunner consumers (asm-tokenizer + asm-dataset-nix's compiler_suit_runner). The conventions:
+Each dynrunner consumer owns its **own** slurm-root subdir under `BIG/slurm/` so their `out/` / `log/` / `image_bin/` trees never collide:
 
-- **asm-tokenizer** writes flat under `<slurm-root>/out/` mirroring the source layout of `--source-already-staged` (per commit `8da909d`). Reads from `<slurm-root>/out/dataset/...` as Phase-1 input when asm-dataset-nix has prepared binaries.
-- **asm-dataset-nix (compiler_suit_runner)** writes to `<slurm-root>/out/dataset/<binary-name>/<variant-id>/` with sibling `<variant-id>.json` sidecars per variant. Do NOT change this output-path layout without warning — asm-tokenizer reads from it.
+| Consumer | `--slurm-root-folder` | Output tree |
+|---|---|---|
+| **asm-tokenizer** | `/home/k/kruppb/BIG/slurm/tokenizer` | `tokenizer/out/<package>/<file>_output.csv` |
+| **asm-dataset-nix** (compiler_suit_runner) | `/home/k/kruppb/BIG/slurm/gen-binary-dataset` *(confirm with peer)* | its own `out/` subtree |
 
-If you are running asm-dataset-nix and want to change the `./dataset/<binary>/<variant-id>/` layout, ping `asm-tokenizer` on the claude-comm channel first; their `--source-already-staged` paths reference this layout.
+The **source corpus is shared** at `/home/k/kruppb/BIG/slurm/corpus-v2` — that path goes to `--source-already-staged`, NEVER to `--slurm-root-folder`. asm-tokenizer reads the `dataset` package as a normal source subfolder from `corpus-v2/dataset/` (its tokenized output lands at `tokenizer/out/dataset/`); the asm-dataset-nix → `corpus-v2/dataset/` write-side flow needs peer confirmation.
+
+> **2026-06-09 incident — do NOT repeat.** An asm-tokenizer dispatch used the stale **shared** `--slurm-root-folder /home/k/kruppb/BIG/slurm` (the value this doc and `SLURM_RUNBOOK.md` previously carried) instead of `…/tokenizer`. Output then landed under the shared `BIG/slurm/out/`, and `--skip-existing` — which resolves against `<slurm-root>/out/` — saw none of the 4363 existing `tokenizer/out/` CSVs, so it skipped nothing and silently re-tokenized the whole corpus (wasting the 24h slot). Always use the per-consumer root above; `--skip-existing` only works when the slurm-root matches where the prior outputs actually live.
+
+The old shared `BIG/slurm/out/` is legacy — do not write there. If asm-dataset-nix changes its output layout or the `corpus-v2/dataset/` convention, ping `asm-tokenizer` on the claude-comm channel first; asm-tokenizer's `--source-already-staged` reference depends on it.
 
 ## 15-job cap coordination with asm-dataset-nix
 
