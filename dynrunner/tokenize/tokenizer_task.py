@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from dynamic_runner import _native
+from dynamic_runner import _native, parse_cores
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 from dynrunner.binary_selection import (
@@ -330,6 +330,20 @@ class TokenizerTask:
         cmd_args = ["--platform", "auto"]
         if hasattr(args, "simulate_errors") and args.simulate_errors is not None:
             cmd_args.extend(["--simulate-errors", str(args.simulate_errors)])
+        # Tell the worker how many siblings share its node so its Ghidra
+        # JVM can cap its analysis-thread pools to a fair CPU share (else
+        # every worker sizes its pools from the full host width and N
+        # workers oversubscribe the node N×, starving the coordinator).
+        #
+        # ``--cores`` is the framework's per-machine worker-count flag;
+        # ``parse_cores`` resolves its spec ("0"/"N"/"+N"/"-N") against
+        # THIS node's detected CPU count. The framework re-runs this
+        # method per-secondary against that node's forwarded argv (the
+        # SLURM wrapper re-emits ``--cores`` per node), so the resolved
+        # value is correct per-node on heterogeneous clusters.
+        cmd_args.extend(
+            ["--workers-per-node", str(parse_cores(args.cores))]
+        )
         return cmd_args
 
     def get_output_filename_pattern(

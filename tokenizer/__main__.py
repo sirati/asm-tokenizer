@@ -20,6 +20,7 @@ from dynamic_runner.worker import (
 
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.arch import Platform
+from tokenizer.disasm import configure_worker_jvm_processor_cap
 from tokenizer.arch_translation import arch_to_platform
 from tokenizer.output_filename import format_output_basename
 from tokenizer.run_tokenizer import NonRecoverableTokenizerError, run_tokenizer
@@ -246,6 +247,19 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Disassembly backend to use (default: ghidra)",
     )
     parser.add_argument(
+        "--workers-per-node",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of tokenize workers sharing this node (the dispatch's "
+            "per-machine worker count). The disassembly JVM caps its "
+            "thread pools to ceil(machine_cores / N) so N co-located "
+            "workers stop oversubscribing the node's CPU. Framework "
+            "dispatch supplies it from --cores; omit (default) for no cap."
+        ),
+    )
+    parser.add_argument(
         "--simulate-errors",
         type=float,
         metavar="PERCENTAGE",
@@ -317,6 +331,13 @@ def _on_args(args: argparse.Namespace) -> None:
     # worker / batch / single runs always leave it None → production
     # keeps the per-instruction debug-label rendering OFF.
     _DEBUG_RENDER = args.debug is not None
+
+    # Size the disassembly JVM's thread pools to this worker's fair share
+    # of the node BEFORE the first task constructs a provider (the JVM is
+    # process-global per worker and boots once). The framework passes the
+    # per-node worker count via ``--workers-per-node``; absent (standalone
+    # runs / a dispatch that omits it) leaves the JVM uncapped with a WARN.
+    configure_worker_jvm_processor_cap(args.workers_per_node)
 
     logger = logging.getLogger()
     logger.info(f"[*] Source directory: {_SOURCE_DIR}")
