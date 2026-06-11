@@ -49,9 +49,7 @@ from tokenizer.disasm.types import (
     OperandView,
     RegisterView,
 )
-
-
-PROVIDER_IDS = ["ghidra", "angr"]
+from tokenizer.tests._provider_support import PROVIDER_PARAMS
 
 
 ANGR_REG_LIST_SKIP_REASON = (
@@ -93,7 +91,7 @@ def _find_first(predicate, iterable):
 # ---------------------------------------------------------------------------
 # T-A: Protocol shape walk
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("provider", PROVIDER_PARAMS, indirect=True)
 def test_t_a_protocol_shape(provider):
     """iter_functions -> blocks -> instructions -> operands all match
     their typed Protocols; every operand carries a valid OperandKind enum."""
@@ -143,7 +141,7 @@ def test_t_a_protocol_shape(provider):
 # ---------------------------------------------------------------------------
 # T-B: instruction.address is within block.addr..block.addr+block.size
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("provider", PROVIDER_PARAMS, indirect=True)
 def test_t_b_instruction_address_within_block(provider):
     """For >=100 instructions sampled across the binary, the instruction's
     address falls inside its parent block's [addr, addr+size) range."""
@@ -173,7 +171,7 @@ def test_t_b_instruction_address_within_block(provider):
 # ---------------------------------------------------------------------------
 # T-C: operand.fp_type is None or an FpType enum
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("provider", PROVIDER_PARAMS, indirect=True)
 def test_t_c_fp_type_typed(provider):
     """``operand.fp_type`` is either ``None`` or an instance of ``FpType``."""
     checked = 0
@@ -192,7 +190,7 @@ def test_t_c_fp_type_typed(provider):
 # ---------------------------------------------------------------------------
 # T-D: x86 MEM operand consistency
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("provider", PROVIDER_PARAMS, indirect=True)
 def test_t_d_x86_mem_operand_shape(provider):
     """For any single x86 instruction with a MEM operand carrying base+disp,
     ``op.mem.base`` is a ``RegisterView``, ``op.mem.disp`` is ``int``,
@@ -231,7 +229,7 @@ def test_t_d_x86_mem_operand_shape(provider):
 # ---------------------------------------------------------------------------
 # T-E: ARM conditional-instruction prefix decoding
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("arm32_provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("arm32_provider", PROVIDER_PARAMS, indirect=True)
 def test_t_e_arm_condition_code_prefix(arm32_provider):
     """A conditional ARM instruction (e.g. ``beq``) yields a
     ``ConditionCodePrefixView`` instance in its prefix list with a valid
@@ -272,7 +270,7 @@ def test_t_e_arm_condition_code_prefix(arm32_provider):
 # ---------------------------------------------------------------------------
 # T-F: Reuse semantics + deepcopy stash safety
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("provider", PROVIDER_PARAMS, indirect=True)
 def test_t_f_operand_reuse_semantics(provider):
     """Holding an ``OperandView`` reference across an ``operands`` iteration
     advance: the held reference's properties reflect the LATER operand
@@ -338,7 +336,7 @@ def test_t_f_operand_reuse_semantics(provider):
 # ---------------------------------------------------------------------------
 # T-G: No materialization - iter_functions() does not force decode
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("provider", PROVIDER_PARAMS, indirect=True)
 def test_t_g_no_eager_decode(provider):
     """``iter_functions()`` yields FunctionView cursors lazily; the function
     count should be obtainable WITHOUT block/instruction decode.
@@ -386,7 +384,7 @@ def test_t_g_no_eager_decode(provider):
 # ---------------------------------------------------------------------------
 # T-H: REG_LIST presence + member count on arm32 stmdb
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("arm32_provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("arm32_provider", PROVIDER_PARAMS, indirect=True)
 def test_t_h_arm_reg_list_membership(arm32_provider, request):
     """``stmdb`` on arm32 emits exactly one ``OperandKind.REG_LIST`` operand
     whose reg_list view iterates >= 2 members. If the function
@@ -449,7 +447,7 @@ def test_t_h_arm_reg_list_membership(arm32_provider, request):
 # ---------------------------------------------------------------------------
 # T-I: REG_LIST writeback regression guard
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("arm32_provider", PROVIDER_IDS, indirect=True, ids=PROVIDER_IDS)
+@pytest.mark.parametrize("arm32_provider", PROVIDER_PARAMS, indirect=True)
 def test_t_i_arm_reg_list_writeback(arm32_provider, request):
     """``stmdb sp!`` carries writeback=True on its REG_LIST operand.
 
