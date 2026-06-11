@@ -18,6 +18,9 @@ No Textual dependency -- the helper is pure rich.
 from __future__ import annotations
 
 import pytest
+
+pytest.importorskip("rich")
+
 from rich.style import Style
 from rich.text import Text
 
