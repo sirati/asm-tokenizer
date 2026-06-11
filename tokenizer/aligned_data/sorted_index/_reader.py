@@ -139,7 +139,13 @@ class SortedIndexReader:
         ``[lo, hi]`` with the reader's valid range
         ``[min_length, max_length]``.  Returns 0 when the band is
         entirely out of range or the overlap is empty.
+
+        Length 0 is the index's EXCLUSION marker (0-variant and
+        gated-out sections are stamped 0 by the builder), so the band
+        is clamped to ``lo >= 1`` -- excluded sections are never
+        eligible, no matter how low the band reaches.
         """
+        lo = max(lo, 1)
         lo_idx = max(0, lo - self._min_length)
         hi_idx = min(self._counts.size - 1, hi - self._min_length)
         if lo_idx > hi_idx:
@@ -162,7 +168,12 @@ class SortedIndexReader:
 
         Returns a fresh ``u32`` ndarray (never a view of the blob).
         Returns an empty array when the band pool is empty.
+
+        Length 0 is the index's EXCLUSION marker (see
+        :meth:`count_in_band`); the band is clamped to ``lo >= 1`` so
+        excluded sections are never drawn.
         """
+        lo = max(lo, 1)
         lo_idx = max(0, lo - self._min_length)
         hi_idx = min(self._counts.size - 1, hi - self._min_length)
         if lo_idx > hi_idx:

@@ -290,3 +290,42 @@ def test_reader_bucket_matches_encoder_oracle(
         # equal-length keys preserve their input order).
         got = rdr.sample_section_indices(L, 999, rng).tolist()
         assert got == expected
+
+
+# ---------------------------------------------------------------------------
+# Length-0 exclusion marker vs band sampling
+# ---------------------------------------------------------------------------
+
+
+def test_band_never_samples_length_zero_marker() -> None:
+    """Bands reaching 0 must skip the EXCLUSION-marker bucket.
+
+    The builder stamps 0-variant and gated-out sections with length 0;
+    those entries are unsampleable (decode rejects 0-variant sections).
+    A band of ``(0, hi)`` therefore must neither count nor draw them.
+    """
+    import numpy as np
+
+    from tokenizer.aligned_data.sorted_index._wire import encode_sorted_index
+
+    # Sections: idx 0 + 3 excluded (length 0); idx 1, 2 real lengths.
+    lengths = np.array([0, 7, 9, 0], dtype=np.uint32)
+    blob = encode_sorted_index(lengths)
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "zb_sorted_max_d003.idx"
+        path.write_bytes(blob)
+        reader = SortedIndexReader(
+            path,
+            reduction=LengthReduction(kind=ReductionKind.MAX),
+            depth=3,
+        )
+        assert reader.count_in_band(0, 100) == 2
+        rng = np.random.default_rng(0)
+        drawn = reader.sample_section_indices_in_band(0, 100, 10, rng)
+        assert sorted(drawn.tolist()) == [1, 2]
+        # Exact-length access at 0 still reports the marker bucket for
+        # diagnostics; only BAND eligibility excludes it.
+        assert reader.count_at(0) == 2
