@@ -13,9 +13,11 @@ This test pins:
 
 * every supported bit-width (2 through 32) round-trips byte-for-byte under
   several deterministic data shapes,
-* the routing in ``_pack_bits`` keeps width 11 off the buggy vec path until
-  it gets repaired,
-* the documented vec path keeps working at every other ≤12 width.
+* the concrete 11-bit cross-word corpus pattern that surfaced the bug.
+
+The vec packer has since been rewritten to cover ALL widths (the 11-bit
+scalar detour is gone); byte-identity against the legacy scalar writer is
+pinned in ``test_compact_base64_pack_vec.py``.
 """
 
 from __future__ import annotations

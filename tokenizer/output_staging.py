@@ -38,11 +38,16 @@ stays unaware of where ``output_dir`` actually lives.
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 from dynamic_runner.worker import Task
+
+from tokenizer.progress import log_stage
+
+logger = logging.getLogger(__name__)
 
 _SLURM_OUT_TMP = Path("/app/out-tmp")
 
@@ -118,7 +123,10 @@ def staged_publish(
         # handles intra-/cross-FS atomicity.
         outputs = [p for p in sorted(staging_dir.rglob("*")) if p.is_file()]
         if outputs:
-            task.publish_all(*outputs)
+            with log_stage(
+                logger, f"atomic publish of {len(outputs)} staged files ({scope})"
+            ):
+                task.publish_all(*outputs)
     else:
         # Standalone: writes land at their final destination directly.
         # Atomic-publish only applies to container mode where the

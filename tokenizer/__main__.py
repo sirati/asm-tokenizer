@@ -170,6 +170,7 @@ _OUTPUT_DIR: Path
 _BACKEND: str
 _SIMULATE_ERRORS: float
 _DUMP_DUPLICATE_FUNCTION_METADATA: bool
+_DEBUG_RENDER: bool
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -302,7 +303,7 @@ def _on_args(args: argparse.Namespace) -> None:
     the handler closes over.
     """
     global _PLATFORM, _SKIP_EXISTING, _SOURCE_DIR, _OUTPUT_DIR, _BACKEND, _SIMULATE_ERRORS
-    global _DUMP_DUPLICATE_FUNCTION_METADATA
+    global _DUMP_DUPLICATE_FUNCTION_METADATA, _DEBUG_RENDER
 
     increase_csv_field_size_limit()
     _setup_logging(args)
@@ -312,6 +313,10 @@ def _on_args(args: argparse.Namespace) -> None:
     _BACKEND = args.backend
     _SIMULATE_ERRORS = float(args.simulate_errors) if args.simulate_errors is not None else 0.0
     _DUMP_DUPLICATE_FUNCTION_METADATA = bool(args.dump_duplicate_function_metadata)
+    # ``--debug`` is a mode in the mutually-exclusive entry group, so
+    # worker / batch / single runs always leave it None → production
+    # keeps the per-instruction debug-label rendering OFF.
+    _DEBUG_RENDER = args.debug is not None
 
     logger = logging.getLogger()
     logger.info(f"[*] Source directory: {_SOURCE_DIR}")
@@ -402,6 +407,7 @@ def handle(task: Task) -> WorkerOutput | None:
             source_relative_path=source_relative_path,
             output_basename=job.output_basename,
             dump_duplicate_function_metadata=_DUMP_DUPLICATE_FUNCTION_METADATA,
+            debug_render=_DEBUG_RENDER,
         )
         warnings_total = max(0, warnings)
         filtered_total = max(0, filtered)
@@ -459,6 +465,9 @@ def _run_standalone(args: argparse.Namespace) -> None:
         output_dir=output_dir,
         backend=args.backend,
         dump_duplicate_function_metadata=bool(args.dump_duplicate_function_metadata),
+        # ``--debug`` runs render full per-instruction debug labels;
+        # --single / --batch production runs skip the rendering.
+        debug_render=args.debug is not None,
     )
 
     if args.batch:

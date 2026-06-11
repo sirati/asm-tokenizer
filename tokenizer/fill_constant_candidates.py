@@ -8,9 +8,8 @@ from tokenizer.constant_handler import ConstantHandler
 from tokenizer.disasm import DisassemblyProvider, FunctionView, MetadataLookup
 from tokenizer.function_token_list import FunctionTokenList
 from tokenizer.instruction_sets import InstructionSets
-from tokenizer.token_lists import BlockTokenList
 from tokenizer.token_manager import VocabularyManager
-from tokenizer.tokens import BlockToken, Category, TokenResolver, Tokens
+from tokenizer.tokens import Category, TokenResolver, Tokens
 
 VERIFICATION: bool = False
 
@@ -55,8 +54,11 @@ def _emit_jump_table_footer_for(
     # One synthetic instruction holding the whole footer: keeps the
     # run-length arithmetic consistent (BlockTokenList expects at least
     # one instruction per block). The insn-str is a debug label only.
+    # In-place emission: the footer block is a ``view()`` child writing
+    # directly into ``func_tokens``'s buffer (same producer pattern as
+    # the regular per-block emission in ``fill_constant_candidates``).
     base_addr_hex = hex(int(base_addr))
-    footer_block = BlockTokenList(num_insns=1, vocab_manager=vocab_manager)
+    footer_block = func_tokens.view()
     footer_block.append_as_insn(
         insn_str=f"jump_table {base_addr_hex}",
         tokens=footer_tokens,
@@ -201,20 +203,26 @@ def fill_constant_candidates(
     resolver: TokenResolver,
     vocab_manager: VocabularyManager,
     arch_provider: ArchitectureProvider,
+    func_tokens: FunctionTokenList,
     disasm_provider: Optional[DisassemblyProvider] = None,
 ) -> Optional[
     tuple[
         list[tuple[str, list[list[Tokens]]]],
-        list[dict[BlockToken, tuple[str, str]]],
-        dict[str, BlockToken],
         ConstantHandler,
         FunctionTokenList,
         int,
         int,
     ]
 ]:
+    # ``func_tokens`` is the caller-owned grow-only output buffer, reused
+    # across every function of the binary. Reset-on-entry keeps the
+    # contract self-contained: the previous function's contents —
+    # including a view child abandoned by a mid-function exception — are
+    # discarded here, not at the call site. All views handed out from the
+    # previous fill are invalidated now (see ``FunctionTokenList.reset``).
+    func_tokens.reset()
+
     func_min_addr: int = int(func_addr)
-    blocks: set = set()
 
     # `func.blocks` yields the SAME reused `BlockView` instance per step
     # (see ``tokenizer/disasm/types.py`` lifecycle docstring). To hold
@@ -233,41 +241,30 @@ def fill_constant_candidates(
     func_max_addr = int(block_ranges.max())
     constant_handler = ConstantHandler(vocab_manager, resolver, block_ranges)
     temp_bbs: list[tuple[str, list[list[Tokens]]]] = []
-    block_list: list[dict[BlockToken, tuple[int, int]]] = []
-    block_dict: dict[str, BlockToken] = {}
 
     if num_blocks == 1 and len(block_snapshots[0].instructions) == 0:
         return None
 
-    func_tokens = FunctionTokenList(num_blocks, vocab_manager=vocab_manager)
     ordered_blocks = sorted(block_snapshots, key=lambda b: b.addr)
     for block in ordered_blocks:
         func_max_addr = max(block.addr, block.addr + block.size)
 
-        # ``block_addr`` is the human-readable label used by ``block_dict``,
-        # ``blocks`` set, ``temp_bbs``, etc. The resolver's BLOCK cache, in
-        # contrast, is keyed by the typed ``int`` address (matching the
+        # ``block_addr`` is the human-readable label used by ``temp_bbs``
+        # and the per-block insn_str headers. The resolver's BLOCK cache,
+        # in contrast, is keyed by the typed ``int`` address (matching the
         # int key used by ``ConstantHandler._emit_block`` for intra-function
         # jump-target references). Hand the int to ``get_block_id`` so block
         # definitions and references to the same block share identity.
         block_addr = hex(block.addr)
         block_id = resolver.get_block_id(int(block.addr))
         block_token = vocab_manager.BlockId(block_id)
-        block_list.append(
-            {
-                block_token: (
-                    block.addr,
-                    block.addr + block.size,
-                )
-            }
-        )
-        blocks.add(block_addr)
-
-        block_dict[block_addr] = block_token
 
         block_def = [vocab_manager.Block_Def(), block_token]
 
-        disassembly_list = BlockTokenList(len(block.instructions) + 1, vocab_manager=vocab_manager)
+        # In-place block emission: the block is a ``view()`` child writing
+        # directly into ``func_tokens``'s buffer; ``add_block`` below then
+        # only commits counters (no second copy of the token data).
+        disassembly_list = func_tokens.view()
         disassembly_list.append_as_insn(insn_str=f"block {block_addr}", tokens=block_def)
 
         disassembly_list2 = [block_def]
@@ -277,7 +274,12 @@ def fill_constant_candidates(
         # never stashes the wrapper across advances, satisfying the
         # owned-view reuse contract.
         for insn in block.instructions:
-            insn_tokens = disassembly_list.view(insn_str=f"{insn.mnemonic} {insn.op_str}")
+            # Stash-safe lazy label (``InsnDebugLabel``): typed
+            # mnemonic/operand_count captured cheaply; the operand-text
+            # render is provider-deferred (and skipped entirely in
+            # production on the Ghidra backend, where it costs one JVM
+            # round-trip per operand).
+            insn_tokens = disassembly_list.view(insn_str=insn.debug_label())
 
             insn_tokens = arch_provider.parse_instruction(
                 instr_sets,
@@ -291,9 +293,15 @@ def fill_constant_candidates(
                 vocab_manager,
                 insn_tokens,
             )
-            disassembly_list.add_insn(insn_tokens)
             if VERIFICATION:
-                disassembly_list2.append(list(insn_tokens))
+                # Capture BEFORE ``add_insn`` (committing releases the
+                # view child's lookup array) and deepcopy: the raw tokens
+                # are numpy VIEWS into the reusable ``func_tokens`` buffer
+                # and ``temp_bbs`` is retained across functions by the
+                # VERIFICATION consumers in main_loop — a retained view
+                # would be invalidated by the next ``reset()``.
+                disassembly_list2.append(copy.deepcopy(list(insn_tokens)))
+            disassembly_list.add_insn(insn_tokens)
 
         if VERIFICATION:
             for x, y in zip(
@@ -322,8 +330,6 @@ def fill_constant_candidates(
 
     return (
         temp_bbs,
-        block_list,
-        block_dict,
         constant_handler,
         func_tokens,
         func_min_addr,

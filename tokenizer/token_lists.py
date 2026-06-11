@@ -51,8 +51,8 @@ class InsnTokenList:
     def __init__(self, insn_str: str = None, vocab_manager: Optional["VocabularyManager"] = None, init=True):
         # Initialize arrays
         if init:
-            self.token_ids = np.zeros(20, dtype=np.int16)
-            self.metatoken_type_ids = np.zeros(10, dtype=np.int8)
+            self.token_ids = np.zeros(20, dtype=np.int32)
+            self.metatoken_type_ids = np.zeros(10, dtype=np.int32)
             self.metatoken_start_lookup = np.zeros(10, dtype=np.int32)
             self.insn_str = np.array([insn_str], dtype=object)
         elif insn_str is not None:
@@ -221,11 +221,11 @@ class BlockTokenList:
             token_ids_size = num_insns * 8
             type_lookup_size = num_insns * 4 + 2
 
-            self.token_ids = np.zeros(token_ids_size, dtype=np.int16)
-            self.metatoken_type_ids = np.zeros(type_lookup_size, dtype=np.int8)
+            self.token_ids = np.zeros(token_ids_size, dtype=np.int32)
+            self.metatoken_type_ids = np.zeros(type_lookup_size, dtype=np.int32)
             self.metatoken_start_lookup = np.zeros(type_lookup_size, dtype=np.int32)
-            self.insn_metatoken_run_lengths = np.zeros(num_insns + 2, dtype=np.int8)
-            self.insn_idx_run_lengths = np.zeros(num_insns + 2, dtype=np.int8)
+            self.insn_metatoken_run_lengths = np.zeros(num_insns + 2, dtype=np.int32)
+            self.insn_idx_run_lengths = np.zeros(num_insns + 2, dtype=np.int32)
             self.insn_strs = np.zeros(num_insns + 2, dtype=object)
 
         self.last_index = 0
@@ -277,6 +277,12 @@ class BlockTokenList:
             raise RuntimeError("Cannot add instruction while view child is active")
 
         if insn_token_list.last_index == 0:
+            # An EMPTY view child still holds the buffer lease — release
+            # it, or the next ``view()`` call raises "already has an
+            # active view child" even though nothing was written.
+            if insn_token_list.view_parent is self:
+                insn_token_list.readonly = True
+                self.view_child = None
             return
 
         (new_token_ids, new_token_type_ids, new_token_start_lookup, new_insn_strs) = insn_token_list.get_used_arrays()
@@ -330,9 +336,16 @@ class BlockTokenList:
         current_token_pos = int(self.metatoken_start_lookup[self.last_index - 1]) if self.last_index > 0 else 0
 
         if self.view_parent is not None:
-            # Ask parent to resize instead
+            # Ask parent to resize instead. Like the token/type axes
+            # (which thread this block's partial usage up via
+            # ``current_token_pos`` / ``self.last_index``), the insn axis
+            # must pass ``self.insn_count + 1``: the parent's own
+            # ``insn_count`` excludes this block's not-yet-committed
+            # instructions, so a flat ``1`` would under-reserve and the
+            # block's view writes past the parent's insn arrays once the
+            # partial block outgrows the remaining slack.
             self.view_parent._resize_view_arrays(
-                current_token_pos + token_idx_needed, self.last_index + types_needed, 1
+                current_token_pos + token_idx_needed, self.last_index + types_needed, self.insn_count + 1
             )
             return
 
@@ -476,7 +489,9 @@ class BlockTokenList:
         if self.insn_count == 0:
             return "-empty-"
 
-        return f"{self.insn_strs[0]}: [" + "], [".join(asm_str for asm_str in self.insn_strs[1 : self.insn_count]) + "]"
+        # ``insn_strs`` entries are str-able label objects
+        # (``InsnDebugLabel``) or plain strings — stringify explicitly.
+        return f"{self.insn_strs[0]}: [" + "], [".join(str(asm_str) for asm_str in self.insn_strs[1 : self.insn_count]) + "]"
 
     def to_asm_like(self) -> str:
         """Convert the block to an assembly-like string representation"""
