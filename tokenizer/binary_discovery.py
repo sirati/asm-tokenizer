@@ -94,26 +94,55 @@ def _classify_dir_files(
 def _emit_sidecar_dir(
     dir_path: Path,
     folder_stems: set[str],
+    skip_tally: "_SkipTally",
 ) -> Iterator[tuple[BinaryHandle, VariantInfo]]:
     """Yield ``(handle, variant)`` for every sidecar-paired variant in
     this directory, sorted by stem. ``path`` is the binary file inside
     the variant's folder (``<stem>/<variant.pkg>``); the worker reads
     it directly with no extraction. Folders that don't contain the
-    expected ``<pkg>`` file are warned-and-skipped (malformed
-    sidecar)."""
+    expected ``<pkg>`` file are skipped (malformed sidecar / dangling
+    link) — recorded on ``skip_tally``, which the walk summarises in
+    ONE aggregate warning instead of one line per variant (a 55k-variant
+    corpus with a systematic mount/link fault otherwise floods the log)."""
     for stem in sorted(folder_stems):
         json_path = dir_path / f"{stem}{_SIDECAR_JSON_SUFFIX}"
         variant = VariantInfo.from_sidecar(json_path)
         variant_dir = dir_path / stem
         binary_path = variant_dir / variant.pkg
         if not binary_path.is_file():
-            _logger.warning(
-                "sidecar folder %s missing expected binary %r — skipping",
-                variant_dir,
-                variant.pkg,
-            )
+            skip_tally.record(variant_dir)
             continue
         yield BinaryHandle(path=binary_path, variant_dir=variant_dir), variant
+
+
+class _SkipTally:
+    """Aggregates missing-binary sidecar skips across one walk.
+
+    Single concern: count skips, keep the first few example paths, and
+    emit one summary warning at walk end (nothing when count is 0).
+    """
+
+    _MAX_EXAMPLES = 3
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.examples: list[Path] = []
+
+    def record(self, variant_dir: Path) -> None:
+        self.count += 1
+        if len(self.examples) < self._MAX_EXAMPLES:
+            self.examples.append(variant_dir)
+        _logger.debug("sidecar folder %s missing expected binary — skipping", variant_dir)
+
+    def emit_summary(self) -> None:
+        if not self.count:
+            return
+        _logger.warning(
+            "skipped %d sidecar folder(s) with missing/unresolvable binary "
+            "(dangling symlink or malformed sidecar); examples: %s",
+            self.count,
+            ", ".join(str(p) for p in self.examples),
+        )
 
 
 def _emit_orphan_json_warnings(
@@ -176,13 +205,17 @@ def walk_dataset(
     directory, sidecar pairs emit first (alphabetical) then legacy
     files. Iteration order is a deterministic function of the tree.
     """
-    for root, dirs, files in os.walk(source_dir):
-        dirs.sort()
-        dir_path = Path(root)
-        paired_stems = _classify_dir_files(files, dirs)
-        if paired_stems:
-            yield from _emit_sidecar_dir(dir_path, paired_stems)
-            _emit_orphan_json_warnings(dir_path, files, paired_stems)
-            dirs[:] = [d for d in dirs if d not in paired_stems]
-        else:
-            yield from _emit_legacy_dir(dir_path, files)
+    skip_tally = _SkipTally()
+    try:
+        for root, dirs, files in os.walk(source_dir):
+            dirs.sort()
+            dir_path = Path(root)
+            paired_stems = _classify_dir_files(files, dirs)
+            if paired_stems:
+                yield from _emit_sidecar_dir(dir_path, paired_stems, skip_tally)
+                _emit_orphan_json_warnings(dir_path, files, paired_stems)
+                dirs[:] = [d for d in dirs if d not in paired_stems]
+            else:
+                yield from _emit_legacy_dir(dir_path, files)
+    finally:
+        skip_tally.emit_summary()
