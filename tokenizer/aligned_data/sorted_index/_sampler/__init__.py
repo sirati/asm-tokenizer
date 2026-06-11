@@ -13,13 +13,14 @@ The three submodules form one user-facing flow:
 
 from __future__ import annotations
 
-from ._batch import open_length_bucketed_batch
+from ._batch import decode_pointer_batch, open_length_bucketed_batch
 from ._concat import _concat_results, _concat_row_offsets
 from ._sample import MultiBinarySortedIndexSampler, sample_section_pointers
 
 
 __all__ = [
     "MultiBinarySortedIndexSampler",
+    "decode_pointer_batch",
     "open_length_bucketed_batch",
     "sample_section_pointers",
 ]

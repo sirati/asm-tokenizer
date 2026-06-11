@@ -19,6 +19,7 @@ from ._prepass import SectionVariantInfo, read_section_variant_info
 from ._reader import SortedIndexReader, discover_indices
 from ._sampler import (
     MultiBinarySortedIndexSampler,
+    decode_pointer_batch,
     open_length_bucketed_batch,
 )
 from ._types import (
@@ -45,6 +46,7 @@ __all__ = [
     "VariantGate",
     "build_sorted_index_bytes",
     "compute_reduced_lengths",
+    "decode_pointer_batch",
     "discover_indices",
     "encode_sorted_index",
     "open_length_bucketed_batch",
