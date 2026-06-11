@@ -516,6 +516,107 @@ def test_dag_a_b_d_and_a_c_d_visits_d_twice() -> None:
     assert out[2].function_data is out[4].function_data is d_fd
 
 
+def test_path_depth_tracks_dfs_descent() -> None:
+    """``path_depth`` is the DFS descent count: root 0, callee +1 per level.
+
+    Reuses the DAG ``A -> {B, C}; B -> D; C -> D`` whose encounter order
+    is ``[A, B, D, C, D]``. The matching path-depths are
+    ``[0, 1, 2, 1, 2]`` -- the root at 0, the direct callees B/C at 1,
+    and the grandchild D at 2 under EITHER parent. This pins the
+    property that makes one max-depth walk serve every shallower depth:
+    a call_target belongs to the depth-``k`` expansion iff its
+    ``path_depth <= k``."""
+    d_section = _make_section(section_offset=400, function_name_ptr=4)
+    d_fd = _make_function_data("d")
+    b_section = _make_section(
+        section_offset=200,
+        function_name_ptr=2,
+        call_targets=[_ct_local(fid=4, target_offset=400)],
+        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+    )
+    c_section = _make_section(
+        section_offset=300,
+        function_name_ptr=3,
+        call_targets=[_ct_local(fid=4, target_offset=400)],
+        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+    )
+    a_section = _make_section(
+        section_offset=100,
+        function_name_ptr=1,
+        call_targets=[
+            _ct_local(fid=2, target_offset=200),
+            _ct_local(fid=3, target_offset=300),
+        ],
+        variants=[
+            _make_variant(vkey=0, per_call_entries=[(0, 0), (1, 0)]),
+        ],
+    )
+    a_fd = _make_function_data("a")
+    session = _FakeSession()
+    session.add_matched(a_section, {0: a_fd})
+    session.add_matched(b_section, {0: _make_function_data("b")})
+    session.add_matched(c_section, {0: _make_function_data("c")})
+    session.add_matched(d_section, {0: d_fd})
+
+    out = walk_callees(
+        session=session,
+        root_arm=SectionKind.MATCHED,
+        root_section=a_section,
+        root_variant_idx=0,
+        root_function_data=a_fd,
+        root_function_name_ptr=1,
+        max_depth=10,
+        inlined_equivalent_call_targets_only=False,
+    )
+
+    assert [e.function_name_ptr for e in out] == [1, 2, 4, 3, 4]
+    assert [e.path_depth for e in out] == [0, 1, 2, 1, 2]
+
+
+def test_max_depth_one_caps_path_depth_at_one() -> None:
+    """At ``max_depth=1`` every emitted call_target has ``path_depth <= 1``.
+
+    The depth-cap prunes at ``current_depth >= max_depth``, so the
+    depth-1 walk emits exactly the root (0) + direct callees (1) and no
+    deeper rows -- the prefix property the multi-depth build relies on."""
+    grandchild_section = _make_section(
+        section_offset=300, function_name_ptr=3
+    )
+    child_section = _make_section(
+        section_offset=200,
+        function_name_ptr=2,
+        call_targets=[_ct_local(fid=3, target_offset=300)],
+        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+    )
+    root_section = _make_section(
+        section_offset=100,
+        function_name_ptr=1,
+        call_targets=[_ct_local(fid=2, target_offset=200)],
+        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+    )
+    root_fd = _make_function_data("root")
+    session = _FakeSession()
+    session.add_matched(root_section, {0: root_fd})
+    session.add_matched(child_section, {0: _make_function_data("child")})
+    session.add_matched(
+        grandchild_section, {0: _make_function_data("gc")}
+    )
+
+    out = walk_callees(
+        session=session,
+        root_arm=SectionKind.MATCHED,
+        root_section=root_section,
+        root_variant_idx=0,
+        root_function_data=root_fd,
+        root_function_name_ptr=1,
+        max_depth=1,
+        inlined_equivalent_call_targets_only=False,
+    )
+
+    assert [e.path_depth for e in out] == [0, 1]
+    assert max(e.path_depth for e in out) <= 1
+
+
 def test_inlined_equivalent_filter_skips_all_and_none_callers() -> None:
     """``inlined_equivalent_call_targets_only=True``:
 
