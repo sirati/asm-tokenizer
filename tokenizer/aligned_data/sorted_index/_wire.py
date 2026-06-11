@@ -25,7 +25,18 @@ from typing import Tuple
 
 import numpy as np
 
-__all__ = ["encode_sorted_index", "parse_header"]
+__all__ = ["EXCLUDED_LENGTH", "encode_sorted_index", "parse_header"]
+
+
+#: The wire format's EXCLUSION marker: a section stamped with this
+#: length is "present in the index but not eligible for sampling".
+#: Writers stamp it for 0-variant sections and sections failing the
+#: minimum-variant gate (:mod:`._length_compute` / :mod:`._gating`);
+#: readers must never treat the marker bucket as sampling-eligible
+#: (:meth:`._reader.SortedIndexReader.count_in_band` clamps bands to
+#: ``EXCLUDED_LENGTH + 1``). This constant is the single owner of the
+#: invariant -- writer and reader both import it from here.
+EXCLUDED_LENGTH: int = 0
 
 
 def encode_sorted_index(lengths: np.ndarray) -> bytes:

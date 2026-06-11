@@ -37,6 +37,7 @@ from ._gating import VariantGate
 from ._graph_lengths import LARGE_CONTEXT_LEN, compute_node_lengths
 from ._prepass import SectionVariantInfo
 from ._types import IndexSpec, LengthReduction
+from ._wire import EXCLUDED_LENGTH
 
 
 __all__ = [
@@ -106,7 +107,10 @@ def compute_reduced_lengths(
         IndexSpec(reduction=red, depth=d) for red in reductions for d in depths
     ]
     results: Dict[IndexSpec, np.ndarray] = {
-        spec: np.zeros(num_sections, dtype=np.uint32) for spec in specs
+        # Default-fill with the wire format's EXCLUSION marker:
+        # 0-variant and gated-out sections stay at it in every output.
+        spec: np.full(num_sections, EXCLUDED_LENGTH, dtype=np.uint32)
+        for spec in specs
     }
     if num_sections == 0 or int(cols.var_n_calls.size) == 0:
         return results
@@ -132,7 +136,7 @@ def compute_reduced_lengths(
                 data_pointers=cols.var_data_offset_shifted,
                 seg_offsets=cols.var_offsets,
             )
-            per_section[~emitted] = 0
+            per_section[~emitted] = EXCLUDED_LENGTH
             # < LARGE_CONTEXT_LEN (asserted upstream) so the u32 cast
             # is lossless.
             results[IndexSpec(reduction=red, depth=depth)] = (
