@@ -511,16 +511,34 @@ def _run_standalone(args: argparse.Namespace) -> None:
         filtered_lines = filter_queue(absolute_lines, out_dir=str(output_dir), source_dir=str(source_dir))
         logger.info(f"[*] Filtered queue: {len(filtered_lines)} items to process")
 
+        failures: list[str] = []
         for idx, binary_path_str in enumerate(filtered_lines, 1):
             logger.info(f"\n[*] Processing binary {idx}/{len(filtered_lines)}: {binary_path_str}")
             binary_path = Path(binary_path_str).resolve()
             try:
                 run_tokenizer(binary_path, task=Task(relative_path=str(binary_path)), **common_params)
             except Exception as e:
-                logger.info(f"[!] Error processing {binary_path}: {e}")
+                logger.error(f"[!] Error processing {binary_path}: {e}")
                 logger.info("Continuing with next binary in queue...")
+                failures.append(binary_path_str)
                 continue
-        logger.info("\n[*] Batch processing complete.")
+
+        # A binary the operator put in the queue that did not produce its
+        # output is a hard failure, not a skip: the explicit skip-existing
+        # path returns cleanly from ``run_tokenizer`` (logged by
+        # ``filter_queue``), so anything reaching ``failures`` is a real
+        # no-output run. Exit non-zero so a standalone batch that silently
+        # produced nothing can never be mistaken for success.
+        logger.info(
+            f"\n[*] Batch processing complete: "
+            f"{len(filtered_lines) - len(failures)}/{len(filtered_lines)} succeeded."
+        )
+        if failures:
+            logger.error(
+                f"[!] {len(failures)} of {len(filtered_lines)} queued binaries "
+                f"failed to produce output: {', '.join(failures)}"
+            )
+            sys.exit(1)
         return
 
     # --single (also reached after --debug's expansion above).
