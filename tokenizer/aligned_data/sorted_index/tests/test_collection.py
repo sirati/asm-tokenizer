@@ -237,7 +237,7 @@ def test_missing_index_wrong_depth_raises(tmp_path: Path) -> None:
     dir_a.mkdir()
     _build_decodable_binary(dir_a, "good", tmp_path / "scratch_g")
 
-    with pytest.raises(ValueError, match="depth=7"):
+    with pytest.raises(ValueError, match="max_d007"):
         IndexedMemmapCollection.discover(
             [dir_a], reduction=_MAX, depth=7
         )
