@@ -33,11 +33,12 @@ refuses to own.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
+from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
 from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
     assert_matched_sections_prelude,
@@ -58,6 +59,29 @@ def read_sections_bin_blob(path: Path) -> Tuple[bytes, memoryview]:
     raw = path.read_bytes()
     assert_matched_sections_prelude(raw, path=str(path))
     return raw, memoryview(raw)
+
+
+def walk_section_starts(blob: memoryview, region_start: int) -> List[int]:
+    """Byte offsets of every section in ``[region_start, EOF)``, in order.
+
+    The pure structural walk: it streams sections via
+    :func:`...matched_sections_bin.parse_section_bin` from
+    ``region_start`` to the end of ``blob`` and records each section's
+    start offset, owning NO name-resolution concern. Callers needing the
+    resolved function name layer it on top (see the unmatched-arm
+    loader); callers needing only the variant geometry (the
+    realized-lengths pass) feed the returned starts straight into the
+    columnar parser. ``blob`` is the whole-file memoryview from
+    :func:`read_sections_bin_blob` so the offsets are absolute.
+    """
+    starts: List[int] = []
+    end = len(blob)
+    cursor = region_start
+    while cursor < end:
+        _section, next_cursor = parse_section_bin(blob, cursor)
+        starts.append(cursor)
+        cursor = next_cursor
+    return starts
 
 
 def resolve_func_name_or_raise(

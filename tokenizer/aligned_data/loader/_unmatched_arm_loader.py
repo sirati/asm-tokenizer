@@ -33,6 +33,7 @@ from ._sections_bin_walk import (
     read_sections_bin_blob,
     resolve_func_name_or_raise,
     unmatched_region_start,
+    walk_section_starts,
 )
 
 
@@ -52,7 +53,6 @@ def _walk_unmatched_sections(
     every array describes the same section.
     """
     func_names: List[str] = []
-    section_starts: List[int] = []
     variant_counts: List[int] = []
     if not sections_bin.exists():
         return (
@@ -61,19 +61,19 @@ def _walk_unmatched_sections(
             np.zeros(0, dtype=np.int64),
         )
     raw, blob = read_sections_bin_blob(sections_bin)
-    end = len(raw)
-    cursor = region_start
-    while cursor < end:
-        section, next_cursor = parse_section_bin(blob, cursor)
+    # Structural walk (pure section starts) is shared with the
+    # realized-lengths pass; the name + variant-count resolution below
+    # is this loader's own concern, layered on top per section.
+    section_starts = walk_section_starts(blob, region_start)
+    for cursor in section_starts:
+        section, _next = parse_section_bin(blob, cursor)
         func_names.append(
             resolve_func_name_or_raise(
                 section.function_name_ptr, line_to_name,
                 sections_bin, cursor,
             )
         )
-        section_starts.append(cursor)
         variant_counts.append(len(section.variants))
-        cursor = next_cursor
     return (
         func_names,
         np.array(section_starts, dtype=np.int64),
