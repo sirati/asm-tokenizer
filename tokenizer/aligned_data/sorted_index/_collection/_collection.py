@@ -2,26 +2,36 @@
 
 Single concern: *serve unbiased length-bucketed batches from a corpus
 of per-binary indexed memmap directories with persistent per-binary
-sessions.*
+sessions, for any of several configured ``(reduction, depth)`` specs.*
 
 A real corpus is many memmap directories (one per package), each
 holding several per-binary catalogs plus their sorted-index ``.idx``
-files. :class:`IndexedMemmapCollection` is the single typed entry point
-that discovers every binary across the whole collection (via
+files -- one ``.idx`` per ``(reduction, depth)`` :class:`IndexSpec`.
+:class:`IndexedMemmapCollection` is the single typed entry point that
+discovers every binary across the whole collection (via
 :func:`discover_members`), wires them into ONE
-:class:`MultiBinarySortedIndexSampler` (so the urn draw is unbiased over
-the entire corpus, not biased per directory), and serves length-bucketed
-batches through persistent sessions.
+:class:`MultiBinarySortedIndexSampler` PER spec (so each spec's urn draw
+is unbiased over the entire corpus, not biased per directory), and
+serves length-bucketed batches through persistent sessions.
+
+Membership is spec-INDEPENDENT: a binary is a member iff it carries the
+``.idx`` for EVERY configured spec (see :func:`discover_members`). The
+per-spec samplers therefore differ only in their bucket lengths, never
+in their population, and ``members`` / qualified naming / the session
+pool stay collection-level. One warm session per member serves batches
+for depth-0 AND depth-3 alike -- the whole point of binding several
+specs in one collection.
 
 Boundary contract -- everything is REUSE, never reimplementation:
 
 * discovery + naming -> :func:`discover_members`;
-* sampling -> :class:`MultiBinarySortedIndexSampler` (the
+* spec-list boundary + per-call selection -> :mod:`._spec`;
+* sampling -> :class:`MultiBinarySortedIndexSampler` (one per spec; the
   multivariate-hypergeometric urn draw is the unbiasedness mechanism);
 * decode -> :func:`decode_pointer_batch` verbatim;
 * per-binary sessions -> :meth:`BinaryDataset.open_session`, opened
   lazily on first need and held on a :class:`contextlib.ExitStack` until
-  :meth:`close`.
+  :meth:`close` -- shared across every spec.
 """
 
 from __future__ import annotations
@@ -39,12 +49,14 @@ from tokenizer.aligned_data.loader.session import BinarySession
 from .._reader import SortedIndexReader
 from .._sampler import MultiBinarySortedIndexSampler, decode_pointer_batch
 from .._types import (
+    IndexSpec,
     LengthReduction,
     MultiBinaryBatchDecodeResult,
     MultiBinarySectionPointer,
 )
 from ._discovery import discover_members
 from ._member import CollectionMember, MissingIndexPolicy
+from ._spec import normalize_specs, resolve_spec, sorted_specs
 
 
 __all__ = ["IndexedMemmapCollection"]
@@ -56,12 +68,20 @@ class IndexedMemmapCollection:
     Construct via :meth:`discover`. The collection owns:
 
     * the typed :class:`CollectionMember` list (alphabetical by
-      ``qualified_name``);
-    * one :class:`MultiBinarySortedIndexSampler` over
-      ``{qualified_name -> SortedIndexReader}`` -- the single unbiased
-      urn draw over the WHOLE corpus;
+      ``qualified_name``) -- spec-independent;
+    * one :class:`MultiBinarySortedIndexSampler` PER configured spec
+      over ``{qualified_name -> SortedIndexReader}`` -- each the unbiased
+      urn draw over the WHOLE corpus at that spec's lengths;
     * lazily-opened persistent :class:`BinarySession` instances (one per
-      member, opened on first sample, held on an :class:`ExitStack`).
+      member, opened on first sample, held on an :class:`ExitStack`)
+      SHARED across every spec.
+
+    Every per-call method (:meth:`count_at`, :meth:`count_in_band`,
+    :meth:`sample_section_pointers`, :meth:`load_batch`) takes an
+    optional ``spec``: ``None`` resolves to the single configured spec
+    (full back-compat) or raises when several are configured; an unknown
+    spec raises. The configured specs are exposed in stable order via
+    :attr:`specs`.
 
     Use as a context manager (or call :meth:`close`) to release every
     open session deterministically. After :meth:`close`, :meth:`load_batch`
@@ -71,13 +91,18 @@ class IndexedMemmapCollection:
     def __init__(
         self,
         members: List[CollectionMember],
-        readers: Dict[str, SortedIndexReader],
+        readers_by_spec: Dict[IndexSpec, Dict[str, SortedIndexReader]],
         datasets: Dict[str, BinaryDataset],
     ) -> None:
         # ``members`` arrives alphabetical by qualified_name from
         # :meth:`discover`; keep that order for the public properties.
         self._members = members
-        self._sampler = MultiBinarySortedIndexSampler(readers)
+        # One sampler per spec; specs held in stable display order.
+        self._specs: List[IndexSpec] = sorted_specs(readers_by_spec.keys())
+        self._samplers: Dict[IndexSpec, MultiBinarySortedIndexSampler] = {
+            spec: MultiBinarySortedIndexSampler(readers_by_spec[spec])
+            for spec in self._specs
+        }
         self._datasets = datasets
         self._sessions: Dict[str, BinarySession] = {}
         self._stack = ExitStack()
@@ -91,47 +116,77 @@ class IndexedMemmapCollection:
         cls,
         memmap_dirs: Sequence[Path],
         *,
-        reduction: LengthReduction,
-        depth: int,
+        specs: Optional[Sequence[IndexSpec]] = None,
+        reduction: Optional[LengthReduction] = None,
+        depth: Optional[int] = None,
         vocab_manager: Optional[Any] = None,
         on_missing: MissingIndexPolicy = MissingIndexPolicy.RAISE,
     ) -> "IndexedMemmapCollection":
-        """Assemble the collection from ``memmap_dirs``.
+        """Assemble the collection from ``memmap_dirs`` for one or more specs.
+
+        Pass EITHER ``specs=[IndexSpec, ...]`` (one or more
+        ``(reduction, depth)`` pairs) OR the single-spec convenience
+        ``reduction=... depth=...`` -- exactly one form, never both nor
+        neither (:func:`._spec.normalize_specs` validates this boundary;
+        duplicate specs raise). Membership is uniform across specs: a
+        binary missing any spec's ``.idx`` is excluded from the whole
+        collection per ``on_missing``.
 
         Delegates the filesystem discovery + cross-directory naming +
         per-member reader/dataset construction to
-        :func:`discover_members`; missing ``(reduction, depth)`` indices
-        are handled per ``on_missing``.
+        :func:`discover_members`.
         """
-        members, readers, datasets = discover_members(
+        resolved_specs = normalize_specs(specs, reduction, depth)
+        members, readers_by_spec, datasets = discover_members(
             memmap_dirs,
-            reduction=reduction,
-            depth=depth,
+            specs=resolved_specs,
             vocab_manager=vocab_manager,
             on_missing=on_missing,
         )
-        return cls(members, readers, datasets)
+        return cls(members, readers_by_spec, datasets)
 
     # ------------------------------------------------------------------
     # Static surface
     # ------------------------------------------------------------------
     @property
     def members(self) -> List[CollectionMember]:
-        """Discovered members, alphabetical by ``qualified_name``."""
+        """Discovered members, alphabetical by ``qualified_name``.
+
+        Spec-independent: every member carries the ``.idx`` for every
+        configured spec.
+        """
         return list(self._members)
 
     @property
     def binary_names(self) -> List[str]:
-        """Qualified names, alphabetical (the sampler's ``binary_id`` map)."""
-        return self._sampler.binary_names
+        """Qualified names, alphabetical (the ``binary_id`` reverse map).
 
-    def count_at(self, target_length: int) -> int:
+        Spec-independent (membership is uniform across specs).
+        """
+        return [m.qualified_name for m in self._members]
+
+    @property
+    def specs(self) -> List[IndexSpec]:
+        """Configured specs in stable order (by ``(filename_tag, depth)``)."""
+        return list(self._specs)
+
+    def _sampler_for(
+        self, spec: Optional[IndexSpec]
+    ) -> MultiBinarySortedIndexSampler:
+        """Resolve ``spec`` and return its sampler (one helper for all four)."""
+        return self._samplers[resolve_spec(spec, self._specs)]
+
+    def count_at(
+        self, target_length: int, *, spec: Optional[IndexSpec] = None
+    ) -> int:
         """Corpus-wide pool size at the exact ``target_length`` bucket."""
-        return self._sampler.count_at(target_length)
+        return self._sampler_for(spec).count_at(target_length)
 
-    def count_in_band(self, lo: int, hi: int) -> int:
+    def count_in_band(
+        self, lo: int, hi: int, *, spec: Optional[IndexSpec] = None
+    ) -> int:
         """Corpus-wide pool size for lengths in ``[lo, hi]`` inclusive."""
-        return self._sampler.count_in_band(lo, hi)
+        return self._sampler_for(spec).count_in_band(lo, hi)
 
     # ------------------------------------------------------------------
     # Sampling
@@ -143,10 +198,11 @@ class IndexedMemmapCollection:
         rng: np.random.Generator,
         *,
         band: Optional[Tuple[int, int]] = None,
+        spec: Optional[IndexSpec] = None,
     ) -> List[MultiBinarySectionPointer]:
-        """Unbiased cross-corpus sample (delegates to the sampler)."""
+        """Unbiased cross-corpus sample from ``spec``'s pool (delegates)."""
         self._check_open()
-        return self._sampler.sample_section_pointers(
+        return self._sampler_for(spec).sample_section_pointers(
             target_length, count, rng, band=band,
         )
 
@@ -166,15 +222,17 @@ class IndexedMemmapCollection:
         variant_padding: VariantPadding = VariantPadding.PAD_NULL,
         inlined_equivalent_call_targets_only: bool = False,
         include_fid_sidecar: bool = False,
+        spec: Optional[IndexSpec] = None,
     ) -> MultiBinaryBatchDecodeResult:
-        """Sample ``batch_size`` pointers and decode them across the corpus.
+        """Sample ``batch_size`` pointers from ``spec`` and decode them.
 
-        Samples via the internal unbiased sampler (with ``band``
+        Samples via ``spec``'s unbiased sampler (with ``band``
         threading), opens (lazily, reusing already-open ones) one
-        persistent session per sampled binary, and decodes via
-        :func:`decode_pointer_batch` -- the per-call session lifecycle of
-        :func:`open_length_bucketed_batch` is replaced here by sessions
-        that persist across calls until :meth:`close`.
+        persistent session per sampled binary -- SHARED across every spec
+        -- and decodes via :func:`decode_pointer_batch`. The per-call
+        session lifecycle of :func:`open_length_bucketed_batch` is
+        replaced here by sessions that persist across calls until
+        :meth:`close`.
 
         Raises
         ------
@@ -185,7 +243,7 @@ class IndexedMemmapCollection:
             ``target_length`` or across the whole ``band``).
         """
         self._check_open()
-        pointers = self._sampler.sample_section_pointers(
+        pointers = self._sampler_for(spec).sample_section_pointers(
             target_length, batch_size, rng, band=band,
         )
         if not pointers:

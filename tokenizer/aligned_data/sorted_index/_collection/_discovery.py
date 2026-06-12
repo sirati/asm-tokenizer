@@ -1,8 +1,9 @@
 """Discovery + cross-directory naming for the collection layer.
 
-Single concern: *given a set of memmap directories + a (reduction,
-depth) request, resolve the kept :class:`CollectionMember` list (with
-unbiased-exclusion accounting) plus the per-member readers + datasets.*
+Single concern: *given a set of memmap directories + a list of
+:class:`IndexSpec` requests, resolve the kept :class:`CollectionMember`
+list (with unbiased-exclusion accounting) plus the per-spec per-member
+readers + the shared per-member datasets.*
 
 Two orthogonal discovery questions are answered here by reuse, NOT by
 restating any grammar:
@@ -13,6 +14,15 @@ restating any grammar:
 * "which binaries physically exist" is the ``<binary>_index.bin``
   presence rule (:func:`_existing_binaries`) -- the unmatched-arm
   sidecar shares the suffix tail and is excluded.
+
+Membership is spec-INDEPENDENT and uniform across every requested spec:
+a binary is kept iff it carries the ``.idx`` for EVERY spec. A binary
+missing any spec's index is excluded from the WHOLE collection (all
+specs), per :class:`MissingIndexPolicy`. This keeps ``members`` /
+qualified naming / sessions collection-level so the per-spec sampling
+pools differ only in their lengths, never in their population --
+mixed membership would silently shrink one spec's universe relative to
+another's (a sampling bias).
 
 The cross-directory naming rule (unique names stay bare; colliding
 names are qualified by directory; same-``dir.name`` collisions are
@@ -28,8 +38,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 
 from .._reader import SortedIndexReader, discover_indices
-from .._types import LengthReduction
+from .._types import IndexSpec, LengthReduction
 from ._member import CollectionMember, MissingIndexPolicy
+from ._spec import spec_tag
 
 
 __all__ = ["discover_members"]
@@ -126,8 +137,8 @@ def _qualify_names(
     return qualified
 
 
-def _idx_path(memmap_dir: Path, binary_name: str, reduction, depth: int) -> Path:
-    """Canonical sorted-index path for ``(binary, reduction, depth)``.
+def _idx_path(memmap_dir: Path, binary_name: str, spec: IndexSpec) -> Path:
+    """Canonical sorted-index path for ``(binary, spec)``.
 
     Mirrors the grammar :func:`write_sorted_index_files` stamps; the
     presence of this exact file was already confirmed in discovery, so
@@ -135,47 +146,74 @@ def _idx_path(memmap_dir: Path, binary_name: str, reduction, depth: int) -> Path
     """
     return (
         memmap_dir
-        / f"{binary_name}_sorted_{reduction.filename_tag()}_d{depth:03d}.idx"
+        / f"{binary_name}_sorted_{spec.reduction.filename_tag()}"
+        f"_d{spec.depth:03d}.idx"
     )
 
 
 def discover_members(
     memmap_dirs: Sequence[Path],
     *,
-    reduction: LengthReduction,
-    depth: int,
+    specs: Sequence[IndexSpec],
     vocab_manager: Optional[Any],
     on_missing: MissingIndexPolicy,
 ) -> Tuple[
     List[CollectionMember],
-    Dict[str, SortedIndexReader],
+    Dict[IndexSpec, Dict[str, SortedIndexReader]],
     Dict[str, BinaryDataset],
 ]:
-    """Resolve kept members + their readers + (unopened) datasets.
+    """Resolve kept members + their per-spec readers + (unopened) datasets.
 
     For each directory, a binary EXISTS iff its matched-arm
-    ``<binary>_index.bin`` is present. For each existing binary the
-    ``.idx`` matching ``(reduction.filename_tag(), depth)`` must exist
-    (via :func:`discover_indices`). Missing pairs are handled per
-    ``on_missing`` (RAISE: one :class:`ValueError` listing all; SKIP: an
-    ERROR log per excluded binary, then exclude). Returns the
+    ``<binary>_index.bin`` is present. A binary is KEPT iff, for EVERY
+    requested :class:`IndexSpec`, its ``.idx`` matching
+    ``(reduction.filename_tag(), depth)`` exists (via
+    :func:`discover_indices`). A binary missing ANY spec's index is
+    excluded from the WHOLE collection -- membership is uniform across
+    specs. Missing ``(dir, binary, spec)`` triples are handled per
+    ``on_missing`` (RAISE: one :class:`ValueError` listing every triple;
+    SKIP: one ERROR log per excluded binary naming exactly which specs
+    were missing, then exclude). Returns the
     alphabetical-by-``qualified_name`` member list plus the
-    ``{qualified_name -> SortedIndexReader}`` and
-    ``{qualified_name -> BinaryDataset}`` maps the collection wires into
-    its sampler + session machinery.
+    ``{IndexSpec -> {qualified_name -> SortedIndexReader}}`` per-spec
+    reader maps and the shared ``{qualified_name -> BinaryDataset}`` map
+    the collection wires into its per-spec samplers + shared session
+    machinery.
     """
+    # Cache the per-(dir, depth) discovery so a multi-spec request over
+    # the same depth scans each directory once per distinct depth.
+    discovery_cache: Dict[Tuple[Path, int], Dict[str, List[LengthReduction]]]
+    discovery_cache = {}
+
+    def _indices_for(memmap_dir: Path, depth: int) -> Dict[str, List[LengthReduction]]:
+        key = (memmap_dir, depth)
+        cached = discovery_cache.get(key)
+        if cached is None:
+            cached = discover_indices(memmap_dir, depth=depth)
+            discovery_cache[key] = cached
+        return cached
+
     kept: List[Tuple[Path, str]] = []
-    missing: List[Tuple[Path, str]] = []
+    # ``{(dir, binary) -> [missing spec, ...]}`` -- a binary present in
+    # this map is excluded; its value lists exactly which specs it lacks.
+    missing: Dict[Tuple[Path, str], List[IndexSpec]] = {}
     for memmap_dir in memmap_dirs:
         memmap_dir = Path(memmap_dir)
-        by_binary = discover_indices(memmap_dir, depth=depth)
         for binary_name in _existing_binaries(memmap_dir):
-            if _has_index(by_binary.get(binary_name), reduction):
-                kept.append((memmap_dir, binary_name))
+            lacked = [
+                spec
+                for spec in specs
+                if not _has_index(
+                    _indices_for(memmap_dir, spec.depth).get(binary_name),
+                    spec.reduction,
+                )
+            ]
+            if lacked:
+                missing[(memmap_dir, binary_name)] = lacked
             else:
-                missing.append((memmap_dir, binary_name))
+                kept.append((memmap_dir, binary_name))
 
-    _handle_missing(missing, reduction=reduction, depth=depth, on_missing=on_missing)
+    _handle_missing(missing, on_missing=on_missing)
 
     qualified = _qualify_names(kept)
     members: List[CollectionMember] = [
@@ -188,49 +226,57 @@ def discover_members(
     ]
     members.sort(key=lambda m: m.qualified_name)
 
-    readers: Dict[str, SortedIndexReader] = {}
+    readers_by_spec: Dict[IndexSpec, Dict[str, SortedIndexReader]] = {
+        spec: {} for spec in specs
+    }
     datasets: Dict[str, BinaryDataset] = {}
     for member in members:
-        readers[member.qualified_name] = SortedIndexReader(
-            _idx_path(member.memmap_dir, member.binary_name, reduction, depth),
-            reduction=reduction,
-            depth=depth,
-        )
+        for spec in specs:
+            readers_by_spec[spec][member.qualified_name] = SortedIndexReader(
+                _idx_path(member.memmap_dir, member.binary_name, spec),
+                reduction=spec.reduction,
+                depth=spec.depth,
+            )
         datasets[member.qualified_name] = BinaryDataset(
             member.memmap_dir,
             member.binary_name,
             vocab_manager=vocab_manager,
         )
-    return members, readers, datasets
+    return members, readers_by_spec, datasets
 
 
 def _handle_missing(
-    missing: List[Tuple[Path, str]],
+    missing: Dict[Tuple[Path, str], List[IndexSpec]],
     *,
-    reduction: LengthReduction,
-    depth: int,
     on_missing: MissingIndexPolicy,
 ) -> None:
-    """Apply ``on_missing`` to the excluded ``(dir, binary)`` pairs."""
+    """Apply ``on_missing`` to the excluded ``(dir, binary) -> [spec]`` map.
+
+    RAISE lists every missing ``(dir, binary, spec-tag)`` triple in one
+    :class:`ValueError`; SKIP emits one ERROR record per excluded binary
+    naming exactly which spec(s) it lacked (the exclusion drops the
+    binary from ALL specs, which is a sampling bias and must be LOUD).
+    """
     if not missing:
         return
+    ordered = sorted(missing.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
     if on_missing is MissingIndexPolicy.RAISE:
         listing = ", ".join(
-            f"({d}, {b})"
-            for d, b in sorted(missing, key=lambda p: (str(p[0]), p[1]))
+            f"({d}, {b}, {spec_tag(spec)})"
+            for (d, b), specs in ordered
+            for spec in specs
         )
         raise ValueError(
-            "IndexedMemmapCollection.discover: missing sorted-index file "
-            f"for reduction={reduction.filename_tag()!r} depth={depth} in: "
-            f"{listing}",
+            "IndexedMemmapCollection.discover: missing sorted-index file(s) "
+            f"in: {listing}",
         )
-    for d, b in missing:  # SKIP_WITH_ERROR_LOG
+    for (d, b), specs in ordered:  # SKIP_WITH_ERROR_LOG
+        tags = ", ".join(spec_tag(spec) for spec in specs)
         _LOGGER.error(
-            "IndexedMemmapCollection: excluding binary %r in %s -- no "
-            "sorted-index for reduction=%s depth=%d (this is a sampling "
-            "bias)",
+            "IndexedMemmapCollection: excluding binary %r in %s from the "
+            "whole collection -- no sorted-index for spec(s) %s (this is a "
+            "sampling bias)",
             b,
             d,
-            reduction.filename_tag(),
-            depth,
+            tags,
         )
