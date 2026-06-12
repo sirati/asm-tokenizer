@@ -46,13 +46,19 @@ import math
 
 def compute_processor_cap(machine_cores: int, workers_per_node: int) -> int:
     """Return the per-worker processor cap = ``ceil(machine_cores /
-    workers_per_node)``, floored at 1.
+    workers_per_node)``, floored at 2.
 
     Ceiling division (not floor) so the aggregate cap across all workers
     is at least the machine width — under-provisioning every worker would
-    leave cores idle. The floor at 1 guards degenerate inputs (a single
-    detected core split across many workers still gets one processor;
-    ``availableProcessors()`` may never report 0).
+    leave cores idle.
+
+    The floor is 2, not 1: ``-XX:ActiveProcessorCount=1`` puts the whole
+    JVM into single-processor mode — SerialGC, no parallel JIT, every
+    derived pool at size 1 — which costs far more wall-clock per task
+    than the one extra logical thread of oversubscription it avoids
+    (observed on 14-core/14-worker LMU nodes, where the quotient is 1).
+    The worker-side nice offset already bounds the contention damage of
+    the resulting <=2x logical oversubscription.
 
     Raises ``ValueError`` on non-positive inputs: a caller that cannot
     determine a real ``workers_per_node`` must fall back to NO cap rather
@@ -64,7 +70,7 @@ def compute_processor_cap(machine_cores: int, workers_per_node: int) -> int:
         raise ValueError(
             f"workers_per_node must be positive, got {workers_per_node}"
         )
-    return max(1, math.ceil(machine_cores / workers_per_node))
+    return max(2, math.ceil(machine_cores / workers_per_node))
 
 
 def processor_cap_vmargs(cap: int) -> tuple[str, ...]:

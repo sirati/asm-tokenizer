@@ -3,7 +3,7 @@
 Two boundaries are covered without booting a real JVM:
 
 1. ``tokenizer.disasm.ghidra_provider.jvm_processor_cap`` — the pure
-   cap computation (ceil division, floor-at-1, bad-input rejection) and
+   cap computation (ceil division, floor-at-2, bad-input rejection) and
    the flag rendering.
 2. ``tokenizer.disasm.ghidra_provider.provider._ensure_jvm_started`` —
    that the rendered cap flags ride into the launcher's ``add_vmargs``
@@ -39,9 +39,10 @@ from tokenizer.disasm.ghidra_provider.jvm_processor_cap import (
         (32, 4, 8),  # exact division
         (32, 5, 7),  # ceil(32/5) = 7, not 6 — aggregate >= machine width
         (32, 7, 5),  # ceil(32/7) = 5
-        (32, 32, 1),  # one core each
-        (32, 64, 1),  # more workers than cores → floor at 1
-        (1, 8, 1),  # single-core box, many workers → floor at 1
+        (32, 32, 2),  # quotient 1 → floor at 2 (ActiveProcessorCount=1 is SerialGC mode)
+        (32, 64, 2),  # more workers than cores → floor at 2
+        (1, 8, 2),  # single-core box, many workers → floor at 2
+        (14, 14, 2),  # the LMU Krater shape that exposed the floor-at-1 pathology
         (7, 2, 4),  # ceil(7/2) = 4
     ],
 )
@@ -51,9 +52,10 @@ def test_compute_processor_cap_ceil_and_floor(
     assert compute_processor_cap(machine_cores, workers_per_node) == expected
 
 
-def test_compute_processor_cap_never_below_one() -> None:
-    # Extreme oversubscription still yields a usable per-worker count.
-    assert compute_processor_cap(2, 1000) == 1
+def test_compute_processor_cap_never_below_two() -> None:
+    # Extreme oversubscription still yields a JVM-viable per-worker count;
+    # 1 would mean SerialGC + no parallel JIT for the whole JVM.
+    assert compute_processor_cap(2, 1000) == 2
 
 
 @pytest.mark.parametrize("bad", [0, -1, -32])
