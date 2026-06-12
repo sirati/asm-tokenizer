@@ -30,7 +30,6 @@ from dedup_hashmap import HashMapU32U16
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk import (
-    COUNTER_CATEGORIES,
     FUNCTION_CATEGORIES,
     _CATEGORY_TO_SHIFTED_ID,
     apply_per_row_remap,
@@ -246,10 +245,6 @@ def _make_stage3_variant_from_calls(
         ),
         total_surviving_identity_count=0,
         total_surviving_number_chunk_count=0,
-    )
-    stage2_section = Stage2Section(
-        stage1=stage1_section,
-        variants=[stage2_variant],
     )
 
     stage3_variant = Stage3Variant(
