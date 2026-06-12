@@ -1,3 +1,5 @@
+import logging
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Iterable, Protocol, Tuple
@@ -42,6 +44,8 @@ from tokenizer.disasm.types import (
     X86BranchHint,
     X86Segment,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 class MetadataLookup(Protocol):
@@ -168,3 +172,53 @@ def get_disassembly_provider(
             debug_render=debug_render,
         )
     raise ValueError(f"Unsupported disassembly backend: {backend}")
+
+
+def configure_worker_jvm_processor_cap(workers_per_node: int | None) -> None:
+    """Size this worker's disassembly JVM to its fair share of the node.
+
+    The worker entry point calls this ONCE at startup (before any
+    provider is constructed) with the per-node worker count the dispatch
+    runs with. Each worker's Ghidra JVM is then capped to
+    ``ceil(machine_cores / workers_per_node)`` processors so a node
+    running ``workers_per_node`` workers stops oversubscribing the CPU at
+    ``workers_per_node × machine_width`` (the production starvation
+    incident: every worker's JVM sized its analysis pools from the full
+    host core count).
+
+    ``workers_per_node is None`` (the dispatch exposed no worker count)
+    OR an undetectable machine core count → NO cap, with a single WARN —
+    never crash. ``machine_cores`` is ``os.cpu_count()`` (the container
+    sees the host CPUs).
+
+    The cap is a Ghidra-only knob (angr sizes nothing from
+    ``availableProcessors``); the install delegates to the Ghidra
+    provider's process-global JVM-startup config. This stays the single
+    consumer-facing surface so the worker never reaches into the
+    backend-specific submodule.
+    """
+    from tokenizer.disasm.ghidra_provider.jvm_processor_cap import (
+        compute_processor_cap,
+    )
+    from tokenizer.disasm.ghidra_provider.provider import set_processor_cap
+
+    machine_cores = os.cpu_count()
+    if workers_per_node is None or machine_cores is None or machine_cores <= 0:
+        _logger.warning(
+            "JVM processor cap disabled (workers_per_node=%r, "
+            "machine_cores=%r); Ghidra sizes its thread pools from the "
+            "full host width — expect CPU oversubscription when multiple "
+            "workers share a node.",
+            workers_per_node,
+            machine_cores,
+        )
+        set_processor_cap(None)
+        return
+    cap = compute_processor_cap(machine_cores, workers_per_node)
+    _logger.info(
+        "JVM processor cap = %d (machine_cores=%d / workers_per_node=%d)",
+        cap,
+        machine_cores,
+        workers_per_node,
+    )
+    set_processor_cap(cap)

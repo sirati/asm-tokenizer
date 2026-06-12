@@ -18,6 +18,7 @@ from typing import Any, Iterable, Optional
 
 from tokenizer.disasm import DisassemblyProvider, MetadataLookup
 from tokenizer.disasm.ghidra_provider.decode_helper import _GhidraDecodeHelper
+from tokenizer.disasm.ghidra_provider.jvm_processor_cap import processor_cap_vmargs
 from tokenizer.disasm.ghidra_provider.metadata_lookup import GhidraMetadataLookup
 from tokenizer.disasm.ghidra_provider.mnemonic import (
     _GHIDRA_MNEMONIC_ALIASES,
@@ -64,6 +65,31 @@ _GHIDRA_JVM_VMARGS = (
 )
 
 
+# Per-worker JVM processor-cap vmargs (see ``jvm_processor_cap``). The
+# worker entry point computes the cap from its ``--cores`` arg ONCE at
+# startup and installs the rendered flags here via
+# ``set_processor_cap_vmargs`` before any provider is constructed; the
+# JVM boots once per worker process, so the cap is a process-global
+# set-once concern, not a per-task one. Default empty = NO cap (the
+# pre-cap behaviour), so standalone ``--single`` / ``--batch`` runs and
+# any caller that cannot determine ``workers_per_node`` get the full
+# machine width unchanged.
+_PROCESSOR_CAP_VMARGS: tuple[str, ...] = ()
+
+
+def set_processor_cap(cap: int | None) -> None:
+    """Install (or clear) the per-worker JVM processor cap.
+
+    ``cap`` is the resolved per-worker processor count; ``None`` clears
+    the cap (no flags injected → full machine width, the pre-cap
+    behaviour). Must be called before the first provider is constructed —
+    once the JVM is up, ``_ensure_jvm_started`` short-circuits and a later
+    cap change has no effect (the JVM is process-global per worker).
+    """
+    global _PROCESSOR_CAP_VMARGS
+    _PROCESSOR_CAP_VMARGS = () if cap is None else processor_cap_vmargs(cap)
+
+
 def _ensure_jvm_started() -> None:
     """Idempotently boot the Ghidra JVM with our vmargs injected.
 
@@ -72,13 +98,18 @@ def _ensure_jvm_started() -> None:
     internally and gives no hook to add vmargs. Routing every provider
     through this helper keeps the vmargs configuration in one place and
     preserves the original ``pyghidra.started()`` short-circuit.
+
+    The per-worker processor-cap flags (``_PROCESSOR_CAP_VMARGS``, set by
+    ``set_processor_cap``) ride alongside the static GC tuning so the
+    JVM and Ghidra size their thread pools from the capped processor
+    count rather than the full host width.
     """
     import pyghidra
 
     if pyghidra.started():
         return
     launcher = pyghidra.HeadlessPyGhidraLauncher()
-    launcher.add_vmargs(*_GHIDRA_JVM_VMARGS)
+    launcher.add_vmargs(*_GHIDRA_JVM_VMARGS, *_PROCESSOR_CAP_VMARGS)
     launcher.start()
 
 
