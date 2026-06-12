@@ -27,13 +27,11 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
-
 from ._sections_bin_walk import (
     read_sections_bin_blob,
     resolve_func_name_or_raise,
     unmatched_region_start,
-    walk_section_starts,
+    walk_parsed_sections,
 )
 
 
@@ -61,12 +59,13 @@ def _walk_unmatched_sections(
             np.zeros(0, dtype=np.int64),
         )
     raw, blob = read_sections_bin_blob(sections_bin)
-    # Structural walk (pure section starts) is shared with the
-    # realized-lengths pass; the name + variant-count resolution below
-    # is this loader's own concern, layered on top per section.
-    section_starts = walk_section_starts(blob, region_start)
-    for cursor in section_starts:
-        section, _next = parse_section_bin(blob, cursor)
+    # The structural walk (shared with the realized-lengths pass) parses
+    # each section once and threads the parsed ``Section`` out; the name +
+    # variant-count resolution below is this loader's own concern, layered
+    # on top of that single parse -- never a re-parse.
+    section_starts: List[int] = []
+    for cursor, section in walk_parsed_sections(blob, region_start):
+        section_starts.append(cursor)
         func_names.append(
             resolve_func_name_or_raise(
                 section.function_name_ptr, line_to_name,

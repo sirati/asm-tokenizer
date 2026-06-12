@@ -33,12 +33,12 @@ refuses to own.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, Tuple
 
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
-from tokenizer.aligned_data.matched_sections_bin import parse_section_bin
+from tokenizer.aligned_data.matched_sections_bin import Section, parse_section_bin
 from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
     assert_matched_sections_prelude,
@@ -61,27 +61,36 @@ def read_sections_bin_blob(path: Path) -> Tuple[bytes, memoryview]:
     return raw, memoryview(raw)
 
 
-def walk_section_starts(blob: memoryview, region_start: int) -> List[int]:
-    """Byte offsets of every section in ``[region_start, EOF)``, in order.
+def walk_parsed_sections(
+    blob: memoryview, region_start: int
+) -> Iterator[Tuple[int, Section]]:
+    """Yield ``(start, Section)`` for every section in ``[region_start, EOF)``.
 
     The pure structural walk: it streams sections via
-    :func:`...matched_sections_bin.parse_section_bin` from
-    ``region_start`` to the end of ``blob`` and records each section's
-    start offset, owning NO name-resolution concern. Callers needing the
-    resolved function name layer it on top (see the unmatched-arm
-    loader); callers needing only the variant geometry (the
-    realized-lengths pass) feed the returned starts straight into the
-    columnar parser. ``blob`` is the whole-file memoryview from
-    :func:`read_sections_bin_blob` so the offsets are absolute.
+    :func:`...matched_sections_bin.parse_section_bin` from ``region_start``
+    to the end of ``blob`` and yields, in catalog order, each section's
+    absolute start offset PAIRED WITH the ``Section`` the walk already
+    parsed to find the next boundary. The walk owns the parse; it threads
+    the result out rather than discarding it, so a consumer needing the
+    section's fields (the unmatched-arm loader reads
+    ``function_name_ptr`` + ``variants``) reuses this single parse instead
+    of re-parsing every section. Consumers needing only the start offsets
+    (the realized-lengths pass feeds them to the columnar parser) ignore
+    the second element. ``parse_section_bin`` therefore runs exactly once
+    per section per pass.
+
+    The walk owns NO name-resolution concern. ``blob`` is the whole-file
+    memoryview from :func:`read_sections_bin_blob` so the offsets are
+    absolute. As a generator each section is parsed lazily as the consumer
+    pulls it, so a one-shot consumer never holds more than the current
+    ``Section`` live.
     """
-    starts: List[int] = []
     end = len(blob)
     cursor = region_start
     while cursor < end:
-        _section, next_cursor = parse_section_bin(blob, cursor)
-        starts.append(cursor)
+        section, next_cursor = parse_section_bin(blob, cursor)
+        yield cursor, section
         cursor = next_cursor
-    return starts
 
 
 def resolve_func_name_or_raise(
