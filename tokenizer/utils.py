@@ -104,9 +104,14 @@ def filter_queue(lines: list[str], out_dir: str = "out", source_dir: str = "src"
 
         try:
             relative_path = binary_full_path.relative_to(source_path)
-        except ValueError:
-            print(f"[!] Skipping non-source path: {binary_path}")
-            continue
+        except ValueError as e:
+            # A queue line outside the source root is an operator/config
+            # error, not an already-done skip. Silently dropping it would
+            # let a batch run shrink to zero work and still exit success;
+            # surface it so the caller fails hard instead.
+            raise ValueError(
+                f"Queue path is not under the source root '{source_path}': {binary_path}"
+            ) from e
 
         output_csv = out_path / relative_path.parent / f"{binary_name}_output.csv"
 
