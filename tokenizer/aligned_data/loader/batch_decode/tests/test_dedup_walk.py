@@ -841,6 +841,110 @@ def test_fid_sidecar_default_off_returns_none():
     assert fid_row_offsets is None
 
 
+def test_non_call_target_identity_gets_dense_counter_and_unknown_fid():
+    """A call_target whose body references MORE distinct PLT identities
+    than it has PLT call_targets rows.
+
+    The encoder's per-Category ``get_identity`` counter numbers every
+    distinct referenced address (calls AND data-referenced function
+    pointers), so the in-stream caller-local id domain is a SUPERSET of
+    the name-deduped, call-only call_targets table. Here the root has
+    two PLT call_targets (caller-local PLT ids 0, 1) but references a
+    THIRD PLT identity (caller-local id 2) that is a pure data-ref with
+    no call_targets row. The id-2 reference must still get a dense
+    counter (no IndexError) and an UNKNOWN-FID (0) sidecar entry.
+    """
+    root = _CallTargetBuild(
+        fid=100,
+        encounter_category=Category.LOCAL_FUNC,
+        # Three in-stream PLT references: caller-local ids 0, 1 (call
+        # targets) and 2 (data-ref, beyond K=2).
+        in_stream_caller_local_ids=[0, 1, 2],
+        in_stream_categories=[
+            Category.PLT_FUNC,
+            Category.PLT_FUNC,
+            Category.PLT_FUNC,
+        ],
+        section_call_targets=[
+            (300, CallTargetType.PLT),  # caller-local PLT 0
+            (301, CallTargetType.PLT),  # caller-local PLT 1
+        ],
+        counter_counts={},
+    )
+    stage3_variant, identities, slices = _make_stage3_variant_from_calls(
+        [root], batch_idx=0
+    )
+    stage3_batch = _wrap_variant_into_batch(
+        stage3_variant, identities, batch_size=1
+    )
+
+    _, fid_sidecar, fid_row_offsets, fid_per_category_counts = (
+        apply_per_row_remap(
+            stage3_batch,
+            dedup_maps=_make_dedup_maps(),
+            collect_fid_sidecar=True,
+        )
+    )
+
+    # In-stream PLT caller-local ids 0/1/2 -> dense counters 0/1/2.
+    assert identities[slices[0].start + 1 : slices[0].stop].tolist() == [
+        0,
+        1,
+        2,
+    ]
+    assert fid_sidecar is not None
+    # PLT segment: counter 0 -> FID 300, counter 1 -> FID 301, counter 2
+    # (the data-ref) -> UNKNOWN FID 0. LOCAL has the root seed (100).
+    assert fid_sidecar.tolist() == [100, 300, 301, 0]
+    assert fid_row_offsets is not None
+    assert fid_row_offsets.tolist() == [0, 4]
+    # Per-Category counts (LOCAL, PLT, EXT): 1 LOCAL (root seed), 3 PLT
+    # (two call targets + one data-ref), 0 EXT.
+    assert fid_per_category_counts is not None
+    assert fid_per_category_counts[0].tolist() == [1, 3, 0]
+
+
+def test_category_with_zero_call_targets_carries_data_ref_identity():
+    """A FUNCTION Category with ZERO call_targets rows can still carry
+    in-stream identities — purely data-referenced addresses.
+
+    This is the ``K == 0`` edge of the non-call-target path: the root
+    has no PLT call_targets at all yet references one PLT identity
+    (caller-local id 0). It must remap to dense counter 0 with an
+    UNKNOWN-FID sidecar entry, NOT short-circuit to an unmapped /
+    sidecar-less slot.
+    """
+    root = _CallTargetBuild(
+        fid=100,
+        encounter_category=Category.LOCAL_FUNC,
+        in_stream_caller_local_ids=[0],
+        in_stream_categories=[Category.PLT_FUNC],
+        section_call_targets=[],  # K == 0 for every Category
+        counter_counts={},
+    )
+    stage3_variant, identities, slices = _make_stage3_variant_from_calls(
+        [root], batch_idx=0
+    )
+    stage3_batch = _wrap_variant_into_batch(
+        stage3_variant, identities, batch_size=1
+    )
+
+    _, fid_sidecar, fid_row_offsets, fid_per_category_counts = (
+        apply_per_row_remap(
+            stage3_batch,
+            dedup_maps=_make_dedup_maps(),
+            collect_fid_sidecar=True,
+        )
+    )
+
+    assert identities[slices[0].start + 1 : slices[0].stop].tolist() == [0]
+    assert fid_sidecar is not None
+    # LOCAL root seed (100) ++ PLT data-ref counter 0 -> UNKNOWN FID 0.
+    assert fid_sidecar.tolist() == [100, 0]
+    assert fid_per_category_counts is not None
+    assert fid_per_category_counts[0].tolist() == [1, 1, 0]
+
+
 def test_missing_dedup_map_raises():
     """The caller must supply one dedup_map per FUNCTION Category;
     omitting one is a wiring bug and surfaces as AssertionError."""

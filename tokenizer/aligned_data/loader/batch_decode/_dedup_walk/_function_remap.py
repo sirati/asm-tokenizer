@@ -37,6 +37,14 @@ if TYPE_CHECKING:
 __all__ = ["_remap_function_category"]
 
 
+# FID sentinel for a non-call-target FUNCTION identity (no
+# call_targets row, so no recoverable ``function_name_ptr``). FIDs are
+# 1-indexed line numbers into ``<binary>_function_names.txt``; 0 is the
+# natural "no name" sentinel, and the inspector's
+# ``line_to_name.get(fid, "?")`` renders it as ``"?"``.
+_UNKNOWN_FID: int = 0
+
+
 def _function_name_ptrs_per_category(
     call_targets_section: "list[CallTarget]",
     category: Category,
@@ -103,16 +111,19 @@ def _remap_function_category(
     fn_name_ptrs = _function_name_ptrs_per_category(
         stage1.call_targets_section, category
     )
-    K = int(fn_name_ptrs.size)
-    if K == 0:
-        # No in-stream tokens of this Category can exist when the
-        # call_targets table has no entries of this Category (the
-        # encoder would not have emitted any caller-local id of this
-        # Category).
-        return
 
-    # Batched lookup: returns the existing counter id per fn_name_ptr,
-    # or ``NOT_FOUND_U16`` for misses.
+    # Step 1 (UNCONDITIONAL when K > 0): mint counters for this
+    # call_target's K call-target FIDs into the dedup map. This is a
+    # load-bearing SIDE EFFECT independent of whether this call_target
+    # carries in-stream tokens of ``category``: the dedup map for
+    # ``category`` must hold the counter for every call-target FID so
+    # that (a) a later inlined callee's prepend self-counter is
+    # recoverable via ``dedup_map.lookup(callee.function_name_ptr)``
+    # (ALG-9, see :func:`_prepend_slot._write_prepend_slot`), and (b)
+    # subsequent call_targets in the same row dedup against it (ALG-3).
+    # ``K == 0`` (no call targets) makes ``remap_lookup`` empty and the
+    # mint block a no-op; the whole id domain is then handled by the
+    # extend step below.
     remap_lookup = dedup_map.lookup_ndarray(fn_name_ptrs)
     mask_remapped = remap_lookup != NOT_FOUND_U16
 
@@ -139,14 +150,14 @@ def _remap_function_category(
             fresh_fids = fn_name_ptrs[~mask_remapped]
             state.fid_inverse[category].extend(int(f) for f in fresh_fids)
 
-    # The dedup map for ``category`` now holds the counter for every
-    # FID in this category's call_targets_section. When we walk an
-    # inlined callee in encounter order, the callee's prepend
-    # self-counter is recoverable from this same map via
-    # ``dedup_map.lookup(callee.function_name_ptr)`` — no separate
-    # cache is needed.
-
-    # Apply the remap to this call_target's in-stream identity slice.
+    # Step 2 (GATED on in-stream tokens): apply the remap to this
+    # call_target's in-stream slice. A call_target that emits no
+    # identity token of ``category`` has nothing to rewrite — but the
+    # dedup-map population in step 1 still had to run above. Crucially
+    # the converse does NOT hold either: a Category with ZERO
+    # call_targets rows (``K == 0``) can still carry in-stream
+    # identities (purely data-referenced addresses, see the id-domain
+    # note below), so the gate is on the in-stream tokens, NOT on ``K``.
     in_stream_sl = slice(
         call_target.identity_slice.start + 1,
         call_target.identity_slice.stop,
@@ -158,9 +169,86 @@ def _remap_function_category(
     cat_mask = in_stream_token_ids == cat_token_id_shifted
     if not cat_mask.any():
         return
+
     target_view = identities_flat[in_stream_sl]
     # boolean fancy index returns a copy of caller-local ids; gather
     # the deduped counter ids via remap_lookup and write back through
     # the view to the underlying ``identities_flat`` array.
     selected = target_view[cat_mask]
+
+    # The caller-local id domain is the encoder's per-Category
+    # ``get_identity`` counter (TokenResolver), which numbers EVERY
+    # distinct referenced address of the Category in stream-encounter
+    # order — call targets AND addresses referenced only as data (a
+    # function pointer taken with ``lea`` / stored in a table / a
+    # name-collided second address). The call_targets table, by
+    # contrast, is name-deduped and call-only, so its ``K`` rows are a
+    # SUBSET of the id domain: ids ``>= K`` are legitimate identities
+    # that simply have no call-target row (mirrors the inspector's
+    # ``kind_to_called_idx[counter] -> None`` model — see
+    # ``inspector/_render/_batch_decode_backend/_callee_resolver.py``).
+    # The ``remap_lookup`` built above only covers ids ``[0, K)``, so
+    # extend it to cover the full id domain before the gather.
+    remap_lookup = _extend_remap_for_non_call_target_ids(
+        state, category, selected, remap_lookup
+    )
     target_view[cat_mask] = remap_lookup[selected]
+
+
+def _extend_remap_for_non_call_target_ids(
+    state: _RowState,
+    category: Category,
+    selected: np.ndarray,
+    remap_lookup: np.ndarray,
+) -> np.ndarray:
+    """Grow ``remap_lookup`` to cover non-call-target caller-local ids.
+
+    ``remap_lookup`` (length ``K``) maps the call-target-backed
+    caller-local ids ``[0, K)`` to their FID-deduped counter ids.
+    In-stream ids ``>= K`` are identities for addresses that were
+    referenced but never call targets, so they have no FID-backed row.
+    They still need a dense per-Category counter (the model-facing
+    output is a dense counter, not a FID), so each distinct such id in
+    this call_target gets a fresh counter minted from the same
+    ``next_fresh_id`` space the FID path uses — keeping the per-row
+    counter domain hole-free.
+
+    Their FID is unrecoverable at decode time (the call_targets BIN
+    table is name-deduped and call-only; the encoder's full
+    identity->FID metadata is not serialised), so the optional fid
+    sidecar records the ``UNKNOWN`` sentinel (FID 0); the inspector
+    renders these as ``"?"`` via ``line_to_name.get(fid, "?")``. This
+    is a defined, non-corrupting path — the counter is correct by
+    construction; only the human-readable callee name is unknown.
+
+    Returns ``remap_lookup`` unchanged when no id exceeds ``K`` (the
+    common case), else a grown copy indexable by every value in
+    ``selected``.
+    """
+    K = int(remap_lookup.size)
+    max_id = int(selected.max())
+    if max_id < K:
+        return remap_lookup
+
+    # The distinct non-call-target ids actually present in the stream,
+    # in ascending id order (deterministic counter assignment).
+    non_call_target_ids = np.unique(selected[selected >= K])
+
+    next_fresh_id = state.next_fresh_id[category]
+    grown = np.full(max_id + 1, NOT_FOUND_U16, dtype=np.uint16)
+    grown[:K] = remap_lookup
+    fresh_ids = np.arange(
+        non_call_target_ids.size, dtype=np.uint16
+    ) + np.uint16(next_fresh_id)
+    grown[non_call_target_ids] = fresh_ids.astype(np.uint16)
+    state.next_fresh_id[category] = next_fresh_id + int(
+        non_call_target_ids.size
+    )
+
+    # One UNKNOWN-FID (0) sidecar entry per freshly-minted counter,
+    # parallel to the FID path's ``fid_inverse`` extension above.
+    if state.fid_inverse is not None:
+        state.fid_inverse[category].extend(
+            [_UNKNOWN_FID] * int(non_call_target_ids.size)
+        )
+    return grown
