@@ -130,10 +130,15 @@ def _measure(data_u8: np.ndarray, unique_offsets: np.ndarray) -> np.ndarray:
         data_u8, unique_offsets.astype(np.int64)
     )
     body = bulk_contributing_body_lengths(data_u8, starts, counts)
-    if body.size and int(body.max()) > MAX_REALIZED_LENGTH:
+    # Raise BEFORE the uint32 cast (so the OverflowError surfaces the true
+    # value, never a wrapped one). ``0xFFFFFFFF`` is the reserved hashmap
+    # miss sentinel, so the largest storable length is ``MAX_REALIZED_LENGTH``
+    # (== 0xFFFFFFFE); any length >= the sentinel hard-errors, never clamps.
+    if body.size and int(body.max()) >= int(_U32_MISS):
         worst = int(body.max())
         raise OverflowError(
             f"realized length {worst} exceeds the u32 sidecar range "
-            f"({MAX_REALIZED_LENGTH}); the lengths sidecar cannot store it"
+            f"({MAX_REALIZED_LENGTH}); the lengths sidecar cannot store it "
+            f"(0xFFFFFFFF is reserved as the hashmap miss sentinel)"
         )
     return body.astype(np.uint32)

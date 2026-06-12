@@ -123,3 +123,38 @@ def test_empty_offsets_returns_empty(tmp_path) -> None:
     data_u8, _offsets = _lay_data_bin(tmp_path, [[300, 301]])
     out = realized_lengths_for_offsets(data_u8, np.zeros(0, dtype=np.int64))
     assert out.dtype == np.uint32 and out.size == 0
+
+
+def _force_length(monkeypatch, value: int) -> None:
+    """Make the bulk engine report ``value`` for every measured record.
+
+    Lets the boundary tests pin the overflow guard without laying a
+    multi-GB record; ``starts``/``counts`` shapes are preserved so the
+    rest of the compute path is exercised unchanged.
+    """
+
+    def fake_bulk(data, starts, counts):
+        return np.full(np.asarray(starts).size, value, dtype=np.int64)
+
+    monkeypatch.setattr(_compute, "bulk_contributing_body_lengths", fake_bulk)
+
+
+def test_max_storable_length_accepted(tmp_path, monkeypatch) -> None:
+    # 0xFFFFFFFE is the largest storable realized length (0xFFFFFFFF is
+    # reserved as the hashmap miss sentinel); it must round-trip, not raise.
+    data_u8, offsets = _lay_data_bin(tmp_path, [[300, 301, 302]])
+    _force_length(monkeypatch, 0xFFFFFFFE)
+    out = realized_lengths_for_offsets(
+        data_u8, np.array(offsets, dtype=np.int64)
+    )
+    assert out.dtype == np.uint32
+    assert int(out[0]) == 0xFFFFFFFE
+
+
+def test_sentinel_length_raises_overflow(tmp_path, monkeypatch) -> None:
+    # Exactly 0xFFFFFFFF (the reserved miss sentinel) must hard-error
+    # BEFORE the uint32 cast, never clamp.
+    data_u8, offsets = _lay_data_bin(tmp_path, [[300, 301, 302]])
+    _force_length(monkeypatch, 0xFFFFFFFF)
+    with pytest.raises(OverflowError):
+        realized_lengths_for_offsets(data_u8, np.array(offsets, dtype=np.int64))

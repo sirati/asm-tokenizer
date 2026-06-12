@@ -73,9 +73,14 @@ LENGTH_DTYPE = np.dtype("<u4")
 #: CSR jump-table element dtype: per-section element offsets into the body.
 CSR_DTYPE = np.dtype("<u4")
 
-#: Largest realized length the ``u32`` body can carry. The generator
-#: hard-errors (never clamps) on overflow.
-MAX_REALIZED_LENGTH: int = (1 << 32) - 1
+#: Largest realized length the ``u32`` body can carry. Capped one below
+#: the full ``u32`` range because ``0xFFFFFFFF`` is RESERVED as the
+#: ``HashMapU64U32`` vectorized-miss sentinel (see ``_compute._U32_MISS``):
+#: a stored length of ``0xFFFFFFFF`` would be indistinguishable from a
+#: hashmap miss, so dedup would silently re-measure it every chunk and the
+#: overflow guard could never fire for it. The generator hard-errors
+#: (never clamps) on overflow.
+MAX_REALIZED_LENGTH: int = (1 << 32) - 2
 
 
 @dataclass(frozen=True)
