@@ -208,3 +208,67 @@ def assert_matched_sections_prelude(prelude: bytes, *, path: str = "") -> None:
     assert_bin_prelude(
         prelude, expected_magic=MATCHED_SECTIONS_BIN_PRELUDE_MAGIC, path=path
     )
+
+
+# 16-byte file-level prelude written at the start of every
+# ``<binary>_lengths.bin`` / ``<binary>_unmatched_lengths.bin`` (the
+# realized-token-length sidecars). Layout (little-endian):
+#
+#     bytes 0..3   : magic = b"RLEN"
+#     bytes 4..7   : u32 MEMMAP_FORMAT_VERSION
+#     bytes 8..15  : reserved (zero)
+#
+# Body after the prelude: a flat ``u32`` array of realized record-body
+# lengths (one per (section, variant), section-major, variants in
+# catalog order). See :mod:`.realized_lengths._format` for the body /
+# CSR jump-table dtype contract.
+REALIZED_LENGTHS_BIN_PRELUDE_MAGIC: bytes = b"RLEN"
+REALIZED_LENGTHS_BIN_PRELUDE_SIZE: int = _PRELUDE_SIZE
+
+
+def encode_realized_lengths_prelude() -> bytes:
+    """Return the 16-byte prelude bytes for a fresh ``<binary>_lengths.bin``."""
+    return encode_bin_prelude(REALIZED_LENGTHS_BIN_PRELUDE_MAGIC)
+
+
+def assert_realized_lengths_prelude(prelude: bytes, *, path: str = "") -> None:
+    """Raise ``ValueError`` if ``prelude`` is not a valid lengths.bin prelude.
+
+    Same single-chokepoint policy as :func:`assert_data_bin_prelude`.
+    """
+    assert_bin_prelude(
+        prelude, expected_magic=REALIZED_LENGTHS_BIN_PRELUDE_MAGIC, path=path
+    )
+
+
+# 16-byte file-level prelude written at the start of every
+# ``<binary>_lengths_index.bin`` / ``<binary>_unmatched_lengths_index.bin``
+# (the per-section CSR jump table for the realized-length sidecars).
+# Layout (little-endian):
+#
+#     bytes 0..3   : magic = b"RLIX"
+#     bytes 4..7   : u32 MEMMAP_FORMAT_VERSION
+#     bytes 8..15  : reserved (zero)
+#
+# Body after the prelude: ``n_sections + 1`` ``u32`` CSR entries (element
+# offsets into the paired ``_lengths.bin`` body). See
+# :mod:`.realized_lengths._format`.
+REALIZED_LENGTHS_INDEX_BIN_PRELUDE_MAGIC: bytes = b"RLIX"
+REALIZED_LENGTHS_INDEX_BIN_PRELUDE_SIZE: int = _PRELUDE_SIZE
+
+
+def encode_realized_lengths_index_prelude() -> bytes:
+    """Return the 16-byte prelude bytes for a fresh ``<binary>_lengths_index.bin``."""
+    return encode_bin_prelude(REALIZED_LENGTHS_INDEX_BIN_PRELUDE_MAGIC)
+
+
+def assert_realized_lengths_index_prelude(prelude: bytes, *, path: str = "") -> None:
+    """Raise ``ValueError`` if ``prelude`` is not a valid lengths_index.bin prelude.
+
+    Same single-chokepoint policy as :func:`assert_data_bin_prelude`.
+    """
+    assert_bin_prelude(
+        prelude,
+        expected_magic=REALIZED_LENGTHS_INDEX_BIN_PRELUDE_MAGIC,
+        path=path,
+    )
