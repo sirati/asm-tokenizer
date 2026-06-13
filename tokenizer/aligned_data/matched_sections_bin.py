@@ -11,10 +11,18 @@ entry), and per-variant blocks each holding a sparse list of
 ``(called_idx, section_variant_index)`` pairs into the section's
 call_target table.
 
-The writer back-patches forward references in two places, and on every
-emit it re-parses the relevant callee section's own bytes through
-:func:`parse_section_bin` instead of carrying a cross-section variant
-map in writer memory:
+The writer back-patches forward references in two places. Every
+back-patch slot read/write addresses the relevant section's bytes
+through the per-section jump table — the format is itself a jump
+table designed for O(1) random access (``jump_table[i] =
+n_calls_for_variant_i``, one ``u16`` each immediately after the
+header), so a single ``np.cumsum`` over the jump-table bytes yields
+every variant's byte offset. :class:`_SectionLayoutView` is the one
+helper that turns a section's raw header + jump table into the
+``uint16`` / ``uint32`` slot positions all back-patch paths need; NO
+``CallTarget`` / ``VariantBlock`` Python object is materialised in the
+resolve path, and NO cross-section variant map is carried in writer
+memory:
 
 * ``function_section_ptr`` on a call_target — set to ``0`` when
   emitting the call_target if the callee section hasn't been written
@@ -24,18 +32,19 @@ map in writer memory:
   via per-call ``callee_vkey`` to disambiguate which sibling carries
   the matching variant.
 * ``section_variant_index`` inside a per-call entry — backward
-  references (callee section already closed) re-parse the section
-  pointed at by ``_known_sections[callee_fid]`` (the LAST sibling
-  closed, the same offset that ends up in the call_target's
-  ``function_section_ptr``) and look up the entry's ``callee_vkey``;
+  references (callee section already closed) read the section pointed
+  at by ``_known_sections[callee_fid]`` (the LAST sibling closed, the
+  same offset that ends up in the call_target's
+  ``function_section_ptr``) via its jump-table layout and scan the
+  on-disk ``variant_ref_offset`` array for the entry's ``callee_vkey``;
   a hit stamps the resolved index directly, a miss defers as
   :data:`UNRESOLVED_VARIANT_INDEX` plus a "this section is waiting on
   ``callee_fid``" marker in :attr:`SectionWriter._pending_holes`.
   Forward references stamp the same sentinel + marker. At every
-  :meth:`SectionWriter.end_section`, the writer re-parses the
-  just-closed section AND every caller section the marker points
-  at, derives slot positions from the bin's self-describing bytes,
-  and resolves any per-call slot whose owning caller variant's
+  :meth:`SectionWriter.end_section`, the writer reads the just-closed
+  section's jump-table layout AND every caller section the marker
+  points at, derives slot positions from the jump-table cumsum, and
+  resolves any per-call slot whose owning caller variant's
   ``variant_ref_offset`` is in THIS section's variant table.
   Sibling sections with disjoint vkey sets each patch only their
   own matching slots; slots whose vkey is never registered by any
@@ -46,10 +55,12 @@ map in writer memory:
 
 Each section is self-describing: both the variant table needed to
 resolve back-patches AND the slot byte positions inside per-call
-entries are recoverable from the section's own bytes. No slot
-byte-offset cache or cross-section variant map is kept in writer
-memory; :attr:`SectionWriter._pending_holes` only records WHICH
-caller sections are waiting on a given callee FID.
+entries are recoverable from the section's own jump table on demand
+(O(n_variants) numpy cumsum per touch — NOT a memoized parsed cache,
+so the no-parallel-indexing rule holds). No slot byte-offset cache or
+cross-section variant map is kept in writer memory;
+:attr:`SectionWriter._pending_holes` only records WHICH caller
+sections are waiting on a given callee FID.
 
 A finalize-time sweep asserts no ``0xFFFF`` (UNRESOLVED) sentinel
 leaked through to the on-disk bytes. Any FID still in
@@ -101,6 +112,12 @@ SECTION_HEADER_SIZE: int = 8
 #: variant_i in O(1) via ``cumsum(jump_table) * 4 + arange(...) * 8``
 #: rather than the variable-length variant walk it used to need.
 JUMP_TABLE_ENTRY_SIZE: int = 2
+
+
+def _align_up(value: int, alignment: int) -> int:
+    """Round ``value`` up to the next multiple of ``alignment``."""
+    rem = value % alignment
+    return value if rem == 0 else value + (alignment - rem)
 
 
 def _padded_jump_table_bytes(n_variants: int) -> int:
@@ -298,6 +315,162 @@ class Section:
 
 
 # ---------------------------------------------------------------------------
+# Raw-bytes section layout view (back-patch addressing, parse-free)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SectionLayoutView:
+    """Cumsum-derived slot addressing for ONE section, read from raw bytes.
+
+    Single concern: turn a section's self-describing header + jump table
+    (read directly from the writer's live ``uint8`` mmap view) into the
+    byte/u16/u32 slot positions the back-patch paths need, WITHOUT
+    materialising any ``CallTarget`` / ``VariantBlock`` Python object.
+    The section format is itself a jump table designed for O(1) random
+    access: ``jump_table[i] = n_calls_for_variant_i`` (one ``u16`` each,
+    immediately after the 8-byte header), so a single ``np.cumsum`` over
+    the jump-table bytes yields every variant's byte offset. This is
+    computed on demand from the bin bytes each time a section is touched
+    (O(n_variants) numpy), NOT a memoized parsed cache — the
+    no-parallel-indexing rule still holds.
+
+    All position arrays are expressed as element indices into the
+    matching-dtype reinterpretation of the writer's buffer:
+
+    * ``caller_vrefs`` — ``uint32`` ``variant_ref_offset`` per variant,
+      in on-disk (``variant_ref_offset``-ascending) order.
+    * ``called_idx_pos`` / ``sv_idx_pos`` — ``uint16`` index, relative
+      to ``variants_region_start // 2``, of each per-call entry's
+      ``called_idx`` / ``section_variant_index`` slot, in global entry
+      order (variant ascending, entry ascending).
+    * ``entry_to_variant`` — owning variant index per global per-call
+      entry (same order as the ``*_pos`` arrays).
+
+    Empty (``n_variants == 0`` or no per-call entries) sections yield
+    zero-length arrays; callers branch on ``n_call_targets == 0`` /
+    ``total_entries == 0`` exactly as the inline code did.
+    """
+
+    fid: int
+    n_call_targets: int
+    n_variants: int
+    jump_table_offset: int
+    call_targets_start: int
+    variants_region_start: int
+    section_end: int
+    jump_slots: "np.ndarray"
+    total_entries: int
+    entry_to_variant: "np.ndarray"
+    called_idx_pos: "np.ndarray"
+    sv_idx_pos: "np.ndarray"
+    caller_vrefs: "np.ndarray"
+
+    @classmethod
+    def from_bytes(
+        cls, bin_u8: "np.ndarray", section_offset: int
+    ) -> "_SectionLayoutView":
+        """Build the layout view for the section at ``section_offset``.
+
+        ``bin_u8`` is the writer's zero-copy ``uint8`` view of the
+        already-written region. The ``uint16`` / ``uint32``
+        reinterpretations alias the same buffer, so the position arrays
+        index straight into ``bin_u8.view(np.uint16)`` /
+        ``.view(np.uint32)`` with no copy. The duplicated bit (bit 31 of
+        the header FID) is masked off so ``fid`` is the clean line number
+        every identity compare expects.
+        """
+        bin_u16 = bin_u8.view(np.uint16)
+        bin_u32 = bin_u8.view(np.uint32)
+
+        raw_fid, n_call_targets, n_variants = struct.unpack_from(
+            "<IHH", bin_u8, section_offset
+        )
+        fid = raw_fid & _SECTION_FID_MASK
+
+        jump_table_offset = section_offset + SECTION_HEADER_SIZE
+        call_targets_start = jump_table_offset + _padded_jump_table_bytes(
+            n_variants
+        )
+        variants_region_start = (
+            call_targets_start + n_call_targets * CALL_TARGET_ENTRY_SIZE
+        )
+
+        empty_i64 = np.empty(0, dtype=np.int64)
+        if n_variants == 0:
+            return cls(
+                fid=fid,
+                n_call_targets=n_call_targets,
+                n_variants=n_variants,
+                jump_table_offset=jump_table_offset,
+                call_targets_start=call_targets_start,
+                variants_region_start=variants_region_start,
+                section_end=_align_up(variants_region_start, SECTION_ALIGNMENT),
+                jump_slots=np.empty(0, dtype=np.uint16),
+                total_entries=0,
+                entry_to_variant=empty_i64,
+                called_idx_pos=empty_i64,
+                sv_idx_pos=empty_i64,
+                caller_vrefs=np.empty(0, dtype=np.uint32),
+            )
+
+        # Jump-table decode — slot = (variant_byte_len - 8) >> 2 = n_calls.
+        jump_slots = bin_u16[
+            jump_table_offset // 2 : jump_table_offset // 2 + n_variants
+        ]
+        total_entries = int(jump_slots.astype(np.uint32).sum())
+
+        # Per-call entry slot positions inside the variants region (u16
+        # units, relative to variants_region_start // 2). Derivation:
+        #   variant v's header u16-offset = 4*v + 2*cumsum_entries[v]
+        #   entry j of variant v at u16-offset header + 4 + 2*j
+        #   For global entry k where j = k - cumsum_entries[v]:
+        #     called_idx_u16[k] = 4*v + 4 + 2*k   (cumsum_entries cancels)
+        #     sv_idx_u16[k]     = 4*v + 5 + 2*k
+        entry_to_variant = np.repeat(
+            np.arange(n_variants, dtype=np.int64),
+            jump_slots.astype(np.int64),
+        )
+        k = np.arange(total_entries, dtype=np.int64)
+        sv_idx_pos = 4 * entry_to_variant + 5 + 2 * k
+        called_idx_pos = sv_idx_pos - 1
+
+        # Caller variant_ref_offsets — first u32 of each variant header,
+        # in on-disk order. cumsum of per-variant entry counts gives each
+        # header's u32 position.
+        cumsum = np.concatenate(
+            ([np.int64(0)], np.cumsum(jump_slots.astype(np.int64)))
+        )
+        hdr_u32_pos = 2 * np.arange(n_variants, dtype=np.int64) + cumsum[:-1]
+        variants_u32 = bin_u32[variants_region_start // 4 :]
+        caller_vrefs = variants_u32[hdr_u32_pos]
+
+        variants_region_bytes = (
+            n_variants * VARIANT_HEADER_SIZE
+            + total_entries * PER_CALL_ENTRY_SIZE
+        )
+        section_end = _align_up(
+            variants_region_start + variants_region_bytes, SECTION_ALIGNMENT
+        )
+
+        return cls(
+            fid=fid,
+            n_call_targets=n_call_targets,
+            n_variants=n_variants,
+            jump_table_offset=jump_table_offset,
+            call_targets_start=call_targets_start,
+            variants_region_start=variants_region_start,
+            section_end=section_end,
+            jump_slots=jump_slots,
+            total_entries=total_entries,
+            entry_to_variant=entry_to_variant,
+            called_idx_pos=called_idx_pos,
+            sv_idx_pos=sv_idx_pos,
+            caller_vrefs=caller_vrefs,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Writer
 # ---------------------------------------------------------------------------
 
@@ -329,9 +502,9 @@ class SectionWriter:
            the buffer; ``n_calls`` lives in the section's jump table,
            not the variant header.
         b. :meth:`emit_per_call_entries` — appends per-call slots to
-           the buffer. Backward references re-parse the callee section
-           pointed at by ``_known_sections[callee_fid]`` and stamp the
-           resolved variant idx directly on a vkey hit (the callee's
+           the buffer. Backward references read the callee section's
+           jump-table layout (``_known_sections[callee_fid]``) and stamp
+           the resolved variant idx directly on a vkey hit (the callee's
            on-disk variants are already sorted, so the resolved idx is
            the post-sort idx the loader will read); misses (and
            forward references) defer to a back-patch hole.
@@ -340,16 +513,16 @@ class SectionWriter:
     4. :meth:`end_section` — flushes the variant buffer in
        ``variant_ref_offset``-ascending order, stamps the jump table
        from the sorted variants' ``n_calls``, back-patches
-       ``n_variants``, pads to a 4-byte boundary, parses the
-       just-closed section's bytes to recover its variant table,
-       resolves any self-references the just-closed section made into
-       itself (the "callee_fid == my_fid" case that
+       ``n_variants``, pads to a 4-byte boundary, reads the
+       just-closed section's jump-table layout to recover its variant
+       table, resolves any self-references the just-closed section made
+       into itself (the "callee_fid == my_fid" case that
        ``emit_per_call_entries`` deferred), then walks every caller
-       section in ``_pending_holes[my_fid]`` and re-parses each
-       caller's own bytes to stamp the call_target's
-       ``function_section_ptr`` AND any per-call entry whose owning
-       caller variant's ``variant_ref_offset`` matches a variant in
-       THIS section's local table.
+       section in ``_pending_holes[my_fid]`` and re-derives each
+       caller's slot positions from its own jump table to stamp the
+       call_target's ``function_section_ptr`` AND any per-call entry
+       whose owning caller variant's ``variant_ref_offset`` matches a
+       variant in THIS section's local table.
     5. After all sections: :meth:`finalize` — for every FID still in
        ``_pending_holes``: if the callee section was never written
        it raises (builder bug); otherwise the per-caller-section
@@ -652,12 +825,12 @@ class SectionWriter:
     def emit_per_call_entries(self, entries: list[PerCallEntry]) -> None:
         """Append the variant's per-call entries to the variant buffer.
 
-        Backward references (``callee_fid in _known_sections``) re-parse
-        the callee section pointed at by ``_known_sections[callee_fid]``
-        — the LAST sibling closed, which is also the offset that ends
-        up in the call_target's ``function_section_ptr`` after sibling
-        last-write-wins. The just-parsed section's local
-        ``variant_ref_offset -> variant_idx`` map is consulted for the
+        Backward references (``callee_fid in _known_sections``) read the
+        jump-table layout of the callee section pointed at by
+        ``_known_sections[callee_fid]`` — the LAST sibling closed, which
+        is also the offset that ends up in the call_target's
+        ``function_section_ptr`` after sibling last-write-wins. The
+        section's on-disk ``variant_ref_offset`` array is scanned for the
         entry's ``callee_vkey``: a hit stamps the resolved index
         directly. The callee's on-disk variants are already
         ``variant_ref_offset``-sorted (flushed by :meth:`end_section`
@@ -669,10 +842,10 @@ class SectionWriter:
         flight — stamps :data:`UNRESOLVED_VARIANT_INDEX` and records
         THIS section's offset in ``_pending_holes[callee_fid]``. The
         marker is the only thing the writer needs: at the callee's
-        :meth:`end_section` the writer re-parses both that section AND
-        every caller it has marked, and re-derives the slot byte
-        offsets from the bin's self-describing bytes (jump table +
-        variants region). Self-references skip the marker: the slot is
+        :meth:`end_section` the writer reads the jump-table layout of
+        both that section AND every caller it has marked, and re-derives
+        the slot byte offsets from the bin's self-describing bytes (jump
+        table + variants region). Self-references skip the marker: the slot is
         resolved by :meth:`end_section`'s "step 2" self-resolve pass
         on the just-closed section's own bytes, keeping the self-call
         path disjoint from the sibling-close path so the two never
@@ -741,8 +914,8 @@ class SectionWriter:
     def _resolve_backward_variant_index(
         self, *, callee_fid: int, callee_vkey: Hashable
     ) -> Optional[int]:
-        """Resolve a backward-reference variant idx by re-parsing the
-        callee section pointed at by ``_known_sections[callee_fid]``.
+        """Resolve a backward-reference variant idx via the callee
+        section's jump-table layout (``_known_sections[callee_fid]``).
 
         ``None`` when the callee FID has no closed section yet
         (forward reference) OR the callee FID is THIS section (the
@@ -755,30 +928,36 @@ class SectionWriter:
         mismatch — a sibling close or :meth:`finalize` will sweep
         the slot to :data:`MISSING_VARIANT_INDEX`).
 
-        The section we re-parse is the SAME one whose offset will end
+        The section we address is the SAME one whose offset will end
         up in the call_target row's ``function_section_ptr`` after the
         sibling last-write-wins, so the loader can never observe a
         ``(section_offset, variant_idx)`` pair that points into the
         wrong sibling's variant table.
 
-        ``parse_section_bin`` is given a bounded memoryview of the
-        already-written region; the view is released in a ``finally``
-        to keep the mmap unmappable on later finalize.
+        Reads the callee section's header + jump table directly from the
+        live ``uint8`` mmap view (``_SectionLayoutView``); the on-disk
+        ``variant_ref_offset`` per variant (``caller_vrefs``, in
+        on-disk/ascending order) is scanned for ``callee_vkey`` and the
+        FIRST matching on-disk index is returned — byte-for-byte the same
+        index the old per-variant ``for`` loop returned, with no
+        ``CallTarget`` / ``VariantBlock`` object materialised.
         """
         if callee_fid == self._current_fid:
             return None
         section_offset = self._known_sections.get(callee_fid)
         if section_offset is None:
             return None
-        blob = self._writer.view()
-        try:
-            parsed, _end = parse_section_bin(blob, section_offset)
-        finally:
-            blob.release()
-        for i, variant in enumerate(parsed.variants):
-            if variant.variant_ref_offset == callee_vkey:
-                return i
-        return None
+        bin_u8 = self._writer.writable_u8_view()
+        layout = _SectionLayoutView.from_bytes(bin_u8, section_offset)
+        # callee_vkey lives in the u32 variant_ref_offset field; a value
+        # outside the u32 range can never equal an on-disk vref, matching
+        # the old loop's int==int compare (it would never fire either).
+        if not (0 <= int(callee_vkey) <= 0xFFFFFFFF):
+            return None
+        hits = np.nonzero(layout.caller_vrefs == np.uint32(callee_vkey))[0]
+        if hits.size == 0:
+            return None
+        return int(hits[0])
 
     def end_variant(self, vkey: Hashable) -> int:
         """Finalise the currently-open variant in the variant buffer.
@@ -822,10 +1001,11 @@ class SectionWriter:
         underlying writer at section-trailer-time, and its ``n_calls``
         slots into the section's pre-reserved jump table at the
         post-sort position. Then patches ``n_variants``, pads to a
-        4-byte boundary, parses the just-closed section back from its
-        own bytes to recover the variant table. Resolves back-patches
-        in two disjoint sweeps, each parsing on-wire bytes (no
-        writer-side slot-offset cache):
+        4-byte boundary, reads the just-closed section's jump-table
+        layout to recover the variant table. Resolves back-patches in
+        two disjoint sweeps, each addressing on-wire bytes through the
+        jump-table cumsum (no writer-side slot-offset cache, no
+        per-variant object materialisation):
 
         * **Step 2 — self-resolve.** Iterate the just-closed
           section's own call_targets; any row whose ``name_ptr`` is
@@ -838,12 +1018,12 @@ class SectionWriter:
           points at that row gets its ``section_variant_index``
           resolved from the callee section's variant table. For the
           self-call, the callee section IS this section, and its
-          variant table is exactly the one we just parsed.
+          variant table is exactly the one we just read.
 
         * **Step 3 — sibling-close patches.** For each
           ``caller_section_offset`` in
-          ``_pending_holes.get(my_fid, ())``: re-parse that caller
-          section's bytes and (Case A) re-stamp every
+          ``_pending_holes.get(my_fid, ())``: read that caller
+          section's jump-table layout and (Case A) re-stamp every
           ``function_section_ptr`` slot whose ``name_ptr == my_fid``
           to THIS section's offset (W2 last-write-wins on sibling
           collisions; the loader disambiguates via per-call
@@ -930,15 +1110,15 @@ class SectionWriter:
         # ``searchsorted(side="right") - 1`` last-write-wins tie-break
         # consistent across both step-2 and step-3 paths when a
         # section legitimately repeats the same ``variant_ref_offset``.
-        blob = self._writer.view()
-        try:
-            parsed_self, _end = parse_section_bin(blob, section_offset)
-        finally:
-            blob.release()
-        my_vrefs = np.fromiter(
-            (v.variant_ref_offset for v in parsed_self.variants),
-            dtype=np.uint32,
-            count=len(parsed_self.variants),
+        #
+        # ``my_vrefs`` is read straight off the just-flushed jump-table
+        # layout (``caller_vrefs``, on-disk order) — no per-variant
+        # object materialisation. The buffer wrote variants already
+        # sorted, so this is identical to the ascending vref sequence the
+        # old ``parse_section_bin`` loop produced.
+        bin_u8 = self._writer.writable_u8_view()
+        my_vrefs = np.ascontiguousarray(
+            _SectionLayoutView.from_bytes(bin_u8, section_offset).caller_vrefs
         )
         my_sort_order = np.argsort(my_vrefs, kind="stable").astype(np.int64)
         my_sorted_vrefs = my_vrefs[my_sort_order]
@@ -998,8 +1178,8 @@ class SectionWriter:
         ``_known_sections`` may still carry caller per-call slots
         that no sibling registered (cross-arm/cross-section vkey
         mismatch: caller and callee survived pass-1 with disjoint
-        vkey sets). For each such caller, re-parse the caller's
-        bytes, find every per-call slot pointing at the FID that is
+        vkey sets). For each such caller, read the caller's jump-table
+        layout, find every per-call slot pointing at the FID that is
         still ``UNRESOLVED``, stamp :data:`MISSING_VARIANT_INDEX`,
         and — if a warn-log was supplied — append one line naming
         the callee FID, the caller variant's vkey, and the caller
@@ -1038,8 +1218,8 @@ class SectionWriter:
         ``(callee_fid, caller_section_offset)`` pairs that triggered
         the failure.
 
-        For every other FID, re-parse each caller section in the
-        set and stamp :data:`MISSING_VARIANT_INDEX` on each per-call
+        For every other FID, read each caller section's jump-table
+        layout and stamp :data:`MISSING_VARIANT_INDEX` on each per-call
         slot whose ``called_idx`` points at a call_target row
         referencing this FID AND is still ``UNRESOLVED`` (a sibling
         close patched the ones it could). One warn-log line is
@@ -1076,52 +1256,73 @@ class SectionWriter:
     def _stamp_missing_in_caller(
         self, *, caller_section_offset: int, callee_fid: int
     ) -> None:
-        """Walk one caller section's bytes; stamp MISSING on every
-        per-call slot still pointing at ``callee_fid`` as unresolved.
+        """Stamp MISSING on every per-call slot in one caller section
+        still pointing at ``callee_fid`` as unresolved.
 
-        Slot positions are re-derived from the caller's own bytes
-        (call_targets + variants region): no writer-side
-        slot-offset cache. One warn-log line per stamp.
+        Slot positions are re-derived from the caller's own jump-table
+        layout (``_SectionLayoutView``) read straight off the live mmap:
+        no per-variant object materialisation, no writer-side
+        slot-offset cache. The matching per-call slots are visited in
+        global entry order (variant ascending, entry ascending), so the
+        MISSING stamps AND the one-warn-log-line-per-stamp output land
+        byte-for-byte in the same order the old per-variant /
+        per-entry ``for`` loop produced.
         """
-        blob = self._writer.view()
-        try:
-            caller, _end = parse_section_bin(blob, caller_section_offset)
-        finally:
-            blob.release()
-        target_called_idxs = {
-            i
-            for i, ct in enumerate(caller.call_targets)
-            if ct.function_name_ptr == callee_fid
-        }
-        if not target_called_idxs:
+        bin_u8 = self._writer.writable_u8_view()
+        bin_u16 = bin_u8.view(np.uint16)
+        bin_u32 = bin_u8.view(np.uint32)
+        layout = _SectionLayoutView.from_bytes(bin_u8, caller_section_offset)
+        if layout.n_call_targets == 0 or layout.total_entries == 0:
             return
-        for v_idx, variant in enumerate(caller.variants):
-            variant_offset = _variant_block_offset(caller, v_idx)
-            entry_offset = variant_offset + VARIANT_HEADER_SIZE
-            for called_idx, sv_idx in variant.per_call_entries:
-                slot_offset = entry_offset + 2
-                entry_offset += PER_CALL_ENTRY_SIZE
-                if called_idx not in target_called_idxs:
-                    continue
-                if sv_idx != UNRESOLVED_VARIANT_INDEX:
-                    continue
-                if self.verify_holes_unfilled:
-                    self._assert_slot_unresolved(
-                        slot_offset,
-                        MISSING_VARIANT_INDEX,
-                        context="finalize-MISSING",
-                        caller_section_offset=caller_section_offset,
-                        callee_fid=callee_fid,
-                    )
-                self._writer.patch(
-                    slot_offset, struct.pack("<H", MISSING_VARIANT_INDEX)
+
+        # call_target name_ptr column — first u32 of each 3*u32 row.
+        ct_name_ptr = bin_u32[
+            layout.call_targets_start // 4 : layout.variants_region_start // 4
+        ].reshape(layout.n_call_targets, 3)[:, 0]
+        target_called_idxs = np.nonzero(
+            ct_name_ptr == np.uint32(callee_fid)
+        )[0].astype(np.uint16)
+        if target_called_idxs.size == 0:
+            return
+
+        variants_u16 = bin_u16[layout.variants_region_start // 2 :]
+        hole_mask = (
+            np.isin(variants_u16[layout.called_idx_pos], target_called_idxs)
+            & (
+                variants_u16[layout.sv_idx_pos]
+                == np.uint16(UNRESOLVED_VARIANT_INDEX)
+            )
+        )
+        hole_entries = np.nonzero(hole_mask)[0]
+        if hole_entries.size == 0:
+            return
+
+        target_slots = layout.sv_idx_pos[hole_entries]
+        if self.verify_holes_unfilled:
+            self._assert_slots_unresolved_vec(
+                variants_u16,
+                target_slots,
+                np.full(target_slots.shape, MISSING_VARIANT_INDEX, dtype=np.uint16),
+                context="finalize-MISSING",
+                caller_section_offset=caller_section_offset,
+                callee_fid=callee_fid,
+                variants_region_start=layout.variants_region_start,
+            )
+        variants_u16[target_slots] = np.uint16(MISSING_VARIANT_INDEX)
+
+        if self._warn_log is not None:
+            # One line per stamp, in global entry order — owning variant's
+            # variant_ref_offset cast to a plain int so its ``!r`` repr
+            # matches the struct-derived int the old loop logged.
+            hole_vrefs = layout.caller_vrefs[
+                layout.entry_to_variant[hole_entries]
+            ]
+            for vref in hole_vrefs:
+                self._warn_log.write(
+                    f"missing_variant: callee_fid={callee_fid} "
+                    f"callee_vkey={int(vref)!r} "
+                    f"caller_section@{caller_section_offset}\n"
                 )
-                if self._warn_log is not None:
-                    self._warn_log.write(
-                        f"missing_variant: callee_fid={callee_fid} "
-                        f"callee_vkey={variant.variant_ref_offset!r} "
-                        f"caller_section@{caller_section_offset}\n"
-                    )
 
     def close(self) -> None:
         """Flush + unmap the underlying bin without running checks.
@@ -1310,53 +1511,33 @@ class SectionWriter:
         bin_u16 = bin_u8.view(np.uint16)
         bin_u32 = bin_u8.view(np.uint32)
 
-        _caller_fid, n_call_targets, n_variants = struct.unpack_from(
-            "<IHH", bin_u8, caller_section_offset
-        )
-        if n_call_targets == 0:
+        # Shared jump-table layout addressing (header + cumsum-derived
+        # slot positions) — same helper the self-resolve / backward-ref /
+        # finalize paths use, so the layout arithmetic lives in exactly
+        # one place.
+        layout = _SectionLayoutView.from_bytes(bin_u8, caller_section_offset)
+        if layout.n_call_targets == 0:
             return
-
-        jump_table_offset = caller_section_offset + SECTION_HEADER_SIZE
-        call_targets_start = jump_table_offset + _padded_jump_table_bytes(n_variants)
-        variants_region_start = (
-            call_targets_start + n_call_targets * CALL_TARGET_ENTRY_SIZE
-        )
 
         # Case A: stamp function_section_ptr. 3*u32 view of call_targets
         # (name_ptr | section_ptr | flags_packed).
         ct = bin_u32[
-            call_targets_start // 4 : variants_region_start // 4
-        ].reshape(n_call_targets, 3)
+            layout.call_targets_start // 4 : layout.variants_region_start // 4
+        ].reshape(layout.n_call_targets, 3)
         ct_mask = ct[:, 0] == np.uint32(callee_fid)
         if not ct_mask.any():
             return
         ct[ct_mask, 1] = callee_section_offset
 
-        if n_variants == 0:
+        if layout.n_variants == 0:
+            return
+        if layout.total_entries == 0:
             return
 
-        # Jump-table decode — slot = (variant_byte_len - 8) >> 2 = n_calls.
-        jump_slots = bin_u16[
-            jump_table_offset // 2 : jump_table_offset // 2 + n_variants
-        ]
-        total_entries = int(jump_slots.astype(np.uint32).sum())
-        if total_entries == 0:
-            return
-
-        # Per-call entry positions inside the variants region (u16 units).
-        # Derivation:
-        #   variant v's header u16-offset = 4*v + 2*cumsum_entries[v]
-        #   entry j of variant v at u16-offset header + 4 + 2*j
-        #   For global entry k where j = k - cumsum_entries[v]:
-        #     called_idx_u16[k] = 4*v + 4 + 2*k   (cumsum_entries cancels)
-        #     sv_idx_u16[k]     = 4*v + 5 + 2*k
-        entry_to_variant = np.repeat(
-            np.arange(n_variants, dtype=np.int64),
-            jump_slots.astype(np.int64),
-        )
-        k = np.arange(total_entries, dtype=np.int64)
-        sv_idx_pos = 4 * entry_to_variant + 5 + 2 * k
-        called_idx_pos = sv_idx_pos - 1
+        entry_to_variant = layout.entry_to_variant
+        sv_idx_pos = layout.sv_idx_pos
+        called_idx_pos = layout.called_idx_pos
+        variants_region_start = layout.variants_region_start
 
         variants_u16 = bin_u16[variants_region_start // 2 :]
 
@@ -1369,12 +1550,7 @@ class SectionWriter:
             return
 
         # Caller variant_ref_offsets — first u32 of each variant header.
-        cumsum = np.concatenate(
-            ([np.int64(0)], np.cumsum(jump_slots.astype(np.int64)))
-        )
-        hdr_u32_pos = 2 * np.arange(n_variants, dtype=np.int64) + cumsum[:-1]
-        variants_u32 = bin_u32[variants_region_start // 4 :]
-        caller_vrefs = variants_u32[hdr_u32_pos]
+        caller_vrefs = layout.caller_vrefs
 
         # Resolve via pre-built sort index — single searchsorted, no
         # Python dict. ``side="right"`` paired with ``- 1`` picks the
@@ -1410,37 +1586,71 @@ class SectionWriter:
     def _sweep_for_unresolved_sentinels(self) -> None:
         """Walk the bin sections; assert no ``0xFFFF`` slot leaked.
 
-        Reuses the public parser so the sweep can't drift from the
-        emit-side layout: any section the parser produces is also
-        what the bin will look like to readers, and we check every
-        per-call entry's ``section_variant_index``.
+        Jump-table-native, parse-free: each section's
+        :class:`_SectionLayoutView` gives the exact ``section_variant_index``
+        u16 slot positions and the section's end offset (to advance to the
+        next section), so the sweep reads only the per-call ``sv_idx``
+        slots — no ``CallTarget`` / ``VariantBlock`` object is
+        materialised. A single linear pass over the bin.
 
-        Uses a zero-copy :meth:`MemmapBinWriter.view` over the
-        already-written region instead of :meth:`MemmapBinWriter.read`
-        — at corpus scale the bin is multi-GB and a ``bytes`` copy at
-        finalize-time would more than double peak RAM. The memoryview
-        is explicitly :meth:`memoryview.release`-d in a ``finally`` so
-        the subsequent :meth:`MemmapBinWriter.finalize` (which calls
-        ``mmap.close``) does not trip on an exported pointer being
-        held alive by the traceback of an in-flight exception.
-
+        Reads through the writer's zero-copy ``uint8`` mmap view — at
+        corpus scale the bin is multi-GB and a ``bytes`` copy at
+        finalize-time would more than double peak RAM. The reported
+        ``variant_idx`` / ``called_idx`` of the first leak are recovered
+        from the layout's ``entry_to_variant`` and the on-disk
+        ``called_idx`` slot, byte-identical to the old per-entry walk's
+        diagnostic.
         """
-        blob = self._writer.view()
-        try:
-            end = len(blob)
-            offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
-            while offset < end:
-                section, offset = parse_section_bin(blob, offset)
-                for v_idx, variant in enumerate(section.variants):
-                    for called_idx, sv_idx in variant.per_call_entries:
-                        if sv_idx == UNRESOLVED_VARIANT_INDEX:
-                            raise ValueError(
-                                f"unresolved section_variant_index in section "
-                                f"function_name_ptr={section.function_name_ptr} "
-                                f"variant_idx={v_idx} called_idx={called_idx}"
-                            )
-        finally:
-            blob.release()
+        # Collect the first leak's diagnostic fields (if any) inside a
+        # nested scope so EVERY numpy view aliasing the mmap (the
+        # ``uint8`` base, its ``uint16`` reinterpretation, per-section
+        # slices, and the layout view's live ``jump_slots`` slice) is
+        # dropped when the scan returns. Raising from a frame that still
+        # holds such a view would leave an exported pointer alive in the
+        # traceback and block :meth:`MemmapBinWriter.finalize`'s
+        # ``mmap.close`` with "cannot close exported pointers", so the
+        # raise is hoisted out, after every view is out of scope. The
+        # scan returns only plain ``int`` diagnostics — no mmap alias
+        # escapes it.
+        leak_diag = self._first_unresolved_slot()
+        if leak_diag is not None:
+            fid, v_idx, called_idx = leak_diag
+            raise ValueError(
+                f"unresolved section_variant_index in section "
+                f"function_name_ptr={fid} "
+                f"variant_idx={v_idx} called_idx={called_idx}"
+            )
+
+    def _first_unresolved_slot(self) -> Optional[tuple[int, int, int]]:
+        """Return ``(fid, variant_idx, called_idx)`` of the first
+        ``UNRESOLVED`` per-call slot in the bin, or ``None`` if clean.
+
+        All numpy views aliasing the writer's mmap live only in this
+        frame; returning plain ints lets the caller raise without any
+        exported pointer outliving the scan (so the finalize
+        ``mmap.close`` cannot trip on a live export).
+        """
+        bin_u8 = self._writer.writable_u8_view()
+        bin_u16 = bin_u8.view(np.uint16)
+        end = bin_u8.shape[0]
+        offset = MATCHED_SECTIONS_BIN_PRELUDE_SIZE
+        while offset < end:
+            layout = _SectionLayoutView.from_bytes(bin_u8, offset)
+            if layout.total_entries:
+                variants_u16 = bin_u16[layout.variants_region_start // 2 :]
+                leak = np.nonzero(
+                    variants_u16[layout.sv_idx_pos]
+                    == np.uint16(UNRESOLVED_VARIANT_INDEX)
+                )[0]
+                if leak.size:
+                    k = int(leak[0])
+                    return (
+                        layout.fid,
+                        int(layout.entry_to_variant[k]),
+                        int(variants_u16[layout.called_idx_pos[k]]),
+                    )
+            offset = layout.section_end
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1453,9 +1663,13 @@ def _variant_block_offset(section: Section, variant_idx: int) -> int:
 
     Derives the position directly from the section layout (section
     header + jump table + call_targets table + sum of preceding
-    variant block sizes). The writer uses this to address per-call
-    slot byte offsets when back-patching; the caller is responsible
-    for ensuring ``variant_idx`` is a valid index into
+    variant block sizes). This is the simple O(variant_idx) scalar
+    addressing; the writer's back-patch paths instead use the
+    cumsum-vectorised :class:`_SectionLayoutView` (which is O(1) per
+    slot). This helper survives as the test-side reference oracle's
+    independent addressing path, used to cross-check that the
+    vectorised writer lands every slot on the same byte. The caller is
+    responsible for ensuring ``variant_idx`` is a valid index into
     ``section.variants``.
     """
     variants_region_start = (

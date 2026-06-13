@@ -36,6 +36,7 @@ Coverage:
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from pathlib import Path
 
@@ -1630,3 +1631,99 @@ def test_vectorized_hole_fill_byte_equivalence(
                     f"vectorized bytes diverge from reference at offset {i}: "
                     f"vectorized=0x{a:02X} reference=0x{b:02X}"
                 )
+
+
+def _build_forward_ref_chain(path: Path, n: int) -> None:
+    """Long forward-reference chain + self/back edges, every section
+    carrying multiple variants — stresses the jump-table cumsum
+    back-patch addressing across many sections at once.
+
+    Section ``i`` declares LOCAL call_targets to ``i+1`` (forward ref),
+    ``i`` (self-call), and ``i-1`` (backward ref), then emits three
+    variants each per-calling all of them.
+    """
+    writer = SectionWriter(path)
+    for i in range(n):
+        callees: list[CallTargetSpec] = []
+        seen: list[int] = []
+        for fid in (i + 1, i, max(i - 1, 0)):
+            if fid not in seen and 0 <= fid < n:
+                seen.append(fid)
+                callees.append(
+                    CallTargetSpec(
+                        function_name_ptr=fid,
+                        type=CallTargetType.LOCAL,
+                        is_matched=True,
+                    )
+                )
+        writer.begin_section(function_name_ptr=i, n_variants=3)
+        writer.emit_call_targets(callees)
+        for v in range(3):
+            vref = 0x1000 + v
+            writer.begin_variant(variant_ref_offset=vref, data_offset_shifted=v)
+            writer.emit_per_call_entries(
+                [
+                    PerCallEntry(
+                        called_idx=ci,
+                        callee_function_name_ptr=ct.function_name_ptr,
+                        callee_vkey=vref,
+                    )
+                    for ci, ct in enumerate(callees)
+                ]
+            )
+            writer.end_variant(vkey=vref)
+        writer.end_section()
+    writer.finalize()
+
+
+# Frozen sha256 digests captured on BASE e468e3c (the pre-refactor
+# parse_section_bin writer) and re-verified on the jump-table-native
+# tip — the back-patch refactor is addressing-only, so these scenarios
+# must hash identically forever. A digest mismatch means the on-disk
+# section bytes changed; that is a semantic regression, never a benign
+# diff. See the writer's _SectionLayoutView docstring.
+_GATE2_FROZEN_DIGESTS = {
+    "dense": (
+        "1f8f9e65ae152418a623055c1ffe46deafdbf76de293094125a3e5e161d9dec2"
+    ),
+    "chain50": (
+        "22a3607c94fe5b3874e036fd2baaed67276a4c6afd197c466d34a64399f46bcc"
+    ),
+    "chain400": (
+        "bc8e92cb201637f36dc53ca1d4c025144005036fb279090c1f52e01c1c0582e8"
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(_GATE2_FROZEN_DIGESTS))
+def test_back_patch_output_is_byte_identical_to_base(
+    tmp_path: Path, scenario: str
+) -> None:
+    """Pin the jump-table-native back-patch's on-disk output byte-for-byte.
+
+    The refactor that replaced the full-section ``parse_section_bin``
+    re-parse in the resolve path with jump-table cumsum addressing
+    changed only HOW slot byte-offsets are found, never WHAT is written.
+    These sha256 digests were captured on BASE e468e3c (the re-parse
+    writer) and must reproduce on the refactored writer; a mismatch is a
+    correctness regression. ``dense`` exercises sibling FIDs, a
+    self-call, a finalize MISSING-stamp, and an odd ``n_variants``;
+    ``chain50`` / ``chain400`` exercise long forward-ref chains with
+    multi-variant sections so the cumsum addressing is stressed at scale.
+    """
+    path = tmp_path / f"{scenario}.bin"
+    if scenario == "dense":
+        _build_byte_equivalence_fixture(path)
+    elif scenario == "chain50":
+        _build_forward_ref_chain(path, 50)
+    elif scenario == "chain400":
+        _build_forward_ref_chain(path, 400)
+    else:  # pragma: no cover - parametrize guard
+        raise AssertionError(f"unknown scenario {scenario!r}")
+
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert digest == _GATE2_FROZEN_DIGESTS[scenario], (
+        f"{scenario}: section bytes changed vs BASE e468e3c — "
+        f"got {digest}, expected {_GATE2_FROZEN_DIGESTS[scenario]}; "
+        "the back-patch refactor must be addressing-only"
+    )
