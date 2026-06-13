@@ -109,19 +109,46 @@ class ColumnarSections:
     """``u16[total_entries]`` -- resolved callee variant index (or the
     ``MISSING_VARIANT_INDEX`` sentinel)."""
 
+    def pce_variant(self) -> np.ndarray:
+        """``i64[total_entries]`` -- owning flat variant index per entry.
+
+        The CSR inverse of ``pce_offsets``: entry ``e`` belongs to flat
+        variant ``v`` iff ``pce_offsets[v] <= e < pce_offsets[v + 1]``.
+        The parser builds exactly this array (to lay out the per-call
+        entries in variant order) and then discards it; consumers that
+        need the entry-to-variant map call here instead of rebuilding
+        an identical ``np.repeat`` -- the no-reparse contract. Derived
+        on access (no stored state; the dataclass stays frozen).
+        """
+        return np.repeat(
+            np.arange(self.var_n_calls.size, dtype=np.int64),
+            self.var_n_calls,
+        )
+
 
 def _u16(b: np.ndarray, idx: np.ndarray) -> np.ndarray:
-    """Gather little-endian u16 values at byte indices ``idx``."""
-    return b[idx].astype(np.int64) | (b[idx + 1].astype(np.int64) << 8)
+    """Gather little-endian u16 values at byte indices ``idx``.
+
+    Combines in ``uint16`` (the field width) rather than ``int64`` --
+    each byte is <= 255 so the ``<< 8`` of the high byte never wraps
+    the carrier. Callers that do address/size arithmetic on the result
+    upcast explicitly.
+    """
+    return b[idx].astype(np.uint16) | (b[idx + 1].astype(np.uint16) << 8)
 
 
 def _u32(b: np.ndarray, idx: np.ndarray) -> np.ndarray:
-    """Gather little-endian u32 values at byte indices ``idx``."""
+    """Gather little-endian u32 values at byte indices ``idx``.
+
+    Combines in ``uint32`` (the field width); the high byte's ``<< 24``
+    of a value <= 255 stays inside u32. The result is the field's exact
+    unsigned value -- pointers use the full u32 range.
+    """
     return (
-        b[idx].astype(np.int64)
-        | (b[idx + 1].astype(np.int64) << 8)
-        | (b[idx + 2].astype(np.int64) << 16)
-        | (b[idx + 3].astype(np.int64) << 24)
+        b[idx].astype(np.uint32)
+        | (b[idx + 1].astype(np.uint32) << 8)
+        | (b[idx + 2].astype(np.uint32) << 16)
+        | (b[idx + 3].astype(np.uint32) << 24)
     )
 
 
@@ -142,12 +169,23 @@ def _flat_member_addresses(
     ``base_per_parent[p]`` is parent ``p``'s table start; parent ``p``
     owns ``counts[p]`` members of ``stride`` bytes each. Returns
     ``(parent_of_member, member_addresses)`` flattened in parent order.
+
+    ``parent`` is ``int32`` (member counts fit 31 bits at any catalog
+    scale) and ``member_addresses`` is ``uint32`` -- every address is a
+    valid byte offset into a ``sections.bin`` whose offsets the wire
+    format caps at the u32 ``function_section_ptr`` range, so the
+    addressing never wraps. Halves both flat arrays from ``int64`` (they
+    are sized by the catalog's total member counts -- tens of millions
+    of per-call entries at corpus scale).
     """
     offsets = _csr(counts)
     total = int(offsets[-1])
-    parent = np.repeat(np.arange(counts.size, dtype=np.int64), counts)
-    within = np.arange(total, dtype=np.int64) - offsets[parent]
-    return parent, base_per_parent[parent] + stride * within
+    parent = np.repeat(np.arange(counts.size, dtype=np.int32), counts)
+    within = np.arange(total, dtype=np.uint32) - offsets[parent].astype(
+        np.uint32
+    )
+    addr = base_per_parent[parent].astype(np.uint32) + np.uint32(stride) * within
+    return parent, addr
 
 
 def parse_sections_columnar(
@@ -203,14 +241,19 @@ def parse_sections_columnar(
         )
 
     # --- section headers --------------------------------------------------
+    # Counts widen to int64 immediately: they are per-section (tiny) and
+    # feed byte-address/size arithmetic below where a u16 carrier would
+    # wrap (e.g. CALL_TARGET_ENTRY_SIZE * n_call_targets). The big flat
+    # arrays this module narrows are the per-member ADDRESS columns, not
+    # these.
     function_name_ptr = _u32(b, offs).astype(np.uint32)
-    n_call_targets = _u16(b, offs + 4)
-    n_variants = _u16(b, offs + 6)
+    n_call_targets = _u16(b, offs + 4).astype(np.int64)
+    n_variants = _u16(b, offs + 6).astype(np.int64)
 
     # --- jump table (per-variant n_calls) ----------------------------------
     jt_base = offs + SECTION_HEADER_SIZE
     var_section, jt_addr = _flat_member_addresses(jt_base, n_variants, 2)
-    var_n_calls = _u16(b, jt_addr)
+    var_n_calls = _u16(b, jt_addr).astype(np.int64)
     var_offsets = _csr(n_variants)
 
     # --- call_target table --------------------------------------------------
@@ -241,13 +284,16 @@ def parse_sections_columnar(
     section_first_excl[has_vars] = calls_excl[var_offsets[:-1][has_vars]]
     total_vars = int(var_offsets[-1])
     within_var = (
-        np.arange(total_vars, dtype=np.int64) - var_offsets[var_section]
+        np.arange(total_vars, dtype=np.uint32)
+        - var_offsets[var_section].astype(np.uint32)
     )
+    # vb_addr is a valid in-blob byte offset (<= the u32 ptr range), so
+    # it lands in uint32 -- halving this total_vars-sized address array.
     vb_addr = (
-        region_base[var_section]
-        + VARIANT_HEADER_SIZE * within_var
-        + PER_CALL_ENTRY_SIZE
-        * (calls_excl - section_first_excl[var_section])
+        region_base[var_section].astype(np.uint32)
+        + np.uint32(VARIANT_HEADER_SIZE) * within_var
+        + np.uint32(PER_CALL_ENTRY_SIZE)
+        * (calls_excl - section_first_excl[var_section]).astype(np.uint32)
     )
     var_ref_offset = _u32(b, vb_addr).astype(np.uint32)
     var_data_offset_shifted = _u32(b, vb_addr + 4).astype(np.uint32)
