@@ -89,6 +89,7 @@ def _forward_dag_catalog(
 
     cols = ColumnarSections(
         function_name_ptr=secs.astype(np.uint32),
+        is_duplicated=np.zeros(secs.size, dtype=bool),
         n_call_targets=n_ct_per,
         n_variants=n_variants,
         ct_offsets=ct_offsets,

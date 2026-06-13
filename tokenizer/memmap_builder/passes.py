@@ -163,6 +163,14 @@ def process_unmatched_function(
         entries.append(
             {
                 "func_name": func_name,
+                # Per-stream occurrence ordinal of THIS body for its
+                # canonical name. Unique names top out at 0; a DUPLICATED
+                # name (per-TU static initializers, thunks) bumps it per
+                # divergent body. The unmatched grouper keys on
+                # ``(func_name, occurrence)`` so the kth distinct body's
+                # per-stream variants fold into one section instead of all
+                # same-name bodies collapsing into a single giant group.
+                "occurrence": rec.occurrence,
                 "vkey": version_keys[variant_index],
                 "data_offset": offset,
                 "data_len": total,

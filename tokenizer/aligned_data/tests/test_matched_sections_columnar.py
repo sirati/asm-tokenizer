@@ -59,6 +59,7 @@ def _assert_columnar_matches_scalar(base: Path) -> None:
 
     for s, section in enumerate(scalar):
         assert cols.function_name_ptr[s] == section.function_name_ptr
+        assert bool(cols.is_duplicated[s]) == section.is_duplicated
         assert cols.n_call_targets[s] == len(section.call_targets)
         assert cols.n_variants[s] == len(section.variants)
 

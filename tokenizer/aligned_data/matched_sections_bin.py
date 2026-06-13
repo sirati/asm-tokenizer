@@ -156,6 +156,22 @@ MISSING_VARIANT_INDEX: int = 0xFFFE
 #: whose provider library is unknown.
 UNKNOWN_EXTERN_PROVIDER: int = 0
 
+#: Section-header ``function_name_ptr`` is a u32 1-indexed line number
+#: into ``<binary>_function_names.txt`` — always far below 2**31 (it is
+#: bounded by the count of distinct names in a single binary). Bit 31 is
+#: therefore free and carries the per-section ``duplicated`` marker: set
+#: when every body of this canonical name was routed to the unmatched arm
+#: because the name maps to several distinct functions in the binary
+#: (calls into it stamp :data:`MISSING_VARIANT_INDEX`). The bit rides ONLY
+#: on the section HEADER's name_ptr; call_target rows carry the clean FID,
+#: so emit-time identity compares (``_known_sections``,
+#: :meth:`_resolve_caller_section` Case A) are unaffected. Both section
+#: parsers (:func:`parse_section_bin` and the columnar reader) mask it off
+#: and surface it as a separate boolean, so every downstream FID consumer
+#: still sees the clean line number.
+_SECTION_DUPLICATED_BIT: int = 1 << 31
+_SECTION_FID_MASK: int = _SECTION_DUPLICATED_BIT - 1
+
 # Bit packing for the call_target ``flags`` field.
 _FLAG_IS_MATCHED_BIT: int = 0
 _FLAG_TYPE_SHIFT: int = 1
@@ -264,12 +280,21 @@ class VariantBlock:
 
 @dataclass(frozen=True)
 class Section:
-    """Parsed section (one entry in the catalog)."""
+    """Parsed section (one entry in the catalog).
+
+    ``is_duplicated`` is the decoded section-header marker (see
+    :data:`_SECTION_DUPLICATED_BIT`): ``True`` when this section is one
+    of several same-name sibling bodies routed to the unmatched arm
+    because the canonical name maps to several distinct functions in the
+    binary. ``function_name_ptr`` is always the CLEAN line number (the
+    marker bit is masked off here), so FID consumers are unaffected.
+    """
 
     function_name_ptr: int
     section_offset: int
     call_targets: list[CallTarget]
     variants: list[VariantBlock]
+    is_duplicated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +425,11 @@ class SectionWriter:
         # jump-table reservation in :meth:`emit_call_targets` and asserted
         # against the observed count at :meth:`end_section`.
         self._current_n_variants_declared: Optional[int] = None
+        # Caller-declared ``duplicated`` marker for THIS section. Stamped
+        # into bit 31 of the header ``function_name_ptr`` by
+        # :meth:`emit_call_targets` (the clean FID is what
+        # ``_known_sections`` / back-patch compares use).
+        self._current_duplicated: bool = False
         # File offset of THIS section's jump table (first u16 slot). The
         # table is ``n_variants × u16`` immediately after the 8-byte
         # section header, so this is ``section_offset + SECTION_HEADER_SIZE``.
@@ -422,7 +452,13 @@ class SectionWriter:
     # Section lifecycle
     # ------------------------------------------------------------------
 
-    def begin_section(self, function_name_ptr: int, n_variants: int) -> int:
+    def begin_section(
+        self,
+        function_name_ptr: int,
+        n_variants: int,
+        *,
+        duplicated: bool = False,
+    ) -> int:
         """Open a new section for ``function_name_ptr``.
 
         Aligns the cursor up to a 4-byte boundary (pads the gap with
@@ -431,6 +467,15 @@ class SectionWriter:
         FID emitted by EARLIER sections remain in ``_pending_holes`` —
         they're resolved when this section closes via
         :meth:`end_section`.
+
+        ``duplicated`` is a generic per-section marker the writer stamps
+        into bit 31 of the header ``function_name_ptr`` (see
+        :data:`_SECTION_DUPLICATED_BIT`). The writer is domain-agnostic
+        about its meaning; the caller (the unmatched arm) sets it for the
+        same-name sibling sections of a duplicated function. The clean
+        ``function_name_ptr`` is what ``_known_sections`` and the
+        back-patch compares use — only the on-disk header bytes carry the
+        bit, so equality with call_target FIDs is preserved.
 
         ``n_variants`` is the exact number of variants the caller is
         about to emit. It is used to reserve ``n_variants × u16`` bytes
@@ -461,6 +506,12 @@ class SectionWriter:
         index.
         """
         self._assert_no_open_section()
+        if function_name_ptr < 0 or function_name_ptr > _SECTION_FID_MASK:
+            raise ValueError(
+                f"function_name_ptr={function_name_ptr} does not fit the "
+                f"31-bit section-header FID field (max {_SECTION_FID_MASK}); "
+                f"bit 31 is reserved for the duplicated marker"
+            )
         if n_variants < 0:
             raise ValueError(
                 f"n_variants must be non-negative, got {n_variants}"
@@ -481,6 +532,7 @@ class SectionWriter:
         self._current_section_offset = section_offset
         self._n_variants_slot = None
         self._current_n_variants_declared = n_variants
+        self._current_duplicated = duplicated
         # The jump table starts immediately after the section header. It is
         # written by emit_call_targets (which knows its own header_offset),
         # but the offset is deterministic so we cache it here for
@@ -509,9 +561,16 @@ class SectionWriter:
 
         n_call_targets = len(call_targets)
         # Section header: func_line_no | n_call_targets | n_variants (placeholder).
+        # Bit 31 of the func_line_no field carries the per-section
+        # ``duplicated`` marker; the clean FID is kept in ``_current_fid``
+        # for every emit-time identity compare, so only these header bytes
+        # see the bit. Both section parsers mask it back off.
+        header_fid = self._current_fid
+        if self._current_duplicated:
+            header_fid |= _SECTION_DUPLICATED_BIT
         header = struct.pack(
             "<IHH",
-            self._current_fid,
+            header_fid,
             n_call_targets,
             0,  # n_variants — patched at end_section
         )
@@ -919,6 +978,7 @@ class SectionWriter:
         self._current_section_offset = None
         self._n_variants_slot = None
         self._current_n_variants_declared = None
+        self._current_duplicated = False
         self._current_jump_table_offset = None
         self._current_call_targets = []
         self._variant_buffer = None
@@ -1445,10 +1505,15 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
     section_offset = offset
 
     (
-        function_name_ptr,
+        raw_function_name_ptr,
         n_call_targets,
         n_variants,
     ) = struct.unpack_from("<IHH", blob, offset)
+    # Bit 31 of the header FID is the per-section duplicated marker; mask
+    # it off so ``function_name_ptr`` is the clean line number every FID
+    # consumer expects, and surface the bit separately.
+    is_duplicated = bool(raw_function_name_ptr & _SECTION_DUPLICATED_BIT)
+    function_name_ptr = raw_function_name_ptr & _SECTION_FID_MASK
     offset += SECTION_HEADER_SIZE
 
     jump_table: list[int] = list(
@@ -1510,6 +1575,7 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
         section_offset=section_offset,
         call_targets=call_targets,
         variants=variants,
+        is_duplicated=is_duplicated,
     )
     return section, offset
 

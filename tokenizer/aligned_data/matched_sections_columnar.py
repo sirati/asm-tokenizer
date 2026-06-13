@@ -36,6 +36,8 @@ from .matched_sections_bin import (
     SECTION_ALIGNMENT,
     SECTION_HEADER_SIZE,
     VARIANT_HEADER_SIZE,
+    _SECTION_DUPLICATED_BIT,
+    _SECTION_FID_MASK,
 )
 
 
@@ -60,7 +62,13 @@ class ColumnarSections:
 
     # --- section level ---------------------------------------------------
     function_name_ptr: np.ndarray
-    """``u32[n_sections]`` -- the section header's FID field."""
+    """``u32[n_sections]`` -- the section header's FID field (the
+    duplicated-marker bit 31 is masked off; the clean line number)."""
+
+    is_duplicated: np.ndarray
+    """``bool[n_sections]`` -- the section header's duplicated marker
+    (bit 31 of the raw FID field; see
+    ``matched_sections_bin._SECTION_DUPLICATED_BIT``)."""
 
     n_call_targets: np.ndarray
     """``i64[n_sections]``."""
@@ -224,6 +232,7 @@ def parse_sections_columnar(
         z16 = np.zeros(0, dtype=np.uint16)
         return ColumnarSections(
             function_name_ptr=np.zeros(0, dtype=np.uint32),
+            is_duplicated=np.zeros(0, dtype=bool),
             n_call_targets=e,
             n_variants=e.copy(),
             ct_offsets=np.zeros(1, dtype=np.int64),
@@ -246,7 +255,15 @@ def parse_sections_columnar(
     # wrap (e.g. CALL_TARGET_ENTRY_SIZE * n_call_targets). The big flat
     # arrays this module narrows are the per-member ADDRESS columns, not
     # these.
-    function_name_ptr = _u32(b, offs).astype(np.uint32)
+    raw_function_name_ptr = _u32(b, offs).astype(np.uint32)
+    # Bit 31 is the per-section duplicated marker; mask it off so the FID
+    # column is the clean line number, and surface the bit separately.
+    is_duplicated = (
+        raw_function_name_ptr & np.uint32(_SECTION_DUPLICATED_BIT)
+    ).astype(bool)
+    function_name_ptr = (
+        raw_function_name_ptr & np.uint32(_SECTION_FID_MASK)
+    ).astype(np.uint32)
     n_call_targets = _u16(b, offs + 4).astype(np.int64)
     n_variants = _u16(b, offs + 6).astype(np.int64)
 
@@ -330,6 +347,7 @@ def parse_sections_columnar(
 
     return ColumnarSections(
         function_name_ptr=function_name_ptr,
+        is_duplicated=is_duplicated,
         n_call_targets=n_call_targets,
         n_variants=n_variants,
         ct_offsets=ct_offsets,

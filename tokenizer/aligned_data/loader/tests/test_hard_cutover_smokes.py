@@ -105,23 +105,28 @@ def test_bad_sidecar_prelude_raises(tmp_path: Path) -> None:
 
 def test_legacy_6_cell_unmatched_row_raises(tmp_path: Path) -> None:
     """Validator's unmatched-row walker must reject the pre-restructuring
-    6-cell row rather than silently producing an empty index lookup
-    (which would surface as a wave of csv-only-unmatched mis-flags).
+    length-bearing 6-cell row rather than silently producing an empty
+    index lookup (which would surface as a wave of csv-only-unmatched
+    mis-flags). The current layout is also 6 cells, but its trailing cell
+    is the ``0``/``1`` duplicated marker; the legacy layout's trailing
+    cell was an 8-hex length, so swapping the marker for a length value
+    reproduces the legacy shape the guard must reject.
     """
     corpus = build_corpus(
         tmp_path, "bin", unmatched=[unmatched_spec("alpha_fn")]
     )
-    # Take the first variant row of the unmatched sections CSV and pad
-    # it to 6 cells so it looks like the legacy layout.
+    # Take the first 6-cell variant row of the unmatched sections CSV and
+    # overwrite its trailing duplicated marker with a legacy length cell.
     text = corpus.unmatched_sections_csv.read_text("utf-8")
     lines = text.splitlines(keepends=True)
     row_idx = next(
         i for i, line in enumerate(lines)
-        if i >= 1 and line.strip() and line.count(",") == 4
+        if i >= 1 and line.strip() and line.count(",") == 5
     )
     cells = lines[row_idx].rstrip("\r\n").split(",")
-    assert len(cells) == 5, f"sanity: expected 5-cell row, got {cells!r}"
-    legacy = ",".join(cells + ["00000004"])
+    assert len(cells) == 6, f"sanity: expected 6-cell row, got {cells!r}"
+    assert cells[5] in ("0", "1"), f"sanity: trailing marker, got {cells!r}"
+    legacy = ",".join(cells[:5] + ["00000004"])
     lines[row_idx] = legacy + "\n"
     corpus.unmatched_sections_csv.write_text("".join(lines), encoding="utf-8")
 

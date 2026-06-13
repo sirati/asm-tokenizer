@@ -285,6 +285,69 @@ def test_header_back_patch(tmp_path: Path):
     assert offset_a == MATCHED_SECTIONS_BIN_PRELUDE_SIZE
 
 
+def test_duplicated_marker_round_trips_and_keeps_clean_fid(tmp_path: Path):
+    """The ``duplicated`` flag rides bit 31 of the header FID, round-trips
+    through ``parse_section_bin`` as ``Section.is_duplicated``, and leaves
+    the FID (and every emit-time identity compare) clean.
+
+    Two same-FID sibling sections (FID=1, both duplicated) plus one
+    unmarked section (FID=2) that LOCAL-references FID=1: the call_target
+    row carries the CLEAN FID and resolves to a real section offset, proving
+    the marker bit never leaks into call_target equality.
+    """
+    path = tmp_path / "dup_marker.bin"
+    writer = SectionWriter(path)
+
+    # Sibling A (FID=1, duplicated): one variant.
+    writer.begin_section(function_name_ptr=1, n_variants=1, duplicated=True)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0x10, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey=0x10)
+    writer.end_section()
+
+    # Sibling B (FID=1, duplicated): a distinct body sharing the FID.
+    writer.begin_section(function_name_ptr=1, n_variants=1, duplicated=True)
+    writer.emit_call_targets([])
+    writer.begin_variant(variant_ref_offset=0x20, data_offset_shifted=0)
+    writer.emit_per_call_entries([])
+    writer.end_variant(vkey=0x20)
+    writer.end_section()
+
+    # Section C (FID=2, NOT duplicated): LOCAL-references FID=1.
+    writer.begin_section(function_name_ptr=2, n_variants=0)
+    writer.emit_call_targets(
+        [
+            CallTargetSpec(
+                function_name_ptr=1, type=CallTargetType.LOCAL, is_matched=False
+            ),
+        ]
+    )
+    writer.end_section()
+    writer.finalize()
+
+    sections = list(iter_sections_bin(path))
+    assert [s.function_name_ptr for s in sections] == [1, 1, 2]
+    assert [s.is_duplicated for s in sections] == [True, True, False]
+    # The call_target row carries the CLEAN FID (1) and was resolved to a
+    # real section offset (the last sibling, last-write-wins) -- the marker
+    # bit never participated in the identity compare.
+    section_c = sections[2]
+    assert section_c.call_targets[0].function_name_ptr == 1
+    assert section_c.call_targets[0].function_section_ptr == sections[1].section_offset
+
+
+def test_begin_section_rejects_fid_using_reserved_marker_bit(tmp_path: Path):
+    """A FID that would collide with the duplicated-marker bit is rejected
+    up front rather than silently corrupting the marker."""
+    writer = SectionWriter(tmp_path / "fid_overflow.bin")
+    try:
+        with pytest.raises(ValueError, match="duplicated marker"):
+            writer.begin_section(function_name_ptr=(1 << 31), n_variants=0)
+    finally:
+        writer.close()
+
+
 def test_per_variant_back_patch(tmp_path: Path):
     """Section A's variant references B's variant_ref_offset=0x50 before
     B is written; after B emits that variant the slot equals B's

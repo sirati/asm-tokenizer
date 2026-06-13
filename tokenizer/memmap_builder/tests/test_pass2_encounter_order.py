@@ -59,11 +59,13 @@ def _make_unmatched_entry(
     data_offset: int,
     data_len: int = 16,
     token_len: int = 8,
+    occurrence: int = 0,
     extern_libraries: "dict[str, str] | None" = None,
 ) -> dict:
     """Shape matches the dict written by `process_unmatched_function`."""
     return {
         "func_name": func_name,
+        "occurrence": occurrence,
         "vkey": vkey,
         "data_offset": data_offset,
         "data_len": data_len,
@@ -101,7 +103,7 @@ def test_group_unmatched_all_called_is_encounter_ordered():
     ]
 
     grouped = group_unmatched_entries_by_function(entries)
-    assert list(grouped["fn"]["all_called"]) == [
+    assert list(grouped[("fn", 0)]["all_called"]) == [
         ("gamma", LOCAL),
         ("alpha", LOCAL),
         ("beta", LOCAL),
@@ -135,7 +137,7 @@ def test_group_unmatched_cross_category_is_local_plt_extern_grouped():
     ]
 
     grouped = group_unmatched_entries_by_function(entries)
-    assert list(grouped["fn"]["all_called"]) == [
+    assert list(grouped[("fn", 0)]["all_called"]) == [
         ("a", LOCAL),
         ("d", LOCAL),
         ("b", PLT),
@@ -169,7 +171,7 @@ def test_group_unmatched_called_by_version_carries_per_version_typed_set():
     ]
 
     grouped = group_unmatched_entries_by_function(entries)
-    by_version = grouped["fn"]["called_by_version"]
+    by_version = grouped[("fn", 0)]["called_by_version"]
     assert by_version == [
         (0, [("alpha", LOCAL), ("beta", PLT)]),
         (1, [("gamma", LOCAL)]),

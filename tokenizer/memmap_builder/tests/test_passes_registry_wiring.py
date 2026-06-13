@@ -340,7 +340,7 @@ def test_unmatched_group_extern_library_mismatch_first_wins_and_logs(caplog):
         "WARNING", logger="tokenizer.memmap_builder._extern_library_merge"
     ):
         grouped = group_unmatched_entries_by_function(entries)
-    assert grouped["fn"]["extern_libraries"] == {"conflicting": "libfirst.so"}
+    assert grouped[("fn", 0)]["extern_libraries"] == {"conflicting": "libfirst.so"}
     assert any(
         "extern library" in record.getMessage()
         and "mismatch" in record.getMessage()

@@ -55,15 +55,16 @@ def test_write_function_section_csv_emits_three_cells():
     assert len(rows[0][2]) == 8
 
 
-def test_write_unmatched_section_csv_emits_five_cells():
-    """Unmatched-section row has 5 cells: line_no_b64, refs, called,
-    call_targets, indexer.
+def test_write_unmatched_section_csv_emits_six_cells():
+    """Unmatched-section row has 6 cells: line_no_b64, refs, called,
+    call_targets, indexer, duplicated.
 
     First cell is the caller-computed base64 of the function name's
     sidecar line no (NOT the raw function name); writer treats it as
     an opaque string. The third cell carries comma-joined
     ``<base64_line_no>:<L|P|E>`` tokens (Phase 4.1 typed form), still
-    opaque to the writer.
+    opaque to the writer. The trailing cell is the ``0``/``1`` duplicated
+    marker mirroring the authoritative ``sections.bin`` section record.
     """
     buf = StringIO()
     writer = csv.writer(buf, lineterminator='\n')
@@ -75,10 +76,11 @@ def test_write_unmatched_section_csv_emits_five_cells():
         called_functions_str="Aw:L,Bw:L",  # caller-computed (typed line nos)
         call_targets_str="",
         indexer_hex=indexer_hex,
+        duplicated=True,
     )
     rows = list(csv.reader(StringIO(buf.getvalue())))
     assert len(rows) == 1
-    assert rows[0] == ["Aw", "0x1;0x2", "Aw:L,Bw:L", "", indexer_hex]
+    assert rows[0] == ["Aw", "0x1;0x2", "Aw:L,Bw:L", "", indexer_hex, "1"]
 
 
 def test_writers_do_not_accept_legacy_offset_length_pair():
@@ -92,7 +94,9 @@ def test_writers_do_not_accept_legacy_offset_length_pair():
     with pytest.raises(TypeError):
         write_function_section_csv(writer, "0x0", [], 0, 4)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        write_unmatched_section_csv(writer, "Aw", [], "", "", 0, 4)  # type: ignore[arg-type]
+        # Legacy form trailing the (data_offset, data_len) pair after the
+        # indexer_hex + duplicated cells — one positional arg too many.
+        write_unmatched_section_csv(writer, "Aw", [], "", "", "ix", False, 0, 4)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

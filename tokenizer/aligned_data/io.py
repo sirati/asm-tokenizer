@@ -82,8 +82,9 @@ def write_unmatched_section_csv(
     called_functions_str,
     call_targets_str,
     indexer_hex,
+    duplicated,
 ):
-    """Write one unmatched-section row (5 cells).
+    """Write one unmatched-section row (6 cells).
 
     ``line_no_b64`` is the compact urlsafe-base64 of this function's
     1-indexed line number in the ``<binary>_function_names.txt``
@@ -91,6 +92,16 @@ def write_unmatched_section_csv(
     likewise carries comma-joined ``<base64_line_no>:<L|P|E>`` tokens
     (NOT raw function names) produced by the caller — the writer is
     unaware of either indirection or the type tag.
+
+    ``duplicated`` is the section-level marker (``0``/``1``) telling a
+    reader of this debug catalog whether the section is one of several
+    same-name sibling bodies routed here because the canonical name is
+    duplicated in the binary (calls into it stamp ``MISSING_VARIANT_INDEX``)
+    versus a genuinely-single-variant unmatched function. The
+    authoritative copy lives in the ``<binary>_sections.bin`` section
+    record; this CSV column keeps the human-readable catalog in sync
+    (the loader reads the bin, never this CSV). The writer treats the
+    value as an opaque cell.
 
     ``variant_refs`` is the ordered list of ``0x<hex>`` row indices
     (one per version present for this unmatched function). Encoded
@@ -119,6 +130,7 @@ def write_unmatched_section_csv(
             called_functions_str,
             call_targets_str,
             indexer_hex,
+            "1" if duplicated else "0",
         ]
     )
 

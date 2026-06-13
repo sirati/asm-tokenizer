@@ -478,11 +478,32 @@ def write_matched_sections_pass2(
 
 def group_unmatched_entries_by_function(
     unmatched_data_entries: List[dict],
-) -> Dict[str, dict]:
-    """Group unmatched entries by function name.
+) -> "Dict[tuple[str, int], dict]":
+    """Group unmatched entries by DISTINCT function identity.
 
-    Per-function aggregator: collects the vkeys in encounter order
-    (their list position is the ``comp_set_id`` referenced from
+    The grouping key is ``(func_name, occurrence)`` — a DISTINCT-section
+    identity, NOT the bare ``func_name``. A canonical name can map to
+    several genuinely-distinct functions inside one binary (per-TU static
+    initializers, thunks, anon-namespace collisions); the body-divergence
+    deduper bumps the per-stream ``occurrence`` ordinal so the kth
+    divergent body carries ``occurrence == k``. Keying on the bare name
+    would COLLAPSE all k bodies into one section with k×(arch-variants)
+    "versions" sharing repeated vkeys — a malformed catalog AND the
+    pathological giant group that stressed pass-2 into superlinearity at
+    z3 scale. Keying on ``(func_name, occurrence)`` instead yields ONE
+    section per distinct body, each holding only that body's per-stream
+    arch-variants — exactly the small-group distribution the rest of
+    pass-2 was always fed (genuinely-single-variant names top out at
+    ``occurrence == 0`` and are unaffected: one key, one section).
+
+    Each grouped value carries its ``func_name`` (the SECTION's
+    ``function_name_ptr`` is still ``registry.line_no(func_name)``, so
+    distinct occurrences of one name become same-FID sibling sections —
+    a layout the :class:`SectionWriter` already supports and the loader
+    disambiguates via per-call ``callee_vkey``).
+
+    Per-distinct-function aggregator: collects the vkeys in encounter
+    order (their list position is the ``comp_set_id`` referenced from
     ``called_by_version`` and the inlining-data merge). The pass-2
     writer resolves vkeys to ``0x<hex>`` variant refs via the
     ``VariantRegistry``; this stage stays unaware of the on-disk
@@ -504,20 +525,27 @@ def group_unmatched_entries_by_function(
     per-version callee lists in encounter order; the resulting list
     drives the section's ``call_targets[]`` ordering.
     """
-    unmatched_by_func: Dict[str, dict] = {}
+    unmatched_by_func: "Dict[tuple[str, int], dict]" = {}
     for entry in unmatched_data_entries:
         func_name = entry["func_name"]
+        # Distinct-section identity: bare name would merge genuinely-
+        # distinct same-name bodies into one giant group. ``occurrence``
+        # defaults to 0 (the single-and-only body of a name — matching
+        # :func:`parsed_record_iter._parse_occurrence`'s v1 default), so
+        # entries that predate the column still group by name alone.
+        identity = (func_name, entry.get("occurrence", 0))
         vkey = entry["vkey"]
 
-        if func_name not in unmatched_by_func:
-            unmatched_by_func[func_name] = {
+        if identity not in unmatched_by_func:
+            unmatched_by_func[identity] = {
+                "func_name": func_name,
                 "version_data_list": [],
                 "called_by_version": [],
                 "vkeys": [],
                 "_per_variant_extern_libraries": [],
             }
 
-        group = unmatched_by_func[func_name]
+        group = unmatched_by_func[identity]
         group["version_data_list"].append(
             (entry["data_offset"], entry["data_len"], entry["token_len"])
         )
@@ -529,7 +557,8 @@ def group_unmatched_entries_by_function(
     # Single-source-of-truth merges (extern libraries + typed-callee
     # union). Per-variant ordering is whatever the caller fed us
     # (typically variant-index order).
-    for func_name, group in unmatched_by_func.items():
+    for group in unmatched_by_func.values():
+        func_name = group["func_name"]
         group["extern_libraries"] = merge_extern_libraries(
             group.pop("_per_variant_extern_libraries"),
             func_name=func_name,
@@ -643,7 +672,12 @@ def write_unmatched_sections_pass2(
     writer = csv.writer(sections_file, lineterminator=_SECTION_LINE_TERMINATOR)
     unmatched_by_func = group_unmatched_entries_by_function(unmatched_data_entries)
 
-    for func_name, data in unmatched_by_func.items():
+    # Iterate by DISTINCT-function identity ``(func_name, occurrence)``.
+    # Each value carries its own ``func_name`` (the section FID source);
+    # the identity key's occurrence ordinal only distinguishes same-name
+    # sibling sections here and is not needed past the grouping boundary.
+    for data in unmatched_by_func.values():
+        func_name = data["func_name"]
         all_called: "list[TypedCallee]" = data["all_called"]
         version_data_list = data["version_data_list"]
         called_by_version = data["called_by_version"]
@@ -694,6 +728,7 @@ def write_unmatched_sections_pass2(
             called_line_nos_typed,
             call_targets_str,
             indexer_hex,
+            func_name in duplicated_names,
         )
 
         for data_offset, _data_len, _token_len in version_data_list:
@@ -711,9 +746,15 @@ def write_unmatched_sections_pass2(
         # loop below — exactly what the writer's jump-table reservation
         # and ``end_section`` assertion expect.
         function_name_ptr = registry.line_no(func_name)
+        # A duplicated name routes EVERY body to the unmatched arm; mark
+        # the section so consumers can tell "duplicated, calls into it are
+        # J=0xFFFE" from a genuinely-single-variant unmatched function.
+        # The duplication decision is owned by the lockstep classifier
+        # (``duplicated_names``); the writer takes only a generic flag.
         section_writer.begin_section(
             function_name_ptr=function_name_ptr,
             n_variants=len(vkeys),
+            duplicated=func_name in duplicated_names,
         )
         call_targets, unique_called_index_map = _build_call_targets_spec(
             typed_unique_called,

@@ -10,9 +10,15 @@ variant-against-variant.
 The owner ruling, pinned here end-to-end:
 
 1. **Definition side** — every row of a duplicated name routes to the
-   UNMATCHED arm (occurrence 0 included). The matched arm therefore
-   never emits two sections that share a ``function_name_ptr``
-   ("same-FID siblings"), which was the catalog-corruption root cause.
+   UNMATCHED arm (occurrence 0 included), and the unmatched grouper keys
+   on the DISTINCT identity ``(func_name, occurrence)`` so each divergent
+   body becomes its OWN section. N occurrences ⇒ N distinct sections that
+   SHARE the name's FID (same-FID siblings), each holding only that body's
+   per-stream arch-variants — NOT one merged group of all bodies (the
+   merge was both the catalog-corruption AND the pass-2 superlinearity
+   root cause). Each duplicated-routed section carries the
+   ``is_duplicated`` section-header marker; genuinely-single-variant
+   unmatched functions (occurrence-0-only, one section) do not.
 
 2. **Call side** — a matched caller's edge into a duplicated callee is
    RECORDED (the call_target row + per-call entry exist) but its
@@ -22,10 +28,7 @@ The owner ruling, pinned here end-to-end:
    unresolvable rather than resolve against an arbitrary sibling.
 
 The driving merge is the real :func:`lockstep_records`; pass 1/2 are the
-real builder walkers, so this is a faithful end-to-end pin. On the
-occurrence-blind predecessor the merge yielded the duplicated name twice
-down the MATCHED arm, producing two sections that shared one
-``function_name_ptr`` — the assertions below fail loudly on that code.
+real builder walkers, so this is a faithful end-to-end pin.
 """
 
 from __future__ import annotations
@@ -38,7 +41,10 @@ import numpy as np
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.csv_format import write_csv_prelude
 from tokenizer.aligned_data.extern_providers import ExternProviderRegistry
-from tokenizer.aligned_data.index_format import write_index_prelude
+from tokenizer.aligned_data.index_format import (
+    iter_index_entries,
+    write_index_prelude,
+)
 from tokenizer.aligned_data.matched_sections_bin import (
     MISSING_VARIANT_INDEX,
     SectionWriter,
@@ -264,11 +270,20 @@ def _emit_sections_bin(
     return list(iter_sections_bin(bin_path)), registry
 
 
-def test_duplicated_name_end_to_end_no_siblings_and_missing_call_j(
+def test_duplicated_name_end_to_end_distinct_sections_and_missing_call_j(
     tmp_path: Path,
 ) -> None:
-    """Full pipeline: duplicated callee → one unmatched section (no
-    same-FID matched siblings) + caller's call edge stamped 0xFFFE."""
+    """Full pipeline: a duplicated callee becomes ONE DISTINCT unmatched
+    section PER occurrence (each marked duplicated), and the caller's call
+    edge into it is stamped 0xFFFE.
+
+    Owner ruling: do NOT name-merge the same-name bodies into a single
+    section. ``_DUP`` is duplicated (occurrence 0 + 1) in both streams, so
+    the unmatched arm emits TWO distinct sections that SHARE the ``_DUP``
+    FID — same-FID siblings keyed on ``(func_name, occurrence)``, each
+    holding that distinct body's per-stream arch-variants. Both carry the
+    ``is_duplicated`` marker; the genuinely-single-variant caller does not.
+    """
     matched_entries, unmatched_entries, duplicated_names, registry = _emit_arms(
         tmp_path
     )
@@ -283,18 +298,30 @@ def test_duplicated_name_end_to_end_no_siblings_and_missing_call_j(
         tmp_path, matched_entries, unmatched_entries, duplicated_names, registry
     )
 
-    # (a) No two sections share a function_name_ptr — same-FID siblings
-    # are gone from the matched arm at the source.
-    name_ptrs = [s.function_name_ptr for s in sections]
-    assert len(name_ptrs) == len(set(name_ptrs)), (
-        f"same-FID sibling sections present: {name_ptrs!r}"
-    )
-
     dup_fid = registry.line_no(_DUP)
     caller_fid = registry.line_no(_CALLER)
+
+    # (a) The duplicated name is NOT merged: occurrence 0 and occurrence 1
+    # are two DISTINCT sections sharing the _DUP FID (same-FID siblings),
+    # each carrying that body's two per-stream arch-variants.
+    dup_sections = [s for s in sections if s.function_name_ptr == dup_fid]
+    assert len(dup_sections) == 2, (
+        f"expected 2 distinct duplicated sections (occ 0 + occ 1), got "
+        f"{len(dup_sections)}: name_ptrs={[s.function_name_ptr for s in sections]!r}"
+    )
+    for s in dup_sections:
+        assert len(s.variants) == 2, (
+            f"each distinct body keeps its 2 per-stream arch-variants, got "
+            f"{len(s.variants)}"
+        )
+
+    # (c-section) Every duplicated-routed section carries the marker; the
+    # genuinely-single-variant caller does not.
+    assert all(s.is_duplicated for s in dup_sections)
     caller_sections = [s for s in sections if s.function_name_ptr == caller_fid]
     assert len(caller_sections) == 1
     caller_section = caller_sections[0]
+    assert not caller_section.is_duplicated
 
     # The call edge into the duplicated callee is RECORDED in the
     # call_target table.
@@ -320,3 +347,110 @@ def test_duplicated_name_end_to_end_no_siblings_and_missing_call_j(
                     f"expected MISSING_VARIANT_INDEX={MISSING_VARIANT_INDEX:#06x}"
                 )
     assert saw_edge, "caller's per-call edge into the duplicated callee was dropped"
+
+    # Loader cardinality invariant (``_build_record_to_section_idx``): the
+    # unmatched index must carry exactly one record per section-variant
+    # across ALL unmatched sections, in lockstep. Distinct sections must
+    # not break this -- each occurrence's section writes its own index
+    # entries before its section, so the totals still line up. Here the
+    # only unmatched functions are the two duplicated sections (the caller
+    # is matched), so the index count equals their combined variant count.
+    total_section_variants = sum(len(s.variants) for s in dup_sections)
+    n_index_entries = sum(1 for _ in iter_index_entries(tmp_path / "u_idx.bin"))
+    assert n_index_entries == total_section_variants, (
+        f"unmatched index has {n_index_entries} records but the duplicated "
+        f"sections declare {total_section_variants} variants; the loader's "
+        f"record-to-section mapping would raise"
+    )
+
+
+def _identical_body(func_name: str, occurrence: int) -> ParsedRecord:
+    """Two distinct functions with BYTE-IDENTICAL bodies (same seed)."""
+    return _record(func_name, occurrence, called=[], seed=777)
+
+
+def test_byte_identical_distinct_bodies_share_one_data_bin_record(
+    tmp_path: Path,
+) -> None:
+    """(b) Distinct duplicated sections whose bodies are byte-identical
+    LINK via the existing content-dedup hashmap: they reference ONE shared
+    ``_unmatched_data.bin`` record (its offset), they are NOT re-written.
+
+    This is the only allowed non-linearity (content-hash dedup). The two
+    occurrences remain DISTINCT sections (the routing/identity change),
+    but their identical bodies do not duplicate bytes on disk.
+    """
+    classifier = DuplicateNameClassifier()
+    unmatched_data_path = tmp_path / "demo_unmatched_data.bin"
+    registry = FunctionNamesRegistry()
+    unmatched_state = open_arm_dedup_state(unmatched_data_path)
+    error_log = io.StringIO()
+
+    name = "__static_init"
+    # One stream, two occurrences of the same name with identical bodies.
+    stream = [_identical_body(name, 0), _identical_body(name, 1)]
+    unmatched_entries: list[dict] = []
+    for item in lockstep_records([_stream(stream)], classifier=classifier):
+        assert isinstance(item, Unmatched)
+        unmatched_entries.extend(
+            process_unmatched_function(
+                item.func_name,
+                {item.variant_index: item.record},
+                list(_VKEYS),
+                unmatched_state,
+                registry,
+                error_log=error_log,
+            )
+        )
+    finalize_arm_dedup_state(unmatched_state)
+
+    assert classifier.duplicated_names == {name}
+    # Two DISTINCT entries (occurrence 0 + 1) ...
+    occ = sorted(e["occurrence"] for e in unmatched_entries)
+    assert occ == [0, 1]
+    # ... but the identical bodies dedup to ONE shared data.bin offset.
+    offsets = {e["data_offset"] for e in unmatched_entries}
+    assert len(offsets) == 1, (
+        f"byte-identical distinct bodies were re-written instead of linked "
+        f"via content-dedup: offsets={offsets!r}"
+    )
+
+
+def test_genuinely_single_variant_unmatched_is_one_section(
+    tmp_path: Path,
+) -> None:
+    """A unique name present in exactly one stream stays ONE unmatched
+    section and is NOT marked duplicated — the distinct-identity grouping
+    leaves single-variant functions untouched."""
+    classifier = DuplicateNameClassifier()
+    unmatched_data_path = tmp_path / "demo_unmatched_data.bin"
+    registry = FunctionNamesRegistry()
+    unmatched_state = open_arm_dedup_state(unmatched_data_path)
+    error_log = io.StringIO()
+
+    name = "lone_fn"
+    stream = [_record(name, 0, called=[], seed=11)]
+    unmatched_entries: list[dict] = []
+    for item in lockstep_records([_stream(stream)], classifier=classifier):
+        unmatched_entries.extend(
+            process_unmatched_function(
+                item.func_name,
+                {item.variant_index: item.record},
+                list(_VKEYS),
+                unmatched_state,
+                registry,
+                error_log=error_log,
+            )
+        )
+    finalize_arm_dedup_state(unmatched_state)
+    registry.finalize()
+    registry.write_sidecar(tmp_path, "demo")
+
+    assert classifier.duplicated_names == set()
+    sections, registry = _emit_sections_bin(
+        tmp_path, [], unmatched_entries, set(), registry
+    )
+    lone = [s for s in sections if s.function_name_ptr == registry.line_no(name)]
+    assert len(lone) == 1
+    assert len(lone[0].variants) == 1
+    assert not lone[0].is_duplicated
