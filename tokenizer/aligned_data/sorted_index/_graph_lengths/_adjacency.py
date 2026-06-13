@@ -29,7 +29,7 @@ silently drops a splice edge -- a data-quality defect worth surfacing).
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
+from typing import Tuple
 
 import numpy as np
 
@@ -78,9 +78,6 @@ class LiveNodeAdjacency:
             offs.astype(np.uint32),
             np.arange(n_sections, dtype=np.uint32),
         )
-        # Per-section, per-called_idx ascending sibling-candidate cache
-        # (built lazily on first fallback need for a section).
-        self._fallback_cache: Dict[int, Dict[int, np.ndarray]] = {}
         self._report_inventory()
 
     # -- public per-node API ----------------------------------------------
@@ -164,43 +161,22 @@ class LiveNodeAdjacency:
         """Lowest sibling-variant J for ``(sec, called_idx)`` that is
         usable (non-sentinel), or ``-1``.
 
-        The candidate list (ascending sibling variant, that variant's J
-        for this slot) is cached per section -- a per-section read, not a
-        graph-wide structure.
+        Scanned live off the memmap in ascending sibling-variant order
+        (the fallback scan order) for THIS slot only -- a per-section
+        read on demand, never a memoised structure.
         """
-        cands = self._section_candidates(sec).get(called_idx)
-        if cands is None:
-            return -1
-        for J in cands.tolist():
-            if _usable(J):
-                return J
-        return -1
-
-    def _section_candidates(self, sec: int) -> Dict[int, np.ndarray]:
-        """``{called_idx -> ascending-sibling J array}`` for one section.
-
-        Built lazily from the section's variants' per-call entries; the
-        Js are ordered by ascending sibling variant index (the fallback
-        scan order). Cached so repeated fallbacks in one section don't
-        re-scan.
-        """
-        cached = self._fallback_cache.get(sec)
-        if cached is not None:
-            return cached
         cols = self._cols
         v0 = int(cols.var_offsets[sec])
         v1 = int(cols.var_offsets[sec + 1])
-        per_called: Dict[int, list] = {}
         for v in range(v0, v1):
             p0 = int(cols.pce_offsets[v])
             p1 = int(cols.pce_offsets[v + 1])
             called = cols.pce_called_idx[p0:p1]
             Js = cols.pce_section_variant_index[p0:p1]
             for ci, J in zip(called.tolist(), Js.tolist()):
-                per_called.setdefault(int(ci), []).append(int(J))
-        out = {ci: np.asarray(js, dtype=np.int64) for ci, js in per_called.items()}
-        self._fallback_cache[sec] = out
-        return out
+                if int(ci) == called_idx and _usable(int(J)):
+                    return int(J)
+        return -1
 
     # -- inventory logging -------------------------------------------------
 

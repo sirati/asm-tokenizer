@@ -10,8 +10,10 @@ Default values match the plan's D5 + D6:
 
 * ``variant_padding=VariantPadding.PAD_NULL`` -- short sections pad with
   all-null-content rows (recommended default).
-* ``inlined_equivalent_call_targets_only=False``,
-  ``include_fid_sidecar=False``, ``keep_intermediate=False`` -- minimal
+* ``inlined_equivalent_call_targets_only=True`` -- the walk includes
+  only inlining-equivalent (``is_matched``) call targets; the non-
+  inlined-equivalent mode is unsupported (the walkers assert on False).
+* ``include_fid_sidecar=False``, ``keep_intermediate=False`` -- minimal
   output by default.
 
 Collector lifetime (orchestrator amortisation):
@@ -186,9 +188,10 @@ def batch_decode(
         :class:`VariantPadding` policy for the variant axis (plan D6 +
         ALG-10).
     inlined_equivalent_call_targets_only:
-        When True, stage 1's callee walk includes only call targets
-        whose ``is_matched`` flag is True (i.e. only inlining-equivalent
-        callees). Default False -- include every call target.
+        When True (the default), stage 1's callee walk includes only
+        call targets whose ``is_matched`` flag is True (i.e. only
+        inlining-equivalent callees). Passing False is unsupported --
+        the stage-1 walkers assert on it.
     include_fid_sidecar:
         When True, stage 4 builds the optional
         ``(fid_sidecar, fid_row_offsets)`` pair (plan D5).

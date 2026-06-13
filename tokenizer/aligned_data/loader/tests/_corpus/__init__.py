@@ -15,6 +15,9 @@ Submodules:
 * :mod:`.builder`  -- ``build_corpus`` (stub registry) +
                        ``build_corpus_with_registry`` (test-supplied registry)
                        + ``CorpusPaths``
+* :mod:`.corrupt`  -- ``build_corrupt_per_call_j_corpus`` (clean corpus
+                       byte-patched to inject per-call ``J`` corruption
+                       for the standalone catalog validator's tests)
 
 Re-exported here so tests need a single import line.
 """
@@ -25,6 +28,10 @@ from .builder import (
     CorpusPaths,
     build_corpus,
     build_corpus_with_registry,
+)
+from .corrupt import (
+    CorruptCorpus,
+    build_corrupt_per_call_j_corpus,
 )
 from .names import (
     assert_starts_4_byte_aligned,
@@ -41,12 +48,14 @@ from .specs import (
 
 __all__ = (
     "CorpusPaths",
+    "CorruptCorpus",
     "MatchedFunctionSpec",
     "UnmatchedFunctionSpec",
     "VariantSpec",
     "assert_starts_4_byte_aligned",
     "build_corpus",
     "build_corpus_with_registry",
+    "build_corrupt_per_call_j_corpus",
     "make_simple_variant",
     "make_variable_length_names",
     "matched_spec",
