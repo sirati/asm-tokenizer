@@ -23,6 +23,7 @@ import pytest
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.tests._corpus import (
     MatchedFunctionSpec,
+    VariantSpec,
     build_corpus,
     make_simple_variant,
 )
@@ -89,20 +90,46 @@ def _shared_variant(seed: int):
     return make_simple_variant(("shared", 0), token_seed=seed, n_tokens=6)
 
 
+def _chain_variants(seed: int, nxt):
+    """Two shared-vkey variants: v0 calls the chain's next function, v1
+    is quiet.
+
+    The once-only / all-variants-equivalence walk excludes a callee
+    reached by EVERY variant; a single-variant chain would splice
+    nothing (FLAG-A). Pairing the caller variant with a quiet sibling
+    makes each edge "some but not all" so depth still grows the spliced
+    length. Both share the ``("shared", 0)`` vkey so the edge's per-call
+    J lands on the callee's matching variant.
+    """
+    v0 = make_simple_variant(("shared", 0), token_seed=seed, n_tokens=6)
+    v1 = make_simple_variant(("shared", 0), token_seed=seed + 5, n_tokens=7)
+    return (
+        VariantSpec(
+            vkey=v0.vkey, tokens=v0.tokens, block_rl=v0.block_rl,
+            insn_rl=v0.insn_rl, called=(nxt,) if nxt else (),
+        ),
+        VariantSpec(
+            vkey=("shared", 1), tokens=v1.tokens, block_rl=v1.block_rl,
+            insn_rl=v1.insn_rl, called=(),
+        ),
+    )
+
+
 def _build_chain_binary(
     memmap_dir: Path, binary_name: str, *, depths=_DEPTHS
 ) -> None:
     """Place a 5-function call chain whose spliced length grows with depth.
 
-    ``a -> b -> c -> d -> e`` with a shared vkey, so depth-d3 lengths
-    strictly exceed depth-d0 lengths. Probed bucket layout (max
-    reduction): d0 all sections at key 7; d3 keys 7/14/21/28. A band
-    above 14 therefore captures d3 sections but no d0 section.
+    ``a -> b -> c -> d -> e``; each function has a caller variant 0
+    (calls the next) + a quiet sibling variant 1, so depth-d3 lengths
+    strictly exceed depth-d0 lengths for variant 0. Probed bucket layout
+    (max reduction): a band above the d0 keys captures d3 sections but
+    no d0 section.
     """
     specs = [
         MatchedFunctionSpec(
             func_name=name,
-            variants=(_shared_variant(10 * i + 1),),
+            variants=_chain_variants(10 * i + 1, nxt),
             called=(nxt,) if nxt else (),
         )
         for i, (name, nxt) in enumerate(
@@ -368,11 +395,13 @@ def test_sessions_shared_across_specs(tmp_path: Path, monkeypatch) -> None:
         [dir_a], specs=[_SPEC_D0, _SPEC_D3]
     ) as coll:
         rng = np.random.default_rng(1)
-        # batch_size 10 == both binaries' full key-7 pool (5 each) so
+        # batch_size 10 == both binaries' full key-8 pool (5 each) so
         # the d0 draw saturates and samples every section of both
         # binaries; the d3 band draw re-samples the d3-spliced sections.
+        # (d0 MAX key is 8 = 1 self-token + the quiet sibling's 7-token
+        # body, the larger of the two variants.)
         coll.load_batch(
-            7, 10, rng=rng, spec=_SPEC_D0,
+            8, 10, rng=rng, spec=_SPEC_D0,
             context_len=16, num_variants_per_section=1, max_depth=1,
         )
         coll.load_batch(
@@ -402,10 +431,10 @@ def test_load_batch_e2e_differs_per_spec(tmp_path: Path) -> None:
     with IndexedMemmapCollection.discover(
         [dir_a], specs=[_SPEC_D0, _SPEC_D3]
     ) as coll:
-        # d0: exact bucket at key 7 (every section) decodes.
+        # d0: exact bucket at key 8 (every section) decodes.
         rng = np.random.default_rng(11)
         res_d0 = coll.load_batch(
-            7, 5, rng=rng, spec=_SPEC_D0,
+            8, 5, rng=rng, spec=_SPEC_D0,
             context_len=64, num_variants_per_section=1, max_depth=1,
         )
         assert res_d0.inner.tokens.shape[0] == 5

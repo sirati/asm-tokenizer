@@ -208,7 +208,6 @@ def test_batch_decode_kwargs_threaded(monkeypatch: pytest.MonkeyPatch) -> None:
         context_len=16,
         max_depth=2,
         variant_padding=VariantPadding.RAGGED,
-        inlined_equivalent_call_targets_only=True,
         include_fid_sidecar=True,
         keep_intermediate=True,
         rng=explicit_rng,

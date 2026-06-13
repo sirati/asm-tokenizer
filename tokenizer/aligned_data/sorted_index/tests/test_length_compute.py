@@ -204,7 +204,6 @@ def test_combined_fixture_many_variant_max_vs_p50(tmp_path: Path) -> None:
             num_variants_per_section=np.iinfo(np.int32).max,
             max_depth=3,
             variant_padding=VariantPadding.RAGGED,
-            inlined_equivalent_call_targets_only=False,
             rng=rng,
         )
         stage2 = predict_lengths(stage1, context_len=LARGE_CONTEXT_LEN)
@@ -351,7 +350,7 @@ def test_negative_depth_raises(tmp_path: Path) -> None:
 def test_budget_guard_raises(tmp_path: Path) -> None:
     """Lengths reaching LARGE_CONTEXT_LEN refuse to under-report.
 
-    Patches the bulk own-length step to claim every record is at the
+    Patches the bulk body-length step to claim every record is at the
     budget; the compute MUST raise rather than emit a clipped u32.
     """
     base = build_combined_fixture(tmp_path)
@@ -363,7 +362,7 @@ def test_budget_guard_raises(tmp_path: Path) -> None:
         )
 
     with patch(
-        "tokenizer.aligned_data.sorted_index._graph_lengths._own_lengths",
+        "tokenizer.aligned_data.sorted_index._graph_lengths._bfs._body_lengths",
         side_effect=_huge,
     ):
         with pytest.raises(AssertionError, match="LARGE_CONTEXT_LEN"):

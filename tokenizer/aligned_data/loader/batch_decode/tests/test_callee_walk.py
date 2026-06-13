@@ -1,17 +1,26 @@
-"""Unit tests for the stage-1 DFS callee walker.
+"""Unit tests for the stage-1 level-synchronous callee walker.
 
-Single concern: validate the DFS encounter order + cycle suppression
-+ inlining filter + max_depth cap on
+Single concern: validate the BFS encounter order + once-only dedup
++ all-variants-equivalence exclusion + max_depth cap on
 :func:`tokenizer.aligned_data.loader.batch_decode._callee_walk.walk_callees`.
 
 Every test builds a synthetic call graph via the :class:`_FakeSession`
 fixture below: a section registry keyed by ``section_offset`` so the
-walker's ``_idx_for_section_offset`` -> ``_load_matched_for_splice``
+walker's ``_idx_for_section_offset`` ->
+``_load_matched_section_and_variants``
 round-trip resolves to caller-supplied :class:`Section` +
 :class:`FunctionData` pairs. No real binary memmap is touched.
 
-The walker's algorithm is fully described in the module under test;
-these tests pin its observable contract per the task spec:
+Because the once-only mask spans a section's FULL variant set and
+excludes any callee reached by EVERY variant, a single-variant section
+splices nothing (FLAG-A). The resolution-mechanics tests therefore pair
+each caller variant with a quiet sibling (:func:`_calling_variant`) so
+variant 0's callees are "reached by some but not all" and get included;
+``walk_callees`` returns variant 0's list.
+
+These tests pin the walker's observable contract under the owner's
+once-only + all-variants-equivalence spec (supersedes the legacy
+active-path DAG semantics):
 
 1. Single-function root (no callees) -- length 1, root is LOCAL_FUNC,
    parent_call_target_index None.
@@ -20,12 +29,14 @@ these tests pin its observable contract per the task spec:
 4. EXT callee -- skipped (EXT_FUNC bodies not inlined per plan D3).
 5. max_depth=0 -- root only.
 6. max_depth=1 -- root + direct callees; grandchildren skipped.
-7. Cycle A -> B -> A -- output [A, B]; inner A suppressed.
-8. DAG A -> {B, C}; B -> D; C -> D -- output [A, B, D, C, D]
-   (visited set pops on backtrack -> D appears twice).
-9. inlined_equivalent_call_targets_only=True -- skip when all or none
-   of the parent's variants called the target; include only the "some
-   but not all" case.
+7. Cycle A -> B -> A -- output [A, B]; the recursive edge back to an
+   already-included section is a once-only dedup no-op.
+8. Diamond A -> {B, C}; B -> D; C -> D -- output [A, B, C, D] in BFS
+   level order; D is deduped to ONE inclusion (the legacy active-path
+   walk emitted it twice as [A, B, D, C, D]).
+9. all-variants-equivalence -- a callee every variant of a section
+   called is excluded; a variant includes only callees IT directly
+   called (its per-call entries).
 10. parent_call_target_index correctness -- non-root entries index
     into the PARENT's ``call_targets_section``.
 """
@@ -107,6 +118,23 @@ def _make_section(
     )
 
 
+def _calling_variant(per_call_entries: List[Tuple[int, int]]) -> List[VariantBlock]:
+    """A caller variant (variant 0) PLUS a quiet sibling (variant 1).
+
+    The once-only / all-variants-equivalence walk excludes a callee
+    reached by EVERY variant of the section. A single-variant section
+    therefore splices nothing (FLAG-A). These resolution-mechanics tests
+    want variant 0's calls to actually splice, so they pair the caller
+    with a quiet sibling that calls nothing -- making variant 0's callees
+    "reached by SOME but not all" and hence included. ``walk_callees``
+    returns variant 0's list.
+    """
+    return [
+        _make_variant(vkey=0, per_call_entries=per_call_entries),
+        _make_variant(vkey=1, per_call_entries=[]),
+    ]
+
+
 def _ct_local(*, fid: int, target_offset: int) -> CallTarget:
     """LOCAL call_target row pointing at ``target_offset``."""
     return CallTarget(
@@ -140,22 +168,32 @@ def _ct_extern(*, fid: int, target_offset: int) -> CallTarget:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _FakeMatched:
+    """Matched-load result stub: the walker indexes ``.variants`` with
+    the table-size-validated variant choice."""
+
+    variants: List[Optional[FunctionData]]
+
+
 @dataclass
 class _FakeSession:
     """Minimal session stub keyed by ``section_offset``.
 
     The walker reaches into the session via three methods:
     ``_idx_for_section_offset(byte_offset, arm_str)``,
-    ``_load_matched_for_splice(idx, variant_index)``, and
-    ``_load_unmatched_for_splice(idx)``. The fake uses the section's
-    own ``section_offset`` as its idx so the round-trip is trivially
-    invertible.
+    ``_load_matched_section_and_variants(idx)``, and
+    ``_load_unmatched_for_splice(idx)`` (plus the ``_binary_name``
+    identity attribute for demotion inventory logs). The fake uses the
+    section's own ``section_offset`` as its idx so the round-trip is
+    trivially invertible.
 
     Per-section ``FunctionData`` is keyed by ``(section_offset,
     variant_index)`` for matched and by ``section_offset`` for
     unmatched (which has exactly one variant by construction).
     """
 
+    _binary_name: str = "fake-bin"
     matched_sections: Dict[int, Section] = field(default_factory=dict)
     matched_function_data: Dict[Tuple[int, int], FunctionData] = field(
         default_factory=dict
@@ -197,12 +235,15 @@ class _FakeSession:
             )
         raise ValueError(f"unknown arm: {arm!r}")
 
-    def _load_matched_for_splice(
-        self, idx: int, variant_index: int
-    ) -> Tuple[FunctionData, Section, int]:
+    def _load_matched_section_and_variants(
+        self, idx: int
+    ) -> Tuple[Section, int, "_FakeMatched"]:
         section = self.matched_sections[idx]
-        fd = self.matched_function_data[(idx, variant_index)]
-        return fd, section, section.section_offset
+        variants = [
+            self.matched_function_data.get((idx, v))
+            for v in range(len(section.variants))
+        ]
+        return section, section.section_offset, _FakeMatched(variants)
 
     def _load_unmatched_for_splice(
         self, idx: int
@@ -233,7 +274,6 @@ def test_root_only_no_callees() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 1
@@ -250,7 +290,7 @@ def test_one_local_callee_at_depth_1() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
 
@@ -266,7 +306,6 @@ def test_one_local_callee_at_depth_1() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 2
@@ -283,7 +322,7 @@ def test_one_plt_callee_yields_plt_func_category() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_plt(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
 
@@ -299,7 +338,6 @@ def test_one_plt_callee_yields_plt_func_category() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 2
@@ -322,7 +360,7 @@ def test_extern_callee_is_skipped() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_extern(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
 
@@ -338,7 +376,6 @@ def test_extern_callee_is_skipped() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 1
@@ -352,7 +389,7 @@ def test_max_depth_zero_returns_root_only() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
 
@@ -368,7 +405,6 @@ def test_max_depth_zero_returns_root_only() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=0,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 1
@@ -384,14 +420,14 @@ def test_max_depth_one_includes_direct_callees_only() -> None:
         section_offset=200,
         function_name_ptr=2,
         call_targets=[_ct_local(fid=3, target_offset=300)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     child_fd = _make_function_data("child")
     root_section = _make_section(
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
 
@@ -408,7 +444,6 @@ def test_max_depth_one_includes_direct_callees_only() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=1,
-        inlined_equivalent_call_targets_only=False,
     )
 
     # Root + 1 direct callee; grandchild NOT included.
@@ -417,22 +452,23 @@ def test_max_depth_one_includes_direct_callees_only() -> None:
     assert fids == [1, 2]
 
 
-def test_cycle_a_b_a_suppressed_via_active_visited_set() -> None:
-    """A -> B -> A: the second A is suppressed because (arm, A's offset)
-    is already in the active visited set at the time B walks its
-    call_targets."""
+def test_cycle_a_b_a_deduped_by_once_only_mask() -> None:
+    """A -> B -> A: the recursive edge back to A is a once-only dedup
+    no-op -- A's section was seeded at the mask's column 0 (the root is
+    always included once), so B's call back to A re-marks an
+    already-True cell and includes nothing. Output [A, B]."""
     # Section A points at B; section B points back at A.
     a_section = _make_section(
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     b_section = _make_section(
         section_offset=200,
         function_name_ptr=2,
         call_targets=[_ct_local(fid=1, target_offset=100)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
 
     a_fd = _make_function_data("a")
@@ -449,32 +485,31 @@ def test_cycle_a_b_a_suppressed_via_active_visited_set() -> None:
         root_function_data=a_fd,
         root_function_name_ptr=1,
         max_depth=10,
-        inlined_equivalent_call_targets_only=False,
     )
 
-    # [A, B]; B's call back to A is blocked by the active-path cycle
-    # guard.
+    # [A, B]; B's call back to A is deduped (A already at mask col 0).
     assert [e.function_name_ptr for e in out] == [1, 2]
 
 
-def test_dag_a_b_d_and_a_c_d_visits_d_twice() -> None:
-    """DAG-active-path semantics (plan D3): A -> B -> D and A -> C -> D
-    produces [A, B, D, C, D] because the visited set pops on
-    backtrack -- D is *only* on the active path when nested under B
-    (resp. C), not across siblings."""
+def test_dag_a_b_d_and_a_c_d_dedups_d_to_once() -> None:
+    """Once-only semantics (owner's spec, supersedes plan-D3 DAG): the
+    diamond A -> B -> D and A -> C -> D includes D ONCE per variant, not
+    twice. BFS level order: [A(0), B(1), C(1), D(2)] -- D is deduped
+    across the two branches (the legacy active-path walk emitted it
+    twice in DFS order [A, B, D, C, D])."""
     d_section = _make_section(section_offset=400, function_name_ptr=4)
     d_fd = _make_function_data("d")
     b_section = _make_section(
         section_offset=200,
         function_name_ptr=2,
         call_targets=[_ct_local(fid=4, target_offset=400)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     c_section = _make_section(
         section_offset=300,
         function_name_ptr=3,
         call_targets=[_ct_local(fid=4, target_offset=400)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     a_section = _make_section(
         section_offset=100,
@@ -483,9 +518,7 @@ def test_dag_a_b_d_and_a_c_d_visits_d_twice() -> None:
             _ct_local(fid=2, target_offset=200),
             _ct_local(fid=3, target_offset=300),
         ],
-        variants=[
-            _make_variant(vkey=0, per_call_entries=[(0, 0), (1, 0)]),
-        ],
+        variants=_calling_variant([(0, 0), (1, 0)]),
     )
     a_fd = _make_function_data("a")
     b_fd = _make_function_data("b")
@@ -505,40 +538,35 @@ def test_dag_a_b_d_and_a_c_d_visits_d_twice() -> None:
         root_function_data=a_fd,
         root_function_name_ptr=1,
         max_depth=10,
-        inlined_equivalent_call_targets_only=False,
     )
 
-    assert [e.function_name_ptr for e in out] == [1, 2, 4, 3, 4]
-    # The two D occurrences point to the SAME loaded body (one session
-    # load per (section, variant) visit; the walker doesn't memoize
-    # across the DAG -- both load calls return the same FunctionData
-    # instance from the fake session's per-(idx, v_idx) dict).
-    assert out[2].function_data is out[4].function_data is d_fd
+    # BFS level order, D deduped to one occurrence.
+    assert [e.function_name_ptr for e in out] == [1, 2, 3, 4]
+    assert out[3].function_data is d_fd
 
 
-def test_path_depth_tracks_dfs_descent() -> None:
-    """``path_depth`` is the DFS descent count: root 0, callee +1 per level.
+def test_path_depth_tracks_bfs_level() -> None:
+    """``path_depth`` is the BFS level: root 0, callee +1 per level.
 
-    Reuses the DAG ``A -> {B, C}; B -> D; C -> D`` whose encounter order
-    is ``[A, B, D, C, D]``. The matching path-depths are
-    ``[0, 1, 2, 1, 2]`` -- the root at 0, the direct callees B/C at 1,
-    and the grandchild D at 2 under EITHER parent. This pins the
-    property that makes one max-depth walk serve every shallower depth:
-    a call_target belongs to the depth-``k`` expansion iff its
-    ``path_depth <= k``."""
+    The DAG ``A -> {B, C}; B -> D; C -> D`` flattens in BFS order
+    ``[A, B, C, D]`` (D deduped). The matching path-depths are
+    ``[0, 1, 1, 2]`` -- the root at 0, direct callees B/C at 1, and the
+    once-included grandchild D at 2. This pins the property that makes
+    one max-depth walk serve every shallower depth: a call_target
+    belongs to the depth-``k`` expansion iff its ``path_depth <= k``."""
     d_section = _make_section(section_offset=400, function_name_ptr=4)
     d_fd = _make_function_data("d")
     b_section = _make_section(
         section_offset=200,
         function_name_ptr=2,
         call_targets=[_ct_local(fid=4, target_offset=400)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     c_section = _make_section(
         section_offset=300,
         function_name_ptr=3,
         call_targets=[_ct_local(fid=4, target_offset=400)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     a_section = _make_section(
         section_offset=100,
@@ -547,9 +575,7 @@ def test_path_depth_tracks_dfs_descent() -> None:
             _ct_local(fid=2, target_offset=200),
             _ct_local(fid=3, target_offset=300),
         ],
-        variants=[
-            _make_variant(vkey=0, per_call_entries=[(0, 0), (1, 0)]),
-        ],
+        variants=_calling_variant([(0, 0), (1, 0)]),
     )
     a_fd = _make_function_data("a")
     session = _FakeSession()
@@ -566,11 +592,10 @@ def test_path_depth_tracks_dfs_descent() -> None:
         root_function_data=a_fd,
         root_function_name_ptr=1,
         max_depth=10,
-        inlined_equivalent_call_targets_only=False,
     )
 
-    assert [e.function_name_ptr for e in out] == [1, 2, 4, 3, 4]
-    assert [e.path_depth for e in out] == [0, 1, 2, 1, 2]
+    assert [e.function_name_ptr for e in out] == [1, 2, 3, 4]
+    assert [e.path_depth for e in out] == [0, 1, 1, 2]
 
 
 def test_max_depth_one_caps_path_depth_at_one() -> None:
@@ -586,13 +611,13 @@ def test_max_depth_one_caps_path_depth_at_one() -> None:
         section_offset=200,
         function_name_ptr=2,
         call_targets=[_ct_local(fid=3, target_offset=300)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_section = _make_section(
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
     session = _FakeSession()
@@ -610,29 +635,31 @@ def test_max_depth_one_caps_path_depth_at_one() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=1,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert [e.path_depth for e in out] == [0, 1]
     assert max(e.path_depth for e in out) <= 1
 
 
-def test_inlined_equivalent_filter_skips_all_and_none_callers() -> None:
-    """``inlined_equivalent_call_targets_only=True``:
+def test_all_variants_equivalence_excludes_and_direct_calls_only() -> None:
+    """Once-only + all-variants-equivalence, the default-and-only walk:
 
-    - callee called by ALL parent variants -> skipped (no inlining
-      variation).
-    - callee called by NO parent variants -> skipped.
-    - callee called by SOME (but not all) parent variants -> included.
+    A variant includes a callee iff it DIRECTLY called it (its own
+    per-call entries) AND the callee was NOT reached by every variant
+    (columnwise-ALL exclusion). The returned list is the requested
+    variant's; ``walk_callees(root_variant_idx=0)`` returns variant 0's
+    inclusions -- callees variant 0 itself called, minus the ones every
+    variant called.
     """
     # 4 callees; parent section has 3 variants. Per-call-entry sets:
     #   variant 0 calls callees [0, 1]
     #   variant 1 calls callees [0]
     #   variant 2 calls callees [0, 1, 2]
-    # -> called_idx=0 by {0,1,2} (ALL)        -> SKIP
-    # -> called_idx=1 by {0, 2} (SOME, 2/3)   -> INCLUDE
-    # -> called_idx=2 by {2}     (SOME, 1/3)   -> INCLUDE
-    # -> called_idx=3 by {}                    -> SKIP (NONE)
+    # variant-0 perspective (the returned list):
+    # -> called_idx=0 by {0,1,2} (ALL)   -> EXCLUDED (equivalence)
+    # -> called_idx=1 by {0, 2}          -> v0 called it, not all -> INCLUDE
+    # -> called_idx=2 by {2} only        -> v0 did NOT call it -> absent
+    # -> called_idx=3 by {}              -> nobody called it -> absent
     callee_sections = {
         offset: _make_section(section_offset=offset, function_name_ptr=fid)
         for offset, fid in [(200, 2), (300, 3), (400, 4), (500, 5)]
@@ -670,20 +697,18 @@ def test_inlined_equivalent_filter_skips_all_and_none_callers() -> None:
         root_function_data=parent_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=True,
     )
 
-    # Root + callees from called_idx=1 (fid=3) + called_idx=2 (fid=4).
+    # Root + the single callee variant 0 directly called that isn't
+    # all-variants-excluded: called_idx=1 (fid=3). called_idx=0 is
+    # excluded (all called); called_idx=2/3 variant 0 never called.
     fids = [e.function_name_ptr for e in out]
-    assert fids == [1, 3, 4], (
-        f"expected [1, 3, 4], got {fids} -- the filter must drop "
-        "called_idx=0 (all called) AND called_idx=3 (none called) while "
-        "keeping called_idx=1 + called_idx=2 (some but not all)"
+    assert fids == [1, 3], (
+        f"expected [1, 3], got {fids} -- variant 0 includes only its "
+        "own direct call_idx=1 (some-not-all); call_idx=0 is excluded "
+        "(all-variants), call_idx=2 variant 0 never called"
     )
-    # The two non-root entries should carry parent_call_target_index = 1
-    # and 2 respectively.
-    parent_idxs = [e.parent_call_target_index for e in out[1:]]
-    assert parent_idxs == [1, 2]
+    assert [e.parent_call_target_index for e in out[1:]] == [1]
 
 
 def test_parent_call_target_index_indexes_into_parents_call_targets() -> None:
@@ -707,11 +732,7 @@ def test_parent_call_target_index_indexes_into_parents_call_targets() -> None:
             _ct_local(fid=11, target_offset=0),
             _ct_local(fid=4, target_offset=400),
         ],
-        variants=[
-            _make_variant(
-                vkey=0, per_call_entries=[(0, 0), (1, 0), (2, 0)]
-            )
-        ],
+        variants=_calling_variant([(0, 0), (1, 0), (2, 0)]),
     )
     parent_fd = _make_function_data("parent")
     session = _FakeSession()
@@ -726,7 +747,6 @@ def test_parent_call_target_index_indexes_into_parents_call_targets() -> None:
         root_function_data=parent_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 2
@@ -764,7 +784,6 @@ def test_root_encounter_category_is_always_local_func() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=7,
         max_depth=3,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert out[0].encounter_category is Category.LOCAL_FUNC
@@ -777,7 +796,7 @@ def test_unresolved_pointer_is_skipped() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=0)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
     session = _FakeSession()
@@ -791,7 +810,6 @@ def test_unresolved_pointer_is_skipped() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 1
@@ -805,7 +823,7 @@ def test_callee_in_unknown_arm_is_skipped() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root")
     session = _FakeSession()
@@ -820,7 +838,6 @@ def test_callee_in_unknown_arm_is_skipped() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 1
@@ -841,7 +858,6 @@ def test_negative_max_depth_rejected() -> None:
             root_function_data=root_fd,
             root_function_name_ptr=1,
             max_depth=-1,
-            inlined_equivalent_call_targets_only=False,
         )
 
 
@@ -872,7 +888,7 @@ def test_variant_tokens_prepended_only_at_root_not_at_callees() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root", variant_tokens=axis_tokens)
 
@@ -888,7 +904,6 @@ def test_variant_tokens_prepended_only_at_root_not_at_callees() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert len(out) == 2
@@ -921,7 +936,7 @@ def test_unmatched_arm_uses_load_unmatched_for_splice() -> None:
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     root_fd = _make_function_data("root_unmatched")
 
@@ -937,7 +952,6 @@ def test_unmatched_arm_uses_load_unmatched_for_splice() -> None:
         root_function_data=root_fd,
         root_function_name_ptr=1,
         max_depth=5,
-        inlined_equivalent_call_targets_only=False,
     )
 
     assert [e.function_name_ptr for e in out] == [1, 2]

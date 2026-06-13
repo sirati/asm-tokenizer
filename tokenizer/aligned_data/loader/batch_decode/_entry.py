@@ -152,7 +152,7 @@ def batch_decode(
     context_len: int,
     max_depth: int,
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
-    inlined_equivalent_call_targets_only: bool = False,
+    inlined_equivalent_call_targets_only: bool = True,
     include_fid_sidecar: bool = False,
     keep_intermediate: bool = False,
     emit_block_n_insns_runlength: bool = False,

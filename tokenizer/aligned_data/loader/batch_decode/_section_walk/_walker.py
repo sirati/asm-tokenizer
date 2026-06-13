@@ -67,9 +67,10 @@ import numpy as np
 from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
     BucketedRunLengthCollector,
 )
+from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 
 from .._batch_layout import compute_batch_idx_mapping
-from .._callee_walk import PendingCallTarget, walk_callees_pending
+from .._callee_walk import PendingCallTarget, walk_section_callees_pending
 from .._resolve_pointers import resolve_section_pointers
 from .._types import (
     SectionPointerSpec,
@@ -93,7 +94,7 @@ def walk_sections(
     num_variants_per_section: int,
     max_depth: int,
     variant_padding: VariantPadding,
-    inlined_equivalent_call_targets_only: bool,
+    inlined_equivalent_call_targets_only: bool = True,
     rng: np.random.Generator,
     collector: None = ...,
 ) -> Stage1Batch: ...
@@ -105,7 +106,7 @@ def walk_sections(
     num_variants_per_section: int,
     max_depth: int,
     variant_padding: VariantPadding,
-    inlined_equivalent_call_targets_only: bool,
+    inlined_equivalent_call_targets_only: bool = True,
     rng: np.random.Generator,
     collector: BucketedRunLengthCollector,
 ) -> PendingStage1Batch: ...
@@ -116,7 +117,7 @@ def walk_sections(
     num_variants_per_section: int,
     max_depth: int,
     variant_padding: VariantPadding,
-    inlined_equivalent_call_targets_only: bool,
+    inlined_equivalent_call_targets_only: bool = True,
     rng: np.random.Generator,
     collector: Optional[BucketedRunLengthCollector] = None,
 ) -> Union[Stage1Batch, PendingStage1Batch]:
@@ -184,7 +185,7 @@ def _walk_sections_pending(
     num_variants_per_section: int,
     max_depth: int,
     variant_padding: VariantPadding,
-    inlined_equivalent_call_targets_only: bool,
+    inlined_equivalent_call_targets_only: bool = True,
     rng: np.random.Generator,
     collector: BucketedRunLengthCollector,
 ) -> PendingStage1Batch:
@@ -213,33 +214,35 @@ def _walk_sections_pending(
         rng=rng,
     )
 
-    # --- step 3: DFS each (section, variant) onto the shared collector --
-    # The pending pattern lets the caller amortise ``run_lengths`` over
-    # every call_target row in the batch: one pow2-bucketed 2D dispatch
-    # per bucket once the orchestrator flushes.
+    # --- step 3: level-synchronous BFS per section onto the shared
+    # collector. ``inlined_equivalent_call_targets_only`` is absorbed
+    # (always-on); the all-variants-equivalence exclusion is the
+    # default-and-only behaviour, so the flag no longer threads into the
+    # walk (asserted True for the retirement window).
+    assert inlined_equivalent_call_targets_only, (
+        "inlined_equivalent_call_targets_only is absorbed (always-on)"
+    )
+    # The once-only inclusion mask is reset per section; ONE decider
+    # instance is reused across every section in the batch (buffer reuse
+    # -- the mandate's geometric-growth, no-per-section-realloc rule).
+    decider = OnceOnlyInclusion()
     pending_per_variant: List[List[List[PendingCallTarget]]] = []
     for rs in resolved:
-        section_pending: List[List[PendingCallTarget]] = []
-        for slot_v, variant_idx_in_section in enumerate(
-            rs.sampled_variant_indices
-        ):
-            root_function_data = rs.function_data_per_sampled_variant[slot_v]
-            section_pending.append(
-                walk_callees_pending(
-                    session=session,
-                    root_arm=rs.arm,
-                    root_section=rs.section,
-                    root_variant_idx=variant_idx_in_section,
-                    root_function_data=root_function_data,
-                    root_function_name_ptr=int(rs.section.function_name_ptr),
-                    max_depth=max_depth,
-                    inlined_equivalent_call_targets_only=(
-                        inlined_equivalent_call_targets_only
-                    ),
-                    collector=collector,
-                )
+        pending_per_variant.append(
+            walk_section_callees_pending(
+                session=session,
+                arm=rs.arm,
+                section=rs.section,
+                sampled_variant_indices=list(rs.sampled_variant_indices),
+                root_function_data_per_sampled=(
+                    rs.function_data_per_sampled_variant
+                ),
+                root_function_name_ptr=int(rs.section.function_name_ptr),
+                max_depth=max_depth,
+                decider=decider,
+                collector=collector,
             )
-        pending_per_variant.append(section_pending)
+        )
 
     return PendingStage1Batch(
         resolved=resolved,

@@ -13,7 +13,7 @@ larger) cap.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -31,12 +31,22 @@ class VariantSpec:
     ``write_function_binary_data`` so the on-disk ``_data.bin`` records
     are real wire bytes; consumers exercise the same record-parser path
     production goes through.
+
+    ``called`` is an OPTIONAL per-variant call-set override (callee
+    function names this variant actually calls). ``None`` means "this
+    variant calls the function spec's full ``called`` set" -- the
+    historical behaviour. Set it to a SUBSET to make variants of one
+    section call different callees: the once-only / all-variants-
+    equivalence splice semantics only inline a callee reached by SOME
+    but not ALL variants, so a fixture that needs a non-vacuous splice
+    tree must differentiate the per-variant call sets.
     """
 
     vkey: Tuple
     tokens: np.ndarray
     block_rl: np.ndarray
     insn_rl: np.ndarray
+    called: Optional[Tuple[str, ...]] = None
 
 
 @dataclass(frozen=True)

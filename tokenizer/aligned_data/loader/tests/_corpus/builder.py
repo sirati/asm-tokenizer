@@ -296,10 +296,19 @@ def _emit_matched_data(
                     entry_idx=n_entries,
                 )
                 n_entries += 1
+                # Per-variant call-set override: a variant may call a
+                # SUBSET of the section's union ``called`` (drives the
+                # all-variants-equivalence splice semantics). ``None``
+                # keeps the historical "every variant calls everything".
+                variant_called = (
+                    set(typed_called)
+                    if variant.called is None
+                    else set(_project_called_typed(variant.called))
+                )
                 version_data.append(
                     {
                         "vkey": variant.vkey,
-                        "called": set(typed_called),
+                        "called": variant_called,
                         "data_offset": offset,
                         "data_len": length,
                         "token_len": len(variant.tokens),

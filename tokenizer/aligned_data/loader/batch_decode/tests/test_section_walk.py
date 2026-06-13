@@ -92,6 +92,23 @@ def _make_section(
     )
 
 
+def _calling_variant(
+    per_call_entries: List[Tuple[int, int]]
+) -> List[VariantBlock]:
+    """A caller variant (variant 0) + a quiet sibling (variant 1).
+
+    The once-only / all-variants-equivalence walk excludes a callee
+    reached by EVERY variant; a single-variant section therefore splices
+    nothing (FLAG-A). Pairing the caller with a quiet sibling makes
+    variant 0's callees "some but not all" so they get included. The
+    section sampler still picks variant 0 as the emitted slot here.
+    """
+    return [
+        _make_variant(vkey=0, per_call_entries=per_call_entries),
+        _make_variant(vkey=1, per_call_entries=[]),
+    ]
+
+
 def _ct_local(*, fid: int, target_offset: int) -> CallTarget:
     return CallTarget(
         function_name_ptr=fid,
@@ -119,11 +136,13 @@ class _FakeSession:
       ``FunctionData`` for unmatched), so the wiring does NOT re-issue
       the per-arm load to pick up the root variant body.
     * 1b path: ``_idx_for_section_offset(byte_offset, arm_str)``,
-      ``_load_matched_for_splice(idx, variant_index)``,
+      ``_load_matched_section_and_variants(idx)`` (shared with 1a),
       ``_load_unmatched_for_splice(idx)`` -- the DFS callee walk
-      resolves each call_target row and loads the callee body via these
-      helpers. The root body is no longer re-loaded here; 1d reads it
-      from :attr:`ResolvedSection.function_data_per_sampled_variant`.
+      resolves each call_target row and loads the callee section +
+      bodies via these helpers (the table-size-aware variant choice
+      happens in the walker AFTER the load). The root body is no longer
+      re-loaded here; 1d reads it from
+      :attr:`ResolvedSection.function_data_per_sampled_variant`.
 
     The fake uses each section's own ``section_offset`` as its idx so
     ``_idx_for_section_offset`` is a trivial round-trip; the per-section
@@ -131,6 +150,7 @@ class _FakeSession:
     matched and by ``section_offset`` for unmatched.
     """
 
+    _binary_name: str = "fake-bin"
     matched_sections: Dict[int, Section] = field(default_factory=dict)
     matched_function_data: Dict[Tuple[int, int], FunctionData] = field(
         default_factory=dict
@@ -211,13 +231,6 @@ class _FakeSession:
             )
         raise ValueError(f"unknown arm: {arm!r}")
 
-    def _load_matched_for_splice(
-        self, idx: int, variant_index: int
-    ) -> Tuple[FunctionData, Section, int]:
-        section = self.matched_sections[idx]
-        fd = self.matched_function_data[(idx, variant_index)]
-        return fd, section, section.section_offset
-
     def _load_unmatched_for_splice(
         self, idx: int
     ) -> Tuple[FunctionData, Section, int]:
@@ -277,7 +290,6 @@ def test_single_matched_pointer_one_variant_no_callees() -> None:
         num_variants_per_section=1,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -328,7 +340,6 @@ def test_single_pointer_multiple_variants_all_present() -> None:
         num_variants_per_section=3,
         max_depth=1,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -373,7 +384,6 @@ def test_multiple_pointers_mixed_arms_preserve_order() -> None:
         num_variants_per_section=1,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -406,25 +416,27 @@ def test_root_with_local_callees_depth_one() -> None:
             _ct_local(fid=2, target_offset=200),  # called_idx=0
             _ct_local(fid=3, target_offset=300),  # called_idx=1
         ],
-        variants=[
-            _make_variant(vkey=0, per_call_entries=[(0, 0), (1, 0)]),
-        ],
+        variants=_calling_variant([(0, 0), (1, 0)]),
     )
     session = _FakeSession()
-    session.add_matched(root_section, {0: _make_function_data("root")})
+    session.add_matched(
+        root_section,
+        {0: _make_function_data("root"), 1: _make_function_data("root_quiet")},
+    )
     session.add_matched(callee_a, {0: _make_function_data("a")})
     session.add_matched(callee_b, {0: _make_function_data("b")})
 
     out = walk_sections(
         session=session,  # type: ignore[arg-type]
         section_pointers=[SectionPointerSpec(arm=SectionKind.MATCHED, idx=100)],
-        num_variants_per_section=1,
+        num_variants_per_section=2,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
+    # variant 0 (the caller) splices both callees (some-not-all vs the
+    # quiet sibling), in BFS slot order.
     cts = out.sections[0].variants[0].call_targets
     assert [c.function_name_ptr for c in cts] == [1, 2, 3]
     assert cts[0].parent_call_target_index is None
@@ -456,7 +468,6 @@ def test_max_depth_zero_no_callee_recursion() -> None:
         num_variants_per_section=1,
         max_depth=0,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -470,15 +481,16 @@ def test_max_depth_zero_no_callee_recursion() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_inlined_equivalent_filter_is_threaded_through() -> None:
-    """The filter is forwarded to the callee walker. We construct a
-    setup where the filter prunes a callee that the unfiltered run
-    would include, and assert the difference."""
+def test_all_variants_equivalence_applied_by_default() -> None:
+    """The all-variants-equivalence exclusion is the default-and-only
+    behaviour (the legacy ``inlined_equivalent_call_targets_only`` flag
+    is absorbed). A callee every variant called is excluded; each variant
+    emits only the callees IT directly called that survive."""
     # Two callees; root has 2 variants:
     #   variant 0 calls callee 0 only
     #   variant 1 calls callees 0 and 1
-    # => called_idx=0 (fid=2) by {0, 1} (ALL)  -> filter skips
-    # => called_idx=1 (fid=3) by {1}     (SOME) -> filter keeps
+    # => called_idx=0 (fid=2) by {0, 1} (ALL)  -> EXCLUDED
+    # => called_idx=1 (fid=3) by {1}     (SOME) -> included for v1 only
     callee_a = _make_section(section_offset=200, function_name_ptr=2)
     callee_b = _make_section(section_offset=300, function_name_ptr=3)
     root_section = _make_section(
@@ -501,36 +513,20 @@ def test_inlined_equivalent_filter_is_threaded_through() -> None:
     session.add_matched(callee_a, {0: _make_function_data("a")})
     session.add_matched(callee_b, {0: _make_function_data("b")})
 
-    # Unfiltered: variant 0's root has both call_targets visible.
-    unfiltered = walk_sections(
+    out = walk_sections(
         session=session,  # type: ignore[arg-type]
         section_pointers=[SectionPointerSpec(arm=SectionKind.MATCHED, idx=100)],
         num_variants_per_section=2,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
-    fids_v0_unfiltered = [
-        c.function_name_ptr for c in unfiltered.sections[0].variants[0].call_targets
-    ]
-    assert fids_v0_unfiltered == [1, 2, 3]
-
-    # Filtered: called_idx=0 dropped (ALL), called_idx=1 kept (SOME).
-    filtered = walk_sections(
-        session=session,  # type: ignore[arg-type]
-        section_pointers=[SectionPointerSpec(arm=SectionKind.MATCHED, idx=100)],
-        num_variants_per_section=2,
-        max_depth=2,
-        variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=True,
-        rng=_rng(),
-    )
-    fids_v0_filtered = [
-        c.function_name_ptr for c in filtered.sections[0].variants[0].call_targets
-    ]
-    # Root + callee 3 only; callee 2 dropped (ALL variants called it).
-    assert fids_v0_filtered == [1, 3]
+    # variant 0 called only callee 0 (all-excluded) -> root only.
+    fids_v0 = [c.function_name_ptr for c in out.sections[0].variants[0].call_targets]
+    assert fids_v0 == [1]
+    # variant 1 called 0 (excluded) + 1 (some-not-all, included) -> [1, 3].
+    fids_v1 = [c.function_name_ptr for c in out.sections[0].variants[1].call_targets]
+    assert fids_v1 == [1, 3]
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +567,6 @@ def test_pad_null_short_section_padding_rows() -> None:
         num_variants_per_section=2,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -630,7 +625,6 @@ def test_ragged_dense_no_padding() -> None:
         num_variants_per_section=2,
         max_depth=1,
         variant_padding=VariantPadding.RAGGED,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -664,7 +658,6 @@ def test_rng_reproducibility_same_seed() -> None:
         num_variants_per_section=4,
         max_depth=1,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
     )
 
     out_a = walk_sections(
@@ -697,35 +690,44 @@ def test_rng_reproducibility_same_seed() -> None:
 
 
 def test_cycle_in_callee_tree_terminates() -> None:
-    """Mutual A <-> B recursion terminates with the active-path cycle
-    guard (verified by :func:`walk_callees`'s tests; this integration
-    test pins the contract that :func:`walk_sections` does NOT defeat
-    it)."""
+    """Mutual A <-> B recursion terminates under once-only dedup (the
+    recursive edge back to A is deduped; verified by
+    :func:`walk_callees`'s tests). This integration test pins that
+    :func:`walk_sections` does NOT defeat it. The caller carries a quiet
+    sibling so A's call to B is included; both variants are sampled and
+    variant 0 (the caller) is asserted."""
     a_section = _make_section(
         section_offset=100,
         function_name_ptr=1,
         call_targets=[_ct_local(fid=2, target_offset=200)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     b_section = _make_section(
         section_offset=200,
         function_name_ptr=2,
         call_targets=[_ct_local(fid=1, target_offset=100)],
-        variants=[_make_variant(vkey=0, per_call_entries=[(0, 0)])],
+        variants=_calling_variant([(0, 0)]),
     )
     session = _FakeSession()
-    session.add_matched(a_section, {0: _make_function_data("a")})
-    session.add_matched(b_section, {0: _make_function_data("b")})
+    session.add_matched(
+        a_section,
+        {0: _make_function_data("a"), 1: _make_function_data("a_quiet")},
+    )
+    session.add_matched(
+        b_section,
+        {0: _make_function_data("b"), 1: _make_function_data("b_quiet")},
+    )
 
     out = walk_sections(
         session=session,  # type: ignore[arg-type]
         section_pointers=[SectionPointerSpec(arm=SectionKind.MATCHED, idx=100)],
-        num_variants_per_section=1,
+        num_variants_per_section=2,
         max_depth=10,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
+    # variant 0 is the caller; its splice list is [A, B] (B's call back
+    # to A deduped). variant 1 is quiet -> root only.
     fids = [
         c.function_name_ptr
         for c in out.sections[0].variants[0].call_targets
@@ -747,7 +749,6 @@ def test_empty_section_pointers_yields_empty_batch() -> None:
         num_variants_per_section=1,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
     assert out.batch_size == 0
@@ -776,7 +777,6 @@ def test_unmatched_root_uses_unmatched_loader() -> None:
         num_variants_per_section=1,
         max_depth=2,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
     root_ct = out.sections[0].variants[0].call_targets[0]
@@ -806,7 +806,6 @@ def test_resample_records_first_batch_row_for_multi_mapped_slot() -> None:
         num_variants_per_section=3,
         max_depth=1,
         variant_padding=VariantPadding.RESAMPLE_WITHIN_SECTION,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -869,7 +868,6 @@ def test_redistribute_policy_threaded_through() -> None:
         num_variants_per_section=2,
         max_depth=1,
         variant_padding=VariantPadding.REDISTRIBUTE,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
 
@@ -904,7 +902,6 @@ def test_root_function_name_ptr_taken_from_section_header() -> None:
         num_variants_per_section=1,
         max_depth=1,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
     root_ct = out.sections[0].variants[0].call_targets[0]
@@ -924,7 +921,6 @@ def test_stage1batch_dataclass_shape_matches_plan() -> None:
         num_variants_per_section=1,
         max_depth=1,
         variant_padding=VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only=False,
         rng=_rng(),
     )
     assert hasattr(out, "sections")
@@ -950,6 +946,5 @@ def test_negative_max_depth_rejected_via_callee_walker() -> None:
             num_variants_per_section=1,
             max_depth=-1,
             variant_padding=VariantPadding.PAD_NULL,
-            inlined_equivalent_call_targets_only=False,
             rng=_rng(),
         )

@@ -1,85 +1,66 @@
-"""Stage 1 DFS callee walk + cycle detection.
+"""Stage 1 level-synchronous section-level callee walk.
 
-Single concern of this module: take ONE already-resolved root variant
-and flatten its inline-call tree into a DFS encounter-order
-``list[Stage1CallTarget]``.
+Single concern of this module: flatten a section's splice tree into
+per-variant BFS-encounter-order ``list[Stage1CallTarget]`` rows,
+enforcing the owner's once-only + all-variants-equivalence inclusion
+semantics over the section's FULL variant set.
 
 The walk's contract -- one-sentence, per the design-first rule:
 
-  *Given a resolved root function body, produce the level-4 list for
-  the owning variant by depth-capped DFS over each call_target row that
-  resolves to a non-extern callee in the same arm and isn't already on
-  the active recursion path.*
+  *Given a resolved section + its sampled variant root bodies, produce
+  one level-4 list per sampled variant by a level-synchronous BFS over
+  the section's full variant set, including each function body once per
+  variant on first encounter and excluding (+ pruning) any function
+  reached by every variant at that level -- the inclusion decision owned
+  by the shared :mod:`...splice_inclusion` decider.*
 
 That is the entire concern. Section pointer resolution + RNG variant
-sampling at level 2 / 3 is task 1a's module; the
-``batch_idx_to_section_variant`` mapping is task 1c's module; the
-outer wiring that drives this walker per (section, variant) is task
-1d's ``_section_walk.walk_sections``. None of that lives here.
+sampling is the 1a module (:mod:`.._resolve_pointers`); the
+``batch_idx`` mapping is 1c (:mod:`.._batch_layout`); the outer wiring
+that drives this walk per section is 1d's
+:func:`.._section_walk.walk_sections`. None of that lives here.
 
-Algorithm (from ``batch_decode_plan.md`` section ``## Stages --
-algorithm sketch`` -> ``Stage 1: section walk + raw-data load``):
+Inclusion algorithm (the owner's spec, binding -- supersedes the legacy
+plan-D3 active-path DAG semantics; see ``batch_decode_plan.md`` D3 as
+amended):
 
 1. The root function is appended at index 0 with
    ``encounter_category=Category.LOCAL_FUNC`` (root is always a LOCAL
-   entity by D3) and ``parent_call_target_index=None``.
-2. DFS into the root's ``call_targets`` in encounter order:
-   - Skip rows with ``function_section_ptr == 0`` (unresolved -- extern
-     or missing callee section).
-   - Skip rows whose ``type`` is :attr:`CallTargetType.EXTERN`:
-     EXT_FUNC bodies are NOT inlined (plan D3).
-   - Skip rows whose callee key ``(arm, section_byte_offset)`` is
-     already in the ACTIVE visited set -- this is the cycle guard.
-   - Resolve the callee through the session (``_idx_for_section_offset``
-     + per-arm load). If the inverse lookup fails (cross-arm pointer,
-     missing section) skip the row, matching the existing splice
-     walker's ``is_callee_present`` gate.
-   - Choose the callee variant index via
-     :func:`choose_callee_variant` (data-driven, deterministic).
-   - Append a new :class:`Stage1CallTarget` whose
-     :attr:`encounter_category` is :attr:`Category.LOCAL_FUNC` for a
-     LOCAL call site and :attr:`Category.PLT_FUNC` for a PLT call site
-     (plan D3 + D4).
-   - Recurse with ``current_depth + 1``; bail when
-     ``current_depth >= max_depth``.
-3. The visited set is keyed on ``(arm, section.section_offset)``. Popped
-   on backtrack so DAG semantics hold: a callee reachable through two
-   *different* recursion paths appears TWICE in the output (once per
-   path). Only an *active* recursion-path cycle blocks further descent.
-4. ``inlined_equivalent_call_targets_only`` filter (plan D5 stage 1
-   step 4): when ``True``, skip a call_target whose ``called_idx`` was
-   called by EITHER no variants OR every variant of the PARENT's
-   section. Only rows where SOME but not ALL variants called the
-   target carry "inlining variation" signal worth threading through to
-   the model. The "variants" here are the parent variant's siblings
-   within the same section -- NOT a globally-narrowed selection (the
-   plan deliberately scopes the check to the immediate parent).
+   entity) and ``parent_call_target_index=None``. The root's section is
+   seeded at the once-only mask's column 0, so any deeper call resolving
+   to the root section is already-included (self / mutual recursion
+   never re-splices).
+2. The mask is ``[#section_variants, #functions]``. Per BFS level, every
+   surviving parent's call_targets are resolved per variant (the
+   per-edge J-resolution is UNCHANGED -- :mod:`._resolve` owns it), the
+   resolved callee SECTION is marked for that variant, and the shared
+   decider returns which ``(variant, callee)`` pairs are INCLUDED.
+3. **Once-only.** A variant emits a function body only on its FIRST
+   encounter (mask cell False->True). Diamonds, branch-shared callees,
+   and recursion all dedup -- the function appears once per variant.
+4. **All-variants equivalence.** A function reached by EVERY variant at
+   a level (columnwise ALL over the variant axis) is NOT emitted and is
+   PRUNED (never expanded deeper). This is the default-and-only
+   behaviour; the legacy ``inlined_equivalent_call_targets_only`` flag
+   is absorbed (always-on) and slated for retirement.
 
-Why ``walk_callees`` does NOT take an ``rng``: callee variant choice
-is driven by the parent variant's ``per_call_entries`` (data, not a
-sampling decision) via :func:`choose_callee_variant`. The only sampling
-in the stage-1 pipeline is the top-level per-section variant sampling
-in task 1a -- the recursion is purely deterministic given a root
-variant.
-
-Why the entry point takes ``root_section`` and ``root_function_data``
-already resolved: task 1a (section pointer resolution) is the single
-owner of the level-2 section load + level-3 root variant load; this
-module is task 1b and consumes those handles. The clean split lets
-task 1d's outer walker call task 1a + task 1b in sequence per
-``(section_pointer, sampled_variant)`` pair without either module
-knowing about the other's internals.
+Emission order is BFS level order (root, then each level's included
+callees in parent-then-slot order) -- DIFFERENT from the legacy DFS
+subtree-first order, but the same per-variant ``Stage1CallTarget`` list
+shape (``path_depth`` = BFS level).
 
 Module layout:
 
-* :mod:`_pending` owns the :class:`PendingCallTarget` dataclass + the
-  per-row mask-construction + run-length-handle-staging helper, plus
-  :func:`finalise_pending_call_targets` that turns a finished pending
-  list into :class:`Stage1CallTarget` rows.
-* :mod:`_walker` owns the DFS recursion (the cycle / EXTERN / inlining
-  filter logic), the public :func:`walk_callees_pending` entry point
-  for the batched section-walk path, and the single-variant
-  convenience wrapper :func:`walk_callees`.
+* :mod:`._pending` -- the :class:`PendingCallTarget` dataclass + per-row
+  mask construction + run-length staging, plus
+  :func:`finalise_pending_call_targets`.
+* :mod:`._resolve` -- the per-(parent variant, call_target slot)
+  J-resolution (UNCHANGED from the legacy walker, minus the now-shared
+  visited / inlining gates).
+* :mod:`._walker` -- the level-synchronous BFS driving the shared
+  inclusion decider, the public
+  :func:`walk_section_callees_pending` entry point, and the
+  single-variant convenience wrapper :func:`walk_callees`.
 """
 
 from ._pending import (
@@ -87,13 +68,16 @@ from ._pending import (
     build_pending_call_target,
     finalise_pending_call_targets,
 )
-from ._walker import walk_callees, walk_callees_pending
+from ._resolve import ResolvedCallee, resolve_callee
+from ._walker import walk_callees, walk_section_callees_pending
 
 
 __all__ = [
     "PendingCallTarget",
+    "ResolvedCallee",
     "build_pending_call_target",
     "finalise_pending_call_targets",
+    "resolve_callee",
     "walk_callees",
-    "walk_callees_pending",
+    "walk_section_callees_pending",
 ]

@@ -94,7 +94,7 @@ def decode_pointer_batch(
     max_depth: int,
     rng: np.random.Generator,
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
-    inlined_equivalent_call_targets_only: bool = False,
+    inlined_equivalent_call_targets_only: bool = True,
     include_fid_sidecar: bool = False,
 ) -> MultiBinaryBatchDecodeResult:
     """Session-agnostic core: decode a flat pointer batch + concat (plan D7).
@@ -194,7 +194,7 @@ def open_length_bucketed_batch(
     max_depth: int,
     rng: np.random.Generator,
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
-    inlined_equivalent_call_targets_only: bool = False,
+    inlined_equivalent_call_targets_only: bool = True,
     include_fid_sidecar: bool = False,
     keep_intermediate: bool = False,
     band: Optional[Tuple[int, int]] = None,

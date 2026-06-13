@@ -146,7 +146,6 @@ def test_max_depth_length_equals_total_surviving_count(tmp_path: Path) -> None:
             num_variants_per_section=np.iinfo(np.int32).max,
             max_depth=3,
             variant_padding=VariantPadding.RAGGED,
-            inlined_equivalent_call_targets_only=False,
             rng=rng,
         )
         stage2 = predict_lengths(stage1, context_len=LARGE_CONTEXT_LEN)

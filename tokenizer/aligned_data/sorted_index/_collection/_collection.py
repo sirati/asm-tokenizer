@@ -220,7 +220,7 @@ class IndexedMemmapCollection:
         num_variants_per_section: int,
         max_depth: int,
         variant_padding: VariantPadding = VariantPadding.PAD_NULL,
-        inlined_equivalent_call_targets_only: bool = False,
+        inlined_equivalent_call_targets_only: bool = True,
         include_fid_sidecar: bool = False,
         spec: Optional[IndexSpec] = None,
     ) -> MultiBinaryBatchDecodeResult:
