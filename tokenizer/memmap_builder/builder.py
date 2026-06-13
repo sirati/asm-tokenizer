@@ -17,6 +17,7 @@ from tokenizer.compact_base64_utils import base64_to_ndarray_vec
 from tokenizer.vocab_unifier.loader import load_unified_vocab_manager
 
 from ._dedup import finalize_arm_dedup_state, open_arm_dedup_state
+from ._entry_spool import EntrySpool
 from ._output_files import (
     open_matched_section_outputs,
     open_sections_bin_outputs,
@@ -25,6 +26,7 @@ from ._output_files import (
 from .function_names import FunctionNamesRegistry
 from .passes import (
     build_function_lookup_table,
+    collect_sectioned_func_names,
     process_matched_function,
     process_unmatched_function,
     write_matched_sections_pass2,
@@ -168,9 +170,6 @@ def build_memmap_files(
     prefix = binary_name
     unmatched_prefix = f"{binary_name}_unmatched"
 
-    matched_data_entries = []
-    unmatched_data_entries = []
-
     matched_data_path = output_dir / f"{prefix}_data.bin"
     unmatched_data_path = output_dir / f"{unmatched_prefix}_data.bin"
     error_log_path = output_dir / f"{binary_name}.error.log"
@@ -194,6 +193,19 @@ def build_memmap_files(
         # and then drives the writer's generic flush+close.
         stack.callback(lambda: finalize_arm_dedup_state(matched_state))
         stack.callback(lambda: finalize_arm_dedup_state(unmatched_state))
+
+        # Pass-1 entry metadata is spilled to a temp file per arm rather
+        # than retained as a whole-corpus Python list: at z3 scale the
+        # nested ``unique_called`` / per-variant ``called`` /
+        # ``extern_libraries`` payloads cost many GB of RSS held live
+        # across the pass-1 → pass-2 boundary. The spool streams each
+        # entry back in pass 2 one at a time. Co-located in ``output_dir``
+        # so the spill shares the output filesystem; ExitStack-owned so
+        # the temp file is unlinked on any exception too.
+        matched_data_entries = EntrySpool(dir=output_dir)
+        unmatched_data_entries = EntrySpool(dir=output_dir)
+        stack.callback(matched_data_entries.close)
+        stack.callback(unmatched_data_entries.close)
         error_log = stack.enter_context(open(error_log_path, "w", encoding="ascii"))
 
         wrappers = []
@@ -251,7 +263,8 @@ def build_memmap_files(
                         function_names_registry,
                         error_log=error_log,
                     )
-                    unmatched_data_entries.extend(entries)
+                    for entry in entries:
+                        unmatched_data_entries.append(entry)
             elif isinstance(item, Unmatched):
                 entries = process_unmatched_function(
                     item.func_name,
@@ -261,7 +274,8 @@ def build_memmap_files(
                     function_names_registry,
                     error_log=error_log,
                 )
-                unmatched_data_entries.extend(entries)
+                for entry in entries:
+                    unmatched_data_entries.append(entry)
             else:
                 raise TypeError(f"unexpected lockstep yield: {type(item).__name__}")
 
@@ -272,18 +286,24 @@ def build_memmap_files(
         sidecar_path = function_names_registry.write_sidecar(output_dir, binary_name)
         logger.info(f"  Wrote: {sidecar_path}")
 
-        function_lookup = build_function_lookup_table(matched_data_entries, unmatched_data_entries)
-        matched_func_names = {entry["func_name"] for entry in matched_data_entries}
-        # ``sectioned_func_names`` is the set of every function name
-        # whose section will land in ``<binary>_sections.bin`` — the
-        # union of matched and unmatched survivors. Threaded into
-        # pass-2 so the BIN walker can demote LOCAL/PLT call_targets to
-        # the EXTERN-unknown sentinel when the callee was dropped by
-        # pass-1 filters (otherwise the SectionWriter would leak a
-        # forever-unresolved header hole).
-        sectioned_func_names = matched_func_names | {
-            entry["func_name"] for entry in unmatched_data_entries
-        }
+        # ``function_lookup`` + the name sets are the whole-binary
+        # cross-pass tables pass 2 needs before emitting any section
+        # (a matched caller may reference an unmatched callee and vice
+        # versa). They are derived by streaming each arm's spool — only
+        # the small tables persist; the nested entry payloads never live
+        # all-at-once in RAM. ``sectioned_func_names`` is the set of every
+        # function name whose section will land in
+        # ``<binary>_sections.bin`` (matched ∪ unmatched survivors),
+        # threaded into pass-2 so the BIN walker can demote LOCAL/PLT
+        # call_targets to the EXTERN-unknown sentinel when the callee was
+        # dropped by pass-1 filters (otherwise the SectionWriter would
+        # leak a forever-unresolved header hole).
+        function_lookup = build_function_lookup_table(
+            matched_data_entries, unmatched_data_entries
+        )
+        matched_func_names, sectioned_func_names = collect_sectioned_func_names(
+            matched_data_entries, unmatched_data_entries
+        )
 
         logger.info(f"  Creating: {warn_log_path}")
         warn_log = stack.enter_context(open(warn_log_path, "w", encoding="ascii"))
