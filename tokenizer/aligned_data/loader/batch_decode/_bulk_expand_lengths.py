@@ -31,8 +31,12 @@ a record's last position and an F128 carrier within 2 positions of a
 record's tail both raise :class:`AssertionError`.
 
 Memory: the scan walks records in chunks of ~``_CHUNK_TOKENS`` gathered
-tokens, so peak working-set stays a few tens of MB regardless of corpus
-size.
+tokens. Each chunk holds the gathered ``u16`` stream plus ~a dozen
+same-shaped per-token mask/index arrays; at the ``2**22``-token budget
+that is on the order of ~100 MiB of transient working-set, bounded
+regardless of corpus size. The gathered stream itself is ``u16`` (the
+on-disk token width) and the per-token index columns are ``int32`` --
+both halved from the historical ``int64`` carriers.
 """
 
 from __future__ import annotations
@@ -52,10 +56,10 @@ _V2_NUMBER_BLOCK_COUNT = VocabularyManager._V2_NUMBER_BLOCK_COUNT  # 7
 _VC2_VOCAB_ID = _V2_NUMBER_BLOCK_START
 _FLOAT128_VOCAB_ID = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT - 1
 
-#: Gathered-token budget per chunk (u16 tokens). 2**22 tokens ~= 8 MB
-#: for the gathered stream plus a handful of same-shaped masks --
-#: comfortably inside a worker's working set while keeping the numpy
-#: dispatch count negligible.
+#: Gathered-token budget per chunk (u16 tokens). 2**22 tokens is ~8 MiB
+#: for the gathered u16 stream plus ~a dozen same-shaped u16/int32/bool
+#: per-token arrays -- ~100 MiB of transient working-set, comfortably
+#: inside a worker while keeping the numpy dispatch count negligible.
 _CHUNK_TOKENS = 1 << 22
 
 
@@ -102,18 +106,28 @@ def bulk_contributing_body_lengths(
     if n_records == 0:
         return out
 
-    # Chunk over records so that each chunk gathers at most
-    # ~_CHUNK_TOKENS tokens. Records are never split across chunks --
-    # the run-length and tail logic is per-record local.
+    # Token regions are u16-LE at 16-byte-aligned record tails, so every
+    # token_start is even; the chunk scan relies on that to gather via a
+    # single u16 view (see :func:`_scan_chunk`). Validate once -- a stray
+    # odd offset means a corrupt locator, not a silent mis-gather.
+    if bool((starts & 1).any()):
+        raise ValueError(
+            "bulk_contributing_body_lengths: token_starts must be even "
+            "(u16-aligned record-tail offsets); got an odd offset"
+        )
+
+    # Chunk boundaries by searchsorted over the inclusive token prefix
+    # sum: each chunk gathers at most ~_CHUNK_TOKENS tokens, the record
+    # that tips the budget is included, and every chunk makes progress
+    # (so a single >budget record still forms its own chunk). Records
+    # are never split -- the run-length and tail logic is per-record
+    # local.
+    cum = np.cumsum(counts)
     chunk_first = 0
     while chunk_first < n_records:
-        chunk_last = chunk_first
-        budget = 0
-        while chunk_last < n_records:
-            budget += int(counts[chunk_last])
-            chunk_last += 1
-            if budget >= _CHUNK_TOKENS:
-                break
+        base = int(cum[chunk_first - 1]) if chunk_first > 0 else 0
+        tip = int(np.searchsorted(cum, base + _CHUNK_TOKENS, side="left"))
+        chunk_last = min(max(tip + 1, chunk_first + 1), n_records)
         sl = slice(chunk_first, chunk_last)
         out[sl] = _scan_chunk(data_u8, starts[sl], counts[sl])
         chunk_first = chunk_last
@@ -129,24 +143,41 @@ def _scan_chunk(
     if total == 0:
         return np.zeros(n_records, dtype=np.int64)
 
-    # record_of[k] / local byte index for the k-th gathered token.
+    # record_of[k] / local index for the k-th gathered token. The
+    # chunk holds <= _CHUNK_TOKENS tokens and <= that many records, so
+    # the per-token columns fit int32 (halved from int64); the gather
+    # index stays int64 because the ABSOLUTE word offset can exceed
+    # 2**31 on multi-GB corpora.
     rec_ends = np.cumsum(counts)
     rec_starts = rec_ends - counts
-    record_of = np.repeat(np.arange(n_records, dtype=np.int64), counts)
-    within = np.arange(total, dtype=np.int64) - rec_starts[record_of]
-    byte_idx = starts[record_of] + 2 * within
-
-    # Raw u16 stream (byte-pair gather: no alignment assumption on the
-    # token region's absolute offset).
-    raw = data_u8[byte_idx].astype(np.int64) | (
-        data_u8[byte_idx + 1].astype(np.int64) << 8
+    record_of = np.repeat(
+        np.arange(n_records, dtype=np.int32), counts
+    )
+    within = np.arange(total, dtype=np.int32) - rec_starts[record_of].astype(
+        np.int32
     )
 
+    # Single u16-view gather: token regions are u16-LE at even (16-byte
+    # aligned record tail) offsets, validated by the caller, so the
+    # word index is ``(start >> 1) + within`` -- no byte-pair OR, and
+    # ``raw`` stays u16 (the on-disk token width). Native-endian view
+    # matches the rest of the pipeline (the writer + record reader emit
+    # raw ndarray bytes on the same machine class; see
+    # :mod:`tokenizer.variant_tokens.record`).
+    data_u16 = data_u8.view(np.uint16)
+    word_idx = (starts >> 1)[record_of] + within
+    raw = data_u16[word_idx]
+
     # --- survivors of the strip ----------------------------------------
-    survives = raw > _V2_RESERVED_DIGIT_COUNT
-    kept_per_record = np.bincount(
-        record_of, weights=survives, minlength=n_records
-    ).astype(np.int64)
+    # Per-record survivor count via exclusive-cumsum difference at the
+    # record bounds (``np.bincount`` with bool weights routes through
+    # float64; the cumsum-diff stays in int32 and handles empty records
+    # -- rec_ends == rec_starts -- for free).
+    surv_cum = np.zeros(total + 1, dtype=np.int32)
+    np.cumsum(raw > _V2_RESERVED_DIGIT_COUNT, dtype=np.int32, out=surv_cum[1:])
+    kept_per_record = (
+        surv_cum[rec_ends].astype(np.int64) - surv_cum[rec_starts]
+    )
 
     # --- digit-run lengths starting at each position --------------------
     # is_digit runs must not leak across record boundaries: a run starts
@@ -175,8 +206,12 @@ def _scan_chunk(
     run_start_idx = np.nonzero(run_start)[0]
     run_end_idx = np.nonzero(run_end)[0]
     # run_len_at[k] = run length if a digit run starts at k, else 0.
-    run_len_at = np.zeros(total, dtype=np.int64)
-    run_len_at[run_start_idx] = run_end_idx - run_start_idx + 1
+    # A run cannot exceed the chunk's token total (<= _CHUNK_TOKENS), so
+    # int32 holds every length.
+    run_len_at = np.zeros(total, dtype=np.int32)
+    run_len_at[run_start_idx] = (run_end_idx - run_start_idx + 1).astype(
+        np.int32
+    )
 
     # --- VC2 promotion ---------------------------------------------------
     vc2_pos = np.nonzero(raw == _VC2_VOCAB_ID)[0]
@@ -207,7 +242,11 @@ def _scan_chunk(
                 "malformed v2 stream (ALG-2 needs the high u16 of the "
                 "binary128 payload at p+1, p+2)."
             )
-        high_u16 = (raw[f128_pos + 1] << 8) | raw[f128_pos + 2]
+        # raw is u16; widen to int32 before the << 8 so the high-byte
+        # shift can never wrap the u16 carrier.
+        high_u16 = (raw[f128_pos + 1].astype(np.int32) << 8) | raw[
+            f128_pos + 2
+        ].astype(np.int32)
         finite = (high_u16 & 0x7FFF) != 0x7FFF
         np.add.at(f128_extra, record_of[f128_pos[finite]], 1)
 
