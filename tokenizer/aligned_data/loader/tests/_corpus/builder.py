@@ -184,6 +184,9 @@ def build_corpus_with_registry(
                 variants, registry,
                 section_writer, extern_providers,
                 matched_func_names, sectioned_func_names,
+                # Spec-driven corpus: no name is duplicated, so every call
+                # edge resolves normally (no MISSING-sentinel stamping).
+                duplicated_names=set(),
             )
         with open(paths.unmatched_sections_csv, "w", newline="", encoding="ascii") as sf, \
              open(paths.unmatched_index_bin, "wb") as idxf:
@@ -194,6 +197,7 @@ def build_corpus_with_registry(
                 variants, registry,
                 section_writer, extern_providers,
                 matched_func_names, sectioned_func_names,
+                duplicated_names=set(),
             )
         section_writer.finalize()
     except BaseException:

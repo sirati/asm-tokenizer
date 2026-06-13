@@ -58,6 +58,7 @@ def _make_record(
     )
     return ParsedRecord(
         func_name=func_name,
+        occurrence=0,
         insn_runlength=insn_runlength,
         block_runlength=block_runlength,
         tokens=tokens,

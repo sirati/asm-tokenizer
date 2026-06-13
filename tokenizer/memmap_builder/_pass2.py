@@ -70,6 +70,7 @@ from ..aligned_data.csv_format import (
 )
 from ..aligned_data.matched_sections_bin import (
     CallTargetSpec,
+    MISSING_VARIANT_INDEX,
     PerCallEntry,
     SectionWriter,
 )
@@ -231,6 +232,7 @@ def _emit_variant_per_call_entries(
     callee_variant_ref_offset: int,
     registry: FunctionNamesRegistry,
     sectioned_func_names: "set[str]",
+    duplicated_names: "set[str]",
 ) -> None:
     """Translate one variant's ``called`` set into per-call BIN entries.
 
@@ -282,11 +284,21 @@ def _emit_variant_per_call_entries(
         key = (callee_name, callee_type)
         called_idx = unique_called_index_map[key]
         callee_fid = registry.line_no(callee_name)
+        # A call into a DUPLICATED callee is real (the edge is recorded
+        # via ``called_idx``) but unresolvable: the canonical name maps to
+        # several distinct functions, now living as sibling variants in
+        # one unmatched section, and we cannot know WHICH one this site
+        # targets. Stamp the legitimately-missing sentinel rather than
+        # resolve against an arbitrary sibling's variant table.
+        resolved = (
+            MISSING_VARIANT_INDEX if callee_name in duplicated_names else None
+        )
         entries.append(
             PerCallEntry(
                 called_idx=called_idx,
                 callee_function_name_ptr=callee_fid,
                 callee_vkey=callee_variant_ref_offset,
+                resolved_section_variant_index=resolved,
             )
         )
     # Stable sort by call_target category: LOCAL (0) block then PLT (1)
@@ -309,6 +321,7 @@ def write_matched_sections_pass2(
     matched_func_names: "set[str]",
     sectioned_func_names: "set[str]",
     *,
+    duplicated_names: "set[str]",
     error_log=None,
 ):
     """Pass 2: matched sections CSV + pre-v1 ``matched_index.bin`` + BIN catalog.
@@ -442,6 +455,7 @@ def write_matched_sections_pass2(
                 callee_variant_ref_offset=callee_variant_ref_offset,
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
+                duplicated_names=duplicated_names,
             )
             section_writer.end_variant(vkey=vkey)
 
@@ -600,6 +614,7 @@ def write_unmatched_sections_pass2(
     matched_func_names: "set[str]",
     sectioned_func_names: "set[str]",
     *,
+    duplicated_names: "set[str]",
     error_log=None,
 ):
     """Pass 2: unmatched sections CSV + v1 ``unmatched_index.bin`` + BIN catalog.
@@ -735,6 +750,7 @@ def write_unmatched_sections_pass2(
                 callee_variant_ref_offset=callee_variant_ref_offset,
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
+                duplicated_names=duplicated_names,
             )
             section_writer.end_variant(vkey=vkey)
 

@@ -219,11 +219,22 @@ class PerCallEntry:
     matching variant's ``begin_variant(variant_ref_offset=...)``
     argument — typically both are the integer byte offset of the
     vkey in the per-binary variants sidecar.
+
+    ``resolved_section_variant_index`` overrides the entire resolution
+    machinery: when not ``None`` the writer stamps it verbatim and opens
+    NO back-patch hole, used when the caller already knows the slot is
+    unresolvable (e.g. an edge into a callee whose name is duplicated in
+    the binary, so no single variant table legitimately addresses the
+    call — the caller passes :data:`MISSING_VARIANT_INDEX`).
+    ``callee_vkey`` is then never consulted for this entry, but
+    ``called_idx`` / ``callee_function_name_ptr`` still describe the
+    real call edge.
     """
 
     called_idx: int
     callee_function_name_ptr: int
     callee_vkey: Hashable
+    resolved_section_variant_index: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +641,18 @@ class SectionWriter:
 
         for entry in entries:
             self._assert_called_idx_matches(entry)
+            if entry.resolved_section_variant_index is not None:
+                # Caller-declared terminal index: stamp verbatim, open no
+                # hole. The slot is known-unresolvable (e.g. a duplicated
+                # callee) so the resolution machinery is skipped entirely.
+                self._variant_buffer.append_per_call_entry(
+                    struct.pack(
+                        "<HH",
+                        entry.called_idx,
+                        entry.resolved_section_variant_index,
+                    )
+                )
+                continue
             section_variant_index = self._resolve_backward_variant_index(
                 callee_fid=entry.callee_function_name_ptr,
                 callee_vkey=entry.callee_vkey,

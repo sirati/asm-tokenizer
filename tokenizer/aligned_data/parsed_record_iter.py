@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import ast
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import numpy as np
@@ -60,6 +60,15 @@ class ParsedRecord:
     """
 
     func_name: str
+    # Per-binary-CSV occurrence ordinal for this ``func_name``. The body-
+    # divergence deduper (``tokenizer/main_loop.py``) keeps every
+    # genuinely-distinct function that happens to share a canonical name
+    # (per-TU static initializers, thunks, anon-namespace collisions) and
+    # bumps this column: 0 for the first body, 1 for the second, and so
+    # on. A name whose stream tops out at occurrence 0 is unique; any name
+    # that reaches occurrence >= 1 is DUPLICATED. v1 ``opaque_metadata``
+    # rows predate the column and default to 0.
+    occurrence: int
     insn_runlength: np.ndarray
     block_runlength: np.ndarray
     tokens: np.ndarray
@@ -73,7 +82,14 @@ class ParsedRecord:
 
 @dataclass
 class Matched:
-    """Function with rows from ≥ 2 variants. ``records`` is keyed by variant index."""
+    """Function with rows from ≥ 2 variants. ``records`` is keyed by variant index.
+
+    Only ever produced for a name that is UNIQUE in every input stream
+    (occurrence-0-only). A name that is duplicated in any single stream
+    (occurrence reaches >= 1) is structurally barred from this arm by
+    :func:`lockstep_records` — it cannot be aligned variant-against-variant
+    because the name no longer identifies a single function.
+    """
 
     func_name: str
     records: Dict[int, ParsedRecord]
@@ -81,7 +97,14 @@ class Matched:
 
 @dataclass
 class Unmatched:
-    """Function with a row from exactly one variant."""
+    """Function with a row from exactly one variant.
+
+    Also the destination for every row of a DUPLICATED name (see
+    :class:`Matched`): each duplicate body is emitted as its own
+    ``Unmatched`` carrying the originating stream's ``variant_index``,
+    so the unmatched arm groups them into one section's variant blocks
+    rather than same-FID sibling sections.
+    """
 
     func_name: str
     record: ParsedRecord
@@ -89,6 +112,29 @@ class Unmatched:
 
 
 LockstepYield = Union[Matched, Unmatched]
+
+
+@dataclass
+class DuplicateNameClassifier:
+    """One-boundary record of which function names are DUPLICATED in a binary.
+
+    The duplication question ("does this canonical name map to more than
+    one distinct function within this binary?") is answered exactly once,
+    by :func:`lockstep_records`, while it holds the only complete view of
+    every stream's rows for a name. The answer is consumed by two
+    downstream concerns that must agree:
+
+    * def-routing — handled implicitly by :func:`lockstep_records` itself
+      emitting duplicated names down the :class:`Unmatched` arm;
+    * call-side J stamping — pass 2 reads :attr:`duplicated_names` to
+      decide that a call edge into a duplicated callee is RECORDED but
+      its per-call ``section_variant_index`` is unresolvable.
+
+    The set is populated as the generator runs and is complete once the
+    caller has fully drained the :func:`lockstep_records` stream.
+    """
+
+    duplicated_names: set = field(default_factory=set)
 
 
 def open_parsed_record_iter(
@@ -117,15 +163,62 @@ def open_parsed_record_iter(
     return wrapper, iterator(), header
 
 
+def _drain_same_name_group(
+    it: Iterator[ParsedRecord],
+    first: ParsedRecord,
+) -> "tuple[list[ParsedRecord], Optional[ParsedRecord]]":
+    """Consume ``first`` plus every consecutive same-name row from ``it``.
+
+    The per-CSV CSV is sorted by ``(func_name, occurrence)``, so all rows
+    for one name are contiguous in a single stream. Returns ``(group,
+    next_lookahead)`` where ``group`` is the (≥ 1)-length run sharing
+    ``first.func_name`` and ``next_lookahead`` is the first row of the
+    NEXT name (or ``None`` at end-of-stream) — the value that re-seeds the
+    stream's one-record lookahead. ``len(group) >= 2`` is the in-stream
+    duplication signal.
+    """
+    group = [first]
+    name = first.func_name
+    while True:
+        try:
+            nxt = next(it)
+        except StopIteration:
+            return group, None
+        if nxt.func_name != name:
+            return group, nxt
+        group.append(nxt)
+
+
 def lockstep_records(
     per_csv_iters: List[Iterator[ParsedRecord]],
     wrappers: Optional[List[PositionTrackingWrapper]] = None,
     progress_callback: Optional[Callable[[int], None]] = None,
+    classifier: Optional[DuplicateNameClassifier] = None,
 ) -> Iterator[LockstepYield]:
     """Merge N per-CSV ParsedRecord iterators into a typed-sum stream.
 
-    Inputs must be sorted by ``func_name`` (every per-CSV CSV is
-    already sorted; the memmap-output chain guarantees it).
+    Inputs must be sorted by ``(func_name, occurrence)`` (every per-CSV
+    CSV is already sorted; the memmap-output chain guarantees it).
+
+    A canonical function name can map to MULTIPLE distinct functions
+    inside one binary (per-TU static initializers, thunks, anon-namespace
+    collisions) — the body-divergence deduper keeps each body and bumps
+    the per-stream ``occurrence`` ordinal. Such a name is **duplicated**
+    and CANNOT be matched: there is no single function for the matched
+    arm to align variant-against-variant. This merge drains each stream's
+    full consecutive same-name run, classifies the name (unique iff every
+    contributing stream yielded exactly one row), and:
+
+    * unique  ⇒ :class:`Matched` (≥ 2 streams) / :class:`Unmatched`
+      (1 stream), exactly as before;
+    * duplicated ⇒ every drained row down the :class:`Unmatched` arm,
+      one item per row, so the unmatched grouper folds them into a single
+      section's variant blocks instead of same-FID sibling sections.
+
+    When ``classifier`` is supplied, each duplicated name is recorded in
+    :attr:`DuplicateNameClassifier.duplicated_names` so pass 2 can stamp
+    the unresolvable per-call sentinel on edges into those callees. The
+    set is complete once the caller has fully drained this generator.
     """
     current: List[Optional[ParsedRecord]] = []
     for it in per_csv_iters:
@@ -143,24 +236,44 @@ def lockstep_records(
         min_name = min(n for n in names if n is not None)
         matching_indices = [i for i, n in enumerate(names) if n == min_name]
 
-        if len(matching_indices) >= 2:
+        # Drain the full consecutive same-name run from every matching
+        # stream, re-seeding each stream's one-record lookahead with the
+        # first row of its NEXT name. A name is DUPLICATED iff any single
+        # stream contributed more than one row.
+        groups: Dict[int, List[ParsedRecord]] = {}
+        for i in matching_indices:
+            group, current[i] = _drain_same_name_group(
+                per_csv_iters[i], current[i]  # type: ignore[arg-type]
+            )
+            groups[i] = group
+
+        is_duplicated = any(len(group) >= 2 for group in groups.values())
+
+        if is_duplicated:
+            if classifier is not None:
+                classifier.duplicated_names.add(min_name)
+            # Duplicated ⇒ unmatched no matter what: emit every body of
+            # every contributing stream as its own Unmatched item.
+            for i in matching_indices:
+                for record in groups[i]:
+                    yield Unmatched(
+                        func_name=min_name,
+                        record=record,
+                        variant_index=i,
+                    )
+        elif len(matching_indices) >= 2:
+            # Unique in every stream, present in ≥ 2 streams ⇒ matched.
             yield Matched(
                 func_name=min_name,
-                records={i: current[i] for i in matching_indices},  # type: ignore[misc]
+                records={i: groups[i][0] for i in matching_indices},
             )
         else:
             (i,) = matching_indices
             yield Unmatched(
                 func_name=min_name,
-                record=current[i],  # type: ignore[arg-type]
+                record=groups[i][0],
                 variant_index=i,
             )
-
-        for i in matching_indices:
-            try:
-                current[i] = next(per_csv_iters[i])
-            except StopIteration:
-                current[i] = None
 
         if (
             progress_callback is not None
@@ -179,6 +292,7 @@ def _parse_row(
     mapping: Optional[np.ndarray],
 ) -> ParsedRecord:
     func_name = row[0]
+    occurrence = _parse_occurrence(row, column_index)
     tokens = _decode_tokens(row, column_index, mapping)
     block_runlength = base64_to_ndarray_vec(
         row[column_index["block_runlength_base64"]]
@@ -190,6 +304,7 @@ def _parse_row(
     content_hash = _hash_record_body(insn_runlength, block_runlength, tokens)
     return ParsedRecord(
         func_name=func_name,
+        occurrence=occurrence,
         insn_runlength=insn_runlength,
         block_runlength=block_runlength,
         tokens=tokens,
@@ -197,6 +312,23 @@ def _parse_row(
         extern_libraries=extern_libraries,
         content_hash=content_hash,
     )
+
+
+def _parse_occurrence(
+    row: List[str],
+    column_index: "dict[str, int]",
+) -> int:
+    """Read the integer ``occurrence`` ordinal for one CSV row.
+
+    v2 carries a dedicated ``occurrence`` column (0 for the first body
+    of a canonical name, 1+ for divergent same-name bodies). v1
+    ``opaque_metadata`` rows predate the column entirely; they always
+    represent the first-and-only body of their name and so default to 0.
+    """
+    idx = column_index.get("occurrence")
+    if idx is None:
+        return 0
+    return int(row[idx])
 
 
 def _decode_tokens(

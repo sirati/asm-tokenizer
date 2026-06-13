@@ -60,6 +60,7 @@ def _make_parsed_record(
     insn_runlength = np.array([seed + 4], dtype=np.uint8)
     return ParsedRecord(
         func_name=func_name,
+        occurrence=0,
         insn_runlength=insn_runlength,
         block_runlength=block_runlength,
         tokens=tokens,
@@ -219,6 +220,7 @@ def test_same_name_in_plt_and_extern_yields_two_distinct_call_targets(
                 extern_providers,
                 matched_func_names=matched_func_names,
                 sectioned_func_names=sectioned_func_names,
+                duplicated_names=set(),
             )
         section_writer.finalize()
     except BaseException:

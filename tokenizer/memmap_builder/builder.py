@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.aligned_data.parsed_record_iter import (
+    DuplicateNameClassifier,
     Matched,
     Unmatched,
     lockstep_records,
@@ -223,7 +224,14 @@ def build_memmap_files(
             except ImportError:
                 pass
 
-        for item in lockstep_records(per_csv_iters, wrappers, progress_callback):
+        # Single classification boundary: the lockstep merge records every
+        # duplicated canonical name here while it holds the only complete
+        # cross-stream view. Pass 2 reads ``duplicated_names`` to stamp the
+        # unresolvable per-call sentinel on edges into those callees.
+        duplicate_classifier = DuplicateNameClassifier()
+        for item in lockstep_records(
+            per_csv_iters, wrappers, progress_callback, duplicate_classifier
+        ):
             if isinstance(item, Matched):
                 entry = process_matched_function(
                     item,
@@ -313,6 +321,7 @@ def build_memmap_files(
             sections_bin_outputs.extern_providers,
             matched_func_names,
             sectioned_func_names,
+            duplicated_names=duplicate_classifier.duplicated_names,
             error_log=error_log,
         )
 
@@ -330,6 +339,7 @@ def build_memmap_files(
             sections_bin_outputs.extern_providers,
             matched_func_names,
             sectioned_func_names,
+            duplicated_names=duplicate_classifier.duplicated_names,
             error_log=error_log,
         )
 

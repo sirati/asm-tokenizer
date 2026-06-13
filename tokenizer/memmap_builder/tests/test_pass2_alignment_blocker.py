@@ -138,6 +138,7 @@ def test_matched_arm_one_function_section_is_4_aligned(
                 ExternProviderRegistry(),
                 matched_func_names={funcname_17},
                 sectioned_func_names={funcname_17},
+                duplicated_names=set(),
             )
             section_writer.finalize()
         except BaseException:
@@ -239,6 +240,7 @@ def test_matched_arm_two_functions_every_section_is_4_aligned(
                 ExternProviderRegistry(),
                 matched_func_names={fn_a, fn_b},
                 sectioned_func_names={fn_a, fn_b},
+                duplicated_names=set(),
             )
             section_writer.finalize()
         except BaseException:
@@ -294,6 +296,7 @@ def _run_matched_pass2(
                 ExternProviderRegistry(),
                 matched_func_names=matched_func_names,
                 sectioned_func_names=matched_func_names,
+                duplicated_names=set(),
             )
             section_writer.finalize()
         except BaseException:

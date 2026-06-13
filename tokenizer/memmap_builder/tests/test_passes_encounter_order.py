@@ -47,6 +47,7 @@ def _make_record(
     content_hash = int(tokens.tobytes().__hash__() & 0xFFFFFFFFFFFFFFFF)
     return ParsedRecord(
         func_name=func_name,
+        occurrence=0,
         insn_runlength=insn_runlength,
         block_runlength=block_runlength,
         tokens=tokens,

@@ -57,6 +57,7 @@ def _drive_matched(
     *,
     matched_func_names,
     sectioned_func_names,
+    duplicated_names=frozenset(),
 ):
     """Run the matched-arm pass-2 emitter + finalize the BIN.
 
@@ -90,6 +91,7 @@ def _drive_matched(
                 extern_providers,
                 matched_func_names=matched_func_names,
                 sectioned_func_names=sectioned_func_names,
+                duplicated_names=duplicated_names,
             )
         with open(unmatched_csv, "w", newline="", encoding="ascii") as sf, \
              open(unmatched_index, "wb") as idxf:
@@ -107,6 +109,7 @@ def _drive_matched(
                 extern_providers,
                 matched_func_names=matched_func_names,
                 sectioned_func_names=sectioned_func_names,
+                duplicated_names=duplicated_names,
             )
         section_writer.finalize()
     except BaseException:
@@ -422,6 +425,7 @@ def test_unmatched_arm_emits_sections_into_combined_bin(tmp_path: Path) -> None:
                 variants, registry, section_writer, extern_providers,
                 matched_func_names={matched_fn},
                 sectioned_func_names=sectioned,
+                duplicated_names=set(),
             )
         with open(unmatched_csv, "w", newline="", encoding="ascii") as sf, \
              open(unmatched_index, "wb") as idxf:
@@ -432,6 +436,7 @@ def test_unmatched_arm_emits_sections_into_combined_bin(tmp_path: Path) -> None:
                 variants, registry, section_writer, extern_providers,
                 matched_func_names={matched_fn},
                 sectioned_func_names=sectioned,
+                duplicated_names=set(),
             )
         section_writer.finalize()
     except BaseException:
