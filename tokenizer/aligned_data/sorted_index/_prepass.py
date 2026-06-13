@@ -115,8 +115,14 @@ def read_section_variant_info(
     starts, lengths = pair
     if len(starts) == 0:
         return _empty()
-    blob = np.fromfile(
-        base_path / f"{binary_name}_sections.bin", dtype=np.uint8
+    # Memmap (read-only) the catalog blob rather than slurping it into
+    # RAM: ``parse_sections_columnar`` is a pure fancy-index GATHER (it
+    # reads ``blob[idx]`` and never writes), so only the touched pages
+    # fault in and the full catalog never has to be resident.
+    blob = np.memmap(
+        base_path / f"{binary_name}_sections.bin",
+        dtype=np.uint8,
+        mode="r",
     )
     starts = np.asarray(starts, dtype=np.int64)
     return SectionVariantInfo(

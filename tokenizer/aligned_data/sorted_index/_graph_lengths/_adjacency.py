@@ -78,6 +78,12 @@ class LiveNodeAdjacency:
             offs.astype(np.uint32),
             np.arange(n_sections, dtype=np.uint32),
         )
+        # Per-section lazy fallback-J table cache: section idx -> dense
+        # ``int64[n_call_targets]`` whose entry at ``called_idx`` is the
+        # lowest-sibling-variant usable J for that slot (-1 if none).
+        # Built on first fallback for a section (a per-section read, the
+        # SAME scope the live double-loop touched -- never graph-wide).
+        self._fallback_cache: dict = {}
         self._report_inventory()
 
     # -- public per-node API ----------------------------------------------
@@ -161,22 +167,55 @@ class LiveNodeAdjacency:
         """Lowest sibling-variant J for ``(sec, called_idx)`` that is
         usable (non-sentinel), or ``-1``.
 
-        Scanned live off the memmap in ascending sibling-variant order
-        (the fallback scan order) for THIS slot only -- a per-section
-        read on demand, never a memoised structure.
+        O(1) lookup into the section's fallback table (built once per
+        section, vectorized, on first fallback -- a per-section read on
+        demand, never a graph-wide memoised structure). The table
+        preserves the live scan's exact tie-break: ascending sibling
+        variant, and within a variant the first usable per-call entry in
+        on-disk order, decides each slot's fallback J.
         """
+        table = self._fallback_table(sec)
+        if called_idx < 0 or called_idx >= table.size:
+            return -1
+        return int(table[called_idx])
+
+    def _fallback_table(self, sec: int) -> np.ndarray:
+        """``int64[n_call_targets(sec)]`` fallback-J per slot for ``sec``.
+
+        Entry at slot ``ci`` is the J of the EARLIEST usable per-call
+        entry for ``ci`` across the section's variants in on-disk order
+        -- variants laid out ascending, each variant's entries in pce
+        order. This is exactly the value the live double-loop returned
+        (it stopped at the first ``called_idx``-matching usable entry in
+        that same order). Slots with no usable entry hold -1. Cached per
+        section so the scan happens once.
+        """
+        cached = self._fallback_cache.get(sec)
+        if cached is not None:
+            return cached
         cols = self._cols
-        v0 = int(cols.var_offsets[sec])
-        v1 = int(cols.var_offsets[sec + 1])
-        for v in range(v0, v1):
-            p0 = int(cols.pce_offsets[v])
-            p1 = int(cols.pce_offsets[v + 1])
-            called = cols.pce_called_idx[p0:p1]
-            Js = cols.pce_section_variant_index[p0:p1]
-            for ci, J in zip(called.tolist(), Js.tolist()):
-                if int(ci) == called_idx and _usable(int(J)):
-                    return int(J)
-        return -1
+        n_cts = int(cols.n_call_targets[sec])
+        table = np.full(max(0, n_cts), -1, dtype=np.int64)
+        if n_cts > 0:
+            # The section's per-call entries, contiguous and already in
+            # (ascending variant, pce order) -- the live scan order.
+            v0 = int(cols.var_offsets[sec])
+            v1 = int(cols.var_offsets[sec + 1])
+            e0 = int(cols.pce_offsets[v0])
+            e1 = int(cols.pce_offsets[v1])
+            called = cols.pce_called_idx[e0:e1].astype(np.int64)
+            Js = cols.pce_section_variant_index[e0:e1].astype(np.int64)
+            usable = Js != int(MISSING_VARIANT_INDEX)
+            in_range = (called >= 0) & (called < n_cts)
+            keep = usable & in_range
+            # Reverse-then-overwrite so the EARLIEST flat-order usable
+            # entry per slot wins the tie (a later assignment to the same
+            # slot during the reversed pass is an earlier original entry).
+            ci_keep = called[keep][::-1]
+            j_keep = Js[keep][::-1]
+            table[ci_keep] = j_keep
+        self._fallback_cache[sec] = table
+        return table
 
     # -- inventory logging -------------------------------------------------
 
