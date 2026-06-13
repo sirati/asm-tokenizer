@@ -144,13 +144,19 @@ def _encoding_from_string_datatype(dt: Any) -> str:
 def _java_bytes_to_python(raw: Any) -> bytes:
     """Convert a Java ``byte[]`` (JPype-wrapped) into a Python ``bytes``.
 
-    Java bytes are signed; mask each element to the unsigned 0-255 range
-    before assembling. ``raw`` may be None when the Data object hasn't
-    materialized its byte payload -- in that case return ``b""``.
+    JPype 1.6.0 exposes a Java ``byte[]`` through the buffer protocol as a
+    signed-``int8`` buffer, so ``bytes(memoryview(raw))`` performs a single
+    C-level copy of the underlying storage. Because two's-complement signed
+    bytes share the same bit pattern as their unsigned reinterpretation, the
+    copy is byte-identical to the old per-element ``int(b) & 0xFF`` masking
+    (verified for negative Java bytes, e.g. ``-1 -> 0xFF``) while avoiding the
+    52.8M boxed-int allocations the generator path incurred on multi-MB Data
+    blobs. ``raw`` may be None when the Data object hasn't materialized its
+    byte payload -- in that case return ``b""``.
     """
     if raw is None:
         return b""
-    return bytes(int(b) & 0xFF for b in raw)
+    return bytes(memoryview(raw))
 
 
 # ---------------------------------------------------------------------------

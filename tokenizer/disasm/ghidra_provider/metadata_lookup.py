@@ -121,6 +121,20 @@ class GhidraMetadataLookup:
         # addresses (slot order). Populated by walking every function once
         # via ``GhidraDisassemblyProvider.iter_switch_tables``.
         self._switch_table_cache: Optional[dict[int, list[int]]] = None
+        # Per-Data extracted-string-bytes cache: keyed by the containing
+        # Data's min-address offset (plain Python int), valued by the
+        # already-extracted ``(encoding, raw_bytes)`` tuple. ``_classify_string``
+        # is invoked from every immediate-operand ``lookup()``; without this
+        # the entire containing Data (up to ~10 MB for one large string blob)
+        # is re-fetched + re-converted from the Java ``byte[]`` on every call,
+        # several times per function and again in every later function that
+        # references into the same Data -> monotone RSS growth -> OOM.
+        # We cache ONLY the plain ``(str, bytes)`` payload, never a Ghidra
+        # ``Data`` / ``Address`` / JPype handle (those pin the JVM object
+        # graph and would defeat the purpose). Instance-scoped => per-binary
+        # (a fresh ``GhidraMetadataLookup`` is built per binary via
+        # ``GhidraDisassemblyProvider.create_metadata_lookup``).
+        self._string_bytes_cache: dict[int, tuple[str, bytes]] = {}
         # REUSED view wrapper - per-`lookup()` call we mutate its state
         # via `_populate` and return the same instance.
         self._view = _GhidraAddressMetadataView(self)
@@ -171,6 +185,19 @@ class GhidraMetadataLookup:
                 return False, None, None
         except Exception:
             return False, None, None
+        # Cache key: the containing Data's min-address offset (plain int).
+        # All substring lookups into the SAME Data resolve to the same Data
+        # and therefore the same key, so the per-byte Java->Python extraction
+        # happens at most once per Data per binary.
+        try:
+            key = int(data.getMinAddress().getOffset())
+        except Exception:
+            key = None
+        if key is not None:
+            cached = self._string_bytes_cache.get(key)
+            if cached is not None:
+                encoding, raw_bytes = cached
+                return True, encoding, raw_bytes
         try:
             dt = data.getDataType()
         except Exception:
@@ -180,7 +207,10 @@ class GhidraMetadataLookup:
             raw = data.getBytes()
         except Exception:
             raw = None
-        return True, encoding, _java_bytes_to_python(raw)
+        raw_bytes = _java_bytes_to_python(raw)
+        if key is not None:
+            self._string_bytes_cache[key] = (encoding, raw_bytes)
+        return True, encoding, raw_bytes
 
     def _is_vtable(self, addr_obj: Any, block: Any) -> bool:
         """Decide whether ``addr_obj`` is a C++ vtable slot.
