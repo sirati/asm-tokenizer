@@ -50,6 +50,12 @@ def main() -> None:
     )
 
     parser.set_defaults(source="./out/")
+    # Default to ALL platforms (not the shared x86/x64 default) so a
+    # multi-arch corpus is not silently narrowed to x86/x64 — arm/mips
+    # variants would otherwise be dropped from the memmap build. Mirrors
+    # the dynrunner ``build-memmap`` task convention. Pass ``--platform``
+    # to opt into a subset.
+    parser.set_defaults(platform=None)
 
     args = parser.parse_args()
 

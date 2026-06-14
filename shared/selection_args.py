@@ -9,7 +9,7 @@ from pathlib import Path
 class SelectionConfig:
     source_dir: Path
     output_dir: Path
-    platforms: list[str]
+    platforms: list[str] | None
     compiler: str | None
     compiler_versions: list[str] | None
     opt_levels: list[str] | None
@@ -179,7 +179,7 @@ def print_selection_summary(config: SelectionConfig, display_opt_levels: list[st
     """Print a summary of the selection configuration."""
     print(f"Source directory: {config.source_dir}")
     print(f"Output directory: {config.output_dir}")
-    print(f"Platforms: {config.platforms}")
+    print(f"Platforms: {config.platforms if config.platforms else 'all'}")
     print(f"Compiler: {config.compiler if config.compiler else 'all'}")
     print(f"Compiler versions: {config.compiler_versions if config.compiler_versions else 'all'}")
     print(f"Optimization levels: {display_opt_levels if display_opt_levels else 'all'}")

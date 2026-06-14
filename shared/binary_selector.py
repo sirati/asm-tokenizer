@@ -109,8 +109,11 @@ def find_matching_binaries(
 
             platform, comp, version, opt, binary_name = parsed
 
-            # Apply filters
-            if platform not in platforms:
+            # Apply filters. Falsy ``platforms`` means "no platform
+            # filter" (all platforms), matching the compiler / version /
+            # opt-level convention below and the build_field_regexes
+            # path in ``binary_info``.
+            if platforms and platform not in platforms:
                 continue
 
             if compiler and comp != compiler:
