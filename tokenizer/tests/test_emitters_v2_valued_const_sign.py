@@ -50,11 +50,15 @@ def handler(vm: VocabularyManager) -> ConstantHandler:
     return h
 
 
-def _ctx(fp_postfix: Optional[FpType] = None) -> _Ctx:
+def _ctx(
+    fp_postfix: Optional[FpType] = None,
+    fp_postfix_bytes: Optional[bytes] = None,
+) -> _Ctx:
     return _Ctx(
         is_arithmetic=False,
         fp_immediate_type=None,
         fp_postfix_type=fp_postfix,
+        fp_postfix_bytes=fp_postfix_bytes,
     )
 
 
@@ -145,32 +149,41 @@ def test_int64_min_packs_as_unsigned_magnitude_then_value_negative(handler, vm):
 
 
 def test_negative_with_fp_postfix_orders_value_negative_before_float(handler, vm):
-    """``-255`` with ``fp_postfix_type=FLOAT32`` ->
-    ``[Valued_Const_V2(255), Value_Negative(), Float32()]``.
+    """``-255`` with ``fp_postfix_type=FLOAT32`` + dereferenced bytes ->
+    ``[Valued_Const_V2(255), Value_Negative(), Float32(<bits>)]``.
 
     Order is load-bearing: the v2 decoder consumes ``value_negative`` as
     a postfix sign marker on the preceding ``valued_const_v2`` token; if
     the FP postfix came first the decoder would attach FP-typedness to
     the magnitude and then see a stray ``value_negative``. Pinning the
     order here catches an accidental swap of the two postfix appends.
+    The FP postfix is now a VALUED ``floatXX`` carrying the dereferenced
+    image bytes (big-endian).
     """
-    got = handler._emit_valued_const(-255, meta=None, ctx=_ctx(fp_postfix=FpType.FLOAT32))
+    fp_bytes = bytes([0x3F, 0x80, 0x00, 0x00])  # IEEE-754 1.0f
+    got = handler._emit_valued_const(
+        -255, meta=None, ctx=_ctx(fp_postfix=FpType.FLOAT32, fp_postfix_bytes=fp_bytes)
+    )
     expected = [
         *vm.Valued_Const_V2(255).get_token_ids().tolist(),
         *vm.Value_Negative().get_token_ids().tolist(),
-        *vm.Float32(None).get_token_ids().tolist(),
+        *vm.Float32(int.from_bytes(fp_bytes, "big")).get_token_ids().tolist(),
     ]
     assert _ids(got) == expected
 
 
 def test_positive_with_fp_postfix_emits_only_magnitude_then_float(handler, vm):
-    """Positive value with FP postfix: no ``value_negative`` between
-    magnitude and the FP marker. Sanity check that the FP-postfix path
-    is unchanged for non-negative values."""
-    got = handler._emit_valued_const(255, meta=None, ctx=_ctx(fp_postfix=FpType.FLOAT32))
+    """Positive value with FP postfix + dereferenced bytes: no
+    ``value_negative`` between magnitude and the valued ``floatXX``.
+    Sanity check that the FP-postfix path is unchanged for non-negative
+    values."""
+    fp_bytes = bytes([0x3F, 0x80, 0x00, 0x00])  # IEEE-754 1.0f
+    got = handler._emit_valued_const(
+        255, meta=None, ctx=_ctx(fp_postfix=FpType.FLOAT32, fp_postfix_bytes=fp_bytes)
+    )
     expected = [
         *vm.Valued_Const_V2(255).get_token_ids().tolist(),
-        *vm.Float32(None).get_token_ids().tolist(),
+        *vm.Float32(int.from_bytes(fp_bytes, "big")).get_token_ids().tolist(),
     ]
     assert _ids(got) == expected
     assert 256 not in _ids(got)

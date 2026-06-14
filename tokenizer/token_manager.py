@@ -647,6 +647,21 @@ class VocabularyManager:
         and on unified VMs that have not been pre-registered yet."""
         return getattr(self, "_identity_block_range", (self.size, self.size))
 
+    def register_token_type(self, token_cls: "type[Tokens]") -> int:
+        """Register a token type's canonical vocab id WITHOUT constructing a
+        payload-bearing instance (register-without-emit).
+
+        For value-carrying categories (floatXX, valued_const_v2) the type
+        marker's vocab id must exist at a fixed canonical slot even when no
+        concrete value is at hand (e.g. the unifier pre-registering the
+        257..271 blocks, or a representative for vocab introspection).
+        Constructing a sentinel-valued instance to force the side-effecting
+        registration is forbidden — a value-less floatXX is not a legal
+        token. This helper takes the class and registers its canonical
+        basename directly, returning the assigned id.
+        """
+        return self._private_add_token(token_cls._get_basename(), token_cls)
+
     def _register_v2_canonical_blocks(self) -> None:
         """Pre-register the canonical number- and identity-carrying type-
         marker tokens at fixed slots 257..271. Intended to be called by the
@@ -663,16 +678,18 @@ class VocabularyManager:
         )
 
         # Number block — source-declaration order in token_manager.py.
-        # Each factory call registers the type-marker token at the next
-        # slot; the payload value is irrelevant (Inner class' _to_token_ids
-        # emits [type_id, *digit_bytes]; only the type_id registers).
-        self.Valued_Const_V2(0)   # 257
-        self.Float16(None)        # 258
-        self.BFloat16(None)       # 259
-        self.Float32(None)        # 260
-        self.Float64(None)        # 261
-        self.Float80(None)        # 262
-        self.Float128(None)       # 263
+        # Each registration pins the type-marker token at the next slot.
+        # `valued_const_v2` registers via a representative (its payload is
+        # irrelevant — only the type_id lands). The floats register WITHOUT
+        # a payload via `register_token_type`: a value-less floatXX is not
+        # a legal token, so there is no sentinel instance to construct.
+        self.Valued_Const_V2(0)                  # 257
+        self.register_token_type(self.Float16)   # 258
+        self.register_token_type(self.BFloat16)  # 259
+        self.register_token_type(self.Float32)   # 260
+        self.register_token_type(self.Float64)   # 261
+        self.register_token_type(self.Float80)   # 262
+        self.register_token_type(self.Float128)  # 263
 
         # Identity block — first 5 in user-canonical order, then remaining
         # alphabetical (jump_table < ro_data_ptr < rw_data_ptr).
@@ -872,14 +889,16 @@ class VocabularyManager:
     # v2 category tokens cannot be reconstructed from a single type-id via
     # `_reconstruct_token_from_ids` because their `_from_token_ids` asserts
     # the full wire shape (`>= 2` ids for identity/valued_const_v2, exact
-    # `1` or `1 + width_bytes` for floats). For the unifier's representative
+    # `1 + width_bytes` for floats). For the unifier's representative
     # iteration we only need ONE instance per registered type so the
     # remap-table builder can resolve `mappings[type_id] = unified_type_id`;
-    # the identity payload is irrelevant to that mapping.
+    # the payload is irrelevant to that mapping (the digit bytes remap to
+    # themselves in the reserved 0..255 range).
     #
     # Construct a minimal-payload representative per category instead:
     #   * identity tokens and valued_const_v2 → `cls(0)` (1 digit byte for 0)
-    #   * float tokens → `cls(None)` (postfix-annotation form: type id only)
+    #   * float tokens → `cls(0)` (canonical zero bit-pattern; a value-less
+    #     floatXX is not a legal token, so the representative is valued)
     #   * modifier tokens → `cls()` (no payload)
     #
     # Returns `None` for non-v2 token types so the caller falls back to the
@@ -925,8 +944,10 @@ class VocabularyManager:
         if token_type == TokenType.VALUED_CONST_V2:
             return token_cls(0)
         if token_type in self._V2_FLOAT_TOKEN_TYPES:
-            # Postfix-annotation form: bits=None ⇒ wire = `[type_id]`.
-            return token_cls(None)
+            # floatXX is always valued; the representative carries the
+            # canonical zero bit-pattern (parallels valued_const_v2's
+            # `token_cls(0)` above). A value-less floatXX is not legal.
+            return token_cls(0)
         if token_type in self._V2_MODIFIER_TOKEN_TYPES:
             return token_cls()
         return None
@@ -1562,37 +1583,37 @@ class VocabularyManager:
         assert issubclass(ValuedConstV2Inner, ValuedConstToken)
         assert issubclass(ValuedConstV2Inner, ValuedConstTokenV2)
 
-        # Float Inner classes. Two-mode payload: `bits is None` emits only
-        # the type id (postfix annotation form); `bits` set emits the type
-        # id followed by exactly `width_bytes` big-endian digit bytes
-        # (fixed width so the reader can consume the right count without
-        # ambiguity). Width is per-subclass — taken from the ABC's
+        # Float Inner classes. A floatXX token ALWAYS carries a value:
+        # the type id followed by exactly `width_bytes` big-endian digit
+        # bytes (fixed width so the reader can consume the right count
+        # without ambiguity). Width is per-subclass — taken from the ABC's
         # `width_bytes` classvar (already set on Float16Token/.../
-        # Float128Token).
+        # Float128Token). The value-less postfix-annotation form is
+        # FORBIDDEN (see precedence.md "Postfix FP annotation rule"); the
+        # `float_annotation` modifier token covers the unobtainable-value
+        # case instead. Registration without a value goes through
+        # `register_token_type` (register-without-emit), never a sentinel
+        # `bits`.
 
         class _V2FloatInner(TokensInner, FloatToken, ABC):
-            """Mixin for v2 float-category tokens (fixed-width or postfix)."""
+            """Mixin for v2 float-category tokens (always fixed-width valued)."""
 
             __slots__ = ("bits", "_token_ids", "_type_token_id")
 
-            def __init__(self, bits: Optional[int] = None):
+            def __init__(self, bits: int):
                 assert vocab_manager.format_version in (1, 2), (
                     "v2 Inner classes require format_version=1 (unified) or =2 (per-binary CSV) VocabularyManager; "
                     f"got format_version={vocab_manager.format_version}"
                 )
-                if bits is not None:
-                    assert bits >= 0, f"float bits must be unsigned bit pattern, got {bits}"
-                    max_bits = 1 << (self.width_bytes * 8)
-                    assert bits < max_bits, (
-                        f"float bits 0x{bits:x} does not fit in {self.width_bytes} bytes"
-                    )
+                assert bits >= 0, f"float bits must be unsigned bit pattern, got {bits}"
+                max_bits = 1 << (self.width_bytes * 8)
+                assert bits < max_bits, (
+                    f"float bits 0x{bits:x} does not fit in {self.width_bytes} bytes"
+                )
                 self.bits = bits
                 self._type_token_id = vocab_manager._private_add_token(self._get_basename(), self.__class__)
-                if bits is None:
-                    self._token_ids = [self._type_token_id]
-                else:
-                    payload = bits.to_bytes(self.width_bytes, "big")
-                    self._token_ids = [self._type_token_id, *payload]
+                payload = bits.to_bytes(self.width_bytes, "big")
+                self._token_ids = [self._type_token_id, *payload]
 
             @classmethod
             @abstractmethod
@@ -1601,11 +1622,9 @@ class VocabularyManager:
 
             @classmethod
             def _from_token_ids(cls, token_ids: List[int]) -> "_V2FloatInner":
-                if len(token_ids) == 1:
-                    return cls(None)
                 if len(token_ids) - 1 != cls.width_bytes:
                     raise ValueError(
-                        f"v2 {cls._get_basename()} expects 1 (postfix) or "
+                        f"v2 {cls._get_basename()} expects "
                         f"{1 + cls.width_bytes} (inline) ids, got {len(token_ids)}"
                     )
                 bits = _v2_bytes_to_int(token_ids[1:])
@@ -1616,22 +1635,15 @@ class VocabularyManager:
 
             def to_string(self) -> str:
                 basename = self._get_basename()
-                if self.bits is None:
-                    return basename
                 digits = " ".join(f"digit_{b:02X}" for b in self._token_ids[1:])
                 return f"{basename} {digits}"
 
             def to_asm_like(self) -> str:
                 basename = self._get_basename()
-                if self.bits is None:
-                    return basename  # postfix annotation; value lives elsewhere
                 return f"{basename}:{self.bits:0{self.width_bytes * 2}x}"
 
         class Float16Inner(_V2FloatInner, Float16Token):
             __slots__ = ()
-
-            def __init__(self, bits: Optional[int] = None):
-                super().__init__(bits)
 
             @classmethod
             def _get_basename(cls) -> str:
@@ -1644,9 +1656,6 @@ class VocabularyManager:
         class BFloat16Inner(_V2FloatInner, BFloat16Token):
             __slots__ = ()
 
-            def __init__(self, bits: Optional[int] = None):
-                super().__init__(bits)
-
             @classmethod
             def _get_basename(cls) -> str:
                 return "bfloat16"
@@ -1657,9 +1666,6 @@ class VocabularyManager:
 
         class Float32Inner(_V2FloatInner, Float32Token):
             __slots__ = ()
-
-            def __init__(self, bits: Optional[int] = None):
-                super().__init__(bits)
 
             @classmethod
             def _get_basename(cls) -> str:
@@ -1672,9 +1678,6 @@ class VocabularyManager:
         class Float64Inner(_V2FloatInner, Float64Token):
             __slots__ = ()
 
-            def __init__(self, bits: Optional[int] = None):
-                super().__init__(bits)
-
             @classmethod
             def _get_basename(cls) -> str:
                 return "float64"
@@ -1686,9 +1689,6 @@ class VocabularyManager:
         class Float80Inner(_V2FloatInner, Float80Token):
             __slots__ = ()
 
-            def __init__(self, bits: Optional[int] = None):
-                super().__init__(bits)
-
             @classmethod
             def _get_basename(cls) -> str:
                 return "float80"
@@ -1699,9 +1699,6 @@ class VocabularyManager:
 
         class Float128Inner(_V2FloatInner, Float128Token):
             __slots__ = ()
-
-            def __init__(self, bits: Optional[int] = None):
-                super().__init__(bits)
 
             @classmethod
             def _get_basename(cls) -> str:

@@ -268,7 +268,7 @@ def test_v1_vm_accepts_v2_inner_class_instantiation():
     # `format_version in (1, 2)` assertion.
     v1_vm.Local_Func(0)
     v1_vm.Valued_Const_V2(42)
-    v1_vm.Float32(None)
+    v1_vm.Float32(0)  # floatXX is always valued (zero bit-pattern here)
     v1_vm.Thread_Local()
 
 

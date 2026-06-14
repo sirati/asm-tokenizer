@@ -317,15 +317,40 @@ class _V2EmittersMixin:
         return tokens
 
     def _postfix_fp_annotation(self, ctx: _Ctx) -> List[Tokens]:
-        """Append a postfix ``floatXX`` annotation when the load is FP-typed.
+        """Append the FP-postfix annotation when the load is FP-typed.
 
-        Per precedence.md "Postfix FP annotation rule": no inline digits
-        -- the bits=None branch of the ``_V2FloatInner`` mixin emits just
-        the type id. Reader rule: a ``floatXX`` token followed by a
-        token >= 256 (i.e., no inline digits) annotates the previous
-        ptr token's load type.
+        Per precedence.md "Postfix FP annotation rule": a ``floatXX``
+        token ALWAYS carries its ``width_bytes`` of inline IEEE digit
+        bytes. When the caller dereferenced the load target successfully
+        (``ctx.fp_postfix_bytes`` set), emit a VALUED ``floatXX`` whose
+        bits are the big-endian image bytes (matching ``_V2FloatInner``'s
+        ``bits.to_bytes(width, "big")`` encoding). When the value was
+        unobtainable (``None`` -- unmapped / ``.bss`` / unreadable), emit
+        the value-less ``float_annotation`` marker instead. The bare
+        value-less ``floatXX`` form is FORBIDDEN.
         """
         if ctx.fp_postfix_type is None:
             return []
+        if ctx.fp_postfix_bytes is None:
+            return [self.vocab_manager.Float_Annotation()]
         factory = self._fp_factory(ctx.fp_postfix_type)
-        return [factory(None)]
+        bits = int.from_bytes(ctx.fp_postfix_bytes, "big")
+        return [factory(bits)]
+
+    def read_fp_postfix_bytes(self, lookup, addr: int, fp_postfix_type: Optional[FpType]) -> Optional[bytes]:
+        """Dereference an FP-postfix load target to its raw IEEE bytes.
+
+        Single owner of the read-and-width concern shared by every operand
+        call site that routes an FP-postfix load: derives the FP width from
+        the ``FpType`` (via the Inner-class ``width_bytes`` classvar) and
+        reads exactly that many bytes at ``addr`` through the provider's
+        ``MetadataLookup.read_bytes``. Returns the bytes, or ``None`` when
+        no FP postfix applies OR the read was unobtainable (the emitter
+        then degrades to ``float_annotation``). Callers thread the result
+        into ``process_constant_v2(fp_postfix_bytes=...)`` -- the parsed
+        bytes cross the boundary, never the lookup object.
+        """
+        if fp_postfix_type is None:
+            return None
+        width = self._fp_factory(fp_postfix_type).width_bytes
+        return lookup.read_bytes(addr, width)

@@ -251,6 +251,13 @@ def tokenize_operand_memory(
         # "Postfix FP"). The angr path uniformly reports None
         # (``angr_limitations.md`` §1).
         fp_postfix = op.fp_type
+        # Dereference the FP-postfix load target once; thread the parsed
+        # bytes (not the lookup). ``None`` when no FP postfix applies or
+        # the read is unobtainable -> emitter degrades to
+        # ``float_annotation``.
+        fp_postfix_bytes = constant_handler.read_fp_postfix_bytes(
+            lookup, classified_value, fp_postfix
+        )
 
         if force_opaque:
             disp_token = constant_handler.process_constant_v2(
@@ -258,6 +265,7 @@ def tokenize_operand_memory(
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
+                fp_postfix_bytes=fp_postfix_bytes,
             )
             tokens.extend(disp_token)
         # For larger displacements, check if pointing to known constant or code or opaque.
@@ -268,6 +276,7 @@ def tokenize_operand_memory(
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
+                fp_postfix_bytes=fp_postfix_bytes,
             )
             tokens.extend(disp_token)
         else:

@@ -86,6 +86,13 @@ def tokenize_operand_memory_base_disp(
         else:
             force_opaque = not has_base
             meta = lookup.lookup(classified_value)
+            # Dereference the FP-postfix load target once (single owner of
+            # the read+width concern); thread the parsed bytes, not the
+            # lookup. ``None`` when no FP postfix applies or the read is
+            # unobtainable -> emitter degrades to ``float_annotation``.
+            fp_postfix_bytes = constant_handler.read_fp_postfix_bytes(
+                lookup, classified_value, fp_postfix
+            )
 
             if force_opaque or (abs_value > (1 << 18)) or has_resolved:
                 disp_tokens = constant_handler.process_constant_v2(
@@ -93,6 +100,7 @@ def tokenize_operand_memory_base_disp(
                     meta=meta,
                     is_arithmetic=False,
                     fp_postfix_type=fp_postfix,
+                    fp_postfix_bytes=fp_postfix_bytes,
                 )
                 tokens.extend(disp_tokens)
             else:
@@ -102,6 +110,7 @@ def tokenize_operand_memory_base_disp(
                         meta=meta,
                         is_arithmetic=False,
                         fp_postfix_type=fp_postfix,
+                        fp_postfix_bytes=fp_postfix_bytes,
                     )
                     tokens.extend(disp_tokens)
                 else:

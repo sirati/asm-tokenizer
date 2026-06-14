@@ -509,6 +509,20 @@ class AngrMetadataLookup:
         self._populate_view_slots(fallback_meta, addr)
         return self._view
 
+    def read_bytes(self, addr: int, n: int) -> Optional[bytes]:
+        """Read ``n`` raw image bytes at ``addr`` via CLE's loader memory.
+
+        Returns ``None`` when the range is not backed by the loaded image
+        (``loader.memory.load`` raises ``KeyError`` for unmapped addresses).
+        """
+        try:
+            data = self.project.loader.memory.load(addr, n)
+        except Exception:
+            return None
+        if data is None or len(data) != n:
+            return None
+        return bytes(data)
+
 
 # Backward-compat alias
 AddressMetaDataLookup = AngrMetadataLookup

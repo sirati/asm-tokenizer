@@ -27,6 +27,13 @@ class _Ctx:
     is_arithmetic: bool
     fp_immediate_type: Optional[FpType]
     fp_postfix_type: Optional[FpType]
+    # Dereferenced FP-postfix payload: the ``width_bytes`` raw image bytes
+    # the caller read at the resolved load address, or ``None`` when the
+    # value was unobtainable (unmapped / ``.bss`` / unreadable). Drives
+    # ``_postfix_fp_annotation``: bytes -> valued ``floatXX``; ``None`` ->
+    # value-less ``float_annotation`` marker. Always ``None`` when
+    # ``fp_postfix_type`` is ``None`` (no FP postfix applies).
+    fp_postfix_bytes: Optional[bytes] = None
 
 
 # Predicate type. Returns True when the emitter should fire for this

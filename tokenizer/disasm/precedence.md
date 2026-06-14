@@ -169,22 +169,41 @@ slot kind), so the recursion terminates after one level.
 
 Separate from the precedence list. Applies *after* a step 7–10 ptr token has
 been emitted: if the *load instruction* targeting that address is FP-typed
-(e.g. `movss` / `movsd` / `vmovss` / `vld1.32` / `fld` / `fldd`), append a
-`floatXX` token immediately after the ptr token. The float token in this
-position carries **no inline digits** — the actual value lives at the
-pointed-to address, not in the stream.
+(e.g. `movss` / `movsd` / `vmovss` / `vld1.32` / `fld` / `fldd`), annotate the
+load's FP type after the ptr token.
 
-**Reader rule** (resolves the ambiguity with step 1's `floatXX`-with-value
-form):
+A `floatXX` token **ALWAYS carries its `W` inline IEEE digit bytes** — the
+value-less bare-`floatXX` form is **FORBIDDEN** (a `floatXX` is a value-token
+and the valued-token contract is inviolable). The annotation therefore takes
+one of two shapes:
 
-| Token sequence | Meaning |
+- **Dereference succeeded** → emit a **valued `floatXX`**: the caller reads the
+  `W` bytes (`W = floatXX.width_bytes`) at the resolved load address from the
+  loaded image and emits `floatXX` + those `W` digit bytes as the IEEE bit
+  pattern (big-endian). This captures the *actual* FP constant the pointer
+  loads, inline in the stream.
+- **Dereference unobtainable** → emit the value-less `float_annotation`
+  modifier token (single id, no payload). This is a pure type marker meaning
+  "the previous ptr token loads an FP value whose bytes could not be read".
+
+**Dereference policy** (which read attempts are made, by ptr kind):
+
+| ptr kind | policy |
 |---|---|
-| `floatXX` followed by token `< 256` | Inline value: consume `W` digit bytes as the IEEE bit pattern (step 1 / arithmetic FP immediate). |
-| `floatXX` followed by token `≥ 256` | Postfix type annotation on the *previous* ptr token; no inline value, the value lives at the pointed-to address. |
+| `ro_data_ptr` | read (read-only data is image-backed and stable) |
+| `rw_data_ptr` | attempt read; `.bss` / TLS-bss / unreadable → `float_annotation` |
+| `string_ptr` / `jump_table` / slot | attempt read; else `float_annotation` |
 
-Example: `ro_data_ptr <id> float32 <next-metatoken>` annotates "the pointer
-loads a float32"; no digits follow because the four bytes live at the address
+In all cases an unreadable target (`read_bytes` returns `None`) falls back to
+`float_annotation`.
+
+Example (success): `ro_data_ptr <id> float32 <b0> <b1> <b2> <b3>` — the four
+digit bytes are the IEEE-754 single-precision constant read from the address
 the pointer references.
+
+Example (fallback): `rw_data_ptr <id> float_annotation` — the load is FP-typed
+but its bytes live in `.bss` (no image backing), so only the type marker is
+emitted.
 
 ## `is_arithmetic` short-circuit
 

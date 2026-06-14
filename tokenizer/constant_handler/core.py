@@ -116,6 +116,7 @@ class ConstantHandler(_V1LegacyMixin, _V2EmittersMixin):
         is_arithmetic: bool = False,
         fp_immediate_type: Optional[FpType] = None,
         fp_postfix_type: Optional[FpType] = None,
+        fp_postfix_bytes: Optional[bytes] = None,
     ) -> List[Tokens]:
         """Resolve a constant into v2 tokens following ``precedence.md``.
 
@@ -140,12 +141,19 @@ class ConstantHandler(_V1LegacyMixin, _V2EmittersMixin):
             fp_postfix_type: typed ``FpType`` when the operand is an
                 address with FP-typed load instruction. Appended as a
                 postfix annotation after the ptr token emitted by
-                steps 7-10 (no inline digits).
+                steps 7-10.
+            fp_postfix_bytes: the ``width_bytes`` raw image bytes the
+                caller dereferenced at the resolved load address (via
+                ``read_fp_postfix_bytes``), or ``None`` when unobtainable.
+                Bytes -> a valued ``floatXX``; ``None`` -> the value-less
+                ``float_annotation`` marker. Only consulted when
+                ``fp_postfix_type`` is set.
         """
         ctx = _Ctx(
             is_arithmetic=bool(is_arithmetic),
             fp_immediate_type=fp_immediate_type,
             fp_postfix_type=fp_postfix_type,
+            fp_postfix_bytes=fp_postfix_bytes,
         )
 
         for predicate, emitter_name in self._precedence:

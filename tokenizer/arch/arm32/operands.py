@@ -93,6 +93,13 @@ def _emit_arm_disp_value_tokens(
         # magnitude collides with a real string/data address misclassify
         # as a string_ptr / ro_data_ptr.
         meta = lookup.lookup(value)
+        # Dereference the FP-postfix load target once; thread the parsed
+        # bytes (not the lookup). ``None`` when no FP postfix applies or
+        # the read is unobtainable -> emitter degrades to
+        # ``float_annotation``.
+        fp_postfix_bytes = constant_handler.read_fp_postfix_bytes(
+            lookup, value, fp_postfix
+        )
 
         if force_opaque or (abs_value > (1 << 18)) or is_resolved_target:
             disp_tokens = constant_handler.process_constant_v2(
@@ -100,6 +107,7 @@ def _emit_arm_disp_value_tokens(
                 meta=meta,
                 is_arithmetic=False,
                 fp_postfix_type=fp_postfix,
+                fp_postfix_bytes=fp_postfix_bytes,
             )
             tokens.extend(disp_tokens)
         else:
@@ -109,6 +117,7 @@ def _emit_arm_disp_value_tokens(
                     meta=meta,
                     is_arithmetic=False,
                     fp_postfix_type=fp_postfix,
+                    fp_postfix_bytes=fp_postfix_bytes,
                 )
                 tokens.extend(disp_tokens)
             else:

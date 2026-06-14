@@ -2,7 +2,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Iterable, Protocol, Tuple
+from typing import Any, Iterable, Optional, Protocol, Tuple
 
 from tokenizer.disasm.metadata import (
     AddressKind,
@@ -59,6 +59,19 @@ class MetadataLookup(Protocol):
         the transitional dict-shim and v1-tuple-unpacking adapters from
         Phase D.1/D.2 are gone (Phase D.3 / task #40). Use
         ``copy.deepcopy(meta)`` to stash across lookups.
+        """
+        ...
+
+    def read_bytes(self, addr: int, n: int) -> "Optional[bytes]":
+        """Read ``n`` raw bytes from the loaded image at ``addr``.
+
+        Returns ``None`` when the range is unreadable — outside any
+        mapped segment, or in an uninitialized region (``.bss``/TLS-bss)
+        that has no backing bytes in the image. Used by the FP-postfix
+        emitter to dereference a load target and capture the real IEEE
+        constant; an unobtainable read degrades to the value-less
+        ``float_annotation`` marker (see ``precedence.md`` "Postfix FP
+        annotation rule").
         """
         ...
 

@@ -361,6 +361,30 @@ class GhidraMetadataLookup:
         """
         return self._classify_address(addr, allow_slot_recursion=True)
 
+    def read_bytes(self, addr: int, n: int) -> Optional[bytes]:
+        """Read ``n`` raw image bytes at ``addr`` via Ghidra's ``Memory``.
+
+        Returns ``None`` when the range is unreadable: outside any mapped
+        block, or in an uninitialized region (``.bss``/TLS-bss) whose bytes
+        have no backing in the image — ``Memory.getBytes`` raises
+        ``MemoryAccessException`` for those, which we map to ``None``.
+        """
+        import jpype
+
+        try:
+            addr_obj = (
+                self._program.getAddressFactory()
+                .getDefaultAddressSpace()
+                .getAddress(addr)
+            )
+            buf = jpype.JArray(jpype.JByte)(n)
+            read = self._memory.getBytes(addr_obj, buf)
+            if read != n:
+                return None
+            return bytes(memoryview(buf))
+        except Exception:
+            return None
+
     def _classify_address(
         self,
         addr: int,
