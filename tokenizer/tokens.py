@@ -161,6 +161,13 @@ class TokenType(IntEnum):
     # iff the disassembler reported the value as signed, whereas `MEM_MINUS`
     # remains the addressing-operator minus inside `mem[ ... ]mem`.
     VALUE_NEGATIVE = 30
+    # v2 modifier — width-agnostic, value-less marker for an FP-typed pointer
+    # load whose value could not be captured. Same parameterless modifier
+    # shape as THREAD_LOCAL / VTABLE / CODE_PTR_TABLE (single vocab id, no
+    # payload); lands lazily in the instruction-rep range on the unified
+    # vocab. Distinct from the NUMBER-block FLOAT* tokens, which carry a
+    # captured FP magnitude — this marker carries no value.
+    FLOAT_ANNOTATION = 31
     UNRESOLVED = -1
 
 
@@ -749,6 +756,25 @@ class CodePtrTableToken(ModifierToken, ABC):
     @classproperty
     def token_type(cls) -> TokenType:
         return TokenType.CODE_PTR_TABLE
+
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+
+class FloatAnnotationToken(ModifierToken, ABC):
+    """Protocol for the v2 `float_annotation` modifier.
+
+    Width-agnostic, value-less marker for an FP-typed pointer load whose
+    value could not be captured. Parameterless category marker (single vocab
+    id, no payload) — the same wire shape as `thread_local` / `vtable` /
+    `code_ptr_table`. Distinct from the NUMBER-block `FloatToken` family
+    (`float16`..`float128`), which carry a captured FP magnitude; this marker
+    legitimately carries no value because it is a modifier, not a NUMBER token.
+    """
+
+    @classproperty
+    def token_type(cls) -> TokenType:
+        return TokenType.FLOAT_ANNOTATION
 
     @abstractmethod
     def __init__(self) -> None: ...

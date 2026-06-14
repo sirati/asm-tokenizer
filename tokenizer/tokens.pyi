@@ -40,6 +40,8 @@ class TokenType(IntEnum):
     VTABLE: "TokenType"
     CODE_PTR_TABLE: "TokenType"
     VARIANT_AXIS: "TokenType"
+    VALUE_NEGATIVE: "TokenType"
+    FLOAT_ANNOTATION: "TokenType"
     UNRESOLVED: "TokenType"
 
 class MemoryOperandSymbol(Enum):
@@ -271,6 +273,13 @@ class VtableToken(ModifierToken, ABC):
     def __init__(self) -> None: ...
 
 class CodePtrTableToken(ModifierToken, ABC):
+    @property
+    @classmethod
+    def token_type(cls) -> TokenType: ...
+    @abstractmethod
+    def __init__(self) -> None: ...
+
+class FloatAnnotationToken(ModifierToken, ABC):
     @property
     @classmethod
     def token_type(cls) -> TokenType: ...

@@ -14,6 +14,7 @@ from tokenizer.tokens import (
     BlockTokenV2,
     CodePtrTableToken,
     ExtFuncToken,
+    FloatAnnotationToken,
     Float16Token,
     Float32Token,
     Float64Token,
@@ -103,7 +104,11 @@ class VocabularyManager:
     |            |                            | (user-canonical, then alphabetical)        |
     +------------+----------------------------+--------------------------------------------+
     | 272..X     | instruction reps           | mnemonics / register lists / block defs    |
-    |            |                            | merged from per-binary CSVs                |
+    |            |                            | merged from per-binary CSVs; also the      |
+    |            |                            | value-less modifier markers                |
+    |            |                            | (``thread_local``, ``vtable``,             |
+    |            |                            | ``code_ptr_table``, ``float_annotation``)  |
+    |            |                            | which land lazily first-seen               |
     +------------+----------------------------+--------------------------------------------+
     | X+1..Y     | metadata-variant tail      | axis-grouped (``arch`` -> ``comp`` ->      |
     |            |                            | ``cver`` -> ``opt``, then sidecar          |
@@ -774,6 +779,8 @@ class VocabularyManager:
             return self.Vtable
         elif token_type == TokenType.CODE_PTR_TABLE:
             return self.Code_Ptr_Table
+        elif token_type == TokenType.FLOAT_ANNOTATION:
+            return self.Float_Annotation
         elif token_type == TokenType.VARIANT_AXIS:
             return self.Variant_Axis
         elif token_type == TokenType.VALUE_NEGATIVE:
@@ -905,6 +912,7 @@ class VocabularyManager:
         TokenType.THREAD_LOCAL,
         TokenType.VTABLE,
         TokenType.CODE_PTR_TABLE,
+        TokenType.FLOAT_ANNOTATION,
     })
 
     def _make_v2_representative(self, token_type: TokenType):
@@ -1778,6 +1786,19 @@ class VocabularyManager:
         assert issubclass(CodePtrTableInner, ModifierToken)
         assert issubclass(CodePtrTableInner, CodePtrTableToken)
 
+        class FloatAnnotationInner(_V2ModifierInner, FloatAnnotationToken):
+            __slots__ = ()
+
+            def __init__(self):
+                super().__init__()
+
+            @classmethod
+            def _get_basename(cls) -> str:
+                return "float_annotation"
+
+        assert issubclass(FloatAnnotationInner, ModifierToken)
+        assert issubclass(FloatAnnotationInner, FloatAnnotationToken)
+
         # Value_Negative Inner — parameterless postfix sign marker for
         # `valued_const_v2`. Mechanical shape matches the modifier-token
         # family (single vocab id, no payload), but kept as a standalone
@@ -2038,6 +2059,7 @@ class VocabularyManager:
         self.Thread_Local = ThreadLocalInner
         self.Vtable = VtableInner
         self.Code_Ptr_Table = CodePtrTableInner
+        self.Float_Annotation = FloatAnnotationInner
         # Postfix sign marker for valued_const_v2. Registered eagerly in
         # `__init__` to pin its vocab id at `_V2_VALUE_NEGATIVE_TOKEN_ID`
         # (256); the factory exposed here lets callers re-emit it without
