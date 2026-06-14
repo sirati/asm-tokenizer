@@ -20,7 +20,7 @@ function if no variant survived; unmatched simply omits the offending
 variant.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from tokenizer.aligned_data._writers import assemble_function_record
 from tokenizer.aligned_data.parsed_record_iter import Matched, ParsedRecord, Unmatched
@@ -37,6 +37,7 @@ from .function_names import FunctionNamesRegistry
 
 __all__ = (
     "build_function_lookup_table",
+    "collect_sectioned_func_names",
     "group_unmatched_entries_by_function",
     "process_matched_function",
     "process_unmatched_function",
@@ -225,10 +226,17 @@ def _emit_record(
 
 
 def build_function_lookup_table(
-    matched_data_entries: List[dict],
-    unmatched_data_entries: List[dict],
+    matched_data_entries: "Iterable[dict]",
+    unmatched_data_entries: "Iterable[dict]",
 ) -> dict:
-    """Build lookup table: ``{(func_name, vkey): (offset, length, is_matched)}``."""
+    """Build lookup table: ``{(func_name, vkey): (offset, length, is_matched)}``.
+
+    Both arguments are consumed by a single forward iteration each, so a
+    streaming source (e.g. an :class:`~._entry_spool.EntrySpool`) is
+    accepted in place of a materialised list — the table is the only
+    whole-binary structure that survives, and it is far smaller than the
+    nested entry payloads it indexes.
+    """
     function_lookup = {}
 
     for entry in matched_data_entries:
@@ -248,3 +256,27 @@ def build_function_lookup_table(
         )
 
     return function_lookup
+
+
+def collect_sectioned_func_names(
+    matched_data_entries: "Iterable[dict]",
+    unmatched_data_entries: "Iterable[dict]",
+) -> "Tuple[Set[str], Set[str]]":
+    """Derive ``(matched_func_names, sectioned_func_names)`` from the arms.
+
+    ``matched_func_names`` is every function name surviving the matched
+    arm; ``sectioned_func_names`` is the union with the unmatched arm's
+    names — the set of names whose section will land in
+    ``<binary>_sections.bin``. Both are whole-binary cross-pass tables
+    pass 2 needs before emitting any section, so they are derived here in
+    one forward pass over each arm rather than via a list comprehension
+    over a retained entry list (which would pin the whole corpus in RAM).
+    """
+    matched_func_names: "Set[str]" = {
+        entry["func_name"] for entry in matched_data_entries
+    }
+    sectioned_func_names: "Set[str]" = set(matched_func_names)
+    sectioned_func_names.update(
+        entry["func_name"] for entry in unmatched_data_entries
+    )
+    return matched_func_names, sectioned_func_names

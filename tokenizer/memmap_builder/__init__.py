@@ -8,6 +8,7 @@ efficient index structures for random access.
 from .builder import BinaryVersionInfo, VersionKey, build_memmap_files
 from .passes import (
     build_function_lookup_table,
+    collect_sectioned_func_names,
     group_unmatched_entries_by_function,
     process_matched_function,
     process_unmatched_function,
@@ -20,6 +21,7 @@ __all__ = [
     "VersionKey",
     "build_memmap_files",
     "build_function_lookup_table",
+    "collect_sectioned_func_names",
     "group_unmatched_entries_by_function",
     "process_matched_function",
     "process_unmatched_function",
