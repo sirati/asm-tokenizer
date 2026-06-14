@@ -38,7 +38,11 @@ from typing import Dict, Iterator, Tuple
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
-from tokenizer.aligned_data.matched_sections_bin import Section, parse_section_bin
+from tokenizer.aligned_data.matched_sections_bin import (
+    Section,
+    _SECTION_FID_MASK,
+    parse_section_bin,
+)
 from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
     assert_matched_sections_prelude,
@@ -107,7 +111,21 @@ def resolve_func_name_or_raise(
     Identical wording is what the matched + unmatched arm walkers
     used to inline -- centralising it here means a future tweak to
     the migration pointer changes one site, not three.
+
+    Bit 31 of a section-header FID is the duplicated-section marker
+    (:data:`...matched_sections_bin._SECTION_DUPLICATED_BIT`); the
+    function-names sidecar is keyed on the CLEAN low-31-bit line
+    number only. ``parse_section_bin`` already strips the bit from
+    ``Section.function_name_ptr``, but this resolver is the single
+    shared name lookup for every FID consumer, so it masks
+    (``& _SECTION_FID_MASK``) on its own input contract too: a raw
+    header FID resolves to the same name as its clean form instead of
+    a spurious sidecar-drift raise. The mask is a no-op for any clean
+    FID (real line numbers are ``< 2**31`` by construction -- bit 31
+    is reserved), so the genuine sidecar-drift guard below is
+    preserved for every truly-absent (post-mask) FID.
     """
+    fid &= _SECTION_FID_MASK
     if fid not in line_to_name:
         raise ValueError(
             f"{sections_bin}: section at offset {cursor} "
