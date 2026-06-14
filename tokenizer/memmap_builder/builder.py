@@ -1,10 +1,12 @@
 import contextlib
 import logging
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
+from tokenizer.aligned_data.loader.unified_vocab_gate import UNIFIED_VOCAB_BASENAME
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.aligned_data.parsed_record_iter import (
     DuplicateNameClassifier,
@@ -139,6 +141,28 @@ def build_memmap_files(
             f"chain. Re-run tokenizer.vocab_unifier against the per-binary "
             f"CSV inputs to regenerate."
         )
+
+    # Co-locate the exact unified vocab this catalog was built against
+    # into `output_dir`, at the basename the loader's gate searches
+    # (`resolve_unified_vocab_path` probes `<memmap_dir>/<basename>`
+    # first). A memmap catalog is only self-describing if it ships with
+    # the vocab that assigned its uint16 ids — without the co-located
+    # copy a consumer is forced to supply a vocab path by hand and can
+    # silently pass a stale/mismatched one, decoding the same variant
+    # record to the wrong axes. The copy is byte-faithful (`copy2`
+    # preserves metadata) and idempotent across re-runs. `output_dir`
+    # is the catalog's own directory in every caller: the local builder
+    # writes the per-binary bins here directly, and the cluster worker
+    # passes its per-binary `staged_publish` stage dir, so the copy is
+    # picked up by the same atomic publish walk and lands beside the
+    # bins at the gate's in-directory search location.
+    colocated_vocab = output_dir / UNIFIED_VOCAB_BASENAME
+    if not (
+        colocated_vocab.exists()
+        and colocated_vocab.samefile(unified_vocab_path)
+    ):
+        shutil.copy2(unified_vocab_path, colocated_vocab)
+        logger.info(f"  Co-located unified vocab: {colocated_vocab}")
 
     # Variant registry: single authority on the `vkey -> 0x<hex>` ref
     # used by every section-CSV row and the warn-log. Built up front
