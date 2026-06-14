@@ -9,6 +9,7 @@ from tokenizer.compact_base64_utils import ndarray_to_base64
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.variant_tokens import VariantInventory
 
+from .era_detect import detect_legacy_no_value_negative
 from .loader import load_vocab_manager
 from .saver import save_vocabulary
 from .variant_registration import iter_variant_infos
@@ -52,19 +53,28 @@ def unify_vocab(
     Each `csv_file` must be reachable from this root; the relative
     subdir is preserved when computing the mapping path.
 
-    `insert_value_negative`: legacy-compat flag for per-binary CSVs
-    generated BEFORE ``value_negative`` was reserved at slot 256. When
-    True the per-binary CSVs are loaded with only 256 reserved slots
-    (digits only) — the first entry of each per-binary vocabulary is
-    a real token at per-binary id 256, NOT ``value_negative``. The
-    unified vocab still gets the canonical 257-reserved layout
-    (``value_negative`` pinned at unified slot 256), and the per-binary
-    real tokens 256+ are remapped via :meth:`register_on_vocab_manager`
-    into the unified id space (legacy id 256 = ``block_v2`` typically
-    lands at unified id 264). The emitted mapping.b64c sidecars carry
-    the shifted ids, so downstream consumers (memmap_builder) see
-    canonical-layout unified ids regardless of which legacy era the
-    corpus was tokenized in.
+    `insert_value_negative`: DEFAULT (tiebreak) era for per-binary CSVs,
+    NOT a uniform override. Each CSV's era is resolved per-file by
+    :func:`era_detect.detect_legacy_no_value_negative` from its own
+    token-stream carrier coherence; ``insert_value_negative`` only
+    decides the era when detection is inconclusive (legacy data is
+    carrier-blind, and degenerate / too-short CSVs carry no signal). A
+    confident MODERN detection always wins over this default, so a
+    MIXED-era corpus (legacy untouched @256 + modern re-tokenized @257)
+    unifies correctly: pass the legacy default (``True``) and the modern
+    files self-upgrade to 257 while the legacy files keep 256.
+
+    When a CSV is resolved to the legacy era, it is loaded with only 256
+    reserved slots (digits only) — the first entry of its per-binary
+    vocabulary is a real token at per-binary id 256, NOT
+    ``value_negative``. The unified vocab still gets the canonical
+    257-reserved layout (``value_negative`` pinned at unified slot 256),
+    and the per-binary real tokens 256+ are remapped via
+    :meth:`register_on_vocab_manager` into the unified id space (legacy
+    id 256 = ``block_v2`` typically lands at unified id 264). The emitted
+    mapping.b64c sidecars carry the shifted ids, so downstream consumers
+    (memmap_builder) see canonical-layout unified ids regardless of which
+    era each CSV was tokenized in.
     """
     if mapping_output_dir is not None and mapping_source_root is None:
         raise ValueError(
@@ -116,8 +126,20 @@ def unify_vocab(
     loaded_count = 0
     for csv_file in csv_files:
         print(f"Loading vocabulary from {csv_file}")
+        # Per-CSV era resolution. `insert_value_negative` is only the
+        # DEFAULT/tiebreak here — the detector positively confirms the
+        # modern (offset-257) era from the CSV's own token-stream carrier
+        # coherence and overrides the default in that case, so a MIXED-era
+        # corpus (legacy untouched + modern re-tokenized) unifies
+        # correctly regardless of the single global flag. Legacy and
+        # degenerate CSVs keep the default. See `era_detect` for why the
+        # signal is one-directional (modern is positively detectable;
+        # legacy is carrier-blind and must default).
+        legacy_no_value_negative = detect_legacy_no_value_negative(
+            csv_file, default=insert_value_negative,
+        )
         current_vocab_manager = load_vocab_manager(
-            csv_file, legacy_no_value_negative=insert_value_negative,
+            csv_file, legacy_no_value_negative=legacy_no_value_negative,
         )
         if current_vocab_manager is None:
             logger.error(f"Failed to load vocabulary from {csv_file}. Missing or incomplete (no vocab def in last line).")
@@ -153,12 +175,14 @@ def unify_vocab(
         # unified VM agree by construction, so identity remap is the
         # correct translation across the prefix.
         #
-        # Legacy path (``insert_value_negative=True``): per-binary IDs
+        # Legacy path (``legacy_no_value_negative=True``): per-binary IDs
         # 0..255 are digits, and slot 256 is the FIRST REAL TOKEN (the
         # per-binary VM has 256 reserved, not 257). Only the digit
         # prefix identity-remaps; slot 256+ is filled by
-        # ``register_on_vocab_manager`` below.
-        if insert_value_negative:
+        # ``register_on_vocab_manager`` below. The flag is the PER-CSV
+        # detected era (see the load above), not the global default, so
+        # the prefix translation matches the era each CSV was loaded with.
+        if legacy_no_value_negative:
             reserved = VocabularyManager._V2_RESERVED_DIGIT_COUNT
             mappings[:reserved] = np.arange(reserved, dtype=mappings.dtype)
         else:

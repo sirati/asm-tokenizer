@@ -31,13 +31,17 @@ def main() -> None:
         "--insert-neg-value",
         action="store_true",
         help=(
-            "Legacy-compat: per-binary CSVs were generated BEFORE "
-            "value_negative was reserved at slot 256. Load them with only "
-            "256 reserved slots (digits only) and let register_on_vocab_manager "
-            "remap their real tokens (256+) into canonical-layout unified ids. "
-            "Use this for corpora tokenized pre-value_negative-cutover. "
-            "The emitted unified vocab still has the canonical 257-reserved "
-            "layout (value_negative pinned at unified slot 256)."
+            "Legacy-compat DEFAULT era for per-binary CSVs generated "
+            "BEFORE value_negative was reserved at slot 256 (256 reserved "
+            "slots, digits only). NOTE: each CSV's era is now auto-detected "
+            "per-file from its token-stream coherence; this flag is only the "
+            "tiebreak when detection is inconclusive (modern CSVs always "
+            "self-detect as 257-reserved regardless). Pass it for "
+            "MIXED-era corpora (legacy untouched + modern re-tokenized): "
+            "modern files self-upgrade while legacy files keep this default. "
+            "register_on_vocab_manager remaps legacy real tokens (256+) into "
+            "canonical-layout unified ids; the emitted unified vocab always "
+            "has the canonical 257-reserved layout (value_negative at slot 256)."
         ),
     )
 
