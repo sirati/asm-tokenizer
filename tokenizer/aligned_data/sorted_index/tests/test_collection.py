@@ -37,7 +37,7 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
-from .fixtures import build_combined_fixture
+from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
 _MAX = LengthReduction(ReductionKind.MAX)
@@ -133,7 +133,7 @@ def test_discovery_two_dirs_distinct_binaries(tmp_path: Path) -> None:
     _build_decodable_binary(dir_b, "beta", tmp_path / "scratch_b")
 
     with IndexedMemmapCollection.discover(
-        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH
+        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         names = [m.qualified_name for m in coll.members]
         assert names == ["alpha", "beta"]  # alphabetical, bare
@@ -163,7 +163,7 @@ def test_collision_qualified_by_dirname(tmp_path: Path) -> None:
     _build_decodable_binary(dir_a, "lonely", tmp_path / "scratch_l")
 
     with IndexedMemmapCollection.discover(
-        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH
+        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         names = [m.qualified_name for m in coll.members]
         assert names == ["lonely", "pkgA/shared", "pkgB/shared"]
@@ -187,7 +187,7 @@ def test_collision_same_dirname_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="ambiguous qualified name"):
         IndexedMemmapCollection.discover(
-            [dir_a, dir_b], reduction=_MAX, depth=_DEPTH
+            [dir_a, dir_b], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
         )
 
 
@@ -205,7 +205,7 @@ def test_missing_index_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing sorted-index"):
         IndexedMemmapCollection.discover(
-            [dir_a], reduction=_MAX, depth=_DEPTH
+            [dir_a], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
         )
 
 
@@ -268,7 +268,7 @@ def _frequency_setup(tmp_path: Path, pool_a: int, pool_b: int) -> IndexedMemmapC
         _build_decodable_binary(d, name, scratch)
         _overlay_synthetic_index(d, name, _POPULATED_LENGTH, pool)
     return IndexedMemmapCollection.discover(
-        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH
+        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     )
 
 
@@ -337,7 +337,7 @@ def test_sessions_persist_and_lazy(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(BinaryDataset, "open_session", counting_open)
 
     with IndexedMemmapCollection.discover(
-        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH
+        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         # batch_size 8 == the band pool (4 sampleable sections per binary
         # x 2 binaries), so the without-replacement urn draw saturates and
@@ -386,7 +386,7 @@ def test_never_sampled_member_opens_no_session(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(BinaryDataset, "open_session", recording_open)
 
     with IndexedMemmapCollection.discover(
-        [dir_a], reduction=_MAX, depth=_DEPTH
+        [dir_a], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         assert {m.qualified_name for m in coll.members} == {"alpha", "idle"}
         rng = np.random.default_rng(0)
@@ -416,7 +416,7 @@ def test_load_batch_e2e_two_dirs(tmp_path: Path) -> None:
     _build_decodable_binary(dir_b, "beta", tmp_path / "scratch_b")
 
     with IndexedMemmapCollection.discover(
-        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH
+        [dir_a, dir_b], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         rng = np.random.default_rng(42)
         num_variants = 2
@@ -453,7 +453,7 @@ def test_load_batch_band_when_exact_bucket_empty(tmp_path: Path) -> None:
     _build_decodable_binary(dir_a, "alpha", tmp_path / "scratch_a")
 
     with IndexedMemmapCollection.discover(
-        [dir_a], reduction=_MAX, depth=_DEPTH
+        [dir_a], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         # The exact bucket at _EMPTY_LENGTH is empty ...
         assert coll.count_at(_EMPTY_LENGTH) == 0
@@ -477,7 +477,7 @@ def test_load_batch_empty_pool_raises(tmp_path: Path) -> None:
     _build_decodable_binary(dir_a, "alpha", tmp_path / "scratch_a")
 
     with IndexedMemmapCollection.discover(
-        [dir_a], reduction=_MAX, depth=_DEPTH
+        [dir_a], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         rng = np.random.default_rng(0)
         with pytest.raises(ValueError, match="empty sampler pool"):
@@ -502,7 +502,7 @@ def test_close_then_load_batch_raises(tmp_path: Path) -> None:
     _build_decodable_binary(dir_a, "alpha", tmp_path / "scratch_a")
 
     coll = IndexedMemmapCollection.discover(
-        [dir_a], reduction=_MAX, depth=_DEPTH
+        [dir_a], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     )
     coll.close()
     rng = np.random.default_rng(0)
@@ -525,7 +525,7 @@ def test_context_manager_closes(tmp_path: Path) -> None:
     _build_decodable_binary(dir_a, "alpha", tmp_path / "scratch_a")
 
     with IndexedMemmapCollection.discover(
-        [dir_a], reduction=_MAX, depth=_DEPTH
+        [dir_a], reduction=_MAX, depth=_DEPTH, vocab_manager=make_test_vocab_manager()
     ) as coll:
         rng = np.random.default_rng(0)
         coll.load_batch(

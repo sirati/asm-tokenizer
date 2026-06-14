@@ -42,7 +42,7 @@ from tokenizer.aligned_data.sorted_index import (
     open_length_bucketed_batch,
 )
 
-from .fixtures import build_combined_fixture
+from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
 _BINARY_NAME_A = "binA"
@@ -108,9 +108,10 @@ def _open_sampler(memmap_dir: Path) -> MultiBinarySortedIndexSampler:
 
 
 def _make_session_factory(memmap_dir: Path):
+    vocab_manager = make_test_vocab_manager()
     @contextmanager
     def session_factory(binary_name: str) -> Iterator[BinarySession]:
-        dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=None)
+        dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab_manager)
         with dataset.open_session() as session:
             yield session
     return session_factory

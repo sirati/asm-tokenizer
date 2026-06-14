@@ -221,6 +221,18 @@ def batch_decode(
         result) yields the :class:`BatchDecodeResult`. The orchestrator
         is responsible for flushing once it has every pending decode.
     """
+    # Variant-prefix assembly REQUIRES the unified vocab; fail LOUD on a
+    # vocab-less (length/graph-only) session rather than silently dropping
+    # the prefix from every decoded row. Guarded on ``section_pointers``
+    # being non-empty: an empty batch assembles zero rows, so there is no
+    # prefix to drop and no vocab needed (and the no-op caller may legitimately
+    # pass no session). The length/graph paths never reach batch_decode (they
+    # go through ``_bulk_expand_lengths``), so this is the narrowest seam that
+    # is prefix-consuming-ONLY and still holds the session/vocab. See
+    # ``BinarySession.require_vocab_manager``.
+    if section_pointers:
+        session.require_vocab_manager()
+
     if rng is None:
         rng = np.random.default_rng()
 

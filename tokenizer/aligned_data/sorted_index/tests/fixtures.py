@@ -47,6 +47,33 @@ from tokenizer.aligned_data.loader.tests._corpus.specs import VariantSpec
 _BINARY_NAME: str = "sortbin"
 
 
+def make_test_vocab_manager():
+    """A minimal valid unified ``VocabularyManager`` for DECODE-path tests.
+
+    ``batch_decode`` HARD-REQUIRES a vocab to assemble the variant-axis
+    prefix (a vocab-less decode would silently drop it), so every fixture
+    that drives a decode must thread one into its ``BinaryDataset`` /
+    ``IndexedMemmapCollection.discover``. Length/graph-only fixtures never
+    decode and stay vocab-less by design (``build_*_fixture`` deliberately
+    omits the vocab). Built via the production v1 stager + gate so the head-
+    of-vocab invariants hold; the staging dir is ephemeral (the loaded VM is
+    self-contained).
+    """
+    import tempfile
+
+    from tokenizer.aligned_data.loader.tests._loader_test_support import (
+        stage_v1_unified_vocab,
+    )
+    from tokenizer.aligned_data.loader.unified_vocab_gate import (
+        load_and_validate_unified_vocab,
+    )
+
+    with tempfile.TemporaryDirectory() as scratch:
+        return load_and_validate_unified_vocab(
+            stage_v1_unified_vocab(Path(scratch))
+        )
+
+
 class _DeterministicVariantRegistry:
     """Registry that assigns each unique ``vkey`` a 16-byte-aligned offset.
 

@@ -45,7 +45,7 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
-from .fixtures import build_combined_fixture
+from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
 _BINARY_NAME_A = "binA"
@@ -88,9 +88,10 @@ def _build_two_binary_memmap_dir(tmp_path: Path) -> Path:
 @contextmanager
 def _session_factory_for(memmap_dir: Path):
     """Context-manager session_factory closing over ``memmap_dir``."""
+    vocab_manager = make_test_vocab_manager()
     @contextmanager
     def factory(binary_name: str) -> Iterator[BinarySession]:
-        dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=None)
+        dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab_manager)
         with dataset.open_session() as session:
             yield session
     yield factory

@@ -36,7 +36,7 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
-from .fixtures import build_combined_fixture
+from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
 _MAX = LengthReduction(ReductionKind.MAX)
@@ -233,7 +233,7 @@ def test_per_spec_pools_differ_on_call_graph(tmp_path: Path) -> None:
     _build_chain_binary(dir_a, "chain")
 
     with IndexedMemmapCollection.discover(
-        [dir_a], specs=[_SPEC_D0, _SPEC_D3]
+        [dir_a], specs=[_SPEC_D0, _SPEC_D3], vocab_manager=make_test_vocab_manager()
     ) as coll:
         # Band above the d0 universe (everything sits at key 7) but
         # inside the d3 universe (keys 21 + 28).
@@ -392,7 +392,7 @@ def test_sessions_shared_across_specs(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(BinaryDataset, "open_session", counting_open)
 
     with IndexedMemmapCollection.discover(
-        [dir_a], specs=[_SPEC_D0, _SPEC_D3]
+        [dir_a], specs=[_SPEC_D0, _SPEC_D3], vocab_manager=make_test_vocab_manager()
     ) as coll:
         rng = np.random.default_rng(1)
         # batch_size 10 == both binaries' full key-8 pool (5 each) so
@@ -429,7 +429,7 @@ def test_load_batch_e2e_differs_per_spec(tmp_path: Path) -> None:
     _build_chain_binary(dir_a, "chain")
 
     with IndexedMemmapCollection.discover(
-        [dir_a], specs=[_SPEC_D0, _SPEC_D3]
+        [dir_a], specs=[_SPEC_D0, _SPEC_D3], vocab_manager=make_test_vocab_manager()
     ) as coll:
         # d0: exact bucket at key 8 (every section) decodes.
         rng = np.random.default_rng(11)

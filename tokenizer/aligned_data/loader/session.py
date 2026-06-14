@@ -354,10 +354,39 @@ class BinarySession(_BinarySessionHelpersMixin):
         )
         return f"{self._binary_name}{suffix}"
 
+    def require_vocab_manager(self) -> Any:
+        """Return the vocab manager, or RAISE if this session is vocab-less.
+
+        Variant-prefix assembly (the train/decode path) REQUIRES the unified
+        vocab to resolve a binary's variant records into axis token IDs. A
+        ``None`` vocab here is a construction error -- the session was opened
+        without ``vocab_manager=`` (``AlignedDataLoader`` threads it
+        automatically). Length/graph-only consumers never call this and may
+        run vocab-less by design.
+
+        Failing loud is deliberate: decoding variant-prefixed rows with no
+        vocab would SILENTLY drop the prefix and corrupt every training row
+        with no error. Explicit ``raise`` (not ``assert``) because
+        ``python -O`` strips asserts and would resurrect the silent footgun
+        in an optimised run -- exactly where it matters most.
+        """
+        if self._vocab_manager is None:
+            raise ValueError(
+                "BinarySession was opened without a vocab_manager but variant "
+                "decoding was requested. Construct BinaryDataset(..., "
+                "vocab_manager=<unified vm>) or load via AlignedDataLoader "
+                "(auto-loads the co-located unified_vocab.csv). A vocab-less "
+                "session is length/graph-only and must not decode prefixes."
+            )
+        return self._vocab_manager
+
     def get_variant_by_ref(self, ref: str) -> Optional[Dict[str, Any]]:
         # Swallow resolver errors to ``None`` -- parsers want a sentinel
         # for "no variant available", not an exception aborting a batch
-        # over one bad section row.
+        # over one bad section row. The vocab-less case stays tolerant HERE
+        # (length/graph paths resolve refs without needing the vocab); the
+        # train/decode path guards loudly upstream via
+        # ``require_vocab_manager`` at ``batch_decode``.
         if not ref or self._vocab_manager is None:
             return None
         variants_mmap = self._open_variants()
