@@ -13,17 +13,15 @@ category self-token at ``expanded[0]``) are owned by
 mask pre-compute by :func:`...decoded._inline_decode_state.
 build_inline_decode_state`; the ``CallTargetType -> Category`` collapse
 by :data:`...batch_decode._dedup_walk._constants.
-_CALL_TARGET_TYPE_TO_CATEGORY`. This module ONLY drives those owned
-kernels from the geometry's flat ``node`` / ``edge_type`` axes and
-concatenates their outputs -- it re-implements none of the rules, so the
+_CALL_TARGET_TYPE_TO_CATEGORY`. The expansion + state MATH now runs as a
+few vectorized passes over the WHOLE flat CSR body stream
+(:mod:`._batched_expand`, the batched twin of
+:func:`...batch_decode._bulk_expand_lengths.bulk_contributing_geometry`);
+this module ONLY collapses the edge axis to per-node self-token ids and
+SLICES the batched result into the per-node ``states`` / mask list
+contract the dense pass reads. No rule is re-implemented here or in the
+batched twin -- both reproduce the owned kernels' rules, so the
 byte-identity gate cannot diverge on expansion logic.
-
-Remaining hot-path loop: the per-node ``expand_tokens`` dispatch is still
-a Python loop over emitted nodes (the kernel is per-stream). The body
-LOAD is already batched (one gather); the per-node expand is the next
-vectorization target (a batched promotion+strip twin over the flat CSR
-``raw``). Until then the loop reuses the proven scalar semantics so
-correctness is never traded for speed.
 """
 
 from __future__ import annotations
@@ -36,38 +34,67 @@ from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
     _CALL_TARGET_TYPE_TO_CATEGORY,
 )
-from tokenizer.aligned_data.loader.batch_decode._expand_tokens import (
-    expand_tokens,
-)
 from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
-    build_inline_decode_state,
+    InlineDecodeState,
 )
+from tokenizer.tokens import Category
+from tokenizer.token_manager import VocabularyManager
 
+from ._batched_expand import BatchedExpansion, batched_expand
 from ._body_load import GatheredBodies
 
 
 __all__ = ["ExpandedBatch", "expand_node_bodies"]
 
 
-#: The unified vocab is the only layout the carrier-band pre-compute is
-#: valid under (see ``build_inline_decode_state``); the geometry path is
-#: unified-vocab-only by construction.
-_UNIFIED_VOCAB_FORMAT_VERSION = 1
+# Self-token shifted ids -- LOCAL_FUNC is identity-block index 1, PLT_FUNC
+# index 2 (the SAME anchors ``_expand_tokens`` derives); the model-facing
+# value the scalar writes at ``expanded[0]`` is ``id - 256``. Building the
+# CallTargetType -> shifted-id lookup once here keeps the edge-axis
+# collapse a single vectorized gather (no per-node category branch).
+_LOCAL_FUNC_SHIFTED = (
+    VocabularyManager._V2_IDENTITY_BLOCK_START
+    + 1
+    - VocabularyManager._V2_RESERVED_DIGIT_COUNT
+)
+_PLT_FUNC_SHIFTED = (
+    VocabularyManager._V2_IDENTITY_BLOCK_START
+    + 2
+    - VocabularyManager._V2_RESERVED_DIGIT_COUNT
+)
+
+#: ``CallTargetType -> shifted self-token id`` lookup table. Indexed by
+#: the integer ``CallTargetType`` value; entries map through the SAME
+#: ``_CALL_TARGET_TYPE_TO_CATEGORY`` collapse + the scalar
+#: ``_calling_category_shifted_id`` rule (LOCAL_FUNC -> shifted id, PLT_FUNC
+#: -> shifted id). Categories the scalar rejects (anything but LOCAL/PLT)
+#: stay at the sentinel so a stage-1 walker bug surfaces as a raised error,
+#: matching ``expand_tokens``'s AssertionError.
+_SELF_TOKEN_SENTINEL = np.iinfo(np.uint32).max
+_CATEGORY_TO_SHIFTED_ID = {
+    Category.LOCAL_FUNC: _LOCAL_FUNC_SHIFTED,
+    Category.PLT_FUNC: _PLT_FUNC_SHIFTED,
+}
 
 
-@dataclass(frozen=True)
-class _ExpandShim:
-    """Minimal ``expand_tokens`` input: only ``state`` + category are read.
+def _build_self_token_lut() -> np.ndarray:
+    """``uint32`` lookup: ``CallTargetType`` int value -> shifted id.
 
-    ``expand_tokens`` consumes a ``Stage1CallTarget`` but touches ONLY
-    its :attr:`state` (the :class:`InlineDecodeState`) and
-    :attr:`encounter_category`. This shim exposes exactly those two so
-    the owned kernel runs unchanged on geometry-driven inputs -- no
-    dependency on the full Stage-1 hierarchy.
+    Reuses the OWNED ``CallTargetType -> Category`` collapse + the scalar
+    ``_calling_category_shifted_id`` rule so the edge-axis-to-self-token
+    map cannot drift from ``expand_tokens``. Types whose category is not
+    an inlined call category hold the sentinel.
     """
+    max_type = max(int(t) for t in CallTargetType) + 1
+    lut = np.full(max_type, _SELF_TOKEN_SENTINEL, dtype=np.uint32)
+    for ct, category in _CALL_TARGET_TYPE_TO_CATEGORY.items():
+        shifted = _CATEGORY_TO_SHIFTED_ID.get(category)
+        if shifted is not None:
+            lut[int(ct)] = shifted
+    return lut
 
-    state: object
-    encounter_category: object
+
+_SELF_TOKEN_LUT = _build_self_token_lut()
 
 
 @dataclass(frozen=True)
@@ -139,49 +166,83 @@ def expand_node_bodies(
             f"{n_nodes} nodes"
         )
 
-    node_offsets = np.zeros(n_nodes + 1, dtype=np.int64)
     if n_nodes == 0:
         return ExpandedBatch(
             expanded=np.zeros(0, dtype=np.uint16),
-            node_offsets=node_offsets,
+            node_offsets=np.zeros(1, dtype=np.int64),
             states=[],
             extra_value_v2_masks=[],
             extra_f128_masks=[],
         )
 
-    pieces: list[np.ndarray] = []
-    states: list = []
-    extra_value_v2_masks: list[np.ndarray] = []
-    extra_f128_masks: list[np.ndarray] = []
-    lengths = np.empty(n_nodes, dtype=np.int64)
-    for i in range(n_nodes):
-        raw_tokens = raw[rec[i] : rec[i + 1]]
-        state = build_inline_decode_state(
-            raw_tokens, format_version=_UNIFIED_VOCAB_FORMAT_VERSION
+    # Collapse the edge axis to per-node shifted self-token ids via the
+    # owned ``CallTargetType -> Category -> shifted id`` lookup; a category
+    # the scalar ``expand_tokens`` rejects (not LOCAL/PLT) stays at the
+    # sentinel, surfacing a stage-1 walker bug exactly as the scalar's
+    # AssertionError would.
+    self_token_ids = _SELF_TOKEN_LUT[types]
+    if bool((self_token_ids == _SELF_TOKEN_SENTINEL).any()):
+        bad = int(np.nonzero(self_token_ids == _SELF_TOKEN_SENTINEL)[0][0])
+        raise AssertionError(
+            "expand received an edge whose CallTargetType maps to a "
+            "non-inlined category (only LOCAL_FUNC and PLT_FUNC are "
+            f"inlined per plan D3); offending node {bad}, "
+            f"CallTargetType={CallTargetType(int(types[bad]))!r}."
         )
-        category = _CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(int(types[i]))]
-        # Retain the FULL expansion result -- the dense pass reuses the
-        # promotion masks + the parsed state rather than re-running
-        # ``expand_tokens`` / re-parsing the body.
-        result = expand_tokens(
-            _ExpandShim(state=state, encounter_category=category)
-        )
-        pieces.append(result.expanded_token_ids)
-        states.append(state)
-        extra_value_v2_masks.append(result.extra_value_v2_mask)
-        extra_f128_masks.append(result.extra_f128_mask)
-        lengths[i] = result.expanded_token_ids.shape[0]
 
-    np.cumsum(lengths, out=node_offsets[1:])
-    expanded_flat = (
-        np.concatenate(pieces)
-        if pieces
-        else np.zeros(0, dtype=np.uint16)
+    batched = batched_expand(raw, rec, self_token_ids)
+    states, extra_value_v2_masks, extra_f128_masks = _slice_per_node(
+        batched, np.asarray(raw, dtype=np.uint16).reshape(-1), rec
     )
     return ExpandedBatch(
-        expanded=expanded_flat.astype(np.uint16, copy=False),
-        node_offsets=node_offsets,
+        expanded=batched.expanded,
+        node_offsets=batched.node_offsets,
         states=states,
         extra_value_v2_masks=extra_value_v2_masks,
         extra_f128_masks=extra_f128_masks,
     )
+
+
+def _slice_per_node(
+    batched: BatchedExpansion, raw: np.ndarray, rec: np.ndarray
+) -> tuple[list, list, list]:
+    """Slice the batched arrays into the per-node list contract.
+
+    The dense pass (:mod:`._dense_adapter`) reads per-node
+    :class:`InlineDecodeState` objects + the per-node expanded-space
+    promotion masks. Each is a contiguous VIEW into the batched arrays
+    (no per-node ``run_lengths`` / cumsum dispatch -- the batched twin
+    computed them once): the raw-space fields slice by the body CSR
+    ``rec``; the masks slice by the expanded CSR ``node_offsets``; the
+    ``digit_cumsum`` block for node ``i`` spans ``rec[i] + i`` ..
+    ``rec[i + 1] + (i + 1)`` (the per-node ``N + 1`` layout the batched
+    twin packs)."""
+    n_nodes = rec.size - 1
+    node_off = batched.node_offsets
+    states: list = []
+    extra_value_v2_masks: list = []
+    extra_f128_masks: list = []
+    for i in range(n_nodes):
+        lo = int(rec[i])
+        hi = int(rec[i + 1])
+        dc_lo = lo + i
+        dc_hi = hi + (i + 1)
+        states.append(
+            InlineDecodeState(
+                raw_tokens=raw[lo:hi],
+                real_mask=batched.real_mask[lo:hi],
+                number_mask=batched.number_mask[lo:hi],
+                runlen_number=batched.runlen_number[lo:hi],
+                runlen_value=batched.runlen_value[lo:hi],
+                carries_inline_mask=batched.carries_inline_mask[lo:hi],
+                is_negative_per_position=batched.is_negative_per_position[
+                    lo:hi
+                ],
+                digit_cumsum=batched.digit_cumsum[dc_lo:dc_hi],
+            )
+        )
+        eo_lo = int(node_off[i])
+        eo_hi = int(node_off[i + 1])
+        extra_value_v2_masks.append(batched.extra_value_v2_mask[eo_lo:eo_hi])
+        extra_f128_masks.append(batched.extra_f128_mask[eo_lo:eo_hi])
+    return states, extra_value_v2_masks, extra_f128_masks
