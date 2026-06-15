@@ -1,17 +1,25 @@
 """End-to-end batch_decode vs vector_batch benchmark on real memmaps.
 
+Defaults exercise the NON-degenerate path: num_variants=7, B=70, depths 3/1/0
+(depth 3, deepest call-target inclusion, is the most important byte-identity
+case and runs first). Never run the byte-identity gate at num_variants=1 -- at
+nvar=1 FLAG-A fires and single-variant roots splice nothing, so the entire
+multi-variant inclusion/splice path is short-circuited and untested.
+
 Usage
 -----
     python scripts/bench_decode.py
-    python scripts/bench_decode.py --binaries nping openssl --B 64 --L 512 --depth 3
+    python scripts/bench_decode.py --binaries nping openssl --B 70 --L 512 --depths 3 1 0 --num-variants 7
     python scripts/bench_decode.py --cprofile
 
 Before/after comparison recipe (e.g. after a perf change)
 ----------------------------------------------------------
-    git stash
-    python scripts/bench_decode.py 2>&1 | tee /tmp/before.txt
-    git stash pop
+    # Do NOT use ``git stash`` -- the stash stack is global across sibling
+    # worktrees and collides with parallel agents. Use a file-patch instead:
     python scripts/bench_decode.py 2>&1 | tee /tmp/after.txt
+    git diff > /tmp/change.patch && git checkout -- .
+    python scripts/bench_decode.py 2>&1 | tee /tmp/before.txt
+    git apply /tmp/change.patch
     grep -E "^BENCH|^SPEEDUP" /tmp/before.txt /tmp/after.txt
 
 Output lines (machine-greppable)
@@ -38,9 +46,16 @@ WORKTREE = Path(__file__).parent.parent
 
 DEFAULT_MEMMAP_DIR = Path("/home/sirati/devel/python/asm-tokenizer/out/build_memmap")
 DEFAULT_BINARIES = ["nping", "openssl"]
-DEFAULT_B = 64
+DEFAULT_B = 70
 DEFAULT_L = 512
-DEFAULT_DEPTH = 3
+# Depths run in this order; depth 3 (deepest call-target inclusion) is the most
+# important byte-identity case and is run first.
+DEFAULT_DEPTHS = [3, 1, 0]
+# Variants sampled per section. NEVER default this to 1: at nvar=1 the
+# columnwise-ALL exclusion (FLAG-A) fires and single-variant roots splice
+# nothing, short-circuiting the entire multi-variant inclusion/splice path the
+# byte-identity gate is meant to exercise.
+DEFAULT_NUM_VARIANTS = 7
 DEFAULT_ITERS = 7
 DEFAULT_SEED = 42
 
@@ -115,7 +130,7 @@ def _sample_pointers(pointers, rng: np.random.Generator, B: int):
 # ---------------------------------------------------------------------------
 
 
-def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, seed: int):
+def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, num_variants: int, seed: int):
     from tokenizer.aligned_data.loader.batch_decode import (
         VariantPadding,
         batch_decode,
@@ -124,7 +139,7 @@ def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, seed: in
     result = batch_decode(
         session,
         sampled_pointers,
-        num_variants_per_section=1,
+        num_variants_per_section=num_variants,
         context_len=L,
         max_depth=depth,
         variant_padding=VariantPadding.PAD_NULL,
@@ -133,7 +148,7 @@ def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, seed: in
     return result
 
 
-def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int, seed: int):
+def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int, num_variants: int, seed: int):
     from tokenizer.aligned_data.loader.batch_decode import VariantPadding
     from tokenizer.aligned_data.loader.vector_batch._entry import vector_batch_tokens
 
@@ -142,7 +157,7 @@ def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int,
         session,
         sampled_pointers,
         handles=handles,
-        num_variants_per_section=1,
+        num_variants_per_section=num_variants,
         context_len=L,
         max_depth=depth,
         variant_padding=VariantPadding.PAD_NULL,
@@ -227,7 +242,8 @@ def bench_binary(
     vocab_manager,
     B: int,
     L: int,
-    depth: int,
+    depths: List[int],
+    num_variants: int,
     iters: int,
     do_cprofile: bool,
 ) -> None:
@@ -236,9 +252,8 @@ def bench_binary(
         open_vector_batch_arm_set,
     )
 
-    print(f"\n[bench] === {binary} B={B} L={L} D={depth} ===", flush=True)
-
-    # Sample a fixed reproducible set of pointers (same for both loaders).
+    # Sample a fixed reproducible set of pointers (same for both loaders, all
+    # depths) -- the draw is depth-independent so we sample once per binary.
     all_pointers, _dataset = _collect_pointers(memmap_dir, binary, vocab_manager)
     if not all_pointers:
         print(f"[bench] {binary}: no matched sections with variants -- skipping")
@@ -252,38 +267,50 @@ def bench_binary(
 
     with dataset.open_session() as session:
         with open_vector_batch_arm_set(memmap_dir, binary) as handles:
+            for depth in depths:
+                print(
+                    f"\n[bench] === {binary} B={B} L={L} D={depth} nvar={num_variants} ===",
+                    flush=True,
+                )
 
-            # --- correctness gate (run once at seed=0 to verify identity) ---
-            bd_ref = _run_batch_decode(session, sampled, L=L, depth=depth, seed=0)
-            vb_ref = _run_vector_batch(session, sampled, handles, L=L, depth=depth, seed=0)
-            _assert_byte_identical(bd_ref, vb_ref, binary)
-            print(f"[bench] {binary}: byte-identity OK (shape={bd_ref.tokens.shape})")
+                # --- correctness gate (run once at seed=0 to verify identity) ---
+                bd_ref = _run_batch_decode(
+                    session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0
+                )
+                vb_ref = _run_vector_batch(
+                    session, sampled, handles, L=L, depth=depth, num_variants=num_variants, seed=0
+                )
+                _assert_byte_identical(bd_ref, vb_ref, binary)
+                print(f"[bench] {binary} D={depth}: byte-identity OK (shape={bd_ref.tokens.shape})")
 
-            # --- timing ---
-            bd_fn = lambda: _run_batch_decode(session, sampled, L=L, depth=depth, seed=DEFAULT_SEED)
-            vb_fn = lambda: _run_vector_batch(session, sampled, handles, L=L, depth=depth, seed=DEFAULT_SEED)
+                # --- timing (d=depth default-arg pins the loop var per lambda) ---
+                bd_fn = lambda d=depth: _run_batch_decode(
+                    session, sampled, L=L, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
+                )
+                vb_fn = lambda d=depth: _run_vector_batch(
+                    session, sampled, handles, L=L, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
+                )
 
-            if do_cprofile:
-                _profile_loader(bd_fn, label=f"{binary}/batch_decode")
-                _profile_loader(vb_fn, label=f"{binary}/vector_batch")
+                if do_cprofile:
+                    _profile_loader(bd_fn, label=f"{binary}/batch_decode/D{depth}")
+                    _profile_loader(vb_fn, label=f"{binary}/vector_batch/D{depth}")
 
-            bd_median, bd_min = _time_loader(bd_fn, iters)
-            vb_median, vb_min = _time_loader(vb_fn, iters)
+                bd_median, bd_min = _time_loader(bd_fn, iters)
+                vb_median, vb_min = _time_loader(vb_fn, iters)
+                speedup = vb_median / bd_median if bd_median > 0 else float("nan")
 
-    speedup = vb_median / bd_median if bd_median > 0 else float("nan")
-
-    print(
-        f"BENCH {binary} batch_decode B={B} L={L} D={depth} "
-        f"median_ms={bd_median:.1f} min_ms={bd_min:.1f}"
-    )
-    print(
-        f"BENCH {binary} vector_batch B={B} L={L} D={depth} "
-        f"median_ms={vb_median:.1f} min_ms={vb_min:.1f}"
-    )
-    print(
-        f"SPEEDUP {binary} vb/bd={speedup:.3f}  "
-        f"({'vb faster' if speedup < 1 else 'vb slower'})"
-    )
+                print(
+                    f"BENCH {binary} batch_decode B={B} L={L} D={depth} "
+                    f"median_ms={bd_median:.1f} min_ms={bd_min:.1f}"
+                )
+                print(
+                    f"BENCH {binary} vector_batch B={B} L={L} D={depth} "
+                    f"median_ms={vb_median:.1f} min_ms={vb_min:.1f}"
+                )
+                print(
+                    f"SPEEDUP {binary} D={depth} vb/bd={speedup:.3f}  "
+                    f"({'vb faster' if speedup < 1 else 'vb slower'})"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +326,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--binaries", nargs="+", default=DEFAULT_BINARIES,
         help=f"Binary stems to bench (default: {DEFAULT_BINARIES})",
     )
-    p.add_argument("--B", type=int, default=DEFAULT_B, help="Batch size (default 64)")
+    p.add_argument("--B", type=int, default=DEFAULT_B, help="Batch size (default 70)")
     p.add_argument("--L", type=int, default=DEFAULT_L, help="Context length (default 512)")
-    p.add_argument("--depth", type=int, default=DEFAULT_DEPTH, help="Splice depth (default 3)")
+    p.add_argument(
+        "--depths", type=int, nargs="+", default=DEFAULT_DEPTHS,
+        help="Splice depths to run, in order (default: 3 1 0; depth 3 matters most)",
+    )
+    p.add_argument(
+        "--num-variants", type=int, default=DEFAULT_NUM_VARIANTS,
+        help="num_variants_per_section sampled (default 7; do NOT use 1 -- degenerate)",
+    )
     p.add_argument("--iters", type=int, default=DEFAULT_ITERS, help="Timing iterations (default 7)")
     p.add_argument(
         "--cprofile", action="store_true",
@@ -319,7 +353,10 @@ def main(argv=None) -> None:
     memmap_dir: Path = args.memmap_dir
 
     print(f"[bench] memmap_dir={memmap_dir}")
-    print(f"[bench] binaries={args.binaries} B={args.B} L={args.L} D={args.depth} iters={args.iters}")
+    print(
+        f"[bench] binaries={args.binaries} B={args.B} L={args.L} "
+        f"depths={args.depths} nvar={args.num_variants} iters={args.iters}"
+    )
 
     vocab_manager = _load_vocab(memmap_dir)
     print(f"[bench] vocab loaded (format_version={vocab_manager.format_version})")
@@ -332,7 +369,8 @@ def main(argv=None) -> None:
             vocab_manager=vocab_manager,
             B=args.B,
             L=args.L,
-            depth=args.depth,
+            depths=args.depths,
+            num_variants=args.num_variants,
             iters=args.iters,
             do_cprofile=args.cprofile,
         )
