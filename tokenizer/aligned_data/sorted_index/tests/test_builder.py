@@ -43,11 +43,25 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
-from .fixtures import build_combined_fixture
+from ._length_helpers import ensure_sidecar, sidecar_body_lengths
+from .fixtures import build_combined_fixture as _build_combined_fixture
 
 
 _BINARY_NAME = "sortbin"
 _DEPTH = 3
+
+
+def build_combined_fixture(tmp_path: Path) -> Path:
+    """Combined memmap fixture WITH the realized-length sidecar generated.
+
+    The build hard-requires the matched-arm sidecar (its Phase-4a
+    precondition), so every builder test seeds it right after the
+    fixture's memmap dir is laid down -- mirroring the dynrunner
+    phase-4 (b)-depends-on-(a) dependency edge.
+    """
+    base = _build_combined_fixture(tmp_path)
+    ensure_sidecar(base, _BINARY_NAME)
+    return base
 
 _MAX = LengthReduction(kind=ReductionKind.MAX)
 _P50 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=50)
@@ -82,12 +96,9 @@ def _oracle_bytes(
     a self-consistent-but-wrong dict.
     """
     section_info = read_section_variant_info(base, _BINARY_NAME)
-    data_u8 = np.memmap(
-        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
-    )
     per_spec_lengths = compute_reduced_lengths(
         section_info,
-        data_u8,
+        sidecar_body_lengths(base, _BINARY_NAME),
         depths=[depth],
         reductions=reductions,
     )
@@ -167,12 +178,9 @@ def test_build_reader_round_trip(tmp_path: Path) -> None:
     # reuse them for both the builder call (via the inline oracle) AND
     # the reader-side bincount comparison.
     section_info = read_section_variant_info(base, _BINARY_NAME)
-    data_u8 = np.memmap(
-        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
-    )
     per_spec_lengths = compute_reduced_lengths(
         section_info,
-        data_u8,
+        sidecar_body_lengths(base, _BINARY_NAME),
         depths=[_DEPTH],
         reductions=[_MAX, _P50, _P95],
     )

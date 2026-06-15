@@ -19,6 +19,13 @@ Multiple ``--mode`` flags accumulate -- one shared walk per binary
 produces one ``.idx`` file per requested reduction (plan §D8 cost-
 amortisation).  ``--output-dir`` defaults to ``--input-dir`` (the
 conventional sidecar-adjacent placement).
+
+PRECONDITION: each binary's matched-arm realized-length sidecar must
+already exist (run ``python -m
+tokenizer.aligned_data.realized_lengths --input-dir <memmap_dir>``
+first -- the Phase-4a pass). The build consumes those body lengths
+instead of re-decoding ``_data.bin`` geometry; an absent sidecar raises
+a generator-pointing :class:`FileNotFoundError`.
 """
 
 from __future__ import annotations
@@ -52,7 +59,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Build per-binary sorted-index files for the matched-arm "
             "depth-N length sampler. Runs ONE shared Stage 1+2 walk per "
-            "binary across every requested reduction."
+            "binary across every requested reduction. PRECONDITION: each "
+            "binary's matched-arm realized-length sidecar must already "
+            "exist (run `python -m tokenizer.aligned_data.realized_lengths "
+            "--input-dir <dir>` first); this build consumes those body "
+            "lengths instead of re-decoding _data.bin."
         ),
     )
     parser.add_argument(

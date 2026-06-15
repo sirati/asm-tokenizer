@@ -36,6 +36,7 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
+from ._length_helpers import ensure_sidecar
 from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
@@ -74,6 +75,7 @@ def _build_multidepth_binary(
 ) -> None:
     """Place a combined-corpus binary + its REAL multi-depth indexes."""
     _place_combined_binary(memmap_dir, binary_name, scratch)
+    ensure_sidecar(memmap_dir, binary_name)
     write_sorted_index_files(
         memmap_dir, binary_name, reductions=[_MAX], depths=list(depths),
     )
@@ -137,6 +139,7 @@ def _build_chain_binary(
         )
     ]
     build_corpus(memmap_dir, binary_name, matched=specs)
+    ensure_sidecar(memmap_dir, binary_name)
     write_sorted_index_files(
         memmap_dir, binary_name, reductions=[_MAX], depths=list(depths),
     )

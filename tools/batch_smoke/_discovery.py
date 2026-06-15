@@ -9,8 +9,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+# Import the arm grammar from the realized_lengths ``_format`` submodule
+# (not the package ``__init__``, whose generator pulls in sorted_index
+# and risks a circular import): ``_format`` is a leaf module.
+from tokenizer.aligned_data.realized_lengths._format import ARMS
+
 _INDEX_SUFFIX = "_index.bin"
 _UNMATCHED_INDEX_SUFFIX = "_unmatched_index.bin"
+
+# Realized-length CSR sidecars (``<name>_lengths_index.bin`` /
+# ``<name>_unmatched_lengths_index.bin``) also end in ``_index.bin`` but
+# are NOT binary-existence signals -- they co-exist in the memmap dir
+# once the realized-lengths pass has run (the sorted-index build's
+# Phase-4a precondition). Sourced from the realized_lengths arm grammar
+# so this exclusion never drifts from the generator's filenames.
+_REALIZED_LENGTHS_INDEX_SUFFIXES = tuple(arm.index_suffix for arm in ARMS)
 
 
 def discover_binaries(memmap_dir: Path) -> List[str]:
@@ -18,8 +31,9 @@ def discover_binaries(memmap_dir: Path) -> List[str]:
 
     A binary is recognised by the presence of ``<name>_index.bin`` (the
     matched-arm index sidecar emitted by the memmap builder). The
-    ``<name>_unmatched_index.bin`` companion is skipped so each binary
-    is returned once via its matched arm.
+    ``<name>_unmatched_index.bin`` companion and the realized-length CSR
+    sidecars are skipped so each binary is returned once via its matched
+    arm.
     """
     names: List[str] = []
     for entry in memmap_dir.iterdir():
@@ -27,6 +41,8 @@ def discover_binaries(memmap_dir: Path) -> List[str]:
             continue
         name = entry.name
         if name.endswith(_UNMATCHED_INDEX_SUFFIX):
+            continue
+        if name.endswith(_REALIZED_LENGTHS_INDEX_SUFFIXES):
             continue
         if not name.endswith(_INDEX_SUFFIX):
             continue

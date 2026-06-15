@@ -55,6 +55,9 @@ from tokenizer.aligned_data.matched_sections_columnar import (
 from tokenizer.aligned_data.sorted_index._graph_lengths import (
     compute_node_lengths,
 )
+from tokenizer.aligned_data.sorted_index.tests._length_helpers import (
+    reference_body_lengths,
+)
 from tokenizer.aligned_data.sorted_index.tests.fixtures import (
     build_combined_fixture,
     build_many_variant_section_fixture,
@@ -132,7 +135,10 @@ def _new_path(base: Path, name: str) -> Dict[int, np.ndarray]:
     blob = np.fromfile(base / f"{name}_sections.bin", dtype=np.uint8)
     data = np.fromfile(base / f"{name}_data.bin", dtype=np.uint8)
     cols = parse_sections_columnar(blob, starts, lengths)
-    return cols, compute_node_lengths(cols, starts, data, DEPTHS)
+    # The build now consumes per-variant body lengths (the realized-length
+    # sidecar); reconstruct that injected array from the bulk engine.
+    body = reference_body_lengths(cols, data)
+    return cols, compute_node_lengths(cols, starts, body, DEPTHS)
 
 
 def _oracle_lengths(base: Path, name: str) -> List[List[Dict[int, int]]]:
@@ -449,13 +455,10 @@ def test_matches_oracle_on_cycle_with_missing_vkey_fallback(
 
 def test_depth0_equals_own_body_plus_one(tmp_path: Path) -> None:
     # Depth-0 spliced length is byte-identical to the legacy build:
-    # 1 self-token + the contributing body length per variant
-    # (_body_lengths), with NO splice contribution. Pins that the BFS
-    # rewrite did not perturb the depth-0 path.
-    from tokenizer.aligned_data.sorted_index._graph_lengths._resolve import (
-        _body_lengths,
-    )
-
+    # 1 self-token + the contributing body length per variant (the
+    # injected sidecar body length), with NO splice contribution. Pins
+    # that the BFS composes the self-token at the DP site (own = body + 1)
+    # and that depth-0 carries no splice.
     specs = [
         MatchedFunctionSpec(
             func_name="root", variants=_callset(1, [("leaf",), ()]),
@@ -470,8 +473,9 @@ def test_depth0_equals_own_body_plus_one(tmp_path: Path) -> None:
     blob = np.fromfile(tmp_path / "d0id_sections.bin", dtype=np.uint8)
     data = np.fromfile(tmp_path / "d0id_data.bin", dtype=np.uint8)
     cols = parse_sections_columnar(blob, starts, _l)
-    got = compute_node_lengths(cols, starts, data, [0])
-    expected = _body_lengths(cols, data) + 1
+    body = reference_body_lengths(cols, data)
+    got = compute_node_lengths(cols, starts, body, [0])
+    expected = body + 1
     np.testing.assert_array_equal(got[0], expected)
 
 

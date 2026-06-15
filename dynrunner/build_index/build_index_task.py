@@ -140,8 +140,9 @@ class BuildIndexTask:
                         type_id=SORTED_INDEX_TYPE,
                         worker_module=SORTED_INDEX_WORKER,
                         # One shared catalog pre-pass + walk-free length
-                        # compute across every (mode, depth); dominated
-                        # by the per-binary _data.bin scan.
+                        # compute across every (mode, depth); body lengths
+                        # come from the realized-length sidecar (the (a)
+                        # dependency), so no _data.bin scan at build time.
                         timeout_seconds=300.0,
                     ),
                 ),

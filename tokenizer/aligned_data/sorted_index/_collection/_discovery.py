@@ -36,6 +36,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
+# ``_format`` is a leaf module; the realized_lengths package ``__init__``
+# pulls in the generator (which imports sorted_index), so import the arm
+# grammar from the submodule to stay clear of the import cycle.
+from tokenizer.aligned_data.realized_lengths._format import ARMS as _ARMS
 
 from .._reader import SortedIndexReader, discover_indices
 from .._types import IndexSpec, LengthReduction
@@ -49,19 +53,29 @@ __all__ = ["discover_members"]
 _LOGGER = logging.getLogger(__name__)
 
 # Per-binary catalog suffixes. A binary EXISTS iff its matched-arm
-# ``<binary>_index.bin`` is present; the unmatched-arm sidecar shares
-# the suffix tail and must be excluded when deriving names.
+# ``<binary>_index.bin`` is present; the unmatched-arm catalog sidecar
+# and the realized-length CSR sidecars share the ``_index.bin`` tail and
+# must be excluded when deriving names.
 _INDEX_SUFFIX = "_index.bin"
 _UNMATCHED_INDEX_SUFFIX = "_unmatched_index.bin"
+
+# Realized-length CSR sidecars (``<binary>_lengths_index.bin`` /
+# ``<binary>_unmatched_lengths_index.bin``) also end in ``_index.bin``
+# but are NOT binary-existence signals. Sourced from the realized_lengths
+# arm grammar so this exclusion never drifts from the generator's
+# filenames.
+_REALIZED_LENGTHS_INDEX_SUFFIXES = tuple(arm.index_suffix for arm in _ARMS)
 
 
 def _existing_binaries(memmap_dir: Path) -> List[str]:
     """Binary names whose matched-arm ``<binary>_index.bin`` is present.
 
-    The unmatched-arm sidecar ``<binary>_unmatched_index.bin`` shares
-    the ``_index.bin`` tail; it is NOT a binary-existence signal and is
-    excluded. Returns names in directory-iteration order (the caller
-    sorts).
+    The unmatched-arm catalog sidecar ``<binary>_unmatched_index.bin``
+    and the realized-length CSR sidecars
+    (``<binary>_lengths_index.bin`` / ``<binary>_unmatched_lengths_index.bin``)
+    share the ``_index.bin`` tail; none is a binary-existence signal and
+    all are excluded. Returns names in directory-iteration order (the
+    caller sorts).
     """
     names: List[str] = []
     for entry in Path(memmap_dir).iterdir():
@@ -69,6 +83,8 @@ def _existing_binaries(memmap_dir: Path) -> List[str]:
             continue
         name = entry.name
         if name.endswith(_UNMATCHED_INDEX_SUFFIX):
+            continue
+        if name.endswith(_REALIZED_LENGTHS_INDEX_SUFFIXES):
             continue
         if not name.endswith(_INDEX_SUFFIX):
             continue

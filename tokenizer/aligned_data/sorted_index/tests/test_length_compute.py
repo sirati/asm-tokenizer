@@ -38,6 +38,7 @@ from tokenizer.aligned_data.sorted_index._length_compute import (
     LARGE_CONTEXT_LEN,
 )
 
+from ._length_helpers import sidecar_body_lengths
 from .fixtures import (
     build_0_variant_section_fixture,
     build_1_variant_section_fixture,
@@ -71,10 +72,9 @@ def _oracle_variant_counts(base: Path, num_matched: int) -> np.ndarray:
     return np.array(counts, dtype=np.int64)
 
 
-def _data_bytes(base: Path) -> np.ndarray:
-    return np.memmap(
-        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
-    )
+def _body_lengths(base: Path) -> np.ndarray:
+    """The matched-arm body lengths the build consumes (via the sidecar)."""
+    return sidecar_body_lengths(base, _BINARY_NAME)
 
 
 def _compute_on(base: Path, *, reductions, depth: int = 3):
@@ -86,7 +86,7 @@ def _compute_on(base: Path, *, reductions, depth: int = 3):
     section_info = read_section_variant_info(base, _BINARY_NAME)
     per_spec = compute_reduced_lengths(
         section_info,
-        _data_bytes(base),
+        _body_lengths(base),
         depths=[depth],
         reductions=reductions,
     )
@@ -255,7 +255,7 @@ def test_multi_mode_runs_one_graph_traversal(tmp_path: Path) -> None:
     ):
         results = compute_reduced_lengths(
             section_info,
-            _data_bytes(base),
+            _body_lengths(base),
             depths=[1, 3],
             reductions=[_MAX, _P50, _P95],
         )
@@ -311,9 +311,11 @@ def test_all_zero_variant_stamps_all_zero(tmp_path: Path) -> None:
     )
     assert zero_only.counts.tolist() == [0]
     del sliced
+    # The sliced catalog carries only the 0-variant section, so its
+    # per-variant body-length array is empty (total_vars == 0).
     results = compute_reduced_lengths(
         zero_only,
-        _data_bytes(base),
+        np.zeros(0, dtype=np.int64),
         depths=[3],
         reductions=[_MAX, _P50],
     )
@@ -326,7 +328,7 @@ def test_empty_depths_raises(tmp_path: Path) -> None:
     section_info = read_section_variant_info(base, _BINARY_NAME)
     with pytest.raises(ValueError, match="depths must be a non-empty"):
         compute_reduced_lengths(
-            section_info, _data_bytes(base), depths=[], reductions=[_MAX]
+            section_info, _body_lengths(base), depths=[], reductions=[_MAX]
         )
 
 
@@ -336,7 +338,7 @@ def test_negative_depth_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="depths must all be >= 0"):
         compute_reduced_lengths(
             section_info,
-            _data_bytes(base),
+            _body_lengths(base),
             depths=[1, -1],
             reductions=[_MAX],
         )
@@ -350,25 +352,83 @@ def test_negative_depth_raises(tmp_path: Path) -> None:
 def test_budget_guard_raises(tmp_path: Path) -> None:
     """Lengths reaching LARGE_CONTEXT_LEN refuse to under-report.
 
-    Patches the bulk body-length step to claim every record is at the
-    budget; the compute MUST raise rather than emit a clipped u32.
+    Injects a body-length array claiming every record is at the budget;
+    the compute MUST raise rather than emit a clipped u32.
     """
     base = build_combined_fixture(tmp_path)
     section_info = read_section_variant_info(base, _BINARY_NAME)
 
-    def _huge(cols, data_u8):
-        return np.full(
-            cols.var_n_calls.size, LARGE_CONTEXT_LEN, dtype=np.int64
+    total_vars = int(section_info.cols.var_n_calls.size)
+    huge = np.full(total_vars, LARGE_CONTEXT_LEN, dtype=np.int64)
+
+    with pytest.raises(AssertionError, match="LARGE_CONTEXT_LEN"):
+        compute_reduced_lengths(
+            section_info,
+            huge,
+            depths=[3],
+            reductions=[_MAX],
         )
 
-    with patch(
-        "tokenizer.aligned_data.sorted_index._graph_lengths._bfs._body_lengths",
-        side_effect=_huge,
-    ):
-        with pytest.raises(AssertionError, match="LARGE_CONTEXT_LEN"):
-            compute_reduced_lengths(
-                section_info,
-                _data_bytes(base),
-                depths=[3],
-                reductions=[_MAX],
-            )
+
+# ---------------------------------------------------------------------------
+# Sidecar byte-identity gate: the consumed sidecar body lengths are
+# byte-identical to the retired _data.bin recompute, for EVERY (mode,
+# depth). This is the proof the refactor is faithful -- the build's
+# length math must not change when the source of the body lengths moved
+# from a per-build geometry decode to the Phase-4a realized-length
+# sidecar.
+# ---------------------------------------------------------------------------
+
+
+def test_sidecar_body_lengths_byte_identical_to_reference(tmp_path: Path) -> None:
+    """Sidecar-fed reduced lengths == bulk-reference-fed, every (mode, depth).
+
+    Builds a real multi-variant fixture, derives the per-variant body
+    lengths TWO ways -- the generated realized-length sidecar (the
+    production input) and an inline ``bulk_token_spans`` +
+    ``bulk_contributing_body_lengths`` recompute (the retired
+    ``_body_lengths`` math, self-contained here) -- and asserts the two
+    body-length arrays are byte-identical AND that every
+    ``compute_reduced_lengths`` output (3 reductions x 4 depths) matches
+    across both feeds.
+    """
+    from .fixtures import _BINARY_NAME as _FX_BINARY_NAME  # noqa: N811
+    from ._length_helpers import reference_body_lengths
+
+    base = build_combined_fixture(tmp_path)
+    section_info = read_section_variant_info(base, _BINARY_NAME)
+
+    # Two feeds of the per-variant body length.
+    sidecar = sidecar_body_lengths(base, _BINARY_NAME)
+    data_u8 = np.memmap(
+        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
+    )
+    reference = reference_body_lengths(section_info.cols, data_u8)
+
+    # The body-length arrays themselves are byte-identical (same dedup,
+    # same bulk engine, same catalog order).
+    assert sidecar.shape == reference.shape, (
+        f"sidecar {sidecar.shape} vs reference {reference.shape}"
+    )
+    np.testing.assert_array_equal(sidecar, reference)
+    assert sidecar.size == int(section_info.cols.var_n_calls.size), (
+        "sidecar length count must equal the catalog's total variant count"
+    )
+
+    # And every (reduction, depth) output is identical across the two
+    # feeds -- the proof the whole length pipeline is feed-agnostic.
+    reductions = [_MAX, _P50, _P95]
+    depths = [0, 1, 2, 3]
+    from_sidecar = compute_reduced_lengths(
+        section_info, sidecar, depths=depths, reductions=reductions
+    )
+    from_reference = compute_reduced_lengths(
+        section_info, reference, depths=depths, reductions=reductions
+    )
+    assert set(from_sidecar) == set(from_reference)
+    for spec in from_sidecar:
+        np.testing.assert_array_equal(
+            from_sidecar[spec], from_reference[spec],
+            err_msg=f"{spec}: sidecar feed diverges from bulk reference",
+        )
+    assert _FX_BINARY_NAME == _BINARY_NAME  # fixture/test name agreement

@@ -22,13 +22,33 @@ import pytest
 
 from tokenizer.aligned_data.sorted_index.__main__ import main as cli_main
 
+from ._length_helpers import ensure_sidecar
 from .fixtures import (
-    build_combined_fixture,
-    build_many_variant_section_fixture,
+    build_combined_fixture as _build_combined_fixture,
+    build_many_variant_section_fixture as _build_many_variant_section_fixture,
 )
 
 
 _BINARY_NAME = "sortbin"
+
+
+def build_combined_fixture(tmp_path: Path) -> Path:
+    """Combined memmap fixture WITH the realized-length sidecar generated.
+
+    The CLI build hard-requires the matched-arm sidecar (the Phase-4a
+    precondition); seed it right after the fixture's memmap dir so the
+    sidecar files travel with the corpus into any multi-binary copy.
+    """
+    base = _build_combined_fixture(tmp_path)
+    ensure_sidecar(base, _BINARY_NAME)
+    return base
+
+
+def build_many_variant_section_fixture(tmp_path: Path) -> Path:
+    """Many-variant memmap fixture WITH the realized-length sidecar generated."""
+    base = _build_many_variant_section_fixture(tmp_path)
+    ensure_sidecar(base, _BINARY_NAME)
+    return base
 
 _FILENAME_RE = re.compile(
     r"^(?P<binary>.+)_sorted_(?P<mode>max|p\d{2})_d(?P<depth>\d{3})\.idx$",

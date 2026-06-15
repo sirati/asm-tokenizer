@@ -45,6 +45,7 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
+from ._length_helpers import ensure_sidecar
 from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
@@ -82,6 +83,10 @@ def _build_two_binary_memmap_dir(tmp_path: Path) -> Path:
                 continue
             new_name = binary_name + entry.name[len("sortbin"):]
             (memmap_dir / new_name).write_bytes(entry.read_bytes())
+        # The sorted-index build hard-requires each binary's matched-arm
+        # realized-length sidecar (the Phase-4a precondition); generate it
+        # for the renamed binary in the final memmap dir.
+        ensure_sidecar(memmap_dir, binary_name)
     return memmap_dir
 
 
