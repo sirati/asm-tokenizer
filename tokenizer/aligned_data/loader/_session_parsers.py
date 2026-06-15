@@ -71,6 +71,47 @@ def arm_arrays(arm: Any, kind: str, binary_name: str):
     return starts
 
 
+def parse_matched_variant(
+    section: Section,
+    variant,
+    *,
+    func_name: str,
+    data_slice: Callable,
+    resolve_ref: Callable,
+) -> FunctionData:
+    """Parse ONE matched section variant block into a ``FunctionData``.
+
+    Single-variant body load: extracts the variant's metadata dict
+    (variant_ref, inlining info, data_offset) via
+    :func:`extract_metadata_from_variant_block`, merges in the resolver
+    output for the canonical-4 axes / filename, and slices the data-bin
+    record at the recovered offset (the only ``_data.bin`` touch). The
+    record is self-describing -- its header carries every geometry field
+    a reader needs -- so no companion length / overlong flag rides
+    alongside the offset.
+
+    Both :func:`parse_matched_section` (all variants) and the callee
+    walk's per-survivor body load route through here, so a single
+    variant's ``FunctionData`` is byte-identical regardless of whether
+    its siblings were materialised.
+    """
+    metadata = extract_metadata_from_variant_block(section, variant)
+    variant_row = resolve_ref(metadata["variant_ref"])
+    if variant_row is not None:
+        for k, v in variant_row.items():
+            metadata.setdefault(k, v)
+    insn_rl, block_rl, tokens = data_slice(metadata["data_offset"])
+    # Per-function COUNTER-Category unique-id counts feed Stage 4a's
+    # ALG-4 offset bump. The loader is the single source of truth
+    # for this metadata; downstream stages read it from
+    # ``FunctionData.metadata["category_counts"]`` without re-decoding.
+    metadata["category_counts"] = compute_category_counts(tokens)
+    return FunctionData(
+        func_name, metadata, tokens, insn_rl, block_rl,
+        variant_tokens=_variant_tokens_from_row(variant_row),
+    )
+
+
 def parse_matched_section(
     section: Section,
     *,
@@ -86,33 +127,20 @@ def parse_matched_section(
     returns the variant dict (or ``None``). Both injected so this
     helper does not import the session's lazy openers.
 
-    Per variant we extract the metadata dict (variant_ref, inlining
-    info, data_offset) via
-    :func:`extract_metadata_from_variant_block`, merge in the resolver
-    output for the canonical-4 axes / filename, and slice the data-bin
-    record at the recovered offset. The record is self-describing --
-    its header carries every geometry field a reader needs -- so no
-    companion length / overlong flag rides alongside the offset.
+    Each variant body is built by :func:`parse_matched_variant` -- the
+    same single-variant parse the callee walk's per-survivor load uses,
+    so the all-variants and one-variant paths can never drift.
     """
-    variants: List[FunctionData] = []
-    for variant in section.variants:
-        metadata = extract_metadata_from_variant_block(section, variant)
-        variant_row = resolve_ref(metadata["variant_ref"])
-        if variant_row is not None:
-            for k, v in variant_row.items():
-                metadata.setdefault(k, v)
-        insn_rl, block_rl, tokens = data_slice(metadata["data_offset"])
-        # Per-function COUNTER-Category unique-id counts feed Stage 4a's
-        # ALG-4 offset bump. The loader is the single source of truth
-        # for this metadata; downstream stages read it from
-        # ``FunctionData.metadata["category_counts"]`` without re-decoding.
-        metadata["category_counts"] = compute_category_counts(tokens)
-        variants.append(
-            FunctionData(
-                func_name, metadata, tokens, insn_rl, block_rl,
-                variant_tokens=_variant_tokens_from_row(variant_row),
-            )
+    variants: List[FunctionData] = [
+        parse_matched_variant(
+            section,
+            variant,
+            func_name=func_name,
+            data_slice=data_slice,
+            resolve_ref=resolve_ref,
         )
+        for variant in section.variants
+    ]
     return MatchedFunction(func_name, variants)
 
 

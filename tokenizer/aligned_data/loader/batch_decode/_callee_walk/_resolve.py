@@ -1,15 +1,29 @@
 """Per-(parent variant, call_target slot) callee resolution.
 
 Single concern: resolve ONE call_target row of a parent section+variant
-to its splice callee -- the callee :class:`Section`, the chosen callee
-variant index, and that variant's :class:`FunctionData` -- or ``None``
-when the row is not spliceable. This is exactly the walker's per-edge
-J-resolution; it is UNCHANGED from the legacy DFS walker (the
+to its splice callee. The resolution is in TWO stages so the body load
+follows the once-only prune instead of preceding it:
+
+* :func:`resolve_callee_metadata` -- the DECISION. Returns everything the
+  BFS needs to drive the shared once-only inclusion decider (the callee
+  :class:`Section`, its ``section_offset`` once-only dedup key, the
+  J-resolved callee variant index, the per-arm load locator) WITHOUT
+  touching ``_data.bin``. Derived from the cheap ``_sections.bin`` parse
+  alone, since :func:`choose_callee_variant` reads only the PARENT's
+  per-call entries and the callee body is never inspected to decide
+  inclusion.
+* :func:`load_callee_body` -- the LOAD. Materialises the chosen callee
+  variant body, issued only for the survivor pairs the BFS actually
+  emits + descends (the pruned / multi-parent-deduped edges never pay
+  the body read + egress copy).
+
+Both stages are UNCHANGED from the legacy DFS walker's J-resolution (the
 fallback/override chain in :func:`choose_callee_variant`, the 0xFFFE
 missing-vkey skip, the EXTERN / unresolved-pointer / unknown-offset
 gates) -- only the once-only-visited and inlining-equivalence gates are
 gone, having moved to the shared inclusion decider
-(:mod:`...splice_inclusion`).
+(:mod:`...splice_inclusion`). Splitting decision from load changes WHEN
+``_data.bin`` is read, never WHICH bytes splice.
 
 The returned ``callee_section.section_offset`` is the once-only dedup
 key the BFS feeds the shared decider (the legacy active-path cycle key
@@ -35,27 +49,30 @@ if TYPE_CHECKING:  # pragma: no cover -- type-only
     from tokenizer.aligned_data.loader.session import BinarySession
 
 
-__all__ = ["ResolvedCallee", "resolve_callee"]
+__all__ = ["ResolvedCalleeMeta", "resolve_callee_metadata", "load_callee_body"]
 
 
 @dataclass(frozen=True)
-class ResolvedCallee:
-    """One spliceable callee edge of a parent (section, variant).
+class ResolvedCalleeMeta:
+    """One spliceable callee edge of a parent (section, variant) -- the
+    metadata-only decision (no body loaded).
 
-    ``section_offset`` is the once-only dedup key; ``function_data`` is
-    the chosen callee variant body (emission input); ``call_target_type``
-    drives the self-prepend :class:`Category` at emission.
+    ``section_offset`` is the once-only dedup key the BFS feeds the
+    shared decider; ``call_target_type`` drives the self-prepend
+    :class:`Category` at emission. ``callee_idx`` is the per-arm load
+    locator :func:`load_callee_body` uses to materialise the chosen
+    ``variant_idx`` body once the prune retains this edge.
     """
 
     section: Section
     variant_idx: int
-    function_data: "FunctionData"
     section_offset: int
     function_name_ptr: int
     call_target_type: CallTargetType
+    callee_idx: int
 
 
-def resolve_callee(
+def resolve_callee_metadata(
     *,
     session: "BinarySession",
     arm: SectionKind,
@@ -64,11 +81,15 @@ def resolve_callee(
     parent_sibling_v_idxs: frozenset,
     called_idx: int,
     ct: CallTarget,
-) -> Optional[ResolvedCallee]:
-    """Resolve one call_target row to its callee, or ``None`` to skip.
+) -> Optional[ResolvedCalleeMeta]:
+    """Decide one call_target row's callee edge, or ``None`` to skip.
 
-    Skip reasons (matched against the legacy splice walker's gates,
-    MINUS the now-shared visited / inlining gates):
+    No ``_data.bin`` touch: only the callee section's ``_sections.bin``
+    catalog entry is parsed (for the ``section_offset`` dedup key and the
+    next-level call_target table) and the parent's per-call entries drive
+    :func:`choose_callee_variant`. Skip reasons (matched against the
+    legacy splice walker's gates, MINUS the now-shared visited / inlining
+    gates):
 
     * Extern call site (``ct.type is CallTargetType.EXTERN``) -- D3
       prohibits inlining extern bodies.
@@ -77,9 +98,6 @@ def resolve_callee(
       ``None``).
     * No usable callee variant (``choose_callee_variant`` -> ``None`` --
       missing-vkey 0xFFFE at every fallback level).
-
-    The callee section is loaded BEFORE the variant choice so the chosen
-    callee variant body is available to splice.
     """
     if ct.type is CallTargetType.EXTERN:
         return None
@@ -95,16 +113,17 @@ def resolve_callee(
     if callee_idx is None:
         return None
 
-    # Per-arm J-free load: matched loads the section + every variant
-    # body; unmatched loads its single record + owning section. Both
-    # surface the callee section the chosen variant body is read from.
+    # Per-arm metadata-only parse: matched parses the catalog entry;
+    # unmatched parses the owning section of the first record. Neither
+    # touches ``_data.bin`` -- the chosen variant body is loaded later
+    # only for survivors via :func:`load_callee_body`.
     if arm is SectionKind.MATCHED:
-        callee_section, _callee_section_offset, callee_matched = (
-            session._load_matched_section_and_variants(callee_idx)
+        callee_section, _callee_section_offset = (
+            session._matched_section_meta(callee_idx)
         )
     else:
-        callee_fd, callee_section, _callee_section_offset = (
-            session._load_unmatched_for_splice(callee_idx)
+        callee_section, _callee_section_offset = (
+            session._unmatched_section_meta(callee_idx)
         )
 
     callee_variant_idx = choose_callee_variant(
@@ -116,14 +135,35 @@ def resolve_callee(
     if callee_variant_idx is None:
         return None
 
-    if arm is SectionKind.MATCHED:
-        callee_fd = callee_matched.variants[callee_variant_idx]
-
-    return ResolvedCallee(
+    return ResolvedCalleeMeta(
         section=callee_section,
         variant_idx=callee_variant_idx,
-        function_data=callee_fd,
         section_offset=int(callee_section.section_offset),
         function_name_ptr=int(ct.function_name_ptr),
         call_target_type=ct.type,
+        callee_idx=callee_idx,
     )
+
+
+def load_callee_body(
+    session: "BinarySession",
+    arm: SectionKind,
+    meta: ResolvedCalleeMeta,
+) -> "FunctionData":
+    """Materialise the chosen callee variant body for a retained edge.
+
+    Issued only for the survivor pairs the BFS emits/descends. Matched
+    loads exactly ``section.variants[meta.variant_idx]`` (the same
+    single-variant parse the all-variants path runs per variant);
+    unmatched loads the section's first-record body -- byte-identical to
+    the legacy walker, which never re-indexed the unmatched body by the
+    chosen variant (one record per unmatched variant).
+    """
+    if arm is SectionKind.MATCHED:
+        return session._load_matched_variant_body(
+            meta.callee_idx, meta.variant_idx
+        )
+    callee_fd, _section, _section_offset = (
+        session._load_unmatched_for_splice(meta.callee_idx)
+    )
+    return callee_fd

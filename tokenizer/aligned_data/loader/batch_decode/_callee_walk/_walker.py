@@ -53,7 +53,11 @@ from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 from tokenizer.tokens import Category
 
 from ._pending import PendingCallTarget, build_pending_call_target
-from ._resolve import ResolvedCallee, resolve_callee
+from ._resolve import (
+    ResolvedCalleeMeta,
+    load_callee_body,
+    resolve_callee_metadata,
+)
 
 if TYPE_CHECKING:  # pragma: no cover -- type-only
     from tokenizer.aligned_data.loader.function_data import FunctionData
@@ -260,7 +264,7 @@ def _step_level(
     # make every variant reach every callee and exclude everything).
     rows: List[int] = []
     fids: List[int] = []
-    resolved: List[ResolvedCallee] = []
+    resolved: List[ResolvedCalleeMeta] = []
     emits: List[tuple] = []
     for fr in frontier:
         if not fr.section.call_targets:
@@ -268,7 +272,7 @@ def _step_level(
         sibling_v_idxs = frozenset(range(len(fr.section.variants)))
         for called_idx in _direct_called_idxs(fr):
             ct = fr.section.call_targets[called_idx]
-            rc = resolve_callee(
+            rc = resolve_callee_metadata(
                 session=session,
                 arm=arm,
                 parent_section=fr.section,
@@ -294,15 +298,18 @@ def _step_level(
     included = result.included
 
     # Emit included callees for sampled rows; collect the next frontier
-    # from every included pair (descent is per-variant).
+    # from every included pair (descent is per-variant). The callee body
+    # is read from ``_data.bin`` ONLY here, for survivors -- pruned and
+    # multi-parent-deduped edges never pay the body load + egress copy.
     next_frontier: List[_RowFrontier] = []
     for pair_idx in result.survivor_pairs.tolist():
         rc = resolved[pair_idx]
         emit, called_idx = emits[pair_idx]
         mask_row = rows[pair_idx]
         if emit:
+            callee_body = load_callee_body(session, arm, rc)
             out[emit_slot[mask_row]].append(
-                _emit_pending(rc, called_idx, depth, collector)
+                _emit_pending(rc, callee_body, called_idx, depth, collector)
             )
         next_frontier.append(
             _RowFrontier(
@@ -333,15 +340,16 @@ def _direct_called_idxs(fr: "_RowFrontier") -> List[int]:
 
 
 def _emit_pending(
-    rc: ResolvedCallee,
+    rc: ResolvedCalleeMeta,
+    callee_body: "FunctionData",
     called_idx: int,
     depth: int,
     collector: BucketedRunLengthCollector,
 ) -> PendingCallTarget:
     """Build the :class:`PendingCallTarget` for one included callee."""
     return build_pending_call_target(
-        function_data=rc.function_data,
-        raw_tokens=rc.function_data.tokens,
+        function_data=callee_body,
+        raw_tokens=callee_body.tokens,
         call_targets_section=list(rc.section.call_targets),
         encounter_category=_CALL_TARGET_TYPE_TO_ENCOUNTER_CATEGORY[
             rc.call_target_type

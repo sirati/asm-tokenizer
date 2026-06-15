@@ -47,6 +47,7 @@ from ._session_parsers import (
     arm_arrays,
     build_unmatched_function_data,
     parse_matched_section,
+    parse_matched_variant,
 )
 from ._session_helpers import _BinarySessionHelpersMixin
 from ._worker_guard import assert_main_process
@@ -209,6 +210,64 @@ class BinarySession(_BinarySessionHelpersMixin):
         )
         return section, section_offset, matched
 
+    def _matched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        """Parse a matched section's BIN catalog entry only (no bodies).
+
+        Returns ``(section, section_offset)`` -- the same parsed
+        :class:`Section` and BIN byte offset
+        :py:meth:`_load_matched_section_and_variants` produces, but
+        WITHOUT touching ``_data.bin`` (no per-variant body materialised).
+        The callee walk's once-only inclusion decision keys solely on the
+        callee ``section_offset`` and the parent's per-call J-resolution,
+        so the body load is deferred to the survivors via
+        :py:meth:`_load_matched_variant_body`.
+        """
+        arm = self._meta_get("matched_arm")
+        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if idx >= len(bin_starts):
+            raise IndexError(f"Index {idx} out of bounds for matched functions")
+        section_offset = int(bin_starts[idx])
+        section = self._parse_section_at(section_offset)
+        return section, section_offset
+
+    def _load_matched_variant_body(
+        self, idx: int, variant_index: int
+    ) -> FunctionData:
+        """Load ONE matched section variant body from ``_data.bin``.
+
+        Parses the section's BIN catalog entry, then materialises only
+        ``section.variants[variant_index]`` via the shared
+        :func:`parse_matched_variant` -- the same single-variant parse
+        :py:meth:`_load_matched_section_and_variants` runs per variant, so
+        the returned body is byte-identical to that path's
+        ``MatchedFunction.variants[variant_index]``. Raises
+        :class:`IndexError` if ``variant_index`` is out of range.
+        """
+        arm = self._meta_get("matched_arm")
+        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if idx >= len(bin_starts):
+            raise IndexError(f"Index {idx} out of bounds for matched functions")
+        section = self._parse_section_at(int(bin_starts[idx]))
+        if variant_index < 0 or variant_index >= len(section.variants):
+            raise IndexError(
+                f"matched function idx={idx} has {len(section.variants)} "
+                f"variants; variant_index {variant_index} out of range"
+            )
+        func_names = getattr(arm, "func_names", None) or []
+        if idx >= len(func_names):
+            raise IndexError(
+                f"matched arm func_names short of index {idx} "
+                f"(have {len(func_names)})"
+            )
+        data_mmap = self._open_data("matched")
+        return parse_matched_variant(
+            section,
+            section.variants[variant_index],
+            func_name=func_names[idx],
+            data_slice=lambda o: self._slice_data_record(data_mmap, o),
+            resolve_ref=self.get_variant_by_ref,
+        )
+
     def _load_unmatched_record_and_section(
         self, idx: int
     ) -> Tuple[Section, int, FunctionData]:
@@ -249,6 +308,23 @@ class BinarySession(_BinarySessionHelpersMixin):
             line_to_name=line_to_name,
         )
         return section, section_offset, fd
+
+    def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        """Parse an unmatched record's owning section only (no body).
+
+        Returns ``(section, section_offset)`` for the record at per-record
+        ``idx`` -- the same parsed :class:`Section` and BIN section offset
+        :py:meth:`_load_unmatched_record_and_section` produces, but
+        WITHOUT slicing the ``_unmatched_data.bin`` record body. The callee
+        walk defers the body load (the first-record body, via
+        :py:meth:`_load_unmatched_for_splice`) to the surviving pairs.
+        """
+        arm = self._meta_get("unmatched_arm")
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        start = int(starts[idx])
+        return self._unmatched_section_for_record(arm, idx, start)
 
     def _load_unmatched_section_and_all_variants(
         self, idx: int

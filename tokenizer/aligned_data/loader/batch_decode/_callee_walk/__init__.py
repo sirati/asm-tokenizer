@@ -68,16 +68,21 @@ from ._pending import (
     build_pending_call_target,
     finalise_pending_call_targets,
 )
-from ._resolve import ResolvedCallee, resolve_callee
+from ._resolve import (
+    ResolvedCalleeMeta,
+    load_callee_body,
+    resolve_callee_metadata,
+)
 from ._walker import walk_callees, walk_section_callees_pending
 
 
 __all__ = [
     "PendingCallTarget",
-    "ResolvedCallee",
+    "ResolvedCalleeMeta",
     "build_pending_call_target",
     "finalise_pending_call_targets",
-    "resolve_callee",
+    "load_callee_body",
+    "resolve_callee_metadata",
     "walk_callees",
     "walk_section_callees_pending",
 ]
