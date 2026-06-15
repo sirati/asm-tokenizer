@@ -93,9 +93,10 @@ class BinarySession(_BinarySessionHelpersMixin):
     ``_data.bin`` records are self-describing -- their headers carry
     insn / block / token geometry -- so no companion ``lengths`` or
     ``is_overlong`` array crosses any boundary here. Section parsing
-    happens against an in-memory ``memoryview`` of
-    ``<binary>_sections.bin``; the BIN's prelude is validated on first
-    open and a per-session memoryview is held until ``__exit__``.
+    happens against an ``np.memmap`` ``memoryview`` of
+    ``<binary>_sections.bin`` (lazy per-section paging, not a full read);
+    the BIN's prelude is validated on first open and a per-session
+    memoryview is held until ``__exit__``.
     """
 
     def __init__(
@@ -110,7 +111,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         self._vocab_manager = vocab_manager
         self._metadata = metadata
 
-        self._sections_bin_blob: Optional[bytes] = None
+        self._sections_bin_blob: Optional[np.memmap] = None
         self._sections_bin_view: Optional[memoryview] = None
         self._data_mmap: Optional[np.ndarray] = None
         self._data_kind: Optional[str] = None
@@ -403,13 +404,17 @@ class BinarySession(_BinarySessionHelpersMixin):
     # --- lazy openers ----------------------------------------------
 
     def _open_sections_bin(self) -> memoryview:
-        """Lazy-load the per-binary section catalog as a memoryview.
+        """Lazy-``mmap`` the per-binary section catalog as a memoryview.
 
-        The BIN is small relative to ``_data.bin`` (sections carry
-        header + call_targets + per-variant blocks but no token
-        payload), so we read the whole file into memory once per
-        session rather than mmap-ing it; the memoryview keeps parser
-        slicing zero-copy. Prelude is validated on first open.
+        The catalog is ``np.memmap``-ed (NOT slurped) so
+        :func:`parse_section_bin` pages in only the section(s) a batch
+        actually touches. A fresh :class:`BinarySession` is opened per
+        sampled binary per batch; a full read would copy the ENTIRE
+        catalog every time (z3's ``_sections.bin`` is ~348MB), so the
+        eager copy dominated per-batch memory even though the far larger
+        ``_data.bin`` was already lazy. The memoryview keeps parser
+        slicing zero-copy and is pinned (with the backing ``np.memmap``)
+        for the session lifetime. Prelude is validated on first open.
         """
         if self._stack is None:
             raise RuntimeError("BinarySession used outside its with-block")
@@ -419,9 +424,12 @@ class BinarySession(_BinarySessionHelpersMixin):
         # which arm's path we resolve doesn't matter, but we walk through
         # the conventional per-binary filename for clarity.
         path = self._base_path / f"{self._binary_name}_sections.bin"
-        # Pin the bytes so the view stays valid for the session lifetime.
-        raw, view = read_sections_bin_blob(path)
-        self._sections_bin_blob = raw
+        # Pin the mmap so the view (and any Section sliced from it) stays
+        # valid for the session lifetime; __exit__ releases the view then
+        # drops this ref, so the mapping unmaps by refcounting with no
+        # explicit close (no exported-pointer BufferError risk).
+        mm, view = read_sections_bin_blob(path)
+        self._sections_bin_blob = mm
         self._sections_bin_view = view
         return view
 

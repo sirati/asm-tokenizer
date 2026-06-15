@@ -143,9 +143,11 @@ def _read_unmatched(base_path: Path, binary_name: str) -> ArmCatalog:
                       walk_parsed_sections(blob_view, region_start)]
     if not section_starts:
         return _empty_catalog()
-    # ``parse_sections_columnar`` wants a uint8 ndarray; the blob bytes
-    # back the section-start offsets the walk just produced.
-    blob = np.frombuffer(raw, dtype=np.uint8)
+    # ``parse_sections_columnar`` wants a uint8 ndarray; ``raw`` is the
+    # ``np.memmap(uint8)`` backing the section-start offsets the walk just
+    # produced, so ``np.asarray`` is a zero-copy view that keeps the read
+    # lazy (the columnar parser pages in only the bytes it indexes).
+    blob = np.asarray(raw)
     cols = parse_sections_columnar(
         blob, np.asarray(section_starts, dtype=np.int64)
     )
