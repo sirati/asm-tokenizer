@@ -50,7 +50,10 @@ from pathlib import Path
 from dynamic_runner import TaskDep
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
-from tools.batch_smoke._discovery import discover_binaries, filter_binaries
+from tokenizer.aligned_data.binary_discovery import (
+    discover_binaries,
+    filter_binaries,
+)
 
 from dynrunner.binary_selection import BinaryIdentifier, TaskInfo
 
