@@ -77,6 +77,21 @@ class ParsedRecord:
     # list equals the function whose encoder-assigned identity for C is K.
     called_funcs: list[tuple[str, CallTargetType]]
     extern_libraries: dict[str, str]
+    # Per-callee disambiguator for calls into DUPLICATED canonical names.
+    # Maps a LOCAL callee name to the ``occurrence`` ordinal of the
+    # specific sibling body this call site targets — the value the
+    # producer's ``callee_occurrence_backfill`` injected onto the matching
+    # ``local_funcs`` metadata entry. ONLY duplicated-name local callees
+    # are present (the producer injects nothing for a name that resolves
+    # uniquely), so an empty dict means "no call site needs sibling
+    # disambiguation" — the common case, mirroring ``extern_libraries``'s
+    # empty-for-v1 default. The build side reads it at the per-call
+    # emission seam to pick the occurrence-k sibling section instead of
+    # the legitimately-missing sentinel. Key is the callee name alone:
+    # within one record's LOCAL category names are already deduped (see
+    # ``called_from_v2_metadata``), so the name uniquely identifies the
+    # call target the occurrence belongs to.
+    called_occurrences: dict[str, int]
     content_hash: int
 
 
@@ -300,7 +315,9 @@ def _parse_row(
     insn_runlength = base64_to_ndarray_vec(
         row[column_index["instruction_runlength_base64"]]
     )
-    called, extern_libraries = _extract_called_funcs(row, column_index)
+    called, extern_libraries, called_occurrences = _extract_called_funcs(
+        row, column_index
+    )
     content_hash = _hash_record_body(insn_runlength, block_runlength, tokens)
     return ParsedRecord(
         func_name=func_name,
@@ -310,6 +327,7 @@ def _parse_row(
         tokens=tokens,
         called_funcs=called,
         extern_libraries=extern_libraries,
+        called_occurrences=called_occurrences,
         content_hash=content_hash,
     )
 
@@ -352,33 +370,35 @@ V2_CATEGORY_TYPES: "tuple[tuple[str, CallTargetType], ...]" = (
 def _extract_called_funcs(
     row: List[str],
     column_index: "dict[str, int]",
-) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
-    """Return ``(typed_called, extern_libraries)`` for one CSV row.
+) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str], dict[str, int]]":
+    """Return ``(typed_called, extern_libraries, called_occurrences)`` for one CSV row.
 
     Schema dispatch mirrors the pre-refactor
     ``helpers.get_called_functions_from_row`` — v2 carries a ``metadata``
     JSON column; v1 carries the Python-repr ``opaque_metadata`` column.
-    The library dict is only populated by v2; v1 always returns ``{}``.
+    The library dict and the occurrence dict are only populated by v2; v1
+    always returns ``{}`` for both (it predates the metadata that carries
+    them).
     """
     if "metadata" in column_index:
         return called_from_v2_metadata(row[column_index["metadata"]])
     if "opaque_metadata" in column_index:
         return _called_from_v1_opaque_metadata(row[column_index["opaque_metadata"]])
-    return [], {}
+    return [], {}, {}
 
 
 def called_from_v2_metadata(
     metadata_cell: str,
-) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
+) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str], dict[str, int]]":
     if not metadata_cell:
-        return [], {}
+        return [], {}, {}
     # Raise loud on malformed metadata (F-MED-11 / plan decision #5):
     # a corrupted CSV is a data-integrity violation that should crash
     # the consumer rather than silently emit zero callees + collapse
     # every EXTERN row to the same provider.
     meta = json.loads(metadata_cell)
     if not isinstance(meta, dict):
-        return [], {}
+        return [], {}, {}
     # Preserve the encoder's per-category allocation order: each
     # ``V2_CATEGORY_TYPES`` array is the CSV's identity-indexed
     # metadata cell, so the K-th name in category C is the function
@@ -389,6 +409,27 @@ def called_from_v2_metadata(
     # Categories are concatenated in LOCAL -> PLT -> EXTERN order.
     called: list[tuple[str, CallTargetType]] = []
     extern_libraries: dict[str, str] = {}
+    # Sibling disambiguator for calls into DUPLICATED local names: the
+    # producer's ``callee_occurrence_backfill`` stamps an ``occurrence``
+    # key onto a ``local_funcs`` entry IFF that callee body's canonical
+    # name maps to several distinct bodies in this binary. Harvest it
+    # here keyed by callee name; absent (the overwhelmingly common
+    # non-duplicated case) leaves the name out of the map entirely, which
+    # the build side reads as "no sibling to disambiguate -> missing".
+    #
+    # AMBIGUITY GUARD: ``local_funcs`` carries one entry per distinct
+    # callee ADDRESS, so a caller that targets TWO sibling bodies of the
+    # same canonical name emits two entries with that name and DIFFERENT
+    # occurrence values. The LOCAL category below dedupes by NAME, and the
+    # call_target table likewise carries one row per ``(name, type)`` — so
+    # the wire format has no slot to resolve those two edges to two
+    # different siblings. Picking either occurrence would be an arbitrary
+    # wrong-sibling miscompute. Instead, a name seen with conflicting
+    # occurrence values is recorded as AMBIGUOUS and removed from the
+    # resolvable map; the build side then treats it exactly like an absent
+    # occurrence (stamps the missing sentinel), never a sibling.
+    called_occurrences: dict[str, int] = {}
+    _ambiguous_occurrence_names: set[str] = set()
     for category_key, category_type in V2_CATEGORY_TYPES:
         names_in_order: list[str] = []
         for entry in meta.get(category_key, ()) or ():
@@ -400,18 +441,35 @@ def called_from_v2_metadata(
                         library = entry.get("library")
                         if isinstance(library, str):
                             extern_libraries[name] = library
+                    elif category_type is CallTargetType.LOCAL:
+                        occurrence = entry.get("occurrence")
+                        if isinstance(occurrence, int) and not isinstance(
+                            occurrence, bool
+                        ):
+                            if name in _ambiguous_occurrence_names:
+                                continue
+                            existing = called_occurrences.get(name)
+                            if existing is None:
+                                called_occurrences[name] = occurrence
+                            elif existing != occurrence:
+                                # Same name, two distinct siblings from one
+                                # caller — unresolvable; demote to missing.
+                                _ambiguous_occurrence_names.add(name)
+                                del called_occurrences[name]
         for unique_name in dict.fromkeys(names_in_order):
             called.append((unique_name, category_type))
-    return called, extern_libraries
+    return called, extern_libraries, called_occurrences
 
 
 def _called_from_v1_opaque_metadata(
     opaque_metadata: str,
-) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str]]":
+) -> "tuple[list[tuple[str, CallTargetType]], dict[str, str], dict[str, int]]":
     # v1 carries only ``local_function`` callees, in disassembler
     # encounter order. Mirror the v2 path: order-preserving dedupe via
     # ``dict.fromkeys`` instead of set + alphabetical sort, so the K-th
-    # surviving name equals the encoder's K-th LOCAL allocation.
+    # surviving name equals the encoder's K-th LOCAL allocation. v1
+    # predates the occurrence disambiguator entirely, so the third return
+    # is always empty.
     try:
         meta = ast.literal_eval(opaque_metadata)
         names_in_order: list[str] = []
@@ -424,9 +482,10 @@ def _called_from_v1_opaque_metadata(
         return (
             [(name, CallTargetType.LOCAL) for name in dict.fromkeys(names_in_order)],
             {},
+            {},
         )
     except Exception:
-        return [], {}
+        return [], {}, {}
 
 
 def _hash_record_body(
