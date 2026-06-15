@@ -177,6 +177,9 @@ def _run_arm_pipeline(
         root_sampled_variants=root_variants,
         seq_len=context_len,
         max_depth=max_depth,
+        # The remembered-excluded pool + dense reservation feed ONLY
+        # backfill; compute them only when the backfill hook is present.
+        need_excluded_pool=augment_geometry is not None,
     )
     if augment_geometry is not None:
         geometry = augment_geometry(geometry)

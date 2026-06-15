@@ -89,6 +89,7 @@ def compute_row_inclusions(
     root_sections: np.ndarray,
     root_sampled_variants: np.ndarray,
     max_depth: int,
+    need_excluded_pool: bool = True,
 ) -> List[RowInclusion]:
     """Per-row ordered emitted nodes + remembered-excluded pool.
 
@@ -108,6 +109,16 @@ def compute_row_inclusions(
         ``(root_sections[r], root_sampled_variants[r])`` pair.
     max_depth:
         Splice-tree BFS depth cap (``>= 0``).
+    need_excluded_pool:
+        Whether the remembered-excluded backfill pool is needed. The pool
+        is the FULL-set-included MINUS subset-emitted diff -- it feeds
+        ONLY backfill (:mod:`._backfill`), which runs only when the caller
+        passes an ``augment_geometry`` hook. When ``False`` the per-row
+        ``excluded_nodes`` / ``excluded_edge_types`` are left empty and the
+        per-section FULL-variant-set BFS (:func:`_bfs_full_included`) is
+        skipped entirely -- the dominant cost of the prepass when backfill
+        is off. Byte-identity-safe: the emitted nodes are unchanged; only
+        the (then-unused) pool is suppressed.
 
     Returns
     -------
@@ -161,32 +172,40 @@ def compute_row_inclusions(
         )
         # Full-set inclusion membership (order discarded) for the pool diff,
         # plus the EDGE ct_type each full-set callee was reached by -- the
-        # provenance a re-inlined pool node carries through backfill.
-        included_full, full_edge_type = _bfs_full_included(
-            section_idx=section_idx,
-            cols=cols,
-            adjacency=adjacency,
-            decider=decider,
-            max_depth=max_depth,
-        )
+        # provenance a re-inlined pool node carries through backfill. Skipped
+        # when the pool is not needed (backfill off): this FULL-variant-set
+        # BFS is the prepass's dominant cost and feeds ONLY the (then-unused)
+        # pool.
+        if need_excluded_pool:
+            included_full, full_edge_type = _bfs_full_included(
+                section_idx=section_idx,
+                cols=cols,
+                adjacency=adjacency,
+                decider=decider,
+                max_depth=max_depth,
+            )
         for local, r in enumerate(batch_rows):
             emitted = emitted_per_row[local]
             emitted_types = emitted_types_per_row[local]
-            # Remembered-excluded = full-set-included MINUS subset-emitted
-            # (the callees the narrower subset mask pruned). De-duplicated
-            # ascending; excludes anything this row already emitted.
-            pool = np.setdiff1d(
-                included_full, emitted, assume_unique=False
-            ).astype(np.int64)
-            # Carry each pool node's FULL-set edge ct_type verbatim (the
-            # ct_type it would have had as an inlined callee). full_edge_type
-            # is keyed by node so the gather is a parallel lookup, never a
-            # default.
-            pool_types = (
-                full_edge_type[pool]
-                if pool.size
-                else np.zeros(0, dtype=np.uint8)
-            )
+            if need_excluded_pool:
+                # Remembered-excluded = full-set-included MINUS subset-emitted
+                # (the callees the narrower subset mask pruned). De-duplicated
+                # ascending; excludes anything this row already emitted.
+                pool = np.setdiff1d(
+                    included_full, emitted, assume_unique=False
+                ).astype(np.int64)
+                # Carry each pool node's FULL-set edge ct_type verbatim (the
+                # ct_type it would have had as an inlined callee). full_edge_type
+                # is keyed by node so the gather is a parallel lookup, never a
+                # default.
+                pool_types = (
+                    full_edge_type[pool]
+                    if pool.size
+                    else np.zeros(0, dtype=np.uint8)
+                )
+            else:
+                pool = np.zeros(0, dtype=np.int64)
+                pool_types = np.zeros(0, dtype=np.uint8)
             out[r] = RowInclusion(
                 emitted_nodes=emitted,
                 emitted_edge_types=emitted_types,

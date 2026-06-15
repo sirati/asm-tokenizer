@@ -50,6 +50,7 @@ from ._reserve import compute_dense_reservation
 from ._types import (
     BatchGeometry,
     BatchRowEmission,
+    DenseReservation,
 )
 
 
@@ -66,6 +67,7 @@ def compute_batch_geometry(
     root_sampled_variants: np.ndarray,
     seq_len: int,
     max_depth: int,
+    need_excluded_pool: bool = True,
 ) -> BatchGeometry:
     """The body-free ``[B, L]`` geometry prepass.
 
@@ -92,6 +94,13 @@ def compute_batch_geometry(
         ``L`` -- the per-row token-column budget.
     max_depth:
         Splice BFS depth cap (``>= 0``).
+    need_excluded_pool:
+        Whether the remembered-excluded backfill pool + dense reservation
+        (both backfill-only outputs) must be computed. ``False`` (backfill
+        off) skips the FULL-variant-set inclusion BFS + the pool/reservation
+        flatten -- the dominant prepass cost -- and emits empty,
+        correctly-shaped placeholders. The emitted-node geometry is
+        unchanged, so the scatter result is byte-identical.
 
     Returns
     -------
@@ -114,6 +123,7 @@ def compute_batch_geometry(
         root_sections=root_sections,
         root_sampled_variants=root_sampled_variants,
         max_depth=max_depth,
+        need_excluded_pool=need_excluded_pool,
     )
     n_rows = len(inclusions)
 
@@ -129,14 +139,23 @@ def compute_batch_geometry(
         prefix_len=prefix_len,
         seq_len=seq_len,
     )
-    reservation = compute_dense_reservation(
-        id_total=emission.id_total,
-        value_total=emission.value_total,
-        row_offsets=emission.row_offsets,
-    )
-    excluded_pool, excluded_offsets, excluded_edge_type = _flatten_excluded(
-        inclusions
-    )
+    # The dense reservation + the remembered-excluded pool are BOTH
+    # backfill-only outputs; with backfill off they are unread, so skip
+    # them and emit empty, correctly-shaped placeholders.
+    if need_excluded_pool:
+        reservation = compute_dense_reservation(
+            id_total=emission.id_total,
+            value_total=emission.value_total,
+            row_offsets=emission.row_offsets,
+        )
+        excluded_pool, excluded_offsets, excluded_edge_type = _flatten_excluded(
+            inclusions
+        )
+    else:
+        reservation = _empty_reservation(n_rows)
+        excluded_pool = np.zeros(0, dtype=np.int64)
+        excluded_offsets = np.zeros(n_rows + 1, dtype=np.int64)
+        excluded_edge_type = np.zeros(0, dtype=np.uint8)
 
     return BatchGeometry(
         n_rows=n_rows,
@@ -197,6 +216,23 @@ def _flatten_emission(
         value_total=value_total,
     )
     return emission, root_nodes
+
+
+def _empty_reservation(n_rows: int) -> DenseReservation:
+    """An all-zero, correctly-shaped reservation (backfill-off placeholder).
+
+    The reservation feeds ONLY backfill; with backfill off it is unread,
+    so this carries the ``[B]`` / ``[B + 1]`` shapes without paying the
+    segmented sums.
+    """
+    zeros_rows = np.zeros(n_rows, dtype=np.int64)
+    zeros_off = np.zeros(n_rows + 1, dtype=np.int64)
+    return DenseReservation(
+        id_reserved=zeros_rows,
+        id_offsets=zeros_off,
+        value_reserved=zeros_rows.copy(),
+        value_offsets=zeros_off.copy(),
+    )
 
 
 def _flatten_excluded(inclusions: List[RowInclusion]):
