@@ -181,6 +181,10 @@ def _run_arm_pipeline(
         # The remembered-excluded pool + dense reservation feed ONLY
         # backfill; compute them only when the backfill hook is present.
         need_excluded_pool=augment_geometry is not None,
+        # The cols-invariant adjacency, built once per binary on the
+        # handles -- so the per-binary MISSING inventory scan + offset map
+        # are not rebuilt on every batch.
+        adjacency=handles.adjacency,
     )
     if augment_geometry is not None:
         geometry = augment_geometry(geometry)

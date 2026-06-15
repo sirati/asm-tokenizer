@@ -39,6 +39,9 @@ from typing import List
 import numpy as np
 
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
+from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
+    LiveNodeAdjacency,
+)
 from tokenizer.aligned_data.realized_lengths._geometry_reader import (
     RealizedGeometryReader,
 )
@@ -69,6 +72,7 @@ def compute_batch_geometry(
     seq_len: int,
     max_depth: int,
     need_excluded_pool: bool = True,
+    adjacency: LiveNodeAdjacency | None = None,
 ) -> BatchGeometry:
     """The body-free ``[B, L]`` geometry prepass.
 
@@ -106,6 +110,12 @@ def compute_batch_geometry(
         flatten -- the dominant prepass cost -- and emits empty,
         correctly-shaped placeholders. The emitted-node geometry is
         unchanged, so the scatter result is byte-identical.
+    adjacency:
+        A pre-built :class:`LiveNodeAdjacency` over the SAME ``cols`` /
+        ``section_offsets``, threaded to :func:`compute_row_inclusions` so
+        the cols-invariant adjacency (offset->idx map + per-binary MISSING
+        inventory scan) is built once per binary, not per batch. ``None``
+        falls back to a fresh per-call build.
 
     Returns
     -------
@@ -130,6 +140,7 @@ def compute_batch_geometry(
         root_groups=root_groups,
         max_depth=max_depth,
         need_excluded_pool=need_excluded_pool,
+        adjacency=adjacency,
     )
     n_rows = len(inclusions)
 

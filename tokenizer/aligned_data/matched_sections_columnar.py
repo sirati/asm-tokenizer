@@ -27,6 +27,7 @@ parent, in on-disk order throughout:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 
@@ -116,6 +117,21 @@ class ColumnarSections:
     pce_section_variant_index: np.ndarray
     """``u16[total_entries]`` -- resolved callee variant index (or the
     ``MISSING_VARIANT_INDEX`` sentinel)."""
+
+    @cached_property
+    def sec_of_var(self) -> np.ndarray:
+        """``i64[total_variants]`` -- owning SECTION index per flat variant.
+
+        ``np.repeat(arange(n_sections), n_variants)``: the variant-major
+        inverse of ``var_offsets``. Corpus-sized (one entry per variant)
+        and cols-invariant, so it is memoised once per catalog rather than
+        rebuilt by every consumer per batch -- the no-reparse contract.
+        Computed on first access (the frozen dataclass stores the cache in
+        ``__dict__``, leaving the declared fields immutable).
+        """
+        return np.repeat(
+            np.arange(self.n_variants.size, dtype=np.int64), self.n_variants
+        )
 
     def pce_variant(self) -> np.ndarray:
         """``i64[total_entries]`` -- owning flat variant index per entry.

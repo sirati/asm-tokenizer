@@ -91,6 +91,7 @@ def compute_row_inclusions(
     root_groups: np.ndarray,
     max_depth: int,
     need_excluded_pool: bool = True,
+    adjacency: LiveNodeAdjacency | None = None,
 ) -> List[RowInclusion]:
     """Per-row ordered emitted nodes + remembered-excluded pool.
 
@@ -101,7 +102,18 @@ def compute_row_inclusions(
         columnar` output) -- the body-free splice graph.
     section_offsets:
         ``int[n_sections]`` byte offsets parallel to ``cols`` (the
-        :class:`LiveNodeAdjacency` offset->idx key source).
+        :class:`LiveNodeAdjacency` offset->idx key source). Used ONLY to
+        construct the adjacency when ``adjacency`` is not injected.
+    adjacency:
+        A pre-built :class:`LiveNodeAdjacency` over the SAME ``cols`` /
+        ``section_offsets``. The adjacency (its offset->idx hashmap + the
+        per-binary MISSING inventory scan) is cols-invariant, so callers
+        with a stable per-binary catalog (the dataloader's handles) pass
+        the once-built instance instead of forcing a fresh build -- and
+        the full-array inventory scan -- on every batch. When ``None`` it
+        is built here from ``cols`` / ``section_offsets`` (the only extra
+        argument the build needs), so test / one-shot callers need not
+        thread it.
     root_sections:
         ``int[B]`` -- the per-row root SECTION index.
     root_sampled_variants:
@@ -157,10 +169,8 @@ def compute_row_inclusions(
             f"parallel; got {sec.shape} vs {smp.shape} vs {grp.shape}"
         )
     n_rows = sec.size
-    sec_of_var = np.repeat(
-        np.arange(cols.n_variants.size, dtype=np.int64), cols.n_variants
-    )
-    adjacency = LiveNodeAdjacency(cols, section_offsets, sec_of_var)
+    if adjacency is None:
+        adjacency = LiveNodeAdjacency(cols, section_offsets, cols.sec_of_var)
     decider = OnceOnlyInclusion()
 
     # Group batch rows by DECIDER-ROOT group, NOT by catalog section. Every
