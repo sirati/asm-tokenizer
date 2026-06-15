@@ -44,6 +44,8 @@ from tokenizer.aligned_data.loader.decoded._variant_selection import (
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import CallTarget, Section
 
+from ._section_meta_memo import CalleeSectionMetaMemo
+
 if TYPE_CHECKING:  # pragma: no cover -- type-only
     from tokenizer.aligned_data.loader.function_data import FunctionData
     from tokenizer.aligned_data.loader.session import BinarySession
@@ -81,6 +83,7 @@ def resolve_callee_metadata(
     parent_sibling_v_idxs: frozenset,
     called_idx: int,
     ct: CallTarget,
+    section_meta_memo: "CalleeSectionMetaMemo",
 ) -> Optional[ResolvedCalleeMeta]:
     """Decide one call_target row's callee edge, or ``None`` to skip.
 
@@ -116,15 +119,13 @@ def resolve_callee_metadata(
     # Per-arm metadata-only parse: matched parses the catalog entry;
     # unmatched parses the owning section of the first record. Neither
     # touches ``_data.bin`` -- the chosen variant body is loaded later
-    # only for survivors via :func:`load_callee_body`.
-    if arm is SectionKind.MATCHED:
-        callee_section, _callee_section_offset = (
-            session._matched_section_meta(callee_idx)
-        )
-    else:
-        callee_section, _callee_section_offset = (
-            session._unmatched_section_meta(callee_idx)
-        )
+    # only for survivors via :func:`load_callee_body`. The per-walk memo
+    # owns the meta-method dispatch + parses each ``(arm, idx)`` once, so
+    # the same callee reached across sibling parents / BFS levels /
+    # sampled variants does not re-run ``parse_section_bin``.
+    callee_section, _callee_section_offset = section_meta_memo.section_meta(
+        session, arm, callee_idx
+    )
 
     callee_variant_idx = choose_callee_variant(
         parent_section,

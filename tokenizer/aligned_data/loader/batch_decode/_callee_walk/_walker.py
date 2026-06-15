@@ -58,6 +58,7 @@ from ._resolve import (
     load_callee_body,
     resolve_callee_metadata,
 )
+from ._section_meta_memo import CalleeSectionMetaMemo
 
 if TYPE_CHECKING:  # pragma: no cover -- type-only
     from tokenizer.aligned_data.loader.function_data import FunctionData
@@ -121,6 +122,7 @@ def walk_callees(
         max_depth=max_depth,
         decider=decider,
         collector=collector,
+        section_meta_memo=CalleeSectionMetaMemo(),
     )
     from ._pending import finalise_pending_call_targets
 
@@ -177,6 +179,7 @@ def walk_section_callees_pending(
     max_depth: int,
     decider: OnceOnlyInclusion,
     collector: BucketedRunLengthCollector,
+    section_meta_memo: CalleeSectionMetaMemo,
 ) -> List[List[PendingCallTarget]]:
     """Level-synchronous BFS over a section's full variant set.
 
@@ -186,6 +189,9 @@ def walk_section_callees_pending(
 
     The ``decider`` is reused across sections (the caller resets nothing
     -- :meth:`OnceOnlyInclusion.begin_root` clears it here per section).
+    The ``section_meta_memo`` is likewise reused across every section in
+    the batch (caller-owned, per-walk lifetime): the same callee catalog
+    entry parses once whether it is reached from this section or another.
     """
     if max_depth < 0:
         raise ValueError(f"max_depth must be >= 0; got {max_depth}")
@@ -236,6 +242,7 @@ def walk_section_callees_pending(
             collector=collector,
             emit_slot=emit_slot,
             out=out,
+            section_meta_memo=section_meta_memo,
         )
 
     return out
@@ -251,6 +258,7 @@ def _step_level(
     collector: BucketedRunLengthCollector,
     emit_slot: List[int],
     out: List[List[PendingCallTarget]],
+    section_meta_memo: CalleeSectionMetaMemo,
 ) -> List[_RowFrontier]:
     """Resolve one level: mark the mask, emit included callees, return
     the next level's frontier (the included pairs, descent per-variant).
@@ -280,6 +288,7 @@ def _step_level(
                 parent_sibling_v_idxs=sibling_v_idxs,
                 called_idx=called_idx,
                 ct=ct,
+                section_meta_memo=section_meta_memo,
             )
             if rc is None:
                 continue

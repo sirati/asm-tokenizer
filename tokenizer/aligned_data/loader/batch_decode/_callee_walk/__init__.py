@@ -73,10 +73,12 @@ from ._resolve import (
     load_callee_body,
     resolve_callee_metadata,
 )
+from ._section_meta_memo import CalleeSectionMetaMemo
 from ._walker import walk_callees, walk_section_callees_pending
 
 
 __all__ = [
+    "CalleeSectionMetaMemo",
     "PendingCallTarget",
     "ResolvedCalleeMeta",
     "build_pending_call_target",
