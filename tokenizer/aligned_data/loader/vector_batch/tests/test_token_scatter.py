@@ -190,13 +190,25 @@ def test_prefix_values_match_width_twin_and_shift():
     values, offsets = variant_prefix_values(
         c.variants_u8, c.cols, nodes=nodes
     )
+    # The prefix WIDTH equals the record header n_tokens (= len(tokens[1:]),
+    # what ``get_variant_by_ref`` returns) -- NOT n_tokens-1. The corpus's
+    # per-node widths are [1, 1, 2, 0, 3]; nodes [0, 2, 3] -> [1, 2, 0].
     assert widths.tolist() == [1, 2, 0]
     assert np.array_equal(np.diff(offsets), widths)
     assert offsets[-1] == int(widths.sum())
-    # The synthetic records store raw id 0 in the payload; the shift is
-    # ``raw - 256`` (uint16 wrap), so every value is the shifted id 0.
+    # VALUE-LEVEL byte-identity: the gathered ids must be the FULL
+    # ``record[1:]`` payload (shifted ``raw - 256``), row-major over the
+    # sampled nodes. The corpus stores DISTINCT non-zero ids per node, so a
+    # reader that drops the last id of a node's payload (the historical
+    # ``n_tokens - 1`` off-by-one) produces WRONG ids here, not merely a
+    # short count.
     shift = int(VocabularyManager._V2_RESERVED_DIGIT_COUNT)
-    expected = np.full(values.size, (0 - shift) & 0xFFFF, dtype=np.uint16)
+    expected_raw = [
+        rid for node in nodes.tolist() for rid in c.prefix_token_ids[node]
+    ]
+    expected = np.array(
+        [(rid - shift) & 0xFFFF for rid in expected_raw], dtype=np.uint16
+    )
     assert np.array_equal(values, expected)
 
 
