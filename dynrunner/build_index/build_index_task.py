@@ -55,7 +55,11 @@ from tokenizer.aligned_data.binary_discovery import (
     filter_binaries,
 )
 
-from dynrunner.binary_selection import BinaryIdentifier, TaskInfo
+from dynrunner.binary_selection import (
+    BinaryIdentifier,
+    TaskInfo,
+    add_asm_selection_arguments,
+)
 
 
 _logger = logging.getLogger(__name__)
@@ -239,6 +243,13 @@ class BuildIndexTask:
         return 512 * 1024 * 1024 + 256 * 1024 * 1024
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
+        # Vendored asm-binary corpus selection flags (--platform etc.) —
+        # see TokenizerTask.add_task_arguments for rationale. The
+        # composite pipeline registers this block once and each child's
+        # private flags individually, so standalone `--task build-index`
+        # must register it here itself (mirrors MemmapBuilderTask /
+        # VocabUnifierTask add_task_arguments).
+        add_asm_selection_arguments(parser)
         self.add_private_task_arguments(parser)
 
     def add_private_task_arguments(self, parser: ArgumentParser) -> None:
