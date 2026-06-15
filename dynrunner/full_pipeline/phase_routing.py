@@ -18,7 +18,12 @@ walks — every protocol method delegates to the child paired with a
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace as _replace_dataclass
 from pathlib import Path
+
+from dynamic_runner import TaskDep
+
+from dynrunner.binary_selection import TaskInfo
 
 
 TOKENIZE_PHASE = "tokenize"
@@ -123,3 +128,40 @@ def phase_for_type(type_id: str) -> str:
     need the phase to look up its route.
     """
     return _TYPE_TO_PHASE[type_id]
+
+
+def decorate_index_items_with_memmap_dep(
+    index_items: list[TaskInfo], memmap_task_id: str
+) -> list[TaskInfo]:
+    """Add the cross-phase ``memmap → realized_lengths`` edge to a
+    binary's index items.
+
+    The cross-phase dependency is the composite-pipeline's knowledge,
+    NOT the standalone ``BuildIndexTask`` child's — the child stays
+    dep-free across phases so it remains usable standalone. So the
+    composite decorates the child's items here, on the boundary between
+    phase 3 (memmap) and phase 4 (index).
+
+    Only the realized-length item gains the cross-phase edge: the
+    sorted-index item already depends (intra-phase) on the
+    realized-length item, so its transitive prerequisite chain reaches
+    the memmap predecessor through the rlen item. The memmap task's
+    identity is ``(phase_id="memmap", task_id=binary_name)`` —
+    ``MemmapBuilderTask`` sets ``task_id == binary_name`` — so the edge
+    is ``TaskDep(task_id=memmap_task_id, phase_id="memmap")``. The
+    existing intra-phase ``task_depends_on`` entries are preserved
+    (prepended-to, not replaced).
+    """
+    cross_phase_dep = TaskDep(task_id=memmap_task_id, phase_id=BUILD_MEMMAP_PHASE)
+    decorated: list[TaskInfo] = []
+    for item in index_items:
+        if item.type_id == REALIZED_LENGTHS_TYPE:
+            decorated.append(
+                _replace_dataclass(
+                    item,
+                    task_depends_on=(cross_phase_dep, *item.task_depends_on),
+                )
+            )
+        else:
+            decorated.append(item)
+    return decorated
