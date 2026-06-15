@@ -76,6 +76,13 @@ def variant_prefix_values(
     if n_rows == 0:
         return np.zeros(0, dtype=np.uint16), prefix_offsets
 
+    # Absent / empty ``_variants.bin`` -> no prefix records exist; the
+    # session yields empty ``variant_tokens`` (see
+    # ``BinarySession._open_variants``), so every row's prefix is empty.
+    # Mirror the WIDTH twin (:func:`.._prefix.variant_prefix_lengths`).
+    if variants_u8.size == 0:
+        return np.zeros(0, dtype=np.uint16), prefix_offsets
+
     ref_offsets = cols.var_ref_offset[node_idx].astype(np.int64)
     if bool((ref_offsets & 1).any()):
         raise ValueError(

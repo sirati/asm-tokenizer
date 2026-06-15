@@ -61,6 +61,14 @@ def variant_prefix_lengths(
     node_idx = np.asarray(nodes, dtype=np.int64).reshape(-1)
     if node_idx.size == 0:
         return np.zeros(0, dtype=np.int64)
+    # An ABSENT / empty ``_variants.bin`` means no variant-prefix records
+    # exist; the session's variant resolver returns empty ``variant_tokens``
+    # in that case (``BinarySession._open_variants`` yields ``None`` for a
+    # missing file), so the prefix WIDTH is uniformly 0 -- regardless of the
+    # catalog's ``var_ref_offset`` (which references records that were never
+    # materialised). Mirror that here rather than reading past the buffer.
+    if variants_u8.size == 0:
+        return np.zeros(node_idx.size, dtype=np.int64)
     ref_offsets = cols.var_ref_offset[node_idx].astype(np.int64)
     if bool((ref_offsets & 1).any()):
         raise ValueError(

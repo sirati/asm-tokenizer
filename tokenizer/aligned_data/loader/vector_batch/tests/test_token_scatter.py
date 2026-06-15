@@ -168,6 +168,54 @@ def test_multi_row_independent_columns():
     assert tokens[1].tolist() == [5, 301, 302, 0, 0, 0, 0, 0]
 
 
+def test_prefix_values_match_width_twin_and_shift():
+    """``variant_prefix_values`` (the scatter's prefix-id reader) returns
+    CSR offsets matching the width twin (``variant_prefix_lengths``) and
+    shifts ids by ``- 256`` -- on the synthetic ``_variants.bin`` with
+    non-empty per-row prefixes."""
+    from tokenizer.aligned_data.loader.vector_batch._prefix import (
+        variant_prefix_lengths,
+    )
+    from tokenizer.aligned_data.loader.vector_batch._scatter._prefix_values import (
+        variant_prefix_values,
+    )
+    from tokenizer.token_manager import VocabularyManager
+
+    from ._synthetic import build_synthetic_corpus
+
+    c = build_synthetic_corpus()
+    nodes = np.array([0, 2, 3])  # root_v0 (prefix 1), A (prefix 2), B (prefix 0)
+    widths = variant_prefix_lengths(c.variants_u8, c.cols, nodes=nodes)
+    values, offsets = variant_prefix_values(
+        c.variants_u8, c.cols, nodes=nodes
+    )
+    assert widths.tolist() == [1, 2, 0]
+    assert np.array_equal(np.diff(offsets), widths)
+    assert offsets[-1] == int(widths.sum())
+    # The synthetic records store raw id 0 in the payload; the shift is
+    # ``raw - 256`` (uint16 wrap), so every value is the shifted id 0.
+    shift = int(VocabularyManager._V2_RESERVED_DIGIT_COUNT)
+    expected = np.full(values.size, (0 - shift) & 0xFFFF, dtype=np.uint16)
+    assert np.array_equal(values, expected)
+
+
+def test_prefix_values_empty_variants_buffer():
+    """An ABSENT/empty ``_variants.bin`` yields a zero-width prefix for
+    every row (mirrors the session's None-variants behaviour)."""
+    from tokenizer.aligned_data.loader.vector_batch._scatter._prefix_values import (
+        variant_prefix_values,
+    )
+
+    from ._synthetic import build_synthetic_corpus
+
+    c = build_synthetic_corpus()
+    values, offsets = variant_prefix_values(
+        np.zeros(0, dtype=np.uint8), c.cols, nodes=np.array([0, 2, 3])
+    )
+    assert values.size == 0
+    assert offsets.tolist() == [0, 0, 0, 0]
+
+
 def test_empty_batch_and_zero_seqlen():
     """Degenerate shapes return the right zero tensors without error."""
     g0 = _geometry(
