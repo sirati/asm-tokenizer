@@ -122,6 +122,10 @@ def vector_batch_tokens(
         section_pointers,
         num_variants_per_section=num_variants_per_section,
         rng=rng,
+        # vector_batch gathers bodies via the RLG3 geometry / scatter and
+        # never reads ``function_data_per_sampled_variant``; skip the dead
+        # per-sampled-variant body parse + category-count.
+        load_bodies=False,
     )
     batch_idx_to_section_variant, batch_size = compute_batch_idx_mapping(
         resolved,

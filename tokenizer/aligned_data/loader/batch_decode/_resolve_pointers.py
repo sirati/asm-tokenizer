@@ -90,6 +90,8 @@ class ResolvedSection:
             ``sampled_variant_indices[v]``. Harvested from the same
             per-arm load that produced :attr:`section`, so the wiring
             does NOT re-parse the section to pick up the variant body.
+            EMPTY when the resolver ran with ``load_bodies=False`` (the
+            geometry-first vector_batch path, which never reads it).
     """
 
     arm: SectionKind
@@ -105,6 +107,7 @@ def resolve_section_pointers(
     *,
     num_variants_per_section: int,
     rng: np.random.Generator,
+    load_bodies: bool = True,
 ) -> List[ResolvedSection]:
     """Resolve each ``SectionPointerSpec`` and sample variant indices.
 
@@ -140,6 +143,17 @@ def resolve_section_pointers(
         rng: Sampling source. Passed through to
             :func:`_select_variant_indices` verbatim; callers seed for
             reproducibility.
+        load_bodies: When ``True`` (default) the sampled variant bodies
+            are loaded into ``function_data_per_sampled_variant`` (the
+            decode + auto-size paths need them). When ``False`` only the
+            catalog parse + variant-index sampling run; the body list is
+            left EMPTY -- the geometry-first vector_batch path gathers its
+            own bodies via the RLG3 geometry and never reads
+            ``function_data_per_sampled_variant``, so its per-variant body
+            parse + ``category_counts`` is dead work. The sampling +
+            ``section`` + ``sampled_variant_indices`` are identical either
+            way, so the rng draw stays in lockstep with the body-loading
+            path.
 
     Returns:
         ``list[ResolvedSection]`` parallel to ``section_pointers``.
@@ -184,7 +198,9 @@ def resolve_section_pointers(
                 function_data_per_sampled_variant=[
                     _load_sampled_variant_body(session, pointer, section, v)
                     for v in sampled_ints
-                ],
+                ]
+                if load_bodies
+                else [],
             )
         )
     return resolved
