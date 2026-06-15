@@ -60,6 +60,9 @@ class SyntheticCorpus:
     value_count: np.ndarray
     #: per-NODE variant-prefix width (n_axis), for hand-computation.
     prefix_len: np.ndarray
+    #: per-NODE raw prefix payload ids (``record[1:]``), for value-level
+    #: byte-identity assertions on the prefix reader.
+    prefix_token_ids: list
     #: var_offsets, exposed for node-index arithmetic in tests.
     var_offsets: np.ndarray
 
@@ -122,9 +125,19 @@ def build_synthetic_corpus(
     # --- variant prefix widths (n_axis) + _variants.bin -----------------
     # Distinct prefix widths so the layout's per-row prefix offset is
     # exercised. var_ref_offset points at each node's record in the
-    # synthetic _variants.bin.
+    # synthetic _variants.bin. Each node's payload carries DISTINCT non-zero
+    # raw ids (>= the reserved-digit floor) so a value-level reader that
+    # drops the last id (the historical off-by-one) is caught by WHICH ids
+    # are gathered -- not just by the width count. Per node, the ids are
+    # ``[1000 + node*10 + j for j in range(width)]``.
     prefix_len = np.array([1, 1, 2, 0, 3], dtype=np.int64)  # per NODE
-    variants_u8, var_ref_offset = _build_variants_bin(prefix_len)
+    prefix_token_ids = [
+        [1000 + node * 10 + j for j in range(int(width))]
+        for node, width in enumerate(prefix_len.tolist())
+    ]
+    variants_u8, var_ref_offset = _build_variants_bin(
+        prefix_len, token_ids=prefix_token_ids
+    )
 
     var_data_offset_shifted = np.zeros(total_vars, dtype=np.uint32)
 
@@ -170,6 +183,7 @@ def build_synthetic_corpus(
         id_count=id_count.astype(np.int64),
         value_count=value_count.astype(np.int64),
         prefix_len=prefix_len,
+        prefix_token_ids=prefix_token_ids,
         var_offsets=var_offsets,
     )
 
@@ -180,23 +194,39 @@ def _csr(counts: np.ndarray) -> np.ndarray:
     return out
 
 
-def _build_variants_bin(prefix_len: np.ndarray):
+def _build_variants_bin(prefix_len: np.ndarray, *, token_ids: list | None = None):
     """A ``_variants.bin`` whose record at ``var_ref_offset[node]`` has a
-    leading u16 ``n_tokens == prefix_len[node] + 1``.
+    leading u16 ``n_tokens == prefix_len[node]``.
 
-    Records are ``[n_tokens, *ids]`` u16 (the production
-    :func:`tokenizer.variant_tokens.record.read_record` layout); the
-    prefix width the prepass derives is ``n_tokens - 1``. Returns
+    Records are ``[n_tokens, *ids]`` u16 exactly as production writes them
+    (:func:`tokenizer.variant_tokens.encoder.encode_record`): the leading
+    u16 ``n_tokens`` is the COUNT of payload ids that follow, so the array
+    has length ``1 + n_tokens`` and ``tokens[1:]`` (what
+    ``get_variant_by_ref`` returns) has ``n_tokens`` ids. The prefix WIDTH
+    the prepass derives is therefore ``n_tokens`` itself.
+
+    ``token_ids`` optionally supplies the per-node payload id list (length
+    ``prefix_len[node]``); when given, the bytes match what
+    ``variant_prefix_values`` must gather, so a byte-identity test can
+    assert the actual prefix ids (not just the width). Returns
     ``(variants_u8, var_ref_offset)``.
     """
     records = []
     offsets = []
     cursor = 0
-    for n_axis in prefix_len.tolist():
-        n_tokens = int(n_axis) + 1
+    for node, n_axis in enumerate(prefix_len.tolist()):
+        n_tokens = int(n_axis)
         rec = np.empty(1 + n_tokens, dtype=np.uint16)
         rec[0] = n_tokens
-        rec[1:] = 0  # token ids irrelevant to the prefix WIDTH read
+        if token_ids is None:
+            rec[1:] = 0  # token ids irrelevant to the prefix WIDTH read
+        else:
+            ids = token_ids[node]
+            assert len(ids) == n_tokens, (
+                f"_build_variants_bin: token_ids[{node}] has {len(ids)} "
+                f"ids, expected n_tokens={n_tokens}"
+            )
+            rec[1:] = np.asarray(ids, dtype=np.uint16)
         offsets.append(cursor)
         records.append(rec)
         cursor += rec.nbytes

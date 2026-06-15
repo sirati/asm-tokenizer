@@ -7,14 +7,16 @@ with NO ``_data.bin`` touch and NO body decode.
 
 WHY this is body-free + a single u16 read: each variant's record in
 ``_variants.bin`` is ``[n_tokens, *ids]`` as little-endian u16 (see
-:func:`tokenizer.variant_tokens.record.read_record`). The decode path's
-``variant_tokens`` is the ``ids`` slice ``tokens[1:]`` (the leading size
-header dropped; see
-:func:`...loader.variant_resolver.get_variant_by_ref`), so the prefix
-WIDTH is exactly ``n_tokens - 1``. The byte offset of a variant's record
-is the catalog's ``var_ref_offset`` (the vkey). We gather the leading
-u16 at every sampled variant's ref offset in ONE vectorized pass and
-subtract 1 -- never reading the payload, never touching ``_data.bin``.
+:func:`tokenizer.variant_tokens.record.read_record`). The leading u16
+``n_tokens`` is the COUNT OF PAYLOAD IDS that follow it (the record array
+has length ``1 + n_tokens``; see :func:`...variant_tokens.encoder`). The
+decode path's ``variant_tokens`` is the ``ids`` slice ``tokens[1:]`` (the
+leading size header dropped; see
+:func:`...loader.variant_resolver.get_variant_by_ref`), so it has exactly
+``n_tokens`` elements -- the prefix WIDTH is ``n_tokens``. The byte offset
+of a variant's record is the catalog's ``var_ref_offset`` (the vkey). We
+gather the leading u16 at every sampled variant's ref offset in ONE
+vectorized pass -- never reading the payload, never touching ``_data.bin``.
 """
 
 from __future__ import annotations
@@ -54,9 +56,10 @@ def variant_prefix_lengths(
     Returns
     -------
     np.ndarray
-        ``int64[k]`` prefix lengths = ``n_tokens - 1`` per node, the
-        column count the variant-token prefix occupies ahead of the root
-        body. Units: token columns.
+        ``int64[k]`` prefix lengths = ``n_tokens`` per node, the column
+        count the variant-token prefix occupies ahead of the root body
+        (= ``len(get_variant_by_ref(...).variant_tokens)``). Units: token
+        columns.
     """
     node_idx = np.asarray(nodes, dtype=np.int64).reshape(-1)
     if node_idx.size == 0:
@@ -84,4 +87,4 @@ def variant_prefix_lengths(
             "buffer are out of sync"
         )
     n_tokens = words[ref_offsets >> 1].astype(np.int64)
-    return n_tokens - 1
+    return n_tokens

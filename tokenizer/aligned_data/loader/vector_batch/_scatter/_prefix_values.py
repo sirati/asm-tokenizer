@@ -11,7 +11,8 @@ WHY ``record[1:]`` shifted by ``- 256`` (matches the scalar assembler):
 each ``_variants.bin`` record is ``[n_tokens, *ids]`` little-endian u16
 (see :func:`tokenizer.variant_tokens.record.read_record`). The decode
 path's ``Stage1Variant.variant_tokens`` is the ``ids`` slice
-``tokens[1:]`` (leading size header dropped; see
+``tokens[1:]`` (leading size header dropped; the record array is length
+``1 + n_tokens`` so this slice has exactly ``n_tokens`` ids; see
 :func:`...loader.variant_resolver.get_variant_by_ref`), and Stage 4 row
 assembly emits ``(variant_tokens - 256)`` once per row before any body
 (see ``batch_decode._token_assembly``). variant_tokens are statically
@@ -98,11 +99,15 @@ def variant_prefix_values(
             "buffer are out of sync"
         )
     n_tokens = words[ref_word].astype(np.int64)
-    widths = n_tokens - 1  # the prefix WIDTH (size header dropped)
+    # The prefix WIDTH is the full payload-id count ``n_tokens``: only the
+    # leading size header is dropped (``tokens[1:]`` in
+    # ``get_variant_by_ref``), and the record array is ``[n_tokens, *ids]``
+    # of length ``1 + n_tokens`` -- so ``tokens[1:]`` has ``n_tokens`` ids.
+    widths = n_tokens
     if bool((widths < 0).any()):
         raise ValueError(
-            "variant_prefix_values: a variant record declares n_tokens=0 "
-            "(no room for the dropped size token) -- corrupt record"
+            "variant_prefix_values: a variant record declares a negative "
+            "n_tokens -- corrupt record"
         )
     np.cumsum(widths, out=prefix_offsets[1:])
     total = int(prefix_offsets[-1])
