@@ -32,6 +32,10 @@ from tokenizer.disasm.ghidra_provider.prefix_build import (
     _compute_fp_type,
     _ghidra_processor_to_architecture,
 )
+from tokenizer.disasm.ghidra_provider.project_workspace import (
+    create_project_workspace,
+    remove_project_workspace,
+)
 from tokenizer.disasm.ghidra_provider.switch_table_walker import (
     walk_switch_tables_for_function,
 )
@@ -165,45 +169,52 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # rationale + scheme.
         self._binary_id_hash: bytes = compute_binary_identity_hash(binary_path)
 
-        # pyghidra defaults `project_location` to the binary's parent
-        # directory, which is the read-only `--source-already-staged`
-        # bind-mount in the SLURM container. Redirect into the
-        # writable ephemeral root (`/app/out-tmp` if the container
-        # provides it, else `/tmp`). Per-binary subdir keyed off the
-        # binary's parent dir name (unique per variant in our corpus
-        # layout) so concurrent variants don't collide on the
-        # `<binary-name>_ghidra` project name pyghidra derives.
-        out_tmp_root = Path("/app/out-tmp")
-        project_root = out_tmp_root if out_tmp_root.is_dir() else Path("/tmp")
-        project_location = project_root / "ghidra-projects" / binary_path.parent.name
-        project_location.mkdir(parents=True, exist_ok=True)
-        self._project_location = project_location
+        # A fresh, unique ephemeral project directory per provider —
+        # created and torn down by `project_workspace` (see that module
+        # for why: collision-free across concurrent workers + reused
+        # workers, and removed in `close()` so `/tmp` doesn't balloon).
+        # pyghidra would otherwise default `project_location` to the
+        # binary's parent directory, which is the read-only
+        # `--source-already-staged` bind-mount in the SLURM container.
+        self._project_location = create_project_workspace()
 
         # open_program is the simplest API: import, auto-analyze, return
         # a FlatProgramAPI context manager.  We defer analysis (analyze=False)
-        # so build_cfg() controls when it happens.
-        self._ctx = pyghidra.open_program(
-            binary_path,
-            project_location=project_location,
-            analyze=False,
-        )
-        self._flat_api = self._ctx.__enter__()
-        self._program = self._flat_api.getCurrentProgram()
-        self._fm = self._program.getFunctionManager()
-        self._listing = self._program.getListing()
-        self._memory = self._program.getMemory()
-        self._reg_map = _RegisterMap(self._program)
-        self._analyzed = False
-        self._closed = False
-        # Owned-view scaffolding lazily initialized by iter_functions on
-        # first call (so close() can null out program references without
-        # leaving stale views behind).
-        self._function_view: Optional[Any] = None
-        # `iter_functions` populates this map with `entry_addr -> Ghidra
-        # Function` for every function it visits; `iter_switch_tables`
-        # consumes it to look up the underlying Java handle from the
-        # FunctionView (no more `function._raw` unwrap dance).
-        self._funcs_by_entry: dict[int, Any] = {}
+        # so build_cfg() controls when it happens. If construction fails
+        # before close() can run, drop the workspace so it isn't leaked.
+        self._ctx = None
+        try:
+            self._ctx = pyghidra.open_program(
+                binary_path,
+                project_location=self._project_location,
+                analyze=False,
+            )
+            self._flat_api = self._ctx.__enter__()
+            self._program = self._flat_api.getCurrentProgram()
+            self._fm = self._program.getFunctionManager()
+            self._listing = self._program.getListing()
+            self._memory = self._program.getMemory()
+            self._reg_map = _RegisterMap(self._program)
+            self._analyzed = False
+            self._closed = False
+            # Owned-view scaffolding lazily initialized by iter_functions
+            # on first call (so close() can null out program references
+            # without leaving stale views behind).
+            self._function_view: Optional[Any] = None
+            # `iter_functions` populates this map with `entry_addr ->
+            # Ghidra Function` for every function it visits;
+            # `iter_switch_tables` consumes it to look up the underlying
+            # Java handle from the FunctionView (no more `function._raw`
+            # unwrap dance).
+            self._funcs_by_entry: dict[int, Any] = {}
+        except Exception:
+            if self._ctx is not None:
+                try:
+                    self._ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+            remove_project_workspace(self._project_location)
+            raise
 
     def close(self) -> None:
         """Unload the current Program + close the Project so the
@@ -239,6 +250,10 @@ class GhidraDisassemblyProvider(DisassemblyProvider):
         # from a clean slate.
         self._function_view = None
         self._funcs_by_entry = {}
+        # Ghidra has released the project above; remove its ephemeral
+        # directory so reused workers don't accumulate project dirs
+        # across the thousands of binaries a long run tokenizes.
+        remove_project_workspace(self._project_location)
 
     def build_cfg(self) -> None:
         """Run Ghidra's auto-analysis (the equivalent of CFGFast)."""
