@@ -3,10 +3,11 @@
 The memmap builder stamps an 8-byte identity fingerprint of the unified
 vocab into each ``_data.bin`` prelude (the reserved slot); the loader
 recomputes it from the vocab it actually loaded and HARD-FAILS when a
-catalog is decoded with a DIFFERENT (same-format-version) vocab -- which
-would silently mis-decode the variant-axis band. ``NO_FINGERPRINT``
-(all-zero) is the backward-compatible soft-skip for bins / vocabs that
-predate the fingerprint.
+catalog is decoded with a DIFFERENT (same-format-version) vocab -- the bin
+stores unified-vocab token ids for the whole stream, so a wrong vocab
+silently mis-decodes EVERY token, not just the variant axes.
+``NO_FINGERPRINT`` (all-zero) is the backward-compatible soft-skip for
+bins / vocabs that predate the fingerprint.
 
 Covers: the prelude codec round-trip, the file-hash helper's
 distinguishing power, and the session-level verify (match passes,

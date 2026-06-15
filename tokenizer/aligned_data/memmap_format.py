@@ -149,9 +149,10 @@ def encode_data_bin_prelude(
     :func:`tokenizer.aligned_data.loader.unified_vocab_gate.compute_vocab_fingerprint`).
     The loader compares it against the loaded vocab and HARD-FAILS on
     mismatch — catching the case where a catalog is decoded with the wrong
-    (same-format-version) vocab, which would silently mis-decode the
-    variant-axis band. Defaults to :data:`NO_FINGERPRINT` (soft no-op) so
-    fixtures + bins predating the fingerprint stay valid.
+    (same-format-version) vocab. ``_data.bin`` stores unified-vocab token ids
+    for the whole stream, so a wrong vocab silently mis-decodes EVERY token
+    (not just the variant axes). Defaults to :data:`NO_FINGERPRINT` (soft
+    no-op) so fixtures + bins predating the fingerprint stay valid.
     """
     return encode_bin_prelude(DATA_BIN_PRELUDE_MAGIC, reserved=vocab_fingerprint)
 

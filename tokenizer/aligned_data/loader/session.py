@@ -470,8 +470,10 @@ class BinarySession(_BinarySessionHelpersMixin):
         # #27 safety net: a _data.bin built post-fingerprint carries the
         # identity of the unified vocab it was built against. If we hold a
         # fingerprinted vocab (loaded via the gate) and it disagrees, this
-        # catalog is being decoded with the WRONG vocab -- which would
-        # silently mis-decode the variant-axis band. Fail loud. Soft-skip
+        # catalog is being decoded with the WRONG vocab -- _data.bin stores
+        # unified-vocab token ids for the WHOLE stream, so a wrong vocab
+        # silently remaps EVERY token (instructions, numbers, identities,
+        # AND the variant axes), not just the prefix. Fail loud. Soft-skip
         # when either side lacks a fingerprint (pre-#27 bin, or a vocab not
         # loaded through the gate).
         catalog_fp = read_bin_prelude_reserved(prelude)
@@ -482,9 +484,10 @@ class BinarySession(_BinarySessionHelpersMixin):
                     f"catalog<->vocab fingerprint mismatch for {path}: this "
                     f"_data.bin was built against a DIFFERENT unified_vocab "
                     f"(catalog={catalog_fp.hex()}) than the one loaded "
-                    f"(vocab={vocab_fp.hex()}). Decoding with this vocab would "
-                    f"silently mis-decode the variant-axis band. Load the "
-                    f"unified_vocab.csv co-located with this memmap."
+                    f"(vocab={vocab_fp.hex()}). Every token id in the stream "
+                    f"resolves against the unified vocab, so decoding with the "
+                    f"wrong one mis-decodes EVERY token, not just the variant "
+                    f"axes. Load the unified_vocab.csv co-located with this memmap."
                 )
         # The trailing ``total_entries`` u32 is the per-lookup
         # ``entry_idx < total_entries`` bound; read + cache it once

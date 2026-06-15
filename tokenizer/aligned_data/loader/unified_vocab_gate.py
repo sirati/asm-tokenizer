@@ -166,7 +166,8 @@ def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
 
     # Stamp the vocab's identity fingerprint onto the VM so the per-binary
     # session can verify a catalog was built against THIS vocab before
-    # decoding it -- catching a wrong-but-same-format-version vocab that
-    # would silently mis-decode the variant-axis band (#27 safety net).
+    # decoding it -- a wrong-but-same-format-version vocab silently mis-decodes
+    # EVERY token (the bin stores unified ids for the whole stream), not just
+    # the variant axes (#27 safety net).
     vocab_manager._vocab_fingerprint = compute_vocab_fingerprint(vocab_path)
     return vocab_manager
