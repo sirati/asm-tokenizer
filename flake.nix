@@ -134,6 +134,124 @@
           ];
         };
 
+      # ── memmap-loader: env + source-parameterized builder ─────────
+      #
+      # The standalone memmap-loader runtime (the memmap data loader +
+      # VocabularyManager, importable WITHOUT ghidra/angr/pyghidra) is
+      # decomposed into two reusable parts so a downstream consumer can
+      # compose the ghidra/angr-free ENV with THEIR OWN pinned tokenizer
+      # source (for byte-identity with their training baseline):
+      #
+      #   env            - the bare decode-source-AGNOSTIC Python env
+      #                    (numpy + dedup-hashmap + xxhash + portalocker).
+      #   mkMemmapLoader - { src }: a runCommand that copies `src` onto
+      #                    the import path of `env`, runs the import
+      #                    gate AGAINST `src` (so any caller's source with
+      #                    a top-level ghidra/angr leak fails the build),
+      #                    and installs the `memmap-loader-python`
+      #                    launcher. `src` is the only parameter.
+      #
+      # main's own `packages.memmap-loader` is just `mkMemmapLoader`
+      # eating its own dogfood (`{ src = projectSource; }`); there is no
+      # second runCommand, so the env/gate/launcher logic has a single
+      # source of truth shared by main and any downstream caller.
+      memmapLoaderFor =
+        system:
+        let
+          pkgs = pkgsFor system;
+
+          # Runtime Python env for the standalone memmap-loader. Carries
+          # ONLY the closure's third-party deps: numpy, the in-tree pyo3
+          # `dedup-hashmap`, plus xxhash (parsed_record_iter hashing) and
+          # portalocker (loader file-locking) — both pulled in via
+          # `tokenizer.aligned_data.__init__`, which runs on ANY loader
+          # submodule import. Deliberately EXCLUDES ghidra, pyghidra,
+          # angr, capstone, lief, pandas — the memmap data loader +
+          # VocabularyManager import closure touches none of them at
+          # import time (the disasm modules pulled in are
+          # `tokenizer.disasm.{metadata,types}`, pure stdlib data/Protocol
+          # views; all ghidra/angr imports under tokenizer/ are lazy).
+          # `dedup-hashmap` has a dash; inside a `with python-pkgs;` list
+          # the bare identifier parses as subtraction (`dedup - hashmap`),
+          # so it ships via explicit attribute access (cf. the same dodge
+          # in `deploymentPythonPackages`).
+          memmapLoaderPython = pkgs.python314.withPackages (
+            python-pkgs: [
+              python-pkgs.numpy
+              python-pkgs.dedup-hashmap
+              python-pkgs.xxhash
+              python-pkgs.portalocker
+            ]
+          );
+
+          # Build-time import-cleanliness gate for the memmap-loader
+          # package: imports the loader + VocabularyManager surface with
+          # the entire disasm stack (ghidra/angr/pyghidra/capstone/lief +
+          # angr deps + pandas) BLOCKED via a meta_path finder. Any future
+          # top-level ghidra/angr leak in the GATED src fails `nix build`.
+          memmapLoaderImportGate = pkgs.writeText "memmap-loader-import-gate.py" ''
+            import sys, importlib.abc
+            BLOCK = ("angr", "pyghidra", "ghidra", "claripy", "pyvex",
+                     "archinfo", "cle", "capstone", "lief", "pandas")
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path, target=None):
+                    if name.split(".")[0] in BLOCK:
+                        raise ModuleNotFoundError(f"blocked for gate: {name}")
+                    return None
+            sys.meta_path.insert(0, Blocker())
+            from tokenizer.aligned_data.loader import (
+                AlignedDataLoader, MatchedFunction, FunctionData,
+            )
+            from tokenizer.aligned_data.loader.batch_decode import (
+                batch_decode, BatchDecodeResult,
+            )
+            from tokenizer.aligned_data.loader import vector_batch  # noqa: F401
+            from tokenizer.token_manager import VocabularyManager
+            import numpy, dedup_hashmap, xxhash, portalocker  # noqa: F401
+            assert VocabularyManager is not None
+            print("memmap-loader import gate OK (ghidra/angr/pyghidra absent)")
+          '';
+
+          memmapLoaderLauncher = pkgs.writeText "memmap-loader-python.sh" ''
+            #!${pkgs.bash}/bin/bash
+            export PYTHONPATH="@srcDir@''${PYTHONPATH:+:$PYTHONPATH}"
+            exec ${memmapLoaderPython}/bin/python "$@"
+          '';
+
+          # Source-parameterized builder. Copies the caller-provided
+          # tokenizer `src` onto the import path of the shared
+          # `memmapLoaderPython` env, runs the import gate against THAT
+          # src, and installs the launcher pointing at it. The single
+          # parameter `src` is the only thing main vs. a downstream
+          # consumer differ on.
+          mkMemmapLoader =
+            { src }:
+            pkgs.runCommand "memmap-loader"
+              {
+                passthru = {
+                  inherit memmapLoaderPython;
+                  projectSource = src;
+                };
+              }
+              ''
+                srcDir="$out/share/memmap-loader/tokenizer-src"
+                mkdir -p "$srcDir"
+                cp -r ${src}/. "$srcDir"
+
+                # Import-cleanliness gate (fails the build on a ghidra/angr leak).
+                PYTHONPATH="$srcDir" ${memmapLoaderPython}/bin/python ${memmapLoaderImportGate}
+
+                mkdir -p "$out/bin"
+                substitute ${memmapLoaderLauncher} "$out/bin/memmap-loader-python" \
+                  --subst-var-by srcDir "$srcDir"
+                chmod +x "$out/bin/memmap-loader-python"
+              '';
+        in
+        {
+          env = memmapLoaderPython;
+          inherit mkMemmapLoader;
+        };
+
       # Package definitions
       deploymentPythonPackages =
         python-pkgs:
@@ -260,63 +378,11 @@
             ++ [ python-pkgs.dynamic-runner ]
           );
 
-          # Runtime Python env for the standalone memmap-loader package.
-          # Carries ONLY the closure's third-party deps: numpy, the
-          # in-tree pyo3 `dedup-hashmap`, plus xxhash (parsed_record_iter
-          # hashing) and portalocker (loader file-locking) — both pulled
-          # in via `tokenizer.aligned_data.__init__`, which runs on ANY
-          # loader submodule import. Deliberately EXCLUDES ghidra,
-          # pyghidra, angr, capstone, lief, pandas — the memmap data
-          # loader + VocabularyManager import closure touches none of
-          # them at import time (the disasm modules pulled in are
-          # `tokenizer.disasm.{metadata,types}`, pure stdlib data/Protocol
-          # views; all ghidra/angr imports under tokenizer/ are lazy).
-          # `dedup-hashmap` has a dash; inside a `with python-pkgs;` list
-          # the bare identifier parses as subtraction (`dedup - hashmap`),
-          # so it ships via explicit attribute access (cf. the same dodge
-          # in `deploymentPythonPackages`).
-          memmapLoaderPython = pkgs.python314.withPackages (
-            python-pkgs: [
-              python-pkgs.numpy
-              python-pkgs.dedup-hashmap
-              python-pkgs.xxhash
-              python-pkgs.portalocker
-            ]
-          );
-
-          # Build-time import-cleanliness gate for the memmap-loader
-          # package: imports the loader + VocabularyManager surface with
-          # the entire disasm stack (ghidra/angr/pyghidra/capstone/lief +
-          # angr deps + pandas) BLOCKED via a meta_path finder. Any future
-          # top-level ghidra/angr leak in the closure fails `nix build`.
-          memmapLoaderImportGate = pkgs.writeText "memmap-loader-import-gate.py" ''
-            import sys, importlib.abc
-            BLOCK = ("angr", "pyghidra", "ghidra", "claripy", "pyvex",
-                     "archinfo", "cle", "capstone", "lief", "pandas")
-            class Blocker(importlib.abc.MetaPathFinder):
-                def find_spec(self, name, path, target=None):
-                    if name.split(".")[0] in BLOCK:
-                        raise ModuleNotFoundError(f"blocked for gate: {name}")
-                    return None
-            sys.meta_path.insert(0, Blocker())
-            from tokenizer.aligned_data.loader import (
-                AlignedDataLoader, MatchedFunction, FunctionData,
-            )
-            from tokenizer.aligned_data.loader.batch_decode import (
-                batch_decode, BatchDecodeResult,
-            )
-            from tokenizer.aligned_data.loader import vector_batch  # noqa: F401
-            from tokenizer.token_manager import VocabularyManager
-            import numpy, dedup_hashmap, xxhash, portalocker  # noqa: F401
-            assert VocabularyManager is not None
-            print("memmap-loader import gate OK (ghidra/angr/pyghidra absent)")
-          '';
-
-          memmapLoaderLauncher = pkgs.writeText "memmap-loader-python.sh" ''
-            #!${pkgs.bash}/bin/bash
-            export PYTHONPATH="@srcDir@''${PYTHONPATH:+:$PYTHONPATH}"
-            exec ${memmapLoaderPython}/bin/python "$@"
-          '';
+          # memmap-loader env + source-parameterized builder live in the
+          # outer let (shared with the `lib` output); pull them in here so
+          # `packages.memmap-loader` can dogfood the builder on main's own
+          # `projectSource`.
+          inherit (memmapLoaderFor system) mkMemmapLoader;
 
           # Restrict app payload to selected source directories and root Python files only
           projectSource = pkgs.lib.cleanSourceWith {
@@ -589,28 +655,21 @@
             };
           };
 
+          # Bare, decode-source-AGNOSTIC runtime env (numpy +
+          # dedup-hashmap + xxhash + portalocker), for a downstream
+          # consumer that wants to compose it with their own pinned
+          # tokenizer source by hand.
+          memmap-loader-env = (memmapLoaderFor system).env;
+
           # Standalone runtime package: the memmap data loader +
           # VocabularyManager, importable WITHOUT ghidra/angr/pyghidra.
           # Ships the whole `tokenizer/` source tree (via `projectSource`)
-          # on the import path of a Python env that carries only
-          # numpy + dedup-hashmap, plus a `memmap-loader-python` launcher.
-          memmap-loader = pkgs.runCommand "memmap-loader"
-            {
-              passthru = { inherit memmapLoaderPython projectSource; };
-            }
-            ''
-              srcDir="$out/share/memmap-loader/tokenizer-src"
-              mkdir -p "$srcDir"
-              cp -r ${projectSource}/. "$srcDir"
-
-              # Import-cleanliness gate (fails the build on a ghidra/angr leak).
-              PYTHONPATH="$srcDir" ${memmapLoaderPython}/bin/python ${memmapLoaderImportGate}
-
-              mkdir -p "$out/bin"
-              substitute ${memmapLoaderLauncher} "$out/bin/memmap-loader-python" \
-                --subst-var-by srcDir "$srcDir"
-              chmod +x "$out/bin/memmap-loader-python"
-            '';
+          # on the import path of the bare env, plus a
+          # `memmap-loader-python` launcher. This is just the shared
+          # `mkMemmapLoader` builder eating its own dogfood on main's own
+          # source — a downstream consumer calls the same builder with
+          # THEIR source (see the `lib.<system>.mkMemmapLoader` output).
+          memmap-loader = mkMemmapLoader { src = projectSource; };
 
           default = self.packages.${system}.dockerImage;
         }
@@ -645,6 +704,19 @@
               ''
             );
           };
+        }
+      );
+
+      # Per-system builders for downstream consumers. `mkMemmapLoader`
+      # needs `pkgs` (it bundles a Python env), so it is exposed
+      # per-system rather than as a pkgs-free `lib`. A downstream flake
+      # pins this repo's `main`, then calls
+      # `asm-tokenizer.lib.<system>.mkMemmapLoader { src = <their src>; }`
+      # to get a memmap-loader package built against THEIR tokenizer
+      # source — the import gate runs against the provided src.
+      lib = forAllSystems (
+        system: {
+          inherit (memmapLoaderFor system) mkMemmapLoader;
         }
       );
     };
