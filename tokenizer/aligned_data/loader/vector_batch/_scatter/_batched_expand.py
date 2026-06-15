@@ -417,7 +417,14 @@ def batched_expand(
     )
 
     # --- promotion (paint into a working copy of raw) --------------------
-    working = raw.copy()
+    # The promotion paint is the ONLY mutation of the raw stream, and it
+    # only fires when a VC2 / F128 carrier token is present. With no carrier
+    # the working stream is never written, so the defensive copy is dead --
+    # alias ``raw`` directly (the downstream strip/shift only READS it).
+    has_carrier = bool(
+        (real_mask & ((raw == _VC2_VOCAB_ID) | (raw == _FLOAT128_VOCAB_ID))).any()
+    )
+    working = raw.copy() if has_carrier else raw
     extra_vc2_raw, extra_f128_raw = _promote_batched(
         working, real_mask, runlen_number, node_of, rec_starts, counts
     )
