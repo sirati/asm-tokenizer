@@ -30,7 +30,6 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     SectionPointerSpec,
 )
 from tokenizer.aligned_data.loader.function_data import FunctionData
-from tokenizer.aligned_data.loader.matched_function import MatchedFunction
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import (
     Section,
@@ -78,16 +77,28 @@ def _make_section(n_variants: int, section_offset: int = 0) -> Section:
 class _FakeSession:
     """Minimal stand-in for :class:`BinarySession`.
 
-    Implements only the two load helpers
-    :func:`resolve_section_pointers` calls. Each map keys per-arm
-    ``idx`` to the pre-built :class:`Section`. The third tuple element
-    is the per-arm body container the resolver harvests
-    (``MatchedFunction`` for matched, single ``FunctionData`` for
-    unmatched).
+    Implements only the lazy load helpers
+    :func:`resolve_section_pointers` calls: the body-free catalog parse
+    (:py:meth:`_matched_section_meta` / :py:meth:`_unmatched_section_meta`)
+    plus the per-variant body load
+    (:py:meth:`_load_matched_variant_body` /
+    :py:meth:`_load_unmatched_variant_body`). Each map keys per-arm
+    base ``idx`` to the pre-built :class:`Section` and the per-variant
+    body list; the resolver now parses the catalog once then loads ONLY
+    the sampled variants' bodies, so the fake serves bodies one index at
+    a time (mirroring the real session's sampled-only contract).
+
+    The unmatched body load mirrors the real session's 2-arg signature
+    (``idx, section`` -- no ``variant_index``): the resolver passes the
+    per-record idx ``base + variant_index``, and the fake derives the
+    slot positionally from the owning base, exactly as the real session
+    re-derives ``variant_slot`` from the record idx.
     """
 
     matched_sections: Dict[int, Section] = field(default_factory=dict)
-    matched_functions: Dict[int, MatchedFunction] = field(default_factory=dict)
+    matched_variant_function_data: Dict[int, List[FunctionData]] = field(
+        default_factory=dict
+    )
     unmatched_sections: Dict[int, Section] = field(default_factory=dict)
     unmatched_variant_function_data: Dict[int, List[FunctionData]] = field(
         default_factory=dict
@@ -102,9 +113,7 @@ class _FakeSession:
         variant_function_data: List[FunctionData],
     ) -> None:
         self.matched_sections[idx] = section
-        self.matched_functions[idx] = MatchedFunction(
-            func_name=f"matched_{idx}", variants=variant_function_data
-        )
+        self.matched_variant_function_data[idx] = variant_function_data
 
     def add_unmatched(
         self,
@@ -112,28 +121,37 @@ class _FakeSession:
         section: Section,
         variant_function_data: List[FunctionData],
     ) -> None:
-        # Parallels :py:meth:`add_matched`: unmatched sections store one
-        # record per variant, so the fake mirrors the matched-arm shape.
+        # ``idx`` is the section's first-record (base) idx; unmatched
+        # sections store one record per variant, so the body list is
+        # served per-record from ``base .. base + n - 1``.
         self.unmatched_sections[idx] = section
         self.unmatched_variant_function_data[idx] = variant_function_data
 
-    # ---- load helpers -------------------------------------------------
+    # ---- lazy load helpers --------------------------------------------
 
-    def _load_matched_section_and_variants(
-        self, idx: int
-    ) -> Tuple[Section, int, MatchedFunction]:
+    def _matched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.matched_sections[idx]
-        return section, section.section_offset, self.matched_functions[idx]
+        return section, section.section_offset
 
-    def _load_unmatched_section_and_all_variants(
-        self, idx: int
-    ) -> Tuple[Section, int, List[FunctionData]]:
+    def _load_matched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        return self.matched_variant_function_data[idx][variant_index]
+
+    def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.unmatched_sections[idx]
-        return (
-            section,
-            section.section_offset,
-            self.unmatched_variant_function_data[idx],
-        )
+        return section, section.section_offset
+
+    def _load_unmatched_variant_body(
+        self, idx: int, section: Section
+    ) -> FunctionData:
+        # 2-arg form: ``idx`` is the per-record idx. Find the owning base
+        # and return its slot ``idx - base`` -- the positional derivation
+        # the real session performs.
+        for base, bodies in self.unmatched_variant_function_data.items():
+            if base <= idx < base + len(bodies):
+                return bodies[idx - base]
+        raise IndexError(f"no unmatched record at idx {idx}")
 
 
 # ---------------------------------------------------------------------------

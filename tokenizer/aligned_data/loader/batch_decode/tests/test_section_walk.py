@@ -214,7 +214,14 @@ class _FakeSession:
     def _load_unmatched_variant_body(
         self, idx: int, section: Section
     ) -> FunctionData:
-        return self.unmatched_function_data[idx]
+        # 2-arg form: ``idx`` is the per-record idx. This fake uses the
+        # section's ``section_offset`` as its base idx, so the variant
+        # slot is ``idx - section.section_offset`` -- the positional
+        # derivation the real session performs.
+        v_idx = idx - section.section_offset
+        return self.unmatched_variant_function_data[
+            (section.section_offset, v_idx)
+        ]
 
     def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.unmatched_sections[idx]

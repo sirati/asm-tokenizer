@@ -87,9 +87,11 @@ def _make_section(n_variants: int, section_offset: int = 0) -> Section:
 
 @dataclass
 class _FakeSession:
-    """Hand-rolled stand-in for :class:`BinarySession` that exposes only
-    the two private load helpers :func:`resolve_section_pointers`
-    touches.
+    """Hand-rolled stand-in for :class:`BinarySession` that exposes the
+    lazy load helpers :func:`resolve_section_pointers` touches (the
+    body-free catalog parse plus the per-variant body load), plus the
+    legacy eager matched load the ``_old_inspector_peek`` regression
+    helper still calls directly.
     """
 
     matched_sections: Dict[int, Section] = field(default_factory=dict)
@@ -126,18 +128,35 @@ class _FakeSession:
     def _load_matched_section_and_variants(
         self, idx: int
     ) -> Tuple[Section, int, MatchedFunction]:
+        # Retained for the legacy ``_old_inspector_peek`` regression helper
+        # (a direct eager load, NOT the resolver path).
         section = self.matched_sections[idx]
         return section, section.section_offset, self.matched_functions[idx]
 
-    def _load_unmatched_section_and_all_variants(
-        self, idx: int
-    ) -> Tuple[Section, int, List[FunctionData]]:
+    # ---- lazy load helpers (the resolver's sampled-only contract) -----
+
+    def _matched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        section = self.matched_sections[idx]
+        return section, section.section_offset
+
+    def _load_matched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        return self.matched_functions[idx].variants[variant_index]
+
+    def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.unmatched_sections[idx]
-        return (
-            section,
-            section.section_offset,
-            self.unmatched_variant_function_data[idx],
-        )
+        return section, section.section_offset
+
+    def _load_unmatched_variant_body(
+        self, idx: int, section: Section
+    ) -> FunctionData:
+        # 2-arg form: ``idx`` is the per-record idx. Derive the slot
+        # ``idx - base`` from the owning base, mirroring the real session.
+        for base, bodies in self.unmatched_variant_function_data.items():
+            if base <= idx < base + len(bodies):
+                return bodies[idx - base]
+        raise IndexError(f"no unmatched record at idx {idx}")
 
 
 # ---------------------------------------------------------------------------
