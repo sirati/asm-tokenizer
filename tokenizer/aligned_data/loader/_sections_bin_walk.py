@@ -34,6 +34,7 @@ refuses to own.
 
 from __future__ import annotations
 
+import enum
 from pathlib import Path
 from typing import Dict, Iterator, Tuple
 
@@ -51,6 +52,23 @@ from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
     assert_matched_sections_prelude,
 )
+
+
+class SectionRegion(enum.Enum):
+    """Which region of the shared ``_sections.bin`` a read covers.
+
+    The catalog is emitted matched-region-first, unmatched-region-second.
+    Every consumer that re-reads the BIN (the realized-lengths /
+    realized-geometry dedup, the vectorized dataloader's columnar
+    pre-pass) discriminates ONLY on the region -- not on the sidecar
+    family -- so this is the single typed selector those reads share. It
+    lives beside the region-walk primitives (:func:`unmatched_region_start`
+    + :func:`walk_parsed_sections`) it selects between, so no consumer
+    re-derives the matched-vs-unmatched split inline.
+    """
+
+    MATCHED = "matched"
+    UNMATCHED = "unmatched"
 
 
 def read_sections_bin_blob(path: Path) -> Tuple[np.memmap, memoryview]:

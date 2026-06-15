@@ -27,13 +27,13 @@ unmatched arm needs no bespoke decoder.
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from tokenizer.aligned_data.loader._sections_bin_walk import (
+    SectionRegion,
     read_sections_bin_blob,
     unmatched_region_start,
     walk_parsed_sections,
@@ -49,19 +49,6 @@ from ._format import MATCHED_ARM, UNMATCHED_ARM, RealizedLengthsArm
 
 
 __all__ = ["ArmCatalog", "SectionRegion", "read_region_catalog", "read_arm_catalog"]
-
-
-class SectionRegion(enum.Enum):
-    """Which region of the shared ``_sections.bin`` a catalog read covers.
-
-    The two sidecar families (lengths + geometry) both dedup against the
-    same two regions; the region -- not the sidecar family -- is the only
-    discriminator the catalog read needs, so it is the typed selector
-    threaded into :func:`read_region_catalog`.
-    """
-
-    MATCHED = "matched"
-    UNMATCHED = "unmatched"
 
 
 #: Same record-offset shift the matched/unmatched arm loaders use:
