@@ -11,24 +11,38 @@ scatter; this module never implements backfill.
 Sampling parity (byte-identity contract): the SAME sampler
 ``batch_decode`` uses is reused verbatim -- :func:`...batch_decode.
 _resolve_pointers.resolve_section_pointers` (RNG-sampled native variant
-indices per section) + :func:`...batch_decode._section_walk._batch_idx.
+indices per section) + :func:`...batch_decode._batch_layout.
 compute_batch_idx_mapping` (the ALG-10 ``batch_idx`` layout). Driven from
 the same ``rng`` the two paths draw IDENTICAL samples, so the geometry +
 scatter assemble byte-identically against ``batch_decode`` with backfill
 off (the entry harness proves this).
 
+Per-arm dispatch (byte-identity for UNMATCHED roots): the sampler + the
+``batch_idx`` layout are ARM-AGNOSTIC -- one shared draw spans both arms.
+The geometry + scatter + dense passes, however, are ARM-SCOPED (each
+reads one arm's columnar catalog + RLG3 geometry + ``_data.bin``). So the
+orchestrator GROUPS the resolved batch rows by arm and runs the
+geometry -> scatter -> dense pipeline ONCE PER ARM against that arm's
+handles, then merges the per-arm (disjoint-row) full-batch results. The
+cross-arm DROP (a root that calls a callee in the OTHER arm) is automatic:
+each arm's ``LiveNodeAdjacency`` ``_sec_map`` holds only THAT arm's
+section offsets, so a cross-arm callee misses -> -1 -> dropped, exactly
+``batch_decode``'s arm-keyed behaviour. This module adds NO cross-arm
+following / inlining.
+
 The geometry handles (columnar catalog + RLG3 geometry + ``_variants.bin``
 + ``_data.bin``) are opened body-free via the SAME readers the index
-build uses (:func:`...sorted_index._prepass.read_section_variant_info`,
+build uses (:func:`...sorted_index._prepass.read_region_section_variant_info`,
 :class:`...realized_lengths.RealizedGeometryReader`) -- no bespoke BIN
-parse.
+parse. A single-arm :class:`.session_handles.VectorBatchHandles` is the
+historical MATCHED-only contract; a :class:`.session_handles.
+VectorBatchArmSet` carries both arms keyed by :class:`SectionKind`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -43,16 +57,11 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     VariantPadding,
 )
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
-from tokenizer.aligned_data.realized_lengths import (
-    RealizedGeometryReader,
-)
-from tokenizer.aligned_data.sorted_index._prepass import (
-    read_section_variant_info,
-)
 
 from ._geometry import compute_batch_geometry
+from ._merge import merge_arm_results
 from ._scatter import build_dense_sidecars, scatter_batch_tokens
-from .session_handles import VectorBatchHandles
+from .session_handles import VectorBatchArmSet, VectorBatchHandles
 
 
 __all__ = ["VectorBatchResult", "vector_batch_tokens"]
@@ -93,7 +102,7 @@ def vector_batch_tokens(
     session,
     section_pointers: List[SectionPointerSpec],
     *,
-    handles: VectorBatchHandles,
+    handles,
     num_variants_per_section: int,
     context_len: int,
     max_depth: int,
@@ -102,7 +111,7 @@ def vector_batch_tokens(
     augment_geometry=None,
     include_fid_sidecar: bool = False,
 ) -> VectorBatchResult:
-    """Sample -> geometry prepass -> fused scatter -> token + dense sidecars.
+    """Sample -> per-arm (geometry -> scatter -> dense) -> merge.
 
     Parameters
     ----------
@@ -110,14 +119,18 @@ def vector_batch_tokens(
         The :class:`BinarySession` the sampler resolves pointers +
         variants through (the SAME object ``batch_decode`` samples on).
     section_pointers:
-        The MATCHED-arm section pointers to batch (one ``(arm, idx)``
-        per section). Only ``SectionKind.MATCHED`` is supported by the
-        geometry path; an unmatched pointer raises.
+        The section pointers to batch (one ``(arm, idx)`` per section).
+        MATCHED and UNMATCHED roots are both supported when ``handles``
+        is a both-arms :class:`.session_handles.VectorBatchArmSet`; with
+        a single :class:`.session_handles.VectorBatchHandles` only the
+        arm that bundle was opened for may be sampled.
     handles:
-        The opened body-free + body geometry handles
-        (:class:`.session_handles.VectorBatchHandles`): the columnar
-        catalog + ``section_offsets``, the RLG3 geometry reader, and the
-        ``_variants.bin`` / ``_data.bin`` uint8 views.
+        Either a single-arm :class:`.session_handles.VectorBatchHandles`
+        (treated as the MATCHED arm -- the historical contract) or a
+        both-arms :class:`.session_handles.VectorBatchArmSet`. With an
+        arm set, matched + unmatched roots are each routed through their
+        own arm's columnar catalog + RLG3 geometry + ``_data.bin``, and
+        the per-arm row tensors merge back into the one batch.
     num_variants_per_section / context_len / max_depth / variant_padding /
     rng:
         The same knobs ``batch_decode`` takes; ``rng`` defaults to a
@@ -128,7 +141,7 @@ def vector_batch_tokens(
         provided it is a callable ``BatchGeometry -> BatchGeometry``
         applied AFTER the prepass and BEFORE the scatter (TD builds the
         backfill transform separately). This module never implements
-        backfill; it only leaves the hook.
+        backfill; it only leaves the hook. Applied per arm.
     include_fid_sidecar:
         When True, the dense pass also produces the per-Category FID
         sidecars (``fid_sidecar`` / ``fid_row_offsets`` /
@@ -143,15 +156,12 @@ def vector_batch_tokens(
     """
     if rng is None:
         rng = np.random.default_rng()
-    if section_pointers and any(
-        sp.arm is not SectionKind.MATCHED for sp in section_pointers
-    ):
-        raise NotImplementedError(
-            "vector_batch_tokens supports MATCHED-arm pointers only; the "
-            "RLG3 geometry + columnar catalog are matched-arm scoped"
-        )
+    handles_by_arm = _normalize_handles(handles)
 
     # --- sample EXACTLY as batch_decode does (shared sampler + rng) ------
+    # The sampler + batch_idx layout are ARM-AGNOSTIC: one shared draw
+    # spans both arms, so the per-arm runs assemble against the SAME
+    # canonical mapping batch_decode produced.
     resolved = resolve_section_pointers(
         session,
         section_pointers,
@@ -165,11 +175,121 @@ def vector_batch_tokens(
         rng=rng,
     )
 
-    # --- per-batch-row (catalog section idx, NATIVE variant idx) ---------
-    root_sections, root_variants = _rows_to_catalog_nodes(
-        batch_idx_to_section_variant, resolved
+    # --- dispatch each non-padding row to its arm's handles --------------
+    # Group the batch rows by arm; run the geometry -> scatter -> dense
+    # pipeline ONCE PER ARM against that arm's catalog + RLG3 geometry +
+    # _data.bin (over an arm-masked mapping so other arms' rows read as
+    # padding), then merge the per-arm disjoint-row full-batch results.
+    arm_results: List[VectorBatchResult] = []
+    for arm, arm_handles in handles_by_arm.items():
+        masked_mapping = _mask_other_arms(
+            batch_idx_to_section_variant, resolved, arm
+        )
+        if not _has_real_rows(masked_mapping):
+            continue
+        arm_results.append(
+            _run_arm_pipeline(
+                arm_handles,
+                masked_mapping=masked_mapping,
+                batch_size=batch_size,
+                resolved=resolved,
+                context_len=context_len,
+                max_depth=max_depth,
+                augment_geometry=augment_geometry,
+                include_fid_sidecar=include_fid_sidecar,
+            )
+        )
+
+    if not arm_results:
+        return _empty_result(
+            batch_idx_to_section_variant,
+            batch_size=batch_size,
+            context_len=context_len,
+            include_fid_sidecar=include_fid_sidecar,
+        )
+    return merge_arm_results(
+        arm_results,
+        batch_idx_to_section_variant=batch_idx_to_section_variant,
     )
 
+
+def _normalize_handles(handles) -> Dict[SectionKind, VectorBatchHandles]:
+    """Map ``handles`` to an arm -> :class:`VectorBatchHandles` dict.
+
+    A bare :class:`VectorBatchHandles` is the historical MATCHED-only
+    contract; a :class:`VectorBatchArmSet` carries both arms keyed by
+    :class:`SectionKind`. Returning a dict keyed by arm lets the dispatch
+    loop treat both shapes uniformly.
+    """
+    if isinstance(handles, VectorBatchArmSet):
+        return dict(handles.by_kind)
+    if isinstance(handles, VectorBatchHandles):
+        return {SectionKind.MATCHED: handles}
+    raise TypeError(
+        f"handles must be VectorBatchHandles or VectorBatchArmSet, got "
+        f"{type(handles).__name__}"
+    )
+
+
+def _mask_other_arms(
+    batch_idx_to_section_variant: np.ndarray,
+    resolved,
+    arm: SectionKind,
+) -> np.ndarray:
+    """Rewrite every row NOT belonging to ``arm`` to the padding sentinel.
+
+    A non-padding row ``r`` belongs to whichever arm its resolved root
+    carries (``resolved[mapping[r, 0]].arm``). Blanking the other arms'
+    rows to ``(UINT32_MAX, UINT32_MAX)`` makes the arm-scoped geometry +
+    dense passes see ONLY this arm's rows (the dense builder + the token
+    re-expand both key off the non-padding rows), yet the result still
+    carries the full ``[B, 2]`` shape so the per-arm results merge
+    row-wise. The original mapping is never mutated (a copy is returned).
+    """
+    mapping = np.asarray(batch_idx_to_section_variant)
+    masked = mapping.copy()
+    section_col = mapping[:, 0]
+    is_padding = section_col == _PADDING_SENTINEL
+    keep = np.zeros(mapping.shape[0], dtype=bool)
+    real_rows = np.nonzero(~is_padding)[0]
+    for r in real_rows.tolist():
+        if resolved[int(section_col[r])].arm is arm:
+            keep[r] = True
+    masked[~keep] = _PADDING_SENTINEL
+    return masked
+
+
+def _has_real_rows(batch_idx_to_section_variant: np.ndarray) -> bool:
+    """True iff the mapping carries at least one non-padding row."""
+    mapping = np.asarray(batch_idx_to_section_variant)
+    if mapping.shape[0] == 0:
+        return False
+    return bool((mapping[:, 0] != _PADDING_SENTINEL).any())
+
+
+def _run_arm_pipeline(
+    handles: VectorBatchHandles,
+    *,
+    masked_mapping: np.ndarray,
+    batch_size: int,
+    resolved,
+    context_len: int,
+    max_depth: int,
+    augment_geometry,
+    include_fid_sidecar: bool,
+) -> VectorBatchResult:
+    """Geometry -> scatter -> dense for ONE arm's rows, full-batch shaped.
+
+    ``masked_mapping`` is the canonical mapping with every OTHER arm's
+    rows rewritten to the padding sentinel, so the geometry + dense
+    passes run only over this arm's rows yet scatter back to the true
+    batch positions (the re-expand + the dense CSR both key off the
+    non-padding rows). The returned result fills only this arm's rows;
+    the orchestrator merges the per-arm results row-wise.
+    """
+    root_sections, root_variants = _rows_to_catalog_nodes(
+        masked_mapping, resolved
+    )
     geometry = compute_batch_geometry(
         cols=handles.cols,
         section_offsets=handles.section_offsets,
@@ -189,31 +309,23 @@ def vector_batch_tokens(
         data_u8=handles.data_u8,
         variants_u8=handles.variants_u8,
     )
-
-    # Re-expand the per-included-row tensor onto the full batch (padding
-    # rows stay all-zero). The geometry runs only over the non-padding
-    # rows; ``batch_idx_to_section_variant`` carries the padding layout.
     tokens = _expand_to_batch(
         scattered.tokens,
-        batch_idx_to_section_variant,
+        masked_mapping,
         batch_size=batch_size,
         context_len=context_len,
     )
-
-    # Dense identity + numeric sidecars from the SAME expanded bodies the
-    # token scatter produced (no _data.bin re-read / re-expand). Already
-    # placed onto the full batch (padding rows zero-length).
     dense = build_dense_sidecars(
         geometry,
         scattered.expanded,
         cols=handles.cols,
-        batch_idx_to_section_variant=batch_idx_to_section_variant,
+        batch_idx_to_section_variant=masked_mapping,
         batch_size=batch_size,
         include_fid_sidecar=include_fid_sidecar,
     )
     return VectorBatchResult(
         tokens=tokens,
-        batch_idx_to_section_variant=batch_idx_to_section_variant,
+        batch_idx_to_section_variant=masked_mapping,
         identities=dense.identities,
         identity_row_offsets=dense.identity_row_offsets,
         numbers_significant=dense.numbers_significant,
@@ -225,13 +337,49 @@ def vector_batch_tokens(
     )
 
 
+def _empty_result(
+    batch_idx_to_section_variant: np.ndarray,
+    *,
+    batch_size: int,
+    context_len: int,
+    include_fid_sidecar: bool,
+) -> VectorBatchResult:
+    """The all-padding result (no non-padding row in any arm).
+
+    Mirrors ``batch_decode``'s empty-batch shape: an all-zero ``[B, L]``
+    token tensor, the canonical mapping, and zero-length dense sidecars
+    with ``[B + 1]`` all-zero CSR offsets (+ ``[B, 3]`` zero FID counts
+    when the flag is set).
+    """
+    tokens = np.zeros((batch_size, context_len), dtype=np.uint16)
+    zero_offsets = np.zeros(batch_size + 1, dtype=np.uint32)
+    if include_fid_sidecar:
+        fid_sidecar = np.empty(0, dtype=np.uint16)
+        fid_row_offsets = np.zeros(batch_size + 1, dtype=np.uint32)
+        fid_per_category_counts = np.zeros((batch_size, 3), dtype=np.uint32)
+    else:
+        fid_sidecar = fid_row_offsets = fid_per_category_counts = None
+    return VectorBatchResult(
+        tokens=tokens,
+        batch_idx_to_section_variant=np.asarray(batch_idx_to_section_variant),
+        identities=np.empty(0, dtype=np.uint16),
+        identity_row_offsets=zero_offsets,
+        numbers_significant=np.empty(0, dtype=np.uint64),
+        numbers_sign_exponent=np.empty(0, dtype=np.uint32),
+        number_row_offsets=zero_offsets.copy(),
+        fid_sidecar=fid_sidecar,
+        fid_row_offsets=fid_row_offsets,
+        fid_per_category_counts=fid_per_category_counts,
+    )
+
+
 def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved):
     """Per NON-padding batch row, ``(catalog_section_idx, native_variant)``.
 
     ``batch_idx_to_section_variant`` column 0 is the position in
     ``resolved``; column 1 is the SLOT into that section's
     ``sampled_variant_indices`` (post-sampling, NOT the native variant).
-    The prepass needs the catalog section index (MATCHED ``idx``) + the
+    The prepass needs the catalog section index (per-arm ``idx``) + the
     NATIVE variant index, so we map both through ``resolved``.
     """
     mapping = np.asarray(batch_idx_to_section_variant, dtype=np.int64)
