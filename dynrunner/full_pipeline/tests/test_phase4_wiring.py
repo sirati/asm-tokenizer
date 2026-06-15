@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
+
 from dynamic_runner import TaskDep
 
 from dynrunner.binary_selection import BinaryIdentifier, TaskInfo
@@ -116,6 +118,41 @@ def test_index_types_route_to_memmap_subdir() -> None:
         out = argv[argv.index("--output") + 1]
         assert src == str(Path("/root/out") / "memmap")
         assert out == str(Path("/root/out") / "memmap")
+
+
+def test_sorted_index_worker_argv_carries_mode_and_depth() -> None:
+    """Closes the threading coverage hole: the sorted-index worker argv
+    MUST carry the dispatcher's --mode/--depth (the worker declares them
+    required; an omitted pair yields zero .idx). The realized-length
+    worker takes no mode/depth (it ignores them), so it is excluded.
+
+    Asserts the actual reduction/depth VALUES the dispatcher parsed reach
+    the worker argv, not merely that the flags are present."""
+    fp = FullPipelineTask()
+    args = _composite_args()  # parsed with --mode p75 --depth 0
+    argv = fp.build_worker_command_args(
+        SORTED_INDEX_TYPE, args, "/root/out", "/root/out", False
+    )
+    assert "--mode" in argv and "--depth" in argv
+    assert argv[argv.index("--mode") + 1] == "p75"
+    assert argv[argv.index("--depth") + 1] == "0"
+    # The realized-length worker is configured solely by --source/--output.
+    rlen_argv = fp.build_worker_command_args(
+        REALIZED_LENGTHS_TYPE, args, "/root/out", "/root/out", False
+    )
+    assert "--mode" not in rlen_argv and "--depth" not in rlen_argv
+
+
+def test_composite_parse_fails_loud_when_mode_depth_omitted() -> None:
+    """The dispatcher must FAIL at parse time when --mode/--depth are
+    omitted (mirroring the sorted-index worker's required=True), rather
+    than silently emitting an incomplete worker argv that crashes the
+    worker mid-run and produces no .idx."""
+    fp = FullPipelineTask()
+    parser = argparse.ArgumentParser()
+    fp.add_task_arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--unified-vocab", "unified_vocab.csv"])
 
 
 def test_build_index_items_decorate_cross_phase_dep() -> None:

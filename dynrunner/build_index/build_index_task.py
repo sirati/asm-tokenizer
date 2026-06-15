@@ -269,23 +269,27 @@ class BuildIndexTask:
         parser.add_argument(
             "--mode",
             action="append",
-            default=None,
+            required=True,
             metavar="MODE",
             help=(
                 "Sorted-index reduction mode (repeatable). 'max' or "
-                "'p<NN>' (1<=NN<=99). Required for the sorted-index "
-                "type; forwarded verbatim to its worker."
+                "'p<NN>' (1<=NN<=99). Required: the sorted-index worker "
+                "declares it required, so the dispatcher enforces it at "
+                "parse time — fail-loud here rather than letting an "
+                "omitted flag yield an incomplete worker argv (and zero "
+                ".idx). Forwarded verbatim to its worker."
             ),
         )
         parser.add_argument(
             "--depth",
             action="append",
             type=int,
-            default=None,
+            required=True,
             metavar="DEPTH",
             help=(
-                "Sorted-index splice depth (repeatable). Required for "
-                "the sorted-index type; forwarded verbatim to its "
+                "Sorted-index splice depth (repeatable). Required: see "
+                "--mode — the dispatcher enforces the worker's "
+                "requirement at parse time. Forwarded verbatim to its "
                 "worker."
             ),
         )
