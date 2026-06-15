@@ -95,47 +95,27 @@ def test_matched_variant_body_matches_all_variants_load(synthetic_binary) -> Non
 
 
 def test_unmatched_variant_body_matches_full_load(synthetic_binary) -> None:
-    """``_load_unmatched_variant_body(base, J, section)`` equals the
-    section-deriving full record load at record ``base + J`` for EVERY
-    variant slot J of every unmatched section, and issues NO second
-    section parse (the threaded ``section`` is reused).
-
-    Pins the J-resolved body selection: the unmatched body load picks
-    ``section.variants[J]``'s record (one record per variant, contiguous
-    from the section's first-record idx), NOT always the first record.
-    """
+    """``_load_unmatched_variant_body(idx, section)`` equals the
+    section-deriving full record load's ``FunctionData`` and issues NO
+    second section parse (the threaded ``section`` is reused)."""
     fb = synthetic_binary
     ds = BinaryDataset(
         fb["base_path"], fb["binary_name"], vocab_manager=fb["vocab"]
     )
     with ds.open_session() as sess:
-        arm = sess.get_metadata("unmatched_arm")
-        starts = arm.starts
-        # Walk per first-record idx (a section base); for each variant
-        # slot J the J-resolved body must equal the full record load at
-        # base + J. ``_idx_for_section_offset`` is the production path
-        # that hands the callee walk the section's first-record idx.
-        seen_bases: set = set()
-        for record_idx in range(len(starts)):
-            section_idx = sess._unmatched_section_idx(arm, record_idx)
-            base = sess._unmatched_record_slot_base(arm, section_idx)
-            if base in seen_bases:
-                continue
-            seen_bases.add(base)
-            meta_section, _meta_offset = sess._unmatched_section_meta(base)
-            for slot in range(len(meta_section.variants)):
-                _section, _offset, full_fd = (
-                    sess._load_unmatched_record_and_section(base + slot)
-                )
-                with _count_section_parses(sess) as parses:
-                    one = sess._load_unmatched_variant_body(
-                        base, slot, meta_section
-                    )
-                assert parses == [], (
-                    f"unmatched body load re-parsed _sections.bin "
-                    f"(base={base}, slot={slot}, offsets={parses})"
-                )
-                _assert_function_data_equal(one, full_fd)
+        starts = sess.get_metadata("unmatched_arm").starts
+        for idx in range(len(starts)):
+            _section, _offset, full_fd = (
+                sess._load_unmatched_record_and_section(idx)
+            )
+            meta_section, _meta_offset = sess._unmatched_section_meta(idx)
+            with _count_section_parses(sess) as parses:
+                one = sess._load_unmatched_variant_body(idx, meta_section)
+            assert parses == [], (
+                f"unmatched body load re-parsed _sections.bin "
+                f"(idx={idx}, offsets={parses})"
+            )
+            _assert_function_data_equal(one, full_fd)
 
 
 def test_root_bodies_reuse_threaded_section_no_reparse(

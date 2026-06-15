@@ -147,13 +147,6 @@ def _load_root_bodies(
     Only the ``_idx_for_section_offset`` reverse-lookup (a cheap array
     ``np.where``, not a section parse) recovers the per-arm idx the body
     loaders need.
-
-    The returned list is parallel to ``section.variants`` for BOTH arms,
-    so the caller's ``bodies[root_variant_idx]`` selects the sampled
-    variant's body. Unmatched sections (one record per variant, laid out
-    contiguously from the first-record ``idx``) get one body per slot
-    just like matched, so a non-first sampled root variant gets its OWN
-    body, not always the first record.
     """
     idx = session._idx_for_section_offset(
         int(section.section_offset), arm.value
@@ -163,10 +156,7 @@ def _load_root_bodies(
             session._load_matched_variant_body(idx, v, section)
             for v in range(len(section.variants))
         ]
-    return [
-        session._load_unmatched_variant_body(idx, v, section)
-        for v in range(len(section.variants))
-    ]
+    return [session._load_unmatched_variant_body(idx, section)]
 
 
 @dataclass

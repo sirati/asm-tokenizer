@@ -311,64 +311,47 @@ class BinarySession(_BinarySessionHelpersMixin):
         return section, section_offset, fd
 
     def _load_unmatched_variant_body(
-        self, idx: int, variant_index: int, section: Section
+        self, idx: int, section: Section
     ) -> FunctionData:
-        """Load ONE unmatched section variant body, reusing the section.
-
-        ``idx`` is the section's FIRST-RECORD idx (the value
-        :py:meth:`_idx_for_section_offset` returns for the unmatched arm);
-        ``variant_index`` is the J-resolved index into ``section.variants``
-        the caller chose via :func:`choose_callee_variant`. Unmatched
-        sections store ONE record per variant, contiguously from the
-        first-record idx, so variant ``J``'s body is the record at
-        ``idx + J`` -- mirroring the matched arm's
-        ``section.variants[variant_index]`` selection so the J-resolved
-        callee variant body splices, not always the first record.
+        """Load ONE unmatched record body, reusing the threaded section.
 
         ``section`` is the already-parsed owning section the caller
         obtained from :py:meth:`_unmatched_section_meta` (threaded through
         the callee walk's :class:`ResolvedCalleeMeta`), so this load does
         NOT re-derive it via :py:meth:`_unmatched_section_for_record` (no
-        ``_sections.bin`` re-parse). Raises :class:`IndexError` if
-        ``variant_index`` is out of range -- the caller chose to load a
-        specific variant, so silent wrap-around would hide the bug.
+        ``_sections.bin`` re-parse). The drift sanity check
+        (``data_offset_shifted << 4 == start``) already fired when the
+        metadata stage parsed this section, so it is not re-run here.
 
         Returns the same ``FunctionData`` the section-deriving
-        :py:meth:`_load_unmatched_record_and_section` would for record
-        ``idx + variant_index``: the per-record body sliced from
-        ``_unmatched_data.bin``, with the per-slot variant resolved
-        against ``section.variants``.
+        :py:meth:`_load_unmatched_record_and_section` would for ``idx``:
+        the per-record body sliced from ``_unmatched_data.bin`` at
+        ``starts[idx]``, with the per-slot variant resolved against
+        ``section.variants``.
         """
-        if variant_index < 0 or variant_index >= len(section.variants):
-            raise IndexError(
-                f"unmatched section first-record idx={idx} has "
-                f"{len(section.variants)} variants; variant_index "
-                f"{variant_index} out of range"
-            )
         arm = self._meta_get("unmatched_arm")
         starts = arm_arrays(arm, "unmatched", self._binary_name)
-        # Variant J's body is the record at the section's first-record
-        # idx plus the in-section slot J (records are laid out one per
-        # variant, contiguously, by the pass-2 unmatched writer).
-        record_idx = idx + variant_index
-        if record_idx >= len(starts):
-            raise IndexError(
-                f"Index {record_idx} out of bounds for unmatched functions"
-            )
-        start = int(starts[record_idx])
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        start = int(starts[idx])
         data_mmap = self._open_data("unmatched")
         insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
-        # Per-record -> per-variant slot inside the owning section. The
-        # slot is the offset from the section's first-record idx; threaded
-        # into the builder so the per-slot ``variant_ref`` resolves to
-        # THIS record's canonical-4 axes (not the section's first variant).
+        # Per-record -> per-variant slot inside the owning section.
+        # Unmatched sections store one record per variant; the slot is
+        # the offset from the section's first-record idx in the arm's
+        # ``record_to_section_idx`` mapping. Threaded into the builder
+        # so the per-slot ``variant_ref`` resolves to THIS record's
+        # canonical-4 axes (not the section's first variant).
+        section_idx = self._unmatched_section_idx(arm, idx)
+        base = self._unmatched_record_slot_base(arm, section_idx)
+        variant_slot = idx - base
         line_to_name = self._meta_get("line_to_name") or {}
         return build_unmatched_function_data(
             section,
-            self._unmatched_func_name(arm, record_idx),
+            self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
-            variant_slot=variant_index,
+            variant_slot=variant_slot,
             resolve_ref=self.get_variant_by_ref,
             line_to_name=line_to_name,
         )
