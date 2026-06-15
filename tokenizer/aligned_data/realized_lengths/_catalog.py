@@ -27,6 +27,7 @@ unmatched arm needs no bespoke decoder.
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,7 +48,20 @@ from tokenizer.aligned_data.sorted_index._prepass import (
 from ._format import MATCHED_ARM, UNMATCHED_ARM, RealizedLengthsArm
 
 
-__all__ = ["ArmCatalog", "read_arm_catalog"]
+__all__ = ["ArmCatalog", "SectionRegion", "read_region_catalog", "read_arm_catalog"]
+
+
+class SectionRegion(enum.Enum):
+    """Which region of the shared ``_sections.bin`` a catalog read covers.
+
+    The two sidecar families (lengths + geometry) both dedup against the
+    same two regions; the region -- not the sidecar family -- is the only
+    discriminator the catalog read needs, so it is the typed selector
+    threaded into :func:`read_region_catalog`.
+    """
+
+    MATCHED = "matched"
+    UNMATCHED = "unmatched"
 
 
 #: Same record-offset shift the matched/unmatched arm loaders use:
@@ -80,21 +94,46 @@ def _empty_catalog() -> ArmCatalog:
     )
 
 
+def read_region_catalog(
+    base_path: Path, binary_name: str, region: SectionRegion
+) -> ArmCatalog:
+    """Read ``region``'s per-section CSR + per-variant record offsets.
+
+    Dispatches to the matched or unmatched region read; both funnel
+    through :func:`parse_sections_columnar` so the on-disk variant
+    layout is decoded by exactly one parser. Region-keyed so both
+    sidecar families (lengths + geometry) share one catalog read.
+    """
+    base_path = Path(base_path)
+    if region is SectionRegion.MATCHED:
+        return _read_matched(base_path, binary_name)
+    if region is SectionRegion.UNMATCHED:
+        return _read_unmatched(base_path, binary_name)
+    raise ValueError(f"unknown section region: {region!r}")
+
+
+#: Maps a length-arm to the region it dedups against. The geometry arms
+#: carry their region directly (a :class:`SectionRegion` field), so only
+#: the legacy length arm needs this name->region bridge.
+_ARM_REGION = {
+    MATCHED_ARM.name: SectionRegion.MATCHED,
+    UNMATCHED_ARM.name: SectionRegion.UNMATCHED,
+}
+
+
 def read_arm_catalog(
     base_path: Path, binary_name: str, arm: RealizedLengthsArm
 ) -> ArmCatalog:
     """Read ``arm``'s per-section CSR + per-variant record offsets.
 
-    Dispatches to the matched or unmatched region read; both funnel
-    through :func:`parse_sections_columnar` so the on-disk variant
-    layout is decoded by exactly one parser.
+    Thin region-bridge over :func:`read_region_catalog` for the legacy
+    realized-length arm (preserves the original API + callers).
     """
-    base_path = Path(base_path)
-    if arm is MATCHED_ARM:
-        return _read_matched(base_path, binary_name)
-    if arm is UNMATCHED_ARM:
-        return _read_unmatched(base_path, binary_name)
-    raise ValueError(f"unknown realized-lengths arm: {arm!r}")
+    try:
+        region = _ARM_REGION[arm.name]
+    except KeyError:
+        raise ValueError(f"unknown realized-lengths arm: {arm!r}")
+    return read_region_catalog(base_path, binary_name, region)
 
 
 def _from_columns(
