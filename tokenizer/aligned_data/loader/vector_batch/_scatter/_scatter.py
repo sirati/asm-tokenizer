@@ -36,7 +36,7 @@ from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 from .._types import BatchGeometry
 from ._body_load import gather_node_bodies
-from ._expand import expand_node_bodies
+from ._expand import ExpandedBatch, expand_node_bodies
 from ._locator import node_token_spans
 from ._prefix_values import variant_prefix_values
 from ._token_scatter import scatter_tokens
@@ -50,14 +50,15 @@ class ScatteredTokens:
     """The token-tensor scatter result.
 
     ``tokens`` is the model-facing ``u16[B, L]`` tensor (``id == 0`` is
-    the null-content pad). ``expanded_node_offsets`` is the per-emitted-
-    node CSR into the (internally held) flat expanded stream -- exposed
-    so the dense-sidecar pass can reuse the SAME single body load +
-    expand rather than re-reading bodies (no re-parse in the call chain).
+    the null-content pad). ``expanded`` is the per-emitted-node expansion
+    (the flat stream + CSR + the threaded per-node state + promotion
+    masks) -- exposed so the dense-sidecar pass reuses the SAME single
+    body load + expand rather than re-reading bodies (no re-parse in the
+    call chain).
     """
 
     tokens: np.ndarray
-    expanded_node_offsets: np.ndarray
+    expanded: ExpandedBatch
 
 
 def scatter_batch_tokens(
@@ -118,6 +119,4 @@ def scatter_batch_tokens(
     tokens = scatter_tokens(
         geometry, expanded, prefix_tokens, prefix_offsets
     )
-    return ScatteredTokens(
-        tokens=tokens, expanded_node_offsets=expanded.node_offsets
-    )
+    return ScatteredTokens(tokens=tokens, expanded=expanded)

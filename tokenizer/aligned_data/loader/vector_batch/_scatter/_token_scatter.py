@@ -32,6 +32,8 @@ from __future__ import annotations
 import numpy as np
 
 from ._expand import ExpandedBatch
+from ._surviving import row_of_node as _row_of_node
+from ._surviving import surviving_token_counts
 from .._types import BatchGeometry
 
 
@@ -90,13 +92,9 @@ def scatter_tokens(
         )
 
     pref = np.asarray(layout.prefix_len, dtype=np.int64)
-    straddler_local = np.asarray(layout.straddler_local_idx, dtype=np.int64)
-    partial_cut = np.asarray(layout.partial_cut_length, dtype=np.int64)
 
     # --- per-emitted-node geometry ---------------------------------------
-    row_of_node = np.repeat(
-        np.arange(n_rows, dtype=np.int64), np.diff(roff)
-    )
+    row_of_node = _row_of_node(geometry)
     local_idx = np.arange(n_emitted, dtype=np.int64) - roff[row_of_node]
     # Body-relative start column of each node = own-length prefix-sum of
     # the row's prior nodes (global cumsum minus the row's base cumsum).
@@ -105,18 +103,11 @@ def scatter_tokens(
     body_start = gcum[:-1] - body_base[row_of_node]  # int64[n_emitted]
 
     # --- per-node surviving column count ---------------------------------
-    # Default: the whole own_length survives. The straddler keeps only its
-    # partial_cut prefix; nodes after the straddler keep nothing. Rows
-    # with no straddler (straddler_local == -1) keep every node whole.
-    straddler_of_node = straddler_local[row_of_node]
-    cut_of_node = partial_cut[row_of_node]
-    has_straddler = straddler_of_node >= 0
-    after_straddler = has_straddler & (local_idx > straddler_of_node)
-    is_straddler = has_straddler & (local_idx == straddler_of_node)
-
-    surviving = own.copy()
-    surviving[is_straddler] = cut_of_node[is_straddler]
-    surviving[after_straddler] = 0
+    # The straddler keeps only its partial_cut prefix; nodes after the
+    # straddler keep nothing; full rows keep every node whole. Shared with
+    # the dense-sidecar pass (:mod:`._surviving`) so the cut can never
+    # drift between the two arms.
+    surviving = surviving_token_counts(geometry)
 
     # --- flat (row, col, value) of every surviving body slot -------------
     rows_flat, cols_flat, vals_flat = _flatten_node_writes(

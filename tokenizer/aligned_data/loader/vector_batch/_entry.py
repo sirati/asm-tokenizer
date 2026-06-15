@@ -51,7 +51,7 @@ from tokenizer.aligned_data.sorted_index._prepass import (
 )
 
 from ._geometry import compute_batch_geometry
-from ._scatter import scatter_batch_tokens
+from ._scatter import build_dense_sidecars, scatter_batch_tokens
 from .session_handles import VectorBatchHandles
 
 
@@ -65,16 +65,28 @@ _PADDING_SENTINEL = np.iinfo(np.uint32).max
 
 @dataclass(frozen=True)
 class VectorBatchResult:
-    """The vectorized path's token-tensor result (backfill OFF).
+    """The vectorized path's full result (backfill OFF).
 
-    Mirrors the ``batch_decode`` fields the byte-identity harness
-    compares: the ``u16[B, L]`` token tensor + the ``u32[B, 2]``
-    ``(section_idx, variant_idx)`` mapping (padding rows hold the
-    ``(UINT32_MAX, UINT32_MAX)`` sentinel, same as ``batch_decode``).
+    Mirrors the ``batch_decode`` ``BatchDecodeResult`` fields the
+    byte-identity harness compares: the ``u16[B, L]`` token tensor, the
+    ``u32[B, 2]`` ``(section_idx, variant_idx)`` mapping (padding rows
+    hold the ``(UINT32_MAX, UINT32_MAX)`` sentinel), AND the DENSE
+    sidecars -- the post-remap caller-local->counter identity array (+
+    offsets), the ``(significand, sign_exp)`` numeric arrays (+ offsets),
+    and the optional per-Category FID sidecars. Every array is
+    byte-identical to ``batch_decode`` with backfill off.
     """
 
     tokens: np.ndarray
     batch_idx_to_section_variant: np.ndarray
+    identities: np.ndarray
+    identity_row_offsets: np.ndarray
+    numbers_significant: np.ndarray
+    numbers_sign_exponent: np.ndarray
+    number_row_offsets: np.ndarray
+    fid_sidecar: Optional[np.ndarray]
+    fid_row_offsets: Optional[np.ndarray]
+    fid_per_category_counts: Optional[np.ndarray]
 
 
 def vector_batch_tokens(
@@ -88,8 +100,9 @@ def vector_batch_tokens(
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
     rng: Optional[np.random.Generator] = None,
     augment_geometry=None,
+    include_fid_sidecar: bool = False,
 ) -> VectorBatchResult:
-    """Sample -> geometry prepass -> fused scatter -> token tensor.
+    """Sample -> geometry prepass -> fused scatter -> token + dense sidecars.
 
     Parameters
     ----------
@@ -116,11 +129,17 @@ def vector_batch_tokens(
         applied AFTER the prepass and BEFORE the scatter (TD builds the
         backfill transform separately). This module never implements
         backfill; it only leaves the hook.
+    include_fid_sidecar:
+        When True, the dense pass also produces the per-Category FID
+        sidecars (``fid_sidecar`` / ``fid_row_offsets`` /
+        ``fid_per_category_counts``), matching ``batch_decode``'s
+        same-named flag. Default ``False`` (those fields are ``None``).
 
     Returns
     -------
     VectorBatchResult
-        The token tensor + the ``batch_idx_to_section_variant`` mapping.
+        The token tensor + the ``batch_idx_to_section_variant`` mapping
+        + the dense identity / numeric sidecars (+ optional FID sidecars).
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -180,9 +199,29 @@ def vector_batch_tokens(
         batch_size=batch_size,
         context_len=context_len,
     )
+
+    # Dense identity + numeric sidecars from the SAME expanded bodies the
+    # token scatter produced (no _data.bin re-read / re-expand). Already
+    # placed onto the full batch (padding rows zero-length).
+    dense = build_dense_sidecars(
+        geometry,
+        scattered.expanded,
+        cols=handles.cols,
+        batch_idx_to_section_variant=batch_idx_to_section_variant,
+        batch_size=batch_size,
+        include_fid_sidecar=include_fid_sidecar,
+    )
     return VectorBatchResult(
         tokens=tokens,
         batch_idx_to_section_variant=batch_idx_to_section_variant,
+        identities=dense.identities,
+        identity_row_offsets=dense.identity_row_offsets,
+        numbers_significant=dense.numbers_significant,
+        numbers_sign_exponent=dense.numbers_sign_exponent,
+        number_row_offsets=dense.number_row_offsets,
+        fid_sidecar=dense.fid_sidecar,
+        fid_row_offsets=dense.fid_row_offsets,
+        fid_per_category_counts=dense.fid_per_category_counts,
     )
 
 

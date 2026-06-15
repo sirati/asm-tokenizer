@@ -28,7 +28,7 @@ correctness is never traded for speed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -86,6 +86,26 @@ class ExpandedBatch:
     expanded: np.ndarray  # uint16[total_expanded]
     node_offsets: np.ndarray  # int64[n_nodes + 1] -- CSR into ``expanded``
 
+    states: list = field(default_factory=list)
+    """Per-emitted-node :class:`~tokenizer.aligned_data.loader.decoded.
+    _inline_decode_state.InlineDecodeState`, parallel to
+    ``geometry.emission.node``. Built once here (over the gathered raw
+    body); the dense pass (:mod:`._dense`) reads ``raw_tokens`` /
+    ``runlen_number`` / ``digit_cumsum`` / ``real_mask`` /
+    ``is_negative_per_position`` off it instead of re-parsing the body
+    (no re-parse in the call chain). Defaults empty for the token-only
+    test constructors that do not exercise the dense pass."""
+
+    extra_value_v2_masks: list = field(default_factory=list)
+    """Per-node VC2 promotion mask from ``expand_tokens`` (slot 0 =
+    prepend, always False). The dense number-decode kernel reads it to
+    skip painted VC2 continuation slots."""
+
+    extra_f128_masks: list = field(default_factory=list)
+    """Per-node F128 promotion mask from ``expand_tokens`` (slot 0 =
+    prepend, always False). The dense number-decode kernel reads it to
+    skip painted F128 continuation slots + detect finite F128 sources."""
+
 
 def expand_node_bodies(
     bodies: GatheredBodies,
@@ -122,10 +142,17 @@ def expand_node_bodies(
     node_offsets = np.zeros(n_nodes + 1, dtype=np.int64)
     if n_nodes == 0:
         return ExpandedBatch(
-            expanded=np.zeros(0, dtype=np.uint16), node_offsets=node_offsets
+            expanded=np.zeros(0, dtype=np.uint16),
+            node_offsets=node_offsets,
+            states=[],
+            extra_value_v2_masks=[],
+            extra_f128_masks=[],
         )
 
     pieces: list[np.ndarray] = []
+    states: list = []
+    extra_value_v2_masks: list[np.ndarray] = []
+    extra_f128_masks: list[np.ndarray] = []
     lengths = np.empty(n_nodes, dtype=np.int64)
     for i in range(n_nodes):
         raw_tokens = raw[rec[i] : rec[i + 1]]
@@ -133,11 +160,17 @@ def expand_node_bodies(
             raw_tokens, format_version=_UNIFIED_VOCAB_FORMAT_VERSION
         )
         category = _CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(int(types[i]))]
-        expanded = expand_tokens(
+        # Retain the FULL expansion result -- the dense pass reuses the
+        # promotion masks + the parsed state rather than re-running
+        # ``expand_tokens`` / re-parsing the body.
+        result = expand_tokens(
             _ExpandShim(state=state, encounter_category=category)
-        ).expanded_token_ids
-        pieces.append(expanded)
-        lengths[i] = expanded.shape[0]
+        )
+        pieces.append(result.expanded_token_ids)
+        states.append(state)
+        extra_value_v2_masks.append(result.extra_value_v2_mask)
+        extra_f128_masks.append(result.extra_f128_mask)
+        lengths[i] = result.expanded_token_ids.shape[0]
 
     np.cumsum(lengths, out=node_offsets[1:])
     expanded_flat = (
@@ -148,4 +181,7 @@ def expand_node_bodies(
     return ExpandedBatch(
         expanded=expanded_flat.astype(np.uint16, copy=False),
         node_offsets=node_offsets,
+        states=states,
+        extra_value_v2_masks=extra_value_v2_masks,
+        extra_f128_masks=extra_f128_masks,
     )

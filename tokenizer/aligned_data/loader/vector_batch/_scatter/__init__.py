@@ -17,10 +17,22 @@ Single-concern submodules:
   body-free from ``_variants.bin``.
 * :mod:`._token_scatter` -- the single batched ``[B, L]`` scatter +
   straddler cut.
+* :mod:`._surviving` -- the per-node surviving-column count under the
+  straddler cut (shared by the token scatter + the dense pass).
+* :mod:`._dense_adapter` -- flat emission -> staged ``Stage2Batch`` for
+  the dense kernels.
+* :mod:`._dense` -- the dense identity + numeric sidecar producer (reuses
+  the ``batch_decode`` decode kernels; byte-identical with backfill OFF).
 * :mod:`._scatter` -- the orchestrator.
 """
 
+from ._dense import DenseSidecars, build_dense_sidecars
 from ._scatter import ScatteredTokens, scatter_batch_tokens
 
 
-__all__ = ["ScatteredTokens", "scatter_batch_tokens"]
+__all__ = [
+    "DenseSidecars",
+    "ScatteredTokens",
+    "build_dense_sidecars",
+    "scatter_batch_tokens",
+]
