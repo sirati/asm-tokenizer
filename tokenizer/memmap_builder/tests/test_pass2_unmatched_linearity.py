@@ -59,6 +59,7 @@ def _record(func_name, occurrence, *, seed, called=()):
         tokens=np.array([t, t + 1, t + 2], dtype=np.uint16),
         called_funcs=list(called),
         extern_libraries={},
+        called_occurrences={},
         content_hash=seed,  # globally unique -> distinct sections, no dedup link
     )
 

@@ -233,6 +233,7 @@ def _emit_variant_per_call_entries(
     registry: FunctionNamesRegistry,
     sectioned_func_names: "set[str]",
     duplicated_names: "set[str]",
+    variant_called_occurrences: "dict[str, int]",
 ) -> None:
     """Translate one variant's ``called`` set into per-call BIN entries.
 
@@ -274,7 +275,27 @@ def _emit_variant_per_call_entries(
     list-position match between encoder-allocation order and the
     section's ``call_target`` table (plan Decisions 20 + 21) is
     preserved within each category block.
+
+    ``variant_called_occurrences`` maps a callee name to the sibling
+    ``occurrence`` ordinal this caller variant targets, for calls into
+    DUPLICATED canonical names only (callee_name -> k). It is the
+    per-variant sidecar harvested by
+    :func:`parsed_record_iter.called_from_v2_metadata` from the producer-
+    injected ``local_funcs[].occurrence`` field, threaded through pass-1
+    unchanged. A duplicated callee ABSENT from this map (no injected
+    occurrence, an unresolved/indirect call, or an ambiguous edge the
+    extractor demoted because one caller targeted two siblings of the same
+    name) is unresolvable and stamps the missing sentinel — see the
+    decision matrix below.
     """
+    # NOTE (plumbing): ``variant_called_occurrences`` is threaded to this
+    # seam but not yet consulted — calls into a DUPLICATED callee still
+    # stamp the blanket missing sentinel below, exactly as before. The
+    # occurrence-aware decision matrix (resolve a dup call into the
+    # occurrence-k sibling vs. the missing sentinel) lands together with
+    # its only consumer, the SectionWriter's (FID, occurrence)-aware
+    # back-patch — so this commit stays strictly behavior-preserving and
+    # carries no computed-but-unused value.
     entries: List[PerCallEntry] = []
     for callee_name, callee_type in variant_called:
         if callee_type is CallTargetType.EXTERN:
@@ -456,6 +477,7 @@ def write_matched_sections_pass2(
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
                 duplicated_names=duplicated_names,
+                variant_called_occurrences=vdata.get("called_occurrences", {}),
             )
             section_writer.end_variant(vkey=vkey)
 
@@ -512,7 +534,11 @@ def group_unmatched_entries_by_function(
     Typed-callee carry-over: the ``called`` set under each grouped
     entry preserves the ``(name, CallTargetType)`` tuple shape from
     pass 1, and ``extern_libraries`` accumulates across the function
-    group's per-variant entries. Same-name-different-library across
+    group's per-variant entries. ``called_occurrences_by_version`` is a
+    parallel per-variant list (indexed by ``comp_set_id``, same position
+    as ``vkeys`` / ``version_data_list``) of each body's
+    callee-name -> sibling-occurrence map; it is NOT unioned into the
+    cross-variant table so each caller body resolves its own call edges. Same-name-different-library across
     variants on the SAME extern name is a builder bug; the first
     encountered library wins and a warning is logged at the BIN-
     emission site (this aggregator stays I/O-free).
@@ -541,6 +567,7 @@ def group_unmatched_entries_by_function(
                 "func_name": func_name,
                 "version_data_list": [],
                 "called_by_version": [],
+                "called_occurrences_by_version": [],
                 "vkeys": [],
                 "_per_variant_extern_libraries": [],
             }
@@ -552,6 +579,14 @@ def group_unmatched_entries_by_function(
         comp_set_id = len(group["vkeys"])
         group["vkeys"].append(vkey)
         group["called_by_version"].append((comp_set_id, entry["called"]))
+        # Per-variant sibling-disambiguator map (callee_name -> occurrence),
+        # indexed by ``comp_set_id`` (same position as ``vkeys`` /
+        # ``version_data_list``). Carried per-variant — NOT folded into the
+        # cross-variant ``all_called`` table — so each body resolves its own
+        # call edges. Defaults to ``{}`` for entries predating the field.
+        group["called_occurrences_by_version"].append(
+            entry.get("called_occurrences", {})
+        )
         group["_per_variant_extern_libraries"].append(entry["extern_libraries"])
 
     # Single-source-of-truth merges (extern libraries + typed-callee
@@ -681,6 +716,7 @@ def write_unmatched_sections_pass2(
         all_called: "list[TypedCallee]" = data["all_called"]
         version_data_list = data["version_data_list"]
         called_by_version = data["called_by_version"]
+        called_occurrences_by_version = data["called_occurrences_by_version"]
         vkeys = data["vkeys"]
         extern_libraries: "dict[str, str]" = data["extern_libraries"]
 
@@ -792,6 +828,9 @@ def write_unmatched_sections_pass2(
                 registry=registry,
                 sectioned_func_names=sectioned_func_names,
                 duplicated_names=duplicated_names,
+                variant_called_occurrences=called_occurrences_by_version[
+                    comp_set_id
+                ],
             )
             section_writer.end_variant(vkey=vkey)
 

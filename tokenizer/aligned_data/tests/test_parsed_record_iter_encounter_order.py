@@ -38,7 +38,7 @@ def test_v2_local_funcs_preserve_encounter_order_no_alphabetisation():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called, extern_libraries = _extract_called_funcs(row, column_index)
+    called, extern_libraries, _called_occurrences = _extract_called_funcs(row, column_index)
 
     # NOT alphabetised; matches the CSV array's encoder-allocation order.
     assert called == [
@@ -59,7 +59,7 @@ def test_v2_cross_category_same_name_stays_distinct_and_local_precedes_plt():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called, extern_libraries = _extract_called_funcs(row, column_index)
+    called, extern_libraries, _called_occurrences = _extract_called_funcs(row, column_index)
 
     assert called == [
         ("foo", CallTargetType.LOCAL),
@@ -79,7 +79,7 @@ def test_v2_all_three_categories_concat_local_plt_extern():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called, extern_libraries = _extract_called_funcs(row, column_index)
+    called, extern_libraries, _called_occurrences = _extract_called_funcs(row, column_index)
 
     assert called == [
         ("loc2", CallTargetType.LOCAL),
@@ -105,7 +105,7 @@ def test_v2_within_category_dedupe_keeps_first_encounter():
     }
     row, column_index = _row_with_v2_metadata(metadata)
 
-    called, extern_libraries = _extract_called_funcs(row, column_index)
+    called, extern_libraries, _called_occurrences = _extract_called_funcs(row, column_index)
 
     assert called == [
         ("x", CallTargetType.LOCAL),

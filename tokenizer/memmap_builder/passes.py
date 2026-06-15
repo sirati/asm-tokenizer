@@ -99,6 +99,14 @@ def process_matched_function(
                 # order; the matched-arm table-level order comes from
                 # ``unique_called`` separately (plan Decisions 20 + 21).
                 "called": list(rec.called_funcs),
+                # Per-variant sibling disambiguator for calls into
+                # DUPLICATED local names (callee_name -> occurrence). Kept
+                # per-variant (NOT unioned into the cross-variant
+                # ``unique_called`` table) so each caller variant resolves
+                # its own call edges; a name absent here is an unresolvable
+                # call into a duplicated body and stamps the missing
+                # sentinel downstream.
+                "called_occurrences": dict(rec.called_occurrences),
                 "data_offset": offset,
                 "data_len": total,
                 "token_len": int(rec.tokens.size),
@@ -182,6 +190,11 @@ def process_unmatched_function(
                 # downstream per-variant inlining-data emit) walk it in
                 # encounter order (plan Decisions 20 + 21).
                 "called": list(rec.called_funcs),
+                # Per-variant sibling disambiguator (callee_name ->
+                # occurrence) for calls into DUPLICATED local names. Carried
+                # per-variant alongside ``called`` so each caller body
+                # resolves its own edges; see the matched-arm equivalent.
+                "called_occurrences": dict(rec.called_occurrences),
                 "extern_libraries": dict(rec.extern_libraries),
             }
         )
