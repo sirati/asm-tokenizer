@@ -44,7 +44,9 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     Stage2Section,
     Stage2Variant,
 )
-from tokenizer.aligned_data.loader.category_counts import compute_category_counts
+from tokenizer.aligned_data.loader.category_counts import (
+    category_counts_from_runlen,
+)
 from tokenizer.aligned_data.loader.function_data import FunctionData
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import CallTarget, Section
@@ -97,10 +99,13 @@ def build_stage2_batch(
         s2_cts: List[Stage2CallTarget] = []
         for e in range(lo, hi):
             sec = int(section_of_node[e])
-            raw_tokens = expanded.states[e].raw_tokens
+            state = expanded.states[e]
+            raw_tokens = state.raw_tokens
             ct_section = _call_targets_section(cols, ct_offsets, sec)
             s1_ct = Stage1CallTarget(
-                function_data=_function_data_for(raw_tokens),
+                function_data=_function_data_for(
+                    raw_tokens, state.runlen_number
+                ),
                 state=expanded.states[e],
                 call_targets_section=ct_section,
                 encounter_category=_CALL_TARGET_TYPE_TO_CATEGORY[
@@ -178,19 +183,27 @@ def _call_targets_section(
     ]
 
 
-def _function_data_for(raw_tokens: np.ndarray) -> FunctionData:
+def _function_data_for(
+    raw_tokens: np.ndarray, runlen_number: np.ndarray
+) -> FunctionData:
     """A minimal :class:`FunctionData` carrying ``category_counts``.
 
     The dense kernels read ONLY ``function_data.metadata['category_counts']``
     (the ALG-4 COUNTER offset bump) off the level-4 ``function_data``;
     the runlength sidecar (off by default) would also read ``tokens`` /
     ``*_runlength``. The COUNTER counts are decoded from the SAME raw body
-    the expansion already gathered (no BIN re-parse), exactly as the
-    loader's :func:`compute_category_counts` would.
+    the expansion already gathered, reusing the per-node ``runlen_number``
+    the batched expansion already computed (no BIN re-parse, no second
+    ``InlineDecodeState`` rebuild), exactly as the loader's
+    :func:`compute_category_counts` would.
     """
     return FunctionData(
         func_name="",
-        metadata={"category_counts": compute_category_counts(raw_tokens)},
+        metadata={
+            "category_counts": category_counts_from_runlen(
+                raw_tokens, runlen_number
+            )
+        },
         tokens=raw_tokens,
         insn_runlength=np.zeros(0, dtype=np.int64),
         block_runlength=np.zeros(0, dtype=np.int64),

@@ -52,6 +52,7 @@ def _geometry(seq_len: int, sampled_variants, *, max_depth: int = 2, corpus=None
         variants_u8=c.variants_u8,
         root_sections=np.zeros(len(sampled_variants), dtype=np.int64),
         root_sampled_variants=np.asarray(sampled_variants, dtype=np.int64),
+        root_groups=np.zeros(len(sampled_variants), dtype=np.int64),
         seq_len=seq_len,
         max_depth=max_depth,
     )

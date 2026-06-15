@@ -65,6 +65,7 @@ def compute_batch_geometry(
     variants_u8: np.ndarray,
     root_sections: np.ndarray,
     root_sampled_variants: np.ndarray,
+    root_groups: np.ndarray,
     seq_len: int,
     max_depth: int,
     need_excluded_pool: bool = True,
@@ -90,6 +91,10 @@ def compute_batch_geometry(
     root_sections / root_sampled_variants:
         ``int[B]`` parallel -- the sampled (root section, root variant)
         of each batch row.
+    root_groups:
+        ``int[B]`` parallel -- the per-row DECIDER-ROOT group id (rows
+        sharing a group are one root's co-sampled variants; see
+        :func:`._inclusion.compute_row_inclusions`).
     seq_len:
         ``L`` -- the per-row token-column budget.
     max_depth:
@@ -122,6 +127,7 @@ def compute_batch_geometry(
         section_offsets,
         root_sections=root_sections,
         root_sampled_variants=root_sampled_variants,
+        root_groups=root_groups,
         max_depth=max_depth,
         need_excluded_pool=need_excluded_pool,
     )

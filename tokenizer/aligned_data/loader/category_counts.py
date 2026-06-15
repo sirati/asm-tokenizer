@@ -35,6 +35,7 @@ from .decoded._inline_decode_state import build_inline_decode_state
 __all__ = [
     "COUNTER_CATEGORIES",
     "compute_category_counts",
+    "category_counts_from_runlen",
 ]
 
 
@@ -112,9 +113,35 @@ def compute_category_counts(raw_tokens: np.ndarray) -> dict[Category, int]:
         return {cat: 0 for cat in COUNTER_CATEGORIES}
 
     state = build_inline_decode_state(raw_tokens, format_version=1)
-    runlen_number = state.runlen_number
-    n = int(raw_tokens.shape[0])
+    return category_counts_from_runlen(raw_tokens, state.runlen_number)
 
+
+def category_counts_from_runlen(
+    raw_tokens: np.ndarray, runlen_number: np.ndarray
+) -> dict[Category, int]:
+    """Count distinct caller-local ids reusing a precomputed ``runlen_number``.
+
+    Identical contract + output to :func:`compute_category_counts`, but
+    the caller supplies the ``number_mask`` run-length array
+    (``InlineDecodeState.runlen_number``) it already computed for the
+    same ``raw_tokens`` stream, so this path skips the full
+    :class:`InlineDecodeState` rebuild. The distinct-id counting logic is
+    shared with :func:`compute_category_counts` (which delegates here),
+    so the two cannot drift.
+
+    Parameters
+    ----------
+    raw_tokens
+        ``uint16[N]`` v2 wire-form token stream.
+    runlen_number
+        ``InlineDecodeState.runlen_number`` for the SAME ``raw_tokens``:
+        per-position run length of the inline-digit (``< 256``) mask.
+        Must be the aligned, same-length array for ``raw_tokens``.
+    """
+    if raw_tokens.shape[0] == 0:
+        return {cat: 0 for cat in COUNTER_CATEGORIES}
+
+    n = int(raw_tokens.shape[0])
     counts: dict[Category, int] = {}
     for category, carrier_id in _COUNTER_CATEGORY_TO_RAW_ID.items():
         counts[category] = _count_distinct_caller_local_ids(
