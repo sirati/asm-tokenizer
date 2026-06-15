@@ -199,8 +199,9 @@ class _FakeSession:
     trivially invertible.
 
     Per-section ``FunctionData`` is keyed by ``(section_offset,
-    variant_index)`` for matched and by ``section_offset`` for
-    unmatched (which has exactly one variant by construction).
+    variant_index)`` for BOTH arms: unmatched sections store one record
+    (a distinct body) per variant, just like matched, so the J-resolved
+    variant body is addressable per slot.
     """
 
     _binary_name: str = "fake-bin"
@@ -209,7 +210,7 @@ class _FakeSession:
         default_factory=dict
     )
     unmatched_sections: Dict[int, Section] = field(default_factory=dict)
-    unmatched_function_data: Dict[int, FunctionData] = field(
+    unmatched_function_data: Dict[Tuple[int, int], FunctionData] = field(
         default_factory=dict
     )
 
@@ -222,9 +223,22 @@ class _FakeSession:
         for v_idx, fd in variant_function_data.items():
             self.matched_function_data[(section.section_offset, v_idx)] = fd
 
-    def add_unmatched(self, section: Section, fd: FunctionData) -> None:
+    def add_unmatched(self, section: Section, fd) -> None:
+        """Register an unmatched section + its per-variant bodies.
+
+        ``fd`` is either a single :class:`FunctionData` (the canonical
+        single-variant section -- stored at variant 0) or a
+        ``{variant_index: FunctionData}`` dict for a section whose
+        variants carry DISTINCT bodies (one record per variant).
+        """
         self.unmatched_sections[section.section_offset] = section
-        self.unmatched_function_data[section.section_offset] = fd
+        if isinstance(fd, dict):
+            for v_idx, body in fd.items():
+                self.unmatched_function_data[
+                    (section.section_offset, v_idx)
+                ] = body
+        else:
+            self.unmatched_function_data[(section.section_offset, 0)] = fd
 
     # --- session-API surface the walker invokes -------------------------
 
@@ -265,9 +279,9 @@ class _FakeSession:
         return self.matched_function_data[(idx, variant_index)]
 
     def _load_unmatched_variant_body(
-        self, idx: int, section: Section
+        self, idx: int, variant_index: int, section: Section
     ) -> FunctionData:
-        return self.unmatched_function_data[idx]
+        return self.unmatched_function_data[(idx, variant_index)]
 
     def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.unmatched_sections[idx]
@@ -277,7 +291,7 @@ class _FakeSession:
         self, idx: int
     ) -> Tuple[FunctionData, Section, int]:
         section = self.unmatched_sections[idx]
-        fd = self.unmatched_function_data[idx]
+        fd = self.unmatched_function_data[(idx, 0)]
         return fd, section, section.section_offset
 
 
@@ -1079,6 +1093,98 @@ def test_unmatched_arm_uses_load_unmatched_for_splice() -> None:
 
     assert [e.function_name_ptr for e in out] == [1, 2]
     assert out[1].function_data is callee_fd
+
+
+def test_unmatched_callee_splices_j_resolved_variant_body() -> None:
+    """An UNMATCHED callee with DISTINCT-body variants splices the
+    J-resolved variant body, NOT always the first record.
+
+    The callee is an unmatched section with three distinct-body variants.
+    The root variant 0 calls it with ``section_variant_index`` J=2 (its
+    per_call_entry payload), so :func:`choose_callee_variant` returns 2
+    and the spliced body MUST be the callee's variant-2 record. The old
+    unmatched body load discarded J and always returned the section's
+    first record (variant 0) -- this pins the fix.
+    """
+    callee_section = _make_section(
+        section_offset=200,
+        function_name_ptr=2,
+        variants=[
+            _make_variant(vkey=0),
+            _make_variant(vkey=1),
+            _make_variant(vkey=2),
+        ],
+    )
+    callee_bodies = {
+        0: _make_function_data("callee_unmatched_v0"),
+        1: _make_function_data("callee_unmatched_v1"),
+        2: _make_function_data("callee_unmatched_v2"),
+    }
+    # Root variant 0 calls the callee picking J=2; the quiet sibling
+    # makes variant 0's callee "some-but-not-all" so it is not pruned.
+    root_section = _make_section(
+        section_offset=100,
+        function_name_ptr=1,
+        call_targets=[_ct_local(fid=2, target_offset=200)],
+        variants=_calling_variant([(0, 2)]),
+    )
+    root_fd = _make_function_data("root_unmatched")
+    root_fd_v1 = _make_function_data("root_unmatched_v1")
+
+    session = _FakeSession()
+    session.add_unmatched(root_section, root_fd)
+    session.add_unmatched(callee_section, callee_bodies)
+
+    slots = _walk_subset(
+        session,
+        root_arm=SectionKind.UNMATCHED,
+        root_section=root_section,
+        sampled_variant_indices=[0, 1],
+        root_function_data_per_sampled=[root_fd, root_fd_v1],
+        root_function_name_ptr=1,
+        max_depth=5,
+    )
+    out = slots[0]
+
+    assert [e.function_name_ptr for e in out] == [1, 2]
+    # The decisive assertion: variant 2's body splices, not variant 0's.
+    assert out[1].function_data is callee_bodies[2]
+    assert out[1].function_data is not callee_bodies[0]
+
+
+def test_unmatched_root_non_first_variant_uses_own_body() -> None:
+    """An UNMATCHED root sampled at a NON-first variant decodes its OWN
+    body, not always the section's first record.
+
+    The root is an unmatched section with two distinct-body variants;
+    sampling variant 1 must surface variant 1's body at slot 0. The old
+    root-body load returned a single-element list (variant 0 only), so a
+    non-first sampled root variant got the wrong body (or IndexError).
+    """
+    root_section = _make_section(
+        section_offset=100,
+        function_name_ptr=1,
+        variants=[_make_variant(vkey=0), _make_variant(vkey=1)],
+    )
+    root_bodies = {
+        0: _make_function_data("root_unmatched_v0"),
+        1: _make_function_data("root_unmatched_v1"),
+    }
+    session = _FakeSession()
+    session.add_unmatched(root_section, root_bodies)
+
+    out = walk_callees(
+        session,
+        root_arm=SectionKind.UNMATCHED,
+        root_section=root_section,
+        root_variant_idx=1,
+        root_function_data=root_bodies[1],
+        root_function_name_ptr=1,
+        max_depth=5,
+    )
+
+    assert [e.function_name_ptr for e in out] == [1]
+    assert out[0].function_data is root_bodies[1]
 
 
 # ---------------------------------------------------------------------------
