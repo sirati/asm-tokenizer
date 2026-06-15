@@ -52,6 +52,7 @@ import pytest
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._callee_walk import (
+    CalleeSectionMetaMemo,
     finalise_pending_call_targets,
     walk_callees,
     walk_section_callees_pending,
@@ -329,6 +330,7 @@ def _walk_subset(
         max_depth=max_depth,
         decider=decider,
         collector=collector,
+        section_meta_memo=CalleeSectionMetaMemo(),
     )
     runlen = collector.flush()
     return [

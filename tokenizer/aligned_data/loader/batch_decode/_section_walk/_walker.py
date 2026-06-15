@@ -70,7 +70,11 @@ from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
 from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 
 from .._batch_layout import compute_batch_idx_mapping
-from .._callee_walk import PendingCallTarget, walk_section_callees_pending
+from .._callee_walk import (
+    CalleeSectionMetaMemo,
+    PendingCallTarget,
+    walk_section_callees_pending,
+)
 from .._resolve_pointers import resolve_section_pointers
 from .._types import (
     SectionPointerSpec,
@@ -226,6 +230,11 @@ def _walk_sections_pending(
     # instance is reused across every section in the batch (buffer reuse
     # -- the mandate's geometric-growth, no-per-section-realloc rule).
     decider = OnceOnlyInclusion()
+    # The callee-section parse memo is reset per batch (this walk's
+    # lifetime): a callee catalog entry reached from ANY section in the
+    # batch parses once. It is dropped when ``_walk_sections_pending``
+    # returns -- a within-walk parse memo, not a persistent cache.
+    section_meta_memo = CalleeSectionMetaMemo()
     pending_per_variant: List[List[List[PendingCallTarget]]] = []
     for rs in resolved:
         pending_per_variant.append(
@@ -241,6 +250,7 @@ def _walk_sections_pending(
                 max_depth=max_depth,
                 decider=decider,
                 collector=collector,
+                section_meta_memo=section_meta_memo,
             )
         )
 
