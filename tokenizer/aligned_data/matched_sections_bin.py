@@ -262,12 +262,32 @@ class PerCallEntry:
     ``callee_vkey`` is then never consulted for this entry, but
     ``called_idx`` / ``callee_function_name_ptr`` still describe the
     real call edge.
+
+    ``callee_occurrence`` is the single intended same-name sibling this
+    call edge targets: when the callee FID has several same-FID sibling
+    sections (clang ``OUTLINED_FUNCTION_N`` / per-TU static collisions,
+    one section per ``(name, occurrence)`` body), this names WHICH
+    sibling's variant table legitimately addresses the call. ``None``
+    means "no disambiguation" — a non-duplicated callee (one section),
+    OR a duplicated callee the producer could not pin to a single
+    occurrence (ambiguous / no-occurrence), which it instead routes to
+    :data:`MISSING_VARIANT_INDEX` via ``resolved_section_variant_index``.
+    The writer carries an occurrence-bearing hole until the sibling whose
+    own ``begin_section(occurrence=...)`` matches closes, then resolves
+    BOTH the call_target ``function_section_ptr`` AND the per-call
+    ``section_variant_index`` to that one sibling — never an arbitrary
+    last-write-wins sibling. A ``None`` occurrence leaves today's
+    single-section resolution path unchanged. Build-time only; NOT
+    serialized to the wire (the on-disk format is occurrence-blind, the
+    loader reads the already-disambiguated ``(function_section_ptr, J)``
+    pair).
     """
 
     called_idx: int
     callee_function_name_ptr: int
     callee_vkey: Hashable
     resolved_section_variant_index: Optional[int] = None
+    callee_occurrence: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
