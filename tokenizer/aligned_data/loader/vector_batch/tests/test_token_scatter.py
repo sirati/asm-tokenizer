@@ -173,7 +173,25 @@ def test_prefix_values_match_width_twin_and_shift():
     """``variant_prefix_values`` (the scatter's prefix-id reader) returns
     CSR offsets matching the width twin (``variant_prefix_lengths``) and
     shifts ids by ``- 256`` -- on the synthetic ``_variants.bin`` with
-    non-empty per-row prefixes."""
+    non-empty per-row prefixes.
+
+    Coverage of the vector_batch variant-prefix CONTENT (vs. batch_decode):
+    this test independently pins the prefix-id GATHER MECHANICS -- the ids
+    landed are exactly ``record[1:]`` shifted ``- 256``, gathered row-major
+    over the sampled nodes (the distinct non-zero synthetic ids catch the
+    historical ``n_tokens - 1`` off-by-one). The REAL-metadata SEMANTICS of
+    a prefix (that the ids decode to the right arch/comp/cver/opt strings)
+    are the shared ENCODER's concern, asserted independently at the
+    batch_decode e2e level
+    (``batch_decode...test_entry.test_batch_decode_prepends_variant_tokens_once_per_row``).
+    Note the byte-identity oracle (``test_byte_identity``) does NOT close
+    this for vector_batch by transitivity: every byte-identity fixture is
+    built via ``build_corpus_with_registry``, which OMITS ``_variants.bin``,
+    so those rows carry a ZERO-WIDTH prefix -- byte-identity confirms
+    vector_batch == batch_decode on an EMPTY prefix, not on real metadata.
+    The real-metadata semantic guarantee for vector_batch therefore rests
+    on (gather mechanics here) + (shared-encoder semantics asserted at
+    batch_decode), not on a non-empty-prefix byte-identity row."""
     from tokenizer.aligned_data.loader.vector_batch._prefix import (
         variant_prefix_lengths,
     )

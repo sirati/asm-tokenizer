@@ -426,6 +426,47 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
     for vt in variant_tokens_per_slot[1:]:
         np.testing.assert_array_equal(vt, variant_tokens_per_slot[0])
 
+    # Independent ground-truth for the prefix CONTENT. The fixture's
+    # _variants.bin record was encoded from KNOWN metadata (see
+    # ``_session_fixture._write_variants_bin``): arch=x86_64, compiler=gcc,
+    # compilerversion=13.2.0, opt=-O2, no extra metadata. The canonical
+    # axis-string grammar (``tokenizer.variant_tokens.prefixes``) maps that
+    # to the positional axis strings below, in order [arch, comp, cver, opt]
+    # (arch alias-collapsed x86_64 -> x64; opt dash stripped). These are
+    # HUMAN-asserted ground truth -- NOT derived via ``build_axis_strings``
+    # (that is the encoder logic that produced the record, so deriving the
+    # expectation from it would be circular: a wrong-alias or wrong-order
+    # encoder bug would corrupt both the record AND the expectation, and the
+    # test would pass on a real defect). Asserting against literal strings
+    # catches a wrong-but-well-formed prefix (right width, wrong alias /
+    # wrong positional order / wrong value), which a width-only or a
+    # snapshot-equals-itself check cannot.
+    expected_axis_strings = [
+        "arch:x64",
+        "comp:gcc",
+        "cver:gcc:13.2.0",
+        "opt:O2",
+    ]
+    assert n_axis == len(expected_axis_strings), (
+        f"fixture prefix width {n_axis} != {len(expected_axis_strings)} "
+        "expected positional axes (fixture metadata changed?)"
+    )
+
+    # RESOLVER pin: render the RAW resolved variant_tokens back to strings
+    # through the vocab map (NOT the decode-under-test path) and assert the
+    # axis SEMANTICS. ``get_token_str`` is the id->string lookup the vocab
+    # exposes; rendering through it localizes a failure to the encoder /
+    # resolver (wrong ids written/read) vs. Stage-4 row assembly (wrong
+    # placement / shift), which the per-row check below covers.
+    raw_axis_strings = [
+        fb["vocab"].get_token_str(int(tid))
+        for tid in variant_tokens_per_slot[0].tolist()
+    ]
+    assert raw_axis_strings == expected_axis_strings, (
+        f"resolved variant_tokens render to {raw_axis_strings!r}, expected "
+        f"{expected_axis_strings!r} (encoder/resolver emitted wrong axis ids)"
+    )
+
     # Each row's layout (plan D3 + ALG-9 + Stage 4 row assembly):
     #   row[0..n_axis]      = variant_tokens, post-shift (id - 256)
     #   row[n_axis]         = LOCAL_FUNC self-token at root body start
@@ -440,6 +481,12 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
         + 1
         - reserved_digit_count
     )
+    # MECHANICS expectation: the emitted prefix is the raw resolved
+    # variant_tokens shifted by the static ``- 256``. This proves Stage 4
+    # placed the prefix at row start with the right shift; the CONTENT
+    # check below proves those ids are the RIGHT axis tokens (the resolver
+    # pin above already established the raw ids' semantics independently, so
+    # the two together are non-circular on content).
     expected_axis_shifted = (
         variant_tokens_per_slot[0].astype(np.int32) - reserved_digit_count
     ).astype(np.uint16)
@@ -447,6 +494,7 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
     assert result.tokens.shape == (batch_size, context_len)
     for row_idx in range(batch_size):
         row = result.tokens[row_idx]
+        # MECHANICS: prefix lands at slots 0..n_axis with the ``- 256`` shift.
         np.testing.assert_array_equal(
             row[:n_axis],
             expected_axis_shifted,
@@ -454,6 +502,20 @@ def test_batch_decode_prepends_variant_tokens_once_per_row(tmp_path) -> None:
                 f"row {row_idx}: variant_tokens did not land at slots "
                 f"0..{n_axis} of the model-facing token stream"
             ),
+        )
+        # CONTENT: re-apply the ``+ 256`` shift and render through the vocab
+        # map -- the model-facing prefix must decode to the KNOWN axis
+        # strings. Independent of ``decode_record`` / ``get_variant_by_ref``
+        # (the resolution path under test): the expectation is the literal
+        # human ground truth, and ``get_token_str`` is the plain vocab map.
+        rendered_axis_strings = [
+            fb["vocab"].get_token_str(int(tid) + reserved_digit_count)
+            for tid in row[:n_axis].tolist()
+        ]
+        assert rendered_axis_strings == expected_axis_strings, (
+            f"row {row_idx}: model-facing prefix renders to "
+            f"{rendered_axis_strings!r}, expected {expected_axis_strings!r} "
+            "(wrong variant-axis content despite correct width/shift)"
         )
         assert int(row[n_axis]) == local_func_shifted, (
             f"row {row_idx}: expected LOCAL_FUNC prepend "
