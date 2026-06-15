@@ -262,12 +262,32 @@ class PerCallEntry:
     ``callee_vkey`` is then never consulted for this entry, but
     ``called_idx`` / ``callee_function_name_ptr`` still describe the
     real call edge.
+
+    ``callee_occurrence`` is the single intended same-name sibling this
+    call edge targets: when the callee FID has several same-FID sibling
+    sections (clang ``OUTLINED_FUNCTION_N`` / per-TU static collisions,
+    one section per ``(name, occurrence)`` body), this names WHICH
+    sibling's variant table legitimately addresses the call. ``None``
+    means "no disambiguation" — a non-duplicated callee (one section),
+    OR a duplicated callee the producer could not pin to a single
+    occurrence (ambiguous / no-occurrence), which it instead routes to
+    :data:`MISSING_VARIANT_INDEX` via ``resolved_section_variant_index``.
+    The writer carries an occurrence-bearing hole until the sibling whose
+    own ``begin_section(occurrence=...)`` matches closes, then resolves
+    BOTH the call_target ``function_section_ptr`` AND the per-call
+    ``section_variant_index`` to that one sibling — never an arbitrary
+    last-write-wins sibling. A ``None`` occurrence leaves today's
+    single-section resolution path unchanged. Build-time only; NOT
+    serialized to the wire (the on-disk format is occurrence-blind, the
+    loader reads the already-disambiguated ``(function_section_ptr, J)``
+    pair).
     """
 
     called_idx: int
     callee_function_name_ptr: int
     callee_vkey: Hashable
     resolved_section_variant_index: Optional[int] = None
+    callee_occurrence: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +608,36 @@ class SectionWriter:
         # of ``caller_section_offset`` in the set is the only signal
         # the writer needs to revisit a caller when a callee closes.
         self._pending_holes: dict[int, set[int]] = {}
+        # ``_pending_occurrence`` carries the SINGLE intended same-name
+        # sibling occurrence for each occurrence-bearing hole, keyed by
+        # ``(caller_section_offset, callee_fid)``. This is build-time
+        # INPUT metadata (from :attr:`PerCallEntry.callee_occurrence`),
+        # NOT re-parsed from the bin — so holding it does NOT violate the
+        # no-cached-parsed-state rule (which forbids memoizing PARSED
+        # on-disk bytes; this value is writer-authored input that never
+        # reaches the wire). The key is section-granular because every
+        # arch-variant of one caller section that calls a given callee
+        # FID resolves to the SAME callee body — the producer derives the
+        # occurrence from the callee entry address, shared across the
+        # caller's variants — so one occurrence per ``(caller, callee_fid)``
+        # is well-defined. A ``None`` occurrence opens no entry here and
+        # leaves the legacy single-section resolution path untouched. At
+        # each sibling close, :meth:`_resolve_caller_section` consults
+        # this map to patch ONLY the caller whose intended occurrence
+        # equals the closing sibling's; a mismatch is skipped so a later
+        # sibling with the matching occurrence fills it (and a never-
+        # matched occurrence falls through to the finalize MISSING sweep).
+        self._pending_occurrence: dict[tuple[int, int], int] = {}
+        # ``_known_sibling_sections`` maps ``(callee_fid, occurrence) ->
+        # section_offset`` so an occurrence-bearing BACKWARD reference
+        # (the matching sibling already closed) resolves inline to the
+        # RIGHT sibling instead of ``_known_sections``'s FID-keyed
+        # last-write-wins offset. Populated at every :meth:`begin_section`
+        # alongside ``_known_sections``. Occurrence-blind callers
+        # (``callee_occurrence is None``) never consult it — their inline
+        # resolution stays on the legacy ``_known_sections`` path
+        # verbatim. Additive build-time bookkeeping; never serialized.
+        self._known_sibling_sections: dict[tuple[int, int], int] = {}
 
         # Per-section state (cleared on every begin_section).
         self._current_fid: Optional[int] = None
@@ -603,6 +653,13 @@ class SectionWriter:
         # :meth:`emit_call_targets` (the clean FID is what
         # ``_known_sections`` / back-patch compares use).
         self._current_duplicated: bool = False
+        # Caller-declared same-name sibling ``occurrence`` for THIS
+        # section (the kth divergent same-FID body carries
+        # ``occurrence == k``; non-duplicated names top out at 0). Not
+        # serialized — it is threaded into :meth:`end_section` so each
+        # closing sibling knows its own occurrence and resolves only the
+        # holes whose intended ``callee_occurrence`` matches it.
+        self._current_occurrence: int = 0
         # File offset of THIS section's jump table (first u16 slot). The
         # table is ``n_variants × u16`` immediately after the 8-byte
         # section header, so this is ``section_offset + SECTION_HEADER_SIZE``.
@@ -631,6 +688,7 @@ class SectionWriter:
         n_variants: int,
         *,
         duplicated: bool = False,
+        occurrence: int = 0,
     ) -> int:
         """Open a new section for ``function_name_ptr``.
 
@@ -649,6 +707,16 @@ class SectionWriter:
         ``function_name_ptr`` is what ``_known_sections`` and the
         back-patch compares use — only the on-disk header bytes carry the
         bit, so equality with call_target FIDs is preserved.
+
+        ``occurrence`` is this section's same-name sibling ordinal (the
+        kth divergent same-FID body carries ``occurrence == k``;
+        non-duplicated names are 0). It is NOT serialized — the writer
+        threads it into :meth:`end_section` so the closing sibling can
+        resolve only the holes whose intended ``callee_occurrence``
+        matches it (the occurrence-aware sibling-close gate). A caller
+        that never sets occurrences leaves it at the default 0, and with
+        every hole's ``callee_occurrence`` also ``None`` the resolver
+        behaves exactly as before (single-section / last-write-wins).
 
         ``n_variants`` is the exact number of variants the caller is
         about to emit. It is used to reserve ``n_variants × u16`` bytes
@@ -700,12 +768,19 @@ class SectionWriter:
         section_offset = self._writer.cursor
 
         self._known_sections.set(function_name_ptr, section_offset)
+        # Occurrence-addressed sibling map for inline backward resolution
+        # of occurrence-bearing refs. ``_known_sections`` keeps its
+        # FID-keyed last-write-wins entry for the occurrence-blind path.
+        self._known_sibling_sections[(function_name_ptr, occurrence)] = (
+            section_offset
+        )
 
         self._current_fid = function_name_ptr
         self._current_section_offset = section_offset
         self._n_variants_slot = None
         self._current_n_variants_declared = n_variants
         self._current_duplicated = duplicated
+        self._current_occurrence = occurrence
         # The jump table starts immediately after the section header. It is
         # written by emit_call_targets (which knows its own header_offset),
         # but the offset is deterministic so we cache it here for
@@ -888,7 +963,28 @@ class SectionWriter:
             section_variant_index = self._resolve_backward_variant_index(
                 callee_fid=entry.callee_function_name_ptr,
                 callee_vkey=entry.callee_vkey,
+                callee_occurrence=entry.callee_occurrence,
             )
+            if (
+                section_variant_index is not None
+                and entry.callee_occurrence is not None
+            ):
+                # Occurrence-bearing backward ref resolved inline against
+                # the (fid, occurrence) sibling registry. ``emit_call_targets``
+                # stamped this call_target's ``function_section_ptr`` from
+                # ``_known_sections`` (FID-keyed last-write-wins, possibly the
+                # WRONG sibling). Re-stamp Case A to the SAME occurrence-
+                # matching sibling the J came from, so the loader reads a
+                # ``(function_section_ptr, J)`` pair that points into ONE
+                # correct sibling. The matching sibling already closed (the
+                # registry hit proves it) so no Step-3 close re-touches this
+                # row, and this caller was NOT added to ``_pending_holes`` for
+                # this FID — the two paths stay disjoint, no double-patch.
+                self._restamp_function_section_ptr(
+                    called_idx=entry.called_idx,
+                    callee_fid=entry.callee_function_name_ptr,
+                    callee_occurrence=entry.callee_occurrence,
+                )
             if section_variant_index is None:
                 # Forward reference, backward reference whose vkey
                 # is not in the callee section's local variant table,
@@ -907,17 +1003,97 @@ class SectionWriter:
                     self._pending_holes.setdefault(
                         entry.callee_function_name_ptr, set()
                     ).add(self._current_section_offset)
+                    self._record_pending_occurrence(
+                        callee_fid=entry.callee_function_name_ptr,
+                        occurrence=entry.callee_occurrence,
+                    )
             self._variant_buffer.append_per_call_entry(
                 struct.pack("<HH", entry.called_idx, section_variant_index)
             )
 
+    def _record_pending_occurrence(
+        self, *, callee_fid: int, occurrence: Optional[int]
+    ) -> None:
+        """Record THIS section's intended occurrence for a hole into ``callee_fid``.
+
+        Keyed by ``(current_section_offset, callee_fid)``. ``None`` opens
+        no entry — the hole stays occurrence-blind and resolves through
+        the legacy single-section / last-write-wins path, unchanged. A
+        non-``None`` value is the single sibling this caller targets; the
+        first non-``None`` value wins and a second identical set is
+        idempotent. A second, CONFLICTING non-``None`` value for the same
+        ``(caller, callee_fid)`` is a producer contract violation (every
+        arch-variant of one caller section must target the same callee
+        body) and raises rather than silently mis-resolving.
+        """
+        if occurrence is None:
+            return
+        key = (self._current_section_offset, callee_fid)
+        existing = self._pending_occurrence.get(key)
+        if existing is not None and existing != occurrence:
+            raise ValueError(
+                f"conflicting callee_occurrence for caller_section@"
+                f"{self._current_section_offset} -> callee_fid={callee_fid}: "
+                f"{existing} vs {occurrence}; every variant of one caller "
+                f"section must target the same same-name sibling occurrence"
+            )
+        self._pending_occurrence[key] = occurrence
+
+    def _restamp_function_section_ptr(
+        self, *, called_idx: int, callee_fid: int, callee_occurrence: int
+    ) -> None:
+        """Re-stamp ONE call_target row's ``function_section_ptr`` (Case A)
+        to the occurrence-matching sibling for an inline-resolved
+        occurrence-bearing backward reference.
+
+        The row was already written by :meth:`emit_call_targets` with the
+        FID-keyed last-write-wins offset; this overwrites the
+        ``section_ptr`` u32 (the second field of the 12-byte
+        ``<IIHH>`` row) with
+        ``_known_sibling_sections[(callee_fid, callee_occurrence)]``. The
+        row offset is re-derived from THIS in-flight section's own
+        deterministic geometry (header + padded jump table + ``called_idx``
+        rows) — no slot-offset cache. The lookup is guaranteed present:
+        the caller only invokes this after a registry HIT resolved J.
+        """
+        sibling_offset = self._known_sibling_sections[
+            (callee_fid, callee_occurrence)
+        ]
+        call_targets_start = (
+            self._current_section_offset
+            + SECTION_HEADER_SIZE
+            + _padded_jump_table_bytes(self._current_n_variants_declared)
+        )
+        section_ptr_slot = (
+            call_targets_start
+            + called_idx * CALL_TARGET_ENTRY_SIZE
+            + 4  # past the u32 function_name_ptr field
+        )
+        self._writer.patch(section_ptr_slot, struct.pack("<I", sibling_offset))
+
     def _resolve_backward_variant_index(
-        self, *, callee_fid: int, callee_vkey: Hashable
+        self, *, callee_fid: int, callee_vkey: Hashable,
+        callee_occurrence: Optional[int] = None,
     ) -> Optional[int]:
         """Resolve a backward-reference variant idx via the callee
-        section's jump-table layout (``_known_sections[callee_fid]``).
+        section's jump-table layout.
 
-        ``None`` when the callee FID has no closed section yet
+        Occurrence-blind refs (``callee_occurrence is None``) address the
+        callee via ``_known_sections[callee_fid]`` — the FID-keyed
+        last-write-wins offset, the SAME one that ends up in the
+        call_target row's ``function_section_ptr``, so the loader can
+        never see a ``(section_offset, variant_idx)`` pair pointing into
+        the wrong sibling's variant table. This path is byte-for-byte the
+        legacy behaviour.
+
+        Occurrence-bearing refs address the callee via
+        ``_known_sibling_sections[(callee_fid, occurrence)]`` so the
+        resolved index belongs to the OCCURRENCE-MATCHING sibling, never
+        an arbitrary last-write-wins one. When that sibling has not closed
+        yet (forward reference) the lookup misses and the edge defers to
+        an occurrence-gated hole.
+
+        ``None`` when the addressed callee section has not closed yet
         (forward reference) OR the callee FID is THIS section (the
         in-flight section's header carries ``n_variants=0`` placeholder
         until :meth:`end_section`, so its bytes are not yet
@@ -927,12 +1103,6 @@ class SectionWriter:
         does not carry ``callee_vkey`` (legitimate cross-arm vkey
         mismatch — a sibling close or :meth:`finalize` will sweep
         the slot to :data:`MISSING_VARIANT_INDEX`).
-
-        The section we address is the SAME one whose offset will end
-        up in the call_target row's ``function_section_ptr`` after the
-        sibling last-write-wins, so the loader can never observe a
-        ``(section_offset, variant_idx)`` pair that points into the
-        wrong sibling's variant table.
 
         Reads the callee section's header + jump table directly from the
         live ``uint8`` mmap view (``_SectionLayoutView``); the on-disk
@@ -944,7 +1114,12 @@ class SectionWriter:
         """
         if callee_fid == self._current_fid:
             return None
-        section_offset = self._known_sections.get(callee_fid)
+        if callee_occurrence is None:
+            section_offset = self._known_sections.get(callee_fid)
+        else:
+            section_offset = self._known_sibling_sections.get(
+                (callee_fid, callee_occurrence)
+            )
         if section_offset is None:
             return None
         bin_u8 = self._writer.writable_u8_view()
@@ -1143,7 +1318,19 @@ class SectionWriter:
         # that is waiting on my_fid; re-derive slot positions from
         # their own bytes. Do NOT pop — siblings still to close and
         # :meth:`finalize` both re-walk the same set.
+        #
+        # Occurrence gate: a caller that named a specific same-name
+        # sibling (``_pending_occurrence`` carries a non-``None`` intended
+        # occurrence for ``(caller, my_fid)``) is patched ONLY by the
+        # sibling whose own ``occurrence`` matches; a mismatch is skipped
+        # so the right sibling's close (or finalize's MISSING sweep, if
+        # none matches) handles it. A caller with no recorded occurrence
+        # (``None``) keeps the legacy occurrence-blind behaviour.
+        closing_occurrence = self._current_occurrence
         for caller_section_offset in self._pending_holes.get(fid, ()):
+            intended = self._pending_occurrence.get((caller_section_offset, fid))
+            if intended is not None and intended != closing_occurrence:
+                continue
             self._resolve_caller_section(
                 caller_section_offset=caller_section_offset,
                 callee_fid=fid,
@@ -1252,6 +1439,9 @@ class SectionWriter:
                     callee_fid=fid,
                 )
         self._pending_holes.clear()
+        # The intended-occurrence bookkeeping is consumed in lock-step
+        # with the holes it gated; drop it once the holes are swept.
+        self._pending_occurrence.clear()
 
     def _stamp_missing_in_caller(
         self, *, caller_section_offset: int, callee_fid: int
