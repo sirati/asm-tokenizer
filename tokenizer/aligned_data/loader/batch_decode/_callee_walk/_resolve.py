@@ -158,12 +158,17 @@ def load_callee_body(
     unmatched loads the section's first-record body -- byte-identical to
     the legacy walker, which never re-indexed the unmatched body by the
     chosen variant (one record per unmatched variant).
+
+    The already-parsed ``meta.section`` is threaded into both arms'
+    body loads so ``_sections.bin`` is NOT re-parsed here: the metadata
+    stage (:func:`resolve_callee_metadata`) already paid the catalog
+    parse, and re-deriving the section from the index would discard and
+    rebuild it (a re-parse-in-call-chain violation).
     """
     if arm is SectionKind.MATCHED:
         return session._load_matched_variant_body(
-            meta.callee_idx, meta.variant_idx
+            meta.callee_idx, meta.variant_idx, meta.section
         )
-    callee_fd, _section, _section_offset = (
-        session._load_unmatched_for_splice(meta.callee_idx)
+    return session._load_unmatched_variant_body(
+        meta.callee_idx, meta.section
     )
-    return callee_fd

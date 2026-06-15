@@ -231,23 +231,24 @@ class BinarySession(_BinarySessionHelpersMixin):
         return section, section_offset
 
     def _load_matched_variant_body(
-        self, idx: int, variant_index: int
+        self, idx: int, variant_index: int, section: Section
     ) -> FunctionData:
         """Load ONE matched section variant body from ``_data.bin``.
 
-        Parses the section's BIN catalog entry, then materialises only
+        ``section`` is the already-parsed BIN catalog entry the caller
+        obtained from :py:meth:`_matched_section_meta` (threaded through
+        the callee walk's :class:`ResolvedCalleeMeta`), so this load does
+        NOT re-parse ``_sections.bin`` -- it materialises only
         ``section.variants[variant_index]`` via the shared
-        :func:`parse_matched_variant` -- the same single-variant parse
-        :py:meth:`_load_matched_section_and_variants` runs per variant, so
-        the returned body is byte-identical to that path's
-        ``MatchedFunction.variants[variant_index]``. Raises
-        :class:`IndexError` if ``variant_index`` is out of range.
+        :func:`parse_matched_variant`. That is the same single-variant
+        parse :py:meth:`_load_matched_section_and_variants` runs per
+        variant, so the returned body is byte-identical to that path's
+        ``MatchedFunction.variants[variant_index]``. ``idx`` is retained
+        for the O(1) ``func_names[idx]`` lookup (the name carried on the
+        body) and its bounds check. Raises :class:`IndexError` if
+        ``variant_index`` is out of range.
         """
         arm = self._meta_get("matched_arm")
-        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
-        if idx >= len(bin_starts):
-            raise IndexError(f"Index {idx} out of bounds for matched functions")
-        section = self._parse_section_at(int(bin_starts[idx]))
         if variant_index < 0 or variant_index >= len(section.variants):
             raise IndexError(
                 f"matched function idx={idx} has {len(section.variants)} "
@@ -308,6 +309,52 @@ class BinarySession(_BinarySessionHelpersMixin):
             line_to_name=line_to_name,
         )
         return section, section_offset, fd
+
+    def _load_unmatched_variant_body(
+        self, idx: int, section: Section
+    ) -> FunctionData:
+        """Load ONE unmatched record body, reusing the threaded section.
+
+        ``section`` is the already-parsed owning section the caller
+        obtained from :py:meth:`_unmatched_section_meta` (threaded through
+        the callee walk's :class:`ResolvedCalleeMeta`), so this load does
+        NOT re-derive it via :py:meth:`_unmatched_section_for_record` (no
+        ``_sections.bin`` re-parse). The drift sanity check
+        (``data_offset_shifted << 4 == start``) already fired when the
+        metadata stage parsed this section, so it is not re-run here.
+
+        Returns the same ``FunctionData`` the section-deriving
+        :py:meth:`_load_unmatched_record_and_section` would for ``idx``:
+        the per-record body sliced from ``_unmatched_data.bin`` at
+        ``starts[idx]``, with the per-slot variant resolved against
+        ``section.variants``.
+        """
+        arm = self._meta_get("unmatched_arm")
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        start = int(starts[idx])
+        data_mmap = self._open_data("unmatched")
+        insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
+        # Per-record -> per-variant slot inside the owning section.
+        # Unmatched sections store one record per variant; the slot is
+        # the offset from the section's first-record idx in the arm's
+        # ``record_to_section_idx`` mapping. Threaded into the builder
+        # so the per-slot ``variant_ref`` resolves to THIS record's
+        # canonical-4 axes (not the section's first variant).
+        section_idx = self._unmatched_section_idx(arm, idx)
+        base = self._unmatched_record_slot_base(arm, section_idx)
+        variant_slot = idx - base
+        line_to_name = self._meta_get("line_to_name") or {}
+        return build_unmatched_function_data(
+            section,
+            self._unmatched_func_name(arm, idx),
+            start,
+            tokens, insn_rl, block_rl,
+            variant_slot=variant_slot,
+            resolve_ref=self.get_variant_by_ref,
+            line_to_name=line_to_name,
+        )
 
     def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         """Parse an unmatched record's owning section only (no body).
