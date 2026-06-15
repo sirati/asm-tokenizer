@@ -2,17 +2,18 @@
 
 Single concern of this module: flatten a section's splice tree into
 per-variant BFS-encounter-order ``list[Stage1CallTarget]`` rows,
-enforcing the owner's once-only + all-variants-equivalence inclusion
-semantics over the section's FULL variant set.
+enforcing the owner's once-only + all-sampled-variants-equivalence
+inclusion semantics over the section's SAMPLED variant subset.
 
 The walk's contract -- one-sentence, per the design-first rule:
 
   *Given a resolved section + its sampled variant root bodies, produce
   one level-4 list per sampled variant by a level-synchronous BFS over
-  the section's full variant set, including each function body once per
-  variant on first encounter and excluding (+ pruning) any function
-  reached by every variant at that level -- the inclusion decision owned
-  by the shared :mod:`...splice_inclusion` decider.*
+  the section's sampled variant subset, including each function body
+  once per variant on first encounter and excluding (+ pruning) any
+  function reached by every SAMPLED variant at that level -- the
+  inclusion decision owned by the shared :mod:`...splice_inclusion`
+  decider.*
 
 That is the entire concern. Section pointer resolution + RNG variant
 sampling is the 1a module (:mod:`.._resolve_pointers`); the
@@ -30,19 +31,22 @@ amended):
    seeded at the once-only mask's column 0, so any deeper call resolving
    to the root section is already-included (self / mutual recursion
    never re-splices).
-2. The mask is ``[#section_variants, #functions]``. Per BFS level, every
+2. The mask is ``[#sampled_variants, #functions]``. Per BFS level, every
    surviving parent's call_targets are resolved per variant (the
-   per-edge J-resolution is UNCHANGED -- :mod:`._resolve` owns it), the
-   resolved callee SECTION is marked for that variant, and the shared
-   decider returns which ``(variant, callee)`` pairs are INCLUDED.
+   per-edge J-resolution is UNCHANGED -- :mod:`._resolve` owns it, and
+   still keys on the section's full variant set for vkey matching), the
+   resolved callee SECTION is marked for that sampled row, and the
+   shared decider returns which ``(row, callee)`` pairs are INCLUDED.
 3. **Once-only.** A variant emits a function body only on its FIRST
    encounter (mask cell False->True). Diamonds, branch-shared callees,
    and recursion all dedup -- the function appears once per variant.
-4. **All-variants equivalence.** A function reached by EVERY variant at
-   a level (columnwise ALL over the variant axis) is NOT emitted and is
-   PRUNED (never expanded deeper). This is the default-and-only
-   behaviour; the legacy ``inlined_equivalent_call_targets_only`` flag
-   is absorbed (always-on) and slated for retirement.
+4. **All-sampled-variants equivalence.** A function reached by EVERY
+   SAMPLED variant at a level (columnwise ALL over the sampled-row axis)
+   is NOT emitted and is PRUNED (never expanded deeper). This is the
+   default-and-only behaviour; the legacy
+   ``inlined_equivalent_call_targets_only`` flag is absorbed (always-on)
+   and slated for retirement. A single-sampled-variant section therefore
+   splices nothing (FLAG-A).
 
 Emission order is BFS level order (root, then each level's included
 callees in parent-then-slot order) -- DIFFERENT from the legacy DFS
