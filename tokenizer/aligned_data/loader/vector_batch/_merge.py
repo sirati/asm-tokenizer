@@ -21,18 +21,20 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
+from ._result import VectorBatchResult
+
 
 __all__ = ["merge_arm_results"]
 
 
 def merge_arm_results(
-    results: Sequence["VectorBatchResult"],
+    results: Sequence[VectorBatchResult],
     *,
     batch_idx_to_section_variant: np.ndarray,
 ):
     """Row-wise union of per-arm full-batch results (disjoint rows).
 
-    Each entry is a full-batch :class:`...vector_batch._entry.
+    Each entry is a full-batch :class:`...vector_batch._result.
     VectorBatchResult` whose rows are populated for ONE arm only (the
     arm's batch rows carry that arm's tokens + dense segments; every
     other row is the empty / padding default). The arms partition the
@@ -45,8 +47,6 @@ def merge_arm_results(
     so the canonical mapping is threaded in explicitly and stamped onto
     the merged result.
     """
-    from ._entry import VectorBatchResult
-
     if not results:
         raise ValueError("merge_arm_results requires at least one result")
     if len(results) == 1:
@@ -143,7 +143,7 @@ def _merge_csr(
     return merged, merged_offsets
 
 
-def _merge_fid(results: Sequence["VectorBatchResult"]):
+def _merge_fid(results: Sequence[VectorBatchResult]):
     """Merge the optional per-Category FID sidecars (or ``None``).
 
     The FID sidecar is opt-in; either every arm carries it or none does
