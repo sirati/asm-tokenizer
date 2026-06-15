@@ -10,6 +10,7 @@ import numpy as np
 from dynamic_runner.worker import Task
 
 from dynrunner.tokenize import TokenizerPhase
+from tokenizer.callee_occurrence_backfill import backfill_callee_occurrence
 from tokenizer.compact_base64_utils import base64_to_ndarray_vec, ndarray_to_base64
 from tokenizer.fill_constant_candidates import fill_constant_candidates
 from tokenizer.function_data_manager import FunctionData, FunctionDataManager
@@ -211,6 +212,16 @@ def main_loop(
     # value was always 0 anyway — see ``tokenizer/function_filter.py``).
     filtered_count = 0
     last_keepalive_time = time.time()
+
+    # Callee-occurrence backfill state (v2 only). One record per
+    # NON-folded function row written: ``(func_addr, canonical_name,
+    # occurrence)`` where ``occurrence`` is the POST-rollback value that
+    # actually went into CSV column 1, and a per-name written count. At
+    # finalize these collapse into a duplicated-name-only
+    # ``addr -> occurrence`` map handed to
+    # :func:`callee_occurrence_backfill.backfill_callee_occurrence`.
+    occurrence_records: list[tuple[int, str, int]] = []
+    written_name_counts: dict[str, int] = {}
 
     is_v2 = getattr(vocab_manager, "format_version", 1) == 2
     metadata_column_name = "metadata" if is_v2 else "opaque_metadata"
@@ -442,6 +453,17 @@ def main_loop(
                     ]
 
                     writer.writerow(row)
+                    # Record the address -> occurrence parity datum at the
+                    # exact write point: ``occurence`` here is the
+                    # post-rollback value just written to CSV column 1, and
+                    # ``func_addr`` is this body's entry-point offset (the
+                    # join key call-target ``local_funcs[].addr`` entries
+                    # carry). Folded duplicates ``continue`` above, so they
+                    # contribute neither a record nor a name-count bump.
+                    occurrence_records.append((func_addr, canonical_name, occurence))
+                    written_name_counts[canonical_name] = (
+                        written_name_counts.get(canonical_name, 0) + 1
+                    )
                     # Co-step the function-range sidecar: one line
                     # immediately after the FUNCTION row, mirroring the
                     # CSV's function-row ordering. Filtered / dedup-
@@ -529,6 +551,24 @@ def main_loop(
             # Function-range sidecar close — paired with the open at the
             # top of this ``with`` block. Always present (not v2-gated).
             range_sidecar.close()
+
+    # Callee-occurrence backfill (v2 only). The CSV is now closed +
+    # flushed (the ``with`` block above ended). Build the
+    # duplicated-name-only ``addr -> occurrence`` map and hand it to the
+    # backfill module: only callees whose canonical name was written more
+    # than once need a disambiguator (a single-body name always resolves
+    # at occurrence 0). An empty map => no duplicated names => the module
+    # leaves the CSV byte-for-byte untouched.
+    if is_v2:
+        duplicated_names = {
+            name for name, count in written_name_counts.items() if count > 1
+        }
+        addr_to_occurrence = {
+            func_addr: occurrence
+            for (func_addr, name, occurrence) in occurrence_records
+            if name in duplicated_names
+        }
+        backfill_callee_occurrence(Path(csv_path), addr_to_occurrence)
 
     if len(exceptions) > 0:
         # Per-function errors were already log+continue (see inner
