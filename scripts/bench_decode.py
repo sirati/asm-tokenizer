@@ -9,7 +9,7 @@ multi-variant inclusion/splice path is short-circuited and untested.
 Usage
 -----
     python scripts/bench_decode.py
-    python scripts/bench_decode.py --binaries nping openssl --B 70 --L 512 --depths 3 1 0 --num-variants 7
+    python scripts/bench_decode.py --binaries nping openssl --shapes 70x4096 1120x256 --depths 3 1 0 --num-variants 7
     python scripts/bench_decode.py --cprofile
 
 Before/after comparison recipe (e.g. after a perf change)
@@ -46,8 +46,17 @@ WORKTREE = Path(__file__).parent.parent
 
 DEFAULT_MEMMAP_DIR = Path("/home/sirati/devel/python/asm-tokenizer/out/build_memmap")
 DEFAULT_BINARIES = ["nping", "openssl"]
-DEFAULT_B = 70
-DEFAULT_L = 512
+# (batch_size, seq_len) shapes swept per binary. Roughly constant token budget
+# (B*L ~ 287k, except the last) so we cover the few-long-rows <-> many-short-rows
+# spectrum where shape-dependent divergences (e.g. #68 at B=256) hide.
+DEFAULT_SHAPES = [
+    (70, 4096),
+    (140, 2048),
+    (280, 1024),
+    (560, 512),
+    (1120, 256),
+    (1120, 128),
+]
 # Depths run in this order; depth 3 (deepest call-target inclusion) is the most
 # important byte-identity case and is run first.
 DEFAULT_DEPTHS = [3, 1, 0]
@@ -240,8 +249,7 @@ def bench_binary(
     *,
     memmap_dir: Path,
     vocab_manager,
-    B: int,
-    L: int,
+    shapes: List[tuple],
     depths: List[int],
     num_variants: int,
     iters: int,
@@ -252,65 +260,64 @@ def bench_binary(
         open_vector_batch_arm_set,
     )
 
-    # Sample a fixed reproducible set of pointers (same for both loaders, all
-    # depths) -- the draw is depth-independent so we sample once per binary.
     all_pointers, _dataset = _collect_pointers(memmap_dir, binary, vocab_manager)
     if not all_pointers:
         print(f"[bench] {binary}: no matched sections with variants -- skipping")
         return
-
-    rng_sample = np.random.default_rng(DEFAULT_SEED)
-    sampled = _sample_pointers(all_pointers, rng_sample, B)
-    print(f"[bench] {binary}: {len(all_pointers)} sections, sampled {len(sampled)} pointers")
+    print(f"[bench] {binary}: {len(all_pointers)} sections with variants")
 
     dataset = BinaryDataset(memmap_dir, binary, vocab_manager=vocab_manager)
 
     with dataset.open_session() as session:
         with open_vector_batch_arm_set(memmap_dir, binary) as handles:
-            for depth in depths:
-                print(
-                    f"\n[bench] === {binary} B={B} L={L} D={depth} nvar={num_variants} ===",
-                    flush=True,
-                )
+            for B, L in shapes:
+                # Sample B pointers per shape (reproducible: fixed seed per draw),
+                # same set for both loaders + all depths of this shape.
+                sampled = _sample_pointers(all_pointers, np.random.default_rng(DEFAULT_SEED), B)
+                for depth in depths:
+                    print(
+                        f"\n[bench] === {binary} B={B} L={L} D={depth} nvar={num_variants} ===",
+                        flush=True,
+                    )
 
-                # --- correctness gate (run once at seed=0 to verify identity) ---
-                bd_ref = _run_batch_decode(
-                    session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0
-                )
-                vb_ref = _run_vector_batch(
-                    session, sampled, handles, L=L, depth=depth, num_variants=num_variants, seed=0
-                )
-                _assert_byte_identical(bd_ref, vb_ref, binary)
-                print(f"[bench] {binary} D={depth}: byte-identity OK (shape={bd_ref.tokens.shape})")
+                    # --- correctness gate (seed=0) ---
+                    bd_ref = _run_batch_decode(
+                        session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0
+                    )
+                    vb_ref = _run_vector_batch(
+                        session, sampled, handles, L=L, depth=depth, num_variants=num_variants, seed=0
+                    )
+                    _assert_byte_identical(bd_ref, vb_ref, binary)
+                    print(f"[bench] {binary} B={B} L={L} D={depth}: byte-identity OK (shape={bd_ref.tokens.shape})")
 
-                # --- timing (d=depth default-arg pins the loop var per lambda) ---
-                bd_fn = lambda d=depth: _run_batch_decode(
-                    session, sampled, L=L, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
-                )
-                vb_fn = lambda d=depth: _run_vector_batch(
-                    session, sampled, handles, L=L, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
-                )
+                    # --- timing (b/l/d default-args pin the loop vars per lambda) ---
+                    bd_fn = lambda b=B, l=L, d=depth: _run_batch_decode(
+                        session, sampled, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
+                    )
+                    vb_fn = lambda b=B, l=L, d=depth: _run_vector_batch(
+                        session, sampled, handles, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
+                    )
 
-                if do_cprofile:
-                    _profile_loader(bd_fn, label=f"{binary}/batch_decode/D{depth}")
-                    _profile_loader(vb_fn, label=f"{binary}/vector_batch/D{depth}")
+                    if do_cprofile:
+                        _profile_loader(bd_fn, label=f"{binary}/batch_decode/B{B}L{L}D{depth}")
+                        _profile_loader(vb_fn, label=f"{binary}/vector_batch/B{B}L{L}D{depth}")
 
-                bd_median, bd_min = _time_loader(bd_fn, iters)
-                vb_median, vb_min = _time_loader(vb_fn, iters)
-                speedup = vb_median / bd_median if bd_median > 0 else float("nan")
+                    bd_median, bd_min = _time_loader(bd_fn, iters)
+                    vb_median, vb_min = _time_loader(vb_fn, iters)
+                    speedup = vb_median / bd_median if bd_median > 0 else float("nan")
 
-                print(
-                    f"BENCH {binary} batch_decode B={B} L={L} D={depth} "
-                    f"median_ms={bd_median:.1f} min_ms={bd_min:.1f}"
-                )
-                print(
-                    f"BENCH {binary} vector_batch B={B} L={L} D={depth} "
-                    f"median_ms={vb_median:.1f} min_ms={vb_min:.1f}"
-                )
-                print(
-                    f"SPEEDUP {binary} D={depth} vb/bd={speedup:.3f}  "
-                    f"({'vb faster' if speedup < 1 else 'vb slower'})"
-                )
+                    print(
+                        f"BENCH {binary} batch_decode B={B} L={L} D={depth} "
+                        f"median_ms={bd_median:.1f} min_ms={bd_min:.1f}"
+                    )
+                    print(
+                        f"BENCH {binary} vector_batch B={B} L={L} D={depth} "
+                        f"median_ms={vb_median:.1f} min_ms={vb_min:.1f}"
+                    )
+                    print(
+                        f"SPEEDUP {binary} B={B} L={L} D={depth} vb/bd={speedup:.3f}  "
+                        f"({'vb faster' if speedup < 1 else 'vb slower'})"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +333,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--binaries", nargs="+", default=DEFAULT_BINARIES,
         help=f"Binary stems to bench (default: {DEFAULT_BINARIES})",
     )
-    p.add_argument("--B", type=int, default=DEFAULT_B, help="Batch size (default 70)")
-    p.add_argument("--L", type=int, default=DEFAULT_L, help="Context length (default 512)")
+    p.add_argument(
+        "--shapes", nargs="+", default=None, metavar="BxL",
+        help="(batch, seq_len) shapes as BxL, e.g. 70x4096 1120x256 (default: built-in sweep)",
+    )
     p.add_argument(
         "--depths", type=int, nargs="+", default=DEFAULT_DEPTHS,
         help="Splice depths to run, in order (default: 3 1 0; depth 3 matters most)",
@@ -348,13 +357,23 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _parse_shapes(tokens) -> List[tuple]:
+    """Parse ['70x4096', '1120x256'] -> [(70, 4096), (1120, 256)]."""
+    shapes = []
+    for tok in tokens:
+        b_str, _, l_str = tok.lower().partition("x")
+        shapes.append((int(b_str), int(l_str)))
+    return shapes
+
+
 def main(argv=None) -> None:
     args = _build_parser().parse_args(argv)
     memmap_dir: Path = args.memmap_dir
+    shapes = _parse_shapes(args.shapes) if args.shapes else DEFAULT_SHAPES
 
     print(f"[bench] memmap_dir={memmap_dir}")
     print(
-        f"[bench] binaries={args.binaries} B={args.B} L={args.L} "
+        f"[bench] binaries={args.binaries} shapes={shapes} "
         f"depths={args.depths} nvar={args.num_variants} iters={args.iters}"
     )
 
@@ -367,8 +386,7 @@ def main(argv=None) -> None:
             binary,
             memmap_dir=memmap_dir,
             vocab_manager=vocab_manager,
-            B=args.B,
-            L=args.L,
+            shapes=shapes,
             depths=args.depths,
             num_variants=args.num_variants,
             iters=args.iters,
