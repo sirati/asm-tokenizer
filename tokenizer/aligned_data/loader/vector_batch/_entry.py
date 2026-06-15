@@ -288,7 +288,7 @@ def _run_arm_pipeline(
     the orchestrator merges the per-arm results row-wise.
     """
     root_sections, root_variants = _rows_to_catalog_nodes(
-        masked_mapping, resolved
+        masked_mapping, resolved, section_offsets=handles.section_offsets
     )
     geometry = compute_batch_geometry(
         cols=handles.cols,
@@ -373,25 +373,53 @@ def _empty_result(
     )
 
 
-def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved):
+def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_offsets):
     """Per NON-padding batch row, ``(catalog_section_idx, native_variant)``.
 
     ``batch_idx_to_section_variant`` column 0 is the position in
     ``resolved``; column 1 is the SLOT into that section's
     ``sampled_variant_indices`` (post-sampling, NOT the native variant).
-    The prepass needs the catalog section index (per-arm ``idx``) + the
-    NATIVE variant index, so we map both through ``resolved``.
+    The prepass needs the COLUMNAR catalog section index + the NATIVE
+    variant index.
+
+    The catalog section index is recovered ARM-AGNOSTICALLY: a section's
+    BIN byte offset (``rs.section.section_offset``) is its universal key,
+    and ``section_offsets`` (parallel to ``cols``, the same array the
+    :class:`LiveNodeAdjacency` ``_sec_map`` is built from) maps it to the
+    columnar position. ``rs.idx`` is NOT used: it is the per-arm load
+    index, which equals the columnar section idx for the matched arm but
+    is the per-RECORD idx for the unmatched arm (record idx != section
+    idx once a function carries multiple versions). The byte-offset
+    lookup is the single source of truth both arms share.
     """
     mapping = np.asarray(batch_idx_to_section_variant, dtype=np.int64)
+    offsets = np.asarray(section_offsets, dtype=np.int64).reshape(-1)
     is_padding = mapping[:, 0] == int(_PADDING_SENTINEL)
     real = mapping[~is_padding]
     sec_out = np.empty(real.shape[0], dtype=np.int64)
     var_out = np.empty(real.shape[0], dtype=np.int64)
     for i, (resolved_pos, slot) in enumerate(real.tolist()):
         rs = resolved[resolved_pos]
-        sec_out[i] = int(rs.idx)
+        sec_out[i] = _columnar_section_idx(offsets, rs.section.section_offset)
         var_out[i] = int(rs.sampled_variant_indices[slot])
     return sec_out, var_out
+
+
+def _columnar_section_idx(section_offsets: np.ndarray, section_offset: int) -> int:
+    """Position of ``section_offset`` in the arm's ``section_offsets``.
+
+    ``section_offsets`` is ascending (catalog / BIN order), so a binary
+    search recovers the columnar index; a miss is a corpus / handle-arm
+    mismatch and is raised loudly rather than silently returning a bogus
+    neighbour.
+    """
+    pos = int(np.searchsorted(section_offsets, int(section_offset)))
+    if pos >= section_offsets.size or int(section_offsets[pos]) != int(section_offset):
+        raise ValueError(
+            f"section_offset {int(section_offset)} not in this arm's "
+            f"section_offsets (wrong-arm handles?)"
+        )
+    return pos
 
 
 def _expand_to_batch(
