@@ -160,9 +160,10 @@ class LiveNodeAdjacency:
         ptr = int(cols.ct_function_section_ptr[slot])
         if ptr == 0:
             return -1
-        callee_sec = int(self._sec_map.get(np.uint32(ptr)) or _U32_MISS)
-        if callee_sec == int(_U32_MISS):
+        hit = self._sec_map.get(np.uint32(ptr))
+        if hit is None:
             return -1
+        callee_sec = int(hit)
         if _usable(own_J):
             return int(cols.var_offsets[callee_sec]) + own_J
         # Fallback: lowest sibling variant with a usable J for this slot.
