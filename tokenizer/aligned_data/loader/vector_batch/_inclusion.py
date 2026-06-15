@@ -68,13 +68,18 @@ class RowInclusion:
     parallel per-emitted-node :class:`CallTargetType` of the edge that
     reached it (root seeded ``CallTargetType.LOCAL``); ``excluded_nodes``
     is the sampled-subset-pruned / full-set-included backfill pool (de-
-    duplicated, ascending). ``emitted_nodes`` / ``excluded_nodes`` are
-    catalog NODE indices (``var_offsets``-major).
+    duplicated, ascending), with ``excluded_edge_types`` the parallel
+    per-pool-node :class:`CallTargetType` of the FULL-set EDGE that
+    reached it (the very ct_type this callee would have carried had the
+    subset not pruned it -- so a re-inlined pool node keeps its true
+    parent-slot edge type, never a default). ``emitted_nodes`` /
+    ``excluded_nodes`` are catalog NODE indices (``var_offsets``-major).
     """
 
     emitted_nodes: np.ndarray  # int64[k] -- BFS emission order, root at [0]
     emitted_edge_types: np.ndarray  # uint8[k] -- edge CallTargetType per node
     excluded_nodes: np.ndarray  # int64[m] -- remembered backfill pool
+    excluded_edge_types: np.ndarray  # uint8[m] -- edge CallTargetType per pool node
 
 
 def compute_row_inclusions(
@@ -154,8 +159,10 @@ def compute_row_inclusions(
             decider=decider,
             max_depth=max_depth,
         )
-        # Full-set inclusion membership (order discarded) for the pool diff.
-        included_full = _bfs_full_included(
+        # Full-set inclusion membership (order discarded) for the pool diff,
+        # plus the EDGE ct_type each full-set callee was reached by -- the
+        # provenance a re-inlined pool node carries through backfill.
+        included_full, full_edge_type = _bfs_full_included(
             section_idx=section_idx,
             cols=cols,
             adjacency=adjacency,
@@ -170,11 +177,21 @@ def compute_row_inclusions(
             # ascending; excludes anything this row already emitted.
             pool = np.setdiff1d(
                 included_full, emitted, assume_unique=False
+            ).astype(np.int64)
+            # Carry each pool node's FULL-set edge ct_type verbatim (the
+            # ct_type it would have had as an inlined callee). full_edge_type
+            # is keyed by node so the gather is a parallel lookup, never a
+            # default.
+            pool_types = (
+                full_edge_type[pool]
+                if pool.size
+                else np.zeros(0, dtype=np.uint8)
             )
             out[r] = RowInclusion(
                 emitted_nodes=emitted,
                 emitted_edge_types=emitted_types,
-                excluded_nodes=pool.astype(np.int64),
+                excluded_nodes=pool,
+                excluded_edge_types=pool_types,
             )
     return out  # type: ignore[return-value]
 
@@ -278,28 +295,44 @@ def _bfs_full_included(
     adjacency: LiveNodeAdjacency,
     decider: OnceOnlyInclusion,
     max_depth: int,
-) -> np.ndarray:
-    """Full variant-set BFS: the de-duplicated INCLUDED callee node set.
+):
+    """Full variant-set BFS: INCLUDED callee node set + per-node edge type.
 
-    Order is irrelevant here (the pool is a set difference). Mask rows =
-    EVERY variant of the section, so the columnwise-ALL exclusion uses
-    the full mask the legacy index build used. Returns the ascending-
-    unique set of callee nodes any variant included (root excluded).
+    Order is irrelevant for the node SET (the pool is a set difference);
+    mask rows = EVERY variant of the section, so the columnwise-ALL
+    exclusion uses the full mask the legacy index build used.
+
+    Returns ``(included_nodes, node_edge_type)``:
+
+    * ``included_nodes`` -- the ascending-unique set of callee nodes any
+      variant included (root excluded).
+    * ``node_edge_type`` -- ``uint8[n_nodes]`` keyed by catalog node index:
+      ``node_edge_type[n]`` is the :class:`CallTargetType` of the EDGE the
+      full-set BFS reached node ``n`` by (the FIRST inclusion in BFS order
+      wins when the same node is reached via several edges -- deterministic
+      and the natural "the edge that first put it in the pool" choice).
+      Entries for never-included nodes are unset (the caller only ever
+      gathers included / pool nodes, never others). This is the verbatim
+      parent-slot ct_type, NOT a default -- it is the very edge attribute a
+      re-inlined pool node must carry through backfill.
     """
+    n_nodes = int(cols.var_offsets[-1])
+    node_edge_type = np.zeros(n_nodes, dtype=np.uint8)
     n_variants = int(cols.n_variants[section_idx])
     if n_variants <= 0:
-        return np.zeros(0, dtype=np.int64)
+        return np.zeros(0, dtype=np.int64), node_edge_type
     v0 = int(cols.var_offsets[section_idx])
     decider.begin_root(n_variants, section_idx)
 
     parent_row = np.arange(n_variants, dtype=np.int64)
     parent_node = v0 + parent_row
     included: List[np.ndarray] = []
+    seen = np.zeros(n_nodes, dtype=bool)
 
     for _depth in range(1, max_depth + 1):
         if parent_node.size == 0:
             break
-        rows, fids, child_nodes, _child_types = _expand_level(
+        rows, fids, child_nodes, child_types = _expand_level(
             parent_row, parent_node, adjacency
         )
         if child_nodes.size == 0:
@@ -307,14 +340,23 @@ def _bfs_full_included(
         result = decider.step_level(rows, fids)
         inc = result.included
         if bool(inc.any()):
-            included.append(child_nodes[inc])
+            inc_nodes = child_nodes[inc]
+            inc_types = child_types[inc]
+            included.append(inc_nodes)
+            # First-inclusion-wins per node: only stamp the edge type for a
+            # node not already seen, scanning the level in pair order so the
+            # earliest BFS edge is the recorded one.
+            for n, t in zip(inc_nodes.tolist(), inc_types.tolist()):
+                if not seen[n]:
+                    seen[n] = True
+                    node_edge_type[n] = t
         surv = result.survivor_pairs
         parent_row = rows[surv]
         parent_node = child_nodes[surv]
 
     if not included:
-        return np.zeros(0, dtype=np.int64)
-    return np.unique(np.concatenate(included)).astype(np.int64)
+        return np.zeros(0, dtype=np.int64), node_edge_type
+    return np.unique(np.concatenate(included)).astype(np.int64), node_edge_type
 
 
 def _expand_level(

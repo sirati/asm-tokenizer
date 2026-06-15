@@ -78,6 +78,7 @@ def _geometry(
         reservation=reservation,
         excluded_pool=np.zeros(0, dtype=np.int64),
         excluded_pool_offsets=np.zeros(n_rows + 1, dtype=np.int64),
+        excluded_pool_edge_type=np.zeros(0, dtype=np.uint8),
     )
 
 

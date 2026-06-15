@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.vector_batch import compute_batch_geometry
 from tokenizer.aligned_data.loader.vector_batch._backfill import (
     backfill_geometry,
@@ -42,8 +43,8 @@ NODE_C = 4
 OWN = {ROOT_V0: 6, ROOT_V1: 8, NODE_A: 4, NODE_B: 10, NODE_C: 7}
 
 
-def _geometry(seq_len: int, sampled_variants, *, max_depth: int = 2):
-    c = build_synthetic_corpus()
+def _geometry(seq_len: int, sampled_variants, *, max_depth: int = 2, corpus=None):
+    c = corpus if corpus is not None else build_synthetic_corpus()
     g = compute_batch_geometry(
         cols=c.cols,
         section_offsets=c.section_offsets,
@@ -301,3 +302,60 @@ def test_backfilled_geometry_triple_matches_rlg3_axes():
         assert int(em.own_length[flat]) == 1 + int(c.geometry.body_lengths[n])
         assert int(em.id_total[flat]) == int(c.geometry.id_counts[n])
         assert int(em.value_total[flat]) == int(c.geometry.value_counts[n])
+
+
+# ---------------------------------------------------------------------------
+# edge_type provenance: a backfilled node keeps its pruned-edge ct_type
+# ---------------------------------------------------------------------------
+
+
+def test_augmented_emission_edge_type_axis_present_and_aligned():
+    """The augmented emission carries a uint8 edge_type axis parallel to
+    node (every backfill node has an edge type), and the row's ORIGINAL
+    edge types are preserved verbatim in the kept prefix."""
+    c, g = _geometry(seq_len=30, sampled_variants=[0, 1])
+    aug = _backfill(c, g)
+    em = aug.emission
+    assert em.edge_type.dtype == np.uint8
+    assert em.edge_type.shape == em.node.shape
+    # The original (unbackfilled) row1 prefix [root_v1] keeps its edge type.
+    lo = int(em.row_offsets[1])
+    assert int(em.edge_type[lo]) == int(g.emission.edge_type[g.emission.row_offsets[1]])
+
+
+def test_backfilled_node_edge_type_equals_pool_value():
+    """A re-inlined pool node's edge_type EQUALS the ct_type it carried in
+    the excluded_pool -- proving the parent-slot edge type is preserved
+    through backfill, not defaulted. The sec2->sec3 edge is marked PLT, so
+    C lands in row1's pool as a PLT edge and must surface as PLT (not the
+    LOCAL default the root / other edges carry)."""
+    ct = np.array(
+        [
+            int(CallTargetType.LOCAL),  # root -> sec1
+            int(CallTargetType.LOCAL),  # root -> sec2 (B)
+            int(CallTargetType.PLT),    # sec2 -> sec3 (C)
+        ],
+        dtype=np.uint8,
+    )
+    corpus = build_synthetic_corpus(ct_type=ct)
+    c, g = _geometry(seq_len=30, sampled_variants=[0, 1], corpus=corpus)
+
+    # row1 pool carries C(4) as a PLT edge (its full-set parent slot type).
+    p_lo = int(g.excluded_pool_offsets[1])
+    p_hi = int(g.excluded_pool_offsets[1 + 1])
+    pool_nodes = g.excluded_pool[p_lo:p_hi].tolist()
+    pool_types = g.excluded_pool_edge_type[p_lo:p_hi].tolist()
+    assert NODE_C in pool_nodes
+    c_pool_type = pool_types[pool_nodes.index(NODE_C)]
+    assert c_pool_type == int(CallTargetType.PLT)
+
+    # L=30 backfills BOTH B and C into row1; C's emission edge_type must
+    # equal its pool edge_type (PLT), not a default LOCAL.
+    aug = _backfill(c, g)
+    lo = int(aug.emission.row_offsets[1])
+    hi = int(aug.emission.row_offsets[1 + 1])
+    aug_nodes = aug.emission.node[lo:hi].tolist()
+    aug_types = aug.emission.edge_type[lo:hi].tolist()
+    assert NODE_C in aug_nodes
+    assert aug_types[aug_nodes.index(NODE_C)] == c_pool_type
+    assert aug_types[aug_nodes.index(NODE_C)] == int(CallTargetType.PLT)

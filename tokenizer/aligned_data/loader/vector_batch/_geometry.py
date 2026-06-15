@@ -134,7 +134,9 @@ def compute_batch_geometry(
         value_total=emission.value_total,
         row_offsets=emission.row_offsets,
     )
-    excluded_pool, excluded_offsets = _flatten_excluded(inclusions)
+    excluded_pool, excluded_offsets, excluded_edge_type = _flatten_excluded(
+        inclusions
+    )
 
     return BatchGeometry(
         n_rows=n_rows,
@@ -143,6 +145,7 @@ def compute_batch_geometry(
         reservation=reservation,
         excluded_pool=excluded_pool,
         excluded_pool_offsets=excluded_offsets,
+        excluded_pool_edge_type=excluded_edge_type,
     )
 
 
@@ -197,14 +200,22 @@ def _flatten_emission(
 
 
 def _flatten_excluded(inclusions: List[RowInclusion]):
-    """Concatenate per-row remembered-excluded pools into flat CSR."""
+    """Concatenate per-row remembered-excluded pools into flat CSR.
+
+    Returns ``(pool, offsets, edge_type)`` -- the flat node pool, its CSR
+    offsets, and the PARALLEL per-pool-node edge ct_type (concatenated in
+    the SAME row-major order as ``pool``), so backfill can carry each
+    re-inlined node's true parent-slot edge type.
+    """
     per_row = [inc.excluded_nodes for inc in inclusions]
+    per_row_types = [inc.excluded_edge_types for inc in inclusions]
     lengths = np.array([e.size for e in per_row], dtype=np.int64)
     offsets = np.zeros(lengths.size + 1, dtype=np.int64)
     np.cumsum(lengths, out=offsets[1:])
-    pool = (
-        np.concatenate(per_row).astype(np.int64)
-        if per_row
-        else np.zeros(0, dtype=np.int64)
-    )
-    return pool, offsets
+    if per_row:
+        pool = np.concatenate(per_row).astype(np.int64)
+        edge_type = np.concatenate(per_row_types).astype(np.uint8)
+    else:
+        pool = np.zeros(0, dtype=np.int64)
+        edge_type = np.zeros(0, dtype=np.uint8)
+    return pool, offsets, edge_type

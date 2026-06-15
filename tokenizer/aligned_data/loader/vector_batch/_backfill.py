@@ -110,11 +110,13 @@ def backfill_geometry(
     n_rows = geometry.n_rows
     pool = geometry.excluded_pool
     pool_off = geometry.excluded_pool_offsets
+    pool_edge_type = geometry.excluded_pool_edge_type
 
     # Per-row append lists; greedy fit-fully in pool order. A row's loop is
     # over its OWN pool only -- never another row's slice -- so a
     # backfilled node is guaranteed to be in that row's excluded_pool.
     appended_per_row = []
+    appended_edge_types_per_row = []
     for r in range(n_rows):
         emit_lo = int(em.row_offsets[r])
         emit_hi = int(em.row_offsets[r + 1])
@@ -122,19 +124,31 @@ def backfill_geometry(
 
         remaining = seq_len - int(layout.total_length[r])
         chosen: list[int] = []
+        chosen_types: list[int] = []
         p_lo = int(pool_off[r])
         p_hi = int(pool_off[r + 1])
-        for node in pool[p_lo:p_hi].tolist():
+        # Walk the row's pool slice with its PARALLEL edge-type slice so a
+        # chosen node carries its true parent-slot ct_type (the value it
+        # held as a pruned edge), never a default.
+        for node, edge_type in zip(
+            pool[p_lo:p_hi].tolist(), pool_edge_type[p_lo:p_hi].tolist()
+        ):
             if node in already:
                 continue
             own = 1 + int(body[node])
             if own <= remaining:
                 chosen.append(node)
+                chosen_types.append(edge_type)
                 already.add(node)
                 remaining -= own
         appended_per_row.append(np.array(chosen, dtype=np.int64))
+        appended_edge_types_per_row.append(
+            np.array(chosen_types, dtype=np.uint8)
+        )
 
-    aug_emission = _append_emission(em, appended_per_row, body, ids, vals)
+    aug_emission = _append_emission(
+        em, appended_per_row, appended_edge_types_per_row, body, ids, vals
+    )
 
     # The variant PREFIX is a root-node property; the root is untouched by
     # backfill (only appended-after), so the per-row prefix is unchanged.
@@ -157,12 +171,14 @@ def backfill_geometry(
         reservation=aug_reservation,
         excluded_pool=geometry.excluded_pool,
         excluded_pool_offsets=geometry.excluded_pool_offsets,
+        excluded_pool_edge_type=geometry.excluded_pool_edge_type,
     )
 
 
 def _append_emission(
     em: BatchRowEmission,
     appended_per_row,
+    appended_edge_types_per_row,
     body: np.ndarray,
     ids: np.ndarray,
     vals: np.ndarray,
@@ -173,10 +189,15 @@ def _append_emission(
     backfill nodes are concatenated AFTER it (pool order). The appended
     nodes' own_length / id_total / value_total are gathered from the SAME
     RLG3 axes the prepass used (``own = 1 + body_len``), so the augmented
-    emission stays self-consistent with the original entries.
+    emission stays self-consistent with the original entries. The
+    ``edge_type`` axis is the row's ORIGINAL edge types (verbatim, an EDGE
+    property the gather-from-node cannot reconstruct) concatenated with the
+    appended nodes' pool edge types (the pruned-edge ct_type, parallel to
+    ``appended_per_row``).
     """
     n_rows = len(appended_per_row)
     node_parts: list[np.ndarray] = []
+    edge_type_parts: list[np.ndarray] = []
     row_lengths = np.empty(n_rows, dtype=np.int64)
     for r in range(n_rows):
         lo = int(em.row_offsets[r])
@@ -185,12 +206,21 @@ def _append_emission(
         extra = appended_per_row[r]
         node_parts.append(orig)
         node_parts.append(extra)
+        # edge_type is an EDGE property (not derivable from the node): keep
+        # the original slice verbatim, then the appended pool edge types.
+        edge_type_parts.append(em.edge_type[lo:hi])
+        edge_type_parts.append(appended_edge_types_per_row[r])
         row_lengths[r] = orig.size + extra.size
 
     node = (
         np.concatenate(node_parts).astype(np.int64)
         if node_parts
         else np.zeros(0, dtype=np.int64)
+    )
+    edge_type = (
+        np.concatenate(edge_type_parts).astype(np.uint8)
+        if edge_type_parts
+        else np.zeros(0, dtype=np.uint8)
     )
     row_offsets = np.zeros(n_rows + 1, dtype=np.int64)
     np.cumsum(row_lengths, out=row_offsets[1:])
@@ -205,6 +235,7 @@ def _append_emission(
     return BatchRowEmission(
         row_offsets=row_offsets,
         node=node,
+        edge_type=edge_type,
         own_length=own_length,
         id_total=id_total,
         value_total=value_total,

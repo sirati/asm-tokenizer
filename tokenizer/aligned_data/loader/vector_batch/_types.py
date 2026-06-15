@@ -228,3 +228,17 @@ class BatchGeometry:
     """``int64[B + 1]`` -- CSR offsets: row ``r``'s remembered-excluded
     pool is ``excluded_pool[excluded_pool_offsets[r] :
     excluded_pool_offsets[r + 1]]``."""
+
+    excluded_pool_edge_type: np.ndarray
+    """``uint8[n_excluded]`` -- the :class:`~tokenizer.aligned_data.
+    call_target_type.CallTargetType` of the FULL-set EDGE that reached
+    each ``excluded_pool`` node, PARALLEL to :attr:`excluded_pool` (same
+    length, same CSR offsets). Provenance: the pruned callee's parent-slot
+    ``ct_type`` learned in the full-variant-set inclusion pass that built
+    the pool (:mod:`._inclusion`) -- the very edge type this callee would
+    have carried as an inlined node had the SAMPLED subset not pruned it.
+    Backfill (:mod:`._backfill`) gathers from this axis at the same
+    indices it draws the re-inlined nodes, so a backfilled node's
+    :attr:`BatchRowEmission.edge_type` is its TRUE parent-slot ct_type,
+    never a default. Same edge-property semantics as
+    :attr:`BatchRowEmission.edge_type` (LOCAL or PLT; EXTERN gated out)."""

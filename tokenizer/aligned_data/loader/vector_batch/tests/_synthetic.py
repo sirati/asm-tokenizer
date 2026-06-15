@@ -64,8 +64,18 @@ class SyntheticCorpus:
     var_offsets: np.ndarray
 
 
-def build_synthetic_corpus() -> SyntheticCorpus:
-    """Build the hand-computable synthetic catalog + sidecars."""
+def build_synthetic_corpus(
+    *, ct_type: np.ndarray | None = None
+) -> SyntheticCorpus:
+    """Build the hand-computable synthetic catalog + sidecars.
+
+    ``ct_type`` overrides the per-call_target :class:`CallTargetType`
+    array (3 slots, in catalog order: root->sec1, root->sec2, sec2->sec3);
+    default is all ``LOCAL``. A PLT slot lets a test prove the edge type
+    of a re-inlined / pruned callee is carried VERBATIM (not defaulted to
+    LOCAL). EXTERN is gated out of the splice, so only LOCAL / PLT are
+    meaningful here.
+    """
     # --- section / variant shape ----------------------------------------
     n_variants = np.array([2, 1, 1, 1], dtype=np.int64)  # root, A, B, C
     var_offsets = _csr(n_variants)  # nodes: root=0,1 A=2 B=3 C=4
@@ -84,9 +94,14 @@ def build_synthetic_corpus() -> SyntheticCorpus:
         [section_offsets[1], section_offsets[2], section_offsets[3]],
         dtype=np.uint32,
     )
-    ct_type = np.array(
-        [int(CallTargetType.LOCAL)] * 3, dtype=np.uint8
-    )
+    if ct_type is None:
+        ct_type = np.array([int(CallTargetType.LOCAL)] * 3, dtype=np.uint8)
+    else:
+        ct_type = np.asarray(ct_type, dtype=np.uint8).reshape(-1)
+        if ct_type.size != 3:
+            raise ValueError(
+                f"ct_type override must have 3 slots; got {ct_type.size}"
+            )
 
     # --- per-call entries (pce) -----------------------------------------
     # Each variant calls its called slots with its OWN J=0.
