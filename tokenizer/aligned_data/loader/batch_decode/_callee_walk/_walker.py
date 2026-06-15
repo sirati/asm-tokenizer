@@ -139,18 +139,24 @@ def _load_root_bodies(
 ) -> List["FunctionData"]:
     """The per-variant root :class:`FunctionData` for ``section``.
 
-    Harvested from the session's per-arm load keyed on the section's own
-    offset, so the convenience wrapper does not re-parse the body the
-    caller already passed for ``root_variant_idx``.
+    The caller already holds the parsed ``section``; the per-variant
+    bodies are materialised via the section-threaded body loaders
+    (:py:meth:`_load_matched_variant_body` /
+    :py:meth:`_load_unmatched_variant_body`), so ``_sections.bin`` is NOT
+    re-parsed -- mirroring the callee-body load's no-reparse contract.
+    Only the ``_idx_for_section_offset`` reverse-lookup (a cheap array
+    ``np.where``, not a section parse) recovers the per-arm idx the body
+    loaders need.
     """
     idx = session._idx_for_section_offset(
         int(section.section_offset), arm.value
     )
     if arm is SectionKind.MATCHED:
-        _sec, _off, matched = session._load_matched_section_and_variants(idx)
-        return list(matched.variants)
-    fd, _sec, _off = session._load_unmatched_for_splice(idx)
-    return [fd]
+        return [
+            session._load_matched_variant_body(idx, v, section)
+            for v in range(len(section.variants))
+        ]
+    return [session._load_unmatched_variant_body(idx, section)]
 
 
 @dataclass

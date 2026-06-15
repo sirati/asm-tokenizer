@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from tokenizer.aligned_data.loader.batch_decode._callee_walk._walker import (
+    _load_root_bodies,
+)
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
+from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 
 from ._session_fixture import synthetic_binary  # noqa: F401
 
@@ -112,6 +116,38 @@ def test_unmatched_variant_body_matches_full_load(synthetic_binary) -> None:
                 f"(idx={idx}, offsets={parses})"
             )
             _assert_function_data_equal(one, full_fd)
+
+
+def test_root_bodies_reuse_threaded_section_no_reparse(
+    synthetic_binary,
+) -> None:
+    """``_load_root_bodies(session, arm, section)`` harvests the
+    per-variant root bodies from the section it already holds, issuing NO
+    ``_parse_section_at`` -- mirroring the callee body load's no-reparse
+    contract. The harvested bodies are byte-identical to the all-variants
+    load's ``MatchedFunction.variants``.
+    """
+    fb = synthetic_binary
+    ds = BinaryDataset(
+        fb["base_path"], fb["binary_name"], vocab_manager=fb["vocab"]
+    )
+    with ds.open_session() as sess:
+        n_matched = len(sess.get_metadata("matched_arm").bin_starts)
+        for idx in range(n_matched):
+            section, _offset, matched = (
+                sess._load_matched_section_and_variants(idx)
+            )
+            with _count_section_parses(sess) as parses:
+                bodies = _load_root_bodies(
+                    sess, SectionKind.MATCHED, section
+                )
+            assert parses == [], (
+                f"root body harvest re-parsed _sections.bin "
+                f"(idx={idx}, offsets={parses})"
+            )
+            assert len(bodies) == len(matched.variants)
+            for body, expected in zip(bodies, matched.variants):
+                _assert_function_data_equal(body, expected)
 
 
 def test_unmatched_section_meta_matches_full_load(synthetic_binary) -> None:
