@@ -288,14 +288,6 @@ def _emit_variant_per_call_entries(
     name) is unresolvable and stamps the missing sentinel — see the
     decision matrix below.
     """
-    # NOTE (plumbing): ``variant_called_occurrences`` is threaded to this
-    # seam but not yet consulted — calls into a DUPLICATED callee still
-    # stamp the blanket missing sentinel below, exactly as before. The
-    # occurrence-aware decision matrix (resolve a dup call into the
-    # occurrence-k sibling vs. the missing sentinel) lands together with
-    # its only consumer, the SectionWriter's (FID, occurrence)-aware
-    # back-patch — so this commit stays strictly behavior-preserving and
-    # carries no computed-but-unused value.
     entries: List[PerCallEntry] = []
     for callee_name, callee_type in variant_called:
         if callee_type is CallTargetType.EXTERN:
@@ -305,21 +297,30 @@ def _emit_variant_per_call_entries(
         key = (callee_name, callee_type)
         called_idx = unique_called_index_map[key]
         callee_fid = registry.line_no(callee_name)
-        # A call into a DUPLICATED callee is real (the edge is recorded
-        # via ``called_idx``) but unresolvable: the canonical name maps to
-        # several distinct functions, now living as sibling variants in
-        # one unmatched section, and we cannot know WHICH one this site
-        # targets. Stamp the legitimately-missing sentinel rather than
-        # resolve against an arbitrary sibling's variant table.
-        resolved = (
-            MISSING_VARIANT_INDEX if callee_name in duplicated_names else None
-        )
+        # Three-row decision matrix for the call target (see docstring):
+        #   ROW 1 — non-duplicated callee: normal FID resolve, no occurrence.
+        #   ROW 2 — duplicated callee with a known occurrence k: defer to the
+        #     writer's (FID, occurrence) resolver via ``callee_occurrence=k``.
+        #   ROW 3 — duplicated callee with no known occurrence (absent from
+        #     ``variant_called_occurrences``: indirect/unresolved or an
+        #     extractor-demoted ambiguous edge): terminal missing sentinel,
+        #     never routed through FID-resolve.
+        if callee_name not in duplicated_names:
+            resolved = None
+            callee_occurrence = None
+        elif callee_name in variant_called_occurrences:
+            resolved = None
+            callee_occurrence = variant_called_occurrences[callee_name]
+        else:
+            resolved = MISSING_VARIANT_INDEX
+            callee_occurrence = None
         entries.append(
             PerCallEntry(
                 called_idx=called_idx,
                 callee_function_name_ptr=callee_fid,
                 callee_vkey=callee_variant_ref_offset,
                 resolved_section_variant_index=resolved,
+                callee_occurrence=callee_occurrence,
             )
         )
     # Stable sort by call_target category: LOCAL (0) block then PLT (1)
@@ -565,6 +566,13 @@ def group_unmatched_entries_by_function(
         if identity not in unmatched_by_func:
             unmatched_by_func[identity] = {
                 "func_name": func_name,
+                # This section's same-name sibling ordinal (the kth
+                # divergent same-FID body carries ``occurrence == k``;
+                # the single body of a non-duplicated name is 0). The
+                # writer threads it into ``begin_section`` so the closing
+                # sibling resolves only the deferred caller holes whose
+                # intended ``callee_occurrence`` matches it.
+                "occurrence": identity[1],
                 "version_data_list": [],
                 "called_by_version": [],
                 "called_occurrences_by_version": [],
@@ -717,6 +725,7 @@ def write_unmatched_sections_pass2(
         version_data_list = data["version_data_list"]
         called_by_version = data["called_by_version"]
         called_occurrences_by_version = data["called_occurrences_by_version"]
+        occurrence = data["occurrence"]
         vkeys = data["vkeys"]
         extern_libraries: "dict[str, str]" = data["extern_libraries"]
 
@@ -791,6 +800,7 @@ def write_unmatched_sections_pass2(
             function_name_ptr=function_name_ptr,
             n_variants=len(vkeys),
             duplicated=func_name in duplicated_names,
+            occurrence=occurrence,
         )
         call_targets, unique_called_index_map = _build_call_targets_spec(
             typed_unique_called,
