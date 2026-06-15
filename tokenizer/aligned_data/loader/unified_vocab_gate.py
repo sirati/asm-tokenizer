@@ -20,10 +20,30 @@ Kept out of ``aligned_data_loader.py`` so the loader file stays under the
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
-from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
+from tokenizer.aligned_data.memmap_format import (
+    MEMMAP_FORMAT_VERSION,
+    _PRELUDE_RESERVED_SIZE,
+)
 from tokenizer.token_manager import VocabularyManager
+
+
+def compute_vocab_fingerprint(vocab_path: Path) -> bytes:
+    """Return the 8-byte identity fingerprint of a ``unified_vocab.csv``.
+
+    The first 8 bytes of ``sha256(file bytes)`` — enough to distinguish any
+    two distinct corpus vocabs (e.g. an arm64 vs a mips64 unify) with
+    negligible collision risk. The memmap builder stamps this into each
+    ``_data.bin`` prelude; the loader recomputes it from the vocab it
+    actually loaded and HARD-FAILS on mismatch (catalog built against a
+    different vocab than the one being used to decode it). Computed from the
+    raw CSV bytes so the BUILDER (which has the co-located file) and the
+    LOADER (which reads the same file to parse it) agree by construction.
+    """
+    digest = hashlib.sha256(Path(vocab_path).read_bytes()).digest()
+    return digest[:_PRELUDE_RESERVED_SIZE]
 
 # ``load_unified_vocab_manager`` is imported lazily inside the function
 # body to break the import cycle: ``tokenizer.vocab_unifier`` (its
@@ -144,4 +164,9 @@ def load_and_validate_unified_vocab(vocab_path: Path) -> VocabularyManager:
             "per-binary CSVs to regenerate."
         )
 
+    # Stamp the vocab's identity fingerprint onto the VM so the per-binary
+    # session can verify a catalog was built against THIS vocab before
+    # decoding it -- catching a wrong-but-same-format-version vocab that
+    # would silently mis-decode the variant-axis band (#27 safety net).
+    vocab_manager._vocab_fingerprint = compute_vocab_fingerprint(vocab_path)
     return vocab_manager

@@ -190,18 +190,28 @@ def _bytes_equal_modulo_idx(
     return existing[:start] == candidate[:start] and existing[end:] == candidate[end:]
 
 
-def open_arm_dedup_state(path) -> ArmDedupState:
+def open_arm_dedup_state(path, vocab_fingerprint=None) -> ArmDedupState:
     """Construct an :class:`ArmDedupState` with a fresh memmap'd bin.
 
     Stamps the file-level prelude (16 bytes) into the bin so SENTINEL=0
-    is safe at the dedup-map level. The caller owns the returned
+    is safe at the dedup-map level. ``vocab_fingerprint`` (8 bytes) is the
+    identity of the unified vocab this catalog is built against; it lands in
+    the prelude's reserved slot so the loader can HARD-FAIL on a catalog↔
+    vocab mismatch (#27). ``None`` stamps the all-zero soft-skip sentinel
+    (fixtures + non-production callers). The caller owns the returned
     state's writer lifecycle — call :func:`finalize_arm_dedup_state`
     when done (or stash it in an ``ExitStack`` callback) so the
     ``total_entries`` trailer is stamped before the writer closes.
     """
-    from tokenizer.aligned_data.memmap_format import encode_data_bin_prelude
+    from tokenizer.aligned_data.memmap_format import (
+        NO_FINGERPRINT,
+        encode_data_bin_prelude,
+    )
 
-    writer = MemmapBinWriter(path, prelude_bytes=encode_data_bin_prelude())
+    fingerprint = NO_FINGERPRINT if vocab_fingerprint is None else vocab_fingerprint
+    writer = MemmapBinWriter(
+        path, prelude_bytes=encode_data_bin_prelude(fingerprint)
+    )
     return ArmDedupState(writer=writer)
 
 

@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
-from tokenizer.aligned_data.loader.unified_vocab_gate import UNIFIED_VOCAB_BASENAME
+from tokenizer.aligned_data.loader.unified_vocab_gate import (
+    UNIFIED_VOCAB_BASENAME,
+    compute_vocab_fingerprint,
+)
 from tokenizer.aligned_data.memmap_format import MEMMAP_FORMAT_VERSION
 from tokenizer.aligned_data.parsed_record_iter import (
     DuplicateNameClassifier,
@@ -133,6 +136,10 @@ def build_memmap_files(
             f"build_memmap_files: failed to load unified vocab from "
             f"{unified_vocab_path}; cannot encode variant-axis tokens."
         )
+    # Identity fingerprint of the vocab this catalog is built against,
+    # stamped into each _data.bin prelude so the loader can HARD-FAIL if a
+    # catalog is later decoded with the wrong vocab (#27 safety net).
+    vocab_fingerprint = compute_vocab_fingerprint(unified_vocab_path)
     if unified_vocab.format_version != MEMMAP_FORMAT_VERSION:
         raise ValueError(
             f"build_memmap_files: unified vocab at {unified_vocab_path} "
@@ -209,8 +216,12 @@ def build_memmap_files(
         logger.info(f"  Creating: {matched_data_path}")
         logger.info(f"  Creating: {unmatched_data_path}")
         logger.info(f"  Creating: {error_log_path}")
-        matched_state = open_arm_dedup_state(matched_data_path)
-        unmatched_state = open_arm_dedup_state(unmatched_data_path)
+        matched_state = open_arm_dedup_state(
+            matched_data_path, vocab_fingerprint=vocab_fingerprint
+        )
+        unmatched_state = open_arm_dedup_state(
+            unmatched_data_path, vocab_fingerprint=vocab_fingerprint
+        )
         # ``finalize_arm_dedup_state`` stamps the u32-aligned
         # ``total_entries`` trailer (sourced from the dedup state's
         # encounter counter, which advances only on actual writes)

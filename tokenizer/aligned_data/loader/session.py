@@ -460,10 +460,32 @@ class BinarySession(_BinarySessionHelpersMixin):
         # returning garbage records on first slice.
         from tokenizer.aligned_data.memmap_format import (
             DATA_BIN_PRELUDE_SIZE,
+            NO_FINGERPRINT,
             assert_data_bin_prelude,
+            read_bin_prelude_reserved,
             read_data_bin_trailer,
         )
-        assert_data_bin_prelude(bytes(mmap[:DATA_BIN_PRELUDE_SIZE]), path=str(path))
+        prelude = bytes(mmap[:DATA_BIN_PRELUDE_SIZE])
+        assert_data_bin_prelude(prelude, path=str(path))
+        # #27 safety net: a _data.bin built post-fingerprint carries the
+        # identity of the unified vocab it was built against. If we hold a
+        # fingerprinted vocab (loaded via the gate) and it disagrees, this
+        # catalog is being decoded with the WRONG vocab -- which would
+        # silently mis-decode the variant-axis band. Fail loud. Soft-skip
+        # when either side lacks a fingerprint (pre-#27 bin, or a vocab not
+        # loaded through the gate).
+        catalog_fp = read_bin_prelude_reserved(prelude)
+        if catalog_fp != NO_FINGERPRINT:
+            vocab_fp = getattr(self._vocab_manager, "_vocab_fingerprint", None)
+            if vocab_fp is not None and catalog_fp != vocab_fp:
+                raise ValueError(
+                    f"catalog<->vocab fingerprint mismatch for {path}: this "
+                    f"_data.bin was built against a DIFFERENT unified_vocab "
+                    f"(catalog={catalog_fp.hex()}) than the one loaded "
+                    f"(vocab={vocab_fp.hex()}). Decoding with this vocab would "
+                    f"silently mis-decode the variant-axis band. Load the "
+                    f"unified_vocab.csv co-located with this memmap."
+                )
         # The trailing ``total_entries`` u32 is the per-lookup
         # ``entry_idx < total_entries`` bound; read + cache it once
         # here so the hot path doesn't re-parse it per slice.

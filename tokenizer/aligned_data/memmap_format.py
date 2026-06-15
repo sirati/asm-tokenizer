@@ -40,24 +40,52 @@ _PRELUDE_SIZE: int = (
 )
 
 
-def encode_bin_prelude(magic: bytes) -> bytes:
+def encode_bin_prelude(
+    magic: bytes, reserved: bytes = b"\x00" * _PRELUDE_RESERVED_SIZE
+) -> bytes:
     """Return the 16-byte file-level prelude for a bin with the given magic.
 
-    ``magic`` must be exactly 4 bytes. The rest of the prelude is the
-    little-endian ``u32`` ``MEMMAP_FORMAT_VERSION`` followed by 8 zero
-    bytes of reserved space (currently unused; future format revisions
-    may carve fields out of it without bumping the prelude size).
+    ``magic`` must be exactly 4 bytes. The prelude is the little-endian
+    ``u32`` ``MEMMAP_FORMAT_VERSION`` followed by ``reserved`` (exactly 8
+    bytes). ``reserved`` defaults to all-zero (the historic shape); callers
+    that carry an identity fingerprint (e.g. the data-bin's
+    vocab-fingerprint, :func:`encode_data_bin_prelude`) pass it here. All-
+    zero reserved means "no fingerprint stamped" — readers treat it as a
+    soft no-op, preserving forward/backward compatibility with bins written
+    before the fingerprint existed.
     """
     if len(magic) != _PRELUDE_MAGIC_SIZE:
         raise ValueError(
             f"prelude magic must be {_PRELUDE_MAGIC_SIZE} bytes, "
             f"got {len(magic)} ({magic!r})"
         )
-    return (
-        bytes(magic)
-        + struct.pack("<I", MEMMAP_FORMAT_VERSION)
-        + b"\x00" * _PRELUDE_RESERVED_SIZE
-    )
+    if len(reserved) != _PRELUDE_RESERVED_SIZE:
+        raise ValueError(
+            f"prelude reserved must be {_PRELUDE_RESERVED_SIZE} bytes, "
+            f"got {len(reserved)}"
+        )
+    return bytes(magic) + struct.pack("<I", MEMMAP_FORMAT_VERSION) + bytes(reserved)
+
+
+def read_bin_prelude_reserved(prelude: bytes) -> bytes:
+    """Return the 8 reserved bytes of a bin prelude (the fingerprint slot).
+
+    All-zero means "no fingerprint stamped". Callers compare a non-zero
+    value against the expected identity (see the data-bin vocab-fingerprint
+    check in :class:`~tokenizer.aligned_data.loader.session.BinarySession`).
+    """
+    if len(prelude) < _PRELUDE_SIZE:
+        raise ValueError(
+            f"bin prelude too short for reserved field: got {len(prelude)} "
+            f"bytes, expected >= {_PRELUDE_SIZE}"
+        )
+    start = _PRELUDE_MAGIC_SIZE + _PRELUDE_VERSION_SIZE
+    return bytes(prelude[start : start + _PRELUDE_RESERVED_SIZE])
+
+
+#: Sentinel reserved value meaning "no vocab fingerprint stamped" (bins
+#: written before #27, or non-data bins). Readers soft-skip the check.
+NO_FINGERPRINT: bytes = b"\x00" * _PRELUDE_RESERVED_SIZE
 
 
 def assert_bin_prelude(
@@ -111,9 +139,21 @@ DATA_BIN_PRELUDE_MAGIC: bytes = b"DATA"
 DATA_BIN_PRELUDE_SIZE: int = _PRELUDE_SIZE
 
 
-def encode_data_bin_prelude() -> bytes:
-    """Return the 16-byte prelude bytes for a fresh ``_data.bin``."""
-    return encode_bin_prelude(DATA_BIN_PRELUDE_MAGIC)
+def encode_data_bin_prelude(
+    vocab_fingerprint: bytes = NO_FINGERPRINT,
+) -> bytes:
+    """Return the 16-byte prelude bytes for a fresh ``_data.bin``.
+
+    ``vocab_fingerprint`` (8 bytes) records the identity of the unified
+    vocab this catalog was built against (see
+    :func:`tokenizer.aligned_data.loader.unified_vocab_gate.compute_vocab_fingerprint`).
+    The loader compares it against the loaded vocab and HARD-FAILS on
+    mismatch — catching the case where a catalog is decoded with the wrong
+    (same-format-version) vocab, which would silently mis-decode the
+    variant-axis band. Defaults to :data:`NO_FINGERPRINT` (soft no-op) so
+    fixtures + bins predating the fingerprint stay valid.
+    """
+    return encode_bin_prelude(DATA_BIN_PRELUDE_MAGIC, reserved=vocab_fingerprint)
 
 
 def assert_data_bin_prelude(prelude: bytes, *, path: str = "") -> None:
