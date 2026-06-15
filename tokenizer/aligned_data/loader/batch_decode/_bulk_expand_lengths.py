@@ -1,16 +1,21 @@
-"""Bulk contributing-length scan over raw ``_data.bin`` token regions.
+"""Bulk contributing-geometry scan over raw ``_data.bin`` token regions.
 
 Single concern: for a batch of records (token-region spans on the
-``_data.bin`` uint8 array), compute each record's contributing BODY
-length -- the number of positions the record's body occupies in the
+``_data.bin`` uint8 array), compute each record's contributing
+geometry -- the BODY length plus the IDENTITY-carrier count and the
+NUMERIC-sidecar chunk count -- in ONE vectorized pass. ``body_len`` is
+the number of positions the record's body occupies in the
 post-promotion, post-strip expanded stream of :func:`._expand_tokens.
-expand_tokens`. This is the bulk twin of the scalar expansion; the
-expansion SEMANTICS are owned by :mod:`._expand_tokens` and any rule
-change must land there first -- the cross-equivalence test
-(``tests/test_bulk_expand_lengths.py``) pins the two paths to each
+expand_tokens`; ``id_count`` / ``value_chunk_count`` are the dense
+identity / numeric sidecar cardinalities the band-count paths
+(:mod:`._surviving_counts`) define. This is the bulk twin of the scalar
+expansion + band counts; the SEMANTICS are owned by
+:mod:`._expand_tokens` / :mod:`._surviving_counts` and any rule change
+must land there first -- the cross-equivalence test
+(``tests/test_bulk_expand_lengths.py``) pins all three paths to each
 other.
 
-Definition (mirrors ``expand_tokens`` step by step):
+Body-length definition (mirrors ``expand_tokens`` step by step):
 
 * every raw token ``> 256`` survives the strip (1 position each);
 * every VC2 carrier (raw id 257) paints ``max(1, ceil(L / 8)) - 1``
@@ -41,12 +46,18 @@ both halved from the historical ``int64`` carriers.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 from tokenizer.token_manager import VocabularyManager
 
 
-__all__ = ["bulk_contributing_body_lengths"]
+__all__ = [
+    "ContributingGeometry",
+    "bulk_contributing_geometry",
+    "bulk_contributing_body_lengths",
+]
 
 
 _V2_RESERVED_DIGIT_COUNT = VocabularyManager._V2_RESERVED_DIGIT_COUNT  # 256
@@ -56,6 +67,16 @@ _V2_NUMBER_BLOCK_COUNT = VocabularyManager._V2_NUMBER_BLOCK_COUNT  # 7
 _VC2_VOCAB_ID = _V2_NUMBER_BLOCK_START
 _FLOAT128_VOCAB_ID = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT - 1
 
+# NUMBER block raw-id span: [NUMBER_BLOCK_START, NUMBER_BLOCK_START + COUNT)
+# -- every raw carrier in this half-open band is a number-chunk source.
+# IDENTITY block raw-id span: [IDENTITY_BLOCK_START, EAGER_BLOCK_END) -- the
+# eager-block tail bounds it; both anchors come from VocabularyManager
+# exactly as :mod:`._identity_decode` / :mod:`._surviving_counts` derive
+# them, so a canonical-layout shift surfaces here as a constant update.
+_NUMBER_BLOCK_END = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT
+_V2_IDENTITY_BLOCK_START = VocabularyManager._V2_IDENTITY_BLOCK_START  # 264
+_V2_EAGER_BLOCK_END = VocabularyManager._V2_EAGER_BLOCK_END  # 272
+
 #: Gathered-token budget per chunk (u16 tokens). 2**22 tokens is ~8 MiB
 #: for the gathered u16 stream plus ~a dozen same-shaped u16/int32/bool
 #: per-token arrays -- ~100 MiB of transient working-set, comfortably
@@ -63,12 +84,49 @@ _FLOAT128_VOCAB_ID = _V2_NUMBER_BLOCK_START + _V2_NUMBER_BLOCK_COUNT - 1
 _CHUNK_TOKENS = 1 << 22
 
 
-def bulk_contributing_body_lengths(
+class ContributingGeometry(NamedTuple):
+    """Per-record contributing geometry from the single bulk scan.
+
+    Three parallel ``int64`` arrays (entry ``i`` describes record ``i``),
+    all produced by one pass of :func:`bulk_contributing_geometry`:
+
+    body_len:
+        Contributing BODY length -- the number of positions the record's
+        body occupies in the post-promotion, post-strip expanded stream
+        (see module docstring). Identical to the legacy
+        :func:`bulk_contributing_body_lengths` output.
+    id_count:
+        Number of IDENTITY-block raw tokens in the record. Identity
+        carriers are never promoted (one expanded position each), so this
+        is the per-record count of raw ids in
+        ``[_V2_IDENTITY_BLOCK_START, _V2_EAGER_BLOCK_END)``.
+    value_chunk_count:
+        Number of dense NUMERIC-sidecar slots the record fills. After
+        promotion every number source occupies one expanded NUMBER-band
+        position per produced chunk, so this is the per-record count of
+        raw ids in ``[_V2_NUMBER_BLOCK_START, _NUMBER_BLOCK_END)`` plus
+        the VC2 and finite-F128 continuation slots painted by promotion.
+    """
+
+    body_len: np.ndarray
+    id_count: np.ndarray
+    value_chunk_count: np.ndarray
+
+
+def bulk_contributing_geometry(
     data_u8: np.ndarray,
     token_starts: np.ndarray,
     token_counts: np.ndarray,
-) -> np.ndarray:
-    """Contributing body length per record, vectorized + chunked.
+) -> ContributingGeometry:
+    """Per-record ``(body_len, id_count, value_chunk_count)``, one scan.
+
+    The bulk twin of the scalar expansion + band counts: a single
+    vectorized + chunked pass over the raw token regions produces the
+    contributing body length AND the two sidecar cardinalities the dense
+    identity / numeric arrays need. The expansion + band SEMANTICS are
+    owned by :mod:`._expand_tokens` / :mod:`._surviving_counts`; the
+    cross-equivalence test (``tests/test_bulk_expand_lengths.py``) pins
+    all three outputs to those scalar paths.
 
     Parameters
     ----------
@@ -83,9 +141,10 @@ def bulk_contributing_body_lengths(
 
     Returns
     -------
-    np.ndarray
-        ``int64`` array parallel to the inputs; entry ``i`` is record
-        ``i``'s contributing body length (see module docstring).
+    ContributingGeometry
+        Three ``int64`` arrays parallel to the inputs (see the type
+        docstring). The prepended self-token is excluded from all three
+        -- it is the callee walk's concern, not the record's.
 
     Raises
     ------
@@ -102,9 +161,11 @@ def bulk_contributing_body_lengths(
             f"{starts.shape} vs {counts.shape}"
         )
     n_records = starts.size
-    out = np.zeros(n_records, dtype=np.int64)
+    body_len = np.zeros(n_records, dtype=np.int64)
+    id_count = np.zeros(n_records, dtype=np.int64)
+    value_chunk_count = np.zeros(n_records, dtype=np.int64)
     if n_records == 0:
-        return out
+        return ContributingGeometry(body_len, id_count, value_chunk_count)
 
     # Token regions are u16-LE at 16-byte-aligned record tails, so every
     # token_start is even; the chunk scan relies on that to gather via a
@@ -112,7 +173,7 @@ def bulk_contributing_body_lengths(
     # odd offset means a corrupt locator, not a silent mis-gather.
     if bool((starts & 1).any()):
         raise ValueError(
-            "bulk_contributing_body_lengths: token_starts must be even "
+            "bulk_contributing_geometry: token_starts must be even "
             "(u16-aligned record-tail offsets); got an odd offset"
         )
 
@@ -129,19 +190,40 @@ def bulk_contributing_body_lengths(
         tip = int(np.searchsorted(cum, base + _CHUNK_TOKENS, side="left"))
         chunk_last = min(max(tip + 1, chunk_first + 1), n_records)
         sl = slice(chunk_first, chunk_last)
-        out[sl] = _scan_chunk(data_u8, starts[sl], counts[sl])
+        chunk = _scan_chunk(data_u8, starts[sl], counts[sl])
+        body_len[sl] = chunk.body_len
+        id_count[sl] = chunk.id_count
+        value_chunk_count[sl] = chunk.value_chunk_count
         chunk_first = chunk_last
-    return out
+    return ContributingGeometry(body_len, id_count, value_chunk_count)
+
+
+def bulk_contributing_body_lengths(
+    data_u8: np.ndarray,
+    token_starts: np.ndarray,
+    token_counts: np.ndarray,
+) -> np.ndarray:
+    """Contributing body length per record (thin wrapper).
+
+    Returns only the ``body_len`` axis of
+    :func:`bulk_contributing_geometry`; this is the historical #17 index
+    path and stays byte-for-byte identical to the geometry scan's body
+    output. See :class:`ContributingGeometry` for the full triple.
+    """
+    return bulk_contributing_geometry(
+        data_u8, token_starts, token_counts
+    ).body_len
 
 
 def _scan_chunk(
     data_u8: np.ndarray, starts: np.ndarray, counts: np.ndarray
-) -> np.ndarray:
+) -> ContributingGeometry:
     """Scan one chunk of records gathered into a flat token stream."""
     total = int(counts.sum())
     n_records = starts.size
     if total == 0:
-        return np.zeros(n_records, dtype=np.int64)
+        zeros = np.zeros(n_records, dtype=np.int64)
+        return ContributingGeometry(zeros, zeros.copy(), zeros.copy())
 
     # record_of[k] / local index for the k-th gathered token. The
     # chunk holds <= _CHUNK_TOKENS tokens and <= that many records, so
@@ -177,6 +259,26 @@ def _scan_chunk(
     np.cumsum(raw > _V2_RESERVED_DIGIT_COUNT, dtype=np.int32, out=surv_cum[1:])
     kept_per_record = (
         surv_cum[rec_ends].astype(np.int64) - surv_cum[rec_starts]
+    )
+
+    # --- per-record band cardinalities (same cumsum-diff trick) ---------
+    # Identity carriers are never promoted, so id_count is a straight
+    # per-record bincount of raw ids in the IDENTITY block. The raw
+    # NUMBER-block carrier count is the un-promoted half of value_chunk_count
+    # (promotion's continuation slots are added below alongside body_len's
+    # vc2_extra / f128_extra, since they paint NUMBER-block ids too).
+    in_identity_block = (raw >= _V2_IDENTITY_BLOCK_START) & (
+        raw < _V2_EAGER_BLOCK_END
+    )
+    id_cum = np.zeros(total + 1, dtype=np.int32)
+    np.cumsum(in_identity_block, dtype=np.int32, out=id_cum[1:])
+    id_count = id_cum[rec_ends].astype(np.int64) - id_cum[rec_starts]
+
+    in_number_block = (raw >= _V2_NUMBER_BLOCK_START) & (raw < _NUMBER_BLOCK_END)
+    num_cum = np.zeros(total + 1, dtype=np.int32)
+    np.cumsum(in_number_block, dtype=np.int32, out=num_cum[1:])
+    number_carriers_per_record = (
+        num_cum[rec_ends].astype(np.int64) - num_cum[rec_starts]
     )
 
     # --- digit-run lengths starting at each position --------------------
@@ -250,4 +352,14 @@ def _scan_chunk(
         finite = (high_u16 & 0x7FFF) != 0x7FFF
         np.add.at(f128_extra, record_of[f128_pos[finite]], 1)
 
-    return kept_per_record + vc2_extra + f128_extra
+    # value_chunk_count: one dense numeric slot per produced NUMBER-band
+    # expanded position == raw NUMBER-block carriers + the promotion
+    # continuation slots (which paint VC2 / F128 ids, both in the NUMBER
+    # block). vc2_extra / f128_extra are the SAME continuation totals that
+    # feed body_len below, so the two stay in lockstep from one scan.
+    promotion_extra = vc2_extra + f128_extra
+    return ContributingGeometry(
+        body_len=kept_per_record + promotion_extra,
+        id_count=id_count,
+        value_chunk_count=number_carriers_per_record + promotion_extra,
+    )

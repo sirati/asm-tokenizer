@@ -88,11 +88,16 @@ class LiveNodeAdjacency:
 
     # -- public per-node API ----------------------------------------------
 
-    def __call__(self, node: int) -> Tuple[np.ndarray, np.ndarray]:
-        """``(child_nodes, child_secs)`` for ``node``, ascending slot order.
+    def __call__(self, node: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(child_nodes, child_secs, child_types)`` for ``node``.
 
         One entry per DIRECT call the node's variant resolves (skipping
-        gated-out / unresolvable slots).
+        gated-out / unresolvable slots), in ascending slot order.
+        ``child_types`` is the parent slot's :class:`CallTargetType`
+        (``ct_type``) per resolved child -- the EDGE attribute the decode
+        path turns into the inlined-callee self-token category (LOCAL ->
+        LOCAL_FUNC, PLT -> PLT_FUNC; EXTERN is gated out upstream). It is
+        an ``uint8`` array parallel to ``child_nodes`` / ``child_secs``.
         """
         cols = self._cols
         sec = int(self._sec_of_var[node])
@@ -102,7 +107,7 @@ class LiveNodeAdjacency:
         p1 = int(cols.pce_offsets[node + 1])
         if p1 == p0:
             empty = np.zeros(0, dtype=np.int64)
-            return empty, empty.copy()
+            return empty, empty.copy(), np.zeros(0, dtype=np.uint8)
 
         # ascending-unique directly-called slots + the node's own J each.
         called = cols.pce_called_idx[p0:p1].astype(np.int64)
@@ -117,6 +122,7 @@ class LiveNodeAdjacency:
 
         child_nodes = []
         child_secs = []
+        child_types = []
         for ci, J in zip(called.tolist(), own_J.tolist()):
             slot = ct_lo + ci
             if slot >= ct_hi:
@@ -126,12 +132,14 @@ class LiveNodeAdjacency:
                 continue
             child_nodes.append(child)
             child_secs.append(int(self._sec_of_var[child]))
+            child_types.append(int(cols.ct_type[slot]))
         if not child_nodes:
             empty = np.zeros(0, dtype=np.int64)
-            return empty, empty.copy()
+            return empty, empty.copy(), np.zeros(0, dtype=np.uint8)
         return (
             np.asarray(child_nodes, dtype=np.int64),
             np.asarray(child_secs, dtype=np.uint32),
+            np.asarray(child_types, dtype=np.uint8),
         )
 
     # -- per-slot resolution ----------------------------------------------

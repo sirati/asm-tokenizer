@@ -40,6 +40,7 @@ from ..binary_format import (
     parse_binary_header,
     record_total_size,
 )
+from ..index_format import ALIGNMENT_SHIFT
 from ..matched_sections_bin import Section, parse_section_bin
 from ..memmap_format import MATCHED_SECTIONS_BIN_PRELUDE_SIZE
 from ._sections_bin_walk import read_sections_bin_blob
@@ -47,6 +48,7 @@ from ._session_parsers import (
     arm_arrays,
     build_unmatched_function_data,
     parse_matched_section,
+    parse_matched_variant,
 )
 from ._session_helpers import _BinarySessionHelpersMixin
 from ._worker_guard import assert_main_process
@@ -93,9 +95,10 @@ class BinarySession(_BinarySessionHelpersMixin):
     ``_data.bin`` records are self-describing -- their headers carry
     insn / block / token geometry -- so no companion ``lengths`` or
     ``is_overlong`` array crosses any boundary here. Section parsing
-    happens against an in-memory ``memoryview`` of
-    ``<binary>_sections.bin``; the BIN's prelude is validated on first
-    open and a per-session memoryview is held until ``__exit__``.
+    happens against an ``np.memmap`` ``memoryview`` of
+    ``<binary>_sections.bin`` (lazy per-section paging, not a full read);
+    the BIN's prelude is validated on first open and a per-session
+    memoryview is held until ``__exit__``.
     """
 
     def __init__(
@@ -110,7 +113,7 @@ class BinarySession(_BinarySessionHelpersMixin):
         self._vocab_manager = vocab_manager
         self._metadata = metadata
 
-        self._sections_bin_blob: Optional[bytes] = None
+        self._sections_bin_blob: Optional[np.memmap] = None
         self._sections_bin_view: Optional[memoryview] = None
         self._data_mmap: Optional[np.ndarray] = None
         self._data_kind: Optional[str] = None
@@ -208,6 +211,65 @@ class BinarySession(_BinarySessionHelpersMixin):
         )
         return section, section_offset, matched
 
+    def _matched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        """Parse a matched section's BIN catalog entry only (no bodies).
+
+        Returns ``(section, section_offset)`` -- the same parsed
+        :class:`Section` and BIN byte offset
+        :py:meth:`_load_matched_section_and_variants` produces, but
+        WITHOUT touching ``_data.bin`` (no per-variant body materialised).
+        The callee walk's once-only inclusion decision keys solely on the
+        callee ``section_offset`` and the parent's per-call J-resolution,
+        so the body load is deferred to the survivors via
+        :py:meth:`_load_matched_variant_body`.
+        """
+        arm = self._meta_get("matched_arm")
+        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if idx >= len(bin_starts):
+            raise IndexError(f"Index {idx} out of bounds for matched functions")
+        section_offset = int(bin_starts[idx])
+        section = self._parse_section_at(section_offset)
+        return section, section_offset
+
+    def _load_matched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        """Load ONE matched section variant body from ``_data.bin``.
+
+        ``section`` is the already-parsed BIN catalog entry the caller
+        obtained from :py:meth:`_matched_section_meta` (threaded through
+        the callee walk's :class:`ResolvedCalleeMeta`), so this load does
+        NOT re-parse ``_sections.bin`` -- it materialises only
+        ``section.variants[variant_index]`` via the shared
+        :func:`parse_matched_variant`. That is the same single-variant
+        parse :py:meth:`_load_matched_section_and_variants` runs per
+        variant, so the returned body is byte-identical to that path's
+        ``MatchedFunction.variants[variant_index]``. ``idx`` is retained
+        for the O(1) ``func_names[idx]`` lookup (the name carried on the
+        body) and its bounds check. Raises :class:`IndexError` if
+        ``variant_index`` is out of range.
+        """
+        arm = self._meta_get("matched_arm")
+        if variant_index < 0 or variant_index >= len(section.variants):
+            raise IndexError(
+                f"matched function idx={idx} has {len(section.variants)} "
+                f"variants; variant_index {variant_index} out of range"
+            )
+        func_names = getattr(arm, "func_names", None) or []
+        if idx >= len(func_names):
+            raise IndexError(
+                f"matched arm func_names short of index {idx} "
+                f"(have {len(func_names)})"
+            )
+        data_mmap = self._open_data("matched")
+        return parse_matched_variant(
+            section,
+            section.variants[variant_index],
+            func_name=func_names[idx],
+            data_slice=lambda o: self._slice_data_record(data_mmap, o),
+            resolve_ref=self.get_variant_by_ref,
+        )
+
     def _load_unmatched_record_and_section(
         self, idx: int
     ) -> Tuple[Section, int, FunctionData]:
@@ -217,37 +279,103 @@ class BinarySession(_BinarySessionHelpersMixin):
         ``section_offset`` is the BIN byte offset of the owning section
         (NOT the per-record ``_unmatched_data.bin`` offset). Shared by
         :py:meth:`load_unmatched` and the batch-decode pipeline.
+
+        The per-record ``idx`` maps to a ``(section base record, variant
+        slot)`` pair via the arm's ``record_to_section_idx`` mapping; the
+        body load delegates to :py:meth:`_load_unmatched_variant_body`,
+        which slices the variant block's OWN
+        ``data_offset_shifted << ALIGNMENT_SHIFT``. The writer emits the
+        per-record index entries in encounter order but sorts the section's
+        variant blocks by ``variant_ref_offset``, so the positional
+        ``starts[idx]`` and the slot-J variant block are NOT guaranteed to
+        coincide; slicing by the variant's own offset is the single robust
+        source of truth (symmetric with the matched arm and the callee
+        walk), with no residual dependence on emit-order==vref-order.
         """
         arm = self._meta_get("unmatched_arm")
         starts = arm_arrays(arm, "unmatched", self._binary_name)
         if idx >= len(starts):
             raise IndexError(f"Index {idx} out of bounds for unmatched functions")
-        start = int(starts[idx])
-        data_mmap = self._open_data("unmatched")
-        insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
-        section, section_offset = self._unmatched_section_for_record(
-            arm, idx, start
-        )
+        section, section_offset = self._unmatched_section_for_record(arm, idx)
         # Per-record -> per-variant slot inside the owning section.
         # Unmatched sections store one record per variant; the slot is
         # the offset from the section's first-record idx in the arm's
-        # ``record_to_section_idx`` mapping. Threaded into the builder
-        # so the per-slot ``variant_ref`` resolves to THIS record's
-        # canonical-4 axes (not the section's first variant).
+        # ``record_to_section_idx`` mapping.
         section_idx = self._unmatched_section_idx(arm, idx)
         base = self._unmatched_record_slot_base(arm, section_idx)
         variant_slot = idx - base
+        fd = self._load_unmatched_variant_body(base, variant_slot, section)
+        return section, section_offset, fd
+
+    def _load_unmatched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        """Load ONE unmatched section variant body, reusing the section.
+
+        ``section`` is the already-parsed owning section the caller
+        obtained from :py:meth:`_unmatched_section_meta` (threaded through
+        the callee walk's :class:`ResolvedCalleeMeta`), so this load does
+        NOT re-derive it via :py:meth:`_unmatched_section_for_record` (no
+        ``_sections.bin`` re-parse).
+
+        The data record is sliced at ``section.variants[variant_index]``'s
+        OWN ``data_offset_shifted << ALIGNMENT_SHIFT`` -- the SAME way the
+        matched arm slices (:func:`parse_matched_variant`). Unmatched
+        sections store one DISTINCT body record per variant, so loading by
+        the variant block's own offset (rather than the positional
+        ``starts[base + variant_index]``) splices variant-``variant_index``'s
+        body regardless of whether the index-entry order and the
+        variant-block order coincide -- removing the silent dependence on
+        the writer's emit-order==vref-order lock-step. ``idx`` is retained
+        for the section-keyed ``func_names`` lookup (the name is a section
+        property, shared by every variant) and its bounds check. Raises
+        :class:`IndexError` if ``variant_index`` is out of range.
+
+        For ``variant_index == 0`` this is byte-identical to the legacy
+        first-record load: the section's first variant block carries the
+        same ``data_offset_shifted`` as ``starts[base]``.
+        """
+        arm = self._meta_get("unmatched_arm")
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        if variant_index < 0 or variant_index >= len(section.variants):
+            raise IndexError(
+                f"unmatched section idx={idx} has {len(section.variants)} "
+                f"variants; variant_index {variant_index} out of range"
+            )
+        start = (
+            section.variants[variant_index].data_offset_shifted << ALIGNMENT_SHIFT
+        )
+        data_mmap = self._open_data("unmatched")
+        insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
         line_to_name = self._meta_get("line_to_name") or {}
-        fd = build_unmatched_function_data(
+        return build_unmatched_function_data(
             section,
             self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
-            variant_slot=variant_slot,
+            variant_slot=variant_index,
             resolve_ref=self.get_variant_by_ref,
             line_to_name=line_to_name,
         )
-        return section, section_offset, fd
+
+    def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        """Parse an unmatched record's owning section only (no body).
+
+        Returns ``(section, section_offset)`` for the record at per-record
+        ``idx`` -- the same parsed :class:`Section` and BIN section offset
+        :py:meth:`_load_unmatched_record_and_section` produces, but
+        WITHOUT slicing the ``_unmatched_data.bin`` record body. The callee
+        walk defers the body load (sliced at the J-resolved variant block's
+        own offset, via :py:meth:`_load_unmatched_variant_body`) to the
+        surviving pairs.
+        """
+        arm = self._meta_get("unmatched_arm")
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        return self._unmatched_section_for_record(arm, idx)
 
     def _load_unmatched_section_and_all_variants(
         self, idx: int
@@ -257,10 +385,13 @@ class BinarySession(_BinarySessionHelpersMixin):
         Mirrors :py:meth:`_load_matched_section_and_variants` for the
         unmatched arm: returns ``(section, section_offset, list[FunctionData])``
         where the per-variant list is parallel to ``section.variants``.
-        Unmatched sections store one record per variant; the iteration
-        walks records ``[idx .. idx + len(section.variants) - 1]`` and
-        loads each via the per-record body shape. ``idx`` MUST be the
-        section's first-record idx (the value
+        Unmatched sections store one record per variant; each body is
+        sliced at its variant block's own
+        ``data_offset_shifted << ALIGNMENT_SHIFT`` via the shared
+        :py:meth:`_load_unmatched_variant_body` (the single owner of the
+        slice), so the result never depends on the writer's encounter-order
+        index entries lining up with the sorted variant blocks. ``idx``
+        MUST be the section's first-record idx (the value
         :py:meth:`_idx_for_section_offset` returns for the unmatched arm);
         a non-base record idx raises :class:`ValueError`.
         """
@@ -279,30 +410,11 @@ class BinarySession(_BinarySessionHelpersMixin):
                 f"unmatched section variants require first-record idx "
                 f"(section[{section_idx}] base={base}); got idx={idx}"
             )
-        data_mmap = self._open_data("unmatched")
-        line_to_name = self._meta_get("line_to_name") or {}
-        base_start = int(starts[base])
-        section, section_offset = self._unmatched_section_for_record(
-            arm, base, base_start
-        )
-        variants: list = []
-        for slot in range(len(section.variants)):
-            record_idx = base + slot
-            start = int(starts[record_idx])
-            insn_rl, block_rl, tokens = self._slice_data_record(
-                data_mmap, start
-            )
-            variants.append(
-                build_unmatched_function_data(
-                    section,
-                    self._unmatched_func_name(arm, record_idx),
-                    start,
-                    tokens, insn_rl, block_rl,
-                    variant_slot=slot,
-                    resolve_ref=self.get_variant_by_ref,
-                    line_to_name=line_to_name,
-                )
-            )
+        section, section_offset = self._unmatched_section_for_record(arm, base)
+        variants = [
+            self._load_unmatched_variant_body(base, slot, section)
+            for slot in range(len(section.variants))
+        ]
         return section, section_offset, variants
 
     def _slice_data_record(self, data_mmap, offset: int):
@@ -403,13 +515,17 @@ class BinarySession(_BinarySessionHelpersMixin):
     # --- lazy openers ----------------------------------------------
 
     def _open_sections_bin(self) -> memoryview:
-        """Lazy-load the per-binary section catalog as a memoryview.
+        """Lazy-``mmap`` the per-binary section catalog as a memoryview.
 
-        The BIN is small relative to ``_data.bin`` (sections carry
-        header + call_targets + per-variant blocks but no token
-        payload), so we read the whole file into memory once per
-        session rather than mmap-ing it; the memoryview keeps parser
-        slicing zero-copy. Prelude is validated on first open.
+        The catalog is ``np.memmap``-ed (NOT slurped) so
+        :func:`parse_section_bin` pages in only the section(s) a batch
+        actually touches. A fresh :class:`BinarySession` is opened per
+        sampled binary per batch; a full read would copy the ENTIRE
+        catalog every time (z3's ``_sections.bin`` is ~348MB), so the
+        eager copy dominated per-batch memory even though the far larger
+        ``_data.bin`` was already lazy. The memoryview keeps parser
+        slicing zero-copy and is pinned (with the backing ``np.memmap``)
+        for the session lifetime. Prelude is validated on first open.
         """
         if self._stack is None:
             raise RuntimeError("BinarySession used outside its with-block")
@@ -419,9 +535,12 @@ class BinarySession(_BinarySessionHelpersMixin):
         # which arm's path we resolve doesn't matter, but we walk through
         # the conventional per-binary filename for clarity.
         path = self._base_path / f"{self._binary_name}_sections.bin"
-        # Pin the bytes so the view stays valid for the session lifetime.
-        raw, view = read_sections_bin_blob(path)
-        self._sections_bin_blob = raw
+        # Pin the mmap so the view (and any Section sliced from it) stays
+        # valid for the session lifetime; __exit__ releases the view then
+        # drops this ref, so the mapping unmaps by refcounting with no
+        # explicit close (no exported-pointer BufferError risk).
+        mm, view = read_sections_bin_blob(path)
+        self._sections_bin_blob = mm
         self._sections_bin_view = view
         return view
 
@@ -514,40 +633,33 @@ class BinarySession(_BinarySessionHelpersMixin):
     # --- internal helpers ------------------------------------------
 
     def _unmatched_section_for_record(
-        self, arm: Any, idx: int, start: int
+        self, arm: Any, idx: int
     ) -> Tuple[Section, int]:
-        """Resolve the BIN section that owns the per-record ``start``.
+        """Resolve the BIN section that owns the per-record ``idx``.
 
         The unmatched index is per-RECORD (one entry per
         ``_unmatched_data.bin`` record). The arm pre-computes
         ``record_to_section_idx[idx]`` at load time (O(M) once over
         the BIN walk); this dispatch is O(1) for the section-idx
-        lookup plus O(log K) for the slot-base ``np.searchsorted``
-        — negligible compared to the BIN parse this dispatch then
-        triggers.
+        lookup — negligible compared to the BIN parse it then triggers.
 
         Returns ``(section, section_offset)`` -- the parsed section and
         its BIN byte offset, so callers (notably the batch-decode pipeline)
         can use the offset as a cycle key without re-deriving it.
 
-        Sanity-checks the section's variant at the matching slot:
-        its ``data_offset_shifted << 4`` must equal ``start``. A
-        mismatch surfaces as :class:`ValueError`, not a silent wrong-
-        section return, since it indicates the unmatched_index.bin /
-        sections.bin drifted apart at build time.
+        No positional ``starts[idx] == variant.data_offset_shifted << 4``
+        drift check is performed: the body load slices each variant block's
+        OWN ``data_offset_shifted`` (see :py:meth:`_load_unmatched_variant_body`),
+        so the per-record index-entry offset is never used to locate a body.
+        The writer emits index entries in encounter order but sorts variant
+        blocks by ``variant_ref_offset``, so the two orders legitimately
+        differ; an equality assertion against ``starts[idx]`` would FALSELY
+        reject correctly-written corpora rather than guard corruption.
         """
         section_idx = self._unmatched_section_idx(arm, idx)
         section_starts = getattr(arm, "section_starts", None)
         section_offset = int(section_starts[section_idx])
         section = self._parse_section_at(section_offset)
-        slot = idx - self._unmatched_record_slot_base(arm, section_idx)
-        variant = section.variants[slot]
-        if (variant.data_offset_shifted << 4) != start:
-            raise ValueError(
-                f"unmatched section[{section_idx}] variant [{slot}] "
-                f"data_offset {variant.data_offset_shifted << 4} does "
-                f"not match record offset {start} (record idx={idx})"
-            )
         return section, section_offset
 
     def _unmatched_func_name(self, arm: Any, idx: int) -> str:

@@ -15,7 +15,54 @@ walk. Internal helper -- not part of the public batch-decode API.
 
 from __future__ import annotations
 
+import weakref
+
 from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
+
+#: Per-section inverted index ``called_idx -> frozenset(v_idx)``: the set
+#: of in-section variant indices whose ``per_call_entries`` reference each
+#: ``called_idx``. Derived (not re-parsed) from the already-materialised
+#: ``section.variants`` lists; rebuilt lazily on first query of a section
+#: and evicted when that ``Section`` is garbage-collected, so it never
+#: outlives the parsed object it summarises. Keyed by ``id(section)`` with
+#: a weakref finalizer because ``Section`` carries unhashable ``list``
+#: fields (a plain ``WeakKeyDictionary`` would reject it).
+_called_by_index: "dict[int, dict[int, frozenset]]" = {}
+_index_keepalive: "dict[int, weakref.ref]" = {}
+
+
+def _called_by_map(section) -> "dict[int, frozenset]":
+    """Inverted ``called_idx -> {v_idx}`` map for ``section`` (cached).
+
+    Equivalent, for every ``called_idx``, to the set of ``v`` for which
+    ``any(ce[0] == called_idx for ce in section.variants[v].per_call_
+    entries)`` is true -- i.e. the full membership the old per-call
+    ``any``-over-genexpr recomputed on each call. Building it once per
+    section turns each :func:`called_by_in_selection` query into a single
+    dict lookup + C-level set intersection instead of an O(variants ×
+    entries) Python scan.
+    """
+    key = id(section)
+    cached = _called_by_index.get(key)
+    if cached is not None:
+        return cached
+
+    by_called: "dict[int, set]" = {}
+    for v_idx, variant in enumerate(section.variants):
+        for ce in variant.per_call_entries:
+            by_called.setdefault(ce[0], set()).add(v_idx)
+    frozen = {
+        called_idx: frozenset(v_idxs)
+        for called_idx, v_idxs in by_called.items()
+    }
+
+    def _evict(_ref, key=key) -> None:
+        _called_by_index.pop(key, None)
+        _index_keepalive.pop(key, None)
+
+    _index_keepalive[key] = weakref.ref(section, _evict)
+    _called_by_index[key] = frozen
+    return frozen
 
 
 def selection_v_idxs_in_section(
@@ -43,14 +90,17 @@ def called_by_in_selection(
     A variant ``v`` "calls" ``called_idx`` iff some entry in
     ``section.variants[v].per_call_entries`` has its first field equal
     to ``called_idx``.
+
+    Computed as the intersection of ``selection_v_idxs`` with the
+    section's precomputed ``called_idx -> {v_idx}`` inverted index (see
+    :func:`_called_by_map`), which is byte-for-byte the subset the old
+    per-call ``any``-over-genexpr produced, at a single dict lookup +
+    C-level set intersection instead of a nested Python scan.
     """
-    return frozenset(
-        v
-        for v in selection_v_idxs
-        if any(
-            ce[0] == called_idx for ce in section.variants[v].per_call_entries
-        )
-    )
+    callers = _called_by_map(section).get(called_idx)
+    if callers is None:
+        return frozenset()
+    return callers & selection_v_idxs
 
 
 def lookup_callee_variant_for(

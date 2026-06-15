@@ -90,6 +90,8 @@ class ResolvedSection:
             ``sampled_variant_indices[v]``. Harvested from the same
             per-arm load that produced :attr:`section`, so the wiring
             does NOT re-parse the section to pick up the variant body.
+            EMPTY when the resolver ran with ``load_bodies=False`` (the
+            geometry-first vector_batch path, which never reads it).
     """
 
     arm: SectionKind
@@ -105,25 +107,24 @@ def resolve_section_pointers(
     *,
     num_variants_per_section: int,
     rng: np.random.Generator,
+    load_bodies: bool = True,
 ) -> List[ResolvedSection]:
     """Resolve each ``SectionPointerSpec`` and sample variant indices.
 
     For each pointer in ``section_pointers`` (in order):
 
-    * :attr:`SectionKind.MATCHED` -- delegate to
-      :py:meth:`BinarySession._load_matched_section_and_variants(idx)`
-      which returns ``(Section, section_offset, MatchedFunction)``.
-      The full :class:`MatchedFunction.variants` list (one
-      :class:`FunctionData` per variant) is held alongside the parsed
-      :class:`Section` so the sampled-variant-body lookup downstream is
-      a plain list index -- no second per-arm load.
-    * :attr:`SectionKind.UNMATCHED` -- delegate to
-      :py:meth:`BinarySession._load_unmatched_record_and_section(idx)`
-      which returns ``(Section, section_offset, FunctionData)``. The
-      matched_sections_bin invariant guarantees exactly one variant per
-      unmatched section, so the returned :class:`FunctionData` IS the
-      variant body and the per-sampled-variant list has at most one
-      entry.
+    * Parse the pointer's :class:`Section` catalog ONCE
+      (:func:`_parse_section_catalog`), body-free -- it reads
+      ``_sections.bin`` but never ``_data.bin``.
+    * Sample the variant indices off ``len(section.variants)``.
+    * Load a :class:`FunctionData` body for the SAMPLED indices ONLY
+      (:func:`_load_sampled_variant_body`), reusing the already-parsed
+      catalog. The UNSAMPLED variants' body parse + ``category_counts``
+      are never computed -- the dominant decode-path saving, since a
+      request keeps ``num_variants_per_section`` of a section's full
+      variant set. Both arms route through the session's single-variant
+      lazy load, so each kept body is byte-identical to the eager
+      all-variants path's ``variants[idx]``.
 
     Variant index sampling uses
     :func:`_session_helpers._select_variant_indices` -- one source of
@@ -142,6 +143,17 @@ def resolve_section_pointers(
         rng: Sampling source. Passed through to
             :func:`_select_variant_indices` verbatim; callers seed for
             reproducibility.
+        load_bodies: When ``True`` (default) the sampled variant bodies
+            are loaded into ``function_data_per_sampled_variant`` (the
+            decode + auto-size paths need them). When ``False`` only the
+            catalog parse + variant-index sampling run; the body list is
+            left EMPTY -- the geometry-first vector_batch path gathers its
+            own bodies via the RLG3 geometry and never reads
+            ``function_data_per_sampled_variant``, so its per-variant body
+            parse + ``category_counts`` is dead work. The sampling +
+            ``section`` + ``sampled_variant_indices`` are identical either
+            way, so the rng draw stays in lockstep with the body-loading
+            path.
 
     Returns:
         ``list[ResolvedSection]`` parallel to ``section_pointers``.
@@ -160,9 +172,7 @@ def resolve_section_pointers(
 
     resolved: List[ResolvedSection] = []
     for pointer in section_pointers:
-        section, variant_bodies = _load_section_and_variant_bodies(
-            session, pointer
-        )
+        section = _parse_section_catalog(session, pointer)
         sampled = _select_variant_indices(
             n_variants=len(section.variants),
             max_variants=num_variants_per_section,
@@ -174,6 +184,11 @@ def resolve_section_pointers(
         # numpy-typing surprises (e.g. ``MatchedFunction.variants`` is
         # a plain Python list).
         sampled_ints = [int(v) for v in sampled]
+        # Body load is SAMPLED-ONLY: parse + category-count exactly the
+        # variants the draw kept, not every ``section.variants`` entry.
+        # ``_parse_section_catalog`` already paid the (body-free) catalog
+        # parse, so each body is the single-variant load the lazy session
+        # helper performs -- byte-identical to the eager all-variants path.
         resolved.append(
             ResolvedSection(
                 arm=pointer.arm,
@@ -181,44 +196,80 @@ def resolve_section_pointers(
                 section=section,
                 sampled_variant_indices=sampled_ints,
                 function_data_per_sampled_variant=[
-                    variant_bodies[v] for v in sampled_ints
-                ],
+                    _load_sampled_variant_body(session, pointer, section, v)
+                    for v in sampled_ints
+                ]
+                if load_bodies
+                else [],
             )
         )
     return resolved
 
 
-def _load_section_and_variant_bodies(
+def _parse_section_catalog(
     session: "BinarySession", pointer: SectionPointerSpec
-) -> "tuple[Section, list[FunctionData]]":
-    """Dispatch a single pointer through the right per-arm loader and
-    return the parsed :class:`Section` plus the per-variant
-    :class:`FunctionData` list, indexed by the section's native variant
-    index.
+) -> Section:
+    """Parse a single pointer's :class:`Section` catalog -- NO bodies.
+
+    Arm-dispatch only: routes to the session's body-free catalog parse
+    (:py:meth:`BinarySession._matched_section_meta` /
+    :py:meth:`_unmatched_section_meta`), which reads ``_sections.bin``
+    but never touches ``_data.bin``. The sampling step keys solely on
+    ``len(section.variants)``, so the body load is deferred to the
+    sampled survivors via :func:`_load_sampled_variant_body`.
 
     Kept module-private + arm-dispatch-only so
-    :func:`resolve_section_pointers` is a clean walk over the input
-    list. The two loader return tuples differ on their third element
-    (``MatchedFunction`` vs ``list[FunctionData]``); this helper hides
-    that asymmetry behind a uniform ``(section, variant_bodies)`` shape
-    so the resolver's sampling step can index ``variant_bodies[v]``
-    regardless of arm.
-
-    Unmatched sections store one record per variant; the per-section
-    loader iterates every record so ``len(variant_bodies) ==
-    len(section.variants)`` parallels the matched-arm shape.
+    :func:`resolve_section_pointers` stays a clean walk over the input
+    list. The two catalog helpers share the ``(section, section_offset)``
+    return shape; the offset is not needed here (the resolver reads
+    ``section.section_offset`` directly), so only the section is surfaced.
 
     Raises:
         ValueError: On an unknown :class:`SectionKind` member.
     """
     if pointer.arm is SectionKind.MATCHED:
-        section, _section_offset, matched = (
-            session._load_matched_section_and_variants(pointer.idx)
-        )
-        return section, list(matched.variants)
+        section, _section_offset = session._matched_section_meta(pointer.idx)
+        return section
     if pointer.arm is SectionKind.UNMATCHED:
-        section, _section_offset, variants = (
-            session._load_unmatched_section_and_all_variants(pointer.idx)
+        section, _section_offset = session._unmatched_section_meta(pointer.idx)
+        return section
+    raise ValueError(f"unknown SectionKind: {pointer.arm!r}")
+
+
+def _load_sampled_variant_body(
+    session: "BinarySession",
+    pointer: SectionPointerSpec,
+    section: Section,
+    variant_index: int,
+) -> "FunctionData":
+    """Load ONE sampled variant body, reusing the already-parsed catalog.
+
+    Arm-dispatch only: routes to the session's single-variant body load
+    (:py:meth:`BinarySession._load_matched_variant_body` /
+    :py:meth:`_load_unmatched_variant_body`), threading the
+    ``section`` :func:`_parse_section_catalog` already parsed so neither
+    path re-reads ``_sections.bin``. Each load runs the same
+    :func:`parse_matched_variant` / :func:`build_unmatched_function_data`
+    (and thus :func:`compute_category_counts`) the eager all-variants
+    path runs per variant, so the body is byte-identical to that path's
+    ``variants[variant_index]`` -- only the UNSAMPLED variants' work is
+    skipped.
+
+    Unmatched sections store one record per variant; ``pointer.idx`` is
+    the section's first-record idx (the same base the per-section loader
+    pins), and ``variant_index`` selects the slot. Both helpers slice the
+    variant block's OWN ``data_offset_shifted`` so the result never
+    depends on the writer's encounter-order index entries.
+
+    Raises:
+        ValueError: On an unknown :class:`SectionKind` member.
+    """
+    if pointer.arm is SectionKind.MATCHED:
+        return session._load_matched_variant_body(
+            pointer.idx, variant_index, section
         )
-        return section, list(variants)
+    if pointer.arm is SectionKind.UNMATCHED:
+        return session._load_unmatched_variant_body(
+            pointer.idx, variant_index, section
+        )
     raise ValueError(f"unknown SectionKind: {pointer.arm!r}")

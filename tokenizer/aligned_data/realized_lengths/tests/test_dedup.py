@@ -70,15 +70,15 @@ def test_shared_record_measured_once(tmp_path, monkeypatch) -> None:
         [o0, o0, o1, o0, o2, o1, o0, o1, o0], dtype=np.int64
     )
 
-    # Count the unique offsets handed to the bulk length engine.
+    # Count the unique offsets handed to the bulk geometry engine.
     measured = {"total": 0}
-    real_bulk = _compute.bulk_contributing_body_lengths
+    real_bulk = _compute.bulk_contributing_geometry
 
     def counting_bulk(data, starts, counts):
         measured["total"] += int(np.asarray(starts).size)
         return real_bulk(data, starts, counts)
 
-    monkeypatch.setattr(_compute, "bulk_contributing_body_lengths", counting_bulk)
+    monkeypatch.setattr(_compute, "bulk_contributing_geometry", counting_bulk)
 
     lengths = realized_lengths_for_offsets(data_u8, var_offsets)
 
@@ -103,13 +103,13 @@ def test_dedup_across_chunks_still_measures_once(
     var_offsets = np.array([o0, o1, o0, o0, o1, o0], dtype=np.int64)
 
     measured = {"total": 0}
-    real_bulk = _compute.bulk_contributing_body_lengths
+    real_bulk = _compute.bulk_contributing_geometry
 
     def counting_bulk(data, starts, counts):
         measured["total"] += int(np.asarray(starts).size)
         return real_bulk(data, starts, counts)
 
-    monkeypatch.setattr(_compute, "bulk_contributing_body_lengths", counting_bulk)
+    monkeypatch.setattr(_compute, "bulk_contributing_geometry", counting_bulk)
     monkeypatch.setattr(_compute, "_CHUNK_OFFSETS", 2)
 
     lengths = realized_lengths_for_offsets(data_u8, var_offsets)
@@ -126,17 +126,24 @@ def test_empty_offsets_returns_empty(tmp_path) -> None:
 
 
 def _force_length(monkeypatch, value: int) -> None:
-    """Make the bulk engine report ``value`` for every measured record.
+    """Make the bulk engine report ``value`` (body_len) for every record.
 
     Lets the boundary tests pin the overflow guard without laying a
     multi-GB record; ``starts``/``counts`` shapes are preserved so the
-    rest of the compute path is exercised unchanged.
+    rest of the compute path is exercised unchanged. The two non-body
+    axes stay zero so the body axis alone drives the guard.
     """
+    from tokenizer.aligned_data.loader.batch_decode._bulk_expand_lengths import (
+        ContributingGeometry,
+    )
 
     def fake_bulk(data, starts, counts):
-        return np.full(np.asarray(starts).size, value, dtype=np.int64)
+        n = np.asarray(starts).size
+        body = np.full(n, value, dtype=np.int64)
+        zeros = np.zeros(n, dtype=np.int64)
+        return ContributingGeometry(body_len=body, id_count=zeros, value_chunk_count=zeros.copy())
 
-    monkeypatch.setattr(_compute, "bulk_contributing_body_lengths", fake_bulk)
+    monkeypatch.setattr(_compute, "bulk_contributing_geometry", fake_bulk)
 
 
 def test_max_storable_length_accepted(tmp_path, monkeypatch) -> None:

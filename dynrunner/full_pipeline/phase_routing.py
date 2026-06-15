@@ -24,10 +24,15 @@ from pathlib import Path
 TOKENIZE_PHASE = "tokenize"
 UNIFY_VOCAB_PHASE = "unify_vocab"
 BUILD_MEMMAP_PHASE = "memmap"
+BUILD_INDEX_PHASE = "index"
 
 TOKENIZE_TYPE = "tokenizer"
 UNIFY_VOCAB_TYPE = "unify_vocab"
 BUILD_MEMMAP_TYPE = "memmap"
+# Phase 4 declares TWO types in its single phase; both route the same
+# way (read + write the memmap subdir), so both map to BUILD_INDEX_PHASE.
+REALIZED_LENGTHS_TYPE = "realized_lengths"
+SORTED_INDEX_TYPE = "sorted_index"
 
 
 @dataclass(frozen=True)
@@ -70,16 +75,30 @@ def _route_build_memmap(user_source: Path, user_output: Path) -> PhaseRoute:
     return PhaseRoute(source_dir=user_output, output_dir=user_output / "memmap")
 
 
+def _route_build_index(user_source: Path, user_output: Path) -> PhaseRoute:
+    # Phase 4 reads the per-binary memmap sidecars phase 3 wrote and
+    # publishes its index sidecars (realized-length + sorted-index)
+    # co-located there. Source == output == the ``memmap/`` subdir,
+    # because the index generators read and write the same directory by
+    # design (the sorted-index build reads the realized-length sidecars
+    # the same pass produced).
+    memmap_dir = user_output / "memmap"
+    return PhaseRoute(source_dir=memmap_dir, output_dir=memmap_dir)
+
+
 _PHASE_ROUTES = {
     TOKENIZE_PHASE: _route_tokenize,
     UNIFY_VOCAB_PHASE: _route_unify_vocab,
     BUILD_MEMMAP_PHASE: _route_build_memmap,
+    BUILD_INDEX_PHASE: _route_build_index,
 }
 
 _TYPE_TO_PHASE = {
     TOKENIZE_TYPE: TOKENIZE_PHASE,
     UNIFY_VOCAB_TYPE: UNIFY_VOCAB_PHASE,
     BUILD_MEMMAP_TYPE: BUILD_MEMMAP_PHASE,
+    REALIZED_LENGTHS_TYPE: BUILD_INDEX_PHASE,
+    SORTED_INDEX_TYPE: BUILD_INDEX_PHASE,
 }
 
 

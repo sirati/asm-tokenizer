@@ -29,13 +29,23 @@ import numpy as np
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
+from tokenizer.aligned_data.loader._sections_bin_walk import (
+    SectionRegion,
+    read_sections_bin_blob,
+    unmatched_region_start,
+    walk_parsed_sections,
+)
 from tokenizer.aligned_data.matched_sections_columnar import (
     ColumnarSections,
     parse_sections_columnar,
 )
 
 
-__all__ = ["SectionVariantInfo", "read_section_variant_info"]
+__all__ = [
+    "SectionVariantInfo",
+    "read_section_variant_info",
+    "read_region_section_variant_info",
+]
 
 
 @dataclass(frozen=True)
@@ -106,14 +116,42 @@ def read_section_variant_info(
     (the matched-arm locator); index ``i`` corresponds to the i-th
     MATCHED section, matching :meth:`BinarySession.load_matched`'s
     index space. Returns an empty :class:`SectionVariantInfo` when the
-    binary has no matched arm.
+    binary has no matched arm. Thin alias for the matched region of the
+    region-parameterized :func:`read_region_section_variant_info`.
+    """
+    return read_region_section_variant_info(
+        base_path, binary_name, SectionRegion.MATCHED
+    )
+
+
+def read_region_section_variant_info(
+    base_path: Path,
+    binary_name: str,
+    region: SectionRegion,
+) -> SectionVariantInfo:
+    """One columnar read of ``region``'s slice of ``sections.bin``.
+
+    Returns the SAME :class:`SectionVariantInfo` (full columnar catalog
+    + per-section BIN byte offsets) for either region; ``cols`` index
+    ``i`` is the i-th section of ``region`` in catalog order, matching
+    the per-arm index space :class:`BinarySession`'s
+    ``load_matched`` / ``load_unmatched`` use. The matched region is
+    bounded by the ``<binary>_index.bin`` locator (which carries per-
+    section lengths, so the columnar parse is length-validated); the
+    unmatched region is delimited by the structural walk from
+    :func:`unmatched_region_start` (no locator lengths -- the walk's
+    own boundary parse is the validation), reusing the SAME region-agnostic
+    columnar parser. Returns an empty :class:`SectionVariantInfo` when
+    ``region`` has no sections.
     """
     base_path = Path(base_path)
-    pair = read_csv_section_index_arrays(base_path / f"{binary_name}_index.bin")
-    if pair is None:
-        return _empty()
-    starts, lengths = pair
-    if len(starts) == 0:
+    if region is SectionRegion.MATCHED:
+        starts, lengths = _matched_region_starts(base_path, binary_name)
+    elif region is SectionRegion.UNMATCHED:
+        starts, lengths = _unmatched_region_starts(base_path, binary_name)
+    else:
+        raise ValueError(f"unknown section region: {region!r}")
+    if starts is None or starts.size == 0:
         return _empty()
     # Memmap (read-only) the catalog blob rather than slurping it into
     # RAM: ``parse_sections_columnar`` is a pure fancy-index GATHER (it
@@ -124,8 +162,44 @@ def read_section_variant_info(
         dtype=np.uint8,
         mode="r",
     )
-    starts = np.asarray(starts, dtype=np.int64)
     return SectionVariantInfo(
         cols=parse_sections_columnar(blob, starts, lengths),
         section_offsets=starts,
     )
+
+
+def _matched_region_starts(base_path: Path, binary_name: str):
+    """``(starts, lengths)`` for the matched region from the index locator.
+
+    ``lengths`` is the locator's parallel byte-length column, threaded
+    into the columnar parse for end-of-section validation (matched arm
+    only). Returns ``(None, None)`` when the binary has no matched arm.
+    """
+    pair = read_csv_section_index_arrays(base_path / f"{binary_name}_index.bin")
+    if pair is None:
+        return None, None
+    starts, lengths = pair
+    if len(starts) == 0:
+        return None, None
+    return np.asarray(starts, dtype=np.int64), lengths
+
+
+def _unmatched_region_starts(base_path: Path, binary_name: str):
+    """``(starts, None)`` for the unmatched region via the structural walk.
+
+    The unmatched region carries no locator length column, so the
+    columnar parse runs without length validation; the structural walk
+    (:func:`walk_parsed_sections`) is itself the per-section boundary
+    parse. Returns ``(None, None)`` when the binary has no
+    ``_sections.bin`` or an empty unmatched region.
+    """
+    sections_bin = base_path / f"{binary_name}_sections.bin"
+    if not sections_bin.exists():
+        return None, None
+    region_start = unmatched_region_start(base_path / f"{binary_name}_index.bin")
+    raw, blob_view = read_sections_bin_blob(sections_bin)
+    starts = [start for start, _section in
+              walk_parsed_sections(blob_view, region_start)]
+    if not starts:
+        return None, None
+    return np.asarray(starts, dtype=np.int64), None

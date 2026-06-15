@@ -14,12 +14,17 @@ Boundary contract (the design-first sentence):
   per pair. The file-writing wrapper layers filename construction on
   top -- it owns no compute logic.*
 
-No :class:`BinarySession` involvement: the build reads exactly three
-sidecars (``_index.bin`` locator, ``_sections.bin`` catalog,
-``_data.bin`` record headers + token regions) and none of the
-session's metadata machinery. No CLI parsing here; no string-typed
-modes. Callers wanting CLI / multi-binary fan-out go through
-:mod:`.__main__`.
+No :class:`BinarySession` involvement: the build reads the
+``_index.bin`` locator + ``_sections.bin`` catalog for the splice
+geometry and the matched-arm realized-length sidecar
+(:mod:`tokenizer.aligned_data.realized_lengths`) for the per-variant
+body lengths -- it never pages in ``_data.bin``, because the sidecar
+(generated as the Phase-4a pass that runs BEFORE this build) already
+carries every record's contributing body length. The sidecar is a HARD
+precondition: an absent one fails loudly via
+:func:`require_realized_lengths`, never a silent ``_data.bin`` recompute.
+No CLI parsing here; no string-typed modes. Callers wanting CLI /
+multi-binary fan-out go through :mod:`.__main__`.
 """
 
 from __future__ import annotations
@@ -29,10 +34,13 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from tokenizer.aligned_data.memmap_format import (
-    DATA_BIN_PRELUDE_SIZE,
-    assert_data_bin_prelude,
-)
+# Import the reader + arm selector from the realized_lengths SUBMODULES
+# (not the package ``__init__``): the package init pulls in the generator,
+# whose catalog read imports ``sorted_index._prepass`` and so re-enters
+# THIS package -- a circular import. The reader path
+# (``_reader`` -> ``_format`` -> ``memmap_format``) is cycle-free.
+from tokenizer.aligned_data.realized_lengths._format import MATCHED_ARM
+from tokenizer.aligned_data.realized_lengths._reader import RealizedLengths
 
 from ._dedup import PLAIN, DuplicateHandling
 from ._gating import VariantGate
@@ -57,11 +65,14 @@ def build_sorted_index_bytes(
     """Build per-(mode, depth) sorted-index bytes for one binary.
 
     Runs the columnar pre-pass (:func:`read_section_variant_info`),
-    memmaps ``<binary>_data.bin`` read-only (prelude-validated), and
-    computes EVERY requested ``(reduction, depth)`` from one graph
-    traversal via :func:`compute_reduced_lengths` (plan §D8: the
-    heavy work is not repeated per reduction or per depth). Each
-    resulting ``u32[num_sections]`` array is wire-encoded via
+    opens the matched-arm realized-length sidecar (the per-variant body
+    lengths -- a HARD precondition; an absent sidecar raises a
+    generator-pointing :class:`FileNotFoundError`, never a silent
+    ``_data.bin`` recompute), and computes EVERY requested
+    ``(reduction, depth)`` from one graph traversal via
+    :func:`compute_reduced_lengths` (plan §D8: the heavy work is not
+    repeated per reduction or per depth). Each resulting
+    ``u32[num_sections]`` array is wire-encoded via
     :func:`encode_sorted_index`.
 
     Parameters
@@ -96,25 +107,30 @@ def build_sorted_index_bytes(
             for d in depths
         }
 
-    data_path = base_path / f"{binary_name}_data.bin"
-    data_u8 = np.memmap(str(data_path), dtype=np.uint8, mode="r")
-    try:
-        assert_data_bin_prelude(
-            bytes(data_u8[:DATA_BIN_PRELUDE_SIZE]), path=str(data_path)
-        )
+    # Matched-arm body lengths come from the realized-length sidecar
+    # (Phase-4a), never a fresh ``_data.bin`` geometry decode. The reader
+    # pre-flights existence via ``require_realized_lengths`` (a missing
+    # sidecar raises a generator-pointing FileNotFoundError); its flat
+    # ``lengths`` body is section-major in the SAME ``var_offsets`` order
+    # as the pre-pass, so it aligns element-for-element with the catalog.
+    with RealizedLengths.open(base_path, binary_name, MATCHED_ARM) as rlen:
+        body_lengths = np.asarray(rlen.lengths, dtype=np.int64)
+        total_vars = int(section_info.cols.var_n_calls.size)
+        if body_lengths.size != total_vars:
+            raise ValueError(
+                f"matched-arm realized-length sidecar for {binary_name!r} "
+                f"carries {body_lengths.size} body lengths but the catalog "
+                f"pre-pass has {total_vars} variants; the sidecar is stale "
+                f"-- re-run the realized-lengths generator"
+            )
         per_spec_lengths = compute_reduced_lengths(
             section_info,
-            data_u8,
+            body_lengths,
             depths=depths,
             reductions=reductions,
             gate=gate,
             duplicate_handling=duplicate_handling,
         )
-    finally:
-        # np.memmap owns an mmap handle; close it deterministically
-        # rather than waiting on GC (the CLI loops over many binaries).
-        if data_u8._mmap is not None:  # pragma: no branch
-            data_u8._mmap.close()
 
     return {
         spec: encode_sorted_index(lengths)

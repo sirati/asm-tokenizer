@@ -1,7 +1,7 @@
 """Per-section depth-N length compute for the matched-arm sorted index.
 
-Single concern: turn the pre-passed section catalog + the ``_data.bin``
-byte array into one ``u32[num_matched_sections]`` per ``(reduction,
+Single concern: turn the pre-passed section catalog + the per-variant
+body lengths into one ``u32[num_matched_sections]`` per ``(reduction,
 depth)`` pair, where each entry is the reduced key length for the
 matched section at that index.
 
@@ -9,21 +9,21 @@ The heavy lifting is fully vectorized and walk-free:
 
 * :func:`.._graph_lengths.compute_node_lengths` -- per-(section,
   variant) spliced lengths straight from the catalog's splice graph +
-  per-unique-record contributing lengths (no token bodies are decoded,
-  no Stage 1+2 batches are materialised; peak working-set is a few
-  small per-variant columns regardless of corpus size);
+  the INJECTED per-node body lengths (no token bodies are decoded, no
+  Stage 1+2 batches are materialised; peak working-set is a few small
+  per-variant columns regardless of corpus size);
 * :meth:`DuplicateHandling.reduce_segmented` -- per-section reduction
   of the node lengths across all sections in one call per
   ``(reduction, depth)`` pair.
 
 Boundary contract (the design-first sentence):
 
-  *Given the pre-passed catalog + the data bytes + depths + reductions,
-  produce one u32 length array per (reduction, depth) with the reduced
-  key length per matched section. No file I/O. No CLI parsing. Stamps
-  0 for 0-variant and gated-out sections; raises AssertionError if any
-  length reaches the legacy walk's cutoff budget (plan D-2.2 -- the
-  index must never silently under-report).*
+  *Given the pre-passed catalog + the per-variant body lengths + depths
+  + reductions, produce one u32 length array per (reduction, depth) with
+  the reduced key length per matched section. No file I/O. No CLI
+  parsing. Stamps 0 for 0-variant and gated-out sections; raises
+  AssertionError if any length reaches the legacy walk's cutoff budget
+  (plan D-2.2 -- the index must never silently under-report).*
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ __all__ = [
 
 def compute_reduced_lengths(
     section_info: SectionVariantInfo,
-    data_u8: np.ndarray,
+    body_lengths: np.ndarray,
     *,
     depths: List[int],
     reductions: List[LengthReduction],
@@ -74,11 +74,13 @@ def compute_reduced_lengths(
     ----------
     section_info
         Catalog pre-pass (:func:`._prepass.read_section_variant_info`).
-    data_u8
-        The matched arm's ``_data.bin`` as a uint8 array; a read-only
-        ``np.memmap`` keeps the build's resident set bounded on
-        multi-GB corpora (only header bytes + token regions are paged
-        in, in bounded chunks).
+    body_lengths
+        The matched arm's per-variant contributing BODY lengths
+        (``int[total_vars]``, section-major in ``cols.var_offsets``
+        order, EXCLUDING the self/identity token) -- the realized-length
+        sidecar (:mod:`tokenizer.aligned_data.realized_lengths`). No
+        ``_data.bin`` geometry is decoded at index-build time; the
+        sidecar is generated as its own Phase-4a pass.
     depths
         Splice depths to materialise; non-empty, every entry >= 0.
     reductions
@@ -125,7 +127,7 @@ def compute_reduced_lengths(
     )
 
     node_lengths = compute_node_lengths(
-        cols, section_info.section_offsets, data_u8, depths
+        cols, section_info.section_offsets, body_lengths, depths
     )
 
     for depth, lengths in node_lengths.items():

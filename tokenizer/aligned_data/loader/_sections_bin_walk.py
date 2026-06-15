@@ -7,11 +7,13 @@ loaders previously duplicated verbatim.
 
 Boundary contract:
 
-* :func:`read_sections_bin_blob` — read the whole file, validate its
-  16-byte ``MSEC`` prelude, return ``(blob_bytes, memoryview)``. The
-  ``bytes`` is pinned so the caller can keep the memoryview alive
-  (the session does); callers that walk once and drop both let the
-  ``bytes`` GC alongside the view.
+* :func:`read_sections_bin_blob` — ``np.memmap`` the file (so
+  ``parse_section_bin`` pages in only the touched section, not the whole
+  catalog), validate its 16-byte ``MSEC`` prelude, return
+  ``(memmap, memoryview)``. The ``np.memmap`` is pinned so the caller can
+  keep the memoryview alive (the session does); callers that walk once and
+  drop both let the mapping release by refcounting once no slice is
+  exported.
 * :func:`resolve_func_name_or_raise` — turn a parsed-section
   ``function_name_ptr`` (FID) into the resolved function name via the
   ``line_to_name`` sidecar; raise :class:`ValueError` with the
@@ -23,8 +25,8 @@ Boundary contract:
   test fixture previously inlined.
 
 This module deliberately does NOT cache the blob across callers: pass-2
-emits the BIN once and the matched-arm loader reads it once; the
-unmatched-arm loader reads it once; the session reads it once and
+emits the BIN once and the matched-arm loader mmaps it once; the
+unmatched-arm loader mmaps it once; the session mmaps it once and
 pins the memoryview for the session lifetime. Cross-caller caching
 would require a second concern (cache invalidation) this module
 refuses to own.
@@ -32,8 +34,11 @@ refuses to own.
 
 from __future__ import annotations
 
+import enum
 from pathlib import Path
 from typing import Dict, Iterator, Tuple
+
+import numpy as np
 
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
@@ -49,20 +54,48 @@ from tokenizer.aligned_data.memmap_format import (
 )
 
 
-def read_sections_bin_blob(path: Path) -> Tuple[bytes, memoryview]:
-    """Read + prelude-validate ``path``; return the raw bytes + a memoryview.
+class SectionRegion(enum.Enum):
+    """Which region of the shared ``_sections.bin`` a read covers.
 
-    The returned ``memoryview`` covers the whole file (NOT just the
-    data region) so callers can pass absolute file offsets straight
-    through to :func:`tokenizer.aligned_data.matched_sections_bin.parse_section_bin`.
-    Returning the ``bytes`` alongside lets the caller pin the buffer
-    for as long as the view needs to stay live (e.g. for the lifetime
-    of a :class:`BinarySession`); short-lived callers discard both
-    together.
+    The catalog is emitted matched-region-first, unmatched-region-second.
+    Every consumer that re-reads the BIN (the realized-lengths /
+    realized-geometry dedup, the vectorized dataloader's columnar
+    pre-pass) discriminates ONLY on the region -- not on the sidecar
+    family -- so this is the single typed selector those reads share. It
+    lives beside the region-walk primitives (:func:`unmatched_region_start`
+    + :func:`walk_parsed_sections`) it selects between, so no consumer
+    re-derives the matched-vs-unmatched split inline.
     """
-    raw = path.read_bytes()
-    assert_matched_sections_prelude(raw, path=str(path))
-    return raw, memoryview(raw)
+
+    MATCHED = "matched"
+    UNMATCHED = "unmatched"
+
+
+def read_sections_bin_blob(path: Path) -> Tuple[np.memmap, memoryview]:
+    """``mmap`` + prelude-validate ``path``; return the memmap + a memoryview.
+
+    The BIN is NOT slurped into a ``bytes`` object: it is ``np.memmap``-ed
+    so :func:`tokenizer.aligned_data.matched_sections_bin.parse_section_bin`
+    pages in only the section(s) it actually touches. A per-batch
+    :class:`BinarySession` opens a fresh blob per sampled binary; the old
+    full read copied the ENTIRE catalog every time (z3's ``_sections.bin``
+    is ~348MB), so the eager copy dominated per-batch memory while the much
+    larger ``_data.bin`` was already lazy. The mmap drops that copy to the
+    touched pages only.
+
+    The returned ``memoryview`` covers the whole file (NOT just the data
+    region) so callers can pass absolute file offsets straight through to
+    ``parse_section_bin``. Returning the ``np.memmap`` alongside lets the
+    caller pin the mapping for as long as the view (and any ``Section``
+    parsed from a slice of it) needs to stay live -- e.g. for the lifetime
+    of a :class:`BinarySession`; short-lived callers drop both together and
+    the mapping is released by refcounting once no slice is exported.
+    """
+    mm = np.memmap(str(path), dtype=np.uint8, mode="r")
+    assert_matched_sections_prelude(
+        bytes(mm[:MATCHED_SECTIONS_BIN_PRELUDE_SIZE]), path=str(path)
+    )
+    return mm, memoryview(mm)
 
 
 def walk_parsed_sections(

@@ -27,6 +27,7 @@ from typing import Optional, Sequence
 from tools.batch_smoke._discovery import discover_binaries, filter_binaries
 
 from ._generate import generate_realized_lengths
+from ._geometry_generate import generate_realized_geometry
 
 
 __all__ = ["main"]
@@ -36,10 +37,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m tokenizer.aligned_data.realized_lengths",
         description=(
-            "Generate per-binary realized-token-length sidecars "
-            "(_lengths.bin + _lengths_index.bin per arm) for every "
-            "binary in a memmap directory. Runs BEFORE the sorted-index "
-            "build, which later consumes these sidecars."
+            "Generate per-binary realized-token sidecars for every binary "
+            "in a memmap directory: the realized-length pair (_lengths.bin "
+            "+ _lengths_index.bin) AND the realized-geometry superset pair "
+            "(_realized.bin + _realized_index.bin), per arm. Runs BEFORE the "
+            "sorted-index build, which later consumes these sidecars."
         ),
     )
     parser.add_argument(
@@ -83,10 +85,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     for binary_name in selected:
-        written = generate_realized_lengths(args.input_dir, binary_name)
-        for paths in written.values():
-            for path in paths:
-                print(path)
+        for generate in (generate_realized_lengths, generate_realized_geometry):
+            written = generate(args.input_dir, binary_name)
+            for paths in written.values():
+                for path in paths:
+                    print(path)
     return 0
 
 

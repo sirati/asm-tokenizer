@@ -3,6 +3,7 @@
     python -m dynrunner --task tokenize       [...task args]
     python -m dynrunner --task unify-vocab    [...task args]
     python -m dynrunner --task build-memmap   [...task args]
+    python -m dynrunner --task build-index    [...task args]
     python -m dynrunner --task full-pipeline  [...task args]
     python -m dynrunner --task all            (alias for full-pipeline)
 
@@ -33,6 +34,7 @@ _TASK_TO_MODULE: dict[str, str] = {
     "tokenize": "dynrunner.tokenize",
     "unify-vocab": "dynrunner.unify_vocab",
     "build-memmap": "dynrunner.build_memmap",
+    "build-index": "dynrunner.build_index",
     "full-pipeline": "dynrunner.full_pipeline",
 }
 

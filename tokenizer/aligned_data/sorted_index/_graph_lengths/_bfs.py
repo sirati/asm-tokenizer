@@ -24,7 +24,10 @@ root's own section is seeded at column 0, so a self/mutual-recursive
 edge back to the root is already-included and never re-spliced.
 
 Depth-0 lengths are byte-identical to the legacy build: ``own = 1
-self-token + contributing body length`` per :func:`._resolve._body_lengths`.
+self-token + contributing body length``, where the body length is the
+INJECTED matched-arm realized-length sidecar
+(:mod:`tokenizer.aligned_data.realized_lengths`) and the self-token is
+composed here at the DP site.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 
 from ._adjacency import LiveNodeAdjacency
-from ._resolve import LARGE_CONTEXT_LEN, _body_lengths
+from ._resolve import LARGE_CONTEXT_LEN
 
 
 __all__ = ["compute_node_lengths", "LARGE_CONTEXT_LEN"]
@@ -46,7 +49,7 @@ __all__ = ["compute_node_lengths", "LARGE_CONTEXT_LEN"]
 def compute_node_lengths(
     cols: ColumnarSections,
     section_offsets: np.ndarray,
-    data_u8: np.ndarray,
+    body_lengths: np.ndarray,
     depths: List[int],
 ) -> Dict[int, np.ndarray]:
     """Depth-``d`` spliced length per (section, variant) node.
@@ -55,6 +58,17 @@ def compute_node_lengths(
     Raises :class:`AssertionError` if any length reaches
     :data:`LARGE_CONTEXT_LEN` (the legacy build's no-cutoff guarantee
     -- plan D-2.2).
+
+    ``body_lengths`` is the INJECTED per-node contributing BODY length
+    (``int[total_vars]``, section-major in ``cols.var_offsets`` order),
+    EXCLUDING the self/identity token. It is the matched-arm
+    realized-length sidecar
+    (:mod:`tokenizer.aligned_data.realized_lengths`), generated as its
+    own Phase-4a pass, so this module decodes no ``_data.bin`` token
+    geometry. The prepended self-token (exactly 1 per node) is composed
+    HERE at the DP site (``own = body + 1``); the variant-token row
+    PREFIX deliberately stays OUTSIDE the sums (the historical
+    ``_variant_lengths_at_depth`` contract never included it).
 
     Each requested depth is materialised from ONE max-depth BFS per
     root (a shallower depth is the cumulative prefix of the deeper
@@ -73,10 +87,17 @@ def compute_node_lengths(
     if total_vars == 0:
         return {d: np.zeros(0, dtype=np.int64) for d in depths}
 
+    if body_lengths.shape != (total_vars,):
+        raise ValueError(
+            f"body-length array shape {body_lengths.shape!r} does not match "
+            f"the catalog's {total_vars} variants; the injected sidecar "
+            f"lengths are out of alignment with the matched-arm pre-pass"
+        )
+
     # Own length = 1 self-token + contributing body length (the
-    # variant-token row prefix stays outside the sums -- see
-    # :func:`._resolve._body_lengths`). Depth-0 is byte-identical to base.
-    own = _body_lengths(cols, data_u8) + 1
+    # variant-token row prefix stays outside the sums). Depth-0 is
+    # byte-identical to the legacy build.
+    own = body_lengths.astype(np.int64) + 1
 
     # ``cum[d]`` is the cumulative depth-``d`` length per node (own +
     # included bodies up to level d). cum[0] = own.
@@ -177,7 +198,7 @@ def _expand_children(
     sec_chunks: List[np.ndarray] = []
     node_chunks: List[np.ndarray] = []
     for row, node in zip(parent_row.tolist(), parent_node.tolist()):
-        children, child_secs = adjacency(int(node))
+        children, child_secs, _child_types = adjacency(int(node))
         if children.size == 0:
             continue
         row_chunks.append(np.full(children.size, row, dtype=np.int64))

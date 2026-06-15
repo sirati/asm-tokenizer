@@ -37,6 +37,7 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
+from ._length_helpers import ensure_sidecar
 from .fixtures import build_combined_fixture, make_test_vocab_manager
 
 
@@ -80,6 +81,8 @@ def _build_decodable_binary(
 ) -> None:
     """Place a combined-corpus binary + its REAL sorted index in ``memmap_dir``."""
     _place_combined_binary(memmap_dir, binary_name, scratch)
+    # Seed the Phase-4a realized-length sidecar the build now requires.
+    ensure_sidecar(memmap_dir, binary_name)
     write_sorted_index_files(
         memmap_dir, binary_name, reductions=[_MAX], depths=[_DEPTH],
     )

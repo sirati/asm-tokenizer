@@ -365,6 +365,17 @@ def _emit_unmatched_data(
                     entry_idx=n_entries,
                 )
                 n_entries += 1
+                # Per-version call-set override (symmetric with the
+                # matched emitter): a version may call a SUBSET of the
+                # function's union ``called`` so a callee reached by SOME
+                # but not ALL versions drives the all-versions-equivalence
+                # (FLAG-A) splice divergence. ``None`` keeps the historical
+                # "every version calls the whole function set".
+                version_called = (
+                    set(typed_called)
+                    if version.called is None
+                    else set(_project_called_typed(version.called))
+                )
                 unmatched_data_entries.append(
                     {
                         "func_name": spec.func_name,
@@ -372,7 +383,7 @@ def _emit_unmatched_data(
                         "data_offset": offset,
                         "data_len": length,
                         "token_len": len(version.tokens),
-                        "called": set(typed_called),
+                        "called": version_called,
                         "extern_libraries": {},
                     }
                 )

@@ -202,6 +202,24 @@ class _FakeSession:
         matched = MatchedFunction(func_name=f"m{idx}", variants=variants)
         return section, section.section_offset, matched
 
+    def _matched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        section = self.matched_sections[idx]
+        return section, section.section_offset
+
+    def _load_matched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        return self.matched_function_data[(idx, variant_index)]
+
+    def _load_unmatched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        return self.unmatched_variant_function_data[(idx, variant_index)]
+
+    def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        section = self.unmatched_sections[idx]
+        return section, section.section_offset
+
     def _load_unmatched_section_and_all_variants(
         self, idx: int
     ) -> Tuple[Section, int, List[FunctionData]]:
@@ -235,7 +253,7 @@ class _FakeSession:
         self, idx: int
     ) -> Tuple[FunctionData, Section, int]:
         section = self.unmatched_sections[idx]
-        fd = self.unmatched_function_data[idx]
+        fd = self.unmatched_variant_function_data[(idx, 0)]
         return fd, section, section.section_offset
 
 

@@ -7,10 +7,10 @@ cgroup). The factored recurrence (see :mod:`.._graph_lengths`) must
 keep every allocation bounded by the catalog's on-disk table sizes:
 
 * the allocation probe builds a many-variant synthetic catalog whose
-  dense product is ~100x its linear structures, monkeypatches the
-  depth-0 body parse out (so only resolver + DP allocations are
-  traced), and asserts the tracemalloc peak stays far below ONE dense
-  candidate array;
+  dense product is ~100x its linear structures, injects a flat synthetic
+  body-length array (so only resolver + DP allocations are traced), and
+  asserts the tracemalloc peak stays far below ONE dense candidate
+  array;
 * the structural guard pins the resolver's output arrays to their
   contract sizes (``total_cts`` / ``<= total first per-call entries``);
 * the scale smoke runs a few-thousand-section catalog through all four
@@ -29,11 +29,9 @@ import time
 import tracemalloc
 
 import numpy as np
-import pytest
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
-from tokenizer.aligned_data.sorted_index._graph_lengths import _bfs
 from tokenizer.aligned_data.sorted_index._graph_lengths import (
     compute_node_lengths,
 )
@@ -112,24 +110,18 @@ def _forward_dag_catalog(
     return cols, section_offsets
 
 
-@pytest.fixture
-def _stub_body_lengths(monkeypatch):
-    """Replace the depth-0 record parse with a flat synthetic array.
+def _synthetic_body_lengths(cols: ColumnarSections) -> np.ndarray:
+    """Flat synthetic per-variant body length for an injected catalog.
 
     The synthetic catalog has no ``_data.bin``; the probes target the
-    resolver + DP, whose inputs are the catalog columns plus SOME
-    int64 own-length vector.
+    resolver + DP, whose inputs are the catalog columns plus SOME int64
+    body-length vector (the build now consumes the realized-length
+    sidecar, so the BFS takes this array directly).
     """
-    monkeypatch.setattr(
-        _bfs,
-        "_body_lengths",
-        lambda cols, data_u8: np.ones(
-            cols.var_n_calls.size, dtype=np.int64
-        ),
-    )
+    return np.ones(int(cols.var_n_calls.size), dtype=np.int64)
 
 
-def test_resolver_memory_stays_linear(_stub_body_lengths) -> None:
+def test_resolver_memory_stays_linear() -> None:
     # 800 sections x 100 variants x ~175 call targets: the dense
     # candidate product is ~14M edges (~110 MB per int64 array; the
     # historical resolver pinned SEVERAL in parallel), while the
@@ -145,11 +137,11 @@ def test_resolver_memory_stays_linear(_stub_body_lengths) -> None:
     dense_array_bytes = dense_product * 8
     assert dense_array_bytes > 100 * 2**20  # the contrast is real
 
-    data_u8 = np.zeros(16, dtype=np.uint8)
+    body = _synthetic_body_lengths(cols)
     gc.collect()
     tracemalloc.start()
     try:
-        compute_node_lengths(cols, section_offsets, data_u8, [1])
+        compute_node_lengths(cols, section_offsets, body, [1])
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -178,25 +170,25 @@ def test_live_adjacency_children_bounded_by_node_calls() -> None:
     )
     adjacency = LiveNodeAdjacency(cols, section_offsets, sec_of_var)
     for node in range(int(cols.var_offsets[-1])):
-        children, child_secs = adjacency(node)
-        assert children.size == child_secs.size
+        children, child_secs, child_types = adjacency(node)
+        assert children.size == child_secs.size == child_types.size
         assert children.size <= int(cols.var_n_calls[node])
         # Children are valid flat variant indices.
         assert bool((children >= 0).all())
         assert bool((children < cols.var_offsets[-1]).all())
 
 
-def test_scale_smoke_few_thousand_sections(_stub_body_lengths) -> None:
+def test_scale_smoke_few_thousand_sections() -> None:
     # Production depth set on a few-thousand-section catalog; the
     # bound is deliberately loose (CI boxes under load) -- the dense
     # resolver at this shape would page-thrash long past it.
     cols, section_offsets = _forward_dag_catalog(
         n_sections=4000, n_vars=10, n_cts=40, n_calls=8
     )
-    data_u8 = np.zeros(16, dtype=np.uint8)
+    body = _synthetic_body_lengths(cols)
     t0 = time.perf_counter()
     results = compute_node_lengths(
-        cols, section_offsets, data_u8, [0, 1, 2, 3]
+        cols, section_offsets, body, [0, 1, 2, 3]
     )
     elapsed = time.perf_counter() - t0
     assert set(results) == {0, 1, 2, 3}

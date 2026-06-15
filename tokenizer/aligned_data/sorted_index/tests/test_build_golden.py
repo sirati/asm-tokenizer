@@ -31,6 +31,7 @@ from tokenizer.aligned_data.sorted_index import (
     build_sorted_index_bytes,
 )
 
+from ._length_helpers import ensure_sidecar
 from .fixtures import (
     build_combined_fixture,
     build_many_variant_section_fixture,
@@ -152,6 +153,10 @@ def _aggregate(tmp_path: Path) -> str:
 
     lines: List[str] = []
     for name, base in fixtures:
+        # Seed the Phase-4a realized-length sidecar the build now
+        # consumes. The golden hash must NOT change: the sidecar body
+        # lengths are byte-identical to the retired _data.bin recompute.
+        ensure_sidecar(base, name)
         blobs = build_sorted_index_bytes(
             base, name, reductions=_REDS, depths=_DEPTHS
         )

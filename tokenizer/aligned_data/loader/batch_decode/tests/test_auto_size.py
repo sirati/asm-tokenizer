@@ -126,18 +126,30 @@ class _FakeSession:
     def _load_matched_section_and_variants(
         self, idx: int
     ) -> Tuple[Section, int, MatchedFunction]:
+        # Retained for the legacy ``_old_inspector_peek`` regression helper
+        # (a direct eager load, NOT the resolver path).
         section = self.matched_sections[idx]
         return section, section.section_offset, self.matched_functions[idx]
 
-    def _load_unmatched_section_and_all_variants(
-        self, idx: int
-    ) -> Tuple[Section, int, List[FunctionData]]:
+    # ---- lazy load helpers (the resolver's sampled-only contract) -----
+
+    def _matched_section_meta(self, idx: int) -> Tuple[Section, int]:
+        section = self.matched_sections[idx]
+        return section, section.section_offset
+
+    def _load_matched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        return self.matched_functions[idx].variants[variant_index]
+
+    def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.unmatched_sections[idx]
-        return (
-            section,
-            section.section_offset,
-            self.unmatched_variant_function_data[idx],
-        )
+        return section, section.section_offset
+
+    def _load_unmatched_variant_body(
+        self, idx: int, variant_index: int, section: Section
+    ) -> FunctionData:
+        return self.unmatched_variant_function_data[idx][variant_index]
 
 
 # ---------------------------------------------------------------------------

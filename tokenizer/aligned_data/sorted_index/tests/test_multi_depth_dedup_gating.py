@@ -42,10 +42,22 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
-from .fixtures import build_combined_fixture
+from ._length_helpers import ensure_sidecar, sidecar_body_lengths
+from .fixtures import build_combined_fixture as _build_combined_fixture
 
 
 _BINARY_NAME = "sortbin"
+
+
+def build_combined_fixture(tmp_path: Path) -> Path:
+    """Combined memmap fixture WITH the realized-length sidecar generated.
+
+    The build hard-requires the matched-arm sidecar (the Phase-4a
+    precondition), seeded right after the fixture's memmap dir.
+    """
+    base = _build_combined_fixture(tmp_path)
+    ensure_sidecar(base, _BINARY_NAME)
+    return base
 
 _MAX = LengthReduction(kind=ReductionKind.MAX)
 _P50 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=50)
@@ -128,11 +140,11 @@ def test_max_depth_length_equals_total_surviving_count(tmp_path: Path) -> None:
     from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 
     base = build_combined_fixture(tmp_path)
-    data_u8, section_info = _open(base)
+    body_lengths, section_info = _open(base)
     spec = IndexSpec(reduction=_MAX, depth=3)
 
     result = compute_reduced_lengths(
-        section_info, data_u8, depths=[3], reductions=[_MAX]
+        section_info, body_lengths, depths=[3], reductions=[_MAX]
     )[spec]
 
     # multi_fn is section[2] (4 variants); oracle a fresh LEGACY walk
@@ -290,10 +302,15 @@ def test_gate_negative_rejected(kwargs) -> None:
 
 
 def _open(base: Path):
-    data_u8 = np.memmap(
-        str(base / f"{_BINARY_NAME}_data.bin"), dtype=np.uint8, mode="r"
+    """Return ``(body_lengths, section_info)`` the build now consumes.
+
+    The matched-arm body lengths come from the realized-length sidecar
+    (the fixture seeded it), not a fresh ``_data.bin`` decode.
+    """
+    return (
+        sidecar_body_lengths(base, _BINARY_NAME),
+        read_section_variant_info(base, _BINARY_NAME),
     )
-    return data_u8, read_section_variant_info(base, _BINARY_NAME)
 
 
 def test_gating_stamps_zero_on_failing_sections(tmp_path: Path) -> None:
@@ -306,15 +323,15 @@ def test_gating_stamps_zero_on_failing_sections(tmp_path: Path) -> None:
     the exact length the ungated build produced.
     """
     base = build_combined_fixture(tmp_path)
-    data_u8, section_info = _open(base)
+    body_lengths, section_info = _open(base)
     spec = IndexSpec(reduction=_MAX, depth=3)
 
     ungated = compute_reduced_lengths(
-        section_info, data_u8, depths=[3], reductions=[_MAX]
+        section_info, body_lengths, depths=[3], reductions=[_MAX]
     )[spec]
     gated = compute_reduced_lengths(
         section_info,
-        data_u8,
+        body_lengths,
         depths=[3],
         reductions=[_MAX],
         gate=VariantGate(min_variants=2),
@@ -345,7 +362,7 @@ def test_gating_unique_excludes_duplicate_heavy_section(tmp_path: Path) -> None:
     the real per-variant pointers.
     """
     base = build_combined_fixture(tmp_path)
-    data_u8, section_info = _open(base)
+    body_lengths, section_info = _open(base)
     spec = IndexSpec(reduction=_MAX, depth=3)
 
     # Oracle: distinct data pointers per section == total variant count
@@ -355,7 +372,7 @@ def test_gating_unique_excludes_duplicate_heavy_section(tmp_path: Path) -> None:
 
     gated = compute_reduced_lengths(
         section_info,
-        data_u8,
+        body_lengths,
         depths=[3],
         reductions=[_MAX],
         gate=VariantGate(min_variants_unique=3),
@@ -381,7 +398,7 @@ def test_prepass_data_pointers_match_oracle(tmp_path: Path) -> None:
     is provably the parsed BIN field, not a stale or wrong column.
     """
     base = build_combined_fixture(tmp_path)
-    _data_u8, section_info = _open(base)
+    _body_lengths, section_info = _open(base)
     num_matched = section_info.counts.size
 
     oracle_pointers = []
@@ -420,18 +437,18 @@ def test_adjust_for_duplicates_noop_on_distinct_pointers(tmp_path: Path) -> None
     end-to-end (not just in the unit test).
     """
     base = build_combined_fixture(tmp_path)
-    data_u8, section_info = _open(base)
+    body_lengths, section_info = _open(base)
 
     plain = compute_reduced_lengths(
         section_info,
-        data_u8,
+        body_lengths,
         depths=[3],
         reductions=[_MAX, _P50, _P95],
         duplicate_handling=PLAIN,
     )
     dedup = compute_reduced_lengths(
         section_info,
-        data_u8,
+        body_lengths,
         depths=[3],
         reductions=[_MAX, _P50, _P95],
         duplicate_handling=DEDUP_BY_DATA_POINTER,

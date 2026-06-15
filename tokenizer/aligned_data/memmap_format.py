@@ -313,3 +313,69 @@ def assert_realized_lengths_index_prelude(prelude: bytes, *, path: str = "") -> 
         expected_magic=REALIZED_LENGTHS_INDEX_BIN_PRELUDE_MAGIC,
         path=path,
     )
+
+
+# 16-byte file-level prelude written at the start of every
+# ``<binary>_realized.bin`` / ``<binary>_unmatched_realized.bin`` (the
+# realized-GEOMETRY sidecars — a superset of the realized-length body).
+# Layout (little-endian):
+#
+#     bytes 0..3   : magic = b"RLG3"
+#     bytes 4..7   : u32 MEMMAP_FORMAT_VERSION
+#     bytes 8..15  : reserved (zero)
+#
+# Body after the prelude: THREE contiguous ``u32`` blocks each of length
+# N = total (section, variant) count, section-major, in axis order
+# (body_len, id_count, value_count). The three blocks are parallel and
+# share the single ``RGIX`` CSR jump table. See
+# :mod:`.realized_lengths._geometry_format` for the body / CSR contract.
+REALIZED_GEOMETRY_BIN_PRELUDE_MAGIC: bytes = b"RLG3"
+REALIZED_GEOMETRY_BIN_PRELUDE_SIZE: int = _PRELUDE_SIZE
+
+
+def encode_realized_geometry_prelude() -> bytes:
+    """Return the 16-byte prelude bytes for a fresh ``<binary>_realized.bin``."""
+    return encode_bin_prelude(REALIZED_GEOMETRY_BIN_PRELUDE_MAGIC)
+
+
+def assert_realized_geometry_prelude(prelude: bytes, *, path: str = "") -> None:
+    """Raise ``ValueError`` if ``prelude`` is not a valid realized.bin prelude.
+
+    Same single-chokepoint policy as :func:`assert_data_bin_prelude`.
+    """
+    assert_bin_prelude(
+        prelude, expected_magic=REALIZED_GEOMETRY_BIN_PRELUDE_MAGIC, path=path
+    )
+
+
+# 16-byte file-level prelude written at the start of every
+# ``<binary>_realized_index.bin`` / ``<binary>_unmatched_realized_index.bin``
+# (the per-section CSR jump table SHARED by the three geometry blocks).
+# Layout (little-endian):
+#
+#     bytes 0..3   : magic = b"RGIX"
+#     bytes 4..7   : u32 MEMMAP_FORMAT_VERSION
+#     bytes 8..15  : reserved (zero)
+#
+# Body after the prelude: ``n_sections + 1`` ``u32`` CSR entries (element
+# offsets into EACH of the three parallel geometry blocks). See
+# :mod:`.realized_lengths._geometry_format`.
+REALIZED_GEOMETRY_INDEX_BIN_PRELUDE_MAGIC: bytes = b"RGIX"
+REALIZED_GEOMETRY_INDEX_BIN_PRELUDE_SIZE: int = _PRELUDE_SIZE
+
+
+def encode_realized_geometry_index_prelude() -> bytes:
+    """Return the 16-byte prelude bytes for a fresh ``<binary>_realized_index.bin``."""
+    return encode_bin_prelude(REALIZED_GEOMETRY_INDEX_BIN_PRELUDE_MAGIC)
+
+
+def assert_realized_geometry_index_prelude(prelude: bytes, *, path: str = "") -> None:
+    """Raise ``ValueError`` if ``prelude`` is not a valid realized_index.bin prelude.
+
+    Same single-chokepoint policy as :func:`assert_data_bin_prelude`.
+    """
+    assert_bin_prelude(
+        prelude,
+        expected_magic=REALIZED_GEOMETRY_INDEX_BIN_PRELUDE_MAGIC,
+        path=path,
+    )
