@@ -52,15 +52,22 @@ def _lookup_id(vocab: Any, token: str) -> int:
     upstream, not something the encoder should silently coerce.
     """
     token_id = vocab.get_token_id(token)
-    assert token_id != -1, (
-        f"variant-axis token {token!r} not registered in unified vocab; "
-        "upstream discovery (VariantInventory + register pass) missed it"
-    )
-    assert 0 <= token_id <= _UINT16_MAX, (
-        f"variant-axis token {token!r} got vocab id {token_id} which "
-        f"exceeds uint16 ceiling ({_UINT16_MAX}); the unified vocab has "
-        "outgrown the wire format and the bin layout must bump"
-    )
+    # Explicit raises, NOT assert: this is the last-line guard against
+    # writing a silently-wrong id into the variants bin, and `python -O`
+    # strips asserts -- which would turn a phase-2-missed-token into a
+    # ``-1`` (-> 0xFFFF OOB id) and a vocab-overgrows-uint16 into a silent
+    # truncation, in exactly the optimised production run where it matters.
+    if token_id == -1:
+        raise ValueError(
+            f"variant-axis token {token!r} not registered in unified vocab; "
+            "upstream discovery (VariantInventory + register pass) missed it"
+        )
+    if not (0 <= token_id <= _UINT16_MAX):
+        raise ValueError(
+            f"variant-axis token {token!r} got vocab id {token_id} which "
+            f"exceeds uint16 ceiling ({_UINT16_MAX}); the unified vocab has "
+            "outgrown the wire format and the bin layout must bump"
+        )
     return token_id
 
 

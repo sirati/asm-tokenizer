@@ -108,8 +108,9 @@ def test_encode_then_decode_then_encode_byte_identical():
 
 
 def test_uint16_overflow_at_lookup_fires():
-    """A token ID > 65535 must trigger ``AssertionError`` at lookup
-    time, BEFORE any silent truncation can corrupt the record."""
+    """A token ID > 65535 must trigger a ``ValueError`` at lookup time,
+    BEFORE any silent truncation can corrupt the record. Explicit raise
+    (not assert) so the guard survives ``python -O``."""
     vi = FakeVersionInfo(extra_metadata={})
     vocab = FakeVocab()
     # Manually place the arch token at an out-of-range ID.
@@ -117,19 +118,20 @@ def test_uint16_overflow_at_lookup_fires():
     vocab.register_at(arch_strings[0], 0x10000)  # 65536
     for token in arch_strings[1:]:
         vocab.register(token)
-    with pytest.raises(AssertionError, match=r"uint16 ceiling"):
+    with pytest.raises(ValueError, match=r"uint16 ceiling"):
         encode_record(vi, vocab)
 
 
 def test_missing_token_id_fires():
     """If the unifier missed a discovery pass, the encoder must fail
-    loudly instead of silently emitting a sentinel ID."""
+    loudly (``ValueError``, not an ``-O``-strippable assert) instead of
+    silently emitting a sentinel ID."""
     vi = FakeVersionInfo(extra_metadata={"hardening": "full"})
     vocab = FakeVocab()
     # Register only positional axes; omit metadata token.
     for token in build_axis_strings(vi)[:4]:
         vocab.register(token)
-    with pytest.raises(AssertionError, match=r"not registered"):
+    with pytest.raises(ValueError, match=r"not registered"):
         encode_record(vi, vocab)
 
 
