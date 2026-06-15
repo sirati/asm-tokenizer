@@ -161,14 +161,17 @@ def _flatten_emission(
     length twin (``...compute_node_lengths``) uses.
     """
     per_row = [inc.emitted_nodes for inc in inclusions]
+    per_row_types = [inc.emitted_edge_types for inc in inclusions]
     lengths = np.array([e.size for e in per_row], dtype=np.int64)
     row_offsets = np.zeros(lengths.size + 1, dtype=np.int64)
     np.cumsum(lengths, out=row_offsets[1:])
 
     if per_row:
         node = np.concatenate(per_row).astype(np.int64)
+        edge_type = np.concatenate(per_row_types).astype(np.uint8)
     else:
         node = np.zeros(0, dtype=np.int64)
+        edge_type = np.zeros(0, dtype=np.uint8)
 
     # The variant-token row PREFIX is a per-row quantity (kept OUT of
     # own_length); own_length is the self-token + the realized body span.
@@ -185,6 +188,7 @@ def _flatten_emission(
     emission = BatchRowEmission(
         row_offsets=row_offsets,
         node=node,
+        edge_type=edge_type,
         own_length=own_length,
         id_total=id_total,
         value_total=value_total,

@@ -170,8 +170,8 @@ def test_live_adjacency_children_bounded_by_node_calls() -> None:
     )
     adjacency = LiveNodeAdjacency(cols, section_offsets, sec_of_var)
     for node in range(int(cols.var_offsets[-1])):
-        children, child_secs = adjacency(node)
-        assert children.size == child_secs.size
+        children, child_secs, child_types = adjacency(node)
+        assert children.size == child_secs.size == child_types.size
         assert children.size <= int(cols.var_n_calls[node])
         # Children are valid flat variant indices.
         assert bool((children >= 0).all())

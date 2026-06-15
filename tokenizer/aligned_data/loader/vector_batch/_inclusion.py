@@ -41,6 +41,7 @@ from typing import Dict, List
 
 import numpy as np
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
     LiveNodeAdjacency,
@@ -51,17 +52,28 @@ from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 __all__ = ["RowInclusion", "compute_row_inclusions"]
 
 
+#: The edge type seeded for every row's ROOT node. The decode path's root
+#: self-token category is ``LOCAL_FUNC`` (see
+#: ``batch_decode._callee_walk._walker``), which is the ``CallTargetType.
+#: LOCAL`` edge mapping -- so the root is recorded as a LOCAL edge.
+_ROOT_EDGE_TYPE: int = int(CallTargetType.LOCAL)
+
+
 @dataclass(frozen=True)
 class RowInclusion:
     """One batch row's ordered emitted nodes + remembered-excluded pool.
 
     ``emitted_nodes`` is the BFS emission order (root first, then the
-    included callees level by level); ``excluded_nodes`` is the sampled-
-    subset-pruned / full-set-included backfill pool (de-duplicated,
-    ascending). Both are catalog NODE indices (``var_offsets``-major).
+    included callees level by level); ``emitted_edge_types`` is the
+    parallel per-emitted-node :class:`CallTargetType` of the edge that
+    reached it (root seeded ``CallTargetType.LOCAL``); ``excluded_nodes``
+    is the sampled-subset-pruned / full-set-included backfill pool (de-
+    duplicated, ascending). ``emitted_nodes`` / ``excluded_nodes`` are
+    catalog NODE indices (``var_offsets``-major).
     """
 
     emitted_nodes: np.ndarray  # int64[k] -- BFS emission order, root at [0]
+    emitted_edge_types: np.ndarray  # uint8[k] -- edge CallTargetType per node
     excluded_nodes: np.ndarray  # int64[m] -- remembered backfill pool
 
 
@@ -134,7 +146,7 @@ def compute_row_inclusions(
     for section_idx, batch_rows in rows_by_section.items():
         sampled = smp[batch_rows]
         # Subset emission + inclusion mask membership.
-        emitted_per_row, included_subset = _bfs_emit(
+        emitted_per_row, emitted_types_per_row, included_subset = _bfs_emit(
             section_idx=section_idx,
             sampled_variants=sampled,
             cols=cols,
@@ -152,6 +164,7 @@ def compute_row_inclusions(
         )
         for local, r in enumerate(batch_rows):
             emitted = emitted_per_row[local]
+            emitted_types = emitted_types_per_row[local]
             # Remembered-excluded = full-set-included MINUS subset-emitted
             # (the callees the narrower subset mask pruned). De-duplicated
             # ascending; excludes anything this row already emitted.
@@ -160,6 +173,7 @@ def compute_row_inclusions(
             )
             out[r] = RowInclusion(
                 emitted_nodes=emitted,
+                emitted_edge_types=emitted_types,
                 excluded_nodes=pool.astype(np.int64),
             )
     return out  # type: ignore[return-value]
@@ -176,11 +190,17 @@ def _bfs_emit(
 ):
     """Subset BFS: per sampled row, the ORDERED emitted node list.
 
-    Returns ``(emitted_per_row, included_union)``:
+    Returns ``(emitted_per_row, emitted_types_per_row, included_union)``:
 
     * ``emitted_per_row`` -- ``list[int64[k]]`` parallel to
       ``sampled_variants``; each is ``[root, callee, ...]`` in BFS
       emission order.
+    * ``emitted_types_per_row`` -- ``list[uint8[k]]`` parallel to
+      ``emitted_per_row``; each entry is the :class:`CallTargetType` of
+      the EDGE that reached the emitted node (the root is seeded as
+      ``CallTargetType.LOCAL`` -- the decode path's root encounter
+      category is ``LOCAL_FUNC``). The scatter maps this edge type to
+      the inlined-callee self-token category.
     * ``included_union`` -- ``int64[]`` the de-duplicated union of every
       node any sampled row included (root excluded -- the pool diff is
       against callees only). Unused by the caller for the subset pass but
@@ -201,6 +221,11 @@ def _bfs_emit(
     emitted_per_row: List[List[int]] = [
         [v0 + int(sampled_variants[i])] for i in range(n_sampled)
     ]
+    # Per emitted node, the edge CallTargetType that reached it. The root
+    # is seeded LOCAL (its decode encounter category is LOCAL_FUNC).
+    emitted_types_per_row: List[List[int]] = [
+        [_ROOT_EDGE_TYPE] for _ in range(n_sampled)
+    ]
     included: List[int] = []
 
     # Level-0 parents: one per sampled row, expanding ITS OWN sampled
@@ -212,7 +237,7 @@ def _bfs_emit(
     for _depth in range(1, max_depth + 1):
         if parent_node.size == 0:
             break
-        rows, fids, child_nodes = _expand_level(
+        rows, fids, child_nodes, child_types = _expand_level(
             parent_row, parent_node, adjacency
         )
         if child_nodes.size == 0:
@@ -222,12 +247,16 @@ def _bfs_emit(
         if bool(inc.any()):
             inc_rows = rows[inc]
             inc_nodes = child_nodes[inc]
+            inc_types = child_types[inc]
             # Emission order WITHIN this level follows the pair order
             # (parents in frontier order, each parent's children in
             # ascending call_target slot) -- exactly the order
             # ``_expand_level`` concatenated them.
-            for mask_row, node in zip(inc_rows.tolist(), inc_nodes.tolist()):
+            for mask_row, node, edge_type in zip(
+                inc_rows.tolist(), inc_nodes.tolist(), inc_types.tolist()
+            ):
                 emitted_per_row[mask_row].append(node)
+                emitted_types_per_row[mask_row].append(edge_type)
                 included.append(node)
         surv = result.survivor_pairs
         parent_row = rows[surv]
@@ -235,6 +264,7 @@ def _bfs_emit(
 
     return (
         [np.asarray(e, dtype=np.int64) for e in emitted_per_row],
+        [np.asarray(t, dtype=np.uint8) for t in emitted_types_per_row],
         np.unique(np.asarray(included, dtype=np.int64))
         if included
         else np.zeros(0, dtype=np.int64),
@@ -269,7 +299,7 @@ def _bfs_full_included(
     for _depth in range(1, max_depth + 1):
         if parent_node.size == 0:
             break
-        rows, fids, child_nodes = _expand_level(
+        rows, fids, child_nodes, _child_types = _expand_level(
             parent_row, parent_node, adjacency
         )
         if child_nodes.size == 0:
@@ -294,30 +324,40 @@ def _expand_level(
 ):
     """Flatten every parent's resolved children into level pair arrays.
 
-    Returns ``(rows, callee_secs, child_nodes)`` -- one entry per
-    (parent, resolved call_target), parents in frontier order and each
-    parent's children in ascending call_target slot (the order
+    Returns ``(rows, callee_secs, child_nodes, child_types)`` -- one
+    entry per (parent, resolved call_target), parents in frontier order
+    and each parent's children in ascending call_target slot (the order
     :meth:`LiveNodeAdjacency.__call__` returns). ``rows`` is the mask
     row; ``callee_secs`` is the once-only key the decider dedups on;
-    ``child_nodes`` is the flat callee node. Mirrors
-    ``...._graph_lengths._bfs._expand_children`` (the length twin) so the
-    BFS frontier order matches the index build's.
+    ``child_nodes`` is the flat callee node; ``child_types`` is the
+    parent slot's :class:`CallTargetType` (uint8) per child -- the edge
+    attribute the scatter turns into the inlined-callee self-token
+    category. Mirrors ``...._graph_lengths._bfs._expand_children`` (the
+    length twin) so the BFS frontier order matches the index build's.
     """
     row_chunks: List[np.ndarray] = []
     sec_chunks: List[np.ndarray] = []
     node_chunks: List[np.ndarray] = []
+    type_chunks: List[np.ndarray] = []
     for row, node in zip(parent_row.tolist(), parent_node.tolist()):
-        children, child_secs = adjacency(int(node))
+        children, child_secs, child_types = adjacency(int(node))
         if children.size == 0:
             continue
         row_chunks.append(np.full(children.size, row, dtype=np.int64))
         sec_chunks.append(np.asarray(child_secs, dtype=np.uint32))
         node_chunks.append(np.asarray(children, dtype=np.int64))
+        type_chunks.append(np.asarray(child_types, dtype=np.uint8))
     if not row_chunks:
         e_i = np.zeros(0, dtype=np.int64)
-        return e_i, np.zeros(0, dtype=np.uint32), e_i.copy()
+        return (
+            e_i,
+            np.zeros(0, dtype=np.uint32),
+            e_i.copy(),
+            np.zeros(0, dtype=np.uint8),
+        )
     return (
         np.concatenate(row_chunks),
         np.concatenate(sec_chunks),
         np.concatenate(node_chunks),
+        np.concatenate(type_chunks),
     )

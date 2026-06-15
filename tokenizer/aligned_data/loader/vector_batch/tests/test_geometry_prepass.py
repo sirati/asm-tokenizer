@@ -65,6 +65,23 @@ def test_emission_order_and_included_set():
     assert em.own_length.tolist() == [6, 10, 7, 8]
 
 
+def test_emitted_edge_types_root_local_callees_slot_type():
+    """The root entry of every row is the LOCAL edge (root self-token
+    category is LOCAL_FUNC); the synthetic corpus's call_targets are all
+    LOCAL, so every spliced callee carries the LOCAL edge type too."""
+    from tokenizer.aligned_data.call_target_type import CallTargetType
+
+    _c, g = _geometry(seq_len=100, sampled_variants=[0, 1])
+    em = g.emission
+    # edge_type is parallel to node; root + all-LOCAL callees -> all LOCAL.
+    assert em.edge_type.dtype == np.uint8
+    assert em.edge_type.shape == em.node.shape
+    assert em.edge_type.tolist() == [int(CallTargetType.LOCAL)] * em.node.size
+    # The first emitted node of each row (the root) is always a LOCAL edge.
+    roots = em.row_offsets[:-1]
+    assert (em.edge_type[roots] == int(CallTargetType.LOCAL)).all()
+
+
 def test_inclusion_matches_length_twin():
     """sum(own over emitted) per row equals the body-free length twin's
     depth-2 spliced length for the row's root node -- the equivalence

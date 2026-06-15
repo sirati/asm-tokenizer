@@ -198,7 +198,7 @@ def _expand_children(
     sec_chunks: List[np.ndarray] = []
     node_chunks: List[np.ndarray] = []
     for row, node in zip(parent_row.tolist(), parent_node.tolist()):
-        children, child_secs = adjacency(int(node))
+        children, child_secs, _child_types = adjacency(int(node))
         if children.size == 0:
             continue
         row_chunks.append(np.full(children.size, row, dtype=np.int64))

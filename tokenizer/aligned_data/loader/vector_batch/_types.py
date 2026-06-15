@@ -76,6 +76,17 @@ class BatchRowEmission:
     own-length prefix-sum over THIS order. Units: catalog node index
     (``var_offsets``-major, the RLG3 axis index)."""
 
+    edge_type: np.ndarray
+    """``uint8[n_emitted]`` -- the :class:`~tokenizer.aligned_data.
+    call_target_type.CallTargetType` of the EDGE that reached each
+    emitted node, parallel to :attr:`node`. The root entry of every row
+    is ``CallTargetType.LOCAL`` (the decode path's root self-token
+    category is ``LOCAL_FUNC``); inlined callees carry the parent slot's
+    ``ct_type`` (LOCAL or PLT -- EXTERN is gated out of the splice). The
+    scatter (TC2) maps this edge type to the per-function self-token
+    vocab id; the prepass stores only the raw edge type (no vocab
+    knowledge crosses this boundary)."""
+
     own_length: np.ndarray
     """``int64[n_emitted]`` -- the emitted function's own column span =
     ``1 self-token + realized body_len`` (RLG3 ``body_lengths[node]``).
