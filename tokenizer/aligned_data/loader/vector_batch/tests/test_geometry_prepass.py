@@ -42,6 +42,7 @@ def _geometry(seq_len: int, sampled_variants, *, max_depth: int = 2):
         variants_u8=c.variants_u8,
         root_sections=np.zeros(len(sampled_variants), dtype=np.int64),
         root_sampled_variants=np.asarray(sampled_variants, dtype=np.int64),
+        root_groups=np.zeros(len(sampled_variants), dtype=np.int64),
         seq_len=seq_len,
         max_depth=max_depth,
     )
@@ -97,6 +98,7 @@ def test_inclusion_matches_length_twin():
         c.section_offsets,
         root_sections=np.array([0, 0]),
         root_sampled_variants=np.array([0, 1]),
+        root_groups=np.array([0, 0]),
         max_depth=2,
     )
     # root_v0 node = 0, root_v1 node = 1.
@@ -134,6 +136,7 @@ def test_prefix_overflow_cuts_first_body_function():
         variants_u8=c.variants_u8,
         root_sections=np.array([0]),
         root_sampled_variants=np.array([0]),
+        root_groups=np.array([0]),
         seq_len=1,
         max_depth=2,
     )
@@ -196,6 +199,7 @@ def test_single_variant_subset_pool_is_full_set():
         variants_u8=c.variants_u8,
         root_sections=np.array([0]),
         root_sampled_variants=np.array([0]),
+        root_groups=np.array([0]),
         seq_len=100,
         max_depth=2,
     )

@@ -165,7 +165,7 @@ def _run_arm_pipeline(
     non-padding rows). The returned result fills only this arm's rows;
     the orchestrator merges the per-arm results row-wise.
     """
-    root_sections, root_variants = _rows_to_catalog_nodes(
+    root_sections, root_variants, root_groups = _rows_to_catalog_nodes(
         masked_mapping, resolved, section_offsets=handles.section_offsets
     )
     geometry = compute_batch_geometry(
@@ -175,6 +175,7 @@ def _run_arm_pipeline(
         variants_u8=handles.variants_u8,
         root_sections=root_sections,
         root_sampled_variants=root_variants,
+        root_groups=root_groups,
         seq_len=context_len,
         max_depth=max_depth,
         # The remembered-excluded pool + dense reservation feed ONLY
@@ -255,13 +256,14 @@ def empty_result(
 
 
 def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_offsets):
-    """Per NON-padding batch row, ``(catalog_section_idx, native_variant)``.
+    """Per NON-padding batch row, ``(catalog_section_idx, native_variant,
+    decider_group)``.
 
     ``batch_idx_to_section_variant`` column 0 is the position in
     ``resolved``; column 1 is the SLOT into that section's
     ``sampled_variant_indices`` (post-sampling, NOT the native variant).
     The prepass needs the COLUMNAR catalog section index + the NATIVE
-    variant index.
+    variant index + the DECIDER-ROOT group id.
 
     The catalog section index is recovered ARM-AGNOSTICALLY: a section's
     BIN byte offset (``rs.section.section_offset``) is its universal key,
@@ -272,6 +274,14 @@ def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_of
     is the per-RECORD idx for the unmatched arm (record idx != section
     idx once a function carries multiple versions). The byte-offset
     lookup is the single source of truth both arms share.
+
+    The decider-root group is the RESOLVED-ENTRY index (mapping column 0)
+    -- the originating ``batch_decode`` ``walk_section_callees_pending``
+    unit (one resolved section pointer). Rows of the same resolved entry
+    are that root's co-sampled variants (one ``begin_root`` mask); two
+    rows that collide on the same catalog section but came from DIFFERENT
+    resolved entries get DIFFERENT group ids, so the prepass treats each
+    as its own root (the #67 fix -- no cross-root mask conflation).
     """
     mapping = np.asarray(batch_idx_to_section_variant, dtype=np.int64)
     offsets = np.asarray(section_offsets, dtype=np.int64).reshape(-1)
@@ -279,11 +289,13 @@ def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_of
     real = mapping[~is_padding]
     sec_out = np.empty(real.shape[0], dtype=np.int64)
     var_out = np.empty(real.shape[0], dtype=np.int64)
+    grp_out = np.empty(real.shape[0], dtype=np.int64)
     for i, (resolved_pos, slot) in enumerate(real.tolist()):
         rs = resolved[resolved_pos]
         sec_out[i] = _columnar_section_idx(offsets, rs.section.section_offset)
         var_out[i] = int(rs.sampled_variant_indices[slot])
-    return sec_out, var_out
+        grp_out[i] = int(resolved_pos)
+    return sec_out, var_out, grp_out
 
 
 def _columnar_section_idx(section_offsets: np.ndarray, section_offset: int) -> int:

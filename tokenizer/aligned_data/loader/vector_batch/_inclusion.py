@@ -88,6 +88,7 @@ def compute_row_inclusions(
     *,
     root_sections: np.ndarray,
     root_sampled_variants: np.ndarray,
+    root_groups: np.ndarray,
     max_depth: int,
     need_excluded_pool: bool = True,
 ) -> List[RowInclusion]:
@@ -107,6 +108,19 @@ def compute_row_inclusions(
         ``int[B]`` -- the per-row sampled VARIANT index WITHIN the root
         section (``0 <= v < n_variants[section]``). One batch row per
         ``(root_sections[r], root_sampled_variants[r])`` pair.
+    root_groups:
+        ``int[B]`` -- the per-row DECIDER-ROOT group id. Rows sharing a
+        group id are the co-sampled variants of ONE root (one
+        ``begin_root`` call whose mask spans exactly those rows -- the
+        columnwise-ALL exclusion is a property of THIS root's rows only).
+        This is the originating ``batch_decode`` ``walk_section_callees_
+        pending`` unit (one resolved section pointer), NOT the catalog
+        section: distinct batch rows that collide on the same physical
+        section but came from different roots carry DIFFERENT group ids,
+        so each is its own decider root (``n_variants`` = its own group's
+        row count) and a single-variant root splices nothing (FLAG-A).
+        Every row in a group MUST share the same ``root_sections`` value
+        (a group is one section pointer's sampled variants).
     max_depth:
         Splice-tree BFS depth cap (``>= 0``).
     need_excluded_pool:
@@ -136,10 +150,11 @@ def compute_row_inclusions(
         raise ValueError(f"max_depth must be >= 0; got {max_depth}")
     sec = np.asarray(root_sections, dtype=np.int64).reshape(-1)
     smp = np.asarray(root_sampled_variants, dtype=np.int64).reshape(-1)
-    if sec.shape != smp.shape:
+    grp = np.asarray(root_groups, dtype=np.int64).reshape(-1)
+    if not (sec.shape == smp.shape == grp.shape):
         raise ValueError(
-            "root_sections and root_sampled_variants must be parallel; got "
-            f"{sec.shape} vs {smp.shape}"
+            "root_sections, root_sampled_variants and root_groups must be "
+            f"parallel; got {sec.shape} vs {smp.shape} vs {grp.shape}"
         )
     n_rows = sec.size
     sec_of_var = np.repeat(
@@ -148,18 +163,28 @@ def compute_row_inclusions(
     adjacency = LiveNodeAdjacency(cols, section_offsets, sec_of_var)
     decider = OnceOnlyInclusion()
 
-    # Group batch rows by root SECTION: every row sharing a section drives
-    # ONE decider pass whose mask rows are exactly that section's SAMPLED
-    # variants (the subset). begin_root needs the full mask-row count, so
-    # we size the mask to the section's full variant count but only seed /
-    # walk the sampled rows -- non-sampled rows of the section are absent
-    # from the subset mask, so they neither exclude (FLAG-A) nor emit.
+    # Group batch rows by DECIDER-ROOT group, NOT by catalog section. Every
+    # row sharing a group is one root's co-sampled variants and drives ONE
+    # decider pass whose mask rows are exactly those rows (the subset);
+    # begin_root sizes the mask to the GROUP's row count, so the
+    # columnwise-ALL exclusion (FLAG-A) sees only this root's rows -- a
+    # single-variant root splices nothing. Two batch rows that collide on
+    # the same physical section but came from different roots carry
+    # DIFFERENT group ids, so each is its own root and never conflates the
+    # other's variants into its mask (the #67 fix).
     out: List[RowInclusion] = [None] * n_rows  # type: ignore[list-item]
-    rows_by_section: Dict[int, List[int]] = {}
+    rows_by_group: Dict[int, List[int]] = {}
     for r in range(n_rows):
-        rows_by_section.setdefault(int(sec[r]), []).append(r)
+        rows_by_group.setdefault(int(grp[r]), []).append(r)
 
-    for section_idx, batch_rows in rows_by_section.items():
+    for batch_rows in rows_by_group.values():
+        group_secs = sec[batch_rows]
+        section_idx = int(group_secs[0])
+        if bool((group_secs != section_idx).any()):
+            raise ValueError(
+                "all rows of a root_groups group must share root_sections; "
+                f"group spans sections {np.unique(group_secs).tolist()}"
+            )
         sampled = smp[batch_rows]
         # Subset emission + inclusion mask membership.
         emitted_per_row, emitted_types_per_row, included_subset = _bfs_emit(
