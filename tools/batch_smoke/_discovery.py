@@ -13,17 +13,22 @@ from typing import List, Optional, Sequence
 # (not the package ``__init__``, whose generator pulls in sorted_index
 # and risks a circular import): ``_format`` is a leaf module.
 from tokenizer.aligned_data.realized_lengths._format import ARMS
+from tokenizer.aligned_data.realized_lengths._geometry_format import GEOMETRY_ARMS
 
 _INDEX_SUFFIX = "_index.bin"
 _UNMATCHED_INDEX_SUFFIX = "_unmatched_index.bin"
 
-# Realized-length CSR sidecars (``<name>_lengths_index.bin`` /
-# ``<name>_unmatched_lengths_index.bin``) also end in ``_index.bin`` but
-# are NOT binary-existence signals -- they co-exist in the memmap dir
-# once the realized-lengths pass has run (the sorted-index build's
-# Phase-4a precondition). Sourced from the realized_lengths arm grammar
-# so this exclusion never drifts from the generator's filenames.
-_REALIZED_LENGTHS_INDEX_SUFFIXES = tuple(arm.index_suffix for arm in ARMS)
+# Realized-length sidecars also end in ``_index.bin`` but are NOT
+# binary-existence signals -- they co-exist in the memmap dir once the
+# realized-lengths pass has run (the sorted-index build's Phase-4a
+# precondition). BOTH sidecar families must be excluded: the length-CSR
+# arms (``_lengths_index.bin`` / ``_unmatched_lengths_index.bin``) AND
+# the realized-geometry RLG3 arms (``_realized_index.bin`` /
+# ``_unmatched_realized_index.bin``). Sourced from BOTH arm grammars so
+# this exclusion never drifts from the generator's filenames.
+_REALIZED_LENGTHS_INDEX_SUFFIXES = tuple(
+    arm.index_suffix for arm in ARMS
+) + tuple(arm.index_suffix for arm in GEOMETRY_ARMS)
 
 
 def discover_binaries(memmap_dir: Path) -> List[str]:
