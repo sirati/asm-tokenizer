@@ -1,0 +1,323 @@
+"""Body-free BFS emission-ORDER + remembered-excluded pool per batch row.
+
+Single concern: drive the SHARED once-only inclusion decider
+(:mod:`...splice_inclusion.OnceOnlyInclusion`) over the catalog
+adjacency (:class:`...sorted_index._graph_lengths.LiveNodeAdjacency`) to
+produce, for each sampled ``(root section, sampled variant)`` batch row:
+
+1. the ORDERED list of emitted callee NODES in BFS emission order (root,
+   then per level the included callees in parent-then-ascending-
+   call_target-slot order), and
+2. the REMEMBERED extra-excluded pool -- callee nodes the SAMPLED-subset
+   BFS pruned that the FULL variant-set BFS would have included.
+
+WHY reuse, not re-implement: the inclusion semantics (once-only-per-root
+dedup, the columnwise-ALL "reached by every variant => excluded + pruned"
+rule) live in :class:`OnceOnlyInclusion`; the per-node splice children
+(the ``choose_callee_variant`` J fallback chain, EXTERN / unresolved-
+pointer / unknown-offset gates) live in :class:`LiveNodeAdjacency`. This
+module owns ONLY the level-synchronous traversal that records emission
+ORDER (the length-only :func:`...compute_node_lengths` discards order) +
+the sampled-vs-full pool difference.
+
+WHY two BFS passes per root section: the columnwise-ALL exclusion (FLAG-A
+in :mod:`...splice_inclusion._state`) is a property of the mask's variant
+ROWS. The post-T0 decode path feeds the decider the SAMPLED subset, so
+this prepass does too (the two converge by construction). The FULL-set
+pass is run ONLY to learn which callees the subset's narrower mask
+pruned that the full mask would have kept -- the remembered-excluded
+backfill candidates. Both passes reuse the same shared decider + the same
+adjacency; neither touches ``_data.bin``.
+
+The single localized position-assignment choice (the owner's "one-line
+strategy swap" mandate for a future ``--match-legacy-order`` toggle) is
+the BFS frontier ordering here; it is BFS order and nowhere else.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List
+
+import numpy as np
+
+from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
+from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
+    LiveNodeAdjacency,
+)
+from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
+
+
+__all__ = ["RowInclusion", "compute_row_inclusions"]
+
+
+@dataclass(frozen=True)
+class RowInclusion:
+    """One batch row's ordered emitted nodes + remembered-excluded pool.
+
+    ``emitted_nodes`` is the BFS emission order (root first, then the
+    included callees level by level); ``excluded_nodes`` is the sampled-
+    subset-pruned / full-set-included backfill pool (de-duplicated,
+    ascending). Both are catalog NODE indices (``var_offsets``-major).
+    """
+
+    emitted_nodes: np.ndarray  # int64[k] -- BFS emission order, root at [0]
+    excluded_nodes: np.ndarray  # int64[m] -- remembered backfill pool
+
+
+def compute_row_inclusions(
+    cols: ColumnarSections,
+    section_offsets: np.ndarray,
+    *,
+    root_sections: np.ndarray,
+    root_sampled_variants: np.ndarray,
+    max_depth: int,
+) -> List[RowInclusion]:
+    """Per-row ordered emitted nodes + remembered-excluded pool.
+
+    Parameters
+    ----------
+    cols:
+        The columnar ``sections.bin`` catalog (:func:`parse_sections_
+        columnar` output) -- the body-free splice graph.
+    section_offsets:
+        ``int[n_sections]`` byte offsets parallel to ``cols`` (the
+        :class:`LiveNodeAdjacency` offset->idx key source).
+    root_sections:
+        ``int[B]`` -- the per-row root SECTION index.
+    root_sampled_variants:
+        ``int[B]`` -- the per-row sampled VARIANT index WITHIN the root
+        section (``0 <= v < n_variants[section]``). One batch row per
+        ``(root_sections[r], root_sampled_variants[r])`` pair.
+    max_depth:
+        Splice-tree BFS depth cap (``>= 0``).
+
+    Returns
+    -------
+    list[RowInclusion]
+        One per batch row, in input order. ``emitted_nodes[0]`` is always
+        the root node ``var_offsets[section] + sampled_variant``.
+
+    Notes
+    -----
+    Body-free: only ``cols`` (sections.bin) + ``section_offsets`` are
+    read; no ``_data.bin`` byte is touched (the adjacency + decider are
+    metadata-only).
+    """
+    if max_depth < 0:
+        raise ValueError(f"max_depth must be >= 0; got {max_depth}")
+    sec = np.asarray(root_sections, dtype=np.int64).reshape(-1)
+    smp = np.asarray(root_sampled_variants, dtype=np.int64).reshape(-1)
+    if sec.shape != smp.shape:
+        raise ValueError(
+            "root_sections and root_sampled_variants must be parallel; got "
+            f"{sec.shape} vs {smp.shape}"
+        )
+    n_rows = sec.size
+    sec_of_var = np.repeat(
+        np.arange(cols.n_variants.size, dtype=np.int64), cols.n_variants
+    )
+    adjacency = LiveNodeAdjacency(cols, section_offsets, sec_of_var)
+    decider = OnceOnlyInclusion()
+
+    # Group batch rows by root SECTION: every row sharing a section drives
+    # ONE decider pass whose mask rows are exactly that section's SAMPLED
+    # variants (the subset). begin_root needs the full mask-row count, so
+    # we size the mask to the section's full variant count but only seed /
+    # walk the sampled rows -- non-sampled rows of the section are absent
+    # from the subset mask, so they neither exclude (FLAG-A) nor emit.
+    out: List[RowInclusion] = [None] * n_rows  # type: ignore[list-item]
+    rows_by_section: Dict[int, List[int]] = {}
+    for r in range(n_rows):
+        rows_by_section.setdefault(int(sec[r]), []).append(r)
+
+    for section_idx, batch_rows in rows_by_section.items():
+        sampled = smp[batch_rows]
+        # Subset emission + inclusion mask membership.
+        emitted_per_row, included_subset = _bfs_emit(
+            section_idx=section_idx,
+            sampled_variants=sampled,
+            cols=cols,
+            adjacency=adjacency,
+            decider=decider,
+            max_depth=max_depth,
+        )
+        # Full-set inclusion membership (order discarded) for the pool diff.
+        included_full = _bfs_full_included(
+            section_idx=section_idx,
+            cols=cols,
+            adjacency=adjacency,
+            decider=decider,
+            max_depth=max_depth,
+        )
+        for local, r in enumerate(batch_rows):
+            emitted = emitted_per_row[local]
+            # Remembered-excluded = full-set-included MINUS subset-emitted
+            # (the callees the narrower subset mask pruned). De-duplicated
+            # ascending; excludes anything this row already emitted.
+            pool = np.setdiff1d(
+                included_full, emitted, assume_unique=False
+            )
+            out[r] = RowInclusion(
+                emitted_nodes=emitted,
+                excluded_nodes=pool.astype(np.int64),
+            )
+    return out  # type: ignore[return-value]
+
+
+def _bfs_emit(
+    *,
+    section_idx: int,
+    sampled_variants: np.ndarray,
+    cols: ColumnarSections,
+    adjacency: LiveNodeAdjacency,
+    decider: OnceOnlyInclusion,
+    max_depth: int,
+):
+    """Subset BFS: per sampled row, the ORDERED emitted node list.
+
+    Returns ``(emitted_per_row, included_union)``:
+
+    * ``emitted_per_row`` -- ``list[int64[k]]`` parallel to
+      ``sampled_variants``; each is ``[root, callee, ...]`` in BFS
+      emission order.
+    * ``included_union`` -- ``int64[]`` the de-duplicated union of every
+      node any sampled row included (root excluded -- the pool diff is
+      against callees only). Unused by the caller for the subset pass but
+      kept symmetric with :func:`_bfs_full_included`.
+
+    Mask rows are the SAMPLED variants only (the subset). ``begin_root``
+    sizes the mask to ``len(sampled_variants)`` rows; the root column 0
+    seeds every sampled row's own section, so self / mutual recursion
+    never re-splices.
+    """
+    n_sampled = int(sampled_variants.size)
+    v0 = int(cols.var_offsets[section_idx])
+    # The decider's mask rows are 0..n_sampled-1 (the subset), each
+    # standing for one sampled variant. ``begin_root`` seeds the root
+    # section at column 0 for every row.
+    decider.begin_root(max(1, n_sampled), section_idx)
+
+    emitted_per_row: List[List[int]] = [
+        [v0 + int(sampled_variants[i])] for i in range(n_sampled)
+    ]
+    included: List[int] = []
+
+    # Level-0 parents: one per sampled row, expanding ITS OWN sampled
+    # variant node. ``mask_row`` is the subset row (0..n_sampled-1);
+    # ``node`` is the flat catalog node it expands.
+    parent_row = np.arange(n_sampled, dtype=np.int64)
+    parent_node = v0 + sampled_variants.astype(np.int64)
+
+    for _depth in range(1, max_depth + 1):
+        if parent_node.size == 0:
+            break
+        rows, fids, child_nodes = _expand_level(
+            parent_row, parent_node, adjacency
+        )
+        if child_nodes.size == 0:
+            break
+        result = decider.step_level(rows, fids)
+        inc = result.included
+        if bool(inc.any()):
+            inc_rows = rows[inc]
+            inc_nodes = child_nodes[inc]
+            # Emission order WITHIN this level follows the pair order
+            # (parents in frontier order, each parent's children in
+            # ascending call_target slot) -- exactly the order
+            # ``_expand_level`` concatenated them.
+            for mask_row, node in zip(inc_rows.tolist(), inc_nodes.tolist()):
+                emitted_per_row[mask_row].append(node)
+                included.append(node)
+        surv = result.survivor_pairs
+        parent_row = rows[surv]
+        parent_node = child_nodes[surv]
+
+    return (
+        [np.asarray(e, dtype=np.int64) for e in emitted_per_row],
+        np.unique(np.asarray(included, dtype=np.int64))
+        if included
+        else np.zeros(0, dtype=np.int64),
+    )
+
+
+def _bfs_full_included(
+    *,
+    section_idx: int,
+    cols: ColumnarSections,
+    adjacency: LiveNodeAdjacency,
+    decider: OnceOnlyInclusion,
+    max_depth: int,
+) -> np.ndarray:
+    """Full variant-set BFS: the de-duplicated INCLUDED callee node set.
+
+    Order is irrelevant here (the pool is a set difference). Mask rows =
+    EVERY variant of the section, so the columnwise-ALL exclusion uses
+    the full mask the legacy index build used. Returns the ascending-
+    unique set of callee nodes any variant included (root excluded).
+    """
+    n_variants = int(cols.n_variants[section_idx])
+    if n_variants <= 0:
+        return np.zeros(0, dtype=np.int64)
+    v0 = int(cols.var_offsets[section_idx])
+    decider.begin_root(n_variants, section_idx)
+
+    parent_row = np.arange(n_variants, dtype=np.int64)
+    parent_node = v0 + parent_row
+    included: List[np.ndarray] = []
+
+    for _depth in range(1, max_depth + 1):
+        if parent_node.size == 0:
+            break
+        rows, fids, child_nodes = _expand_level(
+            parent_row, parent_node, adjacency
+        )
+        if child_nodes.size == 0:
+            break
+        result = decider.step_level(rows, fids)
+        inc = result.included
+        if bool(inc.any()):
+            included.append(child_nodes[inc])
+        surv = result.survivor_pairs
+        parent_row = rows[surv]
+        parent_node = child_nodes[surv]
+
+    if not included:
+        return np.zeros(0, dtype=np.int64)
+    return np.unique(np.concatenate(included)).astype(np.int64)
+
+
+def _expand_level(
+    parent_row: np.ndarray,
+    parent_node: np.ndarray,
+    adjacency: LiveNodeAdjacency,
+):
+    """Flatten every parent's resolved children into level pair arrays.
+
+    Returns ``(rows, callee_secs, child_nodes)`` -- one entry per
+    (parent, resolved call_target), parents in frontier order and each
+    parent's children in ascending call_target slot (the order
+    :meth:`LiveNodeAdjacency.__call__` returns). ``rows`` is the mask
+    row; ``callee_secs`` is the once-only key the decider dedups on;
+    ``child_nodes`` is the flat callee node. Mirrors
+    ``...._graph_lengths._bfs._expand_children`` (the length twin) so the
+    BFS frontier order matches the index build's.
+    """
+    row_chunks: List[np.ndarray] = []
+    sec_chunks: List[np.ndarray] = []
+    node_chunks: List[np.ndarray] = []
+    for row, node in zip(parent_row.tolist(), parent_node.tolist()):
+        children, child_secs = adjacency(int(node))
+        if children.size == 0:
+            continue
+        row_chunks.append(np.full(children.size, row, dtype=np.int64))
+        sec_chunks.append(np.asarray(child_secs, dtype=np.uint32))
+        node_chunks.append(np.asarray(children, dtype=np.int64))
+    if not row_chunks:
+        e_i = np.zeros(0, dtype=np.int64)
+        return e_i, np.zeros(0, dtype=np.uint32), e_i.copy()
+    return (
+        np.concatenate(row_chunks),
+        np.concatenate(sec_chunks),
+        np.concatenate(node_chunks),
+    )
