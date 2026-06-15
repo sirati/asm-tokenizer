@@ -95,22 +95,32 @@ def test_matched_variant_body_matches_all_variants_load(synthetic_binary) -> Non
 
 
 def test_unmatched_variant_body_matches_full_load(synthetic_binary) -> None:
-    """``_load_unmatched_variant_body(idx, section)`` equals the
-    section-deriving full record load's ``FunctionData`` and issues NO
-    second section parse (the threaded ``section`` is reused)."""
+    """``_load_unmatched_variant_body(base_idx, variant_index, section)``
+    equals the section-deriving full record load's ``FunctionData`` for the
+    record that IS that variant, and issues NO second section parse (the
+    threaded ``section`` is reused). The per-record ``idx`` maps to a
+    ``(section base idx, variant slot)`` pair; the variant-indexed body
+    load slices the variant block's own ``data_offset_shifted``, so it must
+    reproduce the full record load at the same per-record ``idx``."""
     fb = synthetic_binary
     ds = BinaryDataset(
         fb["base_path"], fb["binary_name"], vocab_manager=fb["vocab"]
     )
     with ds.open_session() as sess:
-        starts = sess.get_metadata("unmatched_arm").starts
+        arm = sess.get_metadata("unmatched_arm")
+        starts = arm.starts
         for idx in range(len(starts)):
             _section, _offset, full_fd = (
                 sess._load_unmatched_record_and_section(idx)
             )
-            meta_section, _meta_offset = sess._unmatched_section_meta(idx)
+            section_idx = sess._unmatched_section_idx(arm, idx)
+            base = sess._unmatched_record_slot_base(arm, section_idx)
+            variant_slot = idx - base
+            meta_section, _meta_offset = sess._unmatched_section_meta(base)
             with _count_section_parses(sess) as parses:
-                one = sess._load_unmatched_variant_body(idx, meta_section)
+                one = sess._load_unmatched_variant_body(
+                    base, variant_slot, meta_section
+                )
             assert parses == [], (
                 f"unmatched body load re-parsed _sections.bin "
                 f"(idx={idx}, offsets={parses})"

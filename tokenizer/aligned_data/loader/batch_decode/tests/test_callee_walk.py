@@ -199,8 +199,9 @@ class _FakeSession:
     trivially invertible.
 
     Per-section ``FunctionData`` is keyed by ``(section_offset,
-    variant_index)`` for matched and by ``section_offset`` for
-    unmatched (which has exactly one variant by construction).
+    variant_index)`` for BOTH arms -- the unmatched arm now stores one
+    DISTINCT body per variant and the walker loads it by the J-resolved
+    variant index, symmetric with the matched arm.
     """
 
     _binary_name: str = "fake-bin"
@@ -209,7 +210,7 @@ class _FakeSession:
         default_factory=dict
     )
     unmatched_sections: Dict[int, Section] = field(default_factory=dict)
-    unmatched_function_data: Dict[int, FunctionData] = field(
+    unmatched_function_data: Dict[Tuple[int, int], FunctionData] = field(
         default_factory=dict
     )
 
@@ -223,8 +224,19 @@ class _FakeSession:
             self.matched_function_data[(section.section_offset, v_idx)] = fd
 
     def add_unmatched(self, section: Section, fd: FunctionData) -> None:
+        """Single-variant unmatched section (the body is variant 0)."""
         self.unmatched_sections[section.section_offset] = section
-        self.unmatched_function_data[section.section_offset] = fd
+        self.unmatched_function_data[(section.section_offset, 0)] = fd
+
+    def add_unmatched_variants(
+        self,
+        section: Section,
+        variant_function_data: Dict[int, FunctionData],
+    ) -> None:
+        """Multi-variant unmatched section: one distinct body per variant."""
+        self.unmatched_sections[section.section_offset] = section
+        for v_idx, fd in variant_function_data.items():
+            self.unmatched_function_data[(section.section_offset, v_idx)] = fd
 
     # --- session-API surface the walker invokes -------------------------
 
@@ -265,9 +277,9 @@ class _FakeSession:
         return self.matched_function_data[(idx, variant_index)]
 
     def _load_unmatched_variant_body(
-        self, idx: int, section: Section
+        self, idx: int, variant_index: int, section: Section
     ) -> FunctionData:
-        return self.unmatched_function_data[idx]
+        return self.unmatched_function_data[(idx, variant_index)]
 
     def _unmatched_section_meta(self, idx: int) -> Tuple[Section, int]:
         section = self.unmatched_sections[idx]
@@ -277,7 +289,7 @@ class _FakeSession:
         self, idx: int
     ) -> Tuple[FunctionData, Section, int]:
         section = self.unmatched_sections[idx]
-        fd = self.unmatched_function_data[idx]
+        fd = self.unmatched_function_data[(idx, 0)]
         return fd, section, section.section_offset
 
 

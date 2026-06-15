@@ -40,6 +40,7 @@ from ..binary_format import (
     parse_binary_header,
     record_total_size,
 )
+from ..index_format import ALIGNMENT_SHIFT
 from ..matched_sections_bin import Section, parse_section_bin
 from ..memmap_format import MATCHED_SECTIONS_BIN_PRELUDE_SIZE
 from ._sections_bin_walk import read_sections_bin_blob
@@ -311,47 +312,54 @@ class BinarySession(_BinarySessionHelpersMixin):
         return section, section_offset, fd
 
     def _load_unmatched_variant_body(
-        self, idx: int, section: Section
+        self, idx: int, variant_index: int, section: Section
     ) -> FunctionData:
-        """Load ONE unmatched record body, reusing the threaded section.
+        """Load ONE unmatched section variant body, reusing the section.
 
         ``section`` is the already-parsed owning section the caller
         obtained from :py:meth:`_unmatched_section_meta` (threaded through
         the callee walk's :class:`ResolvedCalleeMeta`), so this load does
         NOT re-derive it via :py:meth:`_unmatched_section_for_record` (no
-        ``_sections.bin`` re-parse). The drift sanity check
-        (``data_offset_shifted << 4 == start``) already fired when the
-        metadata stage parsed this section, so it is not re-run here.
+        ``_sections.bin`` re-parse).
 
-        Returns the same ``FunctionData`` the section-deriving
-        :py:meth:`_load_unmatched_record_and_section` would for ``idx``:
-        the per-record body sliced from ``_unmatched_data.bin`` at
-        ``starts[idx]``, with the per-slot variant resolved against
-        ``section.variants``.
+        The data record is sliced at ``section.variants[variant_index]``'s
+        OWN ``data_offset_shifted << ALIGNMENT_SHIFT`` -- the SAME way the
+        matched arm slices (:func:`parse_matched_variant`). Unmatched
+        sections store one DISTINCT body record per variant, so loading by
+        the variant block's own offset (rather than the positional
+        ``starts[base + variant_index]``) splices variant-``variant_index``'s
+        body regardless of whether the index-entry order and the
+        variant-block order coincide -- removing the silent dependence on
+        the writer's emit-order==vref-order lock-step. ``idx`` is retained
+        for the section-keyed ``func_names`` lookup (the name is a section
+        property, shared by every variant) and its bounds check. Raises
+        :class:`IndexError` if ``variant_index`` is out of range.
+
+        For ``variant_index == 0`` this is byte-identical to the legacy
+        first-record load: the section's first variant block carries the
+        same ``data_offset_shifted`` as ``starts[base]``.
         """
         arm = self._meta_get("unmatched_arm")
         starts = arm_arrays(arm, "unmatched", self._binary_name)
         if idx >= len(starts):
             raise IndexError(f"Index {idx} out of bounds for unmatched functions")
-        start = int(starts[idx])
+        if variant_index < 0 or variant_index >= len(section.variants):
+            raise IndexError(
+                f"unmatched section idx={idx} has {len(section.variants)} "
+                f"variants; variant_index {variant_index} out of range"
+            )
+        start = (
+            section.variants[variant_index].data_offset_shifted << ALIGNMENT_SHIFT
+        )
         data_mmap = self._open_data("unmatched")
         insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
-        # Per-record -> per-variant slot inside the owning section.
-        # Unmatched sections store one record per variant; the slot is
-        # the offset from the section's first-record idx in the arm's
-        # ``record_to_section_idx`` mapping. Threaded into the builder
-        # so the per-slot ``variant_ref`` resolves to THIS record's
-        # canonical-4 axes (not the section's first variant).
-        section_idx = self._unmatched_section_idx(arm, idx)
-        base = self._unmatched_record_slot_base(arm, section_idx)
-        variant_slot = idx - base
         line_to_name = self._meta_get("line_to_name") or {}
         return build_unmatched_function_data(
             section,
             self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
-            variant_slot=variant_slot,
+            variant_slot=variant_index,
             resolve_ref=self.get_variant_by_ref,
             line_to_name=line_to_name,
         )

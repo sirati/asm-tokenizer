@@ -139,10 +139,13 @@ def _load_root_bodies(
 ) -> List["FunctionData"]:
     """The per-variant root :class:`FunctionData` for ``section``.
 
-    The caller already holds the parsed ``section``; the per-variant
-    bodies are materialised via the section-threaded body loaders
-    (:py:meth:`_load_matched_variant_body` /
-    :py:meth:`_load_unmatched_variant_body`), so ``_sections.bin`` is NOT
+    Returns one body per variant for BOTH arms (parallel to
+    ``section.variants``), so a root sampled at any variant slot indexes
+    cleanly into the result. The caller already holds the parsed
+    ``section``; the per-variant bodies are materialised via the
+    section-threaded body loaders (:py:meth:`_load_matched_variant_body` /
+    :py:meth:`_load_unmatched_variant_body`), each slicing its variant
+    block's own ``data_offset_shifted`` so ``_sections.bin`` is NOT
     re-parsed -- mirroring the callee-body load's no-reparse contract.
     Only the ``_idx_for_section_offset`` reverse-lookup (a cheap array
     ``np.where``, not a section parse) recovers the per-arm idx the body
@@ -156,7 +159,10 @@ def _load_root_bodies(
             session._load_matched_variant_body(idx, v, section)
             for v in range(len(section.variants))
         ]
-    return [session._load_unmatched_variant_body(idx, section)]
+    return [
+        session._load_unmatched_variant_body(idx, v, section)
+        for v in range(len(section.variants))
+    ]
 
 
 @dataclass

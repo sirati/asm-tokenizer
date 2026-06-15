@@ -152,12 +152,13 @@ def load_callee_body(
 ) -> "FunctionData":
     """Materialise the chosen callee variant body for a retained edge.
 
-    Issued only for the survivor pairs the BFS emits/descends. Matched
-    loads exactly ``section.variants[meta.variant_idx]`` (the same
-    single-variant parse the all-variants path runs per variant);
-    unmatched loads the section's first-record body -- byte-identical to
-    the legacy walker, which never re-indexed the unmatched body by the
-    chosen variant (one record per unmatched variant).
+    Issued only for the survivor pairs the BFS emits/descends. Both arms
+    load exactly ``section.variants[meta.variant_idx]`` -- the same
+    single-variant parse the all-variants path runs per variant. The
+    unmatched arm stores one DISTINCT body record per variant, so the
+    J-resolved ``variant_idx`` is threaded through (rather than always
+    loading the first record) and the body is sliced at that variant
+    block's own ``data_offset_shifted`` -- symmetric with the matched arm.
 
     The already-parsed ``meta.section`` is threaded into both arms'
     body loads so ``_sections.bin`` is NOT re-parsed here: the metadata
@@ -170,5 +171,5 @@ def load_callee_body(
             meta.callee_idx, meta.variant_idx, meta.section
         )
     return session._load_unmatched_variant_body(
-        meta.callee_idx, meta.section
+        meta.callee_idx, meta.variant_idx, meta.section
     )
