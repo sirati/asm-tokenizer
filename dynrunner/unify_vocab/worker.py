@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 _SOURCE_DIR: Path
 _OUTPUT_DIR: Path
 _UNIFIED_VOCAB_FILENAME: str
+_INSERT_VALUE_NEGATIVE: bool = False
 
 
 def _process_payload(
@@ -46,6 +47,7 @@ def _process_payload(
     source_dir: Path,
     output_dir: Path,
     unified_vocab_filename: str,
+    insert_value_negative: bool,
 ) -> None:
     data = json.loads(payload_json)
     csv_paths_raw = data["csv_paths"]
@@ -67,6 +69,7 @@ def _process_payload(
             stage_dir / unified_vocab_filename,
             mapping_output_dir=stage_dir,
             mapping_source_root=source_dir,
+            insert_value_negative=insert_value_negative,
         )
 
 
@@ -102,6 +105,7 @@ def handle(task: Task) -> WorkerOutput | None:
             _SOURCE_DIR,
             _OUTPUT_DIR,
             _UNIFIED_VOCAB_FILENAME,
+            _INSERT_VALUE_NEGATIVE,
         )
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         raise NonRecoverableError(f"{type(e).__name__}: {e}") from e
@@ -149,6 +153,19 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Filename for the unified vocab CSV (default: unified_vocab.csv).",
     )
     parser.add_argument(
+        "--insert-neg-value",
+        action="store_true",
+        help=(
+            "Legacy-compat: per-binary CSVs were generated BEFORE "
+            "value_negative was reserved at slot 256 (first real token at "
+            "per-binary id 256). Load them with only the 256 digit slots "
+            "reserved and remap real tokens (256+) into the canonical "
+            "unified layout. Use for corpora tokenized pre-value_negative-"
+            "cutover; the emitted unified vocab keeps the canonical "
+            "257-reserved layout."
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         help="Log file instead of stdout/err",
@@ -166,7 +183,7 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 
 def _on_args(args: argparse.Namespace) -> None:
-    global _SOURCE_DIR, _OUTPUT_DIR, _UNIFIED_VOCAB_FILENAME
+    global _SOURCE_DIR, _OUTPUT_DIR, _UNIFIED_VOCAB_FILENAME, _INSERT_VALUE_NEGATIVE
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -196,6 +213,7 @@ def _on_args(args: argparse.Namespace) -> None:
     _SOURCE_DIR = Path(args.source).resolve()
     _OUTPUT_DIR = Path(args.output).resolve()
     _UNIFIED_VOCAB_FILENAME = args.out_unified_vocab
+    _INSERT_VALUE_NEGATIVE = args.insert_neg_value
 
     logger.info(f"[*] Source directory: {_SOURCE_DIR}")
     logger.info(f"[*] Output directory: {_OUTPUT_DIR}")
