@@ -38,11 +38,14 @@ the catalog + locator the pre-pass memmaps and the matched-arm realized-
 length sidecar pair) is page-fault-heavy ``np.memmap`` random access. The
 worker copies that footprint to node-local scratch via
 :func:`tokenizer.output_staging.staged_inputs`, runs the builder against
-the local copies (read AND ``.idx`` write), and atomic-publishes each
-``.idx`` back to its canonical NFS location -- confining the storm to
-local tmpfs. ``staged_inputs`` is a no-op standalone (no
-``/app/out-tmp``), so the build reads/writes ``memmap_dir`` in place and
-the publish self-skips; the on-disk result is identical in both modes.
+the local copies (read AND ``.idx`` write), and set-atomically publishes
+the binary's FULL ``.idx`` set back to its canonical NFS location in ONE
+``publish_all`` transaction -- confining the storm to local tmpfs and
+guaranteeing a kill mid-publish never leaves a PARTIAL ``.idx`` set (which
+would poison ``--skip-existing``). ``staged_inputs`` is a no-op standalone
+(no ``/app/out-tmp``), so the build reads/writes ``memmap_dir`` in place
+and the publish self-skips (src==dst pairs dropped → empty no-op); the
+on-disk result is identical in both modes.
 """
 
 from __future__ import annotations
@@ -147,19 +150,26 @@ def handle(task: Task) -> WorkerOutput | None:
                 duplicate_handling=_DUPLICATE_HANDLING,
                 output_dir=local_memmap_dir,
             )
-            # Publish each ``.idx`` to its canonical NFS location with an
-            # EXPLICIT dst (the auto-derive mirror would route a staged-
-            # subtree source to a polluted ``dst_root/staged-inputs/...``
-            # path). The native publish is the atomic cross-FS path
-            # (copy+fsync+rename); a mid-publish kill leaves a ``.publish-
-            # tmp`` sibling, never a partial ``.idx``. The src==dst guard
-            # makes standalone mode (local dir == ``memmap_dir``) a no-op
-            # so the in-place write isn't republished onto itself.
+            # Publish the binary's FULL ``.idx`` set to its canonical NFS
+            # location as ONE set-atomic ``publish_all`` transaction, each
+            # pair carrying an EXPLICIT dst (the deleted auto-mirror would
+            # route a staged-subtree source to a polluted ``dst_root/
+            # staged-inputs/...`` path). Publishing the whole per-binary
+            # set in one call means a kill mid-publish can never leave a
+            # PARTIAL ``.idx`` set on NFS (which would corrupt the per-
+            # binary index and poison ``--skip-existing``); the native
+            # batch stages all then commits the renames back-to-back under
+            # a signal mask. The src==dst pairs are dropped (standalone:
+            # local dir == ``memmap_dir``), so an empty list republishes
+            # nothing onto itself.
+            pairs = [
+                (idx_path, memmap_dir / idx_path.name)
+                for idx_path in written.values()
+                if idx_path.resolve() != (memmap_dir / idx_path.name).resolve()
+            ]
+            task.publish_all(pairs)
             for spec, idx_path in written.items():
-                dst = memmap_dir / idx_path.name
-                if idx_path.resolve() != dst.resolve():
-                    task.publish(idx_path, dst=dst)
-                logger.info("    %s -> %s", spec, dst)
+                logger.info("    %s -> %s", spec, memmap_dir / idx_path.name)
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         from dynamic_runner.worker import NonRecoverableError
 

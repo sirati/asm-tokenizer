@@ -188,14 +188,20 @@ def test_standalone_writes_idx_in_place_no_publish_error(
 ) -> None:
     monkeypatch.setattr(staging, "is_container_deployment", lambda: False)
 
-    # publish must NOT be invoked in standalone (src == dst self-skip);
-    # if it were, the missing publish env would surface as an error.
-    def _boom(*a, **k):
-        raise AssertionError("publish must self-skip in standalone mode")
+    # publish_all is still invoked, but standalone's src==dst pairs are
+    # dropped so it receives an EMPTY list (a no-op). Asserting the
+    # received pairs are empty pins the self-skip without depending on
+    # publish env that standalone has no reason to set.
+    seen_pairs: list = []
 
-    monkeypatch.setattr(Task, "publish", _boom)
+    def _record(self, pairs) -> None:
+        seen_pairs.append(list(pairs))
+
+    monkeypatch.setattr(Task, "publish_all", _record)
 
     worker.handle(_task(memmap_dir))
+
+    assert seen_pairs == [[]]
 
     published = memmap_dir / _idx_name()
     assert published.is_file()

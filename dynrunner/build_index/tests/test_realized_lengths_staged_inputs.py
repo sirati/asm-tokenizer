@@ -26,13 +26,21 @@ import dynrunner.build_index.realized_lengths_worker as worker
 
 
 class _FakeTask:
-    """Minimal Task stand-in recording explicit-dst publish calls."""
+    """Minimal Task stand-in recording the set-atomic ``publish_all`` call.
+
+    The worker now publishes the binary's full output set in ONE
+    ``publish_all(pairs)`` transaction; ``published`` flattens the pairs
+    it received so the existing per-file assertions still hold.
+    """
 
     def __init__(self) -> None:
         self.published: list[tuple[Path, Path]] = []
+        self.publish_all_calls: int = 0
 
-    def publish(self, src, dst=None, *, key=None) -> None:
-        self.published.append((Path(src), Path(dst)))
+    def publish_all(self, pairs) -> None:
+        self.publish_all_calls += 1
+        for src, dst in pairs:
+            self.published.append((Path(src), Path(dst)))
 
 
 @pytest.fixture
@@ -98,6 +106,8 @@ def test_container_runs_on_local_copies_and_publishes_to_nfs(
 
     # The generator base_path was the node-local scratch, not the NFS dir.
     assert seen["base"] != memmap_dir
+    # The full output set published in ONE set-atomic publish_all call.
+    assert task.publish_all_calls == 1
     # Every returned output was published to the unchanged NFS location.
     dsts = {dst for _src, dst in task.published}
     assert dsts == {
@@ -162,6 +172,9 @@ def test_standalone_runs_in_place_and_skips_publish(
     with mock.patch.object(worker, "generate_realized_lengths", fake_generate):
         worker._generate_and_publish(task, memmap_dir, "binC")
 
-    # No publish in standalone — the output is already at its final
-    # location (local dir == NFS memmap_dir).
+    # Standalone: ``publish_all`` is still invoked exactly once, but with
+    # an EMPTY pair list (the output is already at its final location:
+    # local dir == NFS memmap_dir), so it is a no-op and nothing is
+    # republished onto itself.
+    assert task.publish_all_calls == 1
     assert task.published == []

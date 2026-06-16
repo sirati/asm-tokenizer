@@ -26,11 +26,12 @@ filesystem (the core DDOS). So the worker stages the binary's existing
 inputs to node-local scratch via ``staged_inputs``, runs the generator
 against the local copies (which reads AND writes there), then publishes
 ONLY the generator's returned output sidecars back to the NFS
-``memmap_dir`` via ``task.publish(src, dst=...)`` (native copy→fsync→
-atomic-rename, so a mid-publish kill leaves a ``.publish-tmp`` sibling,
-never a partial sidecar). The published location is byte-for-byte the
-old in-place location, so the co-located sorted-index build still reads
-``_lengths.bin`` from the same NFS dir.
+``memmap_dir`` via ONE ``task.publish_all((src, dst), ...)`` set-atomic
+transaction (native stage-all→signal-masked rename batch, so a mid-
+publish kill leaves only ``.publish-tmp`` siblings, never a PARTIAL
+sidecar SET — which would poison ``--skip-existing``). The published
+location is byte-for-byte the old in-place location, so the co-located
+sorted-index build still reads ``_lengths.bin`` from the same NFS dir.
 
 Standalone (no ``/app/out-tmp``): ``staged_inputs`` is a no-op yielding
 the originals, so the local dir IS the NFS ``memmap_dir`` — the generator
@@ -130,22 +131,32 @@ def _generate_and_publish(
     the originals, so the local dir IS ``memmap_dir`` and the generator
     runs fully in place.
 
-    Only the generator's RETURNED output paths are published — atomically,
-    with an explicit destination at ``memmap_dir/<filename>`` so the
-    sidecars land at the unchanged NFS location regardless of the staged
-    layout. When the local dir already is ``memmap_dir`` (standalone, or
-    nothing staged) the outputs are already final, so publishing is
-    skipped: ``task.publish`` would otherwise self-copy through a publish
-    root that need not exist.
+    Only the generator's RETURNED output paths are published — as ONE
+    set-atomic ``publish_all`` transaction, with an explicit destination
+    at ``memmap_dir/<filename>`` per file so the four sidecars land at the
+    unchanged NFS location regardless of the staged layout. Publishing the
+    full per-binary output set in one call means a kill mid-publish can
+    never leave a PARTIAL set on NFS (which would corrupt downstream reads
+    and poison ``--skip-existing``). When the local dir already is
+    ``memmap_dir`` (standalone, or nothing staged) the outputs are already
+    final, so the pair list is empty and ``publish_all`` is a no-op —
+    ``task.publish_all`` would otherwise self-copy through a publish root
+    that need not exist.
     """
     inputs = _existing_inputs(memmap_dir, binary_name)
     with staged_inputs(inputs, scope=f"realized_lengths/{binary_name}") as local:
         local_dir = next(iter(local.values())).parent if local else memmap_dir
         written = generate_realized_lengths(local_dir, binary_name)
-        if local_dir != memmap_dir:
-            for paths in written.values():
-                for path in paths:
-                    task.publish(path, dst=memmap_dir / path.name)
+        pairs = (
+            [
+                (path, memmap_dir / path.name)
+                for paths in written.values()
+                for path in paths
+            ]
+            if local_dir != memmap_dir
+            else []
+        )
+        task.publish_all(pairs)
     return written
 
 
