@@ -194,10 +194,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_binaries=args.max_binaries,
     )
 
-    for binary_name in selected:
+    for binary in selected:
         written = write_sorted_index_files(
-            args.input_dir,
-            binary_name,
+            binary.memmap_dir,
+            binary.name,
             reductions=reductions,
             depths=depths,
             gate=gate,

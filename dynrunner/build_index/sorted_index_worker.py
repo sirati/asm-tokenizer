@@ -1,12 +1,14 @@
 """Worker subprocess for the ``sorted_index`` phase-4 task type.
 
 Receives one task per binary. The wire's ``relative_path`` is the
-binary_name (an opaque identifier; not a filesystem path); the worker
-re-derives every path from its ``--output`` (the memmap directory) plus
-that binary_name and calls
+binary_name (an opaque identifier; not a filesystem path) and the
+payload carries that binary's ``memmap_dir`` -- the directory its memmap
++ realized-length sidecars actually live in, resolved by discovery (the
+scanned dir in the flat layout, a per-binary subdir in the nested
+container layout). The worker reads that dir off the wire and calls
 ``tokenizer.aligned_data.sorted_index.write_sorted_index_files`` once,
 emitting one ``<binary>_sorted_<mode>_d<depth>.idx`` per requested
-(reduction, depth) pair.
+(reduction, depth) pair next to those sidecars.
 
 The per-run sorted-index configuration (``--mode`` / ``--depth`` + the
 gating / duplicate knobs) arrives on argv — it is identical for every
@@ -24,10 +26,11 @@ realized-length task (wired by ``BuildIndexTask.items_for_binary`` via
 realized-length sidecars this build consumes have been produced.
 
 Output-directory convention: the build reads the binary's memmap +
-realized-length sidecars from the ``--output`` memmap directory and
-writes the ``.idx`` files there (``output_dir`` defaults to the input
-dir — the conventional sidecar-adjacent placement). Under SLURM that is
-the durable ``/app/out-network`` mount.
+realized-length sidecars from the payload ``memmap_dir`` and writes the
+``.idx`` files there (the conventional sidecar-adjacent placement). That
+dir is a per-binary subdir under ``/app/out-network`` in the nested
+container layout, or equals ``--output`` in the flat layout. ``--output``
+is accepted for framework compatibility only.
 """
 
 from __future__ import annotations
@@ -47,11 +50,13 @@ from tokenizer.aligned_data.sorted_index import (
     write_sorted_index_files,
 )
 
+from dynrunner.build_index._payload import memmap_dir_from_task
+
 logger = logging.getLogger(__name__)
 
 # Module-level config populated by ``_on_args`` before the run loop;
-# the ``@task_function`` handler closes over it per task.
-_OUTPUT_DIR: Path
+# the ``@task_function`` handler closes over it per task. The per-binary
+# memmap dir is NOT here -- it arrives on each task's payload.
 _REDUCTIONS: list
 _DEPTHS: list
 _GATE: VariantGate
@@ -62,25 +67,27 @@ _DUPLICATE_HANDLING: object
 def handle(task: Task) -> WorkerOutput | None:
     """Build the sorted-index ``.idx`` files for one binary.
 
-    ``task.relative_path`` is the binary_name (opaque identifier). The
-    builder reads the binary's memmap sidecars (and the realized-length
-    sidecars produced by the dependency task) from ``_OUTPUT_DIR`` and
-    writes one ``.idx`` per (reduction, depth). A missing input is a
-    deterministic permanent miss → NonRecoverable.
+    ``task.relative_path`` is the binary_name (opaque identifier); the
+    payload carries the binary's ``memmap_dir``. The builder reads the
+    binary's memmap sidecars (and the realized-length sidecars produced
+    by the dependency task) from that dir and writes one ``.idx`` per
+    (reduction, depth) there. A missing input is a deterministic
+    permanent miss → NonRecoverable.
     """
     binary_name = task.relative_path
-    logger.info("[*] sorted-index: %s", binary_name)
+    memmap_dir = memmap_dir_from_task(task)
+    logger.info("[*] sorted-index: %s (%s)", binary_name, memmap_dir)
     task.set_phase("sorted_index")
 
     try:
         written = write_sorted_index_files(
-            _OUTPUT_DIR,
+            memmap_dir,
             binary_name,
             reductions=_REDUCTIONS,
             depths=_DEPTHS,
             gate=_GATE,
             duplicate_handling=_DUPLICATE_HANDLING,
-            output_dir=_OUTPUT_DIR,
+            output_dir=memmap_dir,
         )
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         from dynamic_runner.worker import NonRecoverableError
@@ -188,7 +195,7 @@ def _on_args(args: argparse.Namespace) -> None:
     so a bad ``--min-variants*`` combo fails loud at worker startup
     rather than per-task. Mirrors the standalone CLI's validation point.
     """
-    global _OUTPUT_DIR, _REDUCTIONS, _DEPTHS, _GATE, _DUPLICATE_HANDLING
+    global _REDUCTIONS, _DEPTHS, _GATE, _DUPLICATE_HANDLING
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -214,7 +221,6 @@ def _on_args(args: argparse.Namespace) -> None:
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-    _OUTPUT_DIR = Path(args.output).resolve()
     _REDUCTIONS = list(args.mode)
     _DEPTHS = list(args.depth)
     _GATE = VariantGate(
@@ -225,7 +231,6 @@ def _on_args(args: argparse.Namespace) -> None:
         DEDUP_BY_DATA_POINTER if args.adjust_for_duplicates else PLAIN
     )
 
-    logger.info("[*] Memmap directory: %s", _OUTPUT_DIR)
     logger.info("[*] Reductions: %s  Depths: %s", _REDUCTIONS, _DEPTHS)
 
 

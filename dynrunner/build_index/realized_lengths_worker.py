@@ -1,28 +1,30 @@
 """Worker subprocess for the ``realized_lengths`` phase-4 task type.
 
 Receives one task per binary. The wire's ``relative_path`` is the
-binary_name (an opaque identifier; not a filesystem path); the worker
-re-derives every path from its ``--output`` (the memmap directory) plus
-that binary_name and calls
+binary_name (an opaque identifier; not a filesystem path) and the
+payload carries that binary's ``memmap_dir`` -- the directory its memmap
+sidecars actually live in, resolved by discovery (the scanned dir in the
+flat layout, a per-binary subdir in the nested container layout). The
+worker reads that dir off the wire and calls
 ``tokenizer.aligned_data.realized_lengths.generate_realized_lengths``
 once — emitting the four realized-length sidecars
 (``_lengths.bin`` + ``_lengths_index.bin`` per arm) next to the binary's
 memmap inputs.
 
-The worker reimplements no generation logic: it parses the binary_name
-off the wire and forwards a single library call. Discovery, pairing, and
-the per-(section, variant) length compute all live in the
-realized_lengths package.
+The worker reimplements no generation logic and owns no layout
+knowledge: it reads the binary_name + memmap_dir off the wire and
+forwards a single library call. Discovery (and the flat-vs-nested layout
+decision) lives in ``binary_discovery``; the per-(section, variant)
+length compute lives in the realized_lengths package.
 
 Output-directory convention: phase 4 reads from and writes to the SAME
 memmap directory (the per-binary sidecars and the realized-length
 sidecars are co-located by design — the sorted-index build reads both).
-Under SLURM that directory is the durable ``/app/out-network`` mount the
-framework points ``--output`` at, so the worker uses ``--output`` as the
-generator's ``base_path``: inputs are already staged there by the memmap
-phase, and the small idempotent length sidecars are written alongside.
-A worker killed mid-write leaves a partial sidecar that a re-run
-regenerates wholesale (the build is cheap and deterministic).
+The generator's ``base_path`` is the payload ``memmap_dir`` (not
+``--output``), so a nested per-binary subdir resolves correctly; in the
+flat layout that dir equals the ``--output`` root. A worker killed
+mid-write leaves a partial sidecar that a re-run regenerates wholesale
+(the build is cheap and deterministic).
 """
 
 from __future__ import annotations
@@ -36,31 +38,29 @@ from dynamic_runner.worker import Task, WorkerOutput, run, task_function
 from shared import remove_stream_handlers
 from tokenizer.aligned_data.realized_lengths import generate_realized_lengths
 
-logger = logging.getLogger(__name__)
+from dynrunner.build_index._payload import memmap_dir_from_task
 
-# Module-level config populated by ``_on_args`` before the run loop;
-# the ``@task_function`` handler closes over it per task. Mirrors the
-# build_memmap worker's on-args contract.
-_OUTPUT_DIR: Path
+logger = logging.getLogger(__name__)
 
 
 @task_function
 def handle(task: Task) -> WorkerOutput | None:
     """Generate the realized-length sidecars for one binary.
 
-    ``task.relative_path`` is the binary_name (opaque identifier). The
-    generator reads the binary's ``_sections.bin`` / ``_index.bin`` /
-    ``_data.bin`` from ``_OUTPUT_DIR`` and writes the four
-    realized-length sidecars there. A missing input is a deterministic,
-    permanent miss for this binary (re-running won't make it appear), so
-    it is surfaced as NonRecoverable.
+    ``task.relative_path`` is the binary_name (opaque identifier); the
+    payload carries the binary's ``memmap_dir``. The generator reads the
+    binary's ``_sections.bin`` / ``_index.bin`` / ``_data.bin`` from that
+    dir and writes the four realized-length sidecars there. A missing
+    input is a deterministic, permanent miss for this binary (re-running
+    won't make it appear), so it is surfaced as NonRecoverable.
     """
     binary_name = task.relative_path
-    logger.info("[*] realized-lengths: %s", binary_name)
+    memmap_dir = memmap_dir_from_task(task)
+    logger.info("[*] realized-lengths: %s (%s)", binary_name, memmap_dir)
     task.set_phase("realized_lengths")
 
     try:
-        written = generate_realized_lengths(_OUTPUT_DIR, binary_name)
+        written = generate_realized_lengths(memmap_dir, binary_name)
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         from dynamic_runner.worker import NonRecoverableError
 
@@ -124,9 +124,12 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 
 def _on_args(args: argparse.Namespace) -> None:
-    """Hook invoked by ``run()`` before the loop starts."""
-    global _OUTPUT_DIR
+    """Hook invoked by ``run()`` before the loop starts.
 
+    The per-binary memmap dir arrives on each task's payload, so there is
+    no run-level memmap directory to bind here; ``--output`` is accepted
+    for framework compatibility only.
+    """
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     if args.log_file:
@@ -150,9 +153,6 @@ def _on_args(args: argparse.Namespace) -> None:
             format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-
-    _OUTPUT_DIR = Path(args.output).resolve()
-    logger.info("[*] Memmap directory: %s", _OUTPUT_DIR)
 
 
 if __name__ == "__main__":

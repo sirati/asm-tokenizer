@@ -205,11 +205,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     variant_padding = _VARIANT_PADDING_BY_FLAG[args.variant_padding]
 
-    binary_names = filter_binaries(
-        discover_binaries(memmap_dir),
-        only=args.only,
-        max_binaries=args.max_binaries,
-    )
+    binary_names = [
+        binary.name
+        for binary in filter_binaries(
+            discover_binaries(memmap_dir),
+            only=args.only,
+            max_binaries=args.max_binaries,
+        )
+    ]
     if not binary_names:
         print(f"no binaries discovered under {memmap_dir}", file=sys.stderr)
         return 2

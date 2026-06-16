@@ -50,6 +50,7 @@ from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 from dynrunner.binary_selection import TaskInfo, add_asm_selection_arguments
 from dynrunner.build_index.build_index_task import BuildIndexTask
+from dynrunner.build_memmap._publish_scope import memmap_dir_for
 from dynrunner.build_memmap.memmap_builder_task import MemmapBuilderTask
 from dynrunner.tokenize.tokenizer_task import TokenizerTask
 from dynrunner.unify_vocab.vocab_unifier_task import VocabUnifierTask
@@ -493,13 +494,30 @@ class FullPipelineTask:
         decorates them with the cross-phase ``rlen → memmap`` edge. The
         child stays cross-phase-dep-free (standalone-pure); the edge is
         added only on this composite boundary.
+
+        Each binary's ``memmap_dir`` is resolved through the shared
+        ``memmap_dir_for`` (the inverse of the memmap worker's
+        per-binary publish scope) against the memmap phase's output root,
+        so the index worker reads the sidecars from the same
+        ``build_memmap/<name>/`` subdir the memmap phase published them to
+        (nested under container deployment, flat standalone).
         """
+        assert self._user_source is not None and self._user_output is not None, (
+            "FullPipelineTask: index co-spawn requires on_run_start to have "
+            "captured the user-supplied source/output roots."
+        )
+        memmap_root = route_for_phase(
+            BUILD_MEMMAP_PHASE, self._user_source, self._user_output
+        ).output_dir
         index_items: list[TaskInfo] = []
         for memmap_item in memmap_items:
             binary_name = memmap_item.task_id
             if not binary_name:
                 continue
-            binary_index_items = self._index.items_for_binary(binary_name)
+            memmap_dir = memmap_dir_for(memmap_root, binary_name)
+            binary_index_items = self._index.items_for_binary(
+                binary_name, memmap_dir
+            )
             index_items.extend(
                 decorate_index_items_with_memmap_dep(
                     binary_index_items, binary_name
