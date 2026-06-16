@@ -47,7 +47,7 @@ vector_batch entry. For BATCH_DECODE the provider is unused.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -64,10 +64,19 @@ from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
     BucketedRunLengthCollector,
 )
 from tokenizer.aligned_data.loader.session import BinarySession
-from tokenizer.aligned_data.loader.vector_batch._entry import (
-    VectorBatchResult,
-    vector_batch_tokens,
-)
+
+# vector_batch imports sorted_index (``_graph_lengths._adjacency``), so a
+# module-level import of the vector_batch entry here forms a cycle
+# (sorted_index -> _sampler._engine -> vector_batch -> sorted_index). The
+# runtime call ``vector_batch_tokens`` is imported lazily inside
+# :func:`_decode_groups_vector_batch` (by call time both packages are
+# fully initialised); ``VectorBatchResult`` is annotation-only (the file
+# uses ``from __future__ import annotations``) so it is needed only by
+# type-checkers.
+if TYPE_CHECKING:
+    from tokenizer.aligned_data.loader.vector_batch._entry import (
+        VectorBatchResult,
+    )
 
 
 __all__ = [
@@ -251,6 +260,12 @@ def _decode_groups_vector_batch(
     vector_batch is geometry-self-contained: there is no shared collector
     and no deferred flush; each per-binary decode is complete on return.
     """
+    # Lazy import to break the sorted_index <-> vector_batch import cycle
+    # (see the module-level note); safe at call time.
+    from tokenizer.aligned_data.loader.vector_batch._entry import (
+        vector_batch_tokens,
+    )
+
     results: List[Tuple[str, BatchDecodeResult]] = []
     for binary_name in sorted(per_binary_pointers):
         session = _require_session(sessions, binary_name)
