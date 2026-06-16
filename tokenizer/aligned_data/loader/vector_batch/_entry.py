@@ -65,6 +65,8 @@ def vector_batch_tokens(
     rng: Optional[np.random.Generator] = None,
     augment_geometry=None,
     include_fid_sidecar: bool = False,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> VectorBatchResult:
     """Sample -> per-arm (geometry -> scatter -> dense) -> merge.
 
@@ -103,6 +105,15 @@ def vector_batch_tokens(
         sidecars (``fid_sidecar`` / ``fid_row_offsets`` /
         ``fid_per_category_counts``), matching ``batch_decode``'s
         same-named flag. Default ``False`` (those fields are ``None``).
+    unmatched_inline / unmatched_inline_depth:
+        Opt-in unmatched-outline inlining (default OFF), mirroring
+        ``batch_decode``'s same-named flags so the two loaders stay
+        byte-identical with the feature on. When True the inclusion BFS
+        surfaces the matched callees behind unmatched (``is_matched=False``)
+        outlines, recursing unmatched->unmatched up to
+        ``unmatched_inline_depth`` levels, and feeds those to outline
+        detection in place of the outline shells. Default ``False``
+        reproduces the pre-feature geometry byte-for-byte.
 
     Returns
     -------
@@ -144,6 +155,8 @@ def vector_batch_tokens(
         max_depth=max_depth,
         augment_geometry=augment_geometry,
         include_fid_sidecar=include_fid_sidecar,
+        unmatched_inline=unmatched_inline,
+        unmatched_inline_depth=unmatched_inline_depth,
     )
     if not arm_results:
         return empty_result(

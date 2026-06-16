@@ -99,6 +99,8 @@ def walk_sections(
     max_depth: int,
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool = True,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
     rng: np.random.Generator,
     collector: None = ...,
 ) -> Stage1Batch: ...
@@ -111,6 +113,8 @@ def walk_sections(
     max_depth: int,
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool = True,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
     rng: np.random.Generator,
     collector: BucketedRunLengthCollector,
 ) -> PendingStage1Batch: ...
@@ -122,6 +126,8 @@ def walk_sections(
     max_depth: int,
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool = True,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
     rng: np.random.Generator,
     collector: Optional[BucketedRunLengthCollector] = None,
 ) -> Union[Stage1Batch, PendingStage1Batch]:
@@ -148,6 +154,15 @@ def walk_sections(
        provided) return a :class:`PendingStage1Batch` for the caller
        to finalise after they flush the shared collector.
 
+    ``unmatched_inline`` (default False) is the opt-in unmatched-outline
+    inlining seam: when True the per-level callee walk surfaces the
+    matched callees behind unmatched (``is_matched=False``) outlines,
+    recursing unmatched->unmatched up to ``unmatched_inline_depth`` levels,
+    and feeds THOSE to outline detection in place of the outline shells.
+    Default False reproduces the pre-feature behaviour byte-for-byte
+    (``is_matched`` ignored). It is a SEPARATE seam from the vestigial
+    ``inlined_equivalent_call_targets_only`` flag.
+
     See module docstring for the multi-mapped-slot semantics + the
     orchestrator amortisation contract.
     """
@@ -163,6 +178,8 @@ def walk_sections(
             inlined_equivalent_call_targets_only=(
                 inlined_equivalent_call_targets_only
             ),
+            unmatched_inline=unmatched_inline,
+            unmatched_inline_depth=unmatched_inline_depth,
             rng=rng,
             collector=owned,
         )
@@ -177,6 +194,8 @@ def walk_sections(
         inlined_equivalent_call_targets_only=(
             inlined_equivalent_call_targets_only
         ),
+        unmatched_inline=unmatched_inline,
+        unmatched_inline_depth=unmatched_inline_depth,
         rng=rng,
         collector=collector,
     )
@@ -190,6 +209,8 @@ def _walk_sections_pending(
     max_depth: int,
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool = True,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
     rng: np.random.Generator,
     collector: BucketedRunLengthCollector,
 ) -> PendingStage1Batch:
@@ -251,6 +272,8 @@ def _walk_sections_pending(
                 decider=decider,
                 collector=collector,
                 section_meta_memo=section_meta_memo,
+                unmatched_inline=unmatched_inline,
+                unmatched_inline_depth=unmatched_inline_depth,
             )
         )
 

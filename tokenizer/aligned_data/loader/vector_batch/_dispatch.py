@@ -55,6 +55,8 @@ def dispatch_by_arm(
     max_depth: int,
     augment_geometry,
     include_fid_sidecar: bool,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> List[VectorBatchResult]:
     """Per-arm geometry -> scatter -> dense over the shared sample.
 
@@ -86,6 +88,8 @@ def dispatch_by_arm(
                 max_depth=max_depth,
                 augment_geometry=augment_geometry,
                 include_fid_sidecar=include_fid_sidecar,
+                unmatched_inline=unmatched_inline,
+                unmatched_inline_depth=unmatched_inline_depth,
             )
         )
     return arm_results
@@ -155,6 +159,8 @@ def _run_arm_pipeline(
     max_depth: int,
     augment_geometry,
     include_fid_sidecar: bool,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> VectorBatchResult:
     """Geometry -> scatter -> dense for ONE arm's rows, full-batch shaped.
 
@@ -178,6 +184,8 @@ def _run_arm_pipeline(
         root_groups=root_groups,
         seq_len=context_len,
         max_depth=max_depth,
+        unmatched_inline=unmatched_inline,
+        unmatched_inline_depth=unmatched_inline_depth,
         # The remembered-excluded pool + dense reservation feed ONLY
         # backfill; compute them only when the backfill hook is present.
         need_excluded_pool=augment_geometry is not None,

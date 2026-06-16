@@ -88,16 +88,21 @@ class LiveNodeAdjacency:
 
     # -- public per-node API ----------------------------------------------
 
-    def __call__(self, node: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """``(child_nodes, child_secs, child_types)`` for ``node``.
+    def __call__(
+        self, node: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """``(child_nodes, child_secs, child_types, child_is_matched)``.
 
         One entry per DIRECT call the node's variant resolves (skipping
         gated-out / unresolvable slots), in ascending slot order.
         ``child_types`` is the parent slot's :class:`CallTargetType`
         (``ct_type``) per resolved child -- the EDGE attribute the decode
         path turns into the inlined-callee self-token category (LOCAL ->
-        LOCAL_FUNC, PLT -> PLT_FUNC; EXTERN is gated out upstream). It is
-        an ``uint8`` array parallel to ``child_nodes`` / ``child_secs``.
+        LOCAL_FUNC, PLT -> PLT_FUNC; EXTERN is gated out upstream).
+        ``child_is_matched`` is the parent slot's ``is_matched`` flag (the
+        callee's arm) -- read ONLY by the opt-in unmatched-outline inlining
+        transform; the length-twin consumer ignores it. Both are ``uint8``
+        / ``bool`` arrays parallel to ``child_nodes`` / ``child_secs``.
         """
         cols = self._cols
         sec = int(self._sec_of_var[node])
@@ -106,8 +111,7 @@ class LiveNodeAdjacency:
         p0 = int(cols.pce_offsets[node])
         p1 = int(cols.pce_offsets[node + 1])
         if p1 == p0:
-            empty = np.zeros(0, dtype=np.int64)
-            return empty, empty.copy(), np.zeros(0, dtype=np.uint8)
+            return self._empty_children()
 
         # ascending-unique directly-called slots + the node's own J each.
         called = cols.pce_called_idx[p0:p1].astype(np.int64)
@@ -123,6 +127,7 @@ class LiveNodeAdjacency:
         child_nodes = []
         child_secs = []
         child_types = []
+        child_is_matched = []
         for ci, J in zip(called.tolist(), own_J.tolist()):
             slot = ct_lo + ci
             if slot >= ct_hi:
@@ -133,13 +138,25 @@ class LiveNodeAdjacency:
             child_nodes.append(child)
             child_secs.append(int(self._sec_of_var[child]))
             child_types.append(int(cols.ct_type[slot]))
+            child_is_matched.append(bool(cols.ct_is_matched[slot]))
         if not child_nodes:
-            empty = np.zeros(0, dtype=np.int64)
-            return empty, empty.copy(), np.zeros(0, dtype=np.uint8)
+            return self._empty_children()
         return (
             np.asarray(child_nodes, dtype=np.int64),
             np.asarray(child_secs, dtype=np.uint32),
             np.asarray(child_types, dtype=np.uint8),
+            np.asarray(child_is_matched, dtype=bool),
+        )
+
+    @staticmethod
+    def _empty_children() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """The zero-length 4-tuple a node with no resolvable children yields."""
+        empty = np.zeros(0, dtype=np.int64)
+        return (
+            empty,
+            empty.copy().astype(np.uint32),
+            np.zeros(0, dtype=np.uint8),
+            np.zeros(0, dtype=bool),
         )
 
     # -- per-slot resolution ----------------------------------------------

@@ -73,6 +73,8 @@ def compute_batch_geometry(
     max_depth: int,
     need_excluded_pool: bool = True,
     adjacency: LiveNodeAdjacency | None = None,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> BatchGeometry:
     """The body-free ``[B, L]`` geometry prepass.
 
@@ -141,6 +143,8 @@ def compute_batch_geometry(
         max_depth=max_depth,
         need_excluded_pool=need_excluded_pool,
         adjacency=adjacency,
+        unmatched_inline=unmatched_inline,
+        unmatched_inline_depth=unmatched_inline_depth,
     )
     n_rows = len(inclusions)
 

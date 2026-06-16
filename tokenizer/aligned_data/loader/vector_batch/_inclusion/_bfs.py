@@ -33,6 +33,10 @@ from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
     LiveNodeAdjacency,
 )
 from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
+from tokenizer.aligned_data.splice_inclusion._unmatched_expand import (
+    Edge,
+    expand_unmatched_edges,
+)
 
 
 __all__ = [
@@ -59,6 +63,8 @@ def _bfs_emit(
     adjacency: LiveNodeAdjacency,
     decider: OnceOnlyInclusion,
     max_depth: int,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ):
     """Subset BFS: per sampled row, the ORDERED emitted node list.
 
@@ -109,9 +115,14 @@ def _bfs_emit(
     for _depth in range(1, max_depth + 1):
         if parent_node.size == 0:
             break
-        rows, fids, child_nodes, child_types = _expand_level(
+        rows, fids, child_nodes, child_types, child_matched = _expand_level(
             parent_row, parent_node, adjacency
         )
+        if unmatched_inline:
+            rows, fids, child_nodes, child_types = _apply_unmatched_inline(
+                rows, fids, child_nodes, child_types, child_matched,
+                adjacency, unmatched_inline_depth,
+            )
         if child_nodes.size == 0:
             break
         result = decider.step_level(rows, fids)
@@ -150,6 +161,8 @@ def _bfs_full_included(
     adjacency: LiveNodeAdjacency,
     decider: OnceOnlyInclusion,
     max_depth: int,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ):
     """Full variant-set BFS: INCLUDED callee node set + per-node edge type.
 
@@ -187,9 +200,14 @@ def _bfs_full_included(
     for _depth in range(1, max_depth + 1):
         if parent_node.size == 0:
             break
-        rows, fids, child_nodes, child_types = _expand_level(
+        rows, fids, child_nodes, child_types, child_matched = _expand_level(
             parent_row, parent_node, adjacency
         )
+        if unmatched_inline:
+            rows, fids, child_nodes, child_types = _apply_unmatched_inline(
+                rows, fids, child_nodes, child_types, child_matched,
+                adjacency, unmatched_inline_depth,
+            )
         if child_nodes.size == 0:
             break
         result = decider.step_level(rows, fids)
@@ -221,29 +239,33 @@ def _expand_level(
 ):
     """Flatten every parent's resolved children into level pair arrays.
 
-    Returns ``(rows, callee_secs, child_nodes, child_types)`` -- one
-    entry per (parent, resolved call_target), parents in frontier order
-    and each parent's children in ascending call_target slot (the order
-    :meth:`LiveNodeAdjacency.__call__` returns). ``rows`` is the mask
+    Returns ``(rows, callee_secs, child_nodes, child_types, child_matched)``
+    -- one entry per (parent, resolved call_target), parents in frontier
+    order and each parent's children in ascending call_target slot (the
+    order :meth:`LiveNodeAdjacency.__call__` returns). ``rows`` is the mask
     row; ``callee_secs`` is the once-only key the decider dedups on;
     ``child_nodes`` is the flat callee node; ``child_types`` is the
     parent slot's :class:`CallTargetType` (uint8) per child -- the edge
     attribute the scatter turns into the inlined-callee self-token
-    category. Mirrors ``...._graph_lengths._bfs._expand_children`` (the
-    length twin) so the BFS frontier order matches the index build's.
+    category; ``child_matched`` is the parent slot's ``is_matched`` flag
+    (bool) per child, read only by the opt-in unmatched-outline transform.
+    Mirrors ``...._graph_lengths._bfs._expand_children`` (the length twin)
+    so the BFS frontier order matches the index build's.
     """
     row_chunks: List[np.ndarray] = []
     sec_chunks: List[np.ndarray] = []
     node_chunks: List[np.ndarray] = []
     type_chunks: List[np.ndarray] = []
+    matched_chunks: List[np.ndarray] = []
     for row, node in zip(parent_row.tolist(), parent_node.tolist()):
-        children, child_secs, child_types = adjacency(int(node))
+        children, child_secs, child_types, child_matched = adjacency(int(node))
         if children.size == 0:
             continue
         row_chunks.append(np.full(children.size, row, dtype=np.int64))
         sec_chunks.append(np.asarray(child_secs, dtype=np.uint32))
         node_chunks.append(np.asarray(children, dtype=np.int64))
         type_chunks.append(np.asarray(child_types, dtype=np.uint8))
+        matched_chunks.append(np.asarray(child_matched, dtype=bool))
     if not row_chunks:
         e_i = np.zeros(0, dtype=np.int64)
         return (
@@ -251,10 +273,74 @@ def _expand_level(
             np.zeros(0, dtype=np.uint32),
             e_i.copy(),
             np.zeros(0, dtype=np.uint8),
+            np.zeros(0, dtype=bool),
         )
     return (
         np.concatenate(row_chunks),
         np.concatenate(sec_chunks),
         np.concatenate(node_chunks),
         np.concatenate(type_chunks),
+        np.concatenate(matched_chunks),
     )
+
+
+def _apply_unmatched_inline(
+    rows: np.ndarray,
+    fids: np.ndarray,
+    child_nodes: np.ndarray,
+    child_types: np.ndarray,
+    child_matched: np.ndarray,
+    adjacency: LiveNodeAdjacency,
+    cap: int,
+):
+    """Surface matched edges behind unmatched edges for one level.
+
+    Drives the SHARED :func:`expand_unmatched_edges` transform over the
+    level's flat edge arrays, with a resolver that resolves an unmatched
+    node's OWN children via :func:`_expand_level` (the same per-node
+    resolution the level used). Returns the surfaced matched level arrays
+    ``(rows, fids, child_nodes, child_types)`` -- the same shape the BFS
+    feeds the decider, with the ``is_matched`` axis consumed away.
+
+    The payload carried through the transform is the per-edge
+    ``(row, fid, node, edge_type)`` tuple (the once-only key + the
+    emission attributes), so a surfaced matched edge keeps its own
+    parent-slot node + edge type verbatim.
+    """
+
+    def _to_edge(row, fid, node, edge_type, matched) -> Edge:
+        return Edge(
+            mask_row=int(row),
+            dedup_key=int(fid),
+            is_matched=bool(matched),
+            payload=(int(row), int(fid), int(node), int(edge_type)),
+        )
+
+    def _resolve_children(edge: Edge) -> List[Edge]:
+        row, _fid, node, _etype = edge.payload
+        # one-parent expansion: resolve THIS unmatched node's children.
+        c_rows, c_fids, c_nodes, c_types, c_matched = _expand_level(
+            np.asarray([row], dtype=np.int64),
+            np.asarray([node], dtype=np.int64),
+            adjacency,
+        )
+        return [
+            _to_edge(c_rows[i], c_fids[i], c_nodes[i], c_types[i], c_matched[i])
+            for i in range(c_rows.size)
+        ]
+
+    edges = [
+        _to_edge(
+            rows[i], fids[i], child_nodes[i], child_types[i], child_matched[i]
+        )
+        for i in range(rows.size)
+    ]
+    surfaced = expand_unmatched_edges(edges, _resolve_children, max_unmatched_depth=cap)
+    if not surfaced:
+        e_i = np.zeros(0, dtype=np.int64)
+        return e_i, np.zeros(0, dtype=np.uint32), e_i.copy(), np.zeros(0, dtype=np.uint8)
+    s_rows = np.asarray([e.payload[0] for e in surfaced], dtype=np.int64)
+    s_fids = np.asarray([e.payload[1] for e in surfaced], dtype=np.uint32)
+    s_nodes = np.asarray([e.payload[2] for e in surfaced], dtype=np.int64)
+    s_types = np.asarray([e.payload[3] for e in surfaced], dtype=np.uint8)
+    return s_rows, s_fids, s_nodes, s_types

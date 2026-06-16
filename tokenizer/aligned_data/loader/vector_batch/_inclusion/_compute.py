@@ -38,6 +38,8 @@ def compute_row_inclusions(
     max_depth: int,
     need_excluded_pool: bool = True,
     adjacency: LiveNodeAdjacency | None = None,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> List[RowInclusion]:
     """Per-row ordered emitted nodes + remembered-excluded pool.
 
@@ -150,6 +152,8 @@ def compute_row_inclusions(
             adjacency=adjacency,
             decider=decider,
             max_depth=max_depth,
+            unmatched_inline=unmatched_inline,
+            unmatched_inline_depth=unmatched_inline_depth,
         )
         # Full-set inclusion membership (order discarded) for the pool diff,
         # plus the EDGE ct_type each full-set callee was reached by -- the
@@ -164,6 +168,8 @@ def compute_row_inclusions(
                 adjacency=adjacency,
                 decider=decider,
                 max_depth=max_depth,
+                unmatched_inline=unmatched_inline,
+                unmatched_inline_depth=unmatched_inline_depth,
             )
         for local, r in enumerate(batch_rows):
             emitted = emitted_per_row[local]
