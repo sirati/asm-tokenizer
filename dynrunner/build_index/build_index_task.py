@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 from argparse import ArgumentParser, Namespace
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from dynamic_runner import TaskDep
@@ -54,12 +54,15 @@ from tokenizer.aligned_data.binary_discovery import (
     discover_binaries,
     filter_binaries,
 )
+from tokenizer.aligned_data.realized_lengths import ARMS
+from tokenizer.aligned_data.sorted_index import parse_reduction
 
 from dynrunner.binary_selection import (
     BinaryIdentifier,
     TaskInfo,
     add_asm_selection_arguments,
 )
+from dynrunner.skip_existing import filter_items_with_complete_outputs
 
 
 _logger = logging.getLogger(__name__)
@@ -197,7 +200,64 @@ class BuildIndexTask:
             len(items),
             len(selected),
         )
-        return items
+
+        # Full-set --skip-existing: skip an item only when its COMPLETE
+        # per-binary output set is present (rlen: all four length
+        # sidecars; sorted-index: every configured mode×depth .idx). The
+        # workers now publish that set in ONE set-atomic ``publish_all``
+        # transaction, so a kill mid-publish leaves a PARTIAL set; gating
+        # on the full set (not the coarse done-marker) re-runs a partial
+        # set instead of wrongly skipping it.
+        return filter_items_with_complete_outputs(
+            items,
+            skip_existing=getattr(args, "skip_existing", False),
+            output_root=getattr(args, "resolved_output_root", None),
+            required_outputs=self._required_output_names_from_args(args),
+            label="build-index skip-existing",
+        )
+
+    def _required_output_names_from_args(
+        self, args: Namespace
+    ) -> "Callable[[TaskInfo], list[str]]":
+        """A per-item callback yielding the COMPLETE output basename set.
+
+        The sorted-index output set is the cartesian product of the run's
+        configured reductions × depths (parsed from ``args.mode`` /
+        ``args.depth`` exactly as the worker's argparse does), so the
+        skip predicate matches the worker's emission set element-for-
+        element. The realized-length set is the four length sidecars
+        (both arms' lengths + CSR index), named through the arm helpers
+        so the suffix grammar has one owner.
+        """
+        reductions = [parse_reduction(m) for m in (getattr(args, "mode", None) or ())]
+        depths = list(getattr(args, "depth", None) or ())
+        return lambda item: self._required_output_names(item, reductions, depths)
+
+    def _required_output_names(
+        self, item: TaskInfo, reductions: list, depths: list[int]
+    ) -> list[str]:
+        """The complete on-disk output basenames for one phase-4 item.
+
+        rlen item: the four realized-length sidecar basenames (matched +
+        unmatched arms' ``_lengths.bin`` / ``_lengths_index.bin``),
+        derived from the arm path helpers (single source of truth for the
+        suffix grammar). sorted-index item: one
+        ``<binary>_sorted_<tag>_d<depth>.idx`` per configured (mode,
+        depth) pair — the exact set ``write_sorted_index_files`` emits.
+        """
+        binary_name = item.binary_name
+        base = Path(".")
+        if item.type_id == REALIZED_LENGTHS_TYPE:
+            names: list[str] = []
+            for arm in ARMS:
+                names.append(arm.lengths_path(base, binary_name).name)
+                names.append(arm.index_path(base, binary_name).name)
+            return names
+        return [
+            f"{binary_name}_sorted_{red.filename_tag()}_d{depth:03d}.idx"
+            for red in reductions
+            for depth in depths
+        ]
 
     def items_for_binary(
         self, binary_name: str, memmap_dir: Path
