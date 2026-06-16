@@ -25,12 +25,24 @@ realized-length task (wired by ``BuildIndexTask.items_for_binary`` via
 ``TaskInfo.task_depends_on``), so the framework holds it until the
 realized-length sidecars this build consumes have been produced.
 
-Output-directory convention: the build reads the binary's memmap +
-realized-length sidecars from the payload ``memmap_dir`` and writes the
-``.idx`` files there (the conventional sidecar-adjacent placement). That
-dir is a per-binary subdir under ``/app/out-network`` in the nested
-container layout, or equals ``--output`` in the flat layout. ``--output``
-is accepted for framework compatibility only.
+Output-directory convention: the ``.idx`` files land at
+``<memmap_dir>/<binary>_sorted_<mode>_d<depth>.idx`` -- the conventional
+sidecar-adjacent placement consumers read. That ``memmap_dir`` is a
+per-binary subdir under ``/app/out-network`` in the nested container
+layout, or equals ``--output`` in the flat layout. ``--output`` is
+accepted for framework compatibility only.
+
+NFS-staging: the build's input footprint
+(:func:`tokenizer.aligned_data.sorted_index.sorted_index_input_paths`:
+the catalog + locator the pre-pass memmaps and the matched-arm realized-
+length sidecar pair) is page-fault-heavy ``np.memmap`` random access. The
+worker copies that footprint to node-local scratch via
+:func:`tokenizer.output_staging.staged_inputs`, runs the builder against
+the local copies (read AND ``.idx`` write), and atomic-publishes each
+``.idx`` back to its canonical NFS location -- confining the storm to
+local tmpfs. ``staged_inputs`` is a no-op standalone (no
+``/app/out-tmp``), so the build reads/writes ``memmap_dir`` in place and
+the publish self-skips; the on-disk result is identical in both modes.
 """
 
 from __future__ import annotations
@@ -47,8 +59,10 @@ from tokenizer.aligned_data.sorted_index import (
     PLAIN,
     VariantGate,
     parse_reduction,
+    sorted_index_input_paths,
     write_sorted_index_files,
 )
+from tokenizer.output_staging import staged_inputs
 
 from dynrunner.build_index._payload import memmap_dir_from_task
 
@@ -63,39 +77,94 @@ _GATE: VariantGate
 _DUPLICATE_HANDLING: object
 
 
+def _sorted_index_scope(binary_name: str) -> str:
+    """The ``staged_inputs`` scope for one binary's sorted-index build.
+
+    Unique per concurrent task in this worker (the binary identifier),
+    mirroring ``staged_inputs``'s scope contract; namespaced under
+    ``sorted_index/`` so this phase-4 worker's scratch subtree never
+    aliases another worker's.
+    """
+    return f"sorted_index/{binary_name}"
+
+
 @task_function
 def handle(task: Task) -> WorkerOutput | None:
     """Build the sorted-index ``.idx`` files for one binary.
 
     ``task.relative_path`` is the binary_name (opaque identifier); the
-    payload carries the binary's ``memmap_dir``. The builder reads the
-    binary's memmap sidecars (and the realized-length sidecars produced
-    by the dependency task) from that dir and writes one ``.idx`` per
-    (reduction, depth) there. A missing input is a deterministic
-    permanent miss → NonRecoverable.
+    payload carries the binary's ``memmap_dir`` -- the NFS directory its
+    memmap + realized-length sidecars live in. To keep the build off the
+    shared filesystem (the NFS DDOS: ``np.memmap`` random-access over the
+    sidecars page-fault-storms the corpus mount), the worker stages the
+    build's input footprint to node-local scratch via ``staged_inputs``,
+    runs the builder against the local copies (reading AND writing the
+    ``.idx`` there), and atomic-publishes each produced ``.idx`` back to
+    its canonical NFS location ``<memmap_dir>/<binary>_sorted_<mode>_
+    d<depth>.idx`` -- the path consumers read, unchanged.
+
+    A missing input is a deterministic permanent miss → NonRecoverable.
     """
     binary_name = task.relative_path
     memmap_dir = memmap_dir_from_task(task)
     logger.info("[*] sorted-index: %s (%s)", binary_name, memmap_dir)
     task.set_phase("sorted_index")
 
+    # Stage only the inputs that exist: ``staged_inputs`` (``shutil.copy2``)
+    # would raise on an absent source, while the builder legitimately
+    # tolerates absence (a binary with no matched arm lacks the locator /
+    # catalog and yields the canonical empty index). The realized-length
+    # sidecar is a hard precondition the dependency edge guarantees, but a
+    # genuinely missing input is reproduced locally exactly as on NFS --
+    # the builder's generator-pointing FileNotFoundError still fires below.
+    present_inputs = {
+        p: p
+        for p in sorted_index_input_paths(memmap_dir, binary_name)
+        if p.exists()
+    }
+
     try:
-        written = write_sorted_index_files(
-            memmap_dir,
-            binary_name,
-            reductions=_REDUCTIONS,
-            depths=_DEPTHS,
-            gate=_GATE,
-            duplicate_handling=_DUPLICATE_HANDLING,
-            output_dir=memmap_dir,
-        )
+        with staged_inputs(
+            present_inputs, scope=_sorted_index_scope(binary_name)
+        ) as local:
+            # The staged copies all mirror the one NFS ``memmap_dir`` under
+            # the scratch root, so they share a single parent -- the local
+            # memmap dir the builder reads from and writes the ``.idx`` into.
+            # With nothing staged (no matched arm) the build runs against
+            # the original NFS dir, reproducing the same empty result with
+            # no reads to storm. Standalone mode: ``staged_inputs`` is a
+            # no-op, so ``local`` is the originals and the local dir IS
+            # ``memmap_dir`` -- the publish below is then a self-skip.
+            local_memmap_dir = (
+                next(iter(local.values())).parent if local else memmap_dir
+            )
+            written = write_sorted_index_files(
+                local_memmap_dir,
+                binary_name,
+                reductions=_REDUCTIONS,
+                depths=_DEPTHS,
+                gate=_GATE,
+                duplicate_handling=_DUPLICATE_HANDLING,
+                output_dir=local_memmap_dir,
+            )
+            # Publish each ``.idx`` to its canonical NFS location with an
+            # EXPLICIT dst (the auto-derive mirror would route a staged-
+            # subtree source to a polluted ``dst_root/staged-inputs/...``
+            # path). The native publish is the atomic cross-FS path
+            # (copy+fsync+rename); a mid-publish kill leaves a ``.publish-
+            # tmp`` sibling, never a partial ``.idx``. The src==dst guard
+            # makes standalone mode (local dir == ``memmap_dir``) a no-op
+            # so the in-place write isn't republished onto itself.
+            for spec, idx_path in written.items():
+                dst = memmap_dir / idx_path.name
+                if idx_path.resolve() != dst.resolve():
+                    task.publish(idx_path, dst=dst)
+                logger.info("    %s -> %s", spec, dst)
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         from dynamic_runner.worker import NonRecoverableError
 
         raise NonRecoverableError(f"{type(e).__name__}: {e}") from e
 
-    for spec, path in written.items():
-        logger.info("    %s -> %s", spec, path)
     return None
 
 
