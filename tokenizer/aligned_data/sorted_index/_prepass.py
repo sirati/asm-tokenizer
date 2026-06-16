@@ -45,7 +45,30 @@ __all__ = [
     "SectionVariantInfo",
     "read_section_variant_info",
     "read_region_section_variant_info",
+    "sections_bin_path",
+    "index_locator_path",
 ]
+
+
+def sections_bin_path(base_path: Path, binary_name: str) -> Path:
+    """The ``<binary>_sections.bin`` catalog this pre-pass memmaps.
+
+    The single definition of the catalog filename for this concern --
+    the region reads below and any consumer enumerating the pre-pass's
+    input footprint (e.g. a worker staging inputs to node-local scratch)
+    both join through here instead of re-spelling the suffix.
+    """
+    return Path(base_path) / f"{binary_name}_sections.bin"
+
+
+def index_locator_path(base_path: Path, binary_name: str) -> Path:
+    """The ``<binary>_index.bin`` matched-arm locator this pre-pass reads.
+
+    Single definition of the locator filename, mirroring
+    :func:`sections_bin_path`; the matched/unmatched region reads and the
+    input-footprint enumerator share it.
+    """
+    return Path(base_path) / f"{binary_name}_index.bin"
 
 
 @dataclass(frozen=True)
@@ -158,7 +181,7 @@ def read_region_section_variant_info(
     # reads ``blob[idx]`` and never writes), so only the touched pages
     # fault in and the full catalog never has to be resident.
     blob = np.memmap(
-        base_path / f"{binary_name}_sections.bin",
+        sections_bin_path(base_path, binary_name),
         dtype=np.uint8,
         mode="r",
     )
@@ -175,7 +198,7 @@ def _matched_region_starts(base_path: Path, binary_name: str):
     into the columnar parse for end-of-section validation (matched arm
     only). Returns ``(None, None)`` when the binary has no matched arm.
     """
-    pair = read_csv_section_index_arrays(base_path / f"{binary_name}_index.bin")
+    pair = read_csv_section_index_arrays(index_locator_path(base_path, binary_name))
     if pair is None:
         return None, None
     starts, lengths = pair
@@ -193,10 +216,10 @@ def _unmatched_region_starts(base_path: Path, binary_name: str):
     parse. Returns ``(None, None)`` when the binary has no
     ``_sections.bin`` or an empty unmatched region.
     """
-    sections_bin = base_path / f"{binary_name}_sections.bin"
+    sections_bin = sections_bin_path(base_path, binary_name)
     if not sections_bin.exists():
         return None, None
-    region_start = unmatched_region_start(base_path / f"{binary_name}_index.bin")
+    region_start = unmatched_region_start(index_locator_path(base_path, binary_name))
     raw, blob_view = read_sections_bin_blob(sections_bin)
     starts = [start for start, _section in
               walk_parsed_sections(blob_view, region_start)]

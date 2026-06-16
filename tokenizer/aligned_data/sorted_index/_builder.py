@@ -45,12 +45,49 @@ from tokenizer.aligned_data.realized_lengths._reader import RealizedLengths
 from ._dedup import PLAIN, DuplicateHandling
 from ._gating import VariantGate
 from ._length_compute import compute_reduced_lengths
-from ._prepass import read_section_variant_info
+from ._prepass import (
+    index_locator_path,
+    read_section_variant_info,
+    sections_bin_path,
+)
 from ._types import IndexSpec, LengthReduction
 from ._wire import encode_sorted_index
 
 
-__all__ = ["build_sorted_index_bytes", "write_sorted_index_files"]
+__all__ = [
+    "build_sorted_index_bytes",
+    "write_sorted_index_files",
+    "sorted_index_input_paths",
+]
+
+
+def sorted_index_input_paths(
+    memmap_dir: Path, binary_name: str
+) -> List[Path]:
+    """Every per-binary input file the build READS from ``memmap_dir``.
+
+    The build's input footprint, owned where the build lives: the
+    matched-section catalog + locator the pre-pass memmaps
+    (:func:`sections_bin_path` / :func:`index_locator_path`) and the
+    matched-arm realized-length sidecar pair the body-length compute
+    consumes (``MATCHED_ARM`` lengths + CSR index). ``_data.bin`` is
+    deliberately ABSENT -- the realized-length sidecar exists precisely
+    so the build never pages it in.
+
+    Returned in a fixed order; paths are the canonical on-disk locations
+    whether or not they currently exist (a binary with no matched arm
+    legitimately lacks some). A consumer staging these to node-local
+    scratch joins through here instead of re-deriving the suffixes the
+    pre-pass + realized-length format own, so the build's read set has a
+    single source of truth.
+    """
+    base = Path(memmap_dir)
+    return [
+        index_locator_path(base, binary_name),
+        sections_bin_path(base, binary_name),
+        MATCHED_ARM.lengths_path(base, binary_name),
+        MATCHED_ARM.index_path(base, binary_name),
+    ]
 
 
 def build_sorted_index_bytes(
