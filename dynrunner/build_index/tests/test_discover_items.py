@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
+
 from dynamic_runner import TaskDep
 
 from dynrunner.build_index.build_index_task import (
@@ -120,6 +122,18 @@ def test_sorted_index_depends_on_its_own_rlen_per_binary(tmp_path: Path) -> None
             assert it.task_depends_on == (
                 TaskDep(task_id=_rlen_task_id(it.binary_name)),
             )
+
+
+def test_mode_and_depth_required_at_dispatch() -> None:
+    """The dispatcher declares --mode/--depth required (mirroring the
+    sorted-index worker's required=True): omitting either fails loud at
+    parse time, so a missing flag can never silently yield an incomplete
+    worker argv and zero .idx."""
+    for argv in ([], ["--mode", "max"], ["--depth", "0"]):
+        parser = argparse.ArgumentParser()
+        BuildIndexTask().add_task_arguments(parser)
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
 
 
 def test_worker_argv_forwards_sorted_index_config_only_to_sidx() -> None:

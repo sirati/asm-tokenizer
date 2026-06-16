@@ -53,6 +53,7 @@ def _make_record(
         tokens=tokens,
         called_funcs=list(called_funcs),
         extern_libraries={},
+        called_occurrences={},
         content_hash=content_hash,
     )
 

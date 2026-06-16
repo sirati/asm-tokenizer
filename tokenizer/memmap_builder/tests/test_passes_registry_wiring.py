@@ -64,6 +64,7 @@ def _make_record(
         tokens=tokens,
         called_funcs=typed_called,
         extern_libraries=extern_libraries or {},
+        called_occurrences={},
         content_hash=content_hash,
     )
 

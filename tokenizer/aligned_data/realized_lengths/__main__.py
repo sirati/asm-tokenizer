@@ -24,7 +24,10 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from tools.batch_smoke._discovery import discover_binaries, filter_binaries
+from tokenizer.aligned_data.binary_discovery import (
+    discover_binaries,
+    filter_binaries,
+)
 
 from ._generate import generate_realized_lengths
 from ._geometry_generate import generate_realized_geometry

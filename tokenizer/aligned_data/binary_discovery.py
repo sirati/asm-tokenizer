@@ -1,7 +1,17 @@
 """Per-binary memmap-directory scan + post-discovery selection.
 
 Single concern: turn a memmap directory path into a sorted list of
-binary names that the matched-arm batch-decode driver will exercise.
+binary names (recognised by their matched-arm ``<name>_index.bin``
+sidecar) plus the ``--only`` / ``--max-binaries`` post-selection.
+
+Owned by the ``tokenizer.aligned_data`` package because every consumer
+operates on the aligned-data memmap layout and this scan already keys
+off the realized_lengths arm grammars: the realized-length and
+sorted-index generators (their ``__main__`` discovery) and the dynrunner
+phase-4 ``build_index`` task all select their binary set through here,
+and ``tools.run_batch_smoke`` re-exports it for the same scan. Living in
+``aligned_data`` keeps it inside the production image (``tools`` is not
+packaged), so the mesh workers can import it.
 """
 
 from __future__ import annotations

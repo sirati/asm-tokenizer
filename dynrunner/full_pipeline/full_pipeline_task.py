@@ -60,6 +60,7 @@ from .phase_routing import (
     TOKENIZE_PHASE,
     UNIFY_VOCAB_PHASE,
     PhaseRoute,
+    decorate_index_items_with_memmap_dep,
     phase_for_type,
     route_for_phase,
 )
@@ -100,15 +101,38 @@ def _route_args(args: Namespace, route: PhaseRoute) -> Namespace:
     return routed
 
 
-# The phases chained via the lazy ``on_phase_end`` → ``spawn_tasks``
-# discovery path: each one's items are walked off the PRIOR phase's
-# on-disk output, so they materialise only after that prior phase
-# drains. Phase 4 (``index``) is deliberately NOT in this tuple — it is
-# spawned PER BINARY off each memmap task's completion (see
-# ``task_completed_listener``), not in bulk at the end of phase 3, so
-# index work for an already-built binary overlaps phase 3's remaining
-# builds.
+# The phase chain. Each phase's downstream items materialise off the
+# PRIOR phase's on-disk output, so the chain is wired with a linear
+# ``depends_on`` edge in ``get_phases``. Phase 4 (``index``) IS in this
+# tuple so it flows through the same chain-wiring loop — but its edge is
+# RELAXED to a pipelined one (``barrier=False``) so a binary's index
+# build can start the moment THAT binary's memmap build finishes, while
+# the rest of phase 3 is still draining. The per-binary overlap is
+# realised by co-spawning each binary's index items in the SAME
+# ``spawn_tasks`` batch as its memmap item (see ``_spawn_phase_items``),
+# each index item carrying a cross-phase ``task_depends_on`` edge to its
+# memmap predecessor.
 _PHASE_ORDER: tuple[str, ...] = (
+    TOKENIZE_PHASE,
+    UNIFY_VOCAB_PHASE,
+    BUILD_MEMMAP_PHASE,
+    BUILD_INDEX_PHASE,
+)
+
+# The subset of phases whose downstream edge is a strict whole-of-
+# upstream barrier (``barrier=True``, the framework default). The
+# pipelined-edge phase (``index``) is excluded so its ``PhaseSpec`` is
+# decorated with ``barrier=False`` in ``get_phases``.
+_PIPELINED_EDGE_PHASES: frozenset[str] = frozenset({BUILD_INDEX_PHASE})
+
+# The phases whose items materialise via lazy ``on_phase_end`` →
+# ``spawn_tasks`` discovery off the prior phase's on-disk output, in
+# chain order. ``index`` is NOT here: it is not discovered off disk but
+# CO-SPAWNED per binary alongside its memmap predecessor inside the
+# ``memmap`` batch (``_spawn_phase_items(memmap)``), so the cross-phase
+# ``rlen → memmap`` dependency validates against the same batch's
+# known-set. ``on_phase_end`` therefore advances only across this tuple.
+_LAZY_DISCOVERY_ORDER: tuple[str, ...] = (
     TOKENIZE_PHASE,
     UNIFY_VOCAB_PHASE,
     BUILD_MEMMAP_PHASE,
@@ -119,6 +143,13 @@ class FullPipelineTask:
     """Four-phase composite: tokenize → unify-vocab → build-memmap →
     index (realized-lengths + sorted-index).
 
+    Cited against dynamic-runner trunk @ a19ac75b (#540 + #584 + #588 +
+    #590): ``PhaseSpec.barrier`` IS carried across the PyO3 boundary and
+    enforced at both the scheduler phase-state gate and the runtime
+    ``spawn_tasks`` interlock; #590 folds ``task_id`` + ``type_id`` into
+    the wire-canonical task hash so a binary's rlen + sidx items hash
+    distinctly (no dedup-drop).
+
     Instantiates each child task once and dispatches every protocol
     method to the right one. The framework drives phases 1-3 via
     ``PhaseSpec.depends_on``; phase 2 and 3 items materialise lazily
@@ -126,27 +157,34 @@ class FullPipelineTask:
     ``on_phase_end`` hook so children whose discovery walks the output
     tree see their inputs on disk.
 
-    Phase 4 (``index``) carries NO ``depends_on`` the memmap phase — that
-    phase-level barrier is exactly what we must avoid (requirement: no
-    all-of-phase-3 barrier). Instead the composite registers a
-    ``task_completed_listener``; when an individual memmap task
-    completes, the listener spawns THAT binary's two index items
-    (realized-length + sorted-index, the latter depending on the former
-    per binary). So binary X's index build starts the moment X's memmap
-    build finishes, while other binaries' memmap builds continue. The
-    ``index`` PhaseSpec is ``may_be_empty=True`` because its items arrive
-    via late per-binary spawn, never via run-start discovery.
+    Phase 4 (``index``) declares ``depends_on=("memmap",)`` but RELAXES
+    that edge to a pipelined one with ``barrier=False`` — the framework
+    starts the phase ``Active`` from run start, and each index item
+    dispatches as soon as its own per-task ``task_depends_on`` resolves,
+    not when all of phase 3 drains. The per-binary overlap is realised by
+    CO-SPAWNING each binary's two index items (realized-length +
+    sorted-index) in the SAME ``spawn_tasks`` batch as that binary's
+    memmap item, from inside ``_spawn_phase_items(memmap)`` (fired off
+    ``on_phase_end(unify_vocab)``). Each rlen item carries a CROSS-PHASE
+    ``task_depends_on=(TaskDep(task_id=binary_name, phase_id="memmap"),)``
+    edge to its memmap predecessor (memmap ``task_id == binary_name``);
+    the existing intra-phase sidx→rlen edge stays. So per binary X:
+    memmap(X) → rlen(X) → sidx(X), gated per-task even under
+    ``barrier=False``, with X's index build starting the moment X's
+    memmap build finishes while other binaries' memmap builds continue.
 
-    Why a per-task listener and not ``PhaseSpec.barrier=False``: in
-    dynamic_runner 0.4.0 the ``barrier`` field is documented "reserved
-    for future pipelined work and is not used today", and the PyO3
-    ``get_phases`` extractor reads only ``depends_on`` / ``may_be_empty``
-    / ``types`` off each PhaseSpec — ``barrier`` is never carried across
-    the boundary, so it cannot relax the gate. Per-binary overlap is
-    therefore expressed through the per-task completion path that the
-    framework DOES wire (``task_completed_listener`` +
-    ``PrimaryHandle.spawn_tasks``), with the per-binary (b)→(a) edge
-    carried on ``TaskInfo.task_depends_on``.
+    Co-spawning in the SAME batch is what validates the cross-phase
+    dependency: the batch's own known-set contains the memmap item the
+    rlen item names, so the framework's spawn-time validator sees the
+    predecessor and never raises ``UnknownDependency``. It also keeps the
+    index phase non-empty from injection time, avoiding the empty-drain
+    edge — ``may_be_empty=True`` is preserved as the honest declaration
+    that the phase has no RUN-START-discovered items.
+
+    The cross-phase-dep decoration lives HERE in the composite (the
+    pipeline owns the cross-phase knowledge); the standalone
+    ``BuildIndexTask`` child stays dep-free across phases so it remains
+    usable for standalone ``--task build-index`` dispatch.
     """
 
     # `TaskInfo.path` for unify_vocab and build_memmap items is an
@@ -171,39 +209,32 @@ class FullPipelineTask:
             BUILD_INDEX_PHASE: self._index,
         }
         # Captured from on_run_start. The composite needs all of them to
-        # drive lazy phase 2 + 3 discovery from on_phase_end and the
-        # per-binary phase-4 spawn from the completion listener.
+        # drive lazy phase 2 + 3 discovery from on_phase_end (phase 3's
+        # batch also co-spawns the phase-4 index items).
         self._primary_handle: Optional[Any] = None
         self._user_source: Optional[Path] = None
         self._user_output: Optional[Path] = None
         self._args: Optional[Namespace] = None
-        # Task-ids of the memmap items the composite spawned for phase 3.
-        # The completion listener distinguishes "a memmap task finished"
-        # (→ spawn that binary's index work) from any other terminal by
-        # set membership — no string-shape inference on the task_id.
-        self._memmap_task_ids: set[str] = set()
-        # Binaries whose index items have already been spawned, so a
-        # duplicate completion signal (retry, failover replay) never
-        # double-spawns. spawn_tasks itself dedups by content hash, but
-        # this keeps the composite's own logging honest.
-        self._index_spawned_binaries: set[str] = set()
 
     # ── Topology ───────────────────────────────────────────────────────
 
     def get_phases(self) -> tuple[PhaseSpec, ...]:
-        """Build the four phase specs.
+        """Build the four phase specs as one chain over ``_PHASE_ORDER``.
 
-        Phases 1-3 are a linear ``depends_on`` chain over
-        ``_PHASE_ORDER``. We replace each child's ``PhaseSpec.depends_on``
-        to wire the chain without touching the child's own definition
-        (the child still declares no deps because it's authoritative for
-        standalone single-phase dispatch).
-
-        Phase 4 (``index``) is appended with NO ``depends_on``: it must
-        not barrier behind full-phase-3 drain (requirement: no
-        all-of-phase-3 barrier). Its items arrive per binary via the
-        completion listener, so the child's own ``may_be_empty=True`` is
-        preserved verbatim.
+        Every phase gets a linear ``depends_on`` edge to its predecessor
+        by replacing the child's ``PhaseSpec.depends_on`` — the child
+        itself still declares no deps because it's authoritative for
+        standalone single-phase dispatch. Phase 4 (``index``) is wired
+        through the SAME loop (it is in ``_PHASE_ORDER``), so it inherits
+        ``depends_on=("memmap",)``; its edge is then RELAXED to a
+        pipelined one with ``barrier=False`` (membership in
+        ``_PIPELINED_EDGE_PHASES``). The framework starts a
+        ``barrier=False`` phase ``Active`` from run start and gates each
+        item on its own ``task_depends_on`` rather than on full upstream
+        drain, which is what lets a binary's index build overlap the rest
+        of phase 3. The child's ``may_be_empty=True`` is preserved (the
+        index items arrive via the phase-3 co-spawn batch, not run-start
+        discovery).
         """
         phases: list[PhaseSpec] = []
         prior_phase: Optional[str] = None
@@ -215,20 +246,13 @@ class FullPipelineTask:
             )
             child_spec = child_phases[0]
             depends_on = (prior_phase,) if prior_phase is not None else ()
+            barrier = phase_id not in _PIPELINED_EDGE_PHASES
             phases.append(
-                _replace_dataclass(child_spec, depends_on=depends_on)
+                _replace_dataclass(
+                    child_spec, depends_on=depends_on, barrier=barrier
+                )
             )
             prior_phase = phase_id
-
-        # Phase 4: independent of the chain barrier (no depends_on). The
-        # child declares one phase with its two types and may_be_empty;
-        # we take it verbatim so the per-binary spawn path drives it.
-        index_phases = self._index.get_phases()
-        assert len(index_phases) == 1, (
-            f"FullPipelineTask expects the index child to declare one phase; "
-            f"declared {len(index_phases)}"
-        )
-        phases.append(index_phases[0])
         return tuple(phases)
 
     # ── Item discovery ─────────────────────────────────────────────────
@@ -366,67 +390,6 @@ class FullPipelineTask:
             return
         self._spawn_phase_items(next_phase)
 
-    def task_completed_listener(
-        self,
-        task_id: Optional[str],
-        success: bool,
-        error_kind: Optional[str],
-        last_error: Optional[str],
-    ) -> None:
-        """Per-binary phase-3 → phase-4 hand-off.
-
-        Fires once per terminal task transition (success or failure),
-        off the CRDT apply path. When the terminal is a MEMMAP task (by
-        membership in ``self._memmap_task_ids`` — the composite recorded
-        them when it spawned phase 3, so no task_id string-shape
-        inference is needed), the listener spawns THAT binary's two index
-        items via ``primary_handle.spawn_tasks``. The result: binary X's
-        index build starts the moment X's memmap build terminates, with
-        no wait for the rest of phase 3.
-
-        Spawn on COMPLETION, not only on success: a memmap task that
-        failed for one binary still gets its index work attempted; the
-        index workers surface their own missing-input miss as
-        NonRecoverable, matching the pipeline's barrier-on-completion
-        (not barrier-on-success) contract. The memmap binary_name IS the
-        task_id (``MemmapBuilderTask`` sets ``task_id=binary_name``), so
-        the binary name is the task_id verbatim.
-        """
-        if task_id is None or task_id not in self._memmap_task_ids:
-            return
-        binary_name = task_id
-        if binary_name in self._index_spawned_binaries:
-            return
-        self._index_spawned_binaries.add(binary_name)
-
-        if self._primary_handle is None:
-            _logger.error(
-                "FullPipelineTask: index spawn for binary %s skipped — "
-                "primary_handle is None in task_completed_listener. "
-                "Per-binary phase-4 hand-off requires the framework to "
-                "fire on_run_start with a live PrimaryHandle on the "
-                "pool-owning coordinator.",
-                binary_name,
-            )
-            return
-
-        items = self._index.items_for_binary(binary_name)
-        _logger.info(
-            "FullPipelineTask: memmap %s done → spawning %d index item(s).",
-            binary_name,
-            len(items),
-        )
-        errors = self._primary_handle.spawn_tasks(items)
-        if errors:
-            for idx, err in errors:
-                _logger.warning(
-                    "FullPipelineTask: spawn_tasks rejected index item for "
-                    "binary %s (index %d): %r",
-                    binary_name,
-                    idx,
-                    err,
-                )
-
     # ── Internals ──────────────────────────────────────────────────────
 
     def _child_for_type(self, type_id: str):
@@ -434,10 +397,19 @@ class FullPipelineTask:
 
     @staticmethod
     def _next_phase(phase_id: str) -> Optional[str]:
-        idx = _PHASE_ORDER.index(phase_id)
-        if idx + 1 >= len(_PHASE_ORDER):
+        """The next lazily-discovered phase after ``phase_id``, or None.
+
+        Ranges over ``_LAZY_DISCOVERY_ORDER`` (tokenize → unify_vocab →
+        memmap), NOT ``_PHASE_ORDER``: the ``index`` phase is co-spawned
+        inside the memmap batch rather than discovered off disk, so
+        ``on_phase_end(memmap)`` has no lazy next phase to discover.
+        """
+        if phase_id not in _LAZY_DISCOVERY_ORDER:
             return None
-        return _PHASE_ORDER[idx + 1]
+        idx = _LAZY_DISCOVERY_ORDER.index(phase_id)
+        if idx + 1 >= len(_LAZY_DISCOVERY_ORDER):
+            return None
+        return _LAZY_DISCOVERY_ORDER[idx + 1]
 
     def _spawn_phase_items(self, phase_id: str) -> None:
         """Discover ``phase_id`` items against its routed source and
@@ -476,28 +448,61 @@ class FullPipelineTask:
         # the routing the framework's worker argv carries.
         routed_args = _route_args(self._args, route)
         items = list(child.discover_items(route.source_dir, routed_args))
+        # Co-spawn each binary's phase-4 index items in the SAME batch as
+        # the memmap items. Doing it here (not as a separate
+        # ``_spawn_phase_items(index)`` call) is what makes the cross-
+        # phase ``rlen → memmap`` dependency validate: the memmap
+        # predecessor the rlen item names is present in this very batch's
+        # known-set, so the framework's spawn-time dep validator never
+        # raises ``UnknownDependency``. It also keeps the ``barrier=False``
+        # index phase non-empty from injection time, so it does not hit
+        # the empty-drain edge before any item arrives.
+        index_items = (
+            self._build_index_items_for_memmap(items)
+            if phase_id == BUILD_MEMMAP_PHASE
+            else []
+        )
+        batch = [*items, *index_items]
         _logger.info(
-            "FullPipelineTask: phase %s discovered %d item(s); injecting via "
+            "FullPipelineTask: phase %s discovered %d item(s)%s; injecting via "
             "spawn_tasks.",
             phase_id,
             len(items),
+            f" + {len(index_items)} co-spawned index item(s)" if index_items else "",
         )
-        # Record the memmap items' task-ids so the completion listener can
-        # recognise a memmap-task terminal by set membership (not by
-        # parsing the task_id string) and spawn that binary's index work.
-        if phase_id == BUILD_MEMMAP_PHASE:
-            self._memmap_task_ids.update(
-                item.task_id for item in items if item.task_id
-            )
-        if not items:
+        if not batch:
             return
-        errors = self._primary_handle.spawn_tasks(items)
+        errors = self._primary_handle.spawn_tasks(batch)
         if errors:
             for idx, err in errors:
                 _logger.warning(
-                    "FullPipelineTask: spawn_tasks rejected phase %s item "
-                    "index %d: %r",
+                    "FullPipelineTask: spawn_tasks rejected phase %s batch "
+                    "item index %d: %r",
                     phase_id,
                     idx,
                     err,
                 )
+
+    def _build_index_items_for_memmap(
+        self, memmap_items: list[TaskInfo]
+    ) -> list[TaskInfo]:
+        """Build the decorated phase-4 index items for every memmap item.
+
+        For each memmap item (``task_id == binary_name``) the index child
+        emits that binary's rlen + sorted-index items; the composite then
+        decorates them with the cross-phase ``rlen → memmap`` edge. The
+        child stays cross-phase-dep-free (standalone-pure); the edge is
+        added only on this composite boundary.
+        """
+        index_items: list[TaskInfo] = []
+        for memmap_item in memmap_items:
+            binary_name = memmap_item.task_id
+            if not binary_name:
+                continue
+            binary_index_items = self._index.items_for_binary(binary_name)
+            index_items.extend(
+                decorate_index_items_with_memmap_dep(
+                    binary_index_items, binary_name
+                )
+            )
+        return index_items

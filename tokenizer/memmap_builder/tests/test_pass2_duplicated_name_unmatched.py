@@ -102,6 +102,7 @@ def _record(
         tokens=np.array([seed, seed + 1, seed + 2], dtype=np.uint16),
         called_funcs=list(called),
         extern_libraries={},
+        called_occurrences={},
         content_hash=seed,
     )
 

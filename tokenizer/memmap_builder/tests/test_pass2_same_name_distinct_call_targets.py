@@ -66,6 +66,7 @@ def _make_parsed_record(
         tokens=tokens,
         called_funcs=list(called_funcs),
         extern_libraries=dict(extern_libraries),
+        called_occurrences={},
         content_hash=seed,  # distinct per variant -> no primary-map collision
     )
 

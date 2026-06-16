@@ -50,9 +50,16 @@ from pathlib import Path
 from dynamic_runner import TaskDep
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
-from tools.batch_smoke._discovery import discover_binaries, filter_binaries
+from tokenizer.aligned_data.binary_discovery import (
+    discover_binaries,
+    filter_binaries,
+)
 
-from dynrunner.binary_selection import BinaryIdentifier, TaskInfo
+from dynrunner.binary_selection import (
+    BinaryIdentifier,
+    TaskInfo,
+    add_asm_selection_arguments,
+)
 
 
 _logger = logging.getLogger(__name__)
@@ -236,6 +243,13 @@ class BuildIndexTask:
         return 512 * 1024 * 1024 + 256 * 1024 * 1024
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
+        # Vendored asm-binary corpus selection flags (--platform etc.) —
+        # see TokenizerTask.add_task_arguments for rationale. The
+        # composite pipeline registers this block once and each child's
+        # private flags individually, so standalone `--task build-index`
+        # must register it here itself (mirrors MemmapBuilderTask /
+        # VocabUnifierTask add_task_arguments).
+        add_asm_selection_arguments(parser)
         self.add_private_task_arguments(parser)
 
     def add_private_task_arguments(self, parser: ArgumentParser) -> None:
@@ -269,23 +283,27 @@ class BuildIndexTask:
         parser.add_argument(
             "--mode",
             action="append",
-            default=None,
+            required=True,
             metavar="MODE",
             help=(
                 "Sorted-index reduction mode (repeatable). 'max' or "
-                "'p<NN>' (1<=NN<=99). Required for the sorted-index "
-                "type; forwarded verbatim to its worker."
+                "'p<NN>' (1<=NN<=99). Required: the sorted-index worker "
+                "declares it required, so the dispatcher enforces it at "
+                "parse time — fail-loud here rather than letting an "
+                "omitted flag yield an incomplete worker argv (and zero "
+                ".idx). Forwarded verbatim to its worker."
             ),
         )
         parser.add_argument(
             "--depth",
             action="append",
             type=int,
-            default=None,
+            required=True,
             metavar="DEPTH",
             help=(
-                "Sorted-index splice depth (repeatable). Required for "
-                "the sorted-index type; forwarded verbatim to its "
+                "Sorted-index splice depth (repeatable). Required: see "
+                "--mode — the dispatcher enforces the worker's "
+                "requirement at parse time. Forwarded verbatim to its "
                 "worker."
             ),
         )

@@ -35,7 +35,10 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from tools.batch_smoke._discovery import discover_binaries, filter_binaries
+from tokenizer.aligned_data.binary_discovery import (
+    discover_binaries,
+    filter_binaries,
+)
 
 from ._builder import write_sorted_index_files
 from ._dedup import DEDUP_BY_DATA_POINTER, PLAIN
