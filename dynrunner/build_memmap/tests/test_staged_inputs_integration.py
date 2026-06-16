@@ -27,9 +27,10 @@ from tokenizer.memmap_builder.builder import BinaryVersionInfo
 class _FakeTask:
     """Minimal Task stand-in: staged_publish in standalone/container mode
     only needs ``publish_all``; the container branch calls it with the
-    published files. We record nothing — the build stub writes no files."""
+    set-atomic ``(src, dst)`` pair list. We record nothing — the build
+    stub writes no files, so the pair list is empty (a no-op)."""
 
-    def publish_all(self, *paths: Path) -> None:  # pragma: no cover - unused
+    def publish_all(self, pairs) -> None:  # pragma: no cover - unused
         pass
 
 

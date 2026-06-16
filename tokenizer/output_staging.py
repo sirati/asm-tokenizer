@@ -5,8 +5,8 @@ directory; atomic-publish them to the durable destination only on
 clean exit." Workers wrap their library calls in
 ``staged_publish(task, output_dir, scope)`` and write to the yielded
 staging dir; on clean exit the helper enumerates the staged files
-and hands them to ``task.publish_all(...)`` (Rust-side, atomic) so
-they appear at ``output_dir/<rel>``. On exception, nothing reaches
+and hands them to ``task.publish_all(pairs)`` (Rust-side, set-atomic)
+so they appear at ``output_dir/<rel>``. On exception, nothing reaches
 the destination — the partial files stay in the staging dir for
 inspection (the SLURM wrapper rm-rf's ``/app/out-tmp`` on container
 exit).
@@ -14,8 +14,11 @@ exit).
 Mount-aware behaviour:
 
 * SLURM container deployment (``/app/out-tmp`` exists): stage under
-  ``/app/out-tmp/<scope>/``. Publish via ``task.publish_all(*paths)``
-  which routes through ``dynrunner-publish`` (Rust) — same-FS
+  ``/app/out-tmp/<scope>/``. Publish via ``task.publish_all(pairs)``
+  with explicit ``(src, dst)`` pairs (the destination mirrors each
+  staged file's staging-root-relative tail under the framework's
+  ``dst_root()``), which routes through ``dynrunner-publish`` (Rust) —
+  same-FS
   rename(2) where possible, cross-FS copy+fsync+rename+fsync(parent)
   +unlink(src) when staging and destination live on different
   filesystems (typical: tmpfs → NFS).
@@ -45,6 +48,7 @@ from pathlib import Path
 from typing import Hashable, Iterator, Mapping, TypeVar
 
 from dynamic_runner.worker import Task
+from dynamic_runner.worker.publish import dst_root
 
 from tokenizer.progress import log_stage
 
@@ -134,14 +138,25 @@ def staged_publish(
         yield staging_dir
         # Walk only this task's scoped stage dir (no shared debug
         # pickles, no Ghidra Project state) and surface each written
-        # file to the per-path publish API. The Rust-side publish_all
-        # handles intra-/cross-FS atomicity.
+        # file to the set-atomic publish API. Each src lives under the
+        # staging root (``_SLURM_OUT_TMP``); its destination mirrors the
+        # staging-root-relative tail under ``dst_root()`` -- the explicit
+        # form of the (now-deleted) implicit src_root→dst_root mirror, so
+        # the file lands at the byte-identical location the old auto-
+        # mirror produced (``dst_root()/<scope>/<rel>``). The Rust-side
+        # publish_all stages all srcs then commits the renames as ONE
+        # set-atomic transaction, handling intra-/cross-FS atomicity.
         outputs = [p for p in sorted(staging_dir.rglob("*")) if p.is_file()]
         if outputs:
+            destination_root = dst_root()
+            pairs = [
+                (src, destination_root / src.relative_to(_SLURM_OUT_TMP))
+                for src in outputs
+            ]
             with log_stage(
                 logger, f"atomic publish of {len(outputs)} staged files ({scope})"
             ):
-                task.publish_all(*outputs)
+                task.publish_all(pairs)
     else:
         # Standalone: writes land at their final destination directly.
         # Atomic-publish only applies to container mode where the
