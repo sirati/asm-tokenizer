@@ -322,6 +322,15 @@ class VocabularyManager:
         ), "All or none of id_to_token_type, lit_start_cache, and lit_end_cache must be provided"
 
         if id_to_token_type is not None:
+            if len(id_to_token_type) != len(vocab_list):
+                raise ValueError(
+                    "from_vocab: supplied id_to_token_type length "
+                    f"{len(id_to_token_type)} != vocab_list length "
+                    f"{len(vocab_list)}. The type array must align 1:1 with "
+                    "the vocab (e.g. an empty vocab cell must reconstruct to "
+                    "an empty list, not ['']). Fix the loader/producer that "
+                    "built this pair rather than mis-sizing the VM."
+                )
             v_man._id_to_token_type = id_to_token_type
             v_man._lit_start_cache = lit_start_cache
             v_man._lit_start_count = len(lit_start_cache)
