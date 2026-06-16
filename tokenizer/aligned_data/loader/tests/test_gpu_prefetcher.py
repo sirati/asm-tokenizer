@@ -17,6 +17,7 @@ without torch).
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import faulthandler
 import os
@@ -426,6 +427,43 @@ def test_unpicklable_request_raises_at_submit_not_stall():
         assert p.get()["request"] == "ok"
 
 
+def test_stream_back_pressure_safe_many_more_than_decode_ahead():
+    # stream() must accept FAR more requests than decode_ahead without the
+    # caller deadlocking on submit()'s back-pressure (the over-submit footgun:
+    # submitting all N up-front wedges submit() at request decode_ahead+1).
+    # It keeps <= decode_ahead in flight and yields all in FIFO order. A
+    # regression (re-introducing the over-submit) hangs -> the autouse 30s
+    # fixture turns it into a fast FAILURE.
+    N = 50
+    with GpuBatchPrefetcher(
+        make_source=_make_source,
+        produce=_produce,
+        device="cpu",
+        decode_workers=2,
+        decode_ahead=3,            # N >> decode_ahead
+        gpu_ahead=2,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        got = [b["request"] for b in p.stream(range(N))]
+    assert got == list(range(N))
+
+
+def test_stream_empty_requests_yields_nothing():
+    with GpuBatchPrefetcher(
+        make_source=_make_source,
+        produce=_produce,
+        device="cpu",
+        decode_ahead=2,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        assert list(p.stream([])) == []
+
+
 # ==========================================================================
 # C. memmap-after-fork guarantee
 # ==========================================================================
@@ -452,39 +490,69 @@ def test_init_does_not_call_make_source():
 # ==========================================================================
 # D. REAL CUDA smoke -- skipped without torch / GPU (UNVALIDATED here)
 # ==========================================================================
+# Module-level so ``spawn`` can pickle them into the worker (local funcs/
+# namedtuples are NOT picklable -> the worker fails to launch).
+_RealNT = collections.namedtuple("_RealNT", ["ids"])
+
+
+def _real_make_source():
+    return object()
+
+
+def _real_produce(_src, seq):
+    import torch  # only present on the consumer side
+    # content fully determined by ``seq`` so the consumer can assert the
+    # uploaded bytes arrived intact after the async H2D.
+    return {
+        "x": torch.full((1024,), seq, dtype=torch.int32),
+        "nt": _RealNT(torch.ones(8)),
+        "seq": int(seq),
+    }
+
+
 def test_real_cuda_overlap_smoke():
     torch = pytest.importorskip(
         "torch",
         reason="torch absent in dev shell; real cuda stream/event/pin "
-        "overlap is UNVALIDATED here and must be validated consumer-side.",
+        "overlap is validated consumer-side (a CUDA box).",
     )
     if not torch.cuda.is_available():
-        pytest.skip("no CUDA device; real H2D-overlap path unvalidated here")
+        pytest.skip("no CUDA device; real H2D-overlap path validated on GPU")
 
-    import collections
-
-    NT = collections.namedtuple("NT", ["ids"])
-
-    def make_source():
-        return object()
-
-    def produce(_src, n):
-        return {"x": torch.arange(n), "nt": NT(torch.ones(n)), "n": int(n)}
-
+    # Drive many batches with the CORRECT prefetch pattern (prime decode_ahead,
+    # then submit-one-per-get -- submit() blocks by design once decode_ahead
+    # are in flight). A churn matmul on the consumer stream keeps the caching
+    # allocator under reuse pressure, so a missing/incorrect per-leaf
+    # record_stream (the #70 fix) would corrupt an in-use batch -> caught here.
+    N, decode_ahead, bad = 64, 3, 0
     with GpuBatchPrefetcher(
-        make_source=make_source,
-        produce=produce,
+        make_source=_real_make_source,
+        produce=_real_produce,
         device="cuda:0",
-        decode_ahead=2,
-        gpu_ahead=1,
+        decode_ahead=decode_ahead,
+        gpu_ahead=2,
         start_method="spawn",
     ) as p:
-        p.submit(4)
-        p.submit(8)
-        b0 = p.get()
-        assert b0["x"].device.type == "cuda"
-        assert b0["nt"].ids.device.type == "cuda"
-        assert b0["n"] == 4
+        nxt = 0
+        for _ in range(min(decode_ahead, N)):
+            p.submit(nxt)
+            nxt += 1
+        churn = torch.randn(256, 256, device="cuda:0")
+        for s in range(N):
+            b = p.get()
+            assert b["x"].device.type == "cuda"
+            assert b["nt"].ids.device.type == "cuda"
+            _ = churn @ churn                          # reuse pressure
+            torch.cuda.synchronize()
+            if b["seq"] != s or not torch.all(b["x"] == s).item():
+                bad += 1
+            if nxt < N:
+                p.submit(nxt)
+                nxt += 1
+    assert bad == 0, (
+        f"{bad}/{N} batches corrupted under allocator-reuse pressure "
+        "-- the per-leaf record_stream (#70) is not holding on hardware"
+    )
 
 
 # ==========================================================================
@@ -668,12 +736,36 @@ def _assert_overlap_invariants(backend: _FakeCudaBackend, batch: dict) -> None:
         assert k > i_wait, "record_stream after the wait"
 
 
+# The fake-cuda-backend tests are the TORCH-FREE substitute for the real
+# overlap path. With REAL torch present, the prefetcher __init__ validates
+# the device via ``torch.device()``, which rejects the fake ``"cuda:fake"``
+# string -- and the real path is then covered by
+# :func:`test_real_cuda_overlap_smoke` on the GPU. So skip these when a real
+# CUDA torch is importable.
+def _real_cuda_present() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 - torch absent is the common dev-shell case
+        return False
+
+
+_SKIP_IF_REAL_CUDA = pytest.mark.skipif(
+    _real_cuda_present(),
+    reason="fake-cuda backend tests are the torch-free substitute; real CUDA "
+    "is validated by test_real_cuda_overlap_smoke",
+)
+
+
+@_SKIP_IF_REAL_CUDA
 def test_overlap_orchestration_order_with_fake_cuda():
     backend = _FakeCudaBackend()
     batch = _drive_overlap(backend)
     _assert_overlap_invariants(backend, batch)
 
 
+@_SKIP_IF_REAL_CUDA
 @pytest.mark.parametrize(
     "defect",
     ["skip_pin", "compute_stream", "event_before", "no_wait", "no_record_stream"],

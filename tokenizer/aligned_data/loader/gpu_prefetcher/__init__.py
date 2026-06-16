@@ -90,6 +90,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import queue
 import threading
+from collections.abc import Iterable, Iterator
 from typing import Any, Callable, Optional
 
 from ._cuda_backend import CudaBackend, TorchCudaBackend
@@ -295,6 +296,49 @@ class GpuBatchPrefetcher:
             # event AND register the uploaded leaves' cross-stream use.
             self._cuda.wait(gpu_batch, event, self._device, self._is_leaf)
         return gpu_batch
+
+    def stream(self, requests: "Iterable[Any]") -> "Iterator[Any]":
+        """Yield decoded batches for ``requests``, back-pressure-safe.
+
+        The low-level :meth:`submit`/:meth:`get` pair lets a caller
+        over-submit past ``decode_ahead`` -- and :meth:`submit` BLOCKS once
+        ``decode_ahead`` requests are in flight, so a caller that submits the
+        whole request stream before consuming wedges on its own back-pressure
+        (an easy footgun). This helper removes it: it primes ``decode_ahead``
+        requests, then yields each batch in FIFO order as it becomes ready,
+        submitting the NEXT request only as a slot frees. At most
+        ``decode_ahead`` requests are ever in flight, so neither
+        :meth:`submit` nor the caller can deadlock. Usage::
+
+            for batch in prefetcher.stream(requests):
+                train_step(batch)
+
+        ``requests`` is consumed lazily, so the request stream never has to be
+        materialised; the refill happens BEFORE the yield so the worker
+        decodes the next datum while the caller processes this one (the
+        overlap that is the whole point).
+        """
+        it = iter(requests)
+        inflight = 0
+        exhausted = False
+        while inflight < self._decode_ahead and not exhausted:
+            try:
+                self.submit(next(it))
+            except StopIteration:
+                exhausted = True
+            else:
+                inflight += 1
+        while inflight > 0:
+            batch = self.get()
+            inflight -= 1
+            if not exhausted:
+                try:
+                    self.submit(next(it))
+                except StopIteration:
+                    exhausted = True
+                else:
+                    inflight += 1
+            yield batch
 
     # -- main-process upload thread ---------------------------------------
     def _upload_loop(self) -> None:
