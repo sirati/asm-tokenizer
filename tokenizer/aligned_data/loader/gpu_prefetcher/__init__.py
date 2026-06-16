@@ -94,8 +94,10 @@ from typing import Any, Callable, Optional
 
 from ._cuda_backend import CudaBackend, TorchCudaBackend
 from ._pytree import map_tensor_leaves
+from ._spawn_payload import UnpicklablePayloadError, ensure_picklable
 from ._to_device import default_leaf_pred, default_to_device, pin_host
 from ._worker import DecodeWorkerError, decode_worker
+from ._worker_monitor import PrefetchWorkerDied, WorkerMonitor
 
 # torch is OPT-IN. The package is meant to be imported by torch-using
 # consumers; the GPU path (copy stream / event) is a hard no-op without
@@ -107,7 +109,12 @@ try:
 except ImportError:  # pragma: no cover - exercised only where torch absent
     torch = None  # type: ignore[assignment]
 
-__all__ = ["GpuBatchPrefetcher", "default_to_device"]
+__all__ = [
+    "GpuBatchPrefetcher",
+    "PrefetchWorkerDied",
+    "UnpicklablePayloadError",
+    "default_to_device",
+]
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +179,10 @@ class GpuBatchPrefetcher:
         self._request_q: "mp.Queue" = self._ctx.Queue()
         self._result_q: "mp.Queue" = self._ctx.Queue()
         self._workers: list = []
+        # Liveness oversight for the worker pool: lets the upload thread
+        # fail fast (instead of spinning forever) when every worker has
+        # exited while a submitted request is still owed.
+        self._monitor: Optional[WorkerMonitor] = None
 
         # FIFO bookkeeping: submit assigns monotonically increasing seqs;
         # the upload thread reorders worker results into seq order before
@@ -208,6 +219,7 @@ class GpuBatchPrefetcher:
             )
             w.start()
             self._workers.append(w)
+        self._monitor = WorkerMonitor(self._workers)
 
         self._copy_stream = self._cuda.make_copy_stream(self._device)
 
@@ -248,6 +260,12 @@ class GpuBatchPrefetcher:
         """
         if not self._started:
             raise RuntimeError("prefetcher not started")
+        if self._start_method == "spawn":
+            # spawn ships the request by pickle through a background feeder
+            # thread that drops an unpicklable payload SILENTLY -> get()
+            # would park forever. Reject it eagerly, here, before it can
+            # consume a decode slot or enter the queue.
+            ensure_picklable(request)
         self._decode_slots.acquire()
         seq = self._submit_seq
         self._submit_seq += 1
@@ -267,7 +285,9 @@ class GpuBatchPrefetcher:
         item = self._ready_q.get()
         # Consuming a batch frees one slot for the producer to submit into.
         self._decode_slots.release()
-        if isinstance(item, DecodeWorkerError):
+        # Both a worker's produce() error (DecodeWorkerError) and a dead-pool
+        # verdict (PrefetchWorkerDied) ride the ready queue as exceptions.
+        if isinstance(item, BaseException):
             raise item
         gpu_batch, event = item
         if event is not None:
@@ -289,6 +309,12 @@ class GpuBatchPrefetcher:
             try:
                 seq, payload = self._result_q.get(timeout=0.2)
             except queue.Empty:
+                # Drained the result queue and it came up empty: if a worker
+                # has crashed (see WorkerMonitor -- a clean exit only happens
+                # at close(), which ends this loop via _closing), its owed seq
+                # can never arrive, so fail fast instead of spinning forever.
+                if self._monitor is not None and self._monitor.crashed():
+                    self._surface_dead_workers()
                 continue
 
             kind, value = payload
@@ -297,16 +323,51 @@ class GpuBatchPrefetcher:
             else:
                 self._pending[seq] = value
 
-            # Drain in-order results as far as contiguous seqs allow. The
-            # slot is released on get(), not here, so this thread blocking
-            # on a full ready queue never starves the producer's slots.
-            while self._next_upload_seq in self._pending:
-                cpu_batch = self._pending.pop(self._next_upload_seq)
-                self._next_upload_seq += 1
-                if isinstance(cpu_batch, DecodeWorkerError):
-                    self._ready_q.put(cpu_batch)
-                    continue
-                self._ready_q.put(self._upload_one(cpu_batch))
+            self._drain_contiguous()
+
+    def _drain_contiguous(self) -> None:
+        """Upload buffered results as far as contiguous seqs allow (FIFO).
+
+        The slot is released on get(), not here, so this thread blocking on a
+        full ready queue never starves the producer's slots.
+        """
+        while self._next_upload_seq in self._pending:
+            cpu_batch = self._pending.pop(self._next_upload_seq)
+            self._next_upload_seq += 1
+            if isinstance(cpu_batch, DecodeWorkerError):
+                self._ready_q.put(cpu_batch)
+                continue
+            self._ready_q.put(self._upload_one(cpu_batch))
+
+    def _surface_dead_workers(self) -> None:
+        """Resolve EVERY owed seq through ``_ready_q`` when all workers died.
+
+        Walks the owed seqs in FIFO order: a seq the (now-dead) workers DID
+        produce is uploaded normally; a seq they never delivered can no
+        longer arrive, so a :class:`PrefetchWorkerDied` is enqueued in its
+        place. Either way ``get()`` advances instead of parking. No-op when
+        nothing is owed (an idle, possibly torn-down pool). The bounded put
+        blocks until the consumer drains; ``_closing`` breaks it on teardown.
+        """
+        cause = self._monitor.death_cause()
+        # Resolve every submitted-but-undelivered seq, in order, up to the
+        # high-water mark of submissions. ``_submit_seq`` is read afresh each
+        # iteration so requests submitted AFTER the death are resolved too.
+        while not self._closing.is_set() and self._next_upload_seq < self._submit_seq:
+            # Out-of-order results that DID arrive before the death belong
+            # ahead of any gap -- upload them first.
+            self._drain_contiguous()
+            if self._next_upload_seq >= self._submit_seq:
+                break
+            # The seq now at the head was never produced (no live worker can
+            # ever deliver it); fill its FIFO slot with the dead-pool error.
+            self._next_upload_seq += 1
+            self._ready_q.put(
+                PrefetchWorkerDied(
+                    "decode worker(s) exited before delivering a submitted "
+                    f"batch: {cause}"
+                )
+            )
 
     def _upload_one(self, cpu_batch: Any) -> Any:
         """Move every tensor leaf to device on the copy stream; record event.

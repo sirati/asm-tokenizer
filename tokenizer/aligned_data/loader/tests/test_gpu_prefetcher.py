@@ -18,15 +18,53 @@ without torch).
 from __future__ import annotations
 
 import dataclasses
+import faulthandler
 import os
+import signal
+import sys
 import threading
 import time
 from typing import Any
 
 import pytest
 
-from tokenizer.aligned_data.loader.gpu_prefetcher import GpuBatchPrefetcher
+from tokenizer.aligned_data.loader.gpu_prefetcher import (
+    GpuBatchPrefetcher,
+    PrefetchWorkerDied,
+    UnpicklablePayloadError,
+)
 from tokenizer.aligned_data.loader.gpu_prefetcher._pytree import map_tensor_leaves
+
+
+# A hang in the multi-process orchestration must FAIL FAST with the parked
+# thread stacks, never sit for minutes (the load-dependent deadlock this
+# suite guards). pytest-timeout is absent from the dev shell, so a SIGALRM +
+# faulthandler fixture enforces a hard per-test ceiling: on expiry it dumps
+# every thread's traceback (so the parked get()/upload-loop frames are
+# visible) and the alarm signal interrupts the blocked call, failing the test.
+_HARD_TIMEOUT_SECS = 30
+
+
+@pytest.fixture(autouse=True)
+def _hard_timeout():
+    if not hasattr(signal, "SIGALRM"):  # pragma: no cover - non-POSIX
+        yield
+        return
+
+    def _on_alarm(signum, frame):
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        raise TimeoutError(
+            f"test exceeded {_HARD_TIMEOUT_SECS}s hard timeout -- likely a "
+            "prefetcher deadlock (see dumped thread stacks above)"
+        )
+
+    prev = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, _HARD_TIMEOUT_SECS)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, prev)
 
 
 # ==========================================================================
@@ -129,6 +167,37 @@ def _noop_to_device(t, device):  # records nothing; batches carry no tensors
 
 def _never_leaf(_obj):
     return False
+
+
+# -- worker bodies that SIMULATE the load-dependent death (module-level so
+#    they pickle under spawn) ------------------------------------------------
+def _make_source_dies_on_open():
+    # Stands in for a worker that crashes on its post-spawn import / source
+    # open (the real load-dependent failure): the process exits before EVER
+    # putting a result on the queue, so the old get() would park forever.
+    os._exit(42)
+
+
+def _produce_dies_silently(_src, _request):
+    # The source opened, but the FIRST produce kills the process WITHOUT
+    # shipping a result -- the other shape of "owed result never arrives".
+    os._exit(7)
+
+
+def _produce_die_on_one(_src, request):
+    # Produce normally EXCEPT for request == 1, on which the worker exits
+    # without shipping a result -- a single crashed worker among healthy
+    # peers. The crash is fatal to the whole pipeline (torch semantics).
+    if request == 1:
+        os._exit(9)
+    return {"request": request, "worker_pid": os.getpid()}
+
+
+class _Unpicklable:
+    """A payload that cannot cross the spawn pickle boundary."""
+
+    def __reduce__(self):
+        raise TypeError("this request is unpicklable on purpose")
 
 
 def test_orchestration_separate_process_and_fifo():
@@ -247,6 +316,114 @@ def test_orchestration_worker_exception_propagates_not_hang():
         # The pipeline keeps serving after the error.
         third = p.get()
         assert third["request"] == "ok-2"
+
+
+# ==========================================================================
+# B'. WORKER-DEATH FAIL-FAST (the load-dependent deadlock regression)
+# ==========================================================================
+# These SIMULATE the failure the loaded box hit: a worker that exits without
+# ever shipping a result. Pre-fix, get() parked on the empty ready queue
+# forever (the 53-min hang). Post-fix, get() must RAISE PROMPTLY. The
+# autouse hard-timeout fixture turns any regression (a revert of the liveness
+# fix) into a fast FAILURE instead of a multi-minute hang.
+def test_worker_death_on_source_open_raises_not_hangs():
+    # Worker dies on make_source (post-spawn open/import crash). get() must
+    # raise PrefetchWorkerDied naming the dead worker, well within seconds.
+    with GpuBatchPrefetcher(
+        make_source=_make_source_dies_on_open,
+        produce=_produce,
+        device="cpu",
+        decode_workers=1,
+        decode_ahead=2,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        p.submit("x")
+        t0 = time.monotonic()
+        with pytest.raises(PrefetchWorkerDied, match="exited before delivering"):
+            p.get()
+        # Promptly, not after minutes -- proves no infinite park.
+        assert time.monotonic() - t0 < 10.0
+
+
+def test_worker_death_mid_produce_raises_not_hangs():
+    # Source opens, but the first produce kills the process silently. Each
+    # owed get() must raise (not just the first), so a consumer that keeps
+    # calling get() never parks on the now-empty queue.
+    with GpuBatchPrefetcher(
+        make_source=_make_source,
+        produce=_produce_dies_silently,
+        device="cpu",
+        decode_workers=1,
+        decode_ahead=3,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        p.submit("a")
+        p.submit("b")
+        for _ in range(2):
+            with pytest.raises(PrefetchWorkerDied):
+                p.get()
+
+
+def test_single_worker_crash_among_peers_is_fatal_not_hang():
+    # Multi-worker: ONE worker crashes mid-produce while peers stay alive.
+    # A crashed worker is fatal to the whole pipeline (torch DataLoader
+    # semantics) -- the seq it owned can never arrive and is owed by no
+    # surviving peer. Every owed get() must RAISE, never hang. We don't
+    # assert a salvage count (which seqs a peer already produced is racy);
+    # we assert the invariant that matters: no get() parks, and the crash
+    # surfaces as PrefetchWorkerDied.
+    with GpuBatchPrefetcher(
+        make_source=_make_source,
+        produce=_produce_die_on_one,
+        device="cpu",
+        decode_workers=4,
+        decode_ahead=6,
+        gpu_ahead=4,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        for i in range(6):
+            p.submit(i)
+        raised = 0
+        for _ in range(6):
+            try:
+                p.get()
+            except PrefetchWorkerDied:
+                raised += 1
+        # At least the crashed worker's seq surfaces an error; crucially the
+        # loop completed (the hard-timeout fixture would have failed a hang).
+        assert raised >= 1
+
+
+def test_unpicklable_request_raises_at_submit_not_stall():
+    # An unpicklable payload cannot cross the spawn IPC boundary: the
+    # mp.Queue feeder thread would drop it SILENTLY (worker stays alive but
+    # idle) and get() would park forever. submit() must reject it eagerly,
+    # in the calling thread, with a clear error -- never a silent stall.
+    with GpuBatchPrefetcher(
+        make_source=_make_source,
+        produce=_produce,
+        device="cpu",
+        decode_workers=1,
+        decode_ahead=2,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        with pytest.raises(UnpicklablePayloadError, match="not picklable"):
+            p.submit(_Unpicklable())
+        # The slot was NOT consumed by the rejected submit: a good request
+        # still flows and is served.
+        p.submit("ok")
+        assert p.get()["request"] == "ok"
 
 
 # ==========================================================================
