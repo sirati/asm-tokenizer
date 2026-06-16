@@ -139,7 +139,7 @@ def _sample_pointers(pointers, rng: np.random.Generator, B: int):
 # ---------------------------------------------------------------------------
 
 
-def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, num_variants: int, seed: int):
+def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, num_variants: int, seed: int, unmatched_inline: bool = False):
     from tokenizer.aligned_data.loader.batch_decode import (
         VariantPadding,
         batch_decode,
@@ -153,11 +153,12 @@ def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, num_vari
         max_depth=depth,
         variant_padding=VariantPadding.PAD_NULL,
         rng=rng,
+        unmatched_inline=unmatched_inline,
     )
     return result
 
 
-def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int, num_variants: int, seed: int):
+def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int, num_variants: int, seed: int, unmatched_inline: bool = False):
     from tokenizer.aligned_data.loader.batch_decode import VariantPadding
     from tokenizer.aligned_data.loader.vector_batch._entry import vector_batch_tokens
 
@@ -171,6 +172,7 @@ def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int,
         max_depth=depth,
         variant_padding=VariantPadding.PAD_NULL,
         rng=rng,
+        unmatched_inline=unmatched_inline,
     )
     return result
 
@@ -178,6 +180,19 @@ def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int,
 # ---------------------------------------------------------------------------
 # Correctness gate
 # ---------------------------------------------------------------------------
+
+
+def _count_real_tokens(tokens: np.ndarray) -> int:
+    """Non-padding token count -- the emitted content signal.
+
+    PAD_NULL pads short rows / unused columns with the null token (id 0),
+    so non-zero entries are the actually-emitted (self + body + inlined
+    callee) tokens. A flag-ON->flag-OFF delta in this count is the
+    surfacing signal: how many extra tokens the unmatched-outline inlining
+    pulls into (or, if a shell body was longer than its surfaced callees,
+    out of) the stream.
+    """
+    return int(np.count_nonzero(tokens))
 
 
 def _assert_byte_identical(bd_result, vb_result, binary: str) -> None:
@@ -254,6 +269,7 @@ def bench_binary(
     num_variants: int,
     iters: int,
     do_cprofile: bool,
+    unmatched_inline: bool = False,
 ) -> None:
     from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
     from tokenizer.aligned_data.loader.vector_batch.session_handles import (
@@ -280,22 +296,48 @@ def bench_binary(
                         flush=True,
                     )
 
-                    # --- correctness gate (seed=0) ---
+                    # --- correctness gate (seed=0): the two loaders must be
+                    # byte-identical AT WHATEVER unmatched_inline setting is
+                    # under test (flag-OFF is the regression net; flag-ON is
+                    # the cross-loader-equivalence gate the feature must hold).
                     bd_ref = _run_batch_decode(
-                        session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0
+                        session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0,
+                        unmatched_inline=unmatched_inline,
                     )
                     vb_ref = _run_vector_batch(
-                        session, sampled, handles, L=L, depth=depth, num_variants=num_variants, seed=0
+                        session, sampled, handles, L=L, depth=depth, num_variants=num_variants, seed=0,
+                        unmatched_inline=unmatched_inline,
                     )
                     _assert_byte_identical(bd_ref, vb_ref, binary)
-                    print(f"[bench] {binary} B={B} L={L} D={depth}: byte-identity OK (shape={bd_ref.tokens.shape})")
+                    flagmsg = "ON" if unmatched_inline else "OFF"
+                    print(f"[bench] {binary} B={B} L={L} D={depth} unmatched_inline={flagmsg}: byte-identity OK (shape={bd_ref.tokens.shape})")
+
+                    # --- QUALITY: how much does flag-ON change the output? Run
+                    # the flag-OFF reference too and report the emitted-token
+                    # delta (non-padding real tokens) so the enable decision
+                    # has the empirical surfacing signal per binary.
+                    if unmatched_inline:
+                        bd_off = _run_batch_decode(
+                            session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0,
+                            unmatched_inline=False,
+                        )
+                        n_off = _count_real_tokens(bd_off.tokens)
+                        n_on = _count_real_tokens(bd_ref.tokens)
+                        n_diff_rows = int((bd_off.tokens != bd_ref.tokens).any(axis=1).sum())
+                        print(
+                            f"QUALITY {binary} B={B} L={L} D={depth} "
+                            f"real_tokens_off={n_off} real_tokens_on={n_on} "
+                            f"delta={n_on - n_off} changed_rows={n_diff_rows}/{bd_ref.tokens.shape[0]}"
+                        )
 
                     # --- timing (b/l/d default-args pin the loop vars per lambda) ---
                     bd_fn = lambda b=B, l=L, d=depth: _run_batch_decode(
-                        session, sampled, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
+                        session, sampled, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED,
+                        unmatched_inline=unmatched_inline,
                     )
                     vb_fn = lambda b=B, l=L, d=depth: _run_vector_batch(
-                        session, sampled, handles, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED
+                        session, sampled, handles, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED,
+                        unmatched_inline=unmatched_inline,
                     )
 
                     if do_cprofile:
@@ -354,6 +396,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--memmap-dir", type=Path, default=DEFAULT_MEMMAP_DIR,
         help=f"Directory containing the memmap bins (default: {DEFAULT_MEMMAP_DIR})",
     )
+    p.add_argument(
+        "--unmatched-inline", action="store_true",
+        help=(
+            "Run with the opt-in unmatched-outline inlining flag ON in BOTH "
+            "loaders. The byte-identity gate then becomes the flag-ON "
+            "cross-loader-equivalence gate; a QUALITY line per shape reports "
+            "the emitted-token delta vs flag-OFF."
+        ),
+    )
     return p
 
 
@@ -391,6 +442,7 @@ def main(argv=None) -> None:
             num_variants=args.num_variants,
             iters=args.iters,
             do_cprofile=args.cprofile,
+            unmatched_inline=args.unmatched_inline,
         )
 
     print("\n[bench] done.")
