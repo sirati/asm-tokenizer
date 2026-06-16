@@ -10,7 +10,11 @@ reader, sampler, batch helper) lands in later phases.
 
 from __future__ import annotations
 
-from ._builder import build_sorted_index_bytes, write_sorted_index_files
+from ._builder import (
+    build_sorted_index_bytes,
+    sorted_index_input_paths,
+    write_sorted_index_files,
+)
 from ._collection import (
     CollectionMember,
     IndexedMemmapCollection,
@@ -63,5 +67,6 @@ __all__ = [
     "parse_header",
     "parse_reduction",
     "read_section_variant_info",
+    "sorted_index_input_paths",
     "write_sorted_index_files",
 ]

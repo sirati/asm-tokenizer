@@ -210,6 +210,82 @@ def test_discover_nested_only_and_max_binaries(tmp_path: Path) -> None:
     assert {it.binary_name for it in capped} == {"a"}
 
 
+def _rlen_output_names(name: str) -> list[str]:
+    """The four realized-length sidecar basenames for one binary, via the
+    arm helpers (same suffix grammar the generator + skip predicate use)."""
+    from tokenizer.aligned_data.realized_lengths import ARMS
+
+    names: list[str] = []
+    for arm in ARMS:
+        names.append(arm.lengths_path(Path("."), name).name)
+        names.append(arm.index_path(Path("."), name).name)
+    return names
+
+
+def _sidx_output_names(name: str) -> list[str]:
+    """The sorted-index .idx basenames for ``--mode p75 --depth 0 --depth 3``
+    (the ``_args`` fixture's config)."""
+    return [
+        f"{name}_sorted_p75_d000.idx",
+        f"{name}_sorted_p75_d003.idx",
+    ]
+
+
+def _write_outputs(memmap: Path, names: list[str]) -> None:
+    for n in names:
+        (memmap / n).write_bytes(b"x")
+
+
+def test_skip_existing_skips_only_complete_output_sets(tmp_path: Path) -> None:
+    """An item is skipped only when its FULL per-binary output set is
+    present; a partial set (any required member missing) is retained so
+    it re-runs and re-publishes its whole set atomically."""
+    memmap = _make_memmap_dir(tmp_path, ["full", "partrlen", "partsidx"])
+    # ``full``: complete rlen + sidx sets present → both items skipped.
+    _write_outputs(memmap, _rlen_output_names("full"))
+    _write_outputs(memmap, _sidx_output_names("full"))
+    # ``partrlen``: rlen set MISSING one CSR sidecar; sidx set complete.
+    rlen_partial = _rlen_output_names("partrlen")[:-1]
+    _write_outputs(memmap, rlen_partial)
+    _write_outputs(memmap, _sidx_output_names("partrlen"))
+    # ``partsidx``: rlen set complete; sidx set MISSING the d003 .idx.
+    _write_outputs(memmap, _rlen_output_names("partsidx"))
+    _write_outputs(memmap, _sidx_output_names("partsidx")[:1])
+
+    args = _args()
+    args.skip_existing = True
+    args.resolved_output_root = str(memmap)
+
+    items = list(BuildIndexTask().discover_items(memmap, args))
+    kept = {(it.binary_name, it.type_id) for it in items}
+
+    # ``full`` — both members skipped.
+    assert ("full", REALIZED_LENGTHS_TYPE) not in kept
+    assert ("full", SORTED_INDEX_TYPE) not in kept
+    # ``partrlen`` — incomplete rlen set re-runs; its sidx set is complete
+    # so the sidx item is skipped.
+    assert ("partrlen", REALIZED_LENGTHS_TYPE) in kept
+    assert ("partrlen", SORTED_INDEX_TYPE) not in kept
+    # ``partsidx`` — incomplete sidx set re-runs; its rlen set is complete
+    # so the rlen item is skipped.
+    assert ("partsidx", SORTED_INDEX_TYPE) in kept
+    assert ("partsidx", REALIZED_LENGTHS_TYPE) not in kept
+
+
+def test_skip_existing_off_keeps_all_items(tmp_path: Path) -> None:
+    """Without --skip-existing, a complete output set does NOT suppress
+    the item (the gate is opt-in)."""
+    memmap = _make_memmap_dir(tmp_path, ["done"])
+    _write_outputs(memmap, _rlen_output_names("done"))
+    _write_outputs(memmap, _sidx_output_names("done"))
+
+    items = list(BuildIndexTask().discover_items(memmap, _args()))
+    assert {(it.binary_name, it.type_id) for it in items} == {
+        ("done", REALIZED_LENGTHS_TYPE),
+        ("done", SORTED_INDEX_TYPE),
+    }
+
+
 def test_mode_and_depth_required_at_dispatch() -> None:
     """The dispatcher declares --mode/--depth required (mirroring the
     sorted-index worker's required=True): omitting either fails loud at

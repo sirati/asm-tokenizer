@@ -44,6 +44,7 @@ from dynrunner.binary_selection import (
     match_filename,
     process_selection_arguments,
 )
+from dynrunner.skip_existing import filter_items_with_complete_outputs
 
 
 _logger = logging.getLogger(__name__)
@@ -123,27 +124,6 @@ class _FormatVisitor:
                 f.mark(True, payload=identifier)
 
 
-class _OutputFilenameCollector:
-    """Visitor that records every file's basename. Used by the
-    task-side `--skip-existing` filter to enumerate already-completed
-    outputs at `args.resolved_output_root` (gateway-side in SLURM
-    pre-staged mode, local otherwise)."""
-
-    def __init__(self) -> None:
-        self.filenames: set[str] = set()
-
-    def visit(
-        self,
-        parent_payload: object,
-        subfolders: list,
-        files: list,
-    ) -> None:
-        for folder in subfolders:
-            folder.enter(True)
-        for f in files:
-            self.filenames.add(f.name)
-
-
 def _walk_with_filters(
     root: str, filters: SelectionFilters
 ) -> list:
@@ -154,22 +134,6 @@ def _walk_with_filters(
     """
     visitor = _FormatVisitor(filters)
     return _native.find_items(visitor, root)
-
-
-def _collect_existing_output_filenames(
-    output_root: str,
-) -> set[str]:
-    """Walk `output_root` via `_native.find_items` and return the set of
-    file basenames present. A non-existent or unreadable `output_root`
-    yields an empty set rather than failing the dispatch — first-run
-    deployments don't have the directory yet.
-    """
-    collector = _OutputFilenameCollector()
-    try:
-        _native.find_items(collector, output_root)
-    except OSError:
-        return set()
-    return collector.filenames
 
 
 def _config_with_format(config, file_format: str):
@@ -446,28 +410,21 @@ class MemmapBuilderTask:
         # size is the dominant work driver).
         group_items.sort(key=lambda ti: ti.size, reverse=True)
 
-        # Task-side --skip-existing: walk args.resolved_output_root for
-        # already-produced index files; drop matching groups.
-        if getattr(args, "skip_existing", False):
-            output_root = getattr(args, "resolved_output_root", None)
-            if output_root:
-                completed = _collect_existing_output_filenames(output_root)
-                before = len(group_items)
-                group_items = [
-                    ti
-                    for ti in group_items
-                    if self.get_output_filename_pattern(_TYPE_ID, ti)
-                    not in completed
-                ]
-                _logger.info(
-                    "skip-existing: %d candidates → %d remaining "
-                    "(%d skipped via %d existing outputs at %s)",
-                    before,
-                    len(group_items),
-                    before - len(group_items),
-                    len(completed),
-                    output_root,
-                )
+        # Task-side --skip-existing: drop groups whose complete output
+        # set is already present. The memmap worker publishes its
+        # artifacts via ``staged_publish`` (ONE set-atomic ``publish_all``
+        # transaction), so the whole set lands or none of it does —
+        # ``<binary>_index.bin`` is therefore a sound completeness signal
+        # for the group (a kill mid-publish can never have left this
+        # marker beside a partial set).
+        group_items = filter_items_with_complete_outputs(
+            group_items,
+            skip_existing=getattr(args, "skip_existing", False),
+            output_root=getattr(args, "resolved_output_root", None),
+            required_outputs=lambda ti: (
+                self.get_output_filename_pattern(_TYPE_ID, ti),
+            ),
+        )
 
         return group_items
 
