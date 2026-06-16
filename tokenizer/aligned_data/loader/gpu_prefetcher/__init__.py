@@ -92,6 +92,7 @@ import queue
 import threading
 from typing import Any, Callable, Optional
 
+from ._cuda_backend import CudaBackend, TorchCudaBackend
 from ._pytree import map_tensor_leaves
 from ._to_device import default_leaf_pred, default_to_device, pin_host
 from ._worker import DecodeWorkerError, decode_worker
@@ -133,6 +134,7 @@ class GpuBatchPrefetcher:
         c_fallback: bool = False,
         to_device: Optional[Callable[[Any, Any], Any]] = None,
         is_leaf: Optional[Callable[[Any], bool]] = None,
+        cuda_backend: Optional[CudaBackend] = None,
     ) -> None:
         if decode_workers < 1:
             raise ValueError("decode_workers must be >= 1")
@@ -159,6 +161,12 @@ class GpuBatchPrefetcher:
         self._c_fallback = c_fallback
         self._to_device = to_device or default_to_device
         self._is_leaf = is_leaf or default_leaf_pred
+        # The ONE seam owning every torch.cuda primitive (copy stream,
+        # stream-context async move, event record, consumer wait_event +
+        # record_stream). Production default = real torch.cuda; tests inject
+        # a fake that records the op order + stream identities -- so the
+        # overlap is validatable WITHOUT a GPU.
+        self._cuda = cuda_backend or TorchCudaBackend()
 
         self._ctx = mp.get_context(start_method)
         self._request_q: "mp.Queue" = self._ctx.Queue()
@@ -201,12 +209,7 @@ class GpuBatchPrefetcher:
             w.start()
             self._workers.append(w)
 
-        if (
-            torch is not None
-            and self._device.type == "cuda"
-            and torch.cuda.is_available()
-        ):
-            self._copy_stream = torch.cuda.Stream(device=self._device)
+        self._copy_stream = self._cuda.make_copy_stream(self._device)
 
         self._upload_thread = threading.Thread(target=self._upload_loop, daemon=True)
         self._upload_thread.start()
@@ -267,8 +270,10 @@ class GpuBatchPrefetcher:
         if isinstance(item, DecodeWorkerError):
             raise item
         gpu_batch, event = item
-        if event is not None and torch is not None:
-            torch.cuda.current_stream(device=self._device).wait_event(event)
+        if event is not None:
+            # Consumer thread: make the compute stream wait on the copy
+            # event AND register the uploaded leaves' cross-stream use.
+            self._cuda.wait(gpu_batch, event, self._device, self._is_leaf)
         return gpu_batch
 
     # -- main-process upload thread ---------------------------------------
@@ -324,12 +329,10 @@ class GpuBatchPrefetcher:
             )
             return (moved, None)
 
-        with torch.cuda.stream(self._copy_stream):
-            gpu_batch = map_tensor_leaves(
-                cpu_batch,
-                lambda t: self._to_device(t, self._device),
-                is_leaf=self._is_leaf,
-            )
-            event = torch.cuda.Event()
-            event.record(self._copy_stream)
-        return (gpu_batch, event)
+        return self._cuda.upload(
+            cpu_batch,
+            self._device,
+            self._copy_stream,
+            lambda t: self._to_device(t, self._device),
+            self._is_leaf,
+        )
