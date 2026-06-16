@@ -39,9 +39,10 @@ stays unaware of where ``output_dir`` actually lives.
 from __future__ import annotations
 
 import logging
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Hashable, Iterator, Mapping, TypeVar
 
 from dynamic_runner.worker import Task
 
@@ -50,6 +51,20 @@ from tokenizer.progress import log_stage
 logger = logging.getLogger(__name__)
 
 _SLURM_OUT_TMP = Path("/app/out-tmp")
+
+# Node-local scratch root for staged *inputs*, kept distinct from the
+# publish staging subtree (``/app/out-tmp/<scope>/``) so input copies
+# and pending output writes never share a directory. The SLURM wrapper
+# rm-rf's all of ``/app/out-tmp`` on container exit; the per-scope
+# cleanup here additionally frees it eagerly when each task finishes,
+# bounding tmpfs (RAM) residency to the inputs in flight.
+_STAGED_INPUTS_SUBDIR = "staged-inputs"
+
+# Caller-chosen key type for ``staged_inputs``: each source path is
+# requested under an arbitrary hashable key (often the source ``Path``
+# itself) and the yielded mapping returns the local copy under that
+# same key, so callers re-point reads without re-deriving any layout.
+_K = TypeVar("_K", bound=Hashable)
 
 # Scope sentinel for the unify_vocab phase's single-task worker. Owned
 # here — next to ``published_path``, which encodes the scope → on-disk
@@ -132,3 +147,83 @@ def staged_publish(
         # Atomic-publish only applies to container mode where the
         # wrapper trap protects /app/out-tmp from leaking partials.
         yield final_dir
+
+
+def _local_input_path(scratch_root: Path, source: Path) -> Path:
+    """Where ``source`` is copied to under ``scratch_root``.
+
+    Mirrors the source's absolute path tail (leading ``/`` stripped)
+    under the scratch root, so two distinct absolute sources never
+    collide on basename — symmetric to how ``staged_publish`` mirrors a
+    relative subdir layout into the destination. ``Path.parts[0]`` is
+    the anchor (``"/"`` for an absolute path); dropping it yields the
+    root-relative components to rejoin under the scratch dir.
+    """
+    return scratch_root.joinpath(*source.parts[1:])
+
+
+@contextmanager
+def staged_inputs(
+    sources: Mapping[_K, Path], scope: str
+) -> Iterator[dict[_K, Path]]:
+    """Yield node-local copies of ``sources``; delete them on exit.
+
+    Single concern: own the policy "copy the NFS inputs a task needs to
+    node-local scratch, read against the copies, drop them when done" —
+    the input-side mirror of ``staged_publish``. Reading directly off
+    the corpus/output NFS bind-mounts (random-access ``np.memmap`` of
+    ``_data.bin`` especially) page-fault-storms the shared filesystem;
+    staging confines each task's reads to local scratch.
+
+    ``sources`` maps caller-chosen hashable keys to NFS source paths.
+    The yielded dict returns each local copy under the **same key**, so
+    a caller re-points its reads by key lookup without knowing where the
+    scratch lives or how names are de-collided.
+
+    Mount-aware behaviour:
+
+    * SLURM container deployment (``/app/out-tmp`` exists): each source
+      is copied (``shutil.copy2``, preserving mtime) under
+      ``/app/out-tmp/staged-inputs/<scope>/`` at a path mirroring the
+      source's absolute layout, so distinct sources never collide. On
+      exit (clean OR exception) the whole ``<scope>`` subtree is
+      removed, eagerly freeing tmpfs ahead of the wrapper's exit-time
+      rm-rf.
+    * Standalone (no ``/app/out-tmp``): a no-op that yields the original
+      ``sources`` mapping unchanged — no copying, no scratch, so
+      standalone ``--task build-memmap`` etc. read inputs in place.
+
+    Node-local target rationale: ``/app/out-tmp`` is tmpfs (RAM). The
+    per-task inputs are modest (CSVs up to ~25 MB, mappings tiny,
+    ``_data.bin`` ~40 MB avg) and the per-scope cleanup bounds residency
+    to the inputs of tasks in flight — well within the host's 118 GB
+    across 56 workers. If the wrapper later exposes a node-local *disk*
+    scratch mount better suited than tmpfs, redirect the scratch root
+    here; callers are unaffected (they only see the yielded keys).
+
+    ``scope`` must be unique per concurrent task in the same worker
+    (use the binary identifier or a single-task sentinel), mirroring
+    ``staged_publish``'s scope contract.
+    """
+    if not is_container_deployment():
+        # Standalone: read inputs in place; nothing to stage or clean.
+        yield dict(sources)
+        return
+
+    scratch_root = _SLURM_OUT_TMP / _STAGED_INPUTS_SUBDIR / scope
+    local_by_key: dict[_K, Path] = {}
+    try:
+        with log_stage(
+            logger, f"stage {len(sources)} inputs to node-local scratch ({scope})"
+        ):
+            for key, source in sources.items():
+                local = _local_input_path(scratch_root, source)
+                local.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, local)
+                local_by_key[key] = local
+        yield local_by_key
+    finally:
+        # Free the scratch on clean exit AND on exception — bounding
+        # tmpfs residency to tasks actually in flight. Tolerate a
+        # partially-populated tree (a copy failed mid-loop).
+        shutil.rmtree(scratch_root, ignore_errors=True)

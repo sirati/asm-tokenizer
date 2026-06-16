@@ -29,7 +29,12 @@ from dynamic_runner.worker import Task, WorkerOutput, run, task_function
 
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
-from tokenizer.output_staging import UNIFY_VOCAB_SCOPE, published_path, staged_publish
+from tokenizer.output_staging import (
+    UNIFY_VOCAB_SCOPE,
+    published_path,
+    staged_inputs,
+    staged_publish,
+)
 
 from dynrunner.build_memmap._publish_scope import build_memmap_scope
 from tokenizer.variant_info import VariantInfo
@@ -100,7 +105,12 @@ def _process_payload(
     """
     data = json.loads(payload_json)
     versions_raw = data["versions"]
-    versions: list[BinaryVersionInfo] = []
+    # Survivors of the skip-missing pass: each carries its NFS source
+    # paths (csv, mapping, optional meta) and the planner-supplied axes.
+    # The existence checks below read NFS directory entries (cheap
+    # stat(2)) — the page-fault-storm cost is the subsequent *content*
+    # reads, which we move to node-local scratch via ``staged_inputs``.
+    survivors: list[dict] = []
     skipped: list[str] = []
     for entry in versions_raw:
         csv_path = source_dir / entry["csv_path"]
@@ -111,43 +121,18 @@ def _process_payload(
         if not mapping_path.exists():
             skipped.append(f"{entry['arch']}-{entry['compiler']}-{entry['compilerversion']}-{entry['opt']} (mapping missing: {mapping_path})")
             continue
-
-        # Resolve per-variant metadata via the canonical
-        # ``VariantInfo.from_csv`` entry-point. Only invoked when the
-        # planner declared a sidecar path (legacy entries skip the
-        # call entirely to preserve the old default shape — pkg =
-        # group's binary_name, extra_metadata = {}). The declared-
-        # but-missing warning is emitted by ``from_csv`` itself
-        # (mirrors the prior in-worker behavior; just relocated to
-        # the canonical owner).
-        pkg: str = binary_name
-        extra_metadata: dict = {}
         meta_path_rel = entry.get("meta_path")
-        if meta_path_rel is not None:
-            info = VariantInfo.from_csv(
-                csv_path, meta_path=source_dir / meta_path_rel
-            )
-            pkg = info.pkg
-            extra_metadata = info.extra_metadata
-
-        versions.append(
-            BinaryVersionInfo(
-                path=csv_path,
-                mapping_path=mapping_path,
-                arch=entry["arch"],
-                compiler=entry["compiler"],
-                compilerversion=entry["compilerversion"],
-                opt=entry["opt"],
-                pkg=pkg,
-                variant_id=int(entry.get("variant_id", 0)),
-                extra_metadata=extra_metadata,
-                # ``filename`` flows from the planner verbatim (the
-                # CSV's parent folder name for sidecar variants, CSV
-                # basename for legacy). See function docstring for
-                # why ``VariantInfo.from_csv``'s filename is *not*
-                # used here.
-                filename=entry.get("filename", "") or "",
-            )
+        survivors.append(
+            {
+                "entry": entry,
+                "csv_path": csv_path,
+                "mapping_path": mapping_path,
+                "meta_path": (
+                    source_dir / meta_path_rel
+                    if meta_path_rel is not None
+                    else None
+                ),
+            }
         )
 
     if skipped:
@@ -157,7 +142,7 @@ def _process_payload(
             + "\n  ".join(skipped)
         )
 
-    if not versions:
+    if not survivors:
         # Every version's inputs are missing — phase 1/2 failed
         # entirely for this binary group. Re-running won't fix it.
         raise FileNotFoundError(
@@ -165,16 +150,77 @@ def _process_payload(
             f"binary {binary_name!r} have both csv and mapping on disk."
         )
 
-    # Stage the seven per-binary memmap artifacts (`*_data.bin`,
-    # `*_unmatched_data.bin`, `*_sections.csv`, `*_index.bin`,
-    # `*_unmatched_sections.csv`, `*_unmatched_index.bin`,
-    # `<binary>.warn.log`) under `/app/out-tmp/build_memmap/<binary>/`
-    # and atomic-publish to `output_dir` only on clean exit. A worker
-    # killed mid-write leaves nothing partial on `/app/out-network`.
-    with staged_publish(
-        task, output_dir, scope=build_memmap_scope(binary_name)
-    ) as stage_dir:
-        build_memmap_files(versions, stage_dir, binary_name, unified_vocab_path)
+    # Stage every surviving version's NFS inputs (csv + mapping + the
+    # optional `_meta.json` sidecar) to node-local scratch, keyed by the
+    # NFS source path, so the content reads below (`VariantInfo.from_csv`
+    # parsing the csv/meta, and `build_memmap_files` streaming the csv +
+    # loading the mapping) hit local tmpfs instead of page-fault-storming
+    # the shared corpus/output NFS. `staged_inputs` is a no-op standalone
+    # (yields the originals) and drops the local copies on exit. The
+    # output side stages independently via `staged_publish` below.
+    sources: dict[Path, Path] = {}
+    for s in survivors:
+        sources[s["csv_path"]] = s["csv_path"]
+        sources[s["mapping_path"]] = s["mapping_path"]
+        if s["meta_path"] is not None:
+            sources[s["meta_path"]] = s["meta_path"]
+
+    with staged_inputs(sources, scope=build_memmap_scope(binary_name)) as local:
+        versions: list[BinaryVersionInfo] = []
+        for s in survivors:
+            entry = s["entry"]
+            local_csv = local[s["csv_path"]]
+            local_mapping = local[s["mapping_path"]]
+
+            # Resolve per-variant metadata via the canonical
+            # ``VariantInfo.from_csv`` entry-point, reading the LOCAL
+            # csv + meta copies. Only invoked when the planner declared
+            # a sidecar path (legacy entries skip the call entirely to
+            # preserve the old default shape — pkg = group's
+            # binary_name, extra_metadata = {}). The declared-but-
+            # missing warning is emitted by ``from_csv`` itself.
+            pkg: str = binary_name
+            extra_metadata: dict = {}
+            if s["meta_path"] is not None:
+                info = VariantInfo.from_csv(
+                    local_csv, meta_path=local[s["meta_path"]]
+                )
+                pkg = info.pkg
+                extra_metadata = info.extra_metadata
+
+            versions.append(
+                BinaryVersionInfo(
+                    path=local_csv,
+                    mapping_path=local_mapping,
+                    arch=entry["arch"],
+                    compiler=entry["compiler"],
+                    compilerversion=entry["compilerversion"],
+                    opt=entry["opt"],
+                    pkg=pkg,
+                    variant_id=int(entry.get("variant_id", 0)),
+                    extra_metadata=extra_metadata,
+                    # ``filename`` flows from the planner verbatim (the
+                    # CSV's parent folder name for sidecar variants, CSV
+                    # basename for legacy). See function docstring for
+                    # why ``VariantInfo.from_csv``'s filename is *not*
+                    # used here.
+                    filename=entry.get("filename", "") or "",
+                )
+            )
+
+        # Stage the seven per-binary memmap artifacts (`*_data.bin`,
+        # `*_unmatched_data.bin`, `*_sections.csv`, `*_index.bin`,
+        # `*_unmatched_sections.csv`, `*_unmatched_index.bin`,
+        # `<binary>.warn.log`) under
+        # `/app/out-tmp/build_memmap/<binary>/` and atomic-publish to
+        # `output_dir` only on clean exit. A worker killed mid-write
+        # leaves nothing partial on `/app/out-network`.
+        with staged_publish(
+            task, output_dir, scope=build_memmap_scope(binary_name)
+        ) as stage_dir:
+            build_memmap_files(
+                versions, stage_dir, binary_name, unified_vocab_path
+            )
 
 
 @task_function
