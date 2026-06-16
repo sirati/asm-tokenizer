@@ -71,6 +71,7 @@ class BinaryDataset:
         self.unmatched_sections_bin = self.matched_sections_bin
         self.unmatched_data = self.base_path / f"{binary_name}_unmatched_data.bin"
         self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
+        self.variants_bin = self.base_path / f"{binary_name}_variants.bin"
         self.variants_sidecar = self.base_path / f"{binary_name}_variants.csv"
         self.function_names_sidecar = (
             self.base_path / f"{binary_name}_function_names.txt"
@@ -117,6 +118,24 @@ class BinaryDataset:
         )
         self._publish_arm("matched", self._matched_arm)
         self._publish_arm("unmatched", self._unmatched_arm)
+
+        # Variant-axis sidecars are a REQUIRED PAIR: the builder writes
+        # ``_variants.bin`` (axis token records) and ``_variants.csv``
+        # (the byte-offset→filename refs) in lockstep -- both exist or
+        # neither does. The both-absent state is a legitimate legacy /
+        # no-variant-axis corpus (resolution short-circuits, no prefix
+        # expected). An INCONSISTENT corpus -- one side present, the
+        # other missing -- would otherwise decode SILENTLY without the
+        # axis prefix: ``_open_variants`` returns a real mmap, the
+        # resolver reads the record, then the empty ``offset_to_filename``
+        # makes ``offset_to_filename[offset]`` raise KeyError, which the
+        # session swallows to ``None`` and the parser substitutes an
+        # empty variant-token stream. That corrupts every training row
+        # with NO signal. Fail loud here at construction, before any
+        # session opens, naming the binary + the missing file.
+        _assert_variant_sidecars_consistent(
+            self.binary_name, self.variants_bin, self.variants_sidecar
+        )
 
         # Slim ``_variants.csv`` is small (variants per binary count in the
         # dozens-to-hundreds); read once and cache the offset→filename map
@@ -246,6 +265,38 @@ class BinaryDataset:
         self, min_len: int, max_len: int
     ) -> np.ndarray:
         return _band_indices_in_range(self._unmatched_arm, min_len, max_len)
+
+
+# --------------------------------------------------------------------------
+# Variant-axis sidecar pair invariant.
+# --------------------------------------------------------------------------
+def _assert_variant_sidecars_consistent(
+    binary_name: str, variants_bin: Path, variants_csv: Path
+) -> None:
+    """Raise unless the ``_variants.bin`` / ``_variants.csv`` pair agrees.
+
+    Both present (consistent, has variant axes) or both absent (legacy /
+    no-variant-axis corpus) are fine. Exactly one present is the corrupt
+    state that would otherwise silently drop the variant-axis prefix from
+    every decoded row -- the resolver reads the present ``.bin`` record but
+    has no refs to map it (or vice versa), so the missing piece must fail
+    loud here rather than degrade to an axis-less stream downstream.
+    """
+    bin_present = variants_bin.exists()
+    csv_present = variants_csv.exists()
+    if bin_present == csv_present:
+        return
+    missing = variants_csv if bin_present else variants_bin
+    present = variants_bin if bin_present else variants_csv
+    raise ValueError(
+        f"inconsistent variant-axis sidecars for binary {binary_name!r}: "
+        f"{present.name} is present but its required pair {missing.name} is "
+        f"missing. These two files are written in lockstep by the memmap "
+        f"builder -- one without the other means the corpus is incomplete, "
+        f"and decoding would SILENTLY drop the variant-axis prefix from every "
+        f"row. Restore {missing.name} (or remove {present.name} to opt the "
+        f"binary back to the no-variant-axis legacy path)."
+    )
 
 
 # --------------------------------------------------------------------------
