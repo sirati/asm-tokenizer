@@ -60,26 +60,20 @@ from typing import (
 
 import numpy as np
 
-from tokenizer.aligned_data.loader.batch_decode._entry import (
-    PendingBatchDecode,
-    batch_decode,
-)
 from tokenizer.aligned_data.loader.batch_decode._types import (
-    BatchDecodeResult,
     SectionPointerSpec,
     VariantPadding,
-)
-from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
-    BucketedRunLengthCollector,
 )
 from tokenizer.aligned_data.loader.session import BinarySession
 
 from .._types import MultiBinaryBatchDecodeResult, MultiBinarySectionPointer
 from ._concat import _concat_results
+from ._engine import DecodeEngine, VectorBatchHandleProvider, decode_groups
 from ._sample import MultiBinarySortedIndexSampler
 
 
 __all__ = [
+    "DecodeEngine",
     "decode_pointer_batch",
     "open_length_bucketed_batch",
 ]
@@ -96,20 +90,33 @@ def decode_pointer_batch(
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
     inlined_equivalent_call_targets_only: bool = True,
     include_fid_sidecar: bool = False,
+    engine: DecodeEngine = DecodeEngine.BATCH_DECODE,
+    handle_provider: Optional[VectorBatchHandleProvider] = None,
 ) -> MultiBinaryBatchDecodeResult:
     """Session-agnostic core: decode a flat pointer batch + concat (plan D7).
 
     Groups ``pointers`` by ``binary_name``, iterates the binaries in
-    ``sorted(name)`` order, runs :func:`batch_decode` over each group on
-    the matching ALREADY-OPEN session looked up in ``sessions``, drives a
-    single shared :class:`BucketedRunLengthCollector` with ONE flush for
-    the whole batch, finalises every pending decode, and concatenates the
-    per-binary results via :func:`_concat_results`.
+    ``sorted(name)`` order, decodes each group through the selected
+    ``engine`` (:func:`._engine.decode_groups`), and concatenates the
+    per-binary results via :func:`_concat_results`. The grouping +
+    concatenation are engine-agnostic and owned here; the per-binary
+    decode (the collector/flush/finalise staged path for
+    :attr:`DecodeEngine.BATCH_DECODE`, or the geometry-first
+    :func:`vector_batch_tokens` path for :attr:`DecodeEngine.VECTOR_BATCH`)
+    is owned by :mod:`._engine`.
+
+    Engine selection is byte-identical: both engines are driven from the
+    SAME shared ``rng`` in the SAME alphabetical order, so the per-binary
+    samples are identical draw-for-draw and the concatenated result is
+    byte-for-byte equal across engines. :attr:`DecodeEngine.BATCH_DECODE`
+    is the default; :attr:`DecodeEngine.VECTOR_BATCH` additionally
+    requires ``handle_provider`` (``binary_name -> VectorBatchArmSet``,
+    caller-owned lifetime like ``sessions``).
 
     This function owns NO session lifetime: it neither opens nor closes
     sessions. Every binary referenced by a pointer MUST have an open
     session in ``sessions`` that stays open for the duration of the call
-    (the finalise phase reads session-backed numpy views).
+    (the finalise / scatter phase reads session-backed numpy views).
 
     Binary ordering: ``sorted(name)`` matches the alphabetical order
     :attr:`MultiBinarySortedIndexSampler.binary_names` exposes, so the
@@ -122,6 +129,8 @@ def decode_pointer_batch(
     ValueError
         When a pointer names a binary absent from ``sessions`` (a
         missing session is a hard caller error, not a skip).
+    ValueError
+        When ``engine=VECTOR_BATCH`` but ``handle_provider`` is ``None``.
     """
     if not pointers:
         raise ValueError(
@@ -136,49 +145,21 @@ def decode_pointer_batch(
             ptr.section_pointer,
         )
 
-    # Iterate per-binary work in alphabetical order so the concat input
-    # list is canonical and the resulting binary_id_per_row numbering is
-    # stable.
-    #
-    # One collector spans every per-binary Stage 1 walk; one flush
-    # amortises every call_target row's ``run_lengths`` across the whole
-    # batch_load. Caller-owned sessions stay open through both the
-    # staging phase AND the post-flush finalise phase.
-    collector = BucketedRunLengthCollector()
-    pending_decodes: List[Tuple[str, PendingBatchDecode]] = []
-    for binary_name in sorted(per_binary_pointers):
-        section_pointers = per_binary_pointers[binary_name]
-        if binary_name not in sessions:
-            raise ValueError(
-                "decode_pointer_batch: no open session for binary "
-                f"{binary_name!r}",
-            )
-        session = sessions[binary_name]
-        pending = batch_decode(
-            session,
-            section_pointers,
-            num_variants_per_section=num_variants_per_section,
-            context_len=context_len,
-            max_depth=max_depth,
-            variant_padding=variant_padding,
-            inlined_equivalent_call_targets_only=(
-                inlined_equivalent_call_targets_only
-            ),
-            include_fid_sidecar=include_fid_sidecar,
-            keep_intermediate=False,
-            rng=rng,
-            collector=collector,
-        )
-        pending_decodes.append((binary_name, pending))
-
-    # ONE flush -- one pow2-bucketed 2D run_lengths dispatch per bucket
-    # across every binary's call_target rows.
-    runlen_results = collector.flush()
-
-    per_binary_results: List[Tuple[str, BatchDecodeResult]] = [
-        (binary_name, pending.finalise(runlen_results))
-        for binary_name, pending in pending_decodes
-    ]
+    per_binary_results = decode_groups(
+        sessions,
+        per_binary_pointers,
+        engine=engine,
+        context_len=context_len,
+        num_variants_per_section=num_variants_per_section,
+        max_depth=max_depth,
+        rng=rng,
+        variant_padding=variant_padding,
+        inlined_equivalent_call_targets_only=(
+            inlined_equivalent_call_targets_only
+        ),
+        include_fid_sidecar=include_fid_sidecar,
+        handle_provider=handle_provider,
+    )
 
     return _concat_results(per_binary_results)
 

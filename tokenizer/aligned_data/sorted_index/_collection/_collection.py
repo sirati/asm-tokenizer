@@ -46,8 +46,17 @@ from tokenizer.aligned_data.loader.batch_decode._types import VariantPadding
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.session import BinarySession
 
+from tokenizer.aligned_data.loader.vector_batch.session_handles import (
+    VectorBatchArmSet,
+    open_vector_batch_arm_set,
+)
+
 from .._reader import SortedIndexReader
-from .._sampler import MultiBinarySortedIndexSampler, decode_pointer_batch
+from .._sampler import (
+    DecodeEngine,
+    MultiBinarySortedIndexSampler,
+    decode_pointer_batch,
+)
 from .._types import (
     IndexSpec,
     LengthReduction,
@@ -105,6 +114,11 @@ class IndexedMemmapCollection:
         }
         self._datasets = datasets
         self._sessions: Dict[str, BinarySession] = {}
+        # Lazy per-binary vector_batch handle bundles, opened on first
+        # VECTOR_BATCH decode and held on the same ExitStack as the
+        # sessions (released together on :meth:`close`). Empty unless the
+        # vector_batch engine is ever selected.
+        self._vb_handles: Dict[str, VectorBatchArmSet] = {}
         self._stack = ExitStack()
         self._closed = False
 
@@ -222,6 +236,7 @@ class IndexedMemmapCollection:
         variant_padding: VariantPadding = VariantPadding.PAD_NULL,
         inlined_equivalent_call_targets_only: bool = True,
         include_fid_sidecar: bool = False,
+        engine: DecodeEngine = DecodeEngine.BATCH_DECODE,
         spec: Optional[IndexSpec] = None,
     ) -> MultiBinaryBatchDecodeResult:
         """Sample ``batch_size`` pointers from ``spec`` and decode them.
@@ -233,6 +248,14 @@ class IndexedMemmapCollection:
         session lifecycle of :func:`open_length_bucketed_batch` is
         replaced here by sessions that persist across calls until
         :meth:`close`.
+
+        ``engine`` selects the per-binary decode engine
+        (:attr:`DecodeEngine.BATCH_DECODE`, the default; or
+        :attr:`DecodeEngine.VECTOR_BATCH`, the geometry-first path).
+        VECTOR_BATCH is byte-identical to BATCH_DECODE; the collection
+        supplies its per-binary :class:`VectorBatchArmSet` handles lazily
+        through :meth:`_handles_for` (held on the same :class:`ExitStack`
+        as the sessions, released together on :meth:`close`).
 
         Raises
         ------
@@ -271,6 +294,8 @@ class IndexedMemmapCollection:
                 inlined_equivalent_call_targets_only
             ),
             include_fid_sidecar=include_fid_sidecar,
+            engine=engine,
+            handle_provider=self._handles_for,
         )
 
     # ------------------------------------------------------------------
@@ -292,6 +317,28 @@ class IndexedMemmapCollection:
             self._sessions[qualified_name] = session
         return session
 
+    def _handles_for(self, qualified_name: str) -> VectorBatchArmSet:
+        """Return the persistent vector_batch handle bundle for ``qualified_name``.
+
+        Mirrors :meth:`_session_for`: opens both arms' columnar +
+        geometry + body handles lazily on first VECTOR_BATCH decode (a
+        member never decoded under that engine never opens handles),
+        registers the bundle on the same :class:`ExitStack` so
+        :meth:`close` releases it, and reuses it on subsequent calls. The
+        ``base_path`` / ``binary_name`` come from the member's
+        :class:`BinaryDataset` -- the same keys the index build uses.
+        """
+        handles = self._vb_handles.get(qualified_name)
+        if handles is None:
+            dataset = self._datasets[qualified_name]
+            handles = self._stack.enter_context(
+                open_vector_batch_arm_set(
+                    dataset.base_path, dataset.binary_name
+                )
+            )
+            self._vb_handles[qualified_name] = handles
+        return handles
+
     def _check_open(self) -> None:
         if self._closed:
             raise RuntimeError(
@@ -308,6 +355,7 @@ class IndexedMemmapCollection:
             return
         self._closed = True
         self._sessions.clear()
+        self._vb_handles.clear()
         self._stack.close()
 
     def __enter__(self) -> "IndexedMemmapCollection":
