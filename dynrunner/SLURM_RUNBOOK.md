@@ -23,10 +23,11 @@ The intended audience is a fresh subagent or a future-you returning to this afte
 >
 > The dispatch is `nix develop --command python -m dynrunner …`, run **DIRECTLY**. When watching it, that exact invocation **IS** the Monitor's command (see "Watching a running dispatch"). NEVER wrap the dispatch in anything:
 > - ❌ `bash -c "…"` / `sh -c` / a `cd &&` prefix
-> - ❌ an env-var prefix (e.g. `DYNRUNNER_*=… python -m dynrunner …`) — those logging env vars are **removed**; use the `--full-log-file` / `--full-log-dir` flags
-> - ❌ `| tee`, any pipe, or `>`/`2>&1` redirect
+> - ❌ an env-var prefix of ANY kind (e.g. `DYNRUNNER_*=…`, `PYTHONSAFEPATH=1`, `PYTHONPATH=… python -m dynrunner …`). The logging env vars are **removed** (use `--full-log-file` / `--full-log-dir`); and the canonical command is `nix develop --command python -m dynrunner …` run from the worktree cwd, which already provides the deps + puts the project on `sys.path` — `PYTHONSAFEPATH`/`PYTHONPATH` are NOT needed and `PYTHONSAFEPATH=1` actively BREAKS `-m dynrunner` resolution by stripping cwd.
+> - ❌ `| grep` / `| sed` / `| awk` / `| rg` / `--line-buffered` / **ANY text-filter or pipe** on the dispatch stdout — AND none on a `--full-log-file` used as the event source either. **`--important-stdio-only` IS the filter.** A `grep` on top (e.g. `| grep -E "promot|secondary|primary|Traceback|error|complete|…"`) SILENTLY DROPS wake events whose wording you didn't predict — the run can finish, promote, or fail and the Monitor never surfaces it. The Monitor's command is the BARE dispatch; its `--important-stdio-only` stdout flows UNFILTERED, one line = one event.
+> - ❌ `| tee`, any other pipe, or `>`/`2>&1` redirect
 > - ❌ `timeout …`
-> - ❌ backgrounding (`&`) + a separate `tail -f` Monitor, or any `while/until … sleep` babysitter / single-fire waiter loop
+> - ❌ backgrounding (`&`) + a separate `tail -f`/`grep` Monitor on the log, or any `while/until … sleep` babysitter / single-fire waiter loop
 >
 > Run it bare; verify after with a ONE-SHOT check (gateway output files + `ps`/`squeue`), never a timed/polling loop. (NB: the framework's own `dynrunner-slurm-wrapper` binary is an internal component the dispatcher uploads — unrelated to this; "no wrappers" means no scaffolding around YOUR `python -m dynrunner` invocation.)
 
@@ -126,10 +127,13 @@ waiter loop, polling Monitor, or `timeout`.
   fact — never a looping Monitor.
 - **Omitting `--important-stdio-only`** then monitoring the raw verbose stdout
   — it floods the event stream and the Monitor auto-stops.
-- **Any scaffolding around the bare dispatch** — env-var prefixes, `bash -c`/`cd`,
-  `timeout`, `| tee`/pipes, OR a separate single-fire waiter loop to detect
-  teardown. Run the dispatch bare; verify after with a one-shot check, never a
-  timed or polling loop.
+- **Filtering the dispatch stdout (or the full-log) through `grep`/`sed`/`awk`/`rg`.**
+  e.g. `nix develop --command python -m dynrunner … --important-stdio-only | grep -E "promot|secondary|primary|Traceback|error|complete|…"`. This is the single most insidious violation: `--important-stdio-only` is ALREADY the event filter, and a keyword `grep` on top drops any wake line whose exact wording you failed to anticipate (a new promotion phrase, an unfamiliar failure string), so the run silently finishes/fails behind your filter and the Monitor never wakes you. NO text-filter, on the stdout OR on a `--full-log-file` tailed as the event source. The Monitor runs the BARE dispatch; every `--important-stdio-only` line is an event, unfiltered.
+- **Any scaffolding around the bare dispatch** — env-var prefixes (including
+  `PYTHONSAFEPATH`/`PYTHONPATH`), `bash -c`/`cd`, `timeout`, `| tee`/`| grep`/any
+  pipe, OR a separate single-fire waiter loop to detect teardown. Run the
+  dispatch bare (`nix develop --command python -m dynrunner …` from the worktree
+  cwd); verify after with a one-shot check, never a timed or polling loop.
 
 ## Inspecting a running secondary
 
