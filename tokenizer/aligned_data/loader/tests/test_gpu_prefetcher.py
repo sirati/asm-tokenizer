@@ -2,11 +2,17 @@
 
 torch is ABSENT from the dev shell, so coverage is HONEST about its
 scope: these tests exercise the GENERIC PYTREE MOVE (A), the
-multi-process ORCHESTRATION + FIFO + exception propagation (B), and the
+multi-process ORCHESTRATION + FIFO + exception propagation (B), the
 memmap-after-fork guarantee (C) via DEPENDENCY INJECTION (an injected
-``to_device`` + ``is_leaf``). The REAL cuda overlap -- copy stream, event
-record/wait, pinned async H2D -- is UNVALIDATED here and MUST be
-validated by the consumer on their GPU (test D, skipped without torch).
+``to_device`` + ``is_leaf``), and -- via an INJECTED FAKE CUDA BACKEND
+that records the ordered op sequence + stream identities -- the H2D
+overlap ORCHESTRATION/ORDER (E): separate copy stream, pin-before-
+non_blocking copy, event recorded on the copy stream AFTER the copy,
+consumer wait_event on the compute stream, and record_stream of every
+uploaded leaf on the compute stream (the cross-stream-reuse fix). The
+overlap ORDER is now validated without a GPU; the REAL torch.cuda
+hardware confirmation stays a consumer-side smoke (test D, skipped
+without torch).
 """
 
 from __future__ import annotations
@@ -302,3 +308,202 @@ def test_real_cuda_overlap_smoke():
         assert b0["x"].device.type == "cuda"
         assert b0["nt"].ids.device.type == "cuda"
         assert b0["n"] == 4
+
+
+# ==========================================================================
+# E. H2D-OVERLAP ORCHESTRATION via an INJECTED FAKE CUDA BACKEND (no GPU)
+# ==========================================================================
+# The CudaBackend seam lets us drive a REAL GpuBatchPrefetcher end-to-end
+# with a fake torch.cuda that RECORDS the ordered op sequence + stream
+# identities, so the overlap ORDER is asserted without a GPU. The fake is
+# parametrizable to BREAK exactly one invariant at a time, proving the
+# assertions are mutation-sensitive (skip pin / wrong stream / event-before-
+# copy / no wait_event / no record_stream each make the test FAIL).
+class _FakeStream:
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"_FakeStream({self.label!r})"
+
+
+class _FakeEvent:
+    def __init__(self, on_stream: _FakeStream) -> None:
+        self.on_stream = on_stream
+
+
+class _FakeCudaBackend:
+    """A torch-free CudaBackend that logs the ordered overlap ops + streams.
+
+    ``defects`` flips one invariant at a time so the asserting test can
+    prove it catches each break:
+      - "skip_pin"        : the per-leaf move skips pinning
+      - "compute_stream"  : the copy runs on the compute stream, not copy
+      - "event_before"    : event is recorded BEFORE the copy is enqueued
+      - "no_wait"         : the consumer never waits on the event
+      - "no_record_stream": uploaded leaves are not record_stream'd
+    """
+
+    def __init__(self, defects: frozenset[str] = frozenset()) -> None:
+        self.defects = defects
+        self.log: list[tuple] = []
+        self.lock = threading.Lock()
+        self.compute_stream = _FakeStream("compute")
+        self.copy_stream = _FakeStream("copy")
+        # The "current" stream a move sees; set inside upload's context so
+        # the injected to_device can record WHICH stream the copy ran on.
+        self._cur_stream = self.compute_stream
+
+    def _emit(self, *event: Any) -> None:
+        with self.lock:
+            self.log.append(event)
+
+    # -- the move primitive the prefetcher's to_device delegates to --------
+    def move_leaf(self, t: "FakeTensor") -> "FakeTensor":
+        if "skip_pin" not in self.defects:
+            self._emit("pin", t.name)
+        # ("copy", name, stream_label, non_blocking)
+        self._emit("copy", t.name, self._cur_stream.label, True)
+        return FakeTensor(t.name, device="cuda")
+
+    # -- CudaBackend surface ----------------------------------------------
+    def make_copy_stream(self, device: Any) -> _FakeStream:
+        return self.copy_stream
+
+    def upload(self, cpu_batch, device, copy_stream, move_one, is_leaf):
+        ctx_stream = (
+            self.compute_stream
+            if "compute_stream" in self.defects
+            else copy_stream
+        )
+        event = _FakeEvent(on_stream=ctx_stream)
+        if "event_before" in self.defects:
+            self._emit("event_record", ctx_stream.label)
+        prev, self._cur_stream = self._cur_stream, ctx_stream
+        try:
+            gpu_batch = map_tensor_leaves(cpu_batch, move_one, is_leaf=is_leaf)
+        finally:
+            self._cur_stream = prev
+        if "event_before" not in self.defects:
+            self._emit("event_record", ctx_stream.label)
+        return (gpu_batch, event)
+
+    def wait(self, gpu_batch, event, device, is_leaf):
+        if "no_wait" not in self.defects:
+            self._emit("wait_event", self.compute_stream.label, id(event))
+        if "no_record_stream" not in self.defects:
+            map_tensor_leaves(
+                gpu_batch,
+                lambda t: self._emit("record_stream", t.name, self.compute_stream.label)
+                or t,
+                is_leaf=is_leaf,
+            )
+
+
+# Module-level (picklable under spawn). The worker only runs make/produce;
+# the FAKE tensors must survive the IPC pickle, which FakeTensor already does.
+# The namedtuple MUST be module-level too -- a function-local namedtuple is
+# unpicklable, so the worker's result would never return and get() would hang.
+import collections as _collections
+
+_NT_E = _collections.namedtuple("_NT_E", ["ids"])
+
+
+def _make_source_e():
+    return object()
+
+
+def _produce_two_leaf(_src, n):
+    # Two tensor leaves under different container types + a passthrough int.
+    return {"x": FakeTensor(f"x{n}"), "nt": _NT_E(FakeTensor(f"ids{n}")), "n": int(n)}
+
+
+def _drive_overlap(backend: _FakeCudaBackend) -> dict:
+    """Run one batch through a real prefetcher against ``backend``; return it."""
+    with GpuBatchPrefetcher(
+        make_source=_make_source_e,
+        produce=_produce_two_leaf,
+        device="cuda:fake",
+        decode_workers=1,
+        decode_ahead=2,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=lambda t, _device: backend.move_leaf(t),
+        is_leaf=_is_fake_tensor,
+        cuda_backend=backend,
+    ) as p:
+        p.submit(4)
+        batch = p.get()
+    return batch
+
+
+def _assert_overlap_invariants(backend: _FakeCudaBackend, batch: dict) -> None:
+    """The overlap CONTRACT: every leaf moved to cuda, and the op log obeys
+    pin<copy, copy-on-copy-stream, event-after-copy-on-copy-stream,
+    wait-then-record_stream on the compute stream for every leaf."""
+    # Every tensor leaf is GPU-resident.
+    assert batch["x"].device == "cuda"
+    assert batch["nt"].ids.device == "cuda"
+    assert batch["n"] == 4
+
+    log = backend.log
+    ops = [e[0] for e in log]
+
+    # (a) copy stream is SEPARATE from the compute stream.
+    assert backend.copy_stream.label != backend.compute_stream.label
+
+    leaf_names = {"x4", "ids4"}
+    for name in leaf_names:
+        pin_idxs = [k for k, e in enumerate(log) if e == ("pin", name)]
+        # (b) the leaf is PINNED (else non_blocking H2D is a silent no-op)...
+        assert pin_idxs, f"{name}: must be pinned before the copy"
+        i_pin = pin_idxs[0]
+        i_copy = next(
+            k for k, e in enumerate(log)
+            if e[0] == "copy" and e[1] == name
+        )
+        # ...and pinned BEFORE its non_blocking copy.
+        assert i_pin < i_copy, f"{name}: pin must precede copy"
+        # (a) the copy runs on the COPY stream (not compute) with
+        #     non_blocking=True -- else non_blocking is a silent no-op.
+        assert log[i_copy][2] == backend.copy_stream.label, f"{name}: copy on copy stream"
+        assert log[i_copy][3] is True, f"{name}: copy must be non_blocking"
+
+    # (c) the event is recorded ON the copy stream AFTER all copies enqueued.
+    i_event = ops.index("event_record")
+    last_copy = max(k for k, e in enumerate(log) if e[0] == "copy")
+    assert i_event > last_copy, "event must be recorded after the copies"
+    assert log[i_event][1] == backend.copy_stream.label, "event on the copy stream"
+
+    # (d) the consumer waits on the event (compute stream) BEFORE handing the
+    #     batch to compute, and record_stream's EVERY leaf on the compute
+    #     stream (cross-stream-reuse fix).
+    assert "wait_event" in ops, "consumer must wait on the copy event"
+    i_wait = ops.index("wait_event")
+    assert log[i_wait][1] == backend.compute_stream.label
+    assert i_wait > i_event, "consumer waits after the copy event is recorded"
+    recorded = {e[1] for e in log if e[0] == "record_stream"}
+    assert recorded == leaf_names, "every uploaded leaf must be record_stream'd"
+    for k, e in enumerate(log):
+        if e[0] != "record_stream":
+            continue
+        assert e[2] == backend.compute_stream.label
+        assert k > i_wait, "record_stream after the wait"
+
+
+def test_overlap_orchestration_order_with_fake_cuda():
+    backend = _FakeCudaBackend()
+    batch = _drive_overlap(backend)
+    _assert_overlap_invariants(backend, batch)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["skip_pin", "compute_stream", "event_before", "no_wait", "no_record_stream"],
+)
+def test_overlap_invariants_are_mutation_sensitive(defect):
+    # Breaking ANY single overlap invariant must make the assertions FAIL.
+    backend = _FakeCudaBackend(defects=frozenset({defect}))
+    batch = _drive_overlap(backend)
+    with pytest.raises(AssertionError):
+        _assert_overlap_invariants(backend, batch)
