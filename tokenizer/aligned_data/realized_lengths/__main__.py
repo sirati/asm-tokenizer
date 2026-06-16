@@ -87,9 +87,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_binaries=args.max_binaries,
     )
 
-    for binary_name in selected:
+    for binary in selected:
         for generate in (generate_realized_lengths, generate_realized_geometry):
-            written = generate(args.input_dir, binary_name)
+            written = generate(binary.memmap_dir, binary.name)
             for paths in written.values():
                 for path in paths:
                     print(path)

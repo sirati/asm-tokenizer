@@ -30,6 +30,8 @@ from dynamic_runner.worker import Task, WorkerOutput, run, task_function
 from shared import increase_csv_field_size_limit, remove_stream_handlers
 from tokenizer.memmap_builder.builder import BinaryVersionInfo, build_memmap_files
 from tokenizer.output_staging import UNIFY_VOCAB_SCOPE, published_path, staged_publish
+
+from dynrunner.build_memmap._publish_scope import build_memmap_scope
 from tokenizer.variant_info import VariantInfo
 
 logger = logging.getLogger(__name__)
@@ -169,7 +171,9 @@ def _process_payload(
     # `<binary>.warn.log`) under `/app/out-tmp/build_memmap/<binary>/`
     # and atomic-publish to `output_dir` only on clean exit. A worker
     # killed mid-write leaves nothing partial on `/app/out-network`.
-    with staged_publish(task, output_dir, scope=f"build_memmap/{binary_name}") as stage_dir:
+    with staged_publish(
+        task, output_dir, scope=build_memmap_scope(binary_name)
+    ) as stage_dir:
         build_memmap_files(versions, stage_dir, binary_name, unified_vocab_path)
 
 

@@ -83,6 +83,16 @@ SORTED_INDEX_WORKER = "dynrunner.build_index.sorted_index_worker"
 _RLEN_TASK_PREFIX = "rlen:"
 _SIDX_TASK_PREFIX = "sidx:"
 
+# Payload keys on the wire. ``binary_name`` is the opaque identifier; the
+# worker re-derives no path from it directly. ``memmap_dir`` is the
+# directory that binary's memmap sidecars live in (flat scanned dir OR a
+# per-binary nested subdir) -- the worker reads it from the payload and
+# passes it as the generator's base_path, staying ignorant of the
+# discovery layout. Shared with the workers so the literal is defined
+# once on both wire ends.
+PAYLOAD_BINARY_NAME = "binary_name"
+PAYLOAD_MEMMAP_DIR = "memmap_dir"
+
 
 def _rlen_task_id(binary_name: str) -> str:
     return f"{_RLEN_TASK_PREFIX}{binary_name}"
@@ -179,8 +189,8 @@ class BuildIndexTask:
             max_binaries=getattr(args, "max_binaries", None),
         )
         items: list[TaskInfo] = []
-        for binary_name in selected:
-            items.extend(self.items_for_binary(binary_name))
+        for binary in selected:
+            items.extend(self.items_for_binary(binary.name, binary.memmap_dir))
         _logger.info(
             "build-index: discovered %d binaries → %d items (%d binaries × 2 types)",
             len(selected),
@@ -189,7 +199,9 @@ class BuildIndexTask:
         )
         return items
 
-    def items_for_binary(self, binary_name: str) -> list[TaskInfo]:
+    def items_for_binary(
+        self, binary_name: str, memmap_dir: Path
+    ) -> list[TaskInfo]:
         """The two phase-4 items for a single binary: rlen + sorted-index.
 
         Public so the composite pipeline can spawn a single binary's
@@ -197,10 +209,21 @@ class BuildIndexTask:
         (per-binary phase-3→4 overlap), reusing the exact same item shape
         as standalone discovery. The sorted-index item depends on the
         realized-length item (same phase, bare ``TaskDep``).
+
+        ``memmap_dir`` is the directory that binary's memmap sidecars
+        live in (the scanned dir in the flat layout, a per-binary
+        subdirectory in the nested container layout). It rides each
+        item's payload so the worker reads the sidecars from the right
+        place without knowing the discovery layout -- ``--output`` stays
+        the framework-supplied root for both layouts.
         """
         identifier = _opaque_identifier(binary_name)
         rlen_id = _rlen_task_id(binary_name)
         sidx_id = _sidx_task_id(binary_name)
+        payload = {
+            PAYLOAD_BINARY_NAME: binary_name,
+            PAYLOAD_MEMMAP_DIR: str(memmap_dir),
+        }
         rlen_item = TaskInfo(
             path=Path(binary_name),
             size=0,
@@ -209,7 +232,7 @@ class BuildIndexTask:
             type_id=REALIZED_LENGTHS_TYPE,
             affinity_id=None,
             task_id=rlen_id,
-            payload={"binary_name": binary_name},
+            payload=dict(payload),
         )
         sidx_item = TaskInfo(
             path=Path(binary_name),
@@ -226,7 +249,7 @@ class BuildIndexTask:
             # permanent failure — barrier-on-completion, matching the
             # pipeline's per-version skip-on-missing-input contract).
             task_depends_on=(TaskDep(task_id=rlen_id),),
-            payload={"binary_name": binary_name},
+            payload=dict(payload),
         )
         return [rlen_item, sidx_item]
 

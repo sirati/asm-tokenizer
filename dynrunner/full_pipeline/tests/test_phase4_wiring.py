@@ -26,10 +26,12 @@ from dynamic_runner import TaskDep
 
 from dynrunner.binary_selection import BinaryIdentifier, TaskInfo
 from dynrunner.build_index.build_index_task import (
+    PAYLOAD_MEMMAP_DIR,
     REALIZED_LENGTHS_TYPE,
     SORTED_INDEX_TYPE,
     _rlen_task_id,
 )
+from dynrunner.build_memmap._publish_scope import memmap_dir_for
 from dynrunner.build_memmap.memmap_builder_task import (
     _PHASE_ID as MEMMAP_PHASE_ID,
     _TYPE_ID as MEMMAP_TYPE_ID,
@@ -157,13 +159,21 @@ def test_composite_parse_fails_loud_when_mode_depth_omitted() -> None:
 
 def test_build_index_items_decorate_cross_phase_dep() -> None:
     """Each binary's rlen item gains the cross-phase ``memmap`` edge;
-    the sorted-index item keeps its intra-phase rlen edge unchanged."""
+    the sorted-index item keeps its intra-phase rlen edge unchanged; and
+    every item carries the binary's resolved ``memmap_dir`` payload."""
     fp = FullPipelineTask()
+    fp._user_source = Path("/root/src")  # noqa: SLF001
+    fp._user_output = Path("/root/out")  # noqa: SLF001
     memmap_items = [_memmap_item("hello"), _memmap_item("world")]
     index_items = fp._build_index_items_for_memmap(memmap_items)  # noqa: SLF001
 
     # 2 binaries × 2 types.
     assert len(index_items) == 4
+
+    # The memmap phase publishes under <out>/memmap; each binary's
+    # memmap_dir resolves through the shared scope helper (standalone test
+    # env → flat, so it equals the memmap root).
+    expected_memmap_dir = str(memmap_dir_for(Path("/root/out") / "memmap", "hello"))
 
     for name in ("hello", "world"):
         rlen = next(
@@ -182,6 +192,16 @@ def test_build_index_items_decorate_cross_phase_dep() -> None:
         )
         # sidx keeps its INTRA-PHASE rlen edge (no phase_id qualifier).
         assert sidx.task_depends_on == (TaskDep(task_id=_rlen_task_id(name)),)
+        # Each binary's memmap_dir rides the payload, resolved against the
+        # memmap phase's output root.
+        for it in (rlen, sidx):
+            assert it.payload[PAYLOAD_MEMMAP_DIR] == str(
+                memmap_dir_for(Path("/root/out") / "memmap", name)
+            )
+    # Sanity: the helper is the single resolver, not a hand-built literal.
+    assert expected_memmap_dir == str(
+        memmap_dir_for(Path("/root/out") / "memmap", "hello")
+    )
 
 
 def test_cospawn_batch_contains_memmap_and_index() -> None:
