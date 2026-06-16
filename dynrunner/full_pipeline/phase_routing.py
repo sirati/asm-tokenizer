@@ -7,8 +7,9 @@ semantics that ``dynrunner.__main__`` used to apply between three
 independent dispatches, but expressed as a pure data mapping consumed
 inside one composite TaskDefinition.
 
-Why a separate module: the routing rule ("phase 2/3 read the tokenize
-output; phase 3 writes into a ``memmap/`` subdir") is the single piece
+Why a separate module: the routing rule ("phases 2-4 read the tokenize
+output root; the memmap + index workers' staging scopes own their
+per-binary sub-pathing under that root") is the single piece
 of cross-phase knowledge the composite needs. Keeping it isolated lets
 the rest of ``full_pipeline`` stay agnostic of which subtree each child
 walks — every protocol method delegates to the child paired with a
@@ -74,21 +75,30 @@ def _route_unify_vocab(user_source: Path, user_output: Path) -> PhaseRoute:
 
 
 def _route_build_memmap(user_source: Path, user_output: Path) -> PhaseRoute:
-    # Phase 3 reads the same tree the tokenize+unify phases wrote, but
-    # publishes flat-named memmap artefacts into a sibling ``memmap/``
-    # subdir to keep them separate from the per-binary CSV layout.
-    return PhaseRoute(source_dir=user_output, output_dir=user_output / "memmap")
+    # Phase 3 reads the same tree the tokenize+unify phases wrote and
+    # publishes each binary's memmap artefacts under the worker's
+    # ``build_memmap/<name>/`` STAGING SCOPE. The publish layer mirrors
+    # that scope under the run output root (``<out>/build_memmap/<name>``),
+    # so output_dir is the user root itself — NOT a ``memmap/`` subdir.
+    # The staging scope owns ALL sub-pathing under the publish root;
+    # ``--output`` never routes the publish destination (a ``memmap/``
+    # prefix here is phantom — publish ignores it — and only mis-anchors
+    # the phase-4 read against artefacts that actually land at
+    # ``<out>/build_memmap/<name>``). Matches the proven standalone layout.
+    return PhaseRoute(source_dir=user_output, output_dir=user_output)
 
 
 def _route_build_index(user_source: Path, user_output: Path) -> PhaseRoute:
-    # Phase 4 reads the per-binary memmap sidecars phase 3 wrote and
-    # publishes its index sidecars (realized-length + sorted-index)
-    # co-located there. Source == output == the ``memmap/`` subdir,
-    # because the index generators read and write the same directory by
-    # design (the sorted-index build reads the realized-length sidecars
-    # the same pass produced).
-    memmap_dir = user_output / "memmap"
-    return PhaseRoute(source_dir=memmap_dir, output_dir=memmap_dir)
+    # Phase 4 reads each binary's memmap sidecars from the
+    # ``build_memmap/<name>/`` dir phase 3 published under the run output
+    # root, and publishes its own index sidecars (realized-length +
+    # sorted-index) the same scope-owned way. Source == output == the
+    # user root: the per-binary read dir is resolved by ``memmap_dir_for``
+    # against this root (-> ``<out>/build_memmap/<name>``, matching the
+    # publish location), and the index generators' staging scope owns
+    # their output sub-pathing. NO ``memmap/`` prefix — the publish layer
+    # never creates that segment.
+    return PhaseRoute(source_dir=user_output, output_dir=user_output)
 
 
 _PHASE_ROUTES = {

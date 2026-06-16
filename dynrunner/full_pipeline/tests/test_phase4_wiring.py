@@ -6,8 +6,10 @@ Pins:
   ``depends_on=("memmap",)`` but ``barrier=False`` (the pipelined edge,
   so it does not barrier behind full-phase-3 drain) and is
   ``may_be_empty=True``;
-* the index phase's two types route to the ``memmap/`` subdir for both
-  ``--source`` and ``--output``;
+* the index phase's two types route to the user output ROOT for both
+  ``--source`` and ``--output`` (the publish layer's staging scope owns
+  the per-binary ``build_memmap/<name>`` sub-pathing, so there is NO
+  ``memmap/`` prefix — that segment is phantom);
 * ``_spawn_phase_items(memmap)`` co-spawns each binary's two index items
   in the SAME batch as its memmap item; the rlen item carries the
   cross-phase ``memmap`` dep, the sorted-index item keeps its intra-
@@ -107,19 +109,25 @@ def test_four_phases_index_pipelined_edge_and_may_be_empty() -> None:
     assert by_id["memmap"].barrier is True
 
 
-def test_index_types_route_to_memmap_subdir() -> None:
+def test_index_types_route_to_user_output_root() -> None:
     fp = FullPipelineTask()
     args = _composite_args()
     for type_id in (REALIZED_LENGTHS_TYPE, SORTED_INDEX_TYPE):
         argv = fp.build_worker_command_args(
             type_id, args, "/root/out", "/root/out", False
         )
-        # Source + output both point at the memmap/ subdir.
+        # Source + output both point at the user output ROOT — NOT a
+        # ``memmap/`` subdir. The publish layer mirrors each worker's
+        # staging scope (``build_memmap/<name>``) under the run output
+        # root, so the index read path must anchor at that root; a
+        # ``memmap/`` prefix is phantom (publish never creates it) and
+        # would mis-anchor the read against artefacts that land at
+        # ``<out>/build_memmap/<name>``.
         assert "--source" in argv and "--output" in argv
         src = argv[argv.index("--source") + 1]
         out = argv[argv.index("--output") + 1]
-        assert src == str(Path("/root/out") / "memmap")
-        assert out == str(Path("/root/out") / "memmap")
+        assert src == "/root/out"
+        assert out == "/root/out"
 
 
 def test_sorted_index_worker_argv_carries_mode_and_depth() -> None:
@@ -170,10 +178,11 @@ def test_build_index_items_decorate_cross_phase_dep() -> None:
     # 2 binaries × 2 types.
     assert len(index_items) == 4
 
-    # The memmap phase publishes under <out>/memmap; each binary's
-    # memmap_dir resolves through the shared scope helper (standalone test
-    # env → flat, so it equals the memmap root).
-    expected_memmap_dir = str(memmap_dir_for(Path("/root/out") / "memmap", "hello"))
+    # The memmap phase publishes each binary under <out>/build_memmap/<name>
+    # (the staging scope, mirrored under the run output ROOT — no memmap/
+    # segment); each binary's memmap_dir resolves through the shared scope
+    # helper against that root.
+    expected_memmap_dir = str(memmap_dir_for(Path("/root/out"), "hello"))
 
     for name in ("hello", "world"):
         rlen = next(
@@ -193,14 +202,15 @@ def test_build_index_items_decorate_cross_phase_dep() -> None:
         # sidx keeps its INTRA-PHASE rlen edge (no phase_id qualifier).
         assert sidx.task_depends_on == (TaskDep(task_id=_rlen_task_id(name)),)
         # Each binary's memmap_dir rides the payload, resolved against the
-        # memmap phase's output root.
+        # memmap phase's output root (the user output root, NOT a memmap/
+        # subdir — matching where the publish layer writes its artefacts).
         for it in (rlen, sidx):
             assert it.payload[PAYLOAD_MEMMAP_DIR] == str(
-                memmap_dir_for(Path("/root/out") / "memmap", name)
+                memmap_dir_for(Path("/root/out"), name)
             )
     # Sanity: the helper is the single resolver, not a hand-built literal.
     assert expected_memmap_dir == str(
-        memmap_dir_for(Path("/root/out") / "memmap", "hello")
+        memmap_dir_for(Path("/root/out"), "hello")
     )
 
 
