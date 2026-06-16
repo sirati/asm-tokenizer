@@ -278,7 +278,6 @@ def _resolve_node_children(
     *,
     session: "BinarySession",
     arm: SectionKind,
-    mask_row: int,
     section: Section,
     variant_idx: int,
     section_meta_memo: CalleeSectionMetaMemo,
@@ -347,7 +346,6 @@ def _step_level(
         for rc, called_idx in _resolve_node_children(
             session=session,
             arm=arm,
-            mask_row=fr.mask_row,
             section=fr.section,
             variant_idx=fr.variant_idx,
             section_meta_memo=section_meta_memo,
@@ -456,7 +454,6 @@ def _expand_unmatched_level(
             for child_rc, child_called_idx in _resolve_node_children(
                 session=session,
                 arm=arm,
-                mask_row=mask_row,
                 section=rc.section,
                 variant_idx=rc.variant_idx,
                 section_meta_memo=section_meta_memo,
