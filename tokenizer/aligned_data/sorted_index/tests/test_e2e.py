@@ -6,9 +6,12 @@ writer -> file -> discovery -> reader -> sampler -> batch helper
 surfaces as a single failing test:
 
 1. Lay down a tiny 2-binary memmap dir by running the synthetic
-   ``build_combined_fixture`` twice into separate scratch dirs and
-   renaming the on-disk binary-name prefix into one shared dir
+   ``build_combined_fixture_with_variants`` twice into separate scratch
+   dirs and renaming the on-disk binary-name prefix into one shared dir
    (mirrors the helper in ``test_batch_helper.py`` + ``test_cli.py``).
+   The variant-bearing fixture lays down a real ``_variants.bin`` +
+   ``_variants.csv`` so each decoded row carries a non-empty multi-token
+   variant-axis prefix.
 2. Run :func:`write_sorted_index_files` for each binary with multiple
    modes (``[MAX, P95]``) -- exercises the §D8 multi-mode amortised
    walk and the canonical-filename writer.
@@ -18,7 +21,10 @@ surfaces as a single failing test:
 5. Build a :class:`MultiBinarySortedIndexSampler` over the two readers.
 6. Sample a small batch via :func:`open_length_bucketed_batch`.
 7. Assert tensor shapes + per-row binary-id provenance + bucket-bound
-   sanity (sampled rows came from the requested length bucket).
+   sanity (sampled rows came from the requested length bucket) AND the
+   per-row variant-axis prefix CONTENT against an independent
+   ``_variants.bin`` oracle (catches a dropped / mis-shifted prefix
+   token that a shape-only check would miss).
 
 This complements (does not replace) ``test_batch_helper.py``: that
 file exercises the helper against *hand-built* sorted-index files;
@@ -46,12 +52,21 @@ from tokenizer.aligned_data.sorted_index import (
 )
 
 from ._length_helpers import ensure_sidecar
-from .fixtures import build_combined_fixture, make_test_vocab_manager
+from .fixtures import (
+    build_combined_fixture_with_variants,
+    make_test_vocab_manager,
+)
 
 
 _BINARY_NAME_A = "binA"
 _BINARY_NAME_B = "binB"
 _DEPTH = 3
+
+# Padding-row sentinel in ``batch_idx_to_section_variant`` (mirrors the
+# decode pipeline's ``_batch_layout`` PAD_NULL sentinel). Rows holding
+# this carry no content, so their (zero) prefix is excluded from the
+# content oracle.
+_PAD_SENTINEL = np.uint32(0xFFFFFFFF)
 
 _MAX = LengthReduction(kind=ReductionKind.MAX)
 _P95 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=95)
@@ -62,20 +77,27 @@ _P95 = LengthReduction(kind=ReductionKind.PERCENTILE, percentile=95)
 # ---------------------------------------------------------------------------
 
 
-def _build_two_binary_memmap_dir(tmp_path: Path) -> Path:
+def _build_two_binary_memmap_dir(tmp_path: Path, vocab_manager) -> Path:
     """Lay down two distinct named binaries with identical synthetic content.
 
-    The ``build_combined_fixture`` helper hardcodes ``binary_name =
-    "sortbin"`` -- we invoke it against two child dirs and copy each
-    file across with a renamed prefix so the two binaries co-exist in
-    one memmap directory under independently-discoverable names.
+    The ``build_combined_fixture_with_variants`` helper hardcodes
+    ``binary_name = "sortbin"`` -- we invoke it against two child dirs
+    and copy each file across with a renamed prefix so the two binaries
+    co-exist in one memmap directory under independently-discoverable
+    names. The variant-bearing fixture lays down a real ``_variants.bin``
+    + ``_variants.csv`` so each decoded row carries a NON-EMPTY
+    multi-token axis prefix (the content the test asserts on); the
+    shared ``vocab_manager`` is the one the records are encoded against
+    and MUST be threaded into the decoding session.
     """
     memmap_dir = tmp_path / "memmap"
     memmap_dir.mkdir()
     for binary_name in (_BINARY_NAME_A, _BINARY_NAME_B):
         scratch = tmp_path / f"scratch_{binary_name}"
         scratch.mkdir()
-        combined_base = build_combined_fixture(scratch)
+        combined_base = build_combined_fixture_with_variants(
+            scratch, vocab_manager
+        )
         for entry in combined_base.iterdir():
             if not entry.is_file():
                 continue
@@ -91,9 +113,13 @@ def _build_two_binary_memmap_dir(tmp_path: Path) -> Path:
 
 
 @contextmanager
-def _session_factory_for(memmap_dir: Path):
-    """Context-manager session_factory closing over ``memmap_dir``."""
-    vocab_manager = make_test_vocab_manager()
+def _session_factory_for(memmap_dir: Path, vocab_manager):
+    """Context-manager session_factory closing over ``memmap_dir``.
+
+    Threads the caller-supplied ``vocab_manager`` (the one the
+    ``_variants.bin`` records were encoded against) so the in-session
+    variant resolver decodes the axis prefix back to the same vocab ids.
+    """
     @contextmanager
     def factory(binary_name: str) -> Iterator[BinarySession]:
         dataset = BinaryDataset(memmap_dir, binary_name, vocab_manager=vocab_manager)
@@ -131,7 +157,12 @@ def test_e2e_writer_through_batch_helper(tmp_path: Path) -> None:
       (the reader's ``count_at(target_length)`` covers every drawn
       row's source index).
     """
-    memmap_dir = _build_two_binary_memmap_dir(tmp_path)
+    # One shared VocabularyManager threads through the whole pipeline:
+    # the ``_variants.bin`` records are encoded against it (in the
+    # fixture) and the decoding session resolves the axis prefix back
+    # through the same id map.
+    vocab_manager = make_test_vocab_manager()
+    memmap_dir = _build_two_binary_memmap_dir(tmp_path, vocab_manager)
 
     # ---- 2. Run the real writer for each binary with [MAX, P95]. ----
     for binary_name in (_BINARY_NAME_A, _BINARY_NAME_B):
@@ -212,7 +243,7 @@ def test_e2e_writer_through_batch_helper(tmp_path: Path) -> None:
     context_len = 32
     rng = np.random.default_rng(42)
 
-    with _session_factory_for(memmap_dir) as factory:
+    with _session_factory_for(memmap_dir, vocab_manager) as factory:
         result = open_length_bucketed_batch(
             factory,
             sampler,
@@ -249,6 +280,74 @@ def test_e2e_writer_through_batch_helper(tmp_path: Path) -> None:
     ), (
         f"binary_id_per_row not sorted alphabetically: "
         f"{result.binary_id_per_row.tolist()}"
+    )
+
+    # ---- 7d. Variant-axis PREFIX content (not just shape). ----
+    #
+    # Each real (non-padding) row carries a leading variant-axis prefix
+    # -- the ``_variants.bin`` axis tokens, post-shift (id - 256) -- at
+    # columns ``[0 : n_axis]`` before the function body (plan D3 / ALG-9).
+    # A shape-only assertion would not notice an off-by-one that drops the
+    # LAST prefix token (cf. the vector_batch regression) nor a whole-axis
+    # drop. The oracle is read straight from the on-disk ``_variants.bin``
+    # via ``read_record`` -- a path independent of the decode pipeline.
+    # Every variant in this fixture resolves the single shared axis
+    # record, so one oracle prefix covers every real row.
+    from tokenizer.token_manager import VocabularyManager
+    from tokenizer.variant_tokens.record import read_record
+
+    reserved_digit_count = np.uint16(
+        VocabularyManager._V2_RESERVED_DIGIT_COUNT
+    )
+    oracle_prefix_per_binary = {}
+    for binary_name in result.binary_names:
+        variants_bytes = np.fromfile(
+            memmap_dir / f"{binary_name}_variants.bin", dtype=np.uint8
+        )
+        # The single shared record sits at byte 0; ``tokens[1:]`` drops
+        # the leading size header, leaving the raw axis vocab ids.
+        raw_axis = np.array(read_record(variants_bytes, 0)[1:], copy=True)
+        oracle_prefix_per_binary[binary_name] = (
+            raw_axis.astype(np.uint16) - reserved_digit_count
+        )
+    n_axis = oracle_prefix_per_binary[result.binary_names[0]].shape[0]
+    # Guard against a vacuous content assertion: the axis must be a real
+    # MULTI-token prefix that fits inside the context window (so the FULL
+    # prefix lands and an off-by-one on the last token is observable).
+    assert n_axis >= 2, (
+        f"oracle variant prefix is not multi-token (n_axis={n_axis}); "
+        "the content assertion would be vacuous -- the fixture must lay "
+        "down a non-trivial _variants.bin axis record"
+    )
+    assert n_axis < context_len, (
+        f"variant prefix (n_axis={n_axis}) does not fit context_len="
+        f"{context_len}; truncation would mask a last-token drop"
+    )
+
+    section_variant = inner.batch_idx_to_section_variant
+    asserted_real_rows = 0
+    for row_idx in range(expected_rows):
+        if section_variant[row_idx, 0] == _PAD_SENTINEL:
+            # Padding row: null content, no prefix to compare.
+            continue
+        binary_name = result.binary_names[int(result.binary_id_per_row[row_idx])]
+        expected_prefix = oracle_prefix_per_binary[binary_name]
+        np.testing.assert_array_equal(
+            inner.tokens[row_idx, :n_axis],
+            expected_prefix,
+            err_msg=(
+                f"row {row_idx} (binary {binary_name}): decoded variant "
+                f"prefix does not match the _variants.bin oracle -- a "
+                f"prefix token was dropped, mis-shifted, or shape-only "
+                f"coverage masked the content"
+            ),
+        )
+        asserted_real_rows += 1
+    # The batch must contain at least one real row whose prefix we
+    # actually checked, else the content assertion never ran.
+    assert asserted_real_rows >= 1, (
+        "no real (non-padding) rows in the batch; the prefix-content "
+        "assertion did not execute"
     )
 
     # ---- 8. Bucket-bound sanity ----
