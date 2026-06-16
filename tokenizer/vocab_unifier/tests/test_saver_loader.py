@@ -246,6 +246,65 @@ def test_per_binary_v2_round_trip() -> None:
     assert loaded.id_to_token[_RESERVED:] == vm.id_to_token[_RESERVED:]
 
 
+def test_empty_vocab_per_binary_round_trip_no_oob() -> None:
+    """A binary that tokenized to ZERO real vocab tokens (e.g. a
+    debug-only .dbg file) serialises an EMPTY vocab cell. The loader must
+    reconstruct it to an empty token list, NOT a phantom ``['']``: the
+    latter makes ``vocab_list`` one longer than ``id_to_token_type`` and
+    OOBs inside ``iter_representative_tokens`` (the binarycorps phase-2
+    crash, ``IndexError: index 257 is out of bounds for axis 0 with size
+    257``). Pins the empty-cell guard."""
+    vm = _make_vm(platform="x64", real_tokens=[], format_version=2)
+    raw = _save_to_bytes(vm)
+    loaded = load_vocab_manager_csv_row_bytes(raw, "x64")
+
+    assert loaded is not None
+    # No phantom empty-string token; vocab and type array stay 1:1.
+    assert "" not in loaded.id_to_token
+    assert len(loaded.id_to_token) == len(loaded._id_to_token_type)
+    assert len(loaded.id_to_token) == _RESERVED  # digits + value_negative, 0 real
+    # The representative walk (the exact OOB site) must complete.
+    list(loaded.iter_representative_tokens())
+
+
+def test_from_vocab_rejects_mismatched_id_to_token_type() -> None:
+    """Fail-loud guard: a supplied ``id_to_token_type`` whose length
+    disagrees with ``vocab_list`` is a construction-time error, not a
+    deferred OOB tens of thousands of CSVs later in unify. Pins the
+    ``token_manager.from_vocab`` guard."""
+    digit_names = [f"digit_{i:02X}" for i in range(_DIGIT_COUNT)]
+    vocab_list = digit_names + ["value_negative", "extra_token"]  # 258
+    short_types = np.full(_RESERVED, TokenType.UNRESOLVED, dtype=np.int8)  # 257 — one short
+    short_types[_DIGIT_COUNT] = TokenType.VALUE_NEGATIVE
+    empty_int = np.array([], dtype=np.int_)
+    with pytest.raises(ValueError, match="id_to_token_type length"):
+        VocabularyManager.from_vocab(
+            platform="x64",
+            vocab_list=vocab_list,
+            id_to_token_type=short_types,
+            platform_instruction_type_cache=np.full(
+                len(vocab_list), PlatformInstructionTypes.AGNOSTIC, dtype=np.int8
+            ),
+            lit_start_cache=empty_int,
+            lit_end_cache=empty_int,
+            platform_list=None,
+            token_to_platform=None,
+            format_version=2,
+        )
+
+
+def test_split_vocab_cell_empty_is_empty_list() -> None:
+    """Empty / quoted-empty cells yield ``[]`` (not ``['']``); populated
+    cells split normally. The ``"".split(',') == ['']`` gotcha was the
+    binarycorps phase-2 OOB root cause."""
+    from tokenizer.vocab_unifier.loader import _split_vocab_cell
+
+    assert _split_vocab_cell("") == []
+    assert _split_vocab_cell('""') == []
+    assert _split_vocab_cell("a,b,c") == ["a", "b", "c"]
+    assert _split_vocab_cell('"a,b"') == ["a", "b"]
+
+
 def test_unified_v1_trailer_cells_present() -> None:
     """Saver always stamps the 2-cell trailer for v1 unified vocabs.
     Wire layout: 13 base cells + 2 trailer cells = 15 total."""

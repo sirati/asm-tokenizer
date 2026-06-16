@@ -298,6 +298,18 @@ class VocabUnifierTask:
                 "output dir; default: unified_vocab.csv)."
             ),
         )
+        parser.add_argument(
+            "--insert-neg-value",
+            action="store_true",
+            help=(
+                "Legacy-compat: the per-binary CSVs predate value_negative "
+                "being reserved at slot 256 (first real token at per-binary "
+                "id 256). Pass for corpora tokenized pre-value_negative-"
+                "cutover; threads to the unify worker so the loader reserves "
+                "only the 256 digit slots and remaps real tokens (256+) into "
+                "the canonical unified layout."
+            ),
+        )
 
     def build_worker_command_args(
         self,
@@ -310,6 +322,8 @@ class VocabUnifierTask:
         cmd: list[str] = []
         if getattr(args, "out_unified_vocab", None):
             cmd.extend(["--out-unified-vocab", str(args.out_unified_vocab)])
+        if getattr(args, "insert_neg_value", False):
+            cmd.append("--insert-neg-value")
         return cmd
 
     def get_output_filename_pattern(

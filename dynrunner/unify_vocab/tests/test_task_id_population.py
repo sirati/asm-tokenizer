@@ -64,3 +64,28 @@ def test_task_id_equals_sentinel(synthetic_csv: Path, tmp_path: Path) -> None:
     assert items, "discover_items should emit one TaskInfo for the synthetic CSV"
     [item] = items
     assert item.task_id == "unify_vocab"
+
+
+def test_insert_neg_value_threads_to_worker_command(tmp_path: Path) -> None:
+    """The legacy ``--insert-neg-value`` flag must reach the worker argv.
+    Pre-fix the dynrunner unify task didn't thread it at all, so legacy
+    (pre-value_negative) corpora unified with the wrong reserved prefix.
+    Pin the wire: present when set, absent when not."""
+    task = VocabUnifierTask()
+    src, out = tmp_path / "s", tmp_path / "o"
+
+    parser = argparse.ArgumentParser()
+    add_asm_selection_arguments(parser)
+    task.add_private_task_arguments(parser)
+    parser.add_argument("--source", type=str, required=True)
+    parser.add_argument("--output", type=str, required=True)
+
+    args_on = parser.parse_args(
+        ["--source", str(src), "--output", str(out), "--insert-neg-value"]
+    )
+    cmd_on = task.build_worker_command_args("unify_vocab", args_on, src, out, False)
+    assert "--insert-neg-value" in cmd_on
+
+    args_off = parser.parse_args(["--source", str(src), "--output", str(out)])
+    cmd_off = task.build_worker_command_args("unify_vocab", args_off, src, out, False)
+    assert "--insert-neg-value" not in cmd_off

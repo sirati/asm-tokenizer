@@ -22,6 +22,21 @@ _PER_BINARY_FORMAT_VERSION = 2
 _SUPPORTED_FORMAT_VERSIONS = (MEMMAP_FORMAT_VERSION, _PER_BINARY_FORMAT_VERSION)
 
 
+def _split_vocab_cell(cell: str) -> list[str]:
+    """Split a quoted comma-joined vocab cell into a token list.
+
+    Guards the empty-cell case: ``"".split(",")`` returns ``['']`` (a
+    phantom empty-string token), which would make the reconstructed
+    ``vocab_list`` one entry longer than the (correctly empty)
+    ``id_to_token_type`` array and desync the VM (``size`` vs type-array
+    length). A binary that tokenized to zero real vocab tokens (e.g. a
+    debug-only ``.dbg`` file) serialises an empty cell; it must yield
+    ``[]``, not ``['']``.
+    """
+    stripped = cell.strip('"')
+    return stripped.split(",") if stripped else []
+
+
 def assert_valid_vocab_def(row: list[str], platform: Platform) -> None:
     # Layout: 10 base cells (per-binary) or 13 base cells (unified),
     # plus a mandatory 2-cell trailer ("format_version", "<int>"). The
@@ -122,7 +137,7 @@ def load_vocab_manager_csv_row_bytes(
     if not valid:
         return None
 
-    vocabulary = row[1].strip('"').split(",")
+    vocabulary = _split_vocab_cell(row[1])
     id_to_token_type_offset = int(row[2].partition("norm:")[2])
     platform_instruction_type_cache_offset = int(row[4].partition("norm:")[2])
     id_to_token_type = base64_to_ndarray(row[3]).astype(np.int8) + id_to_token_type_offset
@@ -130,7 +145,7 @@ def load_vocab_manager_csv_row_bytes(
     lit_start_cache = base64_to_ndarray(row[7]).astype(np.int_)
     lit_end_cache = base64_to_ndarray(row[9]).astype(np.int_)
     platform_offset = int(row[10].partition("norm:")[2]) if platform == "unified" else None
-    platform_list = row[11].strip('"').split(",") if platform == "unified" else None
+    platform_list = _split_vocab_cell(row[11]) if platform == "unified" else None
     token_to_platform = base64_to_ndarray(row[12]).astype(np.int8) + platform_offset if platform == "unified" else None
 
     # Trailer is mandatory (asserted upstream in assert_valid_vocab_def).
