@@ -53,6 +53,7 @@ from tokenizer.aligned_data.loader.vector_batch.session_handles import (
 
 from .._reader import SortedIndexReader
 from .._sampler import (
+    CrossSpecSortedIndexSampler,
     DecodeEngine,
     MultiBinarySortedIndexSampler,
     decode_pointer_batch,
@@ -112,6 +113,11 @@ class IndexedMemmapCollection:
             spec: MultiBinarySortedIndexSampler(readers_by_spec[spec])
             for spec in self._specs
         }
+        # One cross-(binary x spec) sampler over the SAME readers the
+        # per-spec samplers use, so a cross-depth draw is unbiased across
+        # the binary AND the depth axis at once (each pointer carries the
+        # spec it was drawn from).
+        self._cross_sampler = CrossSpecSortedIndexSampler(readers_by_spec)
         self._datasets = datasets
         self._sessions: Dict[str, BinarySession] = {}
         # Lazy per-binary vector_batch handle bundles, opened on first
@@ -220,6 +226,27 @@ class IndexedMemmapCollection:
             target_length, count, rng, band=band,
         )
 
+    def sample_section_pointers_cross_depth(
+        self,
+        target_length: int,
+        count: int,
+        rng: np.random.Generator,
+        *,
+        band: Optional[Tuple[int, int]] = None,
+    ) -> List[MultiBinarySectionPointer]:
+        """Unbiased cross-(binary x spec) sample over EVERY configured spec.
+
+        Draws across all ``(binary, spec)`` cells at once (no ``spec=``
+        selector -- the depth axis is part of the urn), so each returned
+        :class:`MultiBinarySectionPointer` carries the ``spec`` it was
+        drawn from. The downstream cross-depth decode reads each row's
+        ``max_depth`` straight off ``spec.depth``.
+        """
+        self._check_open()
+        return self._cross_sampler.sample_section_pointers(
+            target_length, count, rng, band=band,
+        )
+
     # ------------------------------------------------------------------
     # Batch loading
     # ------------------------------------------------------------------
@@ -295,6 +322,82 @@ class IndexedMemmapCollection:
             ),
             include_fid_sidecar=include_fid_sidecar,
             engine=engine,
+            handle_provider=self._handles_for,
+        )
+
+    def load_batch_cross_depth(
+        self,
+        target_length: int,
+        batch_size: int,
+        *,
+        rng: np.random.Generator,
+        band: Optional[Tuple[int, int]] = None,
+        context_len: int,
+        num_variants_per_section: int,
+        variant_padding: VariantPadding = VariantPadding.PAD_NULL,
+        inlined_equivalent_call_targets_only: bool = True,
+        include_fid_sidecar: bool = False,
+    ) -> MultiBinaryBatchDecodeResult:
+        """Sample + decode a mixed-depth batch over the cross-(binary x spec) urn.
+
+        Unlike :meth:`load_batch` (one ``spec`` -> one depth), this draws
+        across EVERY configured spec at once, so a single batch mixes
+        sections from different depths. Each sampled pointer's
+        ``spec.depth`` becomes its row's ``max_depth``; the per-pointer
+        depth vector is threaded to :func:`decode_pointer_batch`, which
+        regroups it by binary and runs the geometry-first
+        :func:`vector_batch_tokens` per depth group.
+
+        Cross-depth is VECTOR_BATCH-only (the staged BATCH_DECODE engine
+        has no per-row depth seam), so this method always selects
+        :attr:`DecodeEngine.VECTOR_BATCH` and supplies the per-binary
+        handle bundles via :meth:`_handles_for` -- exactly as
+        :meth:`load_batch` does for that engine.
+
+        Raises
+        ------
+        RuntimeError
+            After :meth:`close`.
+        ValueError
+            When the cross-depth sampler returns no pointers (empty pool
+            at ``target_length`` or across the whole ``band``).
+        """
+        self._check_open()
+        pointers = self._cross_sampler.sample_section_pointers(
+            target_length, batch_size, rng, band=band,
+        )
+        if not pointers:
+            if band is not None:
+                raise ValueError(
+                    "IndexedMemmapCollection.load_batch_cross_depth: empty "
+                    f"sampler pool in band {band}",
+                )
+            raise ValueError(
+                "IndexedMemmapCollection.load_batch_cross_depth: empty "
+                f"sampler pool at target_length={target_length}",
+            )
+
+        # Each row's depth = the spec it was drawn from. The cross-depth
+        # sampler always stamps a spec, so this never reads None.
+        max_depth_per_pointer = np.array(
+            [ptr.spec.depth for ptr in pointers], dtype=np.int64,
+        )
+
+        sampled = {ptr.binary_name for ptr in pointers}
+        sessions = {name: self._session_for(name) for name in sampled}
+        return decode_pointer_batch(
+            sessions,
+            pointers,
+            context_len=context_len,
+            num_variants_per_section=num_variants_per_section,
+            max_depth=max_depth_per_pointer,
+            rng=rng,
+            variant_padding=variant_padding,
+            inlined_equivalent_call_targets_only=(
+                inlined_equivalent_call_targets_only
+            ),
+            include_fid_sidecar=include_fid_sidecar,
+            engine=DecodeEngine.VECTOR_BATCH,
             handle_provider=self._handles_for,
         )
 

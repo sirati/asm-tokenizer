@@ -47,7 +47,16 @@ vector_batch entry. For BATCH_DECODE the provider is unused.
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
@@ -110,6 +119,14 @@ class DecodeEngine(Enum):
 VectorBatchHandleProvider = Callable[[str], object]
 
 
+#: Per-binary ``max_depth``: each binary maps to a scalar ``int`` (the
+#: historical path) or a per-section-pointer ``int`` array (the
+#: cross-depth path). The grouping into this shape is owned by
+#: :func:`._batch.decode_pointer_batch`; this module only routes each
+#: group's value to its engine.
+PerBinaryMaxDepth = Mapping[str, Union[int, np.ndarray]]
+
+
 def decode_groups(
     sessions: Mapping[str, BinarySession],
     per_binary_pointers: Mapping[str, List[SectionPointerSpec]],
@@ -117,7 +134,7 @@ def decode_groups(
     engine: DecodeEngine,
     context_len: int,
     num_variants_per_section: int,
-    max_depth: int,
+    max_depth: PerBinaryMaxDepth,
     rng: np.random.Generator,
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool,
@@ -136,6 +153,11 @@ def decode_groups(
     the SAME shared ``rng`` in the SAME order so their per-binary samples
     are byte-identical draw-for-draw.
 
+    ``max_depth`` is the per-binary mapping (:data:`PerBinaryMaxDepth`):
+    each group's value is threaded to its own decode. A per-section-
+    pointer array value is VECTOR_BATCH-only; the BATCH_DECODE engine
+    raises :class:`NotImplementedError` for it.
+
     Raises
     ------
     ValueError
@@ -143,6 +165,9 @@ def decode_groups(
     ValueError
         When ``engine`` is VECTOR_BATCH but no ``handle_provider`` is
         supplied.
+    NotImplementedError
+        When ``engine`` is BATCH_DECODE but a group's ``max_depth`` is a
+        per-pointer array (cross-depth is a vector_batch-only feature).
     """
     if engine is DecodeEngine.BATCH_DECODE:
         return _decode_groups_batch_decode(
@@ -188,13 +213,29 @@ def _require_session(
     return sessions[binary_name]
 
 
+def _scalar_depth(max_depth: PerBinaryMaxDepth, binary_name: str) -> int:
+    """The scalar depth for ``binary_name``, or reject a per-pointer array.
+
+    The staged BATCH_DECODE engine has no per-row depth seam, so a
+    per-pointer array value is a hard NotImplementedError (cross-depth is
+    vector_batch-only).
+    """
+    value = max_depth[binary_name]
+    if np.asarray(value).ndim != 0:
+        raise NotImplementedError(
+            "DecodeEngine.BATCH_DECODE does not support a per-section-pointer "
+            "max_depth array; cross-depth decoding is VECTOR_BATCH-only",
+        )
+    return int(value)
+
+
 def _decode_groups_batch_decode(
     sessions: Mapping[str, BinarySession],
     per_binary_pointers: Mapping[str, List[SectionPointerSpec]],
     *,
     context_len: int,
     num_variants_per_section: int,
-    max_depth: int,
+    max_depth: PerBinaryMaxDepth,
     rng: np.random.Generator,
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool,
@@ -217,7 +258,7 @@ def _decode_groups_batch_decode(
             per_binary_pointers[binary_name],
             num_variants_per_section=num_variants_per_section,
             context_len=context_len,
-            max_depth=max_depth,
+            max_depth=_scalar_depth(max_depth, binary_name),
             variant_padding=variant_padding,
             inlined_equivalent_call_targets_only=(
                 inlined_equivalent_call_targets_only
@@ -242,7 +283,7 @@ def _decode_groups_vector_batch(
     *,
     context_len: int,
     num_variants_per_section: int,
-    max_depth: int,
+    max_depth: PerBinaryMaxDepth,
     rng: np.random.Generator,
     variant_padding: VariantPadding,
     include_fid_sidecar: bool,
@@ -275,7 +316,7 @@ def _decode_groups_vector_batch(
             handles=handle_provider(binary_name),
             num_variants_per_section=num_variants_per_section,
             context_len=context_len,
-            max_depth=max_depth,
+            max_depth=max_depth[binary_name],
             variant_padding=variant_padding,
             rng=rng,
             include_fid_sidecar=include_fid_sidecar,

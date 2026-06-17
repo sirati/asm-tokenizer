@@ -56,6 +56,7 @@ from typing import (
     Mapping,
     Optional,
     Tuple,
+    Union,
 )
 
 import numpy as np
@@ -85,7 +86,7 @@ def decode_pointer_batch(
     *,
     context_len: int,
     num_variants_per_section: int,
-    max_depth: int,
+    max_depth: Union[int, np.ndarray],
     rng: np.random.Generator,
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
     inlined_equivalent_call_targets_only: bool = True,
@@ -113,6 +114,15 @@ def decode_pointer_batch(
     requires ``handle_provider`` (``binary_name -> VectorBatchArmSet``,
     caller-owned lifetime like ``sessions``).
 
+    ``max_depth`` is a SCALAR ``int`` (every section at that depth -- the
+    historical path) OR a per-POINTER ``int`` array aligned to
+    ``pointers`` (each section at its OWN depth -- the cross-depth path).
+    A per-pointer array is regrouped by binary alongside the pointers, so
+    each binary's :func:`vector_batch_tokens` call receives its own
+    per-section-pointer depth sub-array. The cross-depth array form is
+    VECTOR_BATCH-only; :attr:`DecodeEngine.BATCH_DECODE` rejects it (the
+    staged engine has no per-row depth seam).
+
     This function owns NO session lifetime: it neither opens nor closes
     sessions. Every binary referenced by a pointer MUST have an open
     session in ``sessions`` that stays open for the duration of the call
@@ -137,13 +147,25 @@ def decode_pointer_batch(
             "decode_pointer_batch: empty pointer batch",
         )
 
-    # Group section pointers by binary_name. Only binaries that received
-    # a pointer appear here, so no empty groups are ever decoded.
+    # Group section pointers by binary_name (and, for a per-pointer
+    # cross-depth array, the parallel per-pointer depths in the SAME
+    # append order). Only binaries that received a pointer appear here,
+    # so no empty groups are ever decoded.
     per_binary_pointers: Dict[str, List[SectionPointerSpec]] = {}
-    for ptr in pointers:
+    per_pointer_depth = _per_pointer_depth_array(max_depth, len(pointers))
+    per_binary_depths: Dict[str, List[int]] = {}
+    for i, ptr in enumerate(pointers):
         per_binary_pointers.setdefault(ptr.binary_name, []).append(
             ptr.section_pointer,
         )
+        if per_pointer_depth is not None:
+            per_binary_depths.setdefault(ptr.binary_name, []).append(
+                int(per_pointer_depth[i]),
+            )
+
+    per_binary_max_depth = _per_binary_max_depth(
+        max_depth, per_binary_depths, per_binary_pointers.keys(),
+    )
 
     per_binary_results = decode_groups(
         sessions,
@@ -151,7 +173,7 @@ def decode_pointer_batch(
         engine=engine,
         context_len=context_len,
         num_variants_per_section=num_variants_per_section,
-        max_depth=max_depth,
+        max_depth=per_binary_max_depth,
         rng=rng,
         variant_padding=variant_padding,
         inlined_equivalent_call_targets_only=(
@@ -162,6 +184,51 @@ def decode_pointer_batch(
     )
 
     return _concat_results(per_binary_results)
+
+
+def _per_pointer_depth_array(
+    max_depth: Union[int, np.ndarray], n_pointers: int
+) -> Optional[np.ndarray]:
+    """The per-pointer depth vector, or ``None`` for a scalar ``max_depth``.
+
+    A scalar ``max_depth`` returns ``None`` (every binary inherits the
+    scalar unchanged -- the historical path, never regrouped). An array
+    must be aligned to ``pointers`` (length ``n_pointers``); a mismatch
+    is a hard caller error.
+    """
+    arr = np.asarray(max_depth)
+    if arr.ndim == 0:
+        return None
+    arr = arr.reshape(-1).astype(np.int64)
+    if arr.shape[0] != n_pointers:
+        raise ValueError(
+            f"per-pointer max_depth has length {arr.shape[0]} but there are "
+            f"{n_pointers} pointers"
+        )
+    return arr
+
+
+def _per_binary_max_depth(
+    max_depth: Union[int, np.ndarray],
+    per_binary_depths: Mapping[str, List[int]],
+    binary_names,
+) -> Mapping[str, Union[int, np.ndarray]]:
+    """Per-binary ``max_depth``: the scalar for all, or each group's vector.
+
+    For a scalar ``max_depth`` every binary maps to that scalar (the
+    historical path -- :func:`decode_groups` threads the same int to each
+    group). For a per-pointer array, each binary maps to its own
+    per-section-pointer depth sub-array (built in the same append order
+    the pointer grouping used, so it aligns to that binary's pointer
+    list).
+    """
+    arr = np.asarray(max_depth)
+    if arr.ndim == 0:
+        return {name: int(arr) for name in binary_names}
+    return {
+        name: np.asarray(per_binary_depths[name], dtype=np.int64)
+        for name in binary_names
+    }
 
 
 def open_length_bucketed_batch(
