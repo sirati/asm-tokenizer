@@ -1,32 +1,27 @@
-"""Callee-occurrence disambiguator — call resolves to the specific sibling.
+"""Duplicated-name call edges are unresolvable — uniformly MISSING.
 
-A call into a DUPLICATED canonical name is, by default, stamped the
-legitimately-missing sentinel (``0xFFFE``): the name maps to several
-distinct sibling bodies and a bare ``(name, type)`` call edge cannot say
-which one the site targets (pinned in
-``test_pass2_duplicated_name_unmatched``).
+A call into a DUPLICATED canonical name is stamped the legitimately-
+missing sentinel (``0xFFFE``): the name maps to several distinct sibling
+bodies and the memmap stores ONE shared ``function_section_ptr`` per call
+edge across all of a caller's variants, so the format physically cannot
+point variant-A at sibling-A and variant-B at sibling-B. The producer's
+per-CSV ``occurrence`` ordinal is an emission-ORDER index, NOT a cross-
+variant-stable body identity, so it cannot rescue the edge — variants
+routinely disagree on which body is the kth same-name one (machine-
+outliner clones even differ in COUNT across arch). Resolving via per-
+variant occurrence (the a078d06 attempt) therefore either tripped the
+``conflicting callee_occurrence`` guard or silently spliced the wrong
+body. The standing rule restored here: a duplicated-name callee goes
+MISSING uniformly, gating on the same ``duplicated_names`` predicate that
+routes duplicated function DEFINITIONS to the unmatched arm.
 
-When the producer DOES know — it injects the callee body's ``occurrence``
-onto the caller's ``local_funcs`` metadata entry — the build side must
-resolve the call to that SPECIFIC occurrence's sibling section's variant
-index, NOT the missing sentinel and NOT an arbitrary sibling. These tests
-pin that contract end-to-end through the real merge + pass-1 + pass-2 +
-SectionWriter, reading the resolved ``section_variant_index`` back off the
-emitted ``_sections.bin``.
-
-GATED: these assert the occurrence-aware resolution that the
-``SectionWriter`` (FID, occurrence)-aware back-patch performs and that
-``_emit_variant_per_call_entries`` triggers by populating
-``PerCallEntry.callee_occurrence``. They are RED until that field +
-resolver land; they are the target contract for that change.
-
-The three rows of the emit-decision matrix are pinned:
-* dup callee + occurrence k present  -> resolves to sibling-k (this file);
-* dup callee + occurrence ABSENT     -> 0xFFFE (this file + the sibling
-  duplicated-name test);
-* non-dup callee                     -> resolves by name as today (the
-  existing matched/unmatched suites already pin this; re-pinned here as a
-  control alongside the dup case).
+These tests pin that contract end-to-end through the real merge + pass-1
++ pass-2 + SectionWriter, reading the resolved ``section_variant_index``
+back off the emitted ``_sections.bin``:
+* dup callee, occurrence injected   -> 0xFFFE (the occurrence is ignored);
+* dup callee, occurrence ABSENT     -> 0xFFFE;
+* dup callee, AMBIGUOUS (two siblings, extractor-demoted) -> 0xFFFE;
+* non-dup callee                    -> resolves by name as today (control).
 """
 
 from __future__ import annotations
@@ -194,17 +189,22 @@ def _dup_call_sv_indices(sections, caller_fid, dup_fid):
     return caller, sv
 
 
-def test_forward_ref_matched_caller_resolves_to_occurrence_k_sibling(
+def test_dup_call_with_injected_occurrence_still_stays_missing(
     tmp_path: Path,
 ) -> None:
-    """THE headline forward-ref case: a MATCHED caller (emitted before the
-    unmatched dup-name siblings) whose metadata says it calls ``_DUP@1``
-    resolves, via the deferred (FID, occurrence) back-patch, to the
-    occurrence-1 sibling section's variant — NOT 0xFFFE, NOT occurrence-0.
+    """The standing rule holds EVEN when the producer injected an
+    occurrence: a MATCHED caller whose metadata says it calls ``_DUP@1``
+    is STILL stamped 0xFFFE for that edge in every variant — never
+    resolved to the occurrence-1 sibling.
 
-    The matched arm runs first, so the dup siblings do not exist when the
-    caller closes; the resolution must therefore go through the deferred
-    sibling-close back-patch keyed on (FID, occurrence).
+    The producer's per-CSV ``occurrence`` is an emission-ORDER ordinal,
+    not a cross-variant-stable body identity, and the memmap stores ONE
+    shared ``function_section_ptr`` per call edge across all caller
+    variants. So a duplicated callee has no cross-variant target the
+    format can address: the edge is recorded but unresolvable, regardless
+    of any injected occurrence. (Pre-fix, a078d06 tried to resolve this to
+    sibling-k via per-variant occurrence agreement; that mis-spliced
+    wrong bodies when variants disagreed on the ordinal.)
     """
     dup_call = [(_DUP, CallTargetType.LOCAL)]
     occ_one = {_DUP: 1}
@@ -231,25 +231,16 @@ def test_forward_ref_matched_caller_resolves_to_occurrence_k_sibling(
     dup_fid = registry.line_no(_DUP)
     caller_fid = registry.line_no(_CALLER)
 
-    # The two occurrence sibling sections of _DUP, in occurrence order
-    # (occurrence is the section's distinct-identity key; section emit
-    # order follows it).
-    dup_sections = [s for s in sections if s.function_name_ptr == dup_fid]
-    assert len(dup_sections) == 2
-    occ1_section = dup_sections[1]
-
-    caller, sv_indices = _dup_call_sv_indices(sections, caller_fid, dup_fid)
+    _caller, sv_indices = _dup_call_sv_indices(sections, caller_fid, dup_fid)
     assert sv_indices, "caller's per-call edge into _DUP was dropped"
 
-    # Every resolved edge must point at a REAL variant index inside the
-    # occurrence-1 sibling (not 0xFFFE, and addressable in that section).
+    # Every edge into the duplicated callee is MISSING in EVERY variant,
+    # the injected occurrence notwithstanding.
     for sv_idx in sv_indices:
-        assert sv_idx != MISSING_VARIANT_INDEX, (
-            "call into _DUP@1 was stamped MISSING despite a present occurrence"
-        )
-        assert 0 <= sv_idx < len(occ1_section.variants), (
-            f"resolved section_variant_index={sv_idx} is out of range for the "
-            f"occurrence-1 sibling ({len(occ1_section.variants)} variants)"
+        assert sv_idx == MISSING_VARIANT_INDEX, (
+            f"call into _DUP@1 got J={sv_idx:#06x}; a duplicated callee has no "
+            f"cross-variant target, so it must be MISSING regardless of the "
+            f"injected occurrence"
         )
 
 
