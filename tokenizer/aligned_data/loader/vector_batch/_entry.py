@@ -30,7 +30,7 @@ VectorBatchHandles` is the historical MATCHED-only contract; a
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -45,7 +45,7 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     VariantPadding,
 )
 
-from ._dispatch import dispatch_by_arm, empty_result
+from ._dispatch import dispatch_by_depth_and_arm, empty_result
 from ._merge import merge_arm_results
 from ._result import VectorBatchResult
 
@@ -60,7 +60,7 @@ def vector_batch_tokens(
     handles,
     num_variants_per_section: int,
     context_len: int,
-    max_depth: int,
+    max_depth: Union[int, np.ndarray],
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
     rng: Optional[np.random.Generator] = None,
     augment_geometry=None,
@@ -88,11 +88,23 @@ def vector_batch_tokens(
         arm set, matched + unmatched roots are each routed through their
         own arm's columnar catalog + RLG3 geometry + ``_data.bin``, and
         the per-arm row tensors merge back into the one batch.
-    num_variants_per_section / context_len / max_depth / variant_padding /
-    rng:
+    num_variants_per_section / context_len / variant_padding / rng:
         The same knobs ``batch_decode`` takes; ``rng`` defaults to a
         fresh non-reproducible generator (pass an explicit one for
         deterministic / equivalence-tested sampling).
+    max_depth:
+        Splice depth, as a SCALAR ``int`` (every row decoded at that
+        depth -- the historical contract) OR a per-SECTION-POINTER
+        ``int`` array of length ``len(section_pointers)`` (each section
+        decoded at its OWN depth -- the cross-depth path). Splice depth
+        is a property of a section's spec, not of an individual expanded
+        variant row, so the array is indexed by section pointer and
+        gathered to per-row internally via the batch mapping. The per-row
+        depths are grouped by distinct depth and each group runs the arm
+        pipeline at its scalar depth, then all (depth x arm) partials
+        merge row-wise. With a scalar (or a constant per-pointer array)
+        the result is BYTE-IDENTICAL to the single-depth path: one depth
+        group, one pass.
     augment_geometry:
         OPTIONAL backfill seam (default ``None`` = backfill OFF). When
         provided it is a callable ``BatchGeometry -> BatchGeometry``
@@ -145,14 +157,27 @@ def vector_batch_tokens(
         rng=rng,
     )
 
-    # --- per-arm dispatch over the shared sample, then row-wise merge ----
-    arm_results = dispatch_by_arm(
+    # --- per-(depth, arm) dispatch over the shared sample, then merge ----
+    # Normalise max_depth to a per-ROW array: a scalar broadcasts to a
+    # constant array (one depth group -> the single-depth path runs
+    # byte-identically); a per-POINTER array (one depth per root section
+    # pointer -- the natural cross-depth unit, since depth is a property
+    # of the section's spec, NOT of an individual expanded row) is
+    # expanded to per-row through the just-computed mapping (column 0 =
+    # the resolved/section-pointer index each row came from).
+    max_depth_per_row = _normalize_max_depth(
+        max_depth,
+        batch_size=batch_size,
+        num_section_pointers=len(section_pointers),
+        batch_idx_to_section_variant=batch_idx_to_section_variant,
+    )
+    arm_results = dispatch_by_depth_and_arm(
         handles,
         resolved=resolved,
         batch_idx_to_section_variant=batch_idx_to_section_variant,
         batch_size=batch_size,
         context_len=context_len,
-        max_depth=max_depth,
+        max_depth_per_row=max_depth_per_row,
         augment_geometry=augment_geometry,
         include_fid_sidecar=include_fid_sidecar,
         unmatched_inline=unmatched_inline,
@@ -169,3 +194,47 @@ def vector_batch_tokens(
         arm_results,
         batch_idx_to_section_variant=batch_idx_to_section_variant,
     )
+
+
+_PADDING_SENTINEL = np.iinfo(np.uint32).max
+
+
+def _normalize_max_depth(
+    max_depth: Union[int, np.ndarray],
+    *,
+    batch_size: int,
+    num_section_pointers: int,
+    batch_idx_to_section_variant: np.ndarray,
+) -> np.ndarray:
+    """Resolve ``max_depth`` to an ``int[batch_size]`` per-row array.
+
+    A scalar ``int`` fills every row with that depth (the single-depth
+    contract -> one depth group downstream, byte-identical to today). An
+    array is the per-SECTION-POINTER depth (length
+    ``num_section_pointers`` -- one depth per root section pointer, since
+    splice depth is a property of the section's spec, not of the
+    individual expanded variant rows): it is GATHERED to per-row through
+    ``batch_idx_to_section_variant`` column 0 (the resolved/section-
+    pointer index each non-padding row came from). Padding rows (sentinel
+    in the mapping) get depth 0 -- they are never decoded, so the value
+    is inert; it only keeps the per-row array dense.
+
+    A per-pointer length mismatch is a hard caller error (raised loudly,
+    never silently truncated / padded).
+    """
+    arr = np.asarray(max_depth, dtype=np.int64)
+    if arr.ndim == 0:
+        return np.full(batch_size, int(arr), dtype=np.int64)
+    arr = arr.reshape(-1)
+    if arr.shape[0] != num_section_pointers:
+        raise ValueError(
+            f"per-pointer max_depth has length {arr.shape[0]} but there are "
+            f"{num_section_pointers} section pointers"
+        )
+    mapping = np.asarray(batch_idx_to_section_variant)
+    section_col = mapping[:, 0]
+    is_padding = section_col == _PADDING_SENTINEL
+    per_row = np.zeros(batch_size, dtype=np.int64)
+    real = ~is_padding
+    per_row[real] = arr[section_col[real].astype(np.int64)]
+    return per_row
