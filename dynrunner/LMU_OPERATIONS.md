@@ -102,6 +102,27 @@ On every wake:
 4. **Terminal failure criterion**: sacct shows every secondary's job + its `.batch` step in a terminal state (`FAILED`, `CANCELLED`, `TIMEOUT`, `COMPLETED`) AND no progress evidence was ever observed → the run is dead. Collect gateway log paths, sacct output, last observed local-log lines; proceed to cleanup.
 5. **Stuck-but-still-running**: sacct shows `RUNNING` but the job hasn't advanced past mesh-formation for >10 ticks (~10 min) — same as terminal for decision purposes.
 
+### Late-join observer (watch the live CRDT from a second local process)
+
+A late-joiner is a zero-authority observer that cold-joins the running mesh, restores the CRDT snapshot, and narrates the live run — useful for watching a dispatch from a `tmux` without touching the dispatch process itself. Invoked with LOCAL information only; you do NOT hand-prepare anything on the cluster.
+
+```bash
+# In a tmux pane (survives detach). From the dispatch worktree (so the pin matches the run).
+tmux new-session -d -s obs
+tmux send-keys -t obs 'cd <dispatch-worktree> && nix develop --command python -m dynrunner \
+  --task tokenize --source /tmp/obs-src --output /tmp/obs-out \
+  --observer-join-from-peer-info-dir <slurm-root>/log/run_<ts>/connection_info \
+  --gateway ssh://kruppb@remote.cip.ifi.lmu.de' Enter
+# then:  tmux attach -t obs    to watch the live narration
+```
+
+Gotchas (each one cost a failed attempt the first time):
+
+- **peer-info-dir is the GATEWAY-side `<slurm-root>/log/run_<ts>/connection_info`** — you already know it from the dispatch's `run logs: …` stdout line. Do NOT ssh the gateway to find/copy it: with `--gateway ssh://…` the framework fetches the `*.info` files and opens a per-peer `ssh -L` local-forward tunnel to each peer itself (nothing runs on the gateway; you do zero manual cluster work).
+- **Do NOT pass `--observer-mesh-credentials` with a remote `--gateway`.** Gateway legs ride `ssh -L` TCP forwards (WSS-over-tunnel, no QUIC), so pinned local certs (`/tmp/db-runner-cert-run_<ts>/peer_credentials.json`) are rejected up-front (`ValueError: … cannot be combined with a remote --gateway`). Credentials are ONLY for direct-local (`--gateway local`) QUIC dials. Omit the flag — credentials auto-derive / are unused on the tunnelled path.
+- **`--task` is required by the consumer CLI even though the observer ignores the task entirely.** Use `--task tokenize` with empty dummy `--source`/`--output` dirs — NOT `--task all`/`full-pipeline`, which additionally require `--unified-vocab`/`--mode`/`--depth`. The observer short-circuits before any discovery, so the dummy dirs are never walked.
+- **Wait until the primary is SERVING snapshots** — i.e. past primary-promotion AND discovery-seeding (the tokenize phase has started: watch for `phase tokenize: N to run` on the dispatch stream, or the first output CSVs). Joining earlier fails with `join_running_cluster failed: no SnapshotStreamPackage within the bootstrap timeout (… a cluster mid primary-promotion can leave every request unanswered)`. On a large corpus, discovery can take 10–15+ min; the observer does NOT block-wait, so just re-run the command once tokenize starts. A brief `peer unroutable / forwarder blacklisted` + a secondary-0 disconnect/redial at join is normal and self-heals — `CRDT snapshot received (N tasks, fleet M)` then `observer mirroring baseline …` confirm the join.
+
 ## Cleanup after a dispatch (success OR failure)
 
 The cleanup steps below run on the parent side (or on the subagent only with explicit parent ack). Run all four; skipping any leaves stale state that breaks the next dispatch:
