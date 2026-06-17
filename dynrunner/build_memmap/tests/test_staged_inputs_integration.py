@@ -124,6 +124,7 @@ def test_container_stages_meta_for_variant_info(
         seen["meta"] = Path(meta_path)
 
         class _Info:
+            arch = "armv7l-hf"
             pkg = "mypkg"
             extra_metadata = {"hardening": "full"}
 
@@ -134,6 +135,11 @@ def test_container_stages_meta_for_variant_info(
     def fake_build(versions, output_dir, binary_name, unified_vocab_path):
         captured["pkg"] = versions[0].pkg
         captured["extra"] = versions[0].extra_metadata
+        # arch flows from the resolved VariantInfo identity (the raw,
+        # ABI-preserving sidecar arch), NOT the planner's bitness-
+        # collapsed wire `arch` (`arm` here): the encoder must request
+        # the same `arch:armv7l-hf` token the unifier registered.
+        captured["arch"] = versions[0].arch
 
     monkeypatch.setattr(worker.VariantInfo, "from_csv", staticmethod(fake_from_csv))
     monkeypatch.setattr(worker, "build_memmap_files", fake_build)
@@ -146,7 +152,10 @@ def test_container_stages_meta_for_variant_info(
                 "csv_path": "binA/x86-gcc-9-O2.csv",
                 "mapping_path": "binA/x86-gcc-9-O2.mapping.b64c",
                 "meta_path": "binA/_meta.json",
-                "arch": "x86",
+                # Wire `arch` is the planner's bitness-collapsed value
+                # (`arm` = arch_to_platform("armv7l-hf")); the builder
+                # must override it with the sidecar's raw `armv7l-hf`.
+                "arch": "arm",
                 "compiler": "gcc",
                 "compilerversion": "9",
                 "opt": "O2",
@@ -159,7 +168,91 @@ def test_container_stages_meta_for_variant_info(
     )
 
     assert seen["csv"].exists() is False  # cleaned after build
-    assert captured == {"pkg": "mypkg", "extra": {"hardening": "full"}}
+    assert captured == {
+        "pkg": "mypkg",
+        "extra": {"hardening": "full"},
+        "arch": "armv7l-hf",
+    }
+
+
+def test_abi_arch_from_sidecar_not_collapsed_wire(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression (variant-axis arch mismatch): an ABI-distinguished arch
+    must reach the builder as the raw sidecar value, not the planner's
+    bitness-collapsed wire `arch`.
+
+    The vocab-unifier registers `arch:<arch_to_variant_arch(sidecar_arch)>`
+    (e.g. `arch:armv7l-hf`, identity for this arch). The memmap planner,
+    however, stores `arch_to_platform(platform)` in the wire payload —
+    `arm32` for `armv7l-hf` — which previously rode straight into
+    `BinaryVersionInfo.arch`, so the variant-token encoder requested the
+    unregistered `arch:arm32` and hard-failed the whole memmap group.
+
+    This test uses the REAL `VariantInfo.from_csv` against canonical
+    `<base>_output.csv` + `<base>_meta.json` filenames (standalone
+    pass-through staging) so it exercises the production identity-recovery
+    path. Pre-fix it observes `arm32`; post-fix it observes `armv7l-hf`.
+    """
+    import json
+
+    monkeypatch.setattr(staging, "is_container_deployment", lambda: False)
+
+    src = tmp_path / "src"
+    vocab = tmp_path / "vocab"
+    out = tmp_path / "out"
+    base = "armv7l-hf-clang-7-O3_bzip2__3832fab7"
+    csv = src / "bzip2" / f"{base}_output.csv"
+    csv.parent.mkdir(parents=True, exist_ok=True)
+    csv.write_text("csv-content")
+    meta = src / "bzip2" / f"{base}_meta.json"
+    meta.write_text(
+        json.dumps(
+            {
+                "arch": "armv7l-hf",
+                "compiler": "clang",
+                "compiler_version": "7",
+                "opt": "O3",
+                "pkg": "bzip2",
+                "variant_id": 942865079,
+                "extra_metadata": {},
+            }
+        )
+    )
+    mapping = vocab / "bzip2" / f"{base}_output.mapping.b64c"
+    mapping.parent.mkdir(parents=True, exist_ok=True)
+    mapping.write_text("mapping-content")
+
+    captured: dict = {}
+
+    def fake_build(versions, output_dir, binary_name, unified_vocab_path):
+        captured["arch"] = versions[0].arch
+
+    monkeypatch.setattr(worker, "build_memmap_files", fake_build)
+
+    worker._process_payload(
+        _FakeTask(),
+        "bzip2",
+        _payload(
+            {
+                "csv_path": f"bzip2/{base}_output.csv",
+                "mapping_path": f"bzip2/{base}_output.mapping.b64c",
+                "meta_path": f"bzip2/{base}_meta.json",
+                # Planner's bitness-collapsed wire arch.
+                "arch": "arm32",
+                "compiler": "clang",
+                "compilerversion": "7",
+                "opt": "O3",
+                "variant_id": 942865079,
+            }
+        ),
+        src,
+        vocab,
+        out,
+        tmp_path / "unified_vocab.csv",
+    )
+
+    assert captured["arch"] == "armv7l-hf"
 
 
 def test_skip_missing_preserved_under_staging(

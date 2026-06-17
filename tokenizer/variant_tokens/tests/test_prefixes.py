@@ -64,6 +64,37 @@ def test_arch_alias_collapse_or_identity():
         assert b == "amd64"
 
 
+def test_variant_arch_token_must_not_route_through_platform_collapse():
+    """Cross-phase invariant: the variant-axis arch token is built from
+    the RAW sidecar arch (``arch_to_variant_arch``), never from the
+    bitness-collapsed ``arch_to_platform`` value used for disassembler
+    dispatch.
+
+    The vocab-unifier registers ``build_arch_token(sidecar_arch)``. If
+    the memmap builder instead encodes ``build_arch_token(arch_to_platform
+    (sidecar_arch))`` (the original defect), the two strings diverge for
+    every arch where ``arch_to_platform`` collapses ABI/endianness detail
+    that ``arch_to_variant_arch`` preserves — e.g. ``armv7l-hf`` →
+    registered ``arch:armv7l-hf`` but requested ``arch:arm32``. This test
+    pins that those two derivations disagree precisely on the
+    ABI-distinguished arches, so a future refactor that re-introduces the
+    collapse on the variant-token path fails loudly here.
+    """
+    from tokenizer.arch_translation import _ARCH_TO_PLATFORM, arch_to_platform
+
+    diverging = {
+        arch
+        for arch in _ARCH_TO_PLATFORM
+        if build_arch_token(arch) != build_arch_token(arch_to_platform(arch))
+    }
+    # The ABI/endianness-distinguished arches the corpus actually carries
+    # (armv7l-hf, i686, mipsel, mips64el, ppc64le) plus their siblings.
+    assert {"armv7l-hf", "i686", "mipsel", "mips64el", "ppc64le"} <= diverging
+    # And the family-canonical pairs that BOTH translators collapse the
+    # same way must NOT diverge (these are why x64/arm64 groups worked).
+    assert {"x86_64", "amd64", "aarch64", "x64", "arm64"}.isdisjoint(diverging)
+
+
 def test_axis_strings_layout_no_metadata():
     """Plan §"Token-string prefixes" — exactly 4 positional axes when
     extra_metadata is empty."""

@@ -172,27 +172,44 @@ def _process_payload(
             local_csv = local[s["csv_path"]]
             local_mapping = local[s["mapping_path"]]
 
-            # Resolve per-variant metadata via the canonical
+            # Resolve per-variant identity via the canonical
             # ``VariantInfo.from_csv`` entry-point, reading the LOCAL
             # csv + meta copies. Only invoked when the planner declared
             # a sidecar path (legacy entries skip the call entirely to
             # preserve the old default shape — pkg = group's
             # binary_name, extra_metadata = {}). The declared-but-
             # missing warning is emitted by ``from_csv`` itself.
+            #
+            # ``arch`` MUST come from this resolved identity (the SAME
+            # source of truth ``tokenizer.vocab_unifier`` walks), NOT
+            # from the planner's wire ``entry["arch"]``: the planner
+            # stores ``arch_to_platform(platform)`` (bitness-collapsed,
+            # for disassembler dispatch), so an ABI-distinguished arch
+            # like ``armv7l-hf`` arrives as ``arm32``. The variant-token
+            # encoder would then request ``arch:arm32`` — a token the
+            # unifier (which keeps the raw ``armv7l-hf`` from the same
+            # sidecar) never registered, hard-failing the build. Reading
+            # ``info.arch`` here aligns the encoded token with the
+            # registered one. Legacy entries (no sidecar) keep
+            # ``entry["arch"]``: their filename arch is already a
+            # canonical ``Platform`` literal, for which ``arch_to_platform``
+            # is the identity, so no collapse occurs.
             pkg: str = binary_name
             extra_metadata: dict = {}
+            arch: str = entry["arch"]
             if s["meta_path"] is not None:
                 info = VariantInfo.from_csv(
                     local_csv, meta_path=local[s["meta_path"]]
                 )
                 pkg = info.pkg
                 extra_metadata = info.extra_metadata
+                arch = info.arch
 
             versions.append(
                 BinaryVersionInfo(
                     path=local_csv,
                     mapping_path=local_mapping,
-                    arch=entry["arch"],
+                    arch=arch,
                     compiler=entry["compiler"],
                     compilerversion=entry["compilerversion"],
                     opt=entry["opt"],
