@@ -102,11 +102,27 @@ class IndexedMemmapCollection:
         self,
         members: List[CollectionMember],
         readers_by_spec: Dict[IndexSpec, Dict[str, SortedIndexReader]],
-        datasets: Dict[str, BinaryDataset],
+        vocab_manager: Optional[Any] = None,
     ) -> None:
         # ``members`` arrives alphabetical by qualified_name from
         # :meth:`discover`; keep that order for the public properties.
         self._members = members
+        # ``vocab_manager`` + a ``{qualified_name -> member}`` index are
+        # the only state needed to build each per-binary
+        # :class:`BinaryDataset` lazily (on first session/handles use);
+        # discovery no longer parses any section arm. NOTE: the
+        # ``_variants.bin``/``_variants.csv`` sidecar-PAIR validation that
+        # ``BinaryDataset.__init__`` performs therefore fires at a
+        # binary's FIRST sample (in :meth:`_dataset_for`) rather than at
+        # discovery -- same loud ValueError, just deferred.
+        self._vocab = vocab_manager
+        self._member_by_name: Dict[str, CollectionMember] = {
+            m.qualified_name: m for m in members
+        }
+        # Memoized per-binary datasets: one parse per binary, built on
+        # first use and registered on the shared ExitStack (released with
+        # the sessions on :meth:`close`).
+        self._dataset_cache: Dict[str, BinaryDataset] = {}
         # One sampler per spec; specs held in stable display order.
         self._specs: List[IndexSpec] = sorted_specs(readers_by_spec.keys())
         self._samplers: Dict[IndexSpec, MultiBinarySortedIndexSampler] = {
@@ -118,7 +134,6 @@ class IndexedMemmapCollection:
         # the binary AND the depth axis at once (each pointer carries the
         # spec it was drawn from).
         self._cross_sampler = CrossSpecSortedIndexSampler(readers_by_spec)
-        self._datasets = datasets
         self._sessions: Dict[str, BinarySession] = {}
         # Lazy per-binary vector_batch handle bundles, opened on first
         # VECTOR_BATCH decode and held on the same ExitStack as the
@@ -153,17 +168,19 @@ class IndexedMemmapCollection:
         collection per ``on_missing``.
 
         Delegates the filesystem discovery + cross-directory naming +
-        per-member reader/dataset construction to
-        :func:`discover_members`.
+        per-member reader construction to :func:`discover_members`. The
+        per-binary :class:`BinaryDataset` objects are NOT built here; the
+        collection builds each lazily on first use (see
+        :meth:`_dataset_for`), so ``vocab_manager`` is threaded into the
+        ctor for that deferred construction.
         """
         resolved_specs = normalize_specs(specs, reduction, depth)
-        members, readers_by_spec, datasets = discover_members(
+        members, readers_by_spec = discover_members(
             memmap_dirs,
             specs=resolved_specs,
-            vocab_manager=vocab_manager,
             on_missing=on_missing,
         )
-        return cls(members, readers_by_spec, datasets)
+        return cls(members, readers_by_spec, vocab_manager=vocab_manager)
 
     # ------------------------------------------------------------------
     # Static surface
@@ -404,6 +421,34 @@ class IndexedMemmapCollection:
     # ------------------------------------------------------------------
     # Session lifetime
     # ------------------------------------------------------------------
+    def _dataset_for(self, qualified_name: str) -> BinaryDataset:
+        """Return the per-binary :class:`BinaryDataset`, built lazily.
+
+        Constructs ``BinaryDataset(member.memmap_dir, member.binary_name,
+        vocab_manager=...)`` on first need (parsing that binary's section
+        arms then, NOT at discovery), caches it so every later
+        session/handles use shares ONE instance (one parse per binary),
+        and registers a drop-on-close callback on the same
+        :class:`ExitStack` as the sessions so :meth:`close` releases the
+        cached parse. (A :class:`BinaryDataset` owns only parsed metadata,
+        no OS handles -- those live in :class:`BinarySession` -- so it has
+        nothing to close itself; the callback just frees the cached parse
+        in lockstep with the sessions/handles.) A member never sampled
+        never builds a dataset -- this is what keeps discovery
+        section-parse-free.
+        """
+        dataset = self._dataset_cache.get(qualified_name)
+        if dataset is None:
+            member = self._member_by_name[qualified_name]
+            dataset = BinaryDataset(
+                member.memmap_dir,
+                member.binary_name,
+                vocab_manager=self._vocab,
+            )
+            self._dataset_cache[qualified_name] = dataset
+            self._stack.callback(self._dataset_cache.pop, qualified_name, None)
+        return dataset
+
     def _session_for(self, qualified_name: str) -> BinarySession:
         """Return the persistent session for ``qualified_name``.
 
@@ -415,7 +460,7 @@ class IndexedMemmapCollection:
         session = self._sessions.get(qualified_name)
         if session is None:
             session = self._stack.enter_context(
-                self._datasets[qualified_name].open_session()
+                self._dataset_for(qualified_name).open_session()
             )
             self._sessions[qualified_name] = session
         return session
@@ -433,7 +478,7 @@ class IndexedMemmapCollection:
         """
         handles = self._vb_handles.get(qualified_name)
         if handles is None:
-            dataset = self._datasets[qualified_name]
+            dataset = self._dataset_for(qualified_name)
             handles = self._stack.enter_context(
                 open_vector_batch_arm_set(
                     dataset.base_path, dataset.binary_name
