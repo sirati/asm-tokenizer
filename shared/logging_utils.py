@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,54 @@ def remove_stream_handlers(logger: logging.Logger) -> None:
     handlers_to_remove = [h for h in logger.handlers if isinstance(h, logging.StreamHandler)]
     for handler in handlers_to_remove:
         logger.removeHandler(handler)
+
+
+def resilient_file_handler(
+    log_file_path: Path,
+    level: int = logging.INFO,
+    formatter: logging.Formatter | None = None,
+) -> logging.Handler:
+    """Build a file log handler that NEVER raises if the log sink is unusable.
+
+    A worker's log directory can vanish mid-run (e.g. a shared/bind-mounted
+    log dir deleted on the host leaves the in-container path a *stale mount
+    handle*: ``mkdir(exist_ok=True)`` then raises ``FileExistsError`` and
+    ``touch``/``FileHandler`` raise ``OSError``). Logging is a side concern;
+    losing the log sink must degrade to stderr, never abort the work that
+    produced the logs. This helper localizes that policy so callers only ask
+    for "a handler for this path" and are guaranteed a usable one.
+
+    Returns a ``FileHandler`` at ``log_file_path`` when the directory is
+    writable; otherwise a ``StreamHandler`` on stderr. The chosen handler
+    carries ``formatter`` (or the project-standard format) at ``level``.
+    """
+    if formatter is None:
+        formatter = logging.Formatter(
+            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+    handler: logging.Handler
+    try:
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file_path.touch()
+        handler = logging.FileHandler(log_file_path, mode="a")
+    except OSError as exc:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        # Emit through the fallback so the degradation is itself recorded.
+        logging.getLogger(__name__).warning(
+            "log file %s unusable (%s: %s); falling back to stderr",
+            log_file_path,
+            type(exc).__name__,
+            exc,
+        )
+        return handler
+
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    return handler
 
 
 def setup_logger(

@@ -22,6 +22,7 @@ from .csv_helper import increase_csv_field_size_limit
 from .logging_utils import (
     WarningCounterHandler,
     remove_stream_handlers,
+    resilient_file_handler,
     setup_file_logger,
     setup_logger,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "normalize_opt_levels",
     "WarningCounterHandler",
     "remove_stream_handlers",
+    "resilient_file_handler",
     "setup_file_logger",
     "setup_logger",
     "print_selection_summary",

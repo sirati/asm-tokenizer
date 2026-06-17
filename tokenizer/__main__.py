@@ -18,7 +18,11 @@ from dynamic_runner.worker import (
     task_function,
 )
 
-from shared import increase_csv_field_size_limit, remove_stream_handlers
+from shared import (
+    increase_csv_field_size_limit,
+    remove_stream_handlers,
+    resilient_file_handler,
+)
 from tokenizer.arch import Platform
 from tokenizer.disasm import configure_worker_jvm_processor_cap
 from tokenizer.arch_translation import arch_to_platform
@@ -286,18 +290,9 @@ def _setup_logging(args: argparse.Namespace) -> None:
     if args.log_file:
         if args.dynamic_queue:
             remove_stream_handlers(logger)
-        log_file = Path(args.log_file)
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        log_file.touch()
-        file_handler = logging.FileHandler(log_file, mode="a")
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter(
-                "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-        )
-        logger.addHandler(file_handler)
+        # A vanished/stale log mount must never abort the worker before it
+        # signals Ready; resilient_file_handler degrades to stderr on OSError.
+        logger.addHandler(resilient_file_handler(Path(args.log_file), level=logging.INFO))
     else:
         logging.basicConfig(
             level=logging.INFO,
