@@ -1,17 +1,25 @@
 """End-to-end batch_decode vs vector_batch benchmark on real memmaps.
 
+Defaults exercise the NON-degenerate path: num_variants=7, B=70, depths 3/1/0
+(depth 3, deepest call-target inclusion, is the most important byte-identity
+case and runs first). Never run the byte-identity gate at num_variants=1 -- at
+nvar=1 FLAG-A fires and single-variant roots splice nothing, so the entire
+multi-variant inclusion/splice path is short-circuited and untested.
+
 Usage
 -----
     python scripts/bench_decode.py
-    python scripts/bench_decode.py --binaries nping openssl --B 64 --L 512 --depth 3
+    python scripts/bench_decode.py --binaries nping openssl --shapes 70x4096 1120x256 --depths 3 1 0 --num-variants 7
     python scripts/bench_decode.py --cprofile
 
 Before/after comparison recipe (e.g. after a perf change)
 ----------------------------------------------------------
-    git stash
-    python scripts/bench_decode.py 2>&1 | tee /tmp/before.txt
-    git stash pop
+    # Do NOT use ``git stash`` -- the stash stack is global across sibling
+    # worktrees and collides with parallel agents. Use a file-patch instead:
     python scripts/bench_decode.py 2>&1 | tee /tmp/after.txt
+    git diff > /tmp/change.patch && git checkout -- .
+    python scripts/bench_decode.py 2>&1 | tee /tmp/before.txt
+    git apply /tmp/change.patch
     grep -E "^BENCH|^SPEEDUP" /tmp/before.txt /tmp/after.txt
 
 Output lines (machine-greppable)
@@ -38,9 +46,25 @@ WORKTREE = Path(__file__).parent.parent
 
 DEFAULT_MEMMAP_DIR = Path("/home/sirati/devel/python/asm-tokenizer/out/build_memmap")
 DEFAULT_BINARIES = ["nping", "openssl"]
-DEFAULT_B = 64
-DEFAULT_L = 512
-DEFAULT_DEPTH = 3
+# (batch_size, seq_len) shapes swept per binary. Roughly constant token budget
+# (B*L ~ 287k, except the last) so we cover the few-long-rows <-> many-short-rows
+# spectrum where shape-dependent divergences (e.g. #68 at B=256) hide.
+DEFAULT_SHAPES = [
+    (70, 4096),
+    (140, 2048),
+    (280, 1024),
+    (560, 512),
+    (1120, 256),
+    (1120, 128),
+]
+# Depths run in this order; depth 3 (deepest call-target inclusion) is the most
+# important byte-identity case and is run first.
+DEFAULT_DEPTHS = [3, 1, 0]
+# Variants sampled per section. NEVER default this to 1: at nvar=1 the
+# columnwise-ALL exclusion (FLAG-A) fires and single-variant roots splice
+# nothing, short-circuiting the entire multi-variant inclusion/splice path the
+# byte-identity gate is meant to exercise.
+DEFAULT_NUM_VARIANTS = 7
 DEFAULT_ITERS = 7
 DEFAULT_SEED = 42
 
@@ -115,7 +139,7 @@ def _sample_pointers(pointers, rng: np.random.Generator, B: int):
 # ---------------------------------------------------------------------------
 
 
-def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, seed: int):
+def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, num_variants: int, seed: int, unmatched_inline: bool = False):
     from tokenizer.aligned_data.loader.batch_decode import (
         VariantPadding,
         batch_decode,
@@ -124,16 +148,17 @@ def _run_batch_decode(session, sampled_pointers, *, L: int, depth: int, seed: in
     result = batch_decode(
         session,
         sampled_pointers,
-        num_variants_per_section=1,
+        num_variants_per_section=num_variants,
         context_len=L,
         max_depth=depth,
         variant_padding=VariantPadding.PAD_NULL,
         rng=rng,
+        unmatched_inline=unmatched_inline,
     )
     return result
 
 
-def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int, seed: int):
+def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int, num_variants: int, seed: int, unmatched_inline: bool = False):
     from tokenizer.aligned_data.loader.batch_decode import VariantPadding
     from tokenizer.aligned_data.loader.vector_batch._entry import vector_batch_tokens
 
@@ -142,11 +167,12 @@ def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int,
         session,
         sampled_pointers,
         handles=handles,
-        num_variants_per_section=1,
+        num_variants_per_section=num_variants,
         context_len=L,
         max_depth=depth,
         variant_padding=VariantPadding.PAD_NULL,
         rng=rng,
+        unmatched_inline=unmatched_inline,
     )
     return result
 
@@ -154,6 +180,19 @@ def _run_vector_batch(session, sampled_pointers, handles, *, L: int, depth: int,
 # ---------------------------------------------------------------------------
 # Correctness gate
 # ---------------------------------------------------------------------------
+
+
+def _count_real_tokens(tokens: np.ndarray) -> int:
+    """Non-padding token count -- the emitted content signal.
+
+    PAD_NULL pads short rows / unused columns with the null token (id 0),
+    so non-zero entries are the actually-emitted (self + body + inlined
+    callee) tokens. A flag-ON->flag-OFF delta in this count is the
+    surfacing signal: how many extra tokens the unmatched-outline inlining
+    pulls into (or, if a shell body was longer than its surfaced callees,
+    out of) the stream.
+    """
+    return int(np.count_nonzero(tokens))
 
 
 def _assert_byte_identical(bd_result, vb_result, binary: str) -> None:
@@ -225,65 +264,102 @@ def bench_binary(
     *,
     memmap_dir: Path,
     vocab_manager,
-    B: int,
-    L: int,
-    depth: int,
+    shapes: List[tuple],
+    depths: List[int],
+    num_variants: int,
     iters: int,
     do_cprofile: bool,
+    unmatched_inline: bool = False,
 ) -> None:
     from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
     from tokenizer.aligned_data.loader.vector_batch.session_handles import (
         open_vector_batch_arm_set,
     )
 
-    print(f"\n[bench] === {binary} B={B} L={L} D={depth} ===", flush=True)
-
-    # Sample a fixed reproducible set of pointers (same for both loaders).
     all_pointers, _dataset = _collect_pointers(memmap_dir, binary, vocab_manager)
     if not all_pointers:
         print(f"[bench] {binary}: no matched sections with variants -- skipping")
         return
-
-    rng_sample = np.random.default_rng(DEFAULT_SEED)
-    sampled = _sample_pointers(all_pointers, rng_sample, B)
-    print(f"[bench] {binary}: {len(all_pointers)} sections, sampled {len(sampled)} pointers")
+    print(f"[bench] {binary}: {len(all_pointers)} sections with variants")
 
     dataset = BinaryDataset(memmap_dir, binary, vocab_manager=vocab_manager)
 
     with dataset.open_session() as session:
         with open_vector_batch_arm_set(memmap_dir, binary) as handles:
+            for B, L in shapes:
+                # Sample B pointers per shape (reproducible: fixed seed per draw),
+                # same set for both loaders + all depths of this shape.
+                sampled = _sample_pointers(all_pointers, np.random.default_rng(DEFAULT_SEED), B)
+                for depth in depths:
+                    print(
+                        f"\n[bench] === {binary} B={B} L={L} D={depth} nvar={num_variants} ===",
+                        flush=True,
+                    )
 
-            # --- correctness gate (run once at seed=0 to verify identity) ---
-            bd_ref = _run_batch_decode(session, sampled, L=L, depth=depth, seed=0)
-            vb_ref = _run_vector_batch(session, sampled, handles, L=L, depth=depth, seed=0)
-            _assert_byte_identical(bd_ref, vb_ref, binary)
-            print(f"[bench] {binary}: byte-identity OK (shape={bd_ref.tokens.shape})")
+                    # --- correctness gate (seed=0): the two loaders must be
+                    # byte-identical AT WHATEVER unmatched_inline setting is
+                    # under test (flag-OFF is the regression net; flag-ON is
+                    # the cross-loader-equivalence gate the feature must hold).
+                    bd_ref = _run_batch_decode(
+                        session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0,
+                        unmatched_inline=unmatched_inline,
+                    )
+                    vb_ref = _run_vector_batch(
+                        session, sampled, handles, L=L, depth=depth, num_variants=num_variants, seed=0,
+                        unmatched_inline=unmatched_inline,
+                    )
+                    _assert_byte_identical(bd_ref, vb_ref, binary)
+                    flagmsg = "ON" if unmatched_inline else "OFF"
+                    print(f"[bench] {binary} B={B} L={L} D={depth} unmatched_inline={flagmsg}: byte-identity OK (shape={bd_ref.tokens.shape})")
 
-            # --- timing ---
-            bd_fn = lambda: _run_batch_decode(session, sampled, L=L, depth=depth, seed=DEFAULT_SEED)
-            vb_fn = lambda: _run_vector_batch(session, sampled, handles, L=L, depth=depth, seed=DEFAULT_SEED)
+                    # --- QUALITY: how much does flag-ON change the output? Run
+                    # the flag-OFF reference too and report the emitted-token
+                    # delta (non-padding real tokens) so the enable decision
+                    # has the empirical surfacing signal per binary.
+                    if unmatched_inline:
+                        bd_off = _run_batch_decode(
+                            session, sampled, L=L, depth=depth, num_variants=num_variants, seed=0,
+                            unmatched_inline=False,
+                        )
+                        n_off = _count_real_tokens(bd_off.tokens)
+                        n_on = _count_real_tokens(bd_ref.tokens)
+                        n_diff_rows = int((bd_off.tokens != bd_ref.tokens).any(axis=1).sum())
+                        print(
+                            f"QUALITY {binary} B={B} L={L} D={depth} "
+                            f"real_tokens_off={n_off} real_tokens_on={n_on} "
+                            f"delta={n_on - n_off} changed_rows={n_diff_rows}/{bd_ref.tokens.shape[0]}"
+                        )
 
-            if do_cprofile:
-                _profile_loader(bd_fn, label=f"{binary}/batch_decode")
-                _profile_loader(vb_fn, label=f"{binary}/vector_batch")
+                    # --- timing (b/l/d default-args pin the loop vars per lambda) ---
+                    bd_fn = lambda b=B, l=L, d=depth: _run_batch_decode(
+                        session, sampled, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED,
+                        unmatched_inline=unmatched_inline,
+                    )
+                    vb_fn = lambda b=B, l=L, d=depth: _run_vector_batch(
+                        session, sampled, handles, L=l, depth=d, num_variants=num_variants, seed=DEFAULT_SEED,
+                        unmatched_inline=unmatched_inline,
+                    )
 
-            bd_median, bd_min = _time_loader(bd_fn, iters)
-            vb_median, vb_min = _time_loader(vb_fn, iters)
+                    if do_cprofile:
+                        _profile_loader(bd_fn, label=f"{binary}/batch_decode/B{B}L{L}D{depth}")
+                        _profile_loader(vb_fn, label=f"{binary}/vector_batch/B{B}L{L}D{depth}")
 
-    speedup = vb_median / bd_median if bd_median > 0 else float("nan")
+                    bd_median, bd_min = _time_loader(bd_fn, iters)
+                    vb_median, vb_min = _time_loader(vb_fn, iters)
+                    speedup = vb_median / bd_median if bd_median > 0 else float("nan")
 
-    print(
-        f"BENCH {binary} batch_decode B={B} L={L} D={depth} "
-        f"median_ms={bd_median:.1f} min_ms={bd_min:.1f}"
-    )
-    print(
-        f"BENCH {binary} vector_batch B={B} L={L} D={depth} "
-        f"median_ms={vb_median:.1f} min_ms={vb_min:.1f}"
-    )
-    print(
-        f"SPEEDUP {binary} vb/bd={speedup:.3f}  "
-        f"({'vb faster' if speedup < 1 else 'vb slower'})"
-    )
+                    print(
+                        f"BENCH {binary} batch_decode B={B} L={L} D={depth} "
+                        f"median_ms={bd_median:.1f} min_ms={bd_min:.1f}"
+                    )
+                    print(
+                        f"BENCH {binary} vector_batch B={B} L={L} D={depth} "
+                        f"median_ms={vb_median:.1f} min_ms={vb_min:.1f}"
+                    )
+                    print(
+                        f"SPEEDUP {binary} B={B} L={L} D={depth} vb/bd={speedup:.3f}  "
+                        f"({'vb faster' if speedup < 1 else 'vb slower'})"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +375,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--binaries", nargs="+", default=DEFAULT_BINARIES,
         help=f"Binary stems to bench (default: {DEFAULT_BINARIES})",
     )
-    p.add_argument("--B", type=int, default=DEFAULT_B, help="Batch size (default 64)")
-    p.add_argument("--L", type=int, default=DEFAULT_L, help="Context length (default 512)")
-    p.add_argument("--depth", type=int, default=DEFAULT_DEPTH, help="Splice depth (default 3)")
+    p.add_argument(
+        "--shapes", nargs="+", default=None, metavar="BxL",
+        help="(batch, seq_len) shapes as BxL, e.g. 70x4096 1120x256 (default: built-in sweep)",
+    )
+    p.add_argument(
+        "--depths", type=int, nargs="+", default=DEFAULT_DEPTHS,
+        help="Splice depths to run, in order (default: 3 1 0; depth 3 matters most)",
+    )
+    p.add_argument(
+        "--num-variants", type=int, default=DEFAULT_NUM_VARIANTS,
+        help="num_variants_per_section sampled (default 7; do NOT use 1 -- degenerate)",
+    )
     p.add_argument("--iters", type=int, default=DEFAULT_ITERS, help="Timing iterations (default 7)")
     p.add_argument(
         "--cprofile", action="store_true",
@@ -311,15 +396,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "--memmap-dir", type=Path, default=DEFAULT_MEMMAP_DIR,
         help=f"Directory containing the memmap bins (default: {DEFAULT_MEMMAP_DIR})",
     )
+    p.add_argument(
+        "--unmatched-inline", action="store_true",
+        help=(
+            "Run with the opt-in unmatched-outline inlining flag ON in BOTH "
+            "loaders. The byte-identity gate then becomes the flag-ON "
+            "cross-loader-equivalence gate; a QUALITY line per shape reports "
+            "the emitted-token delta vs flag-OFF."
+        ),
+    )
     return p
+
+
+def _parse_shapes(tokens) -> List[tuple]:
+    """Parse ['70x4096', '1120x256'] -> [(70, 4096), (1120, 256)]."""
+    shapes = []
+    for tok in tokens:
+        b_str, _, l_str = tok.lower().partition("x")
+        shapes.append((int(b_str), int(l_str)))
+    return shapes
 
 
 def main(argv=None) -> None:
     args = _build_parser().parse_args(argv)
     memmap_dir: Path = args.memmap_dir
+    shapes = _parse_shapes(args.shapes) if args.shapes else DEFAULT_SHAPES
 
     print(f"[bench] memmap_dir={memmap_dir}")
-    print(f"[bench] binaries={args.binaries} B={args.B} L={args.L} D={args.depth} iters={args.iters}")
+    print(
+        f"[bench] binaries={args.binaries} shapes={shapes} "
+        f"depths={args.depths} nvar={args.num_variants} iters={args.iters}"
+    )
 
     vocab_manager = _load_vocab(memmap_dir)
     print(f"[bench] vocab loaded (format_version={vocab_manager.format_version})")
@@ -330,11 +437,12 @@ def main(argv=None) -> None:
             binary,
             memmap_dir=memmap_dir,
             vocab_manager=vocab_manager,
-            B=args.B,
-            L=args.L,
-            depth=args.depth,
+            shapes=shapes,
+            depths=args.depths,
+            num_variants=args.num_variants,
             iters=args.iters,
             do_cprofile=args.cprofile,
+            unmatched_inline=args.unmatched_inline,
         )
 
     print("\n[bench] done.")

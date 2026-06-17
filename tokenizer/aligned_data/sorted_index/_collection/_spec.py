@@ -82,9 +82,7 @@ def normalize_specs(
 
 def sorted_specs(specs: Sequence[IndexSpec]) -> List[IndexSpec]:
     """Specs in stable display order: by ``(filename_tag, depth)``."""
-    return sorted(
-        specs, key=lambda s: (s.reduction.filename_tag(), s.depth),
-    )
+    return sorted(specs, key=IndexSpec.sort_key)
 
 
 def resolve_spec(

@@ -64,6 +64,13 @@ class ResolvedCalleeMeta:
     :class:`Category` at emission. ``callee_idx`` is the per-arm load
     locator :func:`load_callee_body` uses to materialise the chosen
     ``variant_idx`` body once the prune retains this edge.
+
+    ``is_matched`` is the resolving call_target's BIN flag (the callee's
+    arm): ``True`` when the callee resides in the matched arm. It is read
+    by the unmatched-outline inlining transform
+    (:mod:`...splice_inclusion._unmatched_expand`) to decide whether an
+    edge is a direct matched target or an unmatched outline to look
+    THROUGH; it does NOT affect any other resolution gate.
     """
 
     section: Section
@@ -72,6 +79,7 @@ class ResolvedCalleeMeta:
     function_name_ptr: int
     call_target_type: CallTargetType
     callee_idx: int
+    is_matched: bool
 
 
 def resolve_callee_metadata(
@@ -143,6 +151,7 @@ def resolve_callee_metadata(
         function_name_ptr=int(ct.function_name_ptr),
         call_target_type=ct.type,
         callee_idx=callee_idx,
+        is_matched=bool(ct.is_matched),
     )
 
 

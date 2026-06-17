@@ -106,12 +106,41 @@ class _FakeVocab:
         return self._i2s.get(token_id, "")
 
 
-def _write_variants_bin(base: Path, binary_name: str, vocab: _FakeVocab) -> int:
-    """Lay down ``_variants.bin`` with one record at byte 0; return the offset.
+def write_variants_slim_csv(
+    base: Path,
+    binary_name: str,
+    offset_to_filename: Dict[int, str],
+) -> None:
+    """Lay down the slim ``_variants.csv`` that pairs ``_variants.bin``.
 
-    Hand-laid (not via the fixture builder) because the variant
-    resolver needs a real axis record produced by ``encode_record``
-    to round-trip back through the decoder.
+    Mirrors the production builder's atomic pair-write (memmap_builder/
+    variants.py): a ``# format=N`` prelude, a
+    ``filename,variant_id,offset`` header, and one row per bin record
+    (offset as bare hex). Hand-laid fixtures that write ``_variants.bin``
+    MUST call this too -- ``BinaryDataset`` hard-fails on a half-present
+    pair, and the resolver needs a filename for every offset it reads.
+    """
+    import csv as _csv
+
+    from tokenizer.aligned_data.csv_format import write_csv_prelude
+
+    csv_path = base / f"{binary_name}_variants.csv"
+    with open(csv_path, "w", newline="", encoding="ascii") as handle:
+        write_csv_prelude(handle)
+        writer = _csv.writer(handle, lineterminator="\n")
+        writer.writerow(["filename", "variant_id", "offset"])
+        for vid, (offset, filename) in enumerate(sorted(offset_to_filename.items())):
+            writer.writerow([filename, f"{vid:08x}", f"{offset:x}"])
+
+
+def _write_variants_bin(base: Path, binary_name: str, vocab: _FakeVocab) -> int:
+    """Lay down the ``_variants.bin`` + slim ``_variants.csv`` pair.
+
+    Returns the byte offset of the single record. Hand-laid (not via the
+    fixture builder) because the variant resolver needs a real axis
+    record produced by ``encode_record`` to round-trip back through the
+    decoder. The slim CSV is written alongside so the corpus passes
+    ``BinaryDataset``'s sidecar-pair invariant.
     """
     from tokenizer.variant_tokens.encoder import encode_record
 
@@ -127,6 +156,9 @@ def _write_variants_bin(base: Path, binary_name: str, vocab: _FakeVocab) -> int:
     with open(variants_path, "wb") as f:
         offset = f.tell()
         f.write(record.tobytes())
+    write_variants_slim_csv(
+        base, binary_name, {offset: f"{binary_name}-x86_64-gcc-13.2.0-O2"}
+    )
     return offset
 
 

@@ -41,9 +41,6 @@ from tokenizer.aligned_data.loader._sections_bin_walk import (
 from tokenizer.aligned_data.matched_sections_columnar import (
     parse_sections_columnar,
 )
-from tokenizer.aligned_data.sorted_index._prepass import (
-    read_section_variant_info,
-)
 
 from ._format import MATCHED_ARM, UNMATCHED_ARM, RealizedLengthsArm
 
@@ -137,6 +134,14 @@ def _from_columns(
 
 def _read_matched(base_path: Path, binary_name: str) -> ArmCatalog:
     """Matched-region columnar pre-pass (reused from sorted_index)."""
+    # Imported lazily (not at module load) to break the realized_lengths ->
+    # sorted_index -> realized_lengths import cycle: this upward edge into the
+    # higher-level sorted_index package is only exercised at generation time,
+    # never when merely reading sidecars or importing format constants.
+    from tokenizer.aligned_data.sorted_index._prepass import (
+        read_section_variant_info,
+    )
+
     info = read_section_variant_info(base_path, binary_name)
     if info.counts.size == 0:
         return _empty_catalog()

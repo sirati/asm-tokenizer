@@ -27,6 +27,7 @@ from ._modes import parse_reduction
 from ._prepass import SectionVariantInfo, read_section_variant_info
 from ._reader import SortedIndexReader, discover_indices
 from ._sampler import (
+    DecodeEngine,
     MultiBinarySortedIndexSampler,
     decode_pointer_batch,
     open_length_bucketed_batch,
@@ -43,6 +44,7 @@ from ._wire import encode_sorted_index, parse_header
 __all__ = [
     "CollectionMember",
     "DEDUP_BY_DATA_POINTER",
+    "DecodeEngine",
     "DuplicateHandling",
     "IndexSpec",
     "IndexedMemmapCollection",

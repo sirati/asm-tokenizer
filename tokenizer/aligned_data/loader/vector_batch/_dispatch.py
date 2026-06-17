@@ -37,12 +37,101 @@ from ._scatter import build_dense_sidecars, scatter_batch_tokens
 from .session_handles import VectorBatchArmSet, VectorBatchHandles
 
 
-__all__ = ["dispatch_by_arm", "empty_result"]
+__all__ = [
+    "dispatch_by_arm",
+    "dispatch_by_depth_and_arm",
+    "empty_result",
+]
 
 
 #: The sentinel a PAD_NULL padding row carries in
 #: ``batch_idx_to_section_variant`` (matches ``Stage1Batch``).
 _PADDING_SENTINEL = np.iinfo(np.uint32).max
+
+
+def dispatch_by_depth_and_arm(
+    handles,
+    *,
+    resolved,
+    batch_idx_to_section_variant: np.ndarray,
+    batch_size: int,
+    context_len: int,
+    max_depth_per_row: np.ndarray,
+    augment_geometry,
+    include_fid_sidecar: bool,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
+) -> List[VectorBatchResult]:
+    """Outer per-DEPTH grouping over :func:`dispatch_by_arm`.
+
+    ``max_depth_per_row`` is the per-row splice depth (``int[batch_size]``,
+    padding rows carry any value -- they are sentinel in the mapping and
+    never decoded). For each DISTINCT depth ``d`` present among the
+    NON-padding rows, the rows whose depth != ``d`` are masked to the
+    padding sentinel (:func:`_mask_other_depths`, mirroring
+    :func:`_mask_other_arms`), and the existing :func:`dispatch_by_arm`
+    runs the arm pipeline at the SCALAR ``max_depth=d`` over that masked
+    mapping. The per-(depth, arm) partials are returned flat -- each fills
+    only its own (depth-and-arm) rows of the shared ``[B, *]`` layout, so
+    the caller's row-wise merge stitches them unambiguously (depth groups
+    partition the non-padding rows exactly as arms do).
+
+    BYTE-IDENTITY: when every non-padding row shares ONE depth (the only
+    case the scalar-``max_depth`` callers ever produced), the loop runs
+    once over an all-real depth mask, so the single ``dispatch_by_arm``
+    call is made with the IDENTICAL mapping + scalar depth as before.
+    """
+    mapping = np.asarray(batch_idx_to_section_variant)
+    section_col = mapping[:, 0]
+    is_padding = section_col == _PADDING_SENTINEL
+    depths = np.asarray(max_depth_per_row).reshape(-1)
+    real_depths = depths[~is_padding]
+    out: List[VectorBatchResult] = []
+    # Ascending distinct depths -> deterministic partial order (the merge
+    # is order-agnostic, but a stable order keeps the output reproducible).
+    for depth in np.unique(real_depths).tolist():
+        depth_masked = _mask_other_depths(
+            batch_idx_to_section_variant, depths, int(depth)
+        )
+        out.extend(
+            dispatch_by_arm(
+                handles,
+                resolved=resolved,
+                batch_idx_to_section_variant=depth_masked,
+                batch_size=batch_size,
+                context_len=context_len,
+                max_depth=int(depth),
+                augment_geometry=augment_geometry,
+                include_fid_sidecar=include_fid_sidecar,
+                unmatched_inline=unmatched_inline,
+                unmatched_inline_depth=unmatched_inline_depth,
+            )
+        )
+    return out
+
+
+def _mask_other_depths(
+    batch_idx_to_section_variant: np.ndarray,
+    max_depth_per_row: np.ndarray,
+    depth: int,
+) -> np.ndarray:
+    """Rewrite every row NOT at ``depth`` to the padding sentinel.
+
+    Mirrors :func:`_mask_other_arms` on the depth axis: a non-padding row
+    whose ``max_depth_per_row`` value != ``depth`` is blanked to
+    ``(UINT32_MAX, UINT32_MAX)`` so the per-depth arm pipeline sees ONLY
+    this depth's rows, yet the result keeps the full ``[B, 2]`` shape so
+    the per-depth partials merge row-wise. The original mapping is never
+    mutated (a copy is returned).
+    """
+    mapping = np.asarray(batch_idx_to_section_variant)
+    masked = mapping.copy()
+    section_col = mapping[:, 0]
+    is_padding = section_col == _PADDING_SENTINEL
+    depths = np.asarray(max_depth_per_row).reshape(-1)
+    keep = (~is_padding) & (depths == depth)
+    masked[~keep] = _PADDING_SENTINEL
+    return masked
 
 
 def dispatch_by_arm(
@@ -55,6 +144,8 @@ def dispatch_by_arm(
     max_depth: int,
     augment_geometry,
     include_fid_sidecar: bool,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> List[VectorBatchResult]:
     """Per-arm geometry -> scatter -> dense over the shared sample.
 
@@ -86,6 +177,8 @@ def dispatch_by_arm(
                 max_depth=max_depth,
                 augment_geometry=augment_geometry,
                 include_fid_sidecar=include_fid_sidecar,
+                unmatched_inline=unmatched_inline,
+                unmatched_inline_depth=unmatched_inline_depth,
             )
         )
     return arm_results
@@ -155,6 +248,8 @@ def _run_arm_pipeline(
     max_depth: int,
     augment_geometry,
     include_fid_sidecar: bool,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> VectorBatchResult:
     """Geometry -> scatter -> dense for ONE arm's rows, full-batch shaped.
 
@@ -178,9 +273,15 @@ def _run_arm_pipeline(
         root_groups=root_groups,
         seq_len=context_len,
         max_depth=max_depth,
+        unmatched_inline=unmatched_inline,
+        unmatched_inline_depth=unmatched_inline_depth,
         # The remembered-excluded pool + dense reservation feed ONLY
         # backfill; compute them only when the backfill hook is present.
         need_excluded_pool=augment_geometry is not None,
+        # The cols-invariant adjacency, built once per binary on the
+        # handles -- so the per-binary MISSING inventory scan + offset map
+        # are not rebuilt on every batch.
+        adjacency=handles.adjacency,
     )
     if augment_geometry is not None:
         geometry = augment_geometry(geometry)

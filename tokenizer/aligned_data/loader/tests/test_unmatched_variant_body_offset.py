@@ -176,6 +176,7 @@ def test_unmatched_callee_body_loads_jresolved_variant(tmp_path) -> None:
                 function_name_ptr=0,
                 call_target_type=CallTargetType.LOCAL,
                 callee_idx=base_idx,
+                is_matched=False,
             )
             body = load_callee_body(sess, SectionKind.UNMATCHED, meta)
             np.testing.assert_array_equal(

@@ -54,6 +54,10 @@ from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import Section
 from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
+from tokenizer.aligned_data.splice_inclusion._unmatched_expand import (
+    Edge,
+    expand_unmatched_edges,
+)
 from tokenizer.tokens import Category
 
 from ._pending import PendingCallTarget, build_pending_call_target
@@ -197,6 +201,8 @@ def walk_section_callees_pending(
     decider: OnceOnlyInclusion,
     collector: BucketedRunLengthCollector,
     section_meta_memo: CalleeSectionMetaMemo,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> List[List[PendingCallTarget]]:
     """Level-synchronous BFS over a section's SAMPLED variant subset.
 
@@ -261,8 +267,50 @@ def walk_section_callees_pending(
             collector=collector,
             out=out,
             section_meta_memo=section_meta_memo,
+            unmatched_inline=unmatched_inline,
+            unmatched_inline_depth=unmatched_inline_depth,
         )
 
+    return out
+
+
+def _resolve_node_children(
+    *,
+    session: "BinarySession",
+    arm: SectionKind,
+    section: Section,
+    variant_idx: int,
+    section_meta_memo: CalleeSectionMetaMemo,
+) -> List[tuple]:
+    """Resolve one node's DIRECT calls into ``(ResolvedCalleeMeta, called_idx)``.
+
+    A variant marks/splices ONLY the call_targets it itself called (its
+    ``per_call_entries``), not every slot in the section's union
+    call_target table -- the once-only mask keys on direct calls so the
+    all-sampled-variants-equivalence test stays meaningful. Returned in
+    ascending call_target-slot order (the BFS emission order). Shared by
+    the level resolve AND the unmatched-expansion resolver (which resolves
+    an unmatched outline's OWN children the same way).
+    """
+    if not section.call_targets:
+        return []
+    sibling_v_idxs = frozenset(range(len(section.variants)))
+    out: List[tuple] = []
+    for called_idx in _direct_called_idxs_for(section, variant_idx):
+        ct = section.call_targets[called_idx]
+        rc = resolve_callee_metadata(
+            session=session,
+            arm=arm,
+            parent_section=section,
+            parent_variant_idx=variant_idx,
+            parent_sibling_v_idxs=sibling_v_idxs,
+            called_idx=called_idx,
+            ct=ct,
+            section_meta_memo=section_meta_memo,
+        )
+        if rc is None:
+            continue
+        out.append((rc, called_idx))
     return out
 
 
@@ -276,44 +324,47 @@ def _step_level(
     collector: BucketedRunLengthCollector,
     out: List[List[PendingCallTarget]],
     section_meta_memo: CalleeSectionMetaMemo,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
 ) -> List[_RowFrontier]:
     """Resolve one level: mark the mask, emit included callees, return
     the next level's frontier (the included pairs, descent per-variant).
+
+    When ``unmatched_inline`` is True the per-level resolved edges are
+    passed through the SHARED unmatched-outline transform
+    (:func:`...splice_inclusion._unmatched_expand.expand_unmatched_edges`)
+    BEFORE driving the decider: each unmatched (``is_matched=False``) edge
+    is replaced by the matched edges surfaced <= ``unmatched_inline_depth``
+    unmatched-hops behind it, so outline detection + emission see the
+    matched callees behind an outline rather than the outline shell. Flag
+    OFF feeds the raw resolved edges verbatim (byte-identical to the
+    pre-feature behaviour, ``is_matched`` ignored).
     """
     # Resolve each surviving parent's DIRECT calls into flat pair lists.
-    # A variant marks/splices ONLY the call_targets it itself called
-    # (its ``per_call_entries``), not every slot in the section's union
-    # call_target table -- the once-only mask keys on direct calls so the
-    # all-sampled-variants-equivalence test ("reached by every sampled
-    # variant") is meaningful (resolving every slot via the sibling
-    # fallback would make every variant reach every callee and exclude
-    # everything).
-    rows: List[int] = []
-    fids: List[int] = []
-    resolved: List[ResolvedCalleeMeta] = []
-    called_idxs: List[int] = []
+    level_pairs: List[tuple] = []  # (ResolvedCalleeMeta, called_idx, mask_row)
     for fr in frontier:
-        if not fr.section.call_targets:
-            continue
-        sibling_v_idxs = frozenset(range(len(fr.section.variants)))
-        for called_idx in _direct_called_idxs(fr):
-            ct = fr.section.call_targets[called_idx]
-            rc = resolve_callee_metadata(
-                session=session,
-                arm=arm,
-                parent_section=fr.section,
-                parent_variant_idx=fr.variant_idx,
-                parent_sibling_v_idxs=sibling_v_idxs,
-                called_idx=called_idx,
-                ct=ct,
-                section_meta_memo=section_meta_memo,
-            )
-            if rc is None:
-                continue
-            rows.append(fr.mask_row)
-            fids.append(rc.section_offset)
-            resolved.append(rc)
-            called_idxs.append(called_idx)
+        for rc, called_idx in _resolve_node_children(
+            session=session,
+            arm=arm,
+            section=fr.section,
+            variant_idx=fr.variant_idx,
+            section_meta_memo=section_meta_memo,
+        ):
+            level_pairs.append((rc, called_idx, fr.mask_row))
+
+    if unmatched_inline:
+        level_pairs = _expand_unmatched_level(
+            level_pairs=level_pairs,
+            session=session,
+            arm=arm,
+            section_meta_memo=section_meta_memo,
+            cap=unmatched_inline_depth,
+        )
+
+    rows = [mask_row for _rc, _ci, mask_row in level_pairs]
+    fids = [rc.section_offset for rc, _ci, _mr in level_pairs]
+    resolved = [rc for rc, _ci, _mr in level_pairs]
+    called_idxs = [ci for _rc, ci, _mr in level_pairs]
 
     if not resolved:
         return []
@@ -353,17 +404,68 @@ def _step_level(
     return next_frontier
 
 
-def _direct_called_idxs(fr: "_RowFrontier") -> List[int]:
-    """Ascending-unique ``called_idx`` the frontier variant DIRECTLY
-    called (its ``per_call_entries``).
+def _direct_called_idxs_for(section: Section, variant_idx: int) -> List[int]:
+    """Ascending-unique ``called_idx`` ``section.variants[variant_idx]``
+    DIRECTLY called (its ``per_call_entries``).
 
     Ascending order matches the sorted-index build's pce ordering
     (``np.unique`` over per-call entries) so a variant's direct calls are
     walked in a stable, deterministic order -- the BFS emission order is
     then a function of the section bytes alone, not iteration accidents.
     """
-    variant = fr.section.variants[fr.variant_idx]
+    variant = section.variants[variant_idx]
     return sorted({int(ce[0]) for ce in variant.per_call_entries})
+
+
+def _expand_unmatched_level(
+    *,
+    level_pairs: List[tuple],
+    session: "BinarySession",
+    arm: SectionKind,
+    section_meta_memo: CalleeSectionMetaMemo,
+    cap: int,
+) -> List[tuple]:
+    """Apply the shared unmatched-outline transform to one level's pairs.
+
+    Maps each ``(ResolvedCalleeMeta, called_idx, mask_row)`` to a shared
+    :class:`Edge` (payload = the pair), drives
+    :func:`expand_unmatched_edges` with a resolver that resolves an
+    unmatched outline's OWN children (the same per-node resolution the
+    level used), and returns the surfaced matched pairs. The unmatched
+    outline's ``called_idx`` provenance is irrelevant to the surfaced
+    matched callees (they carry THEIR OWN parent-slot ``called_idx`` /
+    ``call_target_type``), so each surfaced matched edge keeps its own
+    resolved pair verbatim.
+    """
+
+    def _to_edge(pair: tuple) -> Edge:
+        rc, _called_idx, mask_row = pair
+        return Edge(
+            mask_row=mask_row,
+            dedup_key=rc.section_offset,
+            is_matched=rc.is_matched,
+            payload=pair,
+        )
+
+    def _resolve_children(edge: Edge) -> List[Edge]:
+        rc, _called_idx, mask_row = edge.payload
+        return [
+            _to_edge((child_rc, child_called_idx, mask_row))
+            for child_rc, child_called_idx in _resolve_node_children(
+                session=session,
+                arm=arm,
+                section=rc.section,
+                variant_idx=rc.variant_idx,
+                section_meta_memo=section_meta_memo,
+            )
+        ]
+
+    surfaced = expand_unmatched_edges(
+        [_to_edge(p) for p in level_pairs],
+        _resolve_children,
+        max_unmatched_depth=cap,
+    )
+    return [edge.payload for edge in surfaced]
 
 
 def _emit_pending(

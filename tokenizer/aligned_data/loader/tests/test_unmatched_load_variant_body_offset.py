@@ -36,7 +36,11 @@ from ._corpus import (
     build_corpus_with_registry,
     make_simple_variant,
 )
-from ._session_fixture import _FakeVocab, _VariantStubRegistry
+from ._session_fixture import (
+    _FakeVocab,
+    _VariantStubRegistry,
+    write_variants_slim_csv,
+)
 
 
 # Distinct canonical-4 axes per record: three genuinely-distinct
@@ -72,6 +76,15 @@ def _write_distinct_variants_bin(
 
             offsets.append(f.tell())
             f.write(encode_record(_V(), vocab).tobytes())
+    write_variants_slim_csv(
+        base,
+        binary_name,
+        {
+            off: f"{binary_name}-{ax['arch']}-{ax['compiler']}-"
+            f"{ax['compilerversion']}-{ax['opt']}"
+            for off, ax in zip(offsets, _AXES)
+        },
+    )
     return offsets
 
 

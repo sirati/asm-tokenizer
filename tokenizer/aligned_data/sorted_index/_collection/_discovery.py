@@ -11,9 +11,11 @@ restating any grammar:
 * "which ``.idx`` files exist per directory" delegates to
   :func:`discover_indices` (the canonical filename grammar lives in
   ``_reader``).
-* "which binaries physically exist" is the ``<binary>_index.bin``
-  presence rule (:func:`_existing_binaries`) -- the unmatched-arm
-  sidecar shares the suffix tail and is excluded.
+* "which binaries physically exist" delegates to
+  :func:`discover_binaries` (the canonical ``<binary>_index.bin``
+  presence rule, owning the unmatched-arm + realized-length +
+  realized-geometry sidecar exclusions so they never drift; it also
+  auto-detects the flat vs nested memmap layout).
 
 Membership is spec-INDEPENDENT and uniform across every requested spec:
 a binary is kept iff it carries the ``.idx`` for EVERY spec. A binary
@@ -35,11 +37,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from tokenizer.aligned_data.binary_discovery import discover_binaries
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
-# ``_format`` is a leaf module; the realized_lengths package ``__init__``
-# pulls in the generator (which imports sorted_index), so import the arm
-# grammar from the submodule to stay clear of the import cycle.
-from tokenizer.aligned_data.realized_lengths._format import ARMS as _ARMS
 
 from .._reader import SortedIndexReader, discover_indices
 from .._types import IndexSpec, LengthReduction
@@ -51,45 +50,6 @@ __all__ = ["discover_members"]
 
 
 _LOGGER = logging.getLogger(__name__)
-
-# Per-binary catalog suffixes. A binary EXISTS iff its matched-arm
-# ``<binary>_index.bin`` is present; the unmatched-arm catalog sidecar
-# and the realized-length CSR sidecars share the ``_index.bin`` tail and
-# must be excluded when deriving names.
-_INDEX_SUFFIX = "_index.bin"
-_UNMATCHED_INDEX_SUFFIX = "_unmatched_index.bin"
-
-# Realized-length CSR sidecars (``<binary>_lengths_index.bin`` /
-# ``<binary>_unmatched_lengths_index.bin``) also end in ``_index.bin``
-# but are NOT binary-existence signals. Sourced from the realized_lengths
-# arm grammar so this exclusion never drifts from the generator's
-# filenames.
-_REALIZED_LENGTHS_INDEX_SUFFIXES = tuple(arm.index_suffix for arm in _ARMS)
-
-
-def _existing_binaries(memmap_dir: Path) -> List[str]:
-    """Binary names whose matched-arm ``<binary>_index.bin`` is present.
-
-    The unmatched-arm catalog sidecar ``<binary>_unmatched_index.bin``
-    and the realized-length CSR sidecars
-    (``<binary>_lengths_index.bin`` / ``<binary>_unmatched_lengths_index.bin``)
-    share the ``_index.bin`` tail; none is a binary-existence signal and
-    all are excluded. Returns names in directory-iteration order (the
-    caller sorts).
-    """
-    names: List[str] = []
-    for entry in Path(memmap_dir).iterdir():
-        if not entry.is_file():
-            continue
-        name = entry.name
-        if name.endswith(_UNMATCHED_INDEX_SUFFIX):
-            continue
-        if name.endswith(_REALIZED_LENGTHS_INDEX_SUFFIXES):
-            continue
-        if not name.endswith(_INDEX_SUFFIX):
-            continue
-        names.append(name[: -len(_INDEX_SUFFIX)])
-    return names
 
 
 def _has_index(
@@ -213,21 +173,21 @@ def discover_members(
     # ``{(dir, binary) -> [missing spec, ...]}`` -- a binary present in
     # this map is excluded; its value lists exactly which specs it lacks.
     missing: Dict[Tuple[Path, str], List[IndexSpec]] = {}
-    for memmap_dir in memmap_dirs:
-        memmap_dir = Path(memmap_dir)
-        for binary_name in _existing_binaries(memmap_dir):
+    for scanned_dir in memmap_dirs:
+        for found in discover_binaries(Path(scanned_dir)):
+            binary_dir, binary_name = found.memmap_dir, found.name
             lacked = [
                 spec
                 for spec in specs
                 if not _has_index(
-                    _indices_for(memmap_dir, spec.depth).get(binary_name),
+                    _indices_for(binary_dir, spec.depth).get(binary_name),
                     spec.reduction,
                 )
             ]
             if lacked:
-                missing[(memmap_dir, binary_name)] = lacked
+                missing[(binary_dir, binary_name)] = lacked
             else:
-                kept.append((memmap_dir, binary_name))
+                kept.append((binary_dir, binary_name))
 
     _handle_missing(missing, on_missing=on_missing)
 

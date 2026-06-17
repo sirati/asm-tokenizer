@@ -10,9 +10,13 @@ Default values match the plan's D5 + D6:
 
 * ``variant_padding=VariantPadding.PAD_NULL`` -- short sections pad with
   all-null-content rows (recommended default).
-* ``inlined_equivalent_call_targets_only=True`` -- the walk includes
-  only inlining-equivalent (``is_matched``) call targets; the non-
-  inlined-equivalent mode is unsupported (the walkers assert on False).
+* ``inlined_equivalent_call_targets_only=True`` -- VESTIGIAL / absorbed
+  (always-on); the all-variants-equivalence exclusion is the default-and-
+  only inclusion rule, so this flag no longer gates anything (the walkers
+  assert on False, slated for retirement). NOT the unmatched-outline
+  inlining seam -- that is the separate ``unmatched_inline`` flag.
+* ``unmatched_inline=False`` -- opt-in unmatched-outline inlining OFF by
+  default (byte-identical to the pre-feature behaviour).
 * ``include_fid_sidecar=False``, ``keep_intermediate=False`` -- minimal
   output by default.
 
@@ -124,6 +128,8 @@ def batch_decode(
     max_depth: int,
     variant_padding: VariantPadding = ...,
     inlined_equivalent_call_targets_only: bool = ...,
+    unmatched_inline: bool = ...,
+    unmatched_inline_depth: int = ...,
     include_fid_sidecar: bool = ...,
     keep_intermediate: bool = ...,
     emit_block_n_insns_runlength: bool = ...,
@@ -140,6 +146,8 @@ def batch_decode(
     max_depth: int,
     variant_padding: VariantPadding = ...,
     inlined_equivalent_call_targets_only: bool = ...,
+    unmatched_inline: bool = ...,
+    unmatched_inline_depth: int = ...,
     include_fid_sidecar: bool = ...,
     keep_intermediate: bool = ...,
     emit_block_n_insns_runlength: bool = ...,
@@ -155,6 +163,8 @@ def batch_decode(
     max_depth: int,
     variant_padding: VariantPadding = VariantPadding.PAD_NULL,
     inlined_equivalent_call_targets_only: bool = True,
+    unmatched_inline: bool = False,
+    unmatched_inline_depth: int = 3,
     include_fid_sidecar: bool = False,
     keep_intermediate: bool = False,
     emit_block_n_insns_runlength: bool = False,
@@ -188,10 +198,28 @@ def batch_decode(
         :class:`VariantPadding` policy for the variant axis (plan D6 +
         ALG-10).
     inlined_equivalent_call_targets_only:
-        When True (the default), stage 1's callee walk includes only
-        call targets whose ``is_matched`` flag is True (i.e. only
-        inlining-equivalent callees). Passing False is unsupported --
-        the stage-1 walkers assert on it.
+        VESTIGIAL (absorbed, always-on). Historically meant to restrict
+        the walk to inlining-equivalent call targets; the all-variants-
+        equivalence exclusion is now the default-and-only inclusion rule
+        and this flag no longer gates anything (``is_matched`` is NOT
+        consulted by the inclusion path). Must be True -- the stage-1
+        walkers assert on False; slated for retirement. (For the opt-in
+        unmatched-outline inlining, see ``unmatched_inline`` below -- a
+        SEPARATE seam.)
+    unmatched_inline:
+        Opt-in unmatched-outline inlining (default False). When True,
+        stage 1's callee walk surfaces the matched callees BEHIND each
+        unmatched (``is_matched=False``) call target -- recursing
+        unmatched->unmatched up to ``unmatched_inline_depth`` levels with
+        cycle guarding -- and feeds those matched callees to outline
+        detection IN PLACE OF the unmatched outline shell (so the shell's
+        own body is not emitted; the matched callees behind it are,
+        subject to the once-only + all-variants-equivalence verdict).
+        Default False reproduces the pre-feature behaviour byte-for-byte.
+    unmatched_inline_depth:
+        Cap on consecutive unmatched->unmatched recursion levels for
+        ``unmatched_inline`` (default 3). Ignored when ``unmatched_inline``
+        is False.
     include_fid_sidecar:
         When True, stage 4 builds the optional
         ``(fid_sidecar, fid_row_offsets)`` pair (plan D5).
@@ -247,6 +275,8 @@ def batch_decode(
             inlined_equivalent_call_targets_only=(
                 inlined_equivalent_call_targets_only
             ),
+            unmatched_inline=unmatched_inline,
+            unmatched_inline_depth=unmatched_inline_depth,
             rng=rng,
         )
         return _batch_decode_post_stage1(

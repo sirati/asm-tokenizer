@@ -282,6 +282,17 @@ class IndexSpec:
     reduction: LengthReduction
     depth: int
 
+    def sort_key(self) -> "tuple[str, int]":
+        """Canonical cross-run ordering key: ``(filename_tag, depth)``.
+
+        The SINGLE source of truth for spec ordering -- both the
+        collection's display order (``._spec.sorted_specs``) and the
+        cross-(binary x spec) sampler's canonical cell order key off this
+        so a spec sorts identically everywhere (mirroring the ``.idx``
+        filename's lexsort-by-percentile tag).
+        """
+        return (self.reduction.filename_tag(), self.depth)
+
 
 @dataclass(frozen=True)
 class MultiBinarySectionPointer:
@@ -292,10 +303,19 @@ class MultiBinarySectionPointer:
     single-binary :class:`SectionPointerSpec` (which already encodes
     ``SectionKind.MATCHED`` + per-arm idx); ``binary_name`` selects
     which per-binary session to open.
+
+    ``spec`` is the OPTIONAL ``(reduction, depth)`` :class:`IndexSpec`
+    the pointer was drawn from. It is ``None`` for every single-spec /
+    per-binary draw (the historical path, which never tags a spec); the
+    cross-(binary x spec) sampler stamps it so the cross-depth load path
+    can derive each row's ``max_depth`` from ``spec.depth``. Declared
+    LAST with a ``None`` default so every existing construction is
+    unchanged.
     """
 
     binary_name: str
     section_pointer: SectionPointerSpec
+    spec: Optional[IndexSpec] = None
 
 
 @dataclass(frozen=True)

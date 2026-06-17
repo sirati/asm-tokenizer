@@ -46,8 +46,18 @@ from tokenizer.aligned_data.loader.batch_decode._types import VariantPadding
 from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 from tokenizer.aligned_data.loader.session import BinarySession
 
+from tokenizer.aligned_data.loader.vector_batch.session_handles import (
+    VectorBatchArmSet,
+    open_vector_batch_arm_set,
+)
+
 from .._reader import SortedIndexReader
-from .._sampler import MultiBinarySortedIndexSampler, decode_pointer_batch
+from .._sampler import (
+    CrossSpecSortedIndexSampler,
+    DecodeEngine,
+    MultiBinarySortedIndexSampler,
+    decode_pointer_batch,
+)
 from .._types import (
     IndexSpec,
     LengthReduction,
@@ -103,8 +113,18 @@ class IndexedMemmapCollection:
             spec: MultiBinarySortedIndexSampler(readers_by_spec[spec])
             for spec in self._specs
         }
+        # One cross-(binary x spec) sampler over the SAME readers the
+        # per-spec samplers use, so a cross-depth draw is unbiased across
+        # the binary AND the depth axis at once (each pointer carries the
+        # spec it was drawn from).
+        self._cross_sampler = CrossSpecSortedIndexSampler(readers_by_spec)
         self._datasets = datasets
         self._sessions: Dict[str, BinarySession] = {}
+        # Lazy per-binary vector_batch handle bundles, opened on first
+        # VECTOR_BATCH decode and held on the same ExitStack as the
+        # sessions (released together on :meth:`close`). Empty unless the
+        # vector_batch engine is ever selected.
+        self._vb_handles: Dict[str, VectorBatchArmSet] = {}
         self._stack = ExitStack()
         self._closed = False
 
@@ -206,6 +226,27 @@ class IndexedMemmapCollection:
             target_length, count, rng, band=band,
         )
 
+    def sample_section_pointers_cross_depth(
+        self,
+        target_length: int,
+        count: int,
+        rng: np.random.Generator,
+        *,
+        band: Optional[Tuple[int, int]] = None,
+    ) -> List[MultiBinarySectionPointer]:
+        """Unbiased cross-(binary x spec) sample over EVERY configured spec.
+
+        Draws across all ``(binary, spec)`` cells at once (no ``spec=``
+        selector -- the depth axis is part of the urn), so each returned
+        :class:`MultiBinarySectionPointer` carries the ``spec`` it was
+        drawn from. The downstream cross-depth decode reads each row's
+        ``max_depth`` straight off ``spec.depth``.
+        """
+        self._check_open()
+        return self._cross_sampler.sample_section_pointers(
+            target_length, count, rng, band=band,
+        )
+
     # ------------------------------------------------------------------
     # Batch loading
     # ------------------------------------------------------------------
@@ -222,6 +263,7 @@ class IndexedMemmapCollection:
         variant_padding: VariantPadding = VariantPadding.PAD_NULL,
         inlined_equivalent_call_targets_only: bool = True,
         include_fid_sidecar: bool = False,
+        engine: DecodeEngine = DecodeEngine.BATCH_DECODE,
         spec: Optional[IndexSpec] = None,
     ) -> MultiBinaryBatchDecodeResult:
         """Sample ``batch_size`` pointers from ``spec`` and decode them.
@@ -233,6 +275,14 @@ class IndexedMemmapCollection:
         session lifecycle of :func:`open_length_bucketed_batch` is
         replaced here by sessions that persist across calls until
         :meth:`close`.
+
+        ``engine`` selects the per-binary decode engine
+        (:attr:`DecodeEngine.BATCH_DECODE`, the default; or
+        :attr:`DecodeEngine.VECTOR_BATCH`, the geometry-first path).
+        VECTOR_BATCH is byte-identical to BATCH_DECODE; the collection
+        supplies its per-binary :class:`VectorBatchArmSet` handles lazily
+        through :meth:`_handles_for` (held on the same :class:`ExitStack`
+        as the sessions, released together on :meth:`close`).
 
         Raises
         ------
@@ -271,6 +321,84 @@ class IndexedMemmapCollection:
                 inlined_equivalent_call_targets_only
             ),
             include_fid_sidecar=include_fid_sidecar,
+            engine=engine,
+            handle_provider=self._handles_for,
+        )
+
+    def load_batch_cross_depth(
+        self,
+        target_length: int,
+        batch_size: int,
+        *,
+        rng: np.random.Generator,
+        band: Optional[Tuple[int, int]] = None,
+        context_len: int,
+        num_variants_per_section: int,
+        variant_padding: VariantPadding = VariantPadding.PAD_NULL,
+        inlined_equivalent_call_targets_only: bool = True,
+        include_fid_sidecar: bool = False,
+    ) -> MultiBinaryBatchDecodeResult:
+        """Sample + decode a mixed-depth batch over the cross-(binary x spec) urn.
+
+        Unlike :meth:`load_batch` (one ``spec`` -> one depth), this draws
+        across EVERY configured spec at once, so a single batch mixes
+        sections from different depths. Each sampled pointer's
+        ``spec.depth`` becomes its row's ``max_depth``; the per-pointer
+        depth vector is threaded to :func:`decode_pointer_batch`, which
+        regroups it by binary and runs the geometry-first
+        :func:`vector_batch_tokens` per depth group.
+
+        Cross-depth is VECTOR_BATCH-only (the staged BATCH_DECODE engine
+        has no per-row depth seam), so this method always selects
+        :attr:`DecodeEngine.VECTOR_BATCH` and supplies the per-binary
+        handle bundles via :meth:`_handles_for` -- exactly as
+        :meth:`load_batch` does for that engine.
+
+        Raises
+        ------
+        RuntimeError
+            After :meth:`close`.
+        ValueError
+            When the cross-depth sampler returns no pointers (empty pool
+            at ``target_length`` or across the whole ``band``).
+        """
+        self._check_open()
+        pointers = self._cross_sampler.sample_section_pointers(
+            target_length, batch_size, rng, band=band,
+        )
+        if not pointers:
+            if band is not None:
+                raise ValueError(
+                    "IndexedMemmapCollection.load_batch_cross_depth: empty "
+                    f"sampler pool in band {band}",
+                )
+            raise ValueError(
+                "IndexedMemmapCollection.load_batch_cross_depth: empty "
+                f"sampler pool at target_length={target_length}",
+            )
+
+        # Each row's depth = the spec it was drawn from. The cross-depth
+        # sampler always stamps a spec, so this never reads None.
+        max_depth_per_pointer = np.array(
+            [ptr.spec.depth for ptr in pointers], dtype=np.int64,
+        )
+
+        sampled = {ptr.binary_name for ptr in pointers}
+        sessions = {name: self._session_for(name) for name in sampled}
+        return decode_pointer_batch(
+            sessions,
+            pointers,
+            context_len=context_len,
+            num_variants_per_section=num_variants_per_section,
+            max_depth=max_depth_per_pointer,
+            rng=rng,
+            variant_padding=variant_padding,
+            inlined_equivalent_call_targets_only=(
+                inlined_equivalent_call_targets_only
+            ),
+            include_fid_sidecar=include_fid_sidecar,
+            engine=DecodeEngine.VECTOR_BATCH,
+            handle_provider=self._handles_for,
         )
 
     # ------------------------------------------------------------------
@@ -292,6 +420,28 @@ class IndexedMemmapCollection:
             self._sessions[qualified_name] = session
         return session
 
+    def _handles_for(self, qualified_name: str) -> VectorBatchArmSet:
+        """Return the persistent vector_batch handle bundle for ``qualified_name``.
+
+        Mirrors :meth:`_session_for`: opens both arms' columnar +
+        geometry + body handles lazily on first VECTOR_BATCH decode (a
+        member never decoded under that engine never opens handles),
+        registers the bundle on the same :class:`ExitStack` so
+        :meth:`close` releases it, and reuses it on subsequent calls. The
+        ``base_path`` / ``binary_name`` come from the member's
+        :class:`BinaryDataset` -- the same keys the index build uses.
+        """
+        handles = self._vb_handles.get(qualified_name)
+        if handles is None:
+            dataset = self._datasets[qualified_name]
+            handles = self._stack.enter_context(
+                open_vector_batch_arm_set(
+                    dataset.base_path, dataset.binary_name
+                )
+            )
+            self._vb_handles[qualified_name] = handles
+        return handles
+
     def _check_open(self) -> None:
         if self._closed:
             raise RuntimeError(
@@ -308,6 +458,7 @@ class IndexedMemmapCollection:
             return
         self._closed = True
         self._sessions.clear()
+        self._vb_handles.clear()
         self._stack.close()
 
     def __enter__(self) -> "IndexedMemmapCollection":

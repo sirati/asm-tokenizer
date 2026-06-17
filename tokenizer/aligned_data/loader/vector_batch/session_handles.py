@@ -17,6 +17,7 @@ releases the geometry reader + the memmaps deterministically.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Dict
 
@@ -26,6 +27,9 @@ from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.loader._sections_bin_walk import SectionRegion
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 from tokenizer.aligned_data.realized_lengths import RealizedGeometryReader
+from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
+    LiveNodeAdjacency,
+)
 from tokenizer.aligned_data.realized_lengths._geometry_format import (
     GEOMETRY_ARMS,
     GEOMETRY_MATCHED_ARM,
@@ -76,6 +80,22 @@ class VectorBatchHandles:
     geometry: RealizedGeometryReader
     variants_u8: np.ndarray
     data_u8: np.ndarray
+
+    @cached_property
+    def adjacency(self) -> LiveNodeAdjacency:
+        """The arm's splice adjacency, built once per binary.
+
+        The adjacency (its offset->idx hashmap + the per-binary MISSING
+        inventory scan) is a pure function of ``cols`` / ``section_offsets``
+        -- both fixed for this binary's lifetime -- so it is constructed
+        once here and reused across every batch's geometry prepass rather
+        than rebuilt (and re-scanned) per :func:`compute_batch_geometry`
+        call. Memoised on first access; the frozen handle's fields stay
+        immutable (the cache lands in ``__dict__``).
+        """
+        return LiveNodeAdjacency(
+            self.cols, self.section_offsets, self.cols.sec_of_var
+        )
 
     def close(self) -> None:
         """Release the geometry reader + the memmap views."""

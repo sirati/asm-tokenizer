@@ -30,7 +30,11 @@ def _assert_function_data_equal(a, b) -> None:
     np.testing.assert_array_equal(a.block_runlength, b.block_runlength)
     np.testing.assert_array_equal(a.variant_tokens, b.variant_tokens)
     assert a.func_name == b.func_name
-    assert a.metadata == b.metadata
+    # ``assert_equal`` recurses through the metadata dict (lists of
+    # resolver sub-dicts, nested ``variant_tokens`` ndarrays) with
+    # numpy-aware element comparison -- a bare ``==`` raises on the
+    # ndarray's ambiguous truth value once resolution succeeds.
+    np.testing.assert_equal(a.metadata, b.metadata)
 
 
 def _count_section_parses(sess):
