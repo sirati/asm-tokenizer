@@ -36,7 +36,7 @@ from tokenizer.aligned_data.realized_lengths._geometry_format import (
     RealizedGeometryArm,
 )
 from tokenizer.aligned_data.sorted_index._prepass import (
-    read_region_section_variant_info,
+    read_region_section_variant_info_lazy,
 )
 
 
@@ -166,7 +166,13 @@ def open_vector_batch_handles(
         ``_data.bin`` uint8 memmap.
     """
     base_path = Path(base_path)
-    info = read_region_section_variant_info(base_path, binary_name, arm.region)
+    # Open the catalog LAZILY (matched arm: section-bounded on-demand fill;
+    # unmatched arm: eager, it is cheap). The decode path touches <=5% of
+    # sections, so the full matched columnar parse (~1.9 s on z3) is bounded
+    # to the sampled set's BFS closure instead of paid in full at open.
+    info = read_region_section_variant_info_lazy(
+        base_path, binary_name, arm.region
+    )
     geometry = RealizedGeometryReader.open(base_path, binary_name, arm)
     # An ABSENT ``_variants.bin`` is valid: the session's variant resolver
     # treats it as "no variant-prefix records" (empty ``variant_tokens``).

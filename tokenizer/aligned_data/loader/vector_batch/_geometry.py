@@ -152,6 +152,15 @@ def compute_batch_geometry(
         inclusions, body_axis, id_axis, value_axis
     )
 
+    # Bound the columnar parse to the sections this batch actually emits:
+    # every emitted node (roots + included callees, leaves included) has its
+    # owning section materialised before the variant-prefix / scatter / dense
+    # passes read its heavy ``cols`` columns. The BFS adjacency already filled
+    # the parent/frontier sections; this closes the gap for leaf callees that
+    # were included at max-depth but never expanded as parents. A no-op on the
+    # eager catalog (everything is already resident).
+    cols.ensure_sections(cols.sec_of_var[emission.node])
+
     prefix_len = variant_prefix_lengths(variants_u8, cols, nodes=root_nodes)
 
     layout = compute_token_layout(

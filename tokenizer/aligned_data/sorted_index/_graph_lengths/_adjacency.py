@@ -106,6 +106,11 @@ class LiveNodeAdjacency:
         """
         cols = self._cols
         sec = int(self._sec_of_var[node])
+        # Materialise the node's own section before reading its heavy
+        # columns (no-op on the eager catalog). The scalar walk is the
+        # sorted-index-build path; the vector_batch decode uses
+        # :meth:`expand_batch`, which ensures sections batch-wise.
+        cols.ensure_sections(np.asarray([sec], dtype=np.int64))
         ct_lo = int(cols.ct_offsets[sec])
         ct_hi = int(cols.ct_offsets[sec + 1])
         p0 = int(cols.pce_offsets[node])
@@ -192,6 +197,13 @@ class LiveNodeAdjacency:
         parents = np.asarray(parent_nodes, dtype=np.int64).reshape(-1)
         if parents.size == 0:
             return self._empty_batch()
+
+        # Bound the columnar parse to the sections this frontier touches:
+        # the parents' OWN sections must be materialised before their
+        # per-call-entry rows are read (a no-op on the eager catalog; the
+        # lazy catalog fills them here). Callee sections are ensured later,
+        # after the offset->idx resolve discovers them.
+        cols.ensure_sections(self._sec_of_var[parents])
 
         # CSR-gather every parent's per-call entries in one shot. ``pos`` is
         # the parent INDEX each gathered entry belongs to; the entries are
@@ -410,6 +422,10 @@ class LiveNodeAdjacency:
         if cached is not None:
             return cached
         cols = self._cols
+        # The fallback scan reads this section's per-call entries; ensure it
+        # is materialised (idempotent; usually already filled by the
+        # frontier expand that drove the fallback). No-op on eager cols.
+        cols.ensure_sections(np.asarray([sec], dtype=np.int64))
         n_cts = int(cols.n_call_targets[sec])
         table = np.full(max(0, n_cts), -1, dtype=np.int64)
         if n_cts > 0:
@@ -436,11 +452,16 @@ class LiveNodeAdjacency:
     # -- inventory logging -------------------------------------------------
 
     def _report_inventory(self) -> None:
-        """One per-binary MISSING inventory ERROR line."""
+        """One per-binary MISSING inventory ERROR line.
+
+        Delegates the count to the catalog (``missing_variant_index_count``)
+        so a lazy catalog -- whose ``pce_section_variant_index`` is not yet
+        materialised at adjacency-construction time -- reports 0 here (it
+        emits its own touched-bounded diagnostic as sections fill) instead
+        of forcing the full 40 M-entry scan A-S2 is removing from open.
+        """
         cols = self._cols
-        raw_missing = int(
-            (cols.pce_section_variant_index == MISSING_VARIANT_INDEX).sum()
-        )
+        raw_missing = int(cols.missing_variant_index_count())
         if raw_missing:
             logger.error(
                 "sorted_index: %d per-call entries carry "
