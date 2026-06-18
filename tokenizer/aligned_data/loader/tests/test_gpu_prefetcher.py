@@ -776,3 +776,66 @@ def test_overlap_invariants_are_mutation_sensitive(defect):
     batch = _drive_overlap(backend)
     with pytest.raises(AssertionError):
         _assert_overlap_invariants(backend, batch)
+
+
+# ==========================================================================
+# F. PER-ROW DEPTH LEAF RIDES THE PREFETCH PATH (no torch, injected leaf)
+# ==========================================================================
+# The cross-depth loader attaches a per-row ``depth_per_row`` vector to the
+# batch. The prefetcher is leaf-agnostic, so a consumer that exposes that
+# vector as a tensor leaf must see it moved to device EXACTLY like the token
+# tensor, with its row payload preserved. This proves the pytree + to_device
+# round-trip carries ``depths`` -- no prefetcher code knows the field name.
+@dataclasses.dataclass
+class _DepthConsumerBatch:
+    """A consumer batch carrying a token leaf AND a per-row depth leaf."""
+
+    tokens: FakeTensor
+    depths: FakeTensor  # the per-row source-depth vector, as a tensor leaf
+    seq_len: int        # plain scalar -- must pass through untouched
+
+
+def _make_source_depth():
+    return {"kind": "depth-stub"}
+
+
+def _produce_depth(_src, request):
+    # ``request`` is the per-row depth payload; it is carried on the depths
+    # leaf so the moved-batch assertion can verify the row values survive.
+    rows = list(request)
+    return _DepthConsumerBatch(
+        tokens=FakeTensor("tokens"),
+        depths=FakeTensor(f"depths:{rows}"),
+        seq_len=len(rows),
+    )
+
+
+def test_depth_leaf_moves_to_device_with_tokens_through_prefetcher():
+    with GpuBatchPrefetcher(
+        make_source=_make_source_depth,
+        produce=_produce_depth,
+        device="cpu",
+        decode_workers=1,
+        decode_ahead=3,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=lambda t, device: _move_to_fake_cuda(t),
+        is_leaf=_is_fake_tensor,
+    ) as p:
+        p.submit((0, 1, 3))
+        p.submit((3, 3))
+        a = p.get()
+        b = p.get()
+
+    # Structure preserved; the plain scalar passed through untouched.
+    assert isinstance(a, _DepthConsumerBatch)
+    assert a.seq_len == 3 and b.seq_len == 2
+    # BOTH the token leaf AND the depths leaf were moved to the device --
+    # the prefetcher treated depths exactly like tokens (leaf-agnostic).
+    assert a.tokens.device == "cuda"
+    assert a.depths.device == "cuda"
+    assert b.depths.device == "cuda"
+    # The per-row depth payload survived the H2D round-trip intact and in
+    # FIFO order (the depths leaf carries its source rows verbatim).
+    assert a.depths.name == "depths:[0, 1, 3]"
+    assert b.depths.name == "depths:[3, 3]"

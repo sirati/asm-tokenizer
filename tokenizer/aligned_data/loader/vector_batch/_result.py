@@ -30,10 +30,21 @@ class VectorBatchResult:
     offsets), the ``(significand, sign_exp)`` numeric arrays (+ offsets),
     and the optional per-Category FID sidecars. Every array is
     byte-identical to ``batch_decode`` with backfill off.
+
+    ADDITIONALLY carries ``depth_per_row`` (``int64[B]``), the per-row
+    SOURCE splice depth -- the actual depth value ``d`` each row was
+    decoded at (e.g. ``0`` / ``1`` / ``3``), NOT an index. With a scalar
+    ``max_depth`` every non-padding row holds that one depth (a
+    single-depth batch); with a cross-depth per-pointer ``max_depth`` each
+    row holds its own root section pointer's depth. Padding rows hold
+    ``0`` (inert -- never decoded). This is a PURELY ADDITIONAL field: the
+    token tensor + every dense sidecar above are unchanged, so the
+    byte-identity contract holds.
     """
 
     tokens: np.ndarray
     batch_idx_to_section_variant: np.ndarray
+    depth_per_row: np.ndarray
     identities: np.ndarray
     identity_row_offsets: np.ndarray
     numbers_significant: np.ndarray

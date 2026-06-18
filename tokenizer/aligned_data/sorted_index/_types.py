@@ -39,6 +39,7 @@ __all__ = [
     "LengthReduction",
     "IndexSpec",
     "MultiBinarySectionPointer",
+    "PerBinaryDecodeResult",
     "MultiBinaryBatchDecodeResult",
 ]
 
@@ -319,13 +320,39 @@ class MultiBinarySectionPointer:
 
 
 @dataclass(frozen=True)
+class PerBinaryDecodeResult:
+    """One binary's decoded batch rows + their per-row source depth.
+
+    The cross-binary concat (:func:`._concat._concat_results`) consumes a
+    sequence of these in alphabetical ``binary_name`` order. The
+    ``result`` is the byte-identity-contract :class:`BatchDecodeResult`
+    (shared verbatim across both decode engines); ``depth_per_row`` is the
+    per-row SOURCE splice depth (``int64[batch_size_of_this_binary]``) the
+    decode engine determined -- a scalar broadcast for the single-depth
+    BATCH_DECODE path, or the genuinely per-row depths the cross-depth
+    VECTOR_BATCH path carries on its
+    :class:`~tokenizer.aligned_data.loader.vector_batch._result.VectorBatchResult`.
+    Kept OFF :class:`BatchDecodeResult` so the staged engine's byte-
+    identity contract is untouched; carried alongside here so the concat
+    can stitch a cross-binary ``depth_per_row`` exactly as it stitches
+    ``binary_id_per_row``.
+    """
+
+    binary_name: str
+    result: BatchDecodeResult
+    depth_per_row: np.ndarray
+
+
+@dataclass(frozen=True)
 class MultiBinaryBatchDecodeResult:
     """Extension of :class:`BatchDecodeResult` with cross-binary identity.
 
     The inner :class:`BatchDecodeResult` is the concatenated per-binary
     result (see plan ALG-6); ``binary_id_per_row`` is a per-row index
     into ``binary_names`` so each batch row can be traced back to its
-    source binary (plan D7).
+    source binary (plan D7). ``depth_per_row`` is the parallel per-row
+    SOURCE splice depth so a cross-depth batch row can be depth-
+    conditioned by the consumer.
     """
 
     inner: BatchDecodeResult
@@ -335,3 +362,9 @@ class MultiBinaryBatchDecodeResult:
     binary_names: List[str]
     """``binary_id -> binary_name`` reverse map; alphabetical order
     matching :attr:`MultiBinarySortedIndexSampler.binary_names`."""
+
+    depth_per_row: np.ndarray
+    """``int64[batch_size]`` -- each row's SOURCE splice depth (the actual
+    depth value ``d``, e.g. ``0`` / ``1`` / ``3`` -- NOT an index). A
+    single-depth batch holds one repeated value; a cross-depth batch holds
+    each row's own depth. Padding rows hold ``0`` (inert)."""

@@ -53,6 +53,7 @@ def merge_arm_results(
         return VectorBatchResult(
             tokens=results[0].tokens,
             batch_idx_to_section_variant=batch_idx_to_section_variant,
+            depth_per_row=results[0].depth_per_row,
             identities=results[0].identities,
             identity_row_offsets=results[0].identity_row_offsets,
             numbers_significant=results[0].numbers_significant,
@@ -64,6 +65,7 @@ def merge_arm_results(
         )
 
     tokens = _sum_disjoint_rows([r.tokens for r in results])
+    depth_per_row = _sum_disjoint_rows([r.depth_per_row for r in results])
     identities, identity_row_offsets = _merge_csr(
         [r.identities for r in results],
         [r.identity_row_offsets for r in results],
@@ -81,6 +83,7 @@ def merge_arm_results(
     return VectorBatchResult(
         tokens=tokens,
         batch_idx_to_section_variant=batch_idx_to_section_variant,
+        depth_per_row=depth_per_row,
         identities=identities,
         identity_row_offsets=identity_row_offsets,
         numbers_significant=numbers_significant,

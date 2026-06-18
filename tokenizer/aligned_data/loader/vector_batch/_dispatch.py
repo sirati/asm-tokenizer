@@ -298,6 +298,9 @@ def _run_arm_pipeline(
         batch_size=batch_size,
         context_len=context_len,
     )
+    depth_per_row = _depth_per_row_for_partial(
+        masked_mapping, batch_size=batch_size, max_depth=max_depth
+    )
     dense = build_dense_sidecars(
         geometry,
         scattered.expanded,
@@ -309,6 +312,7 @@ def _run_arm_pipeline(
     return VectorBatchResult(
         tokens=tokens,
         batch_idx_to_section_variant=masked_mapping,
+        depth_per_row=depth_per_row,
         identities=dense.identities,
         identity_row_offsets=dense.identity_row_offsets,
         numbers_significant=dense.numbers_significant,
@@ -345,6 +349,7 @@ def empty_result(
     return VectorBatchResult(
         tokens=tokens,
         batch_idx_to_section_variant=np.asarray(batch_idx_to_section_variant),
+        depth_per_row=np.zeros(batch_size, dtype=np.int64),
         identities=np.empty(0, dtype=np.uint16),
         identity_row_offsets=zero_offsets,
         numbers_significant=np.empty(0, dtype=np.uint64),
@@ -413,6 +418,30 @@ def _columnar_section_idx(section_offsets: np.ndarray, section_offset: int) -> i
             f"section_offsets (wrong-arm handles?)"
         )
     return pos
+
+
+def _depth_per_row_for_partial(
+    batch_idx_to_section_variant, *, batch_size, max_depth
+):
+    """The per-row source depth of ONE (depth, arm) partial's rows.
+
+    The partial's ``masked_mapping`` is already masked to this single
+    scalar ``max_depth`` (the depth grouping happened in
+    :func:`dispatch_by_depth_and_arm`) and to this arm, so every
+    non-padding row of it was decoded at ``max_depth``; padding rows
+    (sentinel) hold ``0`` (inert -- never decoded). The result is
+    ``int64[batch_size]`` populated for this partial's rows only, so the
+    orchestrator's disjoint-row merge stitches the per-(depth, arm)
+    partials exactly as it stitches the token tensor (each partition fills
+    its own rows, all others zero).
+    """
+    mapping = np.asarray(batch_idx_to_section_variant, dtype=np.int64)
+    depth_per_row = np.zeros(batch_size, dtype=np.int64)
+    if batch_size == 0:
+        return depth_per_row
+    is_real = mapping[:, 0] != int(_PADDING_SENTINEL)
+    depth_per_row[is_real] = int(max_depth)
+    return depth_per_row
 
 
 def _expand_to_batch(
