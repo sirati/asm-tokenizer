@@ -44,7 +44,9 @@ from .matched_sections_bin import (
 
 __all__ = [
     "ColumnarSections",
+    "LazyColumnarSections",
     "parse_sections_columnar",
+    "parse_sections_columnar_lazy",
     "read_n_variants_columnar",
 ]
 
