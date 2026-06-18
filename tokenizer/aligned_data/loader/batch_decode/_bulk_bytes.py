@@ -46,6 +46,10 @@ import numpy as np
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
+from ._flat_call_targets import (
+    segment_ids_from_offsets,
+    surviving_call_targets,
+)
 from ._fp_normalize import normalize_per_token_type
 from ._identity_decode import build_identity_idx_2d, view_cast_identities
 from ._inline_bytes import build_inline_bytes
@@ -60,7 +64,6 @@ from ._types import (
 if TYPE_CHECKING:
     from ._types import (
         Stage2Batch,
-        Stage2CallTarget,
         Stage2Section,
         Stage2Variant,
     )
@@ -246,11 +249,11 @@ def _collect_is_negative_per_source_per_type(
 ) -> dict[TokenType, np.ndarray]:
     """Group per-source ``is_negative`` flags by :class:`TokenType`.
 
-    Walks every call_target in DFS encounter order; within each
-    call_target iterates surviving carriers in expanded-stream order
-    (stream-source order, post-promotion / post-strip / post-shift) and
-    appends ``state.is_negative_per_position[carrier_raw_position]`` to
-    the per-:class:`TokenType` list.
+    Batched (B-S2) form of the per-source sign collection. Instead of one
+    compute pass per call_target, the surviving carriers of EVERY
+    call_target are identified + signed in a SINGLE vectorised pass over
+    the flat ``expanded[1:surviving]`` concatenation, then grouped per
+    :class:`TokenType` preserving DFS-then-stream encounter order.
 
     A multi-chunk source (VC2 K>1, F128 finite) contributes ONE entry
     here (per SOURCE, not per chunk) -- 3d's
@@ -261,104 +264,149 @@ def _collect_is_negative_per_source_per_type(
     lives in the gathered byte pattern and 3d doesn't read this array.
     We still populate it for API uniformity (and to make 3d's
     "sign mismatch" diagnostic catch upstream bugs).
+
+    Equivalence to the prior per-call_target walk
+    ---------------------------------------------
+    Per call_target the scalar walk: (1) restricted to
+    ``expanded[1:surviving]`` (slot 0 is the synthetic prepend, never a
+    number carrier); (2) marked CARRIERS as NUMBER-band, non-painted
+    slots; (3) mapped each carrier to its raw position via
+    ``real_positions[cumsum(is_real) - 1]`` (the K-th non-painted slot
+    consumes ``real_positions[K-1]``); (4) read
+    ``is_negative_per_position[raw_pos]``; (5) appended per type in
+    stream order. Each step is reproduced below SEGMENT-WISE: the
+    ``cumsum(is_real)`` becomes a per-call_target segmented cumsum, and
+    ``real_positions`` is concatenated per call_target with a CSR base so
+    a single global gather recovers every carrier's raw position.
     """
 
-    out_lists: dict[TokenType, list[bool]] = {
-        T: [] for T in _NUMBER_BLOCK_TOKEN_TYPES
-    }
+    carrier_block_idx, carrier_signs = _batched_carrier_signs(stage2)
 
-    for section in stage2.sections:
-        for variant in section.variants:
-            for ct in variant.call_targets:
-                if ct.surviving_token_count == 0:
-                    continue
-                _collect_call_target_signs(ct, out_lists)
-
-    return {
-        T: np.asarray(out_lists[T], dtype=np.bool_)
-        for T in _NUMBER_BLOCK_TOKEN_TYPES
-    }
-
-
-def _collect_call_target_signs(
-    ct: "Stage2CallTarget",
-    out_lists: dict[TokenType, list[bool]],
-) -> None:
-    """Walk one call_target's surviving carriers, dispatching by type.
-
-    The walk mirrors :mod:`._number_decode`'s carrier dispatch but only
-    consumes the per-source sign (per the API surface 3d expects).
-
-    Carrier identification (matches :mod:`._number_decode`):
-
-    * Surviving expanded positions ``[1, surviving_token_count)`` (slot 0
-      is the synthetic prepend, never a number carrier).
-    * A position is a CARRIER iff the token is in the NUMBER band AND
-      neither ``extra_value_v2_mask`` nor ``extra_f128_mask`` is True
-      (painted continuations are not source-level carriers).
-
-    Carrier-to-raw-position map: real tokens (``state.real_mask``)
-    correspond 1:1 with non-painted slots of ``expanded[1:]`` in
-    encounter order, so the K-th non-painted slot consumes
-    ``real_positions[K-1]``.
-    """
-    state = ct.stage1.state
-    expanded_token_ids = ct.expanded_token_ids
-    extra_value_v2_mask = ct.extra_value_v2_mask
-    extra_f128_mask = ct.extra_f128_mask
-    surviving = int(ct.surviving_token_count)
-    is_negative_per_position = state.is_negative_per_position
-
-    if surviving <= 1:
-        return
-
-    real_positions = np.nonzero(state.real_mask)[0]
-
-    # Walk in expanded[1:surviving] space via boolean-mask gather.  A
-    # painted slot (either VC2 or F128 continuation) borrows its
-    # carrier's raw position and contributes no fresh sign entry; the
-    # remaining real-token slots consume ``real_positions`` 1:1 in
-    # encounter order.
-    expanded_slice = expanded_token_ids[1:surviving]
-    is_painted = (
-        extra_value_v2_mask[1:surviving] | extra_f128_mask[1:surviving]
-    )
-    is_real = ~is_painted
-
-    # Restrict to NUMBER-band non-painted carriers; the painted-slot
-    # exclusion + band predicate together mirror the scalar walk's
-    # filter.
-    in_number_band = (
-        (expanded_slice >= _NUMBER_BAND_LO_SHIFTED)
-        & (expanded_slice < _NUMBER_BAND_HI_SHIFTED)
-    )
-    carrier_mask = in_number_band & is_real
-    if not carrier_mask.any():
-        return
-
-    # Raw position per non-painted slot = ``real_positions[k]`` where
-    # ``k`` = count of non-painted slots at or before this slot, minus
-    # one.  ``cumsum(is_real) - 1`` gives that index per slot in
-    # encounter order; restricting to ``carrier_mask`` picks the
-    # NUMBER-band entries.
-    real_idx_inclusive = (np.cumsum(is_real) - 1).astype(np.intp)
-    carrier_raw_positions = real_positions[real_idx_inclusive[carrier_mask]]
-    carrier_signs = is_negative_per_position[carrier_raw_positions]
-    carrier_shifted_ids = expanded_slice[carrier_mask]
-    carrier_block_idx = (
-        carrier_shifted_ids - _NUMBER_BAND_LO_SHIFTED
-    ).astype(np.int64)
-
-    # Group per TokenType.  np.nonzero ordering is ascending, so the
-    # per-type lists pick up signs in stream-encounter order -- matches
-    # the per-type idx_2d row order built by :mod:`._number_decode`.
+    out: dict[TokenType, np.ndarray] = {}
     for block_idx, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
         type_mask = carrier_block_idx == block_idx
-        if not type_mask.any():
-            continue
-        out_lists[token_type].extend(
-            carrier_signs[type_mask].astype(bool).tolist()
+        # Boolean-mask selection preserves the flat (DFS, stream) order,
+        # matching the per-type idx_2d row order :mod:`._number_decode`
+        # builds.
+        out[token_type] = carrier_signs[type_mask].astype(np.bool_, copy=False)
+    return out
+
+
+def _batched_carrier_signs(
+    stage2: "Stage2Batch",
+) -> tuple[np.ndarray, np.ndarray]:
+    """One-pass carrier ``(block_idx, sign)`` over all call_targets.
+
+    Returns two parallel ``int64`` / ``bool`` arrays in DFS-then-stream
+    encounter order: ``carrier_block_idx`` (0 = VC2, 1 = F16, ..., 6 =
+    F128) and ``carrier_signs`` (the per-source negative flag). Painted
+    continuation slots and the per-call_target prepend slot contribute no
+    entries (a painted slot borrows its carrier's raw position; the
+    prepend lives in the IDENTITY band).
+    """
+    kept, _kept_idx = surviving_call_targets(stage2)
+    if not kept:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.bool_),
         )
+
+    # --- flat ``expanded[1:surviving]`` concatenation (slot 0 dropped) ---
+    expanded_chunks: list[np.ndarray] = []
+    painted_chunks: list[np.ndarray] = []
+    # --- flat per-call_target ``real_positions`` + ``is_negative`` ---
+    real_pos_chunks: list[np.ndarray] = []
+    is_neg_chunks: list[np.ndarray] = []
+    exp_seg_len = np.empty(len(kept), dtype=np.int64)
+    real_seg_base = np.empty(len(kept), dtype=np.int64)
+
+    real_running = 0
+    for i, ct in enumerate(kept):
+        surviving = int(ct.surviving_token_count)
+        state = ct.stage1.state
+        expanded_chunks.append(
+            ct.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
+        )
+        painted_chunks.append(
+            ct.extra_value_v2_mask[1:surviving]
+            | ct.extra_f128_mask[1:surviving]
+        )
+        exp_seg_len[i] = max(surviving - 1, 0)
+        real_positions = np.nonzero(state.real_mask)[0]
+        real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
+        is_neg_chunks.append(
+            state.is_negative_per_position[real_positions]
+        )
+        real_seg_base[i] = real_running
+        real_running += int(real_positions.shape[0])
+
+    expanded_flat = np.concatenate(expanded_chunks)
+    is_painted_flat = np.concatenate(painted_chunks)
+    is_real_flat = ~is_painted_flat
+    real_pos_flat = np.concatenate(real_pos_chunks)
+    is_neg_at_real_flat = np.concatenate(is_neg_chunks)
+
+    if expanded_flat.shape[0] == 0:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.bool_),
+        )
+
+    # CSR over the expanded-prefix axis (segment i = call_target i).
+    exp_seg_offsets = np.zeros(len(kept) + 1, dtype=np.int64)
+    np.cumsum(exp_seg_len, out=exp_seg_offsets[1:])
+    seg_id = segment_ids_from_offsets(
+        exp_seg_offsets, int(expanded_flat.shape[0])
+    )
+
+    # SEGMENTED ``cumsum(is_real) - 1`` per call_target. A global cumsum
+    # carries the running real-count across segment boundaries; subtract
+    # the cumulative value carried in at each segment's exclusive start to
+    # reset it to the per-call_target ``cumsum(is_real) - 1`` the scalar
+    # walk uses. The per-segment carry-in is the INCLUSIVE global cum at
+    # the previous flat element (0 for the first segment), broadcast over
+    # the segment via ``seg_id``. ``global_cum_excl`` is the exclusive
+    # prefix sum, so its value at each segment's first flat index is
+    # exactly that carry-in.
+    is_real_i64 = is_real_flat.astype(np.int64)
+    global_cum = np.cumsum(is_real_i64)
+    global_cum_excl = global_cum - is_real_i64
+    # ``seg_carry_in[seg]`` = exclusive global cum at the segment's first
+    # element. ``exp_seg_offsets[:-1]`` is the first flat index of each
+    # segment; for a zero-length segment that index coincides with the
+    # next segment's start (no flat element belongs to it, so it is never
+    # read through ``seg_id`` anyway). Trailing zero-length segments would
+    # push the index to ``total``; clip to keep the gather in-bounds (the
+    # clipped value is unused).
+    first_idx = np.minimum(
+        exp_seg_offsets[:-1], int(global_cum_excl.shape[0]) - 1
+    )
+    seg_carry_in = global_cum_excl[first_idx]
+    real_idx_inclusive = global_cum - 1 - seg_carry_in[seg_id]
+
+    # NUMBER-band non-painted carriers.
+    in_number_band = (expanded_flat >= _NUMBER_BAND_LO_SHIFTED) & (
+        expanded_flat < _NUMBER_BAND_HI_SHIFTED
+    )
+    carrier_mask = in_number_band & is_real_flat
+    if not carrier_mask.any():
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.bool_),
+        )
+
+    carrier_seg = seg_id[carrier_mask]
+    # Global index into the concatenated ``real_pos`` / ``is_neg`` arrays
+    # = per-call_target base + per-call_target real index.
+    carrier_real_global = (
+        real_seg_base[carrier_seg]
+        + real_idx_inclusive[carrier_mask]
+    )
+    carrier_signs = is_neg_at_real_flat[carrier_real_global]
+    carrier_block_idx = (
+        expanded_flat[carrier_mask] - _NUMBER_BAND_LO_SHIFTED
+    )
+    return carrier_block_idx, carrier_signs
 
 
 # ---------------------------------------------------------------------------
