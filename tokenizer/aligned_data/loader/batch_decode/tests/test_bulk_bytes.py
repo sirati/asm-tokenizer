@@ -573,6 +573,65 @@ def test_vc2_sign_threaded_per_source_across_chunks() -> None:
     )
 
 
+def test_signed_carrier_after_surviving_one_call_target_keeps_sign() -> None:
+    """A zero-length-body call_target wedged before a signed carrier must
+    not corrupt the carrier's sign attribution.
+
+    A kept call_target with ``surviving == 1`` (only the prepend survives)
+    has a ZERO-LENGTH body segment. The batched sign collection builds
+    per-call_target segment ids over those bodies; a CSR mark-and-cumsum
+    expansion silently MERGES the zero-length boundary into the next
+    segment, shifting every later carrier onto the WRONG call_target's
+    ``real_positions`` -> wrong sign. The empty-safe ``np.repeat`` build
+    keeps the zero-length segment, so the trailing negative VC2 carrier
+    still reads its own ``value_negative`` marker.
+
+    Layout (DFS order):
+      CT_0: positive F32 carrier (real, nonzero-length body).
+      CT_1: identity stream cut to surviving==1 (prepend only -> empty body).
+      CT_2: negative-signed VC2 multi-chunk source.
+
+    Without the fix CT_2's two chunks come out positive (sign mismatch);
+    with the fix they match the ``from_int(magnitude, sign=-1)`` oracle.
+    """
+    raw0 = np.array(
+        [_F32_RAW, 0x40, 0x49, 0x0F, 0xDB], dtype=np.uint16
+    )
+    ct0 = _make_stage2_ct(_make_stage1_ct(raw0))
+
+    raw1 = np.array([_BLOCK_V2_RAW, 0x01, 0x02], dtype=np.uint16)
+    ct1 = _make_stage2_ct(_make_stage1_ct(raw1), cut_length=1)
+    # Sanity: CT_1 is kept (surviving==1) with a zero-length body.
+    assert ct1.surviving_token_count == 1
+
+    magnitude_bytes_be = (1 << 70).to_bytes(9, "big")
+    raw2 = np.array(
+        [_VC2_RAW] + list(magnitude_bytes_be) + [_VALUE_NEGATIVE_RAW],
+        dtype=np.uint16,
+    )
+    stage1_2 = _make_stage1_ct(raw2)
+    # Sanity: the negative postfix marker registered at the VC2 carrier.
+    assert bool(stage1_2.state.is_negative_per_position[0]) is True
+    ct2 = _make_stage2_ct(stage1_2)
+
+    batch = _wrap_stage2_batch([ct0, ct1, ct2])
+    s3 = build_bulk_bytes(batch)
+
+    sig, sign_exp = s3.numbers_per_TokenType[TokenType.VALUED_CONST_V2]
+    assert sig.shape == (2,)
+    expected = from_int(1 << 70, sign=-1)
+    assert len(expected) == 2
+    np.testing.assert_array_equal(
+        sig, np.array([int(c[0]) for c in expected], dtype=np.uint64)
+    )
+    # The sign-bearing field: must match the NEGATIVE oracle. The bug
+    # attributed CT_1's (empty) sign band to CT_2, yielding positive chunks.
+    np.testing.assert_array_equal(
+        sign_exp,
+        np.array([int(c[1]) for c in expected], dtype=np.uint32),
+    )
+
+
 def test_end_to_end_predict_lengths_into_build_bulk_bytes() -> None:
     """End-to-end byte-equivalence: build Stage1Batch -> predict_lengths
     -> build_bulk_bytes, verify the per-:class:`TokenType` chunks match

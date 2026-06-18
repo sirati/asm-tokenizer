@@ -46,10 +46,7 @@ import numpy as np
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
-from ._flat_call_targets import (
-    segment_ids_from_offsets,
-    surviving_call_targets,
-)
+from ._flat_call_targets import surviving_call_targets
 from ._fp_normalize import normalize_per_token_type
 from ._identity_decode import build_identity_idx_2d, view_cast_identities
 from ._inline_bytes import build_inline_bytes
@@ -352,12 +349,16 @@ def _batched_carrier_signs(
             np.empty(0, dtype=np.bool_),
         )
 
-    # CSR over the expanded-prefix axis (segment i = call_target i).
+    # CSR over the expanded-prefix axis (segment i = call_target i). A
+    # kept call_target with ``surviving == 1`` has a ZERO-LENGTH body
+    # segment (its only surviving slot is the prepend, dropped from the
+    # ``[1:surviving]`` body axis); ``np.repeat`` over the per-segment
+    # lengths yields the per-slot segment id correctly even for those empty
+    # segments (the mark-and-cumsum CSR expansion would silently MERGE
+    # consecutive zero-length boundaries, shifting all later segment ids).
     exp_seg_offsets = np.zeros(len(kept) + 1, dtype=np.int64)
     np.cumsum(exp_seg_len, out=exp_seg_offsets[1:])
-    seg_id = segment_ids_from_offsets(
-        exp_seg_offsets, int(expanded_flat.shape[0])
-    )
+    seg_id = np.repeat(np.arange(len(kept), dtype=np.int64), exp_seg_len)
 
     # SEGMENTED ``cumsum(is_real) - 1`` per call_target. A global cumsum
     # carries the running real-count across segment boundaries; subtract
