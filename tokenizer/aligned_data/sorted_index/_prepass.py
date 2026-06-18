@@ -39,12 +39,16 @@ from tokenizer.aligned_data.matched_sections_columnar import (
     ColumnarSections,
     parse_sections_columnar,
 )
+from tokenizer.aligned_data.matched_sections_columnar_lazy import (
+    parse_sections_columnar_lazy,
+)
 
 
 __all__ = [
     "SectionVariantInfo",
     "read_section_variant_info",
     "read_region_section_variant_info",
+    "read_region_section_variant_info_lazy",
     "sections_bin_path",
     "index_locator_path",
 ]
@@ -187,6 +191,51 @@ def read_region_section_variant_info(
     )
     return SectionVariantInfo(
         cols=parse_sections_columnar(blob, starts, lengths),
+        section_offsets=starts,
+    )
+
+
+def read_region_section_variant_info_lazy(
+    base_path: Path,
+    binary_name: str,
+    region: SectionRegion,
+) -> SectionVariantInfo:
+    """Like :func:`read_region_section_variant_info` but LAZY where possible.
+
+    Returns a :class:`SectionVariantInfo` whose ``cols`` is a
+    :class:`...matched_sections_columnar_lazy.LazyColumnarSections` -- the
+    section-level skeleton + CSR offsets eager, the heavy table/variant/
+    per-call columns filled on first touch -- when the region carries the
+    per-section byte LENGTHS the lazy skeleton needs (the MATCHED region,
+    bounded by the ``_index.bin`` locator). The UNMATCHED region has no
+    locator lengths, so it falls back to the EAGER
+    :func:`read_region_section_variant_info` (which is cheap there: the
+    unmatched columnar is a small fraction of the matched catalog).
+
+    The vector_batch handles use this so the dominant matched-arm catalog
+    parse is bounded to the sampled section set; the sorted-index BUILD
+    keeps using the eager reader (it legitimately reads the whole catalog).
+    """
+    base_path = Path(base_path)
+    if region is SectionRegion.MATCHED:
+        starts, lengths = _matched_region_starts(base_path, binary_name)
+    elif region is SectionRegion.UNMATCHED:
+        # No locator lengths -> the lazy skeleton's length-arithmetic base
+        # is unavailable; the eager parse is cheap on this small region.
+        return read_region_section_variant_info(
+            base_path, binary_name, region
+        )
+    else:
+        raise ValueError(f"unknown section region: {region!r}")
+    if starts is None or starts.size == 0:
+        return _empty()
+    blob = np.memmap(
+        sections_bin_path(base_path, binary_name),
+        dtype=np.uint8,
+        mode="r",
+    )
+    return SectionVariantInfo(
+        cols=parse_sections_columnar_lazy(blob, starts, lengths),
         section_offsets=starts,
     )
 

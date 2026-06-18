@@ -41,6 +41,7 @@ yields exactly the bytes the full-batch parse would have written there.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Optional
@@ -49,6 +50,7 @@ import numpy as np
 
 from .matched_sections_bin import (
     CALL_TARGET_ENTRY_SIZE,
+    MISSING_VARIANT_INDEX,
     PER_CALL_ENTRY_SIZE,
     SECTION_HEADER_SIZE,
     VARIANT_HEADER_SIZE,
@@ -65,6 +67,9 @@ from .matched_sections_columnar import (
 
 
 __all__ = ["LazyColumnarSections", "parse_sections_columnar_lazy"]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -240,6 +245,12 @@ class LazyColumnarSections:
         )
 
         self._filled = np.zeros(n_sections, dtype=bool)
+        # Touched-bounded running tally of MISSING_VARIANT_INDEX per-call
+        # entries (the dropped-splice-edge data-quality diagnostic). The
+        # eager catalog scans the whole catalog once; the lazy catalog never
+        # has it all resident, so it accumulates per fill and logs the
+        # incremental contribution -- bounded to the touched sections.
+        self._missing_count = 0
 
     # -- the global node->section inverse (same contract as the eager one) -
     @cached_property
@@ -296,6 +307,42 @@ class LazyColumnarSections:
         self._scatter_variants(secs, sub)
         self._scatter_per_call_entries(secs, sub)
         self._filled[secs] = True
+        self._tally_missing(sub)
+
+    def _tally_missing(self, sub: ColumnarSections) -> None:
+        """Accumulate + log the MISSING-edge count for the just-filled set.
+
+        The per-binary inventory the eager catalog emits in one ERROR line
+        at adjacency construction; here it is bounded to (and emitted per)
+        the touched sections, so the open path never scans the untouched
+        ~95% of the catalog. Same ERROR semantics (each MISSING entry is a
+        silently-dropped splice edge), now reported as it is discovered.
+        """
+        new_missing = int(
+            (sub.pce_section_variant_index == MISSING_VARIANT_INDEX).sum()
+        )
+        if new_missing:
+            self._missing_count += new_missing
+            logger.error(
+                "sorted_index: %d per-call entries carry "
+                "MISSING_VARIANT_INDEX in newly-touched sections "
+                "(running total %d). Each one silently drops a splice edge "
+                "-- the callee's variant set does not cover the caller's "
+                "vkey.",
+                new_missing,
+                self._missing_count,
+            )
+
+    def missing_variant_index_count(self) -> int:
+        """Touched-bounded running MISSING-edge tally (not the full catalog).
+
+        The lazy twin of :meth:`ColumnarSections.missing_variant_index_count`
+        -- it returns only what the FILLED sections have contributed (0 at
+        construction). The full-catalog count is deliberately never computed
+        on the lazy open path; the incremental :meth:`_tally_missing` log is
+        the diagnostic surface instead.
+        """
+        return self._missing_count
 
     def _scatter_call_targets(
         self, secs: np.ndarray, sub: ColumnarSections

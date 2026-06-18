@@ -155,6 +155,32 @@ class ColumnarSections:
             self.var_n_calls,
         )
 
+    def missing_variant_index_count(self) -> int:
+        """Per-call entries carrying the ``MISSING_VARIANT_INDEX`` sentinel.
+
+        The whole-catalog count of dropped splice edges (a data-quality
+        diagnostic). The eager catalog has every entry materialised, so it
+        is one masked sum; the lazy twin overrides this to a touched-bounded
+        running total (it never has the full catalog resident).
+        """
+        from .matched_sections_bin import MISSING_VARIANT_INDEX
+
+        return int(
+            (self.pce_section_variant_index == MISSING_VARIANT_INDEX).sum()
+        )
+
+    def ensure_sections(self, section_indices) -> None:
+        """No-op: the eager catalog already has every section materialised.
+
+        The lazy twin (:class:`...matched_sections_columnar_lazy.
+        LazyColumnarSections`) overrides this to fill the touched sections'
+        heavy columns on first touch. Defining it here -- as a no-op --
+        lets every consumer call ``cols.ensure_sections(secs)`` uniformly
+        against EITHER catalog with no type-test branching: the eager
+        catalog simply has nothing left to fill.
+        """
+        return None
+
 
 def _u16(b: np.ndarray, idx: np.ndarray) -> np.ndarray:
     """Gather little-endian u16 values at byte indices ``idx``.
