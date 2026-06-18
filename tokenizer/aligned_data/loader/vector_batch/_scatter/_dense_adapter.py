@@ -102,6 +102,22 @@ def build_stage2_batch(
         expanded.runlen_number_flat,
         expanded.raw_record_offsets,
     )
+    # B-S1: hoist the COUNTER-category-counts dict shape out of the per-node
+    # loop. ``per_node_counts`` is ``dict[Category, int64[n_emitted]]``; the
+    # per-node ``function_data.metadata['category_counts']`` is one column
+    # slice of it. Precompute the (category, column) pairs ONCE so the per-
+    # node dict build is a flat zip over scalars -- no per-node re-iteration
+    # of the dict keys nor re-hashing of the Category enums.
+    count_cats = tuple(per_node_counts)
+    count_cols = tuple(per_node_counts[cat] for cat in count_cats)
+
+    # B-S1: per-node ``encounter_category`` as one precomputed column. The
+    # node's edge type (0/1/2) maps through ``_CALL_TARGET_TYPE_TO_CATEGORY``
+    # -- a 3-entry table -- so resolve it via a length-3 lookup indexed by
+    # the (already-int) ``edge_type`` array instead of constructing a
+    # ``CallTargetType`` enum + dict lookup per emitted node.
+    encounter_category_per_node = _encounter_category_per_node(edge_type)
+
     # B-S1: per-section ``list[CallTarget]`` cache. ``_call_targets_section``
     # is called once per EMITTED NODE but a section's call_targets table is
     # node-invariant, so nodes of the same section share ONE frozen
@@ -110,6 +126,9 @@ def build_stage2_batch(
     # dedup-map capacity estimate) only read it, never mutate, so sharing
     # the same object is byte-identical.
     ct_section_cache: dict[int, List[CallTarget]] = {}
+    # B-S1: per-section root FID as a Python-int column (one ``int()`` per
+    # distinct section instead of per emitted node).
+    section_fid_int = section_fid.tolist()
 
     sections: List[Stage2Section] = []
     for r in range(n_rows):
@@ -125,15 +144,16 @@ def build_stage2_batch(
             s1_ct = Stage1CallTarget(
                 function_data=_function_data_for(
                     expanded.states[e].raw_tokens,
-                    {cat: int(per_node_counts[cat][e]) for cat in per_node_counts},
+                    {
+                        cat: int(col[e])
+                        for cat, col in zip(count_cats, count_cols)
+                    },
                 ),
                 state=expanded.states[e],
                 call_targets_section=ct_section,
-                encounter_category=_CALL_TARGET_TYPE_TO_CATEGORY[
-                    CallTargetType(int(edge_type[e]))
-                ],
+                encounter_category=encounter_category_per_node[e],
                 parent_call_target_index=None if e == lo else 0,
-                function_name_ptr=int(section_fid[sec]),
+                function_name_ptr=section_fid_int[sec],
                 path_depth=0 if e == lo else 1,
             )
             s2_cts.append(
@@ -162,6 +182,23 @@ def build_stage2_batch(
         identity_row_offsets=identity_row_offsets,
         number_row_offsets=number_row_offsets,
     )
+
+
+def _encounter_category_per_node(edge_type: np.ndarray) -> List[Category]:
+    """Per-node ``encounter_category`` resolved via a length-3 lookup.
+
+    Each node's ``edge_type`` (the int value of its :class:`CallTargetType`)
+    maps to a FUNCTION :class:`Category` through
+    ``_CALL_TARGET_TYPE_TO_CATEGORY``. Resolving that 3-entry table once and
+    indexing it by the (already-int) ``edge_type`` reproduces the per-node
+    ``_CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(int(edge_type[e]))]``
+    byte-for-byte, without an enum construction + dict lookup per node.
+    """
+    table = [
+        _CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(t)]
+        for t in range(len(CallTargetType))
+    ]
+    return [table[t] for t in edge_type.tolist()]
 
 
 def _section_of_node(
