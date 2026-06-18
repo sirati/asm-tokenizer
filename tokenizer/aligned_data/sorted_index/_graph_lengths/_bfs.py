@@ -193,25 +193,19 @@ def _expand_children(
     Children are derived per node live from the catalog memmap (never a
     graph-wide adjacency); the order within a parent is ascending
     call_target-slot order, parents in their level order.
+
+    One vectorized :meth:`LiveNodeAdjacency.expand_batch` pass over the
+    whole frontier resolves every parent's children (no per-node Python
+    call); the mask ROW is gathered from ``parent_row`` by the returned
+    parent index. The edge order is byte-identical to the per-node
+    concatenation (parents ascending, each parent's edges ascending slot),
+    so the build .idx order is preserved.
     """
-    row_chunks: List[np.ndarray] = []
-    sec_chunks: List[np.ndarray] = []
-    node_chunks: List[np.ndarray] = []
-    for row, node in zip(parent_row.tolist(), parent_node.tolist()):
-        children, child_secs, _child_types, _child_matched = adjacency(int(node))
-        if children.size == 0:
-            continue
-        row_chunks.append(np.full(children.size, row, dtype=np.int64))
-        sec_chunks.append(np.asarray(child_secs, dtype=np.uint32))
-        node_chunks.append(np.asarray(children, dtype=np.int64))
-    if not row_chunks:
-        e_i = np.zeros(0, dtype=np.int64)
-        return e_i, np.zeros(0, dtype=np.uint32), e_i.copy()
-    return (
-        np.concatenate(row_chunks),
-        np.concatenate(sec_chunks),
-        np.concatenate(node_chunks),
+    parent_pos, child_secs, child_nodes, _types, _matched = (
+        adjacency.expand_batch(parent_node)
     )
+    rows = np.asarray(parent_row, dtype=np.int64).reshape(-1)[parent_pos]
+    return rows, child_secs, child_nodes
 
 
 def _assert_under_budget(

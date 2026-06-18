@@ -159,6 +159,196 @@ class LiveNodeAdjacency:
             np.zeros(0, dtype=bool),
         )
 
+    # -- public batched API ------------------------------------------------
+
+    def expand_batch(
+        self, parent_nodes: np.ndarray
+    ) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ]:
+        """Resolve every parent's direct-call children in ONE vectorized pass.
+
+        ``parent_nodes`` is an ``int64[P]`` frontier of flat catalog nodes.
+        Returns ``(parent_pos, child_secs, child_nodes, child_types,
+        child_is_matched)`` -- one entry per resolved (parent, call_target)
+        edge, where ``parent_pos`` is the INDEX into ``parent_nodes`` the
+        edge belongs to (the caller maps it back to its own mask row). The
+        per-parent edge resolution is byte-identical to :meth:`__call__`
+        (same gates, same J fallback chain, same ascending-unique-slot
+        order); only the per-node Python loop is gone. Parents appear in
+        ascending ``parent_pos`` order and within a parent in ascending
+        call_target slot -- the SAME flattening the scalar loop produced,
+        so the BFS node SET per level is unchanged (intra-level order is
+        the concatenation order, which the relaxed-order contract leaves
+        free to the decider).
+
+        No Python per-node call: the children of ALL parents are gathered
+        through CSR offsets, sorted+deduped per parent, gated, and
+        J-resolved as flat numpy arrays. The only per-section work is the
+        lazy fallback-table fetch (cached, vectorized) for the sections
+        that actually take the fallback arm.
+        """
+        cols = self._cols
+        parents = np.asarray(parent_nodes, dtype=np.int64).reshape(-1)
+        if parents.size == 0:
+            return self._empty_batch()
+
+        # CSR-gather every parent's per-call entries in one shot. ``pos`` is
+        # the parent INDEX each gathered entry belongs to; the entries are
+        # laid out parent-major (parent 0's pce range, then parent 1's, ...).
+        p0 = cols.pce_offsets[parents]
+        p1 = cols.pce_offsets[parents + 1]
+        counts = (p1 - p0).astype(np.int64)
+        total = int(counts.sum())
+        if total == 0:
+            return self._empty_batch()
+        pos = np.repeat(np.arange(parents.size, dtype=np.int64), counts)
+        # Per-entry flat pce index: parent's p0 + within-parent offset.
+        starts = np.zeros(parents.size, dtype=np.int64)
+        np.cumsum(counts[:-1], out=starts[1:])
+        within = np.arange(total, dtype=np.int64) - starts[pos]
+        entry = p0[pos] + within
+
+        called = cols.pce_called_idx[entry].astype(np.int64)
+        own_J = cols.pce_section_variant_index[entry].astype(np.int64)
+        parent_sec = self._sec_of_var[parents][pos]
+
+        # Per-parent ascending-unique called slot, first own_J wins -- the
+        # scalar path's stable argsort + unique. A composite key keeps the
+        # group (pos) major and called minor; a stable sort then preserves
+        # on-disk order within a (pos, called) tie so the EARLIEST entry's
+        # own_J survives the unique (matching the scalar first-wins).
+        ncall_max = int(called.max()) + 1 if total else 1
+        key = pos * ncall_max + called
+        order = np.argsort(key, kind="stable")
+        pos_s = pos[order]
+        called_s = called[order]
+        own_J_s = own_J[order]
+        sec_s = parent_sec[order]
+        uniq = np.ones(total, dtype=bool)
+        same = (pos_s[1:] == pos_s[:-1]) & (called_s[1:] == called_s[:-1])
+        uniq[1:] = ~same
+        pos_u = pos_s[uniq]
+        called_u = called_s[uniq]
+        own_J_u = own_J_s[uniq]
+        sec_u = sec_s[uniq]
+
+        return self._resolve_batch(pos_u, called_u, own_J_u, sec_u)
+
+    def _resolve_batch(
+        self,
+        pos: np.ndarray,
+        called: np.ndarray,
+        own_J: np.ndarray,
+        sec: np.ndarray,
+    ) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ]:
+        """Vectorized :meth:`_resolve_slot` over the deduped (pos, slot) set.
+
+        ``pos`` / ``called`` / ``own_J`` / ``sec`` are parallel ascending-
+        unique per-parent slot arrays (sec = the parent's section). Mirrors
+        the scalar gate order: slot-in-range -> EXTERN -> ptr!=0 -> sec_map
+        hit -> own-J usable else per-section fallback table -> drop on no
+        usable J. Returns the surviving edges' ``(pos, child_secs,
+        child_nodes, child_types, child_is_matched)``.
+        """
+        cols = self._cols
+        ct_lo = cols.ct_offsets[sec]
+        ct_hi = cols.ct_offsets[sec + 1]
+        slot = ct_lo + called
+        keep = slot < ct_hi
+        if not bool(keep.any()):
+            return self._empty_batch()
+        pos = pos[keep]
+        called = called[keep]
+        own_J = own_J[keep]
+        sec = sec[keep]
+        slot = slot[keep]
+
+        ct_type = cols.ct_type[slot]
+        keep = ct_type != np.uint8(int(CallTargetType.EXTERN))
+        ptr = cols.ct_function_section_ptr[slot]
+        keep &= ptr != 0
+        # Resolve the callee section via the offset->idx hashmap. Misses
+        # (ptr not a known section start) drop, mirroring ``_sec_map.get``
+        # returning ``None``.
+        hit = self._sec_map.lookup_ndarray(ptr.astype(np.uint32)).astype(
+            np.int64
+        )
+        keep &= hit != int(_U32_MISS)
+        if not bool(keep.any()):
+            return self._empty_batch()
+        pos = pos[keep]
+        called = called[keep]
+        own_J = own_J[keep]
+        sec = sec[keep]
+        slot = slot[keep]
+        callee_sec = hit[keep]
+
+        # J selection: own J if usable, else the per-section fallback-table
+        # J for (sec, called); a -1 fallback drops the edge.
+        J = own_J.copy()
+        need_fb = own_J == int(MISSING_VARIANT_INDEX)
+        if bool(need_fb.any()):
+            J[need_fb] = self._fallback_J_batch(
+                sec[need_fb], called[need_fb]
+            )
+        keep = J >= 0
+        if not bool(keep.any()):
+            return self._empty_batch()
+        pos = pos[keep]
+        slot = slot[keep]
+        callee_sec = callee_sec[keep]
+        J = J[keep]
+
+        child_nodes = cols.var_offsets[callee_sec] + J
+        child_secs = self._sec_of_var[child_nodes].astype(np.uint32)
+        child_types = cols.ct_type[slot].astype(np.uint8)
+        child_matched = cols.ct_is_matched[slot].astype(bool)
+        return (
+            pos.astype(np.int64),
+            child_secs,
+            child_nodes.astype(np.int64),
+            child_types,
+            child_matched,
+        )
+
+    def _fallback_J_batch(
+        self, sec: np.ndarray, called: np.ndarray
+    ) -> np.ndarray:
+        """Per-section fallback-J for parallel ``(sec, called)`` pairs.
+
+        Fetches each distinct section's cached fallback table once
+        (:meth:`_fallback_table`, vectorized + memoised) and gathers the
+        per-pair J, returning -1 for an out-of-range ``called`` -- exactly
+        :meth:`_fallback_J`'s per-slot result, batched."""
+        out = np.full(sec.size, -1, dtype=np.int64)
+        for s in np.unique(sec):
+            table = self._fallback_table(int(s))
+            mask = sec == s
+            ci = called[mask]
+            in_range = (ci >= 0) & (ci < table.size)
+            vals = np.full(ci.size, -1, dtype=np.int64)
+            if bool(in_range.any()):
+                vals[in_range] = table[ci[in_range]]
+            out[mask] = vals
+        return out
+
+    @staticmethod
+    def _empty_batch() -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ]:
+        """The zero-length 5-tuple an empty frontier expansion yields."""
+        e_i = np.zeros(0, dtype=np.int64)
+        return (
+            e_i,
+            np.zeros(0, dtype=np.uint32),
+            e_i.copy(),
+            np.zeros(0, dtype=np.uint8),
+            np.zeros(0, dtype=bool),
+        )
+
     # -- per-slot resolution ----------------------------------------------
 
     def _resolve_slot(

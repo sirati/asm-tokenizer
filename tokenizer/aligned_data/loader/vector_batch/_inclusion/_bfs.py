@@ -251,37 +251,20 @@ def _expand_level(
     (bool) per child, read only by the opt-in unmatched-outline transform.
     Mirrors ``...._graph_lengths._bfs._expand_children`` (the length twin)
     so the BFS frontier order matches the index build's.
+
+    One vectorized :meth:`LiveNodeAdjacency.expand_batch` pass over the
+    WHOLE frontier resolves every parent's children -- no per-node Python
+    call. ``expand_batch`` returns the parent INDEX (into ``parent_node``)
+    per edge; the mask row is a single gather ``parent_row[parent_pos]``.
+    The edge order is parents-ascending, each parent's edges ascending
+    call_target slot -- identical to the per-node concatenation this used
+    to build.
     """
-    row_chunks: List[np.ndarray] = []
-    sec_chunks: List[np.ndarray] = []
-    node_chunks: List[np.ndarray] = []
-    type_chunks: List[np.ndarray] = []
-    matched_chunks: List[np.ndarray] = []
-    for row, node in zip(parent_row.tolist(), parent_node.tolist()):
-        children, child_secs, child_types, child_matched = adjacency(int(node))
-        if children.size == 0:
-            continue
-        row_chunks.append(np.full(children.size, row, dtype=np.int64))
-        sec_chunks.append(np.asarray(child_secs, dtype=np.uint32))
-        node_chunks.append(np.asarray(children, dtype=np.int64))
-        type_chunks.append(np.asarray(child_types, dtype=np.uint8))
-        matched_chunks.append(np.asarray(child_matched, dtype=bool))
-    if not row_chunks:
-        e_i = np.zeros(0, dtype=np.int64)
-        return (
-            e_i,
-            np.zeros(0, dtype=np.uint32),
-            e_i.copy(),
-            np.zeros(0, dtype=np.uint8),
-            np.zeros(0, dtype=bool),
-        )
-    return (
-        np.concatenate(row_chunks),
-        np.concatenate(sec_chunks),
-        np.concatenate(node_chunks),
-        np.concatenate(type_chunks),
-        np.concatenate(matched_chunks),
+    parent_pos, child_secs, child_nodes, child_types, child_matched = (
+        adjacency.expand_batch(parent_node)
     )
+    rows = np.asarray(parent_row, dtype=np.int64).reshape(-1)[parent_pos]
+    return rows, child_secs, child_nodes, child_types, child_matched
 
 
 def _apply_unmatched_inline(
