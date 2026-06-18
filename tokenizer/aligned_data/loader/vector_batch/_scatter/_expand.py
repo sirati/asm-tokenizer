@@ -133,6 +133,30 @@ class ExpandedBatch:
     prepend, always False). The dense number-decode kernel reads it to
     skip painted F128 continuation slots + detect finite F128 sources."""
 
+    raw_flat: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.uint16)
+    )
+    """The flat RAW body stream over every node (the source the per-node
+    ``states`` views slice). The batch-wide twin of those views, exposed
+    so the dense pass can compute per-node ``category_counts`` in one
+    batched reduction (:func:`...category_counts.
+    category_counts_from_runlen_batched`) instead of per-node. Defaults
+    empty for token-only test constructors that skip the dense pass."""
+
+    raw_record_offsets: np.ndarray = field(
+        default_factory=lambda: np.zeros(1, dtype=np.int64)
+    )
+    """``int64[n_nodes + 1]`` CSR into ``raw_flat`` (node ``i`` owns
+    ``raw_flat[raw_record_offsets[i] : raw_record_offsets[i + 1]]``) --
+    the raw-body segmentation parallel to ``states``."""
+
+    runlen_number_flat: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.uint16)
+    )
+    """The flat ``InlineDecodeState.runlen_number`` over every node,
+    aligned to ``raw_flat`` (the batch-wide twin of each state's
+    ``runlen_number`` view)."""
+
 
 def expand_node_bodies(
     bodies: GatheredBodies,
@@ -190,9 +214,10 @@ def expand_node_bodies(
             f"CallTargetType={CallTargetType(int(types[bad]))!r}."
         )
 
+    raw_flat = np.asarray(raw, dtype=np.uint16).reshape(-1)
     batched = batched_expand(raw, rec, self_token_ids)
     states, extra_value_v2_masks, extra_f128_masks = _slice_per_node(
-        batched, np.asarray(raw, dtype=np.uint16).reshape(-1), rec
+        batched, raw_flat, rec
     )
     return ExpandedBatch(
         expanded=batched.expanded,
@@ -200,6 +225,9 @@ def expand_node_bodies(
         states=states,
         extra_value_v2_masks=extra_value_v2_masks,
         extra_f128_masks=extra_f128_masks,
+        raw_flat=raw_flat,
+        raw_record_offsets=rec,
+        runlen_number_flat=batched.runlen_number,
     )
 
 
