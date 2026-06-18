@@ -134,85 +134,101 @@ def build_identity_idx_2d(
     """
 
     # ------------------------------------------------------------------
-    # Phase 1 -- single linear walk to collect per-carrier byte offsets.
-    #
-    # We size the output exactly via the per-variant aggregate counts
-    # already computed at stage 2:
-    #   total_in_stream = total_surviving_identity - per-call-target_count_with_at_least_one_surviving_token
-    # ...but that's a slightly awkward derivation. The simpler -- and
-    # equally vectorised -- approach is to collect each call_target's
-    # per-carrier u32[K, 2] block into a Python list of arrays and
-    # concatenate at the end. The Python-list overhead is per-call-target
-    # not per-token, so it stays out of the hot path.
+    # B-S2 batched form: instead of one byte-offset compute pass per
+    # call_target, EVERY surviving in-stream identity carrier of EVERY
+    # call_target is gathered into flat arrays and the ALG-5 row build
+    # runs in a SINGLE vectorised pass. The per-call_target
+    # ``identity_slices`` (a pure cumsum over ``surviving_identity_count``)
+    # and the per-carrier ``inline_byte_slice.start`` base are derived as
+    # CSR arrays. Output ``identity_idx_2d`` rows stay in DFS-then-stream
+    # encounter order -- byte-identical to the per-call_target walk.
     # ------------------------------------------------------------------
+    identity_slices = _identity_slices(stage2_batch)
 
-    rows_chunks: list[np.ndarray] = []
-    identity_slices: list[slice] = []
-    level1_offset: int = 0
+    (
+        carrier_offsets,
+        carrier_L,
+        carrier_raw_positions,
+    ) = _gather_identity_carriers(stage2_batch, inline_byte_slices)
 
-    call_target_iter_idx = 0
+    identity_idx_2d = _identity_rows_from_carriers(
+        carrier_offsets, carrier_L, carrier_raw_positions
+    )
 
+    return identity_idx_2d, identity_slices
+
+
+def _identity_slices(stage2_batch: "Stage2Batch") -> list[slice]:
+    """Per-call_target ``identity_slice`` list (DFS order, all targets).
+
+    Each slice covers ``surviving_identity_count`` entries (INCLUDING the
+    prepend slot) into the level-1 ``identities_flat_caller_local`` array;
+    fully-dropped call_targets get a zero-length slice at the running
+    offset. This is a plain cumsum over the per-call_target surviving
+    identity counts -- the same offsets the per-call_target walk produced,
+    one ``slice`` object per target.
+    """
+    slices: list[slice] = []
+    level1_offset = 0
     for stage2_section in stage2_batch.sections:
         for stage2_variant in stage2_section.variants:
             for stage2_ct in stage2_variant.call_targets:
-                inline_byte_slice = inline_byte_slices[call_target_iter_idx]
-                call_target_iter_idx += 1
-
-                surviving_token_count = stage2_ct.surviving_token_count
-                surviving_identity_count = stage2_ct.surviving_identity_count
-
-                # A call_target that fully dropped under the cut
-                # contributes nothing to either the level-1 identity
-                # array OR the idx_2d table. The slice is empty at the
-                # current level1_offset (length 0, NO advance).
-                if surviving_token_count == 0:
-                    # Defensive: a fully-dropped call_target also has
-                    # zero surviving identity tokens (the prepend at
-                    # expanded position 0 is itself an identity token,
-                    # so it can't survive if surviving_token_count == 0).
-                    assert surviving_identity_count == 0, (
+                sic = int(stage2_ct.surviving_identity_count)
+                if int(stage2_ct.surviving_token_count) == 0:
+                    # Defensive: a fully-dropped call_target also has zero
+                    # surviving identity tokens (the prepend at expanded
+                    # position 0 is itself an identity token).
+                    assert sic == 0, (
                         "Stage 2 invariant violated: a call_target with "
                         "surviving_token_count == 0 must also have "
                         "surviving_identity_count == 0 (the prepend at "
-                        "expanded position 0 is itself an identity "
-                        "token)."
+                        "expanded position 0 is itself an identity token)."
                     )
-                    identity_slices.append(
-                        slice(level1_offset, level1_offset)
-                    )
+                slices.append(slice(level1_offset, level1_offset + sic))
+                level1_offset += sic
+    return slices
+
+
+def _gather_identity_carriers(
+    stage2_batch: "Stage2Batch",
+    inline_byte_slices: list[slice],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flat per-carrier ``(first_payload_offset, L, raw_position)``.
+
+    Walks the DFS call_target stream collecting, for each SURVIVING
+    in-stream identity carrier (the first ``surviving_identity_count - 1``
+    identity-band real tokens of each surviving call_target's raw stream),
+    its absolute first-payload byte offset into ``inline_bytes`` and its
+    payload length ``L`` (per the ALG-5 width table). The gather is a pure
+    array-collection loop (one ``np.concatenate`` per output); the ALG-5
+    row build runs once over the flat arrays.
+    """
+    offset_chunks: list[np.ndarray] = []
+    L_chunks: list[np.ndarray] = []
+    pos_chunks: list[np.ndarray] = []
+
+    ct_iter_idx = 0
+    for stage2_section in stage2_batch.sections:
+        for stage2_variant in stage2_section.variants:
+            for stage2_ct in stage2_variant.call_targets:
+                inline_byte_slice = inline_byte_slices[ct_iter_idx]
+                ct_iter_idx += 1
+
+                if int(stage2_ct.surviving_token_count) == 0:
                     continue
-
-                # Surviving call_target -- at least the prepend slot is
-                # in [8, 16). in_stream_id_count is the count of
-                # identity carriers AFTER the prepend that landed in
-                # the surviving expanded prefix.
-                in_stream_id_count = surviving_identity_count - 1
-
-                # Reserve the full slice (prepend + in-stream entries).
-                identity_slices.append(
-                    slice(level1_offset, level1_offset + surviving_identity_count)
+                in_stream_id_count = (
+                    int(stage2_ct.surviving_identity_count) - 1
                 )
-                level1_offset += surviving_identity_count
-
-                if in_stream_id_count == 0:
-                    # The call_target survives but no in-stream
-                    # identity carrier did (only the prepend at
-                    # expanded[0] is an identity, stage 4 writes that).
-                    # Nothing to add to identity_idx_2d.
+                if in_stream_id_count <= 0:
                     continue
 
-                # Locate the surviving in-stream identity carriers in
-                # raw_tokens. Identity tokens are NEVER promoted (only
-                # VC2 + F128 promote per stage 2a), so their raw-stream
-                # positions are in 1:1 encounter-order correspondence
-                # with the in-stream identity positions in the expanded
-                # stream. The cut may chop off LATER identity carriers
-                # but never reorders -- so the surviving carriers are
-                # exactly the FIRST in_stream_id_count identity-band
-                # entries of state.carries_inline_mask.
                 state = stage2_ct.stage1.state
                 raw_tokens = state.raw_tokens
 
+                # Identity tokens are NEVER promoted, so the surviving
+                # in-stream carriers are the FIRST ``in_stream_id_count``
+                # identity-band real tokens in raw order (the cut chops
+                # later carriers but never reorders).
                 identity_carrier_mask = state.real_mask & (
                     (raw_tokens >= _V2_IDENTITY_BLOCK_START)
                     & (raw_tokens < _V2_EAGER_BLOCK_END)
@@ -220,122 +236,78 @@ def build_identity_idx_2d(
                 identity_carrier_positions = np.nonzero(
                     identity_carrier_mask
                 )[0]
-                surviving_carrier_positions = identity_carrier_positions[
+                p = identity_carrier_positions[
                     :in_stream_id_count
-                ]
+                ].astype(np.int64)
 
-                # ----------------------------------------------------------
-                # Byte-offset computation -- vectorised over the K
-                # surviving identity carriers of this call_target.
-                #
-                # For each carrier at raw position p:
-                #   * Payload length L = runlen_number[p+1] when
-                #     p+1 < n (and 0 otherwise -- a carrier at the
-                #     last raw position has no payload). The runlen
-                #     array is 0 at non-run-start slots, so
-                #     ``runlen_number[p+1] == 0`` whenever
-                #     ``number_mask[p+1] == False`` -- the conditional
-                #     reduces to "is p+1 in-bounds?".
-                #   * First payload-byte's offset in the call_target's
-                #     surviving-inline-byte region equals the count of
-                #     number_mask=True positions in raw_tokens[:p+1]
-                #     (= raw_tokens[:p] since number_mask[p] is False
-                #     at identity carriers; using [:p+1] is also
-                #     correct and the cumsum interface is cleaner).
-                #     Add inline_byte_slice.start for the absolute
-                #     offset in inline_bytes.
-                #
-                # The exclusive-prefix ``state.digit_cumsum`` (computed
-                # once per stream in ``build_inline_decode_state``)
-                # supplies the per-position digit count via
-                # ``state.digit_cumsum[p + 1]`` -- equivalent to the
-                # ``cum_number[p]`` read the prior local cumsum
-                # produced (the values agree at identity carriers,
-                # where ``number_mask[p] == False``).  See
-                # ``InlineDecodeState.digit_cumsum`` for the shape
-                # contract.
-                # ----------------------------------------------------------
+                n = int(raw_tokens.shape[0])
                 runlen_number = state.runlen_number
-                n = raw_tokens.shape[0]
-
-                # Payload length per carrier. p+1 is in-bounds when
-                # p < n - 1; the carrier at position n-1 (if any) has
-                # no payload (L=0). We compute L for ALL carriers via
-                # a conditional fetch -- using np.where to avoid an
-                # out-of-bounds gather.
-                p = surviving_carrier_positions.astype(np.int64)
+                # Payload length L = runlen_number[p+1] when p+1 in
+                # bounds (else 0; a carrier at the last raw slot has no
+                # payload). np.where avoids the OOB gather.
                 has_p1 = p < (n - 1)
-                # For carriers with p == n-1 (no p+1 slot) we read
-                # runlen_number[0] as a safe dummy index; the np.where
-                # below overrides those entries to 0.
                 safe_p1 = np.where(has_p1, p + 1, np.int64(0))
                 L_raw = runlen_number[safe_p1].astype(np.int64)
                 L = np.where(has_p1, L_raw, np.int64(0))
 
-                # First payload byte offset within the call_target's
-                # inline-byte region (0-based) = digit_cumsum[p + 1].
-                # Absolute offset in inline_bytes adds inline_byte_slice.start.
-                first_payload_offset = (
-                    state.digit_cumsum[p + 1].astype(np.int64)
-                    + np.int64(inline_byte_slice.start)
-                )
+                # First payload byte = exclusive digit cumsum at p+1 +
+                # the call_target's inline-byte base.
+                first_payload_offset = state.digit_cumsum[p + 1].astype(
+                    np.int64
+                ) + np.int64(inline_byte_slice.start)
 
-                # idx_2d rows per ALG-5 payload-width table.
-                # We produce a fresh u32[K, 2] array per call_target;
-                # the final concatenate at the bottom does the only
-                # large copy.
-                rows = np.zeros(
-                    (surviving_carrier_positions.shape[0], 2),
-                    dtype=np.uint32,
-                )
-                two_byte_mask = L == 2
-                one_byte_mask = L == 1
-                # 0-byte rows stay [0, 0] from the zero-allocation.
+                offset_chunks.append(first_payload_offset)
+                L_chunks.append(L)
+                pos_chunks.append(p)
 
-                # 2-byte: [hi_offset, lo_offset] with lo = hi + 1.
-                if two_byte_mask.any():
-                    hi_2 = first_payload_offset[two_byte_mask].astype(
-                        np.uint32
-                    )
-                    rows[two_byte_mask, 0] = hi_2
-                    rows[two_byte_mask, 1] = hi_2 + np.uint32(1)
+    if not offset_chunks:
+        empty_i = np.empty(0, dtype=np.int64)
+        return empty_i, empty_i.copy(), empty_i.copy()
+    return (
+        np.concatenate(offset_chunks),
+        np.concatenate(L_chunks),
+        np.concatenate(pos_chunks),
+    )
 
-                # 1-byte: [0, lo_offset]. hi stays at 0 from
-                # zero-allocation; only write lo.
-                if one_byte_mask.any():
-                    rows[one_byte_mask, 1] = first_payload_offset[
-                        one_byte_mask
-                    ].astype(np.uint32)
 
-                # Defensive: any other payload width is a v2-codec
-                # violation for identity tokens (per the v2 spec
-                # identity payloads are 0 / 1 / 2 bytes only).
-                other_width_mask = ~(two_byte_mask | one_byte_mask | (L == 0))
-                if other_width_mask.any():
-                    bad_positions = surviving_carrier_positions[
-                        other_width_mask
-                    ]
-                    bad_lengths = L[other_width_mask]
-                    raise AssertionError(
-                        f"Identity carriers at raw positions "
-                        f"{bad_positions.tolist()} declared payload "
-                        f"lengths {bad_lengths.tolist()} -- v2 spec "
-                        "restricts identity payloads to {0, 1, 2} bytes."
-                    )
+def _identity_rows_from_carriers(
+    first_payload_offset: np.ndarray,
+    L: np.ndarray,
+    raw_positions: np.ndarray,
+) -> np.ndarray:
+    """ALG-5 ``u32[K, 2]`` rows for the flat carrier population.
 
-                rows_chunks.append(rows)
+    A 2-byte carrier emits ``[hi, hi + 1]``; a 1-byte carrier ``[0, lo]``
+    (the leading zero pad supplies the high byte); a 0-byte carrier stays
+    ``[0, 0]``. Any other width is a v2-codec violation. One vectorised
+    pass over all carriers -- no per-call_target iteration.
+    """
+    rows = np.zeros((int(first_payload_offset.shape[0]), 2), dtype=np.uint32)
+    two_byte_mask = L == 2
+    one_byte_mask = L == 1
 
-    # ------------------------------------------------------------------
-    # Phase 2 -- single concatenate. Producing a (0, 2) shape when no
-    # in-stream identity tokens exist anywhere keeps the dtype contract
-    # uniform regardless of the batch's identity-token density.
-    # ------------------------------------------------------------------
-    if rows_chunks:
-        identity_idx_2d = np.concatenate(rows_chunks, axis=0)
-    else:
-        identity_idx_2d = np.zeros((0, 2), dtype=np.uint32)
+    if two_byte_mask.any():
+        hi_2 = first_payload_offset[two_byte_mask].astype(np.uint32)
+        rows[two_byte_mask, 0] = hi_2
+        rows[two_byte_mask, 1] = hi_2 + np.uint32(1)
 
-    return identity_idx_2d, identity_slices
+    if one_byte_mask.any():
+        rows[one_byte_mask, 1] = first_payload_offset[one_byte_mask].astype(
+            np.uint32
+        )
+
+    other_width_mask = ~(two_byte_mask | one_byte_mask | (L == 0))
+    if other_width_mask.any():
+        bad_positions = raw_positions[other_width_mask]
+        bad_lengths = L[other_width_mask]
+        raise AssertionError(
+            f"Identity carriers at raw positions "
+            f"{bad_positions.tolist()} declared payload "
+            f"lengths {bad_lengths.tolist()} -- v2 spec "
+            "restricts identity payloads to {0, 1, 2} bytes."
+        )
+
+    return rows
 
 
 def view_cast_identities(
