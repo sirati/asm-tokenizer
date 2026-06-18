@@ -28,10 +28,8 @@ from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 
-from tokenizer.aligned_data.binary_format import (
-    MAX_HEADER_BYTES,
-    parse_binary_header,
-    record_token_count_from_memmap,
+from tokenizer.aligned_data.binary_format._bulk_geometry import (
+    bulk_token_spans,
 )
 from tokenizer.aligned_data.index_format import read_index_arrays
 from tokenizer.aligned_data.memmap_format import (
@@ -225,26 +223,20 @@ def load_unmatched_lengths(
     Records are self-describing in ``_data.bin``: the header at each
     record start carries the token count directly, so no companion
     ``lengths`` array is needed (the index entry is just an offset).
-    Delegates per-record decoding to
-    :func:`record_token_count_from_memmap`, which owns the header
-    parse + width-tag dispatch in one place.
-
-    Also performs the load-time per-arm sweep that pins the cross-file
-    invariant ``entry_idx == i`` over the arm's known per-record
-    ``starts``; a single mismatch fails with the canonical corrupt-file
-    error so a corrupted index / data-bin pair is rejected at session
-    open instead of returning garbage on first lookup.
+    Delegates the per-record header decode to
+    :func:`...binary_format._bulk_geometry.bulk_token_spans` -- the one
+    vectorized header reader -- over the whole ``starts`` array in a
+    single numpy gather, rather than a Python per-record loop; only its
+    ``token_count`` return is consumed here (the token-start column is
+    the splice path's concern).
     """
     if not paths.data_bin.exists() or len(starts) == 0:
         return np.array([], dtype=np.int32)
 
     data_memmap = np.memmap(str(paths.data_bin), dtype=np.uint8, mode="r")
-    token_counts = [
-        record_token_count_from_memmap(data_memmap, int(starts[i]))
-        for i in range(len(starts))
-    ]
+    _starts, token_counts = bulk_token_spans(data_memmap, starts)
     del data_memmap
-    return np.array(token_counts, dtype=np.int32)
+    return token_counts.astype(np.int32)
 
 
 # --- Per-arm loader dispatch ----------------------------------------------
