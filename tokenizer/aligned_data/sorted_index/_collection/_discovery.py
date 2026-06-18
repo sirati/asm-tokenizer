@@ -3,7 +3,9 @@
 Single concern: *given a set of memmap directories + a list of
 :class:`IndexSpec` requests, resolve the kept :class:`CollectionMember`
 list (with unbiased-exclusion accounting) plus the per-spec per-member
-readers + the shared per-member datasets.*
+readers.* Section parsing (the per-binary :class:`BinaryDataset`) is NOT
+done here -- the collection defers it to first use, so discovery never
+parses the corpus up front.
 
 Two orthogonal discovery questions are answered here by reuse, NOT by
 restating any grammar:
@@ -35,10 +37,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from tokenizer.aligned_data.binary_discovery import discover_binaries
-from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
 
 from .._reader import SortedIndexReader, discover_indices
 from .._types import IndexSpec, LengthReduction
@@ -131,14 +132,12 @@ def discover_members(
     memmap_dirs: Sequence[Path],
     *,
     specs: Sequence[IndexSpec],
-    vocab_manager: Optional[Any],
     on_missing: MissingIndexPolicy,
 ) -> Tuple[
     List[CollectionMember],
     Dict[IndexSpec, Dict[str, SortedIndexReader]],
-    Dict[str, BinaryDataset],
 ]:
-    """Resolve kept members + their per-spec readers + (unopened) datasets.
+    """Resolve kept members + their per-spec readers (NO section parse).
 
     For each directory, a binary EXISTS iff its matched-arm
     ``<binary>_index.bin`` is present. A binary is KEPT iff, for EVERY
@@ -152,9 +151,14 @@ def discover_members(
     were missing, then exclude). Returns the
     alphabetical-by-``qualified_name`` member list plus the
     ``{IndexSpec -> {qualified_name -> SortedIndexReader}}`` per-spec
-    reader maps and the shared ``{qualified_name -> BinaryDataset}`` map
-    the collection wires into its per-spec samplers + shared session
-    machinery.
+    reader maps the collection wires into its per-spec samplers.
+
+    Discovery is deliberately section-parse-FREE: it builds only the
+    cheap ``.idx`` readers + membership and never constructs a
+    :class:`BinaryDataset` (which would eagerly parse every binary's
+    section arms up front). The collection defers each
+    :class:`BinaryDataset` to its first session/handles use, so only
+    sampled binaries pay the parse and never all at once at startup.
     """
     # Cache the per-(dir, depth) discovery so a multi-spec request over
     # the same depth scans each directory once per distinct depth.
@@ -205,7 +209,6 @@ def discover_members(
     readers_by_spec: Dict[IndexSpec, Dict[str, SortedIndexReader]] = {
         spec: {} for spec in specs
     }
-    datasets: Dict[str, BinaryDataset] = {}
     for member in members:
         for spec in specs:
             readers_by_spec[spec][member.qualified_name] = SortedIndexReader(
@@ -213,12 +216,7 @@ def discover_members(
                 reduction=spec.reduction,
                 depth=spec.depth,
             )
-        datasets[member.qualified_name] = BinaryDataset(
-            member.memmap_dir,
-            member.binary_name,
-            vocab_manager=vocab_manager,
-        )
-    return members, readers_by_spec, datasets
+    return members, readers_by_spec
 
 
 def _handle_missing(
