@@ -1,9 +1,9 @@
-"""Focused test for ``_matched_arm_loader._walk_matched_sections``.
+"""Focused test for ``_matched_arm_loader._columnar_matched_sections``.
 
-Round-trips a synthetic 2-variant matched section through the BIN
-parser so the per-section walk + per-variant ``data_offset_shifted``
-decode contract is pinned independently of the orchestrator-level
-``SectionArm`` chain.
+Round-trips a synthetic 2-variant matched section through the columnar
+BIN decoder so the per-section ``function_name_ptr`` resolution +
+per-variant ``data_offset_shifted`` decode contract is pinned
+independently of the orchestrator-level ``SectionArm`` chain.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from tokenizer.aligned_data.matched_sections_bin import (
     SectionWriter,
 )
 from tokenizer.aligned_data.loader._matched_arm_loader import (
-    _walk_matched_sections,
+    _columnar_matched_sections,
 )
 
 
@@ -59,10 +59,12 @@ def _build_one_section_bin(
     return bin_path
 
 
-def test_walk_matched_sections_two_variants_round_trip(tmp_path: Path) -> None:
-    """One section with two variants -> walker returns (func_name,
-    Section) with both variants' ``data_offset_shifted`` round-tripped
-    via the BIN parser."""
+def test_columnar_matched_sections_two_variants_round_trip(
+    tmp_path: Path,
+) -> None:
+    """One section with two variants -> the columnar decode returns
+    (func_name, cols) with both variants' ``data_offset_shifted``
+    round-tripped via the columnar BIN decoder."""
     fid = 42
     variant_offsets = [0x10, 0x20]
     bin_path = _build_one_section_bin(
@@ -76,20 +78,20 @@ def test_walk_matched_sections_two_variants_round_trip(tmp_path: Path) -> None:
     bin_starts = np.array([MATCHED_SECTIONS_BIN_PRELUDE_SIZE], dtype=np.int64)
     line_to_name = {fid: "matched_fn"}
 
-    func_names, sections = _walk_matched_sections(
+    func_names, cols = _columnar_matched_sections(
         bin_path, bin_starts, line_to_name
     )
 
     assert func_names == ["matched_fn"]
-    assert len(sections) == 1
-    section = sections[0]
-    assert section.function_name_ptr == fid
-    assert len(section.variants) == 2
-    decoded_offsets = [v.data_offset_shifted << 4 for v in section.variants]
+    assert cols.function_name_ptr.tolist() == [fid]
+    assert int(cols.var_offsets[-1]) == 2
+    decoded_offsets = (
+        cols.var_data_offset_shifted.astype(np.int64) << 4
+    ).tolist()
     assert decoded_offsets == variant_offsets
 
 
-def test_walk_matched_sections_missing_fid_raises(tmp_path: Path) -> None:
+def test_columnar_matched_sections_missing_fid_raises(tmp_path: Path) -> None:
     """A function_name_ptr absent from line_to_name -> ValueError with
     a migration-pointing message (sidecar drift)."""
     import pytest
@@ -104,12 +106,12 @@ def test_walk_matched_sections_missing_fid_raises(tmp_path: Path) -> None:
     bin_starts = np.array([MATCHED_SECTIONS_BIN_PRELUDE_SIZE], dtype=np.int64)
 
     with pytest.raises(ValueError, match="re-run memmap_builder"):
-        _walk_matched_sections(bin_path, bin_starts, line_to_name={})
+        _columnar_matched_sections(bin_path, bin_starts, line_to_name={})
 
 
-def test_walk_matched_sections_bad_prelude_raises(tmp_path: Path) -> None:
+def test_columnar_matched_sections_bad_prelude_raises(tmp_path: Path) -> None:
     """A ``sections.bin`` with a corrupt prelude raises before the
-    section walk even starts; downstream callers get a clear
+    columnar decode even starts; downstream callers get a clear
     "regenerate the BIN" pointer rather than garbage offsets."""
     import pytest
 
@@ -126,6 +128,6 @@ def test_walk_matched_sections_bad_prelude_raises(tmp_path: Path) -> None:
     bin_starts = np.array([MATCHED_SECTIONS_BIN_PRELUDE_SIZE], dtype=np.int64)
 
     with pytest.raises(ValueError, match="magic"):
-        _walk_matched_sections(
+        _columnar_matched_sections(
             bin_path, bin_starts, line_to_name={fid: "fn"}
         )

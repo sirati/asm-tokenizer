@@ -43,9 +43,9 @@ import numpy as np
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
 )
-from tokenizer.aligned_data.matched_sections_bin import (
-    Section,
-    parse_section_bin,
+from tokenizer.aligned_data.matched_sections_columnar import (
+    ColumnarSections,
+    parse_sections_columnar,
 )
 
 from ._sections_bin_walk import (
@@ -54,51 +54,54 @@ from ._sections_bin_walk import (
 )
 
 
-def _walk_matched_sections(
+def _columnar_matched_sections(
     sections_bin: Path,
     bin_starts: np.ndarray,
     line_to_name: Dict[int, str],
-) -> Tuple[List[str], List[Section]]:
-    """Per-function: parse the BIN section at each ``bin_starts[i]``.
+) -> Tuple[List[str], ColumnarSections]:
+    """Decode every matched section at ``bin_starts`` into columnar arrays.
 
-    Returns ``(func_names, sections)`` where ``sections[i]`` is the
-    parsed :class:`Section` for ``bin_starts[i]`` and ``func_names[i]``
-    is its resolved function name. The matched_index.bin walks the BIN
-    in encounter order -- this function preserves that order.
+    Returns ``(func_names, cols)`` where ``func_names[i]`` is the
+    resolved function name for ``bin_starts[i]`` and ``cols`` is the
+    flat columnar view of those sections (parallel, in encounter
+    order). The matched arm needs only the section-level
+    ``function_name_ptr`` (-> names) and the per-variant
+    ``var_data_offset_shifted`` (-> ``starts``); the columnar decoder is
+    the single vectorized source of truth for the ``sections.bin`` wire
+    format, so this reuses it rather than walking 340k full
+    :class:`Section` objects (each carrying its whole call_target +
+    variant-block table) only to discard them.
     """
     func_names: List[str] = []
-    sections: List[Section] = []
     if not sections_bin.exists() or len(bin_starts) == 0:
-        return func_names, sections
-    _raw, blob = read_sections_bin_blob(sections_bin)
-    for i in range(len(bin_starts)):
-        cursor = int(bin_starts[i])
-        section, _end = parse_section_bin(blob, cursor)
-        func_names.append(
-            resolve_func_name_or_raise(
-                section.function_name_ptr, line_to_name,
-                sections_bin, cursor,
-            )
+        return func_names, parse_sections_columnar(
+            np.zeros(0, dtype=np.uint8), np.zeros(0, dtype=np.int64)
         )
-        sections.append(section)
-    return func_names, sections
-
-
-def _flat_variant_starts(sections: List[Section]) -> np.ndarray:
-    """Flatten per-section variant ``data_offset`` lists into one array.
-
-    Each variant block's ``data_offset_shifted`` is the ``>> 4`` of the
-    real ``_data.bin`` offset (16-byte record alignment). Recovering
-    the real offsets here keeps the arm's ``starts`` semantics in
-    lockstep with ``unmatched_index.bin``-derived offsets (both are
-    real, post-shift byte positions).
-    """
-    flat_offsets: List[int] = [
-        variant.data_offset_shifted << 4
-        for section in sections
-        for variant in section.variants
+    raw, _blob = read_sections_bin_blob(sections_bin)
+    cols = parse_sections_columnar(np.asarray(raw), bin_starts)
+    fids = cols.function_name_ptr
+    func_names = [
+        resolve_func_name_or_raise(
+            int(fids[i]), line_to_name, sections_bin, int(bin_starts[i])
+        )
+        for i in range(len(bin_starts))
     ]
-    return np.array(flat_offsets, dtype=np.int64)
+    return func_names, cols
+
+
+def _flat_variant_starts(cols: ColumnarSections) -> np.ndarray:
+    """Recover the flat per-variant real ``_data.bin`` offsets.
+
+    Each variant block's ``var_data_offset_shifted`` is the ``>> 4`` of
+    the real ``_data.bin`` offset (16-byte record alignment). The
+    columnar ``var_data_offset_shifted`` column is already in section-
+    major, variant-minor order (CSR via ``var_offsets``) -- the same
+    flatten order the per-section walk produced -- so recovering the
+    real offsets is a single ``<< 4`` over that column. Keeping the
+    real (post-shift) offsets here holds the arm's ``starts`` semantics
+    in lockstep with ``unmatched_index.bin``-derived offsets.
+    """
+    return cols.var_data_offset_shifted.astype(np.int64) << 4
 
 
 def load_matched_arm(
@@ -134,7 +137,7 @@ def load_matched_arm(
         return _empty_arm()
     bin_starts, bin_lengths = section_index
 
-    func_names, sections = _walk_matched_sections(
+    func_names, cols = _columnar_matched_sections(
         sections_bin, bin_starts, line_to_name
     )
 
@@ -143,7 +146,7 @@ def load_matched_arm(
     # per-variant (one entry per variant block in encounter order).
     # No length or overlong flag -- the record at each offset is
     # self-describing.
-    starts = _flat_variant_starts(sections)
+    starts = _flat_variant_starts(cols)
 
     # ``select_random_function_by_length`` is a NotImplementedError
     # stub for the matched arm, so the length-band lookup tables have
