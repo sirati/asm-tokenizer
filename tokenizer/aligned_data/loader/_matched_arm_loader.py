@@ -146,6 +146,17 @@ def load_matched_arm(
         return _empty_arm()
     bin_starts, bin_lengths = section_index
 
+    # Validate the ``_sections.bin`` 16-byte prelude EAGERLY (cheap: one
+    # mmap + a 16-byte magic/version check, no catalog parse). The full
+    # columnar parse is deferred below, but a corrupt/stale prelude must
+    # still fail loud at open time -- not silently at first decode -- so
+    # the prelude assertion stays at construction even though the bytes
+    # it guards are paged in lazily.
+    if sections_bin.exists() and len(bin_starts) > 0:
+        _mm, _blob = read_sections_bin_blob(sections_bin)
+        _blob.release()
+        del _mm
+
     # --- Eager part: ONLY the cheap per-function locators above
     # (``_index.bin`` -> ``bin_starts`` / ``bin_lengths``, ~0.4 ms).
     # The full-catalog columnar parse (~2 s on z3) that produces the
