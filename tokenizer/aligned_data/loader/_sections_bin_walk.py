@@ -47,6 +47,7 @@ from tokenizer.aligned_data.matched_sections_bin import (
     Section,
     _SECTION_FID_MASK,
     parse_section_bin,
+    section_end,
 )
 from tokenizer.aligned_data.memmap_format import (
     MATCHED_SECTIONS_BIN_PRELUDE_SIZE,
@@ -128,6 +129,35 @@ def walk_parsed_sections(
         section, next_cursor = parse_section_bin(blob, cursor)
         yield cursor, section
         cursor = next_cursor
+
+
+def walk_section_starts(
+    blob: memoryview, region_start: int
+) -> np.ndarray:
+    """Section start offsets in ``[region_start, EOF)`` -- starts only.
+
+    The boundary-only twin of :func:`walk_parsed_sections`: it streams
+    section starts via :func:`...matched_sections_bin.section_end` (a
+    header + jump-table-only boundary read) instead of building a full
+    :class:`Section` per section. A consumer that needs only the start
+    offsets -- to feed them straight to the columnar decoder
+    (:func:`...matched_sections_columnar.parse_sections_columnar`),
+    which then surfaces every per-section field vectorised -- uses this
+    rather than paying :func:`parse_section_bin`'s call_target /
+    variant-block / per-call-entry object build only to discard it.
+
+    The boundary discovery is irreducibly sequential (each section's
+    start is the prior section's aligned end), but each step now reads
+    just the header + jump table; ``blob`` is the whole-file memoryview
+    from :func:`read_sections_bin_blob` so the offsets are absolute.
+    """
+    end = len(blob)
+    starts: list[int] = []
+    cursor = region_start
+    while cursor < end:
+        starts.append(cursor)
+        cursor = section_end(blob, cursor)
+    return np.array(starts, dtype=np.int64)
 
 
 def resolve_func_name_or_raise(

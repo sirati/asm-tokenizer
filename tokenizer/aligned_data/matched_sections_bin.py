@@ -1878,6 +1878,42 @@ def _variant_block_offset(section: Section, variant_idx: int) -> int:
     )
 
 
+def section_end(blob: memoryview, offset: int) -> int:
+    """End offset (past trailing pad) of the section at ``offset``.
+
+    The boundary-only half of :func:`parse_section_bin`: a section's
+    byte width is fully determined by its 8-byte header
+    (``n_call_targets``, ``n_variants``) and its ``n_variants × u16``
+    jump table (each slot is that variant's per-call entry count), so
+    the end is recoverable WITHOUT materialising any ``CallTarget`` /
+    ``VariantBlock`` / per-call-entry Python object. A region walk that
+    needs only the next section's start (the unmatched-arm loader, the
+    realized-lengths / sorted-index pre-passes) calls here instead of
+    paying the full :func:`parse_section_bin` object build per section.
+
+    Both this and the full :func:`parse_section_bin` close their
+    sections by rounding the region end up via :func:`_align_up` to
+    :data:`SECTION_ALIGNMENT`, so the two boundaries never drift; this
+    function just feeds that pad the region geometry from a
+    header+jump-table-only read instead of from a full variant walk.
+    """
+    _n_call_targets, n_variants = struct.unpack_from("<xxxxHH", blob, offset)
+    jump_table_offset = offset + SECTION_HEADER_SIZE
+    jump_table = struct.unpack_from(f"<{n_variants}H", blob, jump_table_offset)
+    total_entries = sum(jump_table)
+    variants_region_start = (
+        jump_table_offset
+        + _padded_jump_table_bytes(n_variants)
+        + _n_call_targets * CALL_TARGET_ENTRY_SIZE
+    )
+    region_end = (
+        variants_region_start
+        + n_variants * VARIANT_HEADER_SIZE
+        + total_entries * PER_CALL_ENTRY_SIZE
+    )
+    return _align_up(region_end, SECTION_ALIGNMENT)
+
+
 def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
     """Parse one section starting at ``offset`` in ``blob``.
 
@@ -1969,10 +2005,11 @@ def parse_section_bin(blob: memoryview, offset: int) -> tuple[Section, int]:
 
     # Trailer pad — round up to SECTION_ALIGNMENT so the next section
     # starts on a 4-byte boundary (the writer pre-pays this pad at
-    # :meth:`SectionWriter.end_section`).
-    rem = offset % SECTION_ALIGNMENT
-    if rem:
-        offset += SECTION_ALIGNMENT - rem
+    # :meth:`SectionWriter.end_section`). The variant walk leaves
+    # ``offset`` at the unaligned region end; the shared
+    # :func:`_section_region_end` formula closes it (same boundary the
+    # object-free :func:`section_end` computes).
+    offset = _align_up(offset, SECTION_ALIGNMENT)
 
     section = Section(
         function_name_ptr=function_name_ptr,

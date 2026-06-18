@@ -27,31 +27,45 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+from tokenizer.aligned_data.matched_sections_columnar import (
+    parse_sections_columnar,
+)
+
 from ._sections_bin_walk import (
     read_sections_bin_blob,
     resolve_func_name_or_raise,
     unmatched_region_start,
-    walk_parsed_sections,
+    walk_section_starts,
 )
 
 
-def _walk_unmatched_sections(
+def _columnar_unmatched_sections(
     sections_bin: Path,
     region_start: int,
     line_to_name: Dict[int, str],
 ) -> Tuple[List[str], np.ndarray, np.ndarray]:
-    """Parse every section in ``[region_start, EOF)`` of ``sections_bin``.
+    """Decode every section in ``[region_start, EOF)`` columnarly.
 
     Returns ``(func_names, section_starts, section_variant_counts)``
     where ``section_starts[i]`` is the BIN offset of the i-th unmatched
     section, ``func_names[i]`` is its resolved function name, and
     ``section_variant_counts[i]`` is the per-section variant count
     (used by the loader to build the per-record -> per-section lookup
-    table). The walker honours encounter order so the i-th entry of
-    every array describes the same section.
+    table). Encounter order is preserved so the i-th entry of every
+    array describes the same section.
+
+    The unmatched region carries no locator, so the section starts are
+    discovered by a boundary-only walk (:func:`walk_section_starts`,
+    header + jump-table reads only); those starts then feed the single
+    vectorized :func:`parse_sections_columnar` decoder -- the source of
+    truth for the ``sections.bin`` wire format -- from which this arm
+    needs only the section-level ``function_name_ptr`` (-> names) and
+    ``n_variants`` (-> the per-record lookup). Mirrors the matched
+    arm's columnar build rather than materialising one full
+    :class:`Section` (call_target + variant-block + per-call tables)
+    per unmatched function only to discard it.
     """
     func_names: List[str] = []
-    variant_counts: List[int] = []
     if not sections_bin.exists():
         return (
             func_names,
@@ -59,25 +73,16 @@ def _walk_unmatched_sections(
             np.zeros(0, dtype=np.int64),
         )
     raw, blob = read_sections_bin_blob(sections_bin)
-    # The structural walk (shared with the realized-lengths pass) parses
-    # each section once and threads the parsed ``Section`` out; the name +
-    # variant-count resolution below is this loader's own concern, layered
-    # on top of that single parse -- never a re-parse.
-    section_starts: List[int] = []
-    for cursor, section in walk_parsed_sections(blob, region_start):
-        section_starts.append(cursor)
-        func_names.append(
-            resolve_func_name_or_raise(
-                section.function_name_ptr, line_to_name,
-                sections_bin, cursor,
-            )
+    section_starts = walk_section_starts(blob, region_start)
+    cols = parse_sections_columnar(np.asarray(raw), section_starts)
+    fids = cols.function_name_ptr
+    func_names = [
+        resolve_func_name_or_raise(
+            int(fids[i]), line_to_name, sections_bin, int(section_starts[i])
         )
-        variant_counts.append(len(section.variants))
-    return (
-        func_names,
-        np.array(section_starts, dtype=np.int64),
-        np.array(variant_counts, dtype=np.int64),
-    )
+        for i in range(len(section_starts))
+    ]
+    return func_names, section_starts, cols.n_variants.astype(np.int64)
 
 
 def _build_record_to_section_idx(
@@ -158,7 +163,7 @@ def load_unmatched_arm(
     )
 
     region_start = unmatched_region_start(matched_index)
-    func_names, section_starts, variant_counts = _walk_unmatched_sections(
+    func_names, section_starts, variant_counts = _columnar_unmatched_sections(
         paths.sections_bin, region_start, line_to_name
     )
     # Per-record -> per-section lookup table. Without this, the
