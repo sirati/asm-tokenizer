@@ -6,6 +6,16 @@ multi-chunk packing). The vectorised FP normalisation (denormal +
 NaN/Inf branches that turn the u64 bit patterns into the ``(significand,
 sign_exp)`` f96 sidecar shape) is 3d's concern.
 
+Batched (B-S2b): the prior per-call_target DFS loop is replaced by a
+single batched pass. :func:`._batched_carriers.build_batched_carriers`
+identifies + locates every surviving NUMBER-band carrier across the
+batch; the per-:class:`TokenType` emitters
+(:mod:`._emit_vc2` / :mod:`._emit_f128` / :mod:`._emit_fixed_fp`) build
+each type's whole ``idx_2d`` block in one meshgrid. The per-call_target
+chunk slices are reconstructed from per-DFS-call_target per-type ROW
+counts (a single segmented sum + cumsum), not a per-call_target Python
+walk.
+
 Byte layouts (ALG-7)
 --------------------
 
@@ -55,23 +65,23 @@ inside a multi-chunk source drops the trailing (MSB-end) chunks. The
 carrier slot is chunk 0; continuation slots are chunks 1, 2, ...
 
 Iteration order: sections -> variants -> call_targets in DFS encounter
-order (the same linearisation stage 1 + 3a use). Within each
-call_target's surviving prefix we walk the expanded-stream positions
-and emit per-source rows in stream order. The per-call-target
-``inline_byte_slice`` produced by 3a anchors the offsets we emit.
+order (the same linearisation stage 1 + 3a use); within each
+call_target's surviving prefix the carriers are walked in expanded-stream
+order. Per-type row order is DFS-then-stream over carriers; the f128 /
+vc2 sidecars are populated in the same per-type stream order.
 
 ALG-8 reads ``L = state.runlen_number[p_carrier + 1]``, so we still
 need the raw-stream carrier position. The expanded stream alone
 doesn't tell us ``L`` (only ``K``); two distinct ``L`` values can map
-to the same ``K``. We rebuild the expanded->raw position map locally
-per call_target.
+to the same ``K``. The carrier table rebuilds the expanded->raw
+position map (segment-wise) so ``L`` is recoverable.
 
 Plan refs: ``batch_decode_plan.md`` ALG-7 + ALG-8 + Stage 3 step 4.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import numpy as np
 
@@ -81,13 +91,21 @@ from ._band_constants import (
     _FIXED_ROW_WIDTH,
     _NUMBER_BLOCK_TOKEN_TYPES,
 )
-from ._per_call_target import _emit_call_target_rows
+from ._batched_carriers import build_batched_carriers
+from ._emit_f128 import emit_f128_rows
+from ._emit_fixed_fp import emit_fixed_fp_rows
+from ._emit_vc2 import emit_vc2_rows
 
 if TYPE_CHECKING:
     from .._types import Stage2Batch
 
 
 __all__ = ["build_number_idx_2d"]
+
+
+# Block index of each NUMBER-block TokenType (0 = VC2, ..., 6 = F128).
+_VC2_BLOCK = 0
+_F128_BLOCK = len(_NUMBER_BLOCK_TOKEN_TYPES) - 1
 
 
 def build_number_idx_2d(
@@ -102,15 +120,15 @@ def build_number_idx_2d(
 ]:
     """Build per-:class:`TokenType` ``idx_2d`` arrays per ALG-7 + ALG-8.
 
-    Walks every call_target in DFS encounter order, iterates surviving
-    expanded-stream positions, and emits ``u32`` gather-offset rows per
-    surviving number-source carrier into the per-:class:`TokenType`
-    ``idx_2d`` array.
+    Identifies every surviving number-source carrier across the batch in
+    one pass, emits each :class:`TokenType`'s ``idx_2d`` block as a
+    vectorised meshgrid, and reconstructs the per-call_target chunk
+    slices from per-call_target per-type ROW counts.
 
     Parameters
     ----------
     stage2_batch
-        Per-call-target reads pull ``stage1.state`` (raw_tokens, masks,
+        Per-call_target reads pull ``stage1.state`` (raw_tokens, masks,
         runlen_number) -- the byte-width / payload-length data lives
         in the ORIGINAL pre-promotion stream, while expansion identifies
         which positions are chunk-carriers.
@@ -145,68 +163,128 @@ def build_number_idx_2d(
         ``exponent_base``.
     """
 
-    # Output accumulators. Every NUMBER-block TokenType key is always
-    # present so callers can index without a KeyError guard.
-    row_lists_per_type: dict[TokenType, list[np.ndarray]] = {
-        T: [] for T in _NUMBER_BLOCK_TOKEN_TYPES
-    }
-    chunk_slices_per_type: dict[TokenType, list[slice]] = {
-        T: [] for T in _NUMBER_BLOCK_TOKEN_TYPES
-    }
-    running_counts: dict[TokenType, int] = {
-        T: 0 for T in _NUMBER_BLOCK_TOKEN_TYPES
-    }
-    f128_nan_or_inf_flags: list[bool] = []
-    vc2_chunk_indices: list[int] = []
+    n_total_cts = len(inline_byte_slices)
 
-    # DFS encounter order matches 3a's ``inline_byte_slices`` so a
-    # single positional index lines up byte-slice + row-slice handoffs.
-    ct_dfs_idx = 0
-    for section in stage2_batch.sections:
-        for variant in section.variants:
-            for ct in variant.call_targets:
-                # Per-TokenType row counts BEFORE processing this ct, to
-                # produce the per-ct slice into the final concatenation.
-                pre_counts = {
-                    T: running_counts[T] for T in _NUMBER_BLOCK_TOKEN_TYPES
-                }
+    carriers, ct_index = build_batched_carriers(
+        stage2_batch, inline_byte_slices
+    )
 
-                if ct.surviving_token_count > 0:
-                    _emit_call_target_rows(
-                        ct=ct,
-                        inline_byte_slice=inline_byte_slices[ct_dfs_idx],
-                        row_lists_per_type=row_lists_per_type,
-                        running_counts=running_counts,
-                        f128_nan_or_inf_flags=f128_nan_or_inf_flags,
-                        vc2_chunk_indices=vc2_chunk_indices,
-                    )
-
-                for T in _NUMBER_BLOCK_TOKEN_TYPES:
-                    chunk_slices_per_type[T].append(
-                        slice(pre_counts[T], running_counts[T])
-                    )
-
-                ct_dfs_idx += 1
-
+    # Per-type accumulators. Each entry holds the type's row block, the
+    # per-CARRIER row count (carrier order), and the per-CARRIER owning
+    # DFS-call_target index (for the slice reconstruction).
     idx_2d_per_type: dict[TokenType, np.ndarray] = {}
-    for T in _NUMBER_BLOCK_TOKEN_TYPES:
-        if row_lists_per_type[T]:
-            idx_2d_per_type[T] = np.concatenate(
-                row_lists_per_type[T], axis=0
+    rows_per_carrier_per_type: dict[TokenType, np.ndarray] = {}
+    carrier_dfs_ct_per_type: dict[TokenType, np.ndarray] = {}
+
+    block_idx = carriers.carrier_block_idx
+    byte_offsets = carriers.carrier_byte_offsets
+    # DFS-call_target index for each carrier (the slice axis is over the
+    # FULL DFS enumeration, including dropped call_targets).
+    carrier_dfs_ct = (
+        ct_index[carriers.carrier_seg]
+        if block_idx.shape[0]
+        else np.empty(0, dtype=np.int64)
+    )
+
+    f128_is_nan_or_inf = np.empty(0, dtype=np.bool_)
+    vc2_chunk_indices = np.empty(0, dtype=np.int64)
+
+    for b, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
+        type_mask = block_idx == b
+        type_byte_offsets = byte_offsets[type_mask]
+        type_dfs_ct = carrier_dfs_ct[type_mask]
+
+        if b == _VC2_BLOCK:
+            rows, rows_per_carrier, chunk_idx = emit_vc2_rows(
+                p_carriers=carriers.carrier_raw_positions[type_mask],
+                p_carrier_bytes=type_byte_offsets,
+                expanded_positions=(
+                    carriers.carrier_expanded_positions[type_mask]
+                ),
+                carrier_seg=carriers.carrier_seg[type_mask],
+                seg_painted_offsets=carriers.seg_painted_offsets,
+                seg_painted_vc2_flat=carriers.seg_painted_vc2_flat,
+                seg_surviving=carriers.seg_surviving,
+                seg_runlen_base=carriers.seg_runlen_base,
+                runlen_number_flat=carriers.runlen_number_flat,
             )
+            vc2_chunk_indices = chunk_idx
+        elif b == _F128_BLOCK:
+            rows, rows_per_carrier, is_nan_or_inf = emit_f128_rows(
+                p_carrier_bytes=type_byte_offsets,
+                expanded_positions=(
+                    carriers.carrier_expanded_positions[type_mask]
+                ),
+                carrier_seg=carriers.carrier_seg[type_mask],
+                seg_f128_base=carriers.seg_f128_base,
+                f128_full_mask_flat=carriers.f128_full_mask_flat,
+            )
+            f128_is_nan_or_inf = is_nan_or_inf
         else:
-            idx_2d_per_type[T] = np.empty(
-                (0, _FIXED_ROW_WIDTH[T]), dtype=np.uint32
+            rows = emit_fixed_fp_rows(
+                p_carrier_bytes=type_byte_offsets,
+                token_type=token_type,
+            )
+            rows_per_carrier = np.ones(
+                int(type_byte_offsets.shape[0]), dtype=np.int64
             )
 
-    f128_is_nan_or_inf = np.asarray(f128_nan_or_inf_flags, dtype=np.bool_)
-    vc2_chunk_exponent_sidecar = np.asarray(
-        vc2_chunk_indices, dtype=np.uint32
+        idx_2d_per_type[token_type] = rows
+        rows_per_carrier_per_type[token_type] = rows_per_carrier
+        carrier_dfs_ct_per_type[token_type] = type_dfs_ct
+
+    # Ensure every type has a canonical-width empty array when no carrier
+    # of that type appears.
+    for token_type in _NUMBER_BLOCK_TOKEN_TYPES:
+        if idx_2d_per_type[token_type].shape[0] == 0:
+            idx_2d_per_type[token_type] = np.empty(
+                (0, _FIXED_ROW_WIDTH[token_type]), dtype=np.uint32
+            )
+
+    chunk_slices_per_type = _reconstruct_per_ct_slices(
+        n_total_cts=n_total_cts,
+        rows_per_carrier_per_type=rows_per_carrier_per_type,
+        carrier_dfs_ct_per_type=carrier_dfs_ct_per_type,
     )
 
     return (
         idx_2d_per_type,
         chunk_slices_per_type,
         f128_is_nan_or_inf,
-        vc2_chunk_exponent_sidecar,
+        vc2_chunk_indices.astype(np.uint32, copy=False),
     )
+
+
+def _reconstruct_per_ct_slices(
+    *,
+    n_total_cts: int,
+    rows_per_carrier_per_type: dict[TokenType, np.ndarray],
+    carrier_dfs_ct_per_type: dict[TokenType, np.ndarray],
+) -> dict[TokenType, list[slice]]:
+    """Rebuild per-DFS-call_target chunk slices from per-carrier ROW counts.
+
+    The scalar entry produced ``chunk_slices_per_type[T][i] = slice(
+    pre_counts[T], running_counts[T])`` -- the per-DFS-call_target run of
+    type ``T``'s rows. Here we segment-sum each type's per-carrier row
+    counts into per-DFS-call_target totals (``np.add.at`` over the
+    carrier's owning DFS index), then ``cumsum`` to the abutting slice
+    boundaries over the FULL DFS enumeration (dropped call_targets get a
+    zero-length slice ``slice(c, c)`` at their cursor, exactly as the
+    scalar walk emitted for a ``surviving_token_count == 0`` or
+    no-carrier call_target).
+    """
+    chunk_slices_per_type: dict[TokenType, list[slice]] = {}
+    for token_type in _NUMBER_BLOCK_TOKEN_TYPES:
+        per_ct_rows = np.zeros(n_total_cts, dtype=np.int64)
+        rows_per_carrier = rows_per_carrier_per_type[token_type]
+        dfs_ct = carrier_dfs_ct_per_type[token_type]
+        if rows_per_carrier.shape[0]:
+            np.add.at(per_ct_rows, dfs_ct, rows_per_carrier)
+        boundaries = np.zeros(n_total_cts + 1, dtype=np.int64)
+        np.cumsum(per_ct_rows, out=boundaries[1:])
+        slices: List[slice] = [
+            slice(int(boundaries[i]), int(boundaries[i + 1]))
+            for i in range(n_total_cts)
+        ]
+        chunk_slices_per_type[token_type] = slices
+    return chunk_slices_per_type

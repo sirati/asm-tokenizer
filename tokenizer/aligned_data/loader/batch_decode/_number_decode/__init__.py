@@ -6,16 +6,18 @@ Module layout (one concern per file):
 
 * :mod:`._band_constants` -- vocab anchors + canonical NUMBER-block
   TokenType ordering + per-type row widths.
-* :mod:`._emit_fixed_fp` -- per-source row emission for F16 / BF16 /
-  F32 / F64 / F80.
-* :mod:`._emit_f128` -- per-source row emission for FLOAT128 (1- and
-  2-chunk variants + the mid-cut LSB-only case).
-* :mod:`._emit_vc2` -- per-source row emission for VALUED_CONST_V2
-  (ALG-8 multi-chunk packing).
-* :mod:`._per_call_target` -- per-call-target expanded-stream walk +
-  per-source dispatch.
-* :mod:`._entry` -- :func:`build_number_idx_2d` orchestrator over the
-  4-level batch hierarchy.
+* :mod:`._batched_carriers` -- cross-call_target NUMBER-band carrier
+  identification + location (segmented expanded->raw map + byte
+  offsets); the flat carrier table the per-type emitters batch over.
+* :mod:`._emit_fixed_fp` -- batched per-carrier row emission for F16 /
+  BF16 / F32 / F64 / F80.
+* :mod:`._emit_f128` -- batched per-carrier row emission for FLOAT128
+  (1- and 2-chunk variants + the mid-cut LSB-only case).
+* :mod:`._emit_vc2` -- batched per-carrier row emission for
+  VALUED_CONST_V2 (ALG-8 multi-chunk packing).
+* :mod:`._entry` -- :func:`build_number_idx_2d` orchestrator: build the
+  carrier table, dispatch per-type emit, reconstruct per-call_target
+  slices.
 """
 
 from ._band_constants import _NUMBER_BLOCK_TOKEN_TYPES
