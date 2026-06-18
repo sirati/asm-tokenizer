@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 __all__ = [
     "FlatCallTargets",
     "flatten_call_targets",
-    "segment_ids_from_offsets",
     "surviving_call_targets",
 ]
 
@@ -151,23 +150,3 @@ def flatten_call_targets(stage2: "Stage2Batch") -> FlatCallTargets:
         seg_len=seg_len,
         ct_index=ct_index,
     )
-
-
-def segment_ids_from_offsets(
-    seg_offsets: np.ndarray, total: int
-) -> np.ndarray:
-    """``int64[total]`` -- the segment index each flat element belongs to.
-
-    Vectorised inverse of the CSR: element ``k`` belongs to segment
-    ``searchsorted(seg_offsets[1:], k, 'right')``. Built without a Python
-    loop via a scatter-add of ones at each non-first segment start +
-    cumsum, which is the standard CSR->segment-id expansion.
-    """
-    seg_id = np.zeros(total, dtype=np.int64)
-    if seg_offsets.shape[0] > 2:
-        # Mark the start of every segment after the first with a +1; the
-        # running cumsum then carries the segment index forward.
-        starts = seg_offsets[1:-1]
-        seg_id[starts] = 1
-        np.cumsum(seg_id, out=seg_id)
-    return seg_id
