@@ -32,7 +32,7 @@ from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
     _CALL_TARGET_TYPE_TO_CATEGORY,
 )
 from tokenizer.aligned_data.loader.batch_decode._surviving_counts import (
-    count_surviving,
+    count_surviving_batched,
 )
 from tokenizer.aligned_data.loader.batch_decode._types import (
     Stage1Batch,
@@ -102,6 +102,43 @@ def build_stage2_batch(
         expanded.runlen_number_flat,
         expanded.raw_record_offsets,
     )
+    # B-S1: hoist the COUNTER-category-counts dict shape out of the per-node
+    # loop. ``per_node_counts`` is ``dict[Category, int64[n_emitted]]``; the
+    # per-node ``function_data.metadata['category_counts']`` is one column
+    # slice of it. Precompute the (category, column) pairs ONCE so the per-
+    # node dict build is a flat zip over scalars -- no per-node re-iteration
+    # of the dict keys nor re-hashing of the Category enums.
+    count_cats = tuple(per_node_counts)
+    count_cols = tuple(per_node_counts[cat] for cat in count_cats)
+
+    # B-S1: per-node ``encounter_category`` as one precomputed column. The
+    # node's edge type (0/1/2) maps through ``_CALL_TARGET_TYPE_TO_CATEGORY``
+    # -- a 3-entry table -- so resolve it via a length-3 lookup indexed by
+    # the (already-int) ``edge_type`` array instead of constructing a
+    # ``CallTargetType`` enum + dict lookup per emitted node.
+    encounter_category_per_node = _encounter_category_per_node(edge_type)
+
+    # B-S1: per-node surviving identity / number-chunk counts for EVERY
+    # emitted node in ONE segmented band-mask reduction over the flat
+    # ``expanded`` stream, instead of a per-node :func:`count_surviving`
+    # numpy call. ``surviving_id[e]`` / ``surviving_num[e]`` are node ``e``'s
+    # band cardinalities over its surviving prefix -- the same two integers
+    # :func:`count_surviving_batched` returns, computed batch-wide.
+    surviving_id, surviving_num = count_surviving_batched(
+        expanded_flat, node_off, surviving
+    )
+
+    # B-S1: per-section ``list[CallTarget]`` cache. ``_call_targets_section``
+    # is called once per EMITTED NODE but a section's call_targets table is
+    # node-invariant, so nodes of the same section share ONE frozen
+    # read-only list (the redundancy is ~5x at B70 / ~8.5x at B1120). The
+    # downstream consumers (``_function_name_ptrs_per_category``, the
+    # dedup-map capacity estimate) only read it, never mutate, so sharing
+    # the same object is byte-identical.
+    ct_section_cache: dict[int, List[CallTarget]] = {}
+    # B-S1: per-section root FID as a Python-int column (one ``int()`` per
+    # distinct section instead of per emitted node).
+    section_fid_int = section_fid.tolist()
 
     sections: List[Stage2Section] = []
     for r in range(n_rows):
@@ -110,19 +147,23 @@ def build_stage2_batch(
         s2_cts: List[Stage2CallTarget] = []
         for e in range(lo, hi):
             sec = int(section_of_node[e])
-            ct_section = _call_targets_section(cols, ct_offsets, sec)
+            ct_section = ct_section_cache.get(sec)
+            if ct_section is None:
+                ct_section = _call_targets_section(cols, ct_offsets, sec)
+                ct_section_cache[sec] = ct_section
             s1_ct = Stage1CallTarget(
                 function_data=_function_data_for(
                     expanded.states[e].raw_tokens,
-                    {cat: int(per_node_counts[cat][e]) for cat in per_node_counts},
+                    {
+                        cat: int(col[e])
+                        for cat, col in zip(count_cats, count_cols)
+                    },
                 ),
                 state=expanded.states[e],
                 call_targets_section=ct_section,
-                encounter_category=_CALL_TARGET_TYPE_TO_CATEGORY[
-                    CallTargetType(int(edge_type[e]))
-                ],
+                encounter_category=encounter_category_per_node[e],
                 parent_call_target_index=None if e == lo else 0,
-                function_name_ptr=int(section_fid[sec]),
+                function_name_ptr=section_fid_int[sec],
                 path_depth=0 if e == lo else 1,
             )
             s2_cts.append(
@@ -134,6 +175,8 @@ def build_stage2_batch(
                     extra_value_v2_mask=expanded.extra_value_v2_masks[e],
                     extra_f128_mask=expanded.extra_f128_masks[e],
                     surviving_token_count=int(surviving[e]),
+                    surviving_identity_count=int(surviving_id[e]),
+                    surviving_number_chunk_count=int(surviving_num[e]),
                 )
             )
         sections.append(_stage2_section(r, s2_cts))
@@ -151,6 +194,23 @@ def build_stage2_batch(
         identity_row_offsets=identity_row_offsets,
         number_row_offsets=number_row_offsets,
     )
+
+
+def _encounter_category_per_node(edge_type: np.ndarray) -> List[Category]:
+    """Per-node ``encounter_category`` resolved via a length-3 lookup.
+
+    Each node's ``edge_type`` (the int value of its :class:`CallTargetType`)
+    maps to a FUNCTION :class:`Category` through
+    ``_CALL_TARGET_TYPE_TO_CATEGORY``. Resolving that 3-entry table once and
+    indexing it by the (already-int) ``edge_type`` reproduces the per-node
+    ``_CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(int(edge_type[e]))]``
+    byte-for-byte, without an enum construction + dict lookup per node.
+    """
+    table = [
+        _CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(t)]
+        for t in range(len(CallTargetType))
+    ]
+    return [table[t] for t in edge_type.tolist()]
 
 
 def _section_of_node(
@@ -224,18 +284,19 @@ def _stage2_call_target(
     extra_value_v2_mask: np.ndarray,
     extra_f128_mask: np.ndarray,
     surviving_token_count: int,
+    surviving_identity_count: int,
+    surviving_number_chunk_count: int,
 ) -> Stage2CallTarget:
     """Wrap one node's expansion as a ``Stage2CallTarget``.
 
     ``partial_cut_length == surviving_token_count`` (the row-level cut at
     the token level is already encoded in the per-node surviving count);
     ``is_cut`` is True iff the node was truncated below its full length.
-    The surviving identity / number-chunk counts come from the SHARED
-    band-mask kernel (:func:`count_surviving`) over the surviving prefix
-    -- the same kernel Stage-2c uses.
+    The surviving identity / number-chunk counts are this node's slice of
+    the batch-wide :func:`_surviving_counts_batched` band-mask reduction
+    -- the same two integers :func:`count_surviving` returns per node.
     """
     predicted = int(expanded_token_ids.shape[0])
-    counts = count_surviving(expanded_token_ids, surviving_token_count)
     return Stage2CallTarget(
         stage1=s1_ct,
         expanded_token_ids=expanded_token_ids,
@@ -243,8 +304,8 @@ def _stage2_call_target(
         extra_f128_mask=extra_f128_mask,
         predicted_full_length=predicted,
         surviving_token_count=surviving_token_count,
-        surviving_identity_count=counts.surviving_identity_count,
-        surviving_number_chunk_count=counts.surviving_number_chunk_count,
+        surviving_identity_count=surviving_identity_count,
+        surviving_number_chunk_count=surviving_number_chunk_count,
         is_cut=surviving_token_count < predicted,
         partial_cut_length=surviving_token_count,
     )

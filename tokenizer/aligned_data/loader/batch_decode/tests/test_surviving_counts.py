@@ -25,6 +25,7 @@ from tokenizer.aligned_data.loader.batch_decode._surviving_counts import (
     _NUMBER_BAND_HI_SHIFTED,
     _NUMBER_BAND_LO_SHIFTED,
     count_surviving,
+    count_surviving_batched,
 )
 from tokenizer.token_manager import VocabularyManager
 
@@ -252,3 +253,62 @@ def test_counts_are_python_ints_not_numpy_scalars() -> None:
     out = count_surviving(_u16([1, 8]), partial_cut_length=2)
     assert type(out.surviving_identity_count) is int
     assert type(out.surviving_number_chunk_count) is int
+
+
+# ---------------------------------------------------------------------------
+# Batched twin -- element-for-element equivalence with the scalar path
+# ---------------------------------------------------------------------------
+
+
+def _scalar_loop(expanded_flat, node_offsets, surviving):
+    ids, nums = [], []
+    for e in range(len(node_offsets) - 1):
+        node = expanded_flat[node_offsets[e] : node_offsets[e + 1]]
+        out = count_surviving(node, int(surviving[e]))
+        ids.append(out.surviving_identity_count)
+        nums.append(out.surviving_number_chunk_count)
+    return np.asarray(ids, dtype=np.int64), np.asarray(nums, dtype=np.int64)
+
+
+def test_batched_empty_batch_returns_empty_arrays() -> None:
+    ids, nums = count_surviving_batched(
+        _u16([]), np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    )
+    assert ids.shape == (0,)
+    assert nums.shape == (0,)
+
+
+def test_batched_matches_scalar_on_random_ragged_batch() -> None:
+    """The batched kernel must reproduce a per-node ``count_surviving``
+    loop element-for-element across ragged node lengths, mixed band
+    content, zero-length nodes, exact-fit cuts, and over-long cuts."""
+    rng = np.random.default_rng(20260619)
+    for _ in range(50):
+        n_nodes = int(rng.integers(1, 12))
+        node_len = rng.integers(0, 9, size=n_nodes).astype(np.int64)
+        node_offsets = np.zeros(n_nodes + 1, dtype=np.int64)
+        np.cumsum(node_len, out=node_offsets[1:])
+        total = int(node_offsets[-1])
+        # Tokens span null(0), NUMBER(1..7), IDENTITY(8..15), out-of-band(16).
+        expanded_flat = rng.integers(0, 17, size=total).astype(np.uint16)
+        # Surviving prefix lengths: a mix of <node_len, ==node_len, and
+        # > node_len (over-long, must clamp) plus the occasional zero.
+        surviving = np.empty(n_nodes, dtype=np.int64)
+        for e in range(n_nodes):
+            choice = int(rng.integers(0, 4))
+            L = int(node_len[e])
+            if choice == 0:
+                surviving[e] = 0
+            elif choice == 1:
+                surviving[e] = L
+            elif choice == 2:
+                surviving[e] = L + int(rng.integers(1, 4))  # over-long
+            else:
+                surviving[e] = int(rng.integers(0, L + 1)) if L > 0 else 0
+
+        exp_ids, exp_nums = _scalar_loop(expanded_flat, node_offsets, surviving)
+        got_ids, got_nums = count_surviving_batched(
+            expanded_flat, node_offsets, surviving
+        )
+        assert np.array_equal(got_ids, exp_ids)
+        assert np.array_equal(got_nums, exp_nums)

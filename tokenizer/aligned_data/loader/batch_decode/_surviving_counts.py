@@ -63,7 +63,7 @@ import numpy as np
 from tokenizer.token_manager import VocabularyManager
 
 
-__all__ = ["SurvivingCounts", "count_surviving"]
+__all__ = ["SurvivingCounts", "count_surviving", "count_surviving_batched"]
 
 
 # ---------------------------------------------------------------------------
@@ -177,3 +177,77 @@ def count_surviving(
         surviving_identity_count=int(identity_mask.sum()),
         surviving_number_chunk_count=int(number_mask.sum()),
     )
+
+
+def count_surviving_batched(
+    expanded_flat: np.ndarray,
+    node_offsets: np.ndarray,
+    surviving_token_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Batched twin of :func:`count_surviving` over a flat node stream.
+
+    Computes, for EVERY node in one segmented band-mask reduction, the
+    two band cardinalities :func:`count_surviving` returns per node --
+    over the node's surviving prefix
+    ``expanded_flat[node_offsets[e] : node_offsets[e] +
+    min(surviving_token_counts[e], node_len[e])]``.
+
+    Parameters
+    ----------
+    expanded_flat:
+        The flat post-promotion ``u16`` stream for the whole batch; node
+        ``e`` owns ``expanded_flat[node_offsets[e] : node_offsets[e + 1]]``.
+    node_offsets:
+        ``int64[n_nodes + 1]`` CSR jump table into ``expanded_flat``.
+    surviving_token_counts:
+        ``int64[n_nodes]`` -- node ``e``'s surviving prefix length (the
+        per-node ``partial_cut_length``). Clamped to the node length, as
+        numpy slicing clamps ``stop`` in the scalar path.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(surviving_identity_count, surviving_number_chunk_count)``, each
+        ``int64[n_nodes]`` -- the per-node IDENTITY-band and NUMBER-band
+        cardinalities. Identical, element-for-element, to looping
+        :func:`count_surviving` over the nodes.
+    """
+    node_offsets = np.asarray(node_offsets, dtype=np.int64)
+    n_nodes = node_offsets.shape[0] - 1
+    if n_nodes <= 0 or expanded_flat.shape[0] == 0:
+        zeros = np.zeros(max(n_nodes, 0), dtype=np.int64)
+        return zeros, zeros.copy()
+
+    # Per-flat-position owning node id (CSR -> dense via repeat) and the
+    # position's offset within its node.
+    node_len = np.diff(node_offsets)
+    node_id = np.repeat(np.arange(n_nodes, dtype=np.int64), node_len)
+    pos = np.arange(expanded_flat.shape[0], dtype=np.int64)
+    offset_in_node = pos - node_offsets[node_id]
+
+    # A position counts iff it falls in the node's surviving prefix
+    # (offset < clamped surviving length). The clamp to node length is
+    # implicit: offsets only range over the node's own span, so an
+    # over-long ``surviving`` simply includes the whole node.
+    surviving = np.asarray(surviving_token_counts, dtype=np.int64)
+    within = offset_in_node < surviving[node_id]
+
+    ids = expanded_flat
+    identity_mask = (
+        (ids >= _IDENTITY_BAND_LO_SHIFTED)
+        & (ids < _IDENTITY_BAND_HI_SHIFTED)
+        & within
+    )
+    number_mask = (
+        (ids >= _NUMBER_BAND_LO_SHIFTED)
+        & (ids < _NUMBER_BAND_HI_SHIFTED)
+        & within
+    )
+
+    surviving_identity_count = np.bincount(
+        node_id[identity_mask], minlength=n_nodes
+    ).astype(np.int64)
+    surviving_number_chunk_count = np.bincount(
+        node_id[number_mask], minlength=n_nodes
+    ).astype(np.int64)
+    return surviving_identity_count, surviving_number_chunk_count
