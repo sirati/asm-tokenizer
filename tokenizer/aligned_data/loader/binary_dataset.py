@@ -182,7 +182,12 @@ class BinaryDataset:
         ``section_starts`` and whose lengths are recoverable by re-
         parsing the section on demand).
         """
-        setattr(self, f"{attr_prefix}_starts", arm.starts)
+        # ``starts`` is NOT snapshotted here: the matched arm defers it
+        # behind a thunk (the full-catalog parse the vb path never needs),
+        # so reading it eagerly would resurrect the ~2 s open cost. It is
+        # exposed via the ``{matched,unmatched}_starts`` properties below,
+        # which delegate to the arm on demand (the validator's only
+        # consumer triggers the parse there, not at construction).
         setattr(self, f"{attr_prefix}_edge_indices", arm.edge_indices)
         setattr(self, f"{attr_prefix}_count_per_length", arm.count_per_length)
         setattr(self, f"{attr_prefix}_func_names", arm.func_names)
@@ -190,6 +195,24 @@ class BinaryDataset:
         setattr(self, f"{attr_prefix}_section_starts", arm.section_starts)
         setattr(self, f"{attr_prefix}_bin_starts", arm.bin_starts)
         setattr(self, f"{attr_prefix}_bin_lengths", arm.bin_lengths)
+
+    # ------------------------------------------------------------------
+    # Per-record ``starts`` (lazy on the matched arm)
+    # ------------------------------------------------------------------
+    @property
+    def matched_starts(self) -> np.ndarray:
+        """Per-variant ``_data.bin`` offsets (matched arm).
+
+        Delegates to the arm so the full-catalog parse that produces it
+        stays deferred until a consumer (the validator's v1 post-checks)
+        actually reads it -- construction never forces it.
+        """
+        return self._matched_arm.starts
+
+    @property
+    def unmatched_starts(self) -> np.ndarray:
+        """Per-record ``_data.bin`` offsets (unmatched arm; eager)."""
+        return self._unmatched_arm.starts
 
     # ------------------------------------------------------------------
     # Session API

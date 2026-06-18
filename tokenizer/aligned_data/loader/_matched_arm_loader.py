@@ -48,6 +48,7 @@ from tokenizer.aligned_data.matched_sections_columnar import (
     parse_sections_columnar,
 )
 
+from ._lazy_func_names import LazyFuncNames
 from ._sections_bin_walk import (
     read_sections_bin_blob,
     resolve_func_name_or_raise,
@@ -71,6 +72,14 @@ def _columnar_matched_sections(
     format, so this reuses it rather than walking 340k full
     :class:`Section` objects (each carrying its whole call_target +
     variant-block table) only to discard them.
+
+    This is the FULL-catalog parse (~1 M per-call entries on z3). The
+    decode / vector_batch path never reads ``cols`` or the matched
+    ``starts``, and reads a function name only for the handful of
+    sections a batch samples (via :class:`LazyFuncNames`), so
+    :func:`load_matched_arm` defers this whole parse behind a thunk and
+    only the validator's v1 post-checks (matched ``starts``) or a
+    whole-list ``func_names`` walk trigger it.
     """
     func_names: List[str] = []
     if not sections_bin.exists() or len(bin_starts) == 0:
@@ -137,16 +146,39 @@ def load_matched_arm(
         return _empty_arm()
     bin_starts, bin_lengths = section_index
 
-    func_names, cols = _columnar_matched_sections(
-        sections_bin, bin_starts, line_to_name
-    )
+    # --- Eager part: ONLY the cheap per-function locators above
+    # (``_index.bin`` -> ``bin_starts`` / ``bin_lengths``, ~0.4 ms).
+    # The full-catalog columnar parse (~2 s on z3) that produces the
+    # matched ``func_names`` list + per-variant ``starts`` is DEAD for
+    # the vector_batch / session decode path: it re-parses each sampled
+    # section on demand and reads at most one func name per sampled idx.
+    # So defer the whole columnar parse behind a single memoised thunk;
+    # only the validator (matched ``starts``) or a whole-``func_names``
+    # walk (validator / inspector / tests) realises it.
+    _full: list = []
 
-    # Flatten variants into per-record offsets. ``func_names`` stays
-    # per-function (one entry per matched section); ``starts`` is
-    # per-variant (one entry per variant block in encounter order).
-    # No length or overlong flag -- the record at each offset is
-    # self-describing.
-    starts = _flat_variant_starts(cols)
+    def _resolve_full() -> Tuple[List[str], np.ndarray]:
+        if not _full:
+            names, cols = _columnar_matched_sections(
+                sections_bin, bin_starts, line_to_name
+            )
+            # ``starts`` is per-variant (one entry per variant block in
+            # encounter order); ``names`` stays per-function. The record
+            # at each offset is self-describing -- no length / overlong
+            # flag rides alongside.
+            _full.append((names, _flat_variant_starts(cols)))
+        return _full[0]
+
+    # ``func_names[idx]`` resolves a SINGLE section on demand (one
+    # mmap-paged header), so the vb path never triggers the full parse;
+    # iterating / comparing the whole sequence realises the eager list
+    # (and caches it) via the same ``_resolve_full`` parse.
+    func_names = LazyFuncNames(
+        sections_bin,
+        bin_starts,
+        line_to_name,
+        resolve_all=lambda: _resolve_full()[0],
+    )
 
     # ``select_random_function_by_length`` is a NotImplementedError
     # stub for the matched arm, so the length-band lookup tables have
@@ -156,7 +188,7 @@ def load_matched_arm(
     count_per_length = np.zeros(1, dtype=np.int32)
 
     return SectionArm(
-        starts=starts,
+        starts_thunk=lambda: _resolve_full()[1],
         edge_indices=edge_indices,
         count_per_length=count_per_length,
         func_names=func_names,

@@ -21,6 +21,7 @@ sidecar (loaded by ``BinaryDataset``) keyed on each BIN section's
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -87,12 +88,26 @@ class SectionArm:
     ``load_unmatched`` call. Empty on the matched arm (its per-record
     indexing is the validator's concern; the loader's hot path keys on
     ``bin_starts``).
+
+    ``starts`` laziness (matched arm): the matched ``starts`` (per-
+    variant ``_data.bin`` offsets, recovered from the WHOLE columnar
+    catalog) is consumed ONLY by the validator's v1 post-checks, never
+    by the vector_batch / session decode path. To keep
+    ``BinaryDataset.__init__`` off that ~2 s full-catalog parse, the
+    matched loader supplies ``starts`` via ``starts_thunk`` (a memoised
+    zero-arg builder) instead of a materialised array; the ``starts``
+    property realises it on first access and caches the result. Eager
+    callers (unmatched arm, the empty arm) pass a concrete ``starts``
+    array and leave ``starts_thunk`` ``None`` — the property returns the
+    array directly. Likewise the matched ``func_names`` may be a
+    :class:`LazyFuncNames` sequence that resolves a single section's name
+    per ``[idx]`` and only materialises the full list on iteration /
+    equality; its ``Sequence`` contract is a drop-in for ``List[str]``.
     """
 
-    starts: np.ndarray
     edge_indices: np.ndarray
     count_per_length: np.ndarray
-    func_names: List[str] = field(default_factory=list)
+    func_names: Sequence[str] = field(default_factory=list)
     section_starts: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int64)
     )
@@ -105,6 +120,34 @@ class SectionArm:
     record_to_section_idx: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.uint32)
     )
+    # ``starts`` is served through the property below: eager callers set
+    # ``_starts`` (keyword ``starts=``), the matched loader sets
+    # ``starts_thunk`` so the full-catalog parse stays deferred. The
+    # ``_starts_cache`` (a 1-element mutable list) memoises a thunk result
+    # without mutating this frozen dataclass.
+    _starts: Optional[np.ndarray] = field(default=None, repr=False)
+    starts_thunk: Optional[Callable[[], np.ndarray]] = field(
+        default=None, repr=False, compare=False
+    )
+    _starts_cache: list = field(
+        default_factory=list, repr=False, compare=False
+    )
+
+    @property
+    def starts(self) -> np.ndarray:
+        """Per-record ``_data.bin`` offsets.
+
+        Eager arms hold the array directly; the matched arm defers it
+        behind ``starts_thunk`` (the full-catalog parse) and realises +
+        caches it here on first access.
+        """
+        if self._starts is not None:
+            return self._starts
+        if self.starts_thunk is not None:
+            if not self._starts_cache:
+                self._starts_cache.append(self.starts_thunk())
+            return self._starts_cache[0]
+        return np.array([], dtype=np.int64)
 
     @property
     def count(self) -> int:
@@ -285,7 +328,7 @@ def _empty_arm() -> SectionArm:
     length / indexing arithmetic does not degrade.
     """
     return SectionArm(
-        starts=np.array([], dtype=np.int64),
+        _starts=np.array([], dtype=np.int64),
         edge_indices=np.zeros(1, dtype=np.int32),
         count_per_length=np.zeros(1, dtype=np.int32),
         func_names=[],

@@ -174,7 +174,7 @@ def load_unmatched_arm(
         variant_counts, total_records=len(starts)
     )
     return SectionArm(
-        starts=starts,
+        _starts=starts,
         edge_indices=edge_indices,
         count_per_length=count_per_length,
         func_names=func_names,
