@@ -203,6 +203,7 @@ def test_multi_binary_batch_decode_result_is_frozen() -> None:
         inner=inner,
         binary_id_per_row=np.zeros(1, dtype=np.uint32),
         binary_names=["coreutils"],
+        depth_per_row=np.zeros(1, dtype=np.int64),
     )
     with pytest.raises((AttributeError, Exception)):
         result.binary_names = ["other"]  # type: ignore[misc]

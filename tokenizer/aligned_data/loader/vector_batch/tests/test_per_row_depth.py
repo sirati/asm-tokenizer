@@ -212,6 +212,66 @@ def test_mixed_depth_equals_per_depth_decodes(seed, tmp_path):
     )
 
 
+@pytest.mark.parametrize("seed", [0, 1, 7])
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_single_depth_depth_per_row_is_all_that_depth(seed, depth, tmp_path):
+    """A single-depth batch labels every non-padding row with that depth.
+
+    ``depth_per_row`` is the NEW per-row source-depth identifier; for a
+    scalar ``max_depth`` every decoded row holds that one depth and padding
+    rows (mapping sentinel) hold 0. The token tensor + dense sidecars are
+    unchanged (the byte-identity gate above covers that); this only pins
+    the additional field.
+    """
+    base = _prepare(build_combined_fixture, tmp_path)
+    idxs = _nonempty_matched_idxs(base)
+    result = _decode(
+        base, section_idxs=idxs, max_depth=depth, seed=seed,
+        context_len=4096, n_var=4,
+    )
+    mapping = np.asarray(result.batch_idx_to_section_variant)
+    sentinel = np.iinfo(np.uint32).max
+    is_padding = mapping[:, 0] == sentinel
+    depth_per_row = np.asarray(result.depth_per_row)
+    assert depth_per_row.shape == (result.tokens.shape[0],)
+    assert depth_per_row.dtype == np.int64
+    assert np.all(depth_per_row[~is_padding] == depth)
+    assert np.all(depth_per_row[is_padding] == 0)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 7, 42])
+def test_cross_depth_depth_per_row_labels_each_row_source_depth(seed, tmp_path):
+    """A mixed-depth batch's depth_per_row == each row's section depth.
+
+    Each row's source depth is the depth of the section pointer it was
+    drawn from (mapping column 0 -> per_pointer[ptr_idx]); padding rows
+    hold 0. Cross-checked against the SAME per-pointer depth vector the
+    sampler/loader used to split the depth groups.
+    """
+    base = _prepare(build_rich_splice_fixture, tmp_path)
+    idxs = _nonempty_matched_idxs(base)
+    assert len(idxs) >= 2, "fixture must yield multiple section pointers"
+
+    depth_a, depth_b = 0, 3
+    per_pointer = np.where(
+        np.arange(len(idxs)) % 2 == 0, depth_a, depth_b
+    ).astype(np.int64)
+    result = _decode(
+        base, section_idxs=idxs, max_depth=per_pointer, seed=seed,
+        context_len=4096, n_var=4,
+    )
+
+    mapping = np.asarray(result.batch_idx_to_section_variant)
+    depth_per_row = np.asarray(result.depth_per_row)
+    sentinel = np.iinfo(np.uint32).max
+    expected = np.zeros(result.tokens.shape[0], dtype=np.int64)
+    real = mapping[:, 0] != sentinel
+    expected[real] = per_pointer[mapping[real, 0].astype(np.int64)]
+    np.testing.assert_array_equal(depth_per_row, expected)
+    # The batch genuinely mixes depths (else the label test is trivial).
+    assert set(depth_per_row[real].tolist()) == {depth_a, depth_b}
+
+
 def test_per_pointer_length_mismatch_raises(tmp_path):
     """A per-pointer array whose length != #pointers is a hard caller error."""
     base = _prepare(build_combined_fixture, tmp_path)

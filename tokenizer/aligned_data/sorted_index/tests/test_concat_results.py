@@ -19,6 +19,21 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     BatchDecodeResult,
 )
 from tokenizer.aligned_data.sorted_index._sampler import _concat_results
+from tokenizer.aligned_data.sorted_index._types import PerBinaryDecodeResult
+
+
+def _pb(name: str, result: BatchDecodeResult, *, depth: int = 0) -> PerBinaryDecodeResult:
+    """Wrap one synthetic result as a :class:`PerBinaryDecodeResult`.
+
+    The concat now consumes the typed per-binary entry (result + per-row
+    source depth) rather than a bare ``(name, result)`` tuple; ``depth``
+    is broadcast over the result's rows (single-depth, as the synthetic
+    builder produces)."""
+    return PerBinaryDecodeResult(
+        binary_name=name,
+        result=result,
+        depth_per_row=np.full(result.tokens.shape[0], depth, dtype=np.int64),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +150,7 @@ def test_concat_two_binaries_shape_sums_correctly() -> None:
         per_row_numbers=[1, 5, 0],
         tokens_fill=100,
     )
-    out = _concat_results([("alpha", a), ("beta", b)])
+    out = _concat_results([_pb("alpha", a), _pb("beta", b)])
     inner = out.inner
     # tokens: rows stacked, context_len preserved.
     assert inner.tokens.shape == (5, 8)
@@ -165,7 +180,7 @@ def test_concat_binary_id_per_row_matches_input_order() -> None:
         batch_size=3, context_len=4,
         per_row_identity=[0, 0, 0], per_row_numbers=[0, 0, 0], tokens_fill=0,
     )
-    out = _concat_results([("alpha", a), ("beta", b)])
+    out = _concat_results([_pb("alpha", a), _pb("beta", b)])
     assert out.binary_names == ["alpha", "beta"]
     np.testing.assert_array_equal(
         out.binary_id_per_row,
@@ -182,7 +197,7 @@ def test_concat_row_offsets_rebase_to_global_cumsum() -> None:
         batch_size=2, context_len=4,
         per_row_identity=[0, 4], per_row_numbers=[1, 5], tokens_fill=0,
     )
-    out = _concat_results([("alpha", a), ("beta", b)])
+    out = _concat_results([_pb("alpha", a), _pb("beta", b)])
     inner = out.inner
     # identity_row_offsets: prefix is a's [0, 3, 4]; then b's [0, 4]
     # appended re-based by 4 -> [4, 8]. Result [0, 3, 4, 4, 8].
@@ -203,7 +218,7 @@ def test_concat_intermediate_dropped() -> None:
         batch_size=1, context_len=2,
         per_row_identity=[0], per_row_numbers=[0], tokens_fill=0,
     )
-    out = _concat_results([("alpha", a)])
+    out = _concat_results([_pb("alpha", a)])
     assert out.inner.intermediate is None
 
 
@@ -221,7 +236,7 @@ def test_concat_btv_stacked_without_renumbering() -> None:
         per_row_identity=[0], per_row_numbers=[0], tokens_fill=0,
         btv_fill_offset=0,    # same starting offset as `a`: collisions in btv.
     )
-    out = _concat_results([("alpha", a), ("beta", b)])
+    out = _concat_results([_pb("alpha", a), _pb("beta", b)])
     inner = out.inner
     np.testing.assert_array_equal(
         inner.batch_idx_to_section_variant,
@@ -248,7 +263,7 @@ def test_concat_fid_all_present(tmp_path) -> None:
         per_row_identity=[0], per_row_numbers=[0], tokens_fill=10,
         include_fid=True,
     )
-    out = _concat_results([("alpha", a), ("beta", b)])
+    out = _concat_results([_pb("alpha", a), _pb("beta", b)])
     inner = out.inner
     assert inner.fid_sidecar is not None
     assert inner.fid_row_offsets is not None
@@ -281,7 +296,7 @@ def test_concat_fid_all_absent() -> None:
         per_row_identity=[0], per_row_numbers=[0], tokens_fill=0,
         include_fid=False,
     )
-    out = _concat_results([("alpha", a), ("beta", b)])
+    out = _concat_results([_pb("alpha", a), _pb("beta", b)])
     assert out.inner.fid_sidecar is None
     assert out.inner.fid_row_offsets is None
     assert out.inner.fid_per_category_counts is None
@@ -299,7 +314,7 @@ def test_concat_fid_mixed_inputs_raises() -> None:
         include_fid=False,
     )
     with pytest.raises(ValueError, match="include_fid_sidecar inconsistent"):
-        _concat_results([("alpha", a), ("beta", b)])
+        _concat_results([_pb("alpha", a), _pb("beta", b)])
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +332,7 @@ def test_concat_shape_precondition_raises_on_context_len_mismatch() -> None:
         per_row_identity=[0], per_row_numbers=[0], tokens_fill=0,
     )
     with pytest.raises(ValueError, match="tokens.shape\\[1\\] mismatch"):
-        _concat_results([("alpha", a), ("beta", b)])
+        _concat_results([_pb("alpha", a), _pb("beta", b)])
 
 
 def test_concat_empty_input_raises() -> None:
@@ -336,7 +351,7 @@ def test_concat_single_binary_passthrough_shapes() -> None:
         batch_size=2, context_len=4,
         per_row_identity=[2, 3], per_row_numbers=[1, 0], tokens_fill=0,
     )
-    out = _concat_results([("alpha", a)])
+    out = _concat_results([_pb("alpha", a)])
     inner = out.inner
     np.testing.assert_array_equal(inner.tokens, a.tokens)
     np.testing.assert_array_equal(
@@ -348,4 +363,47 @@ def test_concat_single_binary_passthrough_shapes() -> None:
     assert out.binary_names == ["alpha"]
     np.testing.assert_array_equal(
         out.binary_id_per_row, np.array([0, 0], dtype=np.uint32),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-row source depth (cross-depth provenance)
+# ---------------------------------------------------------------------------
+
+
+def test_concat_depth_per_row_concatenates_in_input_order() -> None:
+    """Each binary's per-row depth stitches row-wise like binary_id_per_row."""
+    a = _make_result(
+        batch_size=2, context_len=4,
+        per_row_identity=[0, 0], per_row_numbers=[0, 0], tokens_fill=0,
+    )
+    b = _make_result(
+        batch_size=3, context_len=4,
+        per_row_identity=[0, 0, 0], per_row_numbers=[0, 0, 0], tokens_fill=0,
+    )
+    # alpha rows all depth 0; beta rows all depth 3 (single-depth per binary).
+    out = _concat_results([_pb("alpha", a, depth=0), _pb("beta", b, depth=3)])
+    np.testing.assert_array_equal(
+        out.depth_per_row,
+        np.array([0, 0, 3, 3, 3], dtype=np.int64),
+    )
+    assert out.depth_per_row.dtype == np.int64
+    # Aligned to the same rows binary_id_per_row labels.
+    assert out.depth_per_row.shape == out.binary_id_per_row.shape
+
+
+def test_concat_depth_per_row_preserves_genuine_per_row_variation() -> None:
+    """A binary carrying genuinely mixed per-row depths is carried verbatim."""
+    a = _make_result(
+        batch_size=3, context_len=4,
+        per_row_identity=[0, 0, 0], per_row_numbers=[0, 0, 0], tokens_fill=0,
+    )
+    mixed = PerBinaryDecodeResult(
+        binary_name="alpha",
+        result=a,
+        depth_per_row=np.array([1, 3, 0], dtype=np.int64),
+    )
+    out = _concat_results([mixed])
+    np.testing.assert_array_equal(
+        out.depth_per_row, np.array([1, 3, 0], dtype=np.int64),
     )

@@ -74,6 +74,8 @@ from tokenizer.aligned_data.loader.decoded._bucketed_run_lengths import (
 )
 from tokenizer.aligned_data.loader.session import BinarySession
 
+from .._types import PerBinaryDecodeResult
+
 # vector_batch imports sorted_index (``_graph_lengths._adjacency``), so a
 # module-level import of the vector_batch entry here forms a cycle
 # (sorted_index -> _sampler._engine -> vector_batch -> sorted_index). The
@@ -140,13 +142,15 @@ def decode_groups(
     inlined_equivalent_call_targets_only: bool,
     include_fid_sidecar: bool,
     handle_provider: Optional[VectorBatchHandleProvider] = None,
-) -> List[Tuple[str, BatchDecodeResult]]:
+) -> List[PerBinaryDecodeResult]:
     """Decode the per-binary groups into per-binary results via ``engine``.
 
     Iterates ``per_binary_pointers`` in ``sorted(name)`` order (the
     canonical alphabetical order the concat + ``binary_id_per_row``
-    numbering rely on) and returns ``[(binary_name, BatchDecodeResult),
-    ...]`` in that order, ready for :func:`._concat._concat_results`.
+    numbering rely on) and returns a :class:`PerBinaryDecodeResult` per
+    binary in that order (each carrying the binary's
+    :class:`BatchDecodeResult` AND its per-row source depth), ready for
+    :func:`._concat._concat_results`.
 
     The grouping itself is the caller's concern; this function only
     decodes the already-grouped pointers. Both engines are driven from
@@ -240,7 +244,7 @@ def _decode_groups_batch_decode(
     variant_padding: VariantPadding,
     inlined_equivalent_call_targets_only: bool,
     include_fid_sidecar: bool,
-) -> List[Tuple[str, BatchDecodeResult]]:
+) -> List[PerBinaryDecodeResult]:
     """Staged collector/flush/finalise decode (the historical path).
 
     One shared :class:`BucketedRunLengthCollector` spans every per-binary
@@ -248,17 +252,22 @@ def _decode_groups_batch_decode(
     dispatch across every call_target row in the whole batch; every
     pending decode is then finalised against the flushed run-length
     results.
+
+    This engine is single-depth per binary (the staged path has no
+    per-row depth seam), so each binary's ``depth_per_row`` is its scalar
+    depth broadcast over its rows.
     """
     collector = BucketedRunLengthCollector()
-    pending_decodes: List[Tuple[str, PendingBatchDecode]] = []
+    pending_decodes: List[Tuple[str, int, PendingBatchDecode]] = []
     for binary_name in sorted(per_binary_pointers):
         session = _require_session(sessions, binary_name)
+        scalar_depth = _scalar_depth(max_depth, binary_name)
         pending = batch_decode(
             session,
             per_binary_pointers[binary_name],
             num_variants_per_section=num_variants_per_section,
             context_len=context_len,
-            max_depth=_scalar_depth(max_depth, binary_name),
+            max_depth=scalar_depth,
             variant_padding=variant_padding,
             inlined_equivalent_call_targets_only=(
                 inlined_equivalent_call_targets_only
@@ -268,13 +277,22 @@ def _decode_groups_batch_decode(
             rng=rng,
             collector=collector,
         )
-        pending_decodes.append((binary_name, pending))
+        pending_decodes.append((binary_name, scalar_depth, pending))
 
     runlen_results = collector.flush()
-    return [
-        (binary_name, pending.finalise(runlen_results))
-        for binary_name, pending in pending_decodes
-    ]
+    out: List[PerBinaryDecodeResult] = []
+    for binary_name, scalar_depth, pending in pending_decodes:
+        result = pending.finalise(runlen_results)
+        out.append(
+            PerBinaryDecodeResult(
+                binary_name=binary_name,
+                result=result,
+                depth_per_row=np.full(
+                    result.tokens.shape[0], scalar_depth, dtype=np.int64
+                ),
+            )
+        )
+    return out
 
 
 def _decode_groups_vector_batch(
@@ -288,7 +306,7 @@ def _decode_groups_vector_batch(
     variant_padding: VariantPadding,
     include_fid_sidecar: bool,
     handle_provider: VectorBatchHandleProvider,
-) -> List[Tuple[str, BatchDecodeResult]]:
+) -> List[PerBinaryDecodeResult]:
     """Geometry-first per-binary decode, adapted to the concat contract.
 
     Each group runs :func:`vector_batch_tokens` against the binary's
@@ -296,7 +314,10 @@ def _decode_groups_vector_batch(
     in the SAME alphabetical order the batch_decode engine uses, so the
     per-binary samples are byte-identical. The returned
     :class:`VectorBatchResult` is adapted to a :class:`BatchDecodeResult`
-    so :func:`._concat._concat_results` consumes it unchanged.
+    so :func:`._concat._concat_results` consumes it unchanged; its
+    per-row source depth is carried out verbatim on the
+    :class:`PerBinaryDecodeResult` (this is the cross-depth engine, so the
+    depth genuinely varies row to row).
 
     vector_batch is geometry-self-contained: there is no shared collector
     and no deferred flush; each per-binary decode is complete on return.
@@ -307,7 +328,7 @@ def _decode_groups_vector_batch(
         vector_batch_tokens,
     )
 
-    results: List[Tuple[str, BatchDecodeResult]] = []
+    results: List[PerBinaryDecodeResult] = []
     for binary_name in sorted(per_binary_pointers):
         session = _require_session(sessions, binary_name)
         vb_result = vector_batch_tokens(
@@ -321,7 +342,13 @@ def _decode_groups_vector_batch(
             rng=rng,
             include_fid_sidecar=include_fid_sidecar,
         )
-        results.append((binary_name, _as_batch_decode_result(vb_result)))
+        results.append(
+            PerBinaryDecodeResult(
+                binary_name=binary_name,
+                result=_as_batch_decode_result(vb_result),
+                depth_per_row=np.asarray(vb_result.depth_per_row, dtype=np.int64),
+            )
+        )
     return results
 
 
