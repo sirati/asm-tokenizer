@@ -49,7 +49,9 @@ def _make_pair(
         pkg=pkg,
         variant_id=variant_id,
     )
-    return BinaryHandle(path=path), variant, size
+    # Single-binary case: the on-disk binary-name slot equals ``pkg``
+    # (discovery sets ``handle.binary_name = variant.pkg`` for legacy).
+    return BinaryHandle(path=path, binary_name=pkg), variant, size
 
 
 def test_task_id_matches_identifier_key(tmp_path: Path) -> None:

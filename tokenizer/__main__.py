@@ -36,6 +36,10 @@ from tokenizer.variant_info import VariantInfo
 # than a silent default. The variant sub-dict exactly matches
 # ``VariantInfo``'s field names — see ``_decode_variant``.
 _PAYLOAD_VARIANT_KEY = "variant"
+# Per-binary identity slot (``handle.binary_name``); the output basename
+# uses it instead of ``variant.pkg`` so a sidecar folder's several
+# binaries (sharing one ``variant``) emit distinct, non-colliding files.
+_PAYLOAD_BINARY_NAME_KEY = "binary_name"
 
 def _decode_variant(variant_dict: dict) -> VariantInfo:
     """Reconstruct ``VariantInfo`` from the JSON-decoded payload.
@@ -75,18 +79,24 @@ class _TokenizeJob:
     output_basename: str
 
 
-def _job_for_task(source_path: Path, variant: VariantInfo) -> _TokenizeJob:
+def _job_for_task(
+    source_path: Path, variant: VariantInfo, binary_name: str
+) -> _TokenizeJob:
     """Build the single ``_TokenizeJob`` the worker runs for one task.
 
     The on-disk file at ``source_path`` is always a binary (no
     extraction step) — discovery (``walk_dataset``) emits the binary
     path directly for both legacy 4-axis files and sidecar-folder
     variants. The basename is composed from the variant's canonical-4
-    + pkg + variant_id: for legacy tasks (``variant_id == 0``)
-    ``variant.pkg`` equals the binary basename, so this round-trips
-    the source filename byte-for-byte (preserving legacy output
-    paths); for sidecar-folder tasks (``variant_id != 0``) ``pkg`` is
-    the binary's name within its variant folder.
+    + per-binary ``binary_name`` + variant_id.
+
+    ``binary_name`` is the per-binary identity slot the discovery side
+    threads through the payload (``handle.binary_name``), NOT
+    ``variant.pkg``: a sidecar folder's several binaries share one
+    ``variant`` so ``pkg`` would collide them onto one basename. For
+    legacy / single-binary corpora ``binary_name == pkg``, so this
+    round-trips the source filename byte-for-byte (preserving legacy
+    output paths).
     """
     return _TokenizeJob(
         binary_path=source_path,
@@ -95,7 +105,7 @@ def _job_for_task(source_path: Path, variant: VariantInfo) -> _TokenizeJob:
             variant.compiler,
             variant.compiler_version,
             variant.opt,
-            variant.pkg,
+            binary_name,
             variant.variant_id,
         ),
     )
@@ -385,6 +395,10 @@ def handle(task: Task) -> WorkerOutput | None:
     # ``<variant_dir>/<pkg>`` binaries) — no extraction step exists.
     payload = json.loads(task.payload_str) if task.payload_str else {}
     variant = _decode_variant(payload[_PAYLOAD_VARIANT_KEY])
+    # Per-binary identity slot for the output basename. Falls back to
+    # ``variant.pkg`` for any payload predating the key (legacy /
+    # single-binary corpora, where ``binary_name == pkg`` holds).
+    binary_name = payload.get(_PAYLOAD_BINARY_NAME_KEY) or variant.pkg
 
     # Source-tree-relative path used for output layout + staged_publish
     # scope. ``task.relative_path`` is wire-supplied relative to the
@@ -410,7 +424,7 @@ def handle(task: Task) -> WorkerOutput | None:
         # counts; skip-existing emits return ``(-1, -1)`` which clamp
         # to 0 below — preserves the original semantic that ``0/0``
         # after a full skip is indistinguishable from a clean run.
-        job = _job_for_task(source_path, variant)
+        job = _job_for_task(source_path, variant, binary_name)
         warnings, filtered = run_tokenizer(
             job.binary_path,
             platform=platform,

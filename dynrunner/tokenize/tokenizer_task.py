@@ -255,7 +255,14 @@ class TokenizerTask:
                 # the canonical string format so we don't duplicate it
                 # at the construction site.
                 identifier = TokenizerIdentifier(
-                    binary_name=variant.pkg,
+                    # Per-binary identity slot. A sidecar folder holds
+                    # several binaries under ONE shared ``variant`` (so
+                    # ``variant.pkg`` is no longer unique within a
+                    # folder); ``handle.binary_name`` is the actual
+                    # binary name and the seam the output filename /
+                    # task_id key on. For legacy files it equals
+                    # ``variant.pkg`` so ids/filenames stay invariant.
+                    binary_name=handle.binary_name,
                     platform=variant.arch,
                     compiler=variant.compiler,
                     version=variant.compiler_version,
@@ -279,7 +286,7 @@ class TokenizerTask:
                     phase_id=_PHASE_ID,
                     type_id=_TYPE_ID,
                     task_id=identifier.identifier_key(),
-                    payload=_build_payload(variant),
+                    payload=_build_payload(variant, handle.binary_name),
                 )
 
     # ── Per-type plumbing ──────────────────────────────────────────────
@@ -352,22 +359,29 @@ class TokenizerTask:
         """Output filename for ``item``.
 
         Composes the canonical-format
-        ``<arch>-<compiler>-<compiler_version>-<opt>_<pkg>`` from the
-        VariantInfo carried in ``item.payload`` (sidecar mode) or
-        recovered from the legacy filename (legacy mode), then appends
-        ``_output.csv`` — with a ``__<variant_id:08x>`` suffix on the
-        binary-name slot when ``variant_id != 0`` to disambiguate
+        ``<arch>-<compiler>-<compiler_version>-<opt>_<binary_name>``
+        from the VariantInfo carried in ``item.payload`` (sidecar mode)
+        or recovered from the legacy filename (legacy mode), then
+        appends ``_output.csv`` — with a ``__<variant_id:08x>`` suffix
+        on the binary-name slot when ``variant_id != 0`` to disambiguate
         same-canonical-4 sidecar variants. Delegates the format string
         to ``tokenizer.output_filename`` so the worker's CSV writeout
         and the build_memmap phase's pairing walk use the same single
         source of truth.
 
+        The binary-name slot is ``payload[_PAYLOAD_BINARY_NAME_KEY]``
+        (the actual per-binary name), NOT ``variant.pkg`` — a sidecar
+        folder's several binaries share one ``variant`` so keying on
+        ``pkg`` would collapse them onto one colliding filename. For
+        legacy / single-binary corpora ``binary_name == pkg``, so the
+        emitted name is byte-identical.
+
         Using ``item.path.name`` here would mis-name sidecar tasks (the
         JSON sidecar's filename, e.g.
         ``clang10_armv7l-hf_Oz_15f3f338.json``, does NOT match the
         canonical regex consumed by build_memmap and can't carry the
-        ``pkg`` slot the pairing walk relies on); reconstructing from
-        the canonical fields keeps both formats on a single naming
+        ``binary_name`` slot the pairing walk relies on); reconstructing
+        from the canonical fields keeps both formats on a single naming
         scheme.
         """
         variant = _payload_variant(item)
@@ -376,7 +390,7 @@ class TokenizerTask:
             variant.compiler,
             variant.compiler_version,
             variant.opt,
-            variant.pkg,
+            _payload_binary_name(item, variant),
             variant.variant_id,
         )
 
@@ -398,6 +412,12 @@ class TokenizerTask:
 
 
 _PAYLOAD_VARIANT_KEY = "variant"
+# Per-binary identity slot (``handle.binary_name``). Travels alongside
+# the shared ``variant`` because one sidecar folder's ``variant`` covers
+# several binaries that differ only by this name — it is what the output
+# filename / task_id slot must carry (NOT ``variant.pkg``, which is the
+# package and shared across the folder's binaries).
+_PAYLOAD_BINARY_NAME_KEY = "binary_name"
 
 
 def _variant_to_payload_dict(variant: VariantInfo) -> dict[str, Any]:
@@ -421,13 +441,18 @@ def _variant_to_payload_dict(variant: VariantInfo) -> dict[str, Any]:
     }
 
 
-def _build_payload(variant: VariantInfo) -> dict[str, Any]:
-    """Build the ``TaskInfo.payload`` dict for one variant.
+def _build_payload(variant: VariantInfo, binary_name: str) -> dict[str, Any]:
+    """Build the ``TaskInfo.payload`` dict for one binary.
 
     The framework FFI serialises the dict to JSON on the wire (see
     ``_native.TaskInfo.payload_json``); the worker decodes back to a
     dict and reconstructs ``VariantInfo`` from
-    ``payload[_PAYLOAD_VARIANT_KEY]``.
+    ``payload[_PAYLOAD_VARIANT_KEY]`` plus the per-binary
+    ``payload[_PAYLOAD_BINARY_NAME_KEY]`` identity slot.
+
+    ``binary_name`` rides alongside the shared ``variant`` because one
+    sidecar folder's metadata covers several binaries that differ only
+    by name; it is what the worker's output filename slot must use.
 
     Tarball location is no longer carried in the payload — for
     sidecar tasks ``TaskInfo.path`` IS the tarball (so the framework
@@ -437,6 +462,7 @@ def _build_payload(variant: VariantInfo) -> dict[str, Any]:
     """
     return {
         _PAYLOAD_VARIANT_KEY: _variant_to_payload_dict(variant),
+        _PAYLOAD_BINARY_NAME_KEY: binary_name,
     }
 
 
@@ -464,6 +490,20 @@ def _payload_variant(item: TaskInfo) -> VariantInfo:
         variant_id=int(variant_dict.get("variant_id", 0)),
         extra_metadata=variant_dict.get("extra_metadata", {}) or {},
     )
+
+
+def _payload_binary_name(item: TaskInfo, variant: VariantInfo) -> str:
+    """Per-binary identity slot carried on ``item.payload``.
+
+    The slot the canonical output filename / task_id keys on. Falls
+    back to ``variant.pkg`` when the payload lacks the key — every
+    TaskInfo built through ``_sort_and_tag_pairs`` carries it, but a
+    framework consumer that constructs a TaskInfo without it (or the
+    legacy gateway path) gets the historical ``pkg`` slot, where
+    ``binary_name == pkg`` holds anyway.
+    """
+    payload = item.payload or {}
+    return payload.get(_PAYLOAD_BINARY_NAME_KEY) or variant.pkg
 
 
 def _variant_passes_filters(
