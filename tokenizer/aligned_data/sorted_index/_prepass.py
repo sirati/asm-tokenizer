@@ -33,7 +33,7 @@ from tokenizer.aligned_data.loader._sections_bin_walk import (
     SectionRegion,
     read_sections_bin_blob,
     unmatched_region_start,
-    walk_parsed_sections,
+    walk_section_starts,
 )
 from tokenizer.aligned_data.matched_sections_columnar import (
     ColumnarSections,
@@ -211,9 +211,9 @@ def _unmatched_region_starts(base_path: Path, binary_name: str):
     """``(starts, None)`` for the unmatched region via the structural walk.
 
     The unmatched region carries no locator length column, so the
-    columnar parse runs without length validation; the structural walk
-    (:func:`walk_parsed_sections`) is itself the per-section boundary
-    parse. Returns ``(None, None)`` when the binary has no
+    columnar parse runs without length validation; the boundary-only
+    walk (:func:`walk_section_starts`) is itself the per-section
+    boundary read. Returns ``(None, None)`` when the binary has no
     ``_sections.bin`` or an empty unmatched region.
     """
     sections_bin = sections_bin_path(base_path, binary_name)
@@ -221,8 +221,7 @@ def _unmatched_region_starts(base_path: Path, binary_name: str):
         return None, None
     region_start = unmatched_region_start(index_locator_path(base_path, binary_name))
     raw, blob_view = read_sections_bin_blob(sections_bin)
-    starts = [start for start, _section in
-              walk_parsed_sections(blob_view, region_start)]
-    if not starts:
+    starts = walk_section_starts(blob_view, region_start)
+    if starts.size == 0:
         return None, None
-    return np.asarray(starts, dtype=np.int64), None
+    return starts, None

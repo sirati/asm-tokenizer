@@ -19,8 +19,8 @@ The matched arm reuses :func:`...sorted_index._prepass.
 read_section_variant_info` (matched-region columnar pre-pass). The
 unmatched arm walks the unmatched region of the shared
 ``<binary>_sections.bin`` for its section starts (catalog order, via the
-shared structural walk :func:`...loader._sections_bin_walk.
-walk_parsed_sections`) and feeds those starts through the SAME
+boundary-only walk :func:`...loader._sections_bin_walk.
+walk_section_starts`) and feeds those starts through the SAME
 ``parse_sections_columnar`` -- the parser is region-agnostic, so the
 unmatched arm needs no bespoke decoder.
 """
@@ -36,7 +36,7 @@ from tokenizer.aligned_data.loader._sections_bin_walk import (
     SectionRegion,
     read_sections_bin_blob,
     unmatched_region_start,
-    walk_parsed_sections,
+    walk_section_starts,
 )
 from tokenizer.aligned_data.matched_sections_columnar import (
     parse_sections_columnar,
@@ -165,21 +165,17 @@ def _read_unmatched(base_path: Path, binary_name: str) -> ArmCatalog:
     region_start = unmatched_region_start(matched_index)
     raw, blob_view = read_sections_bin_blob(sections_bin)
     # This arm decodes the region with the vectorised columnar parser, so
-    # it needs only the section START offsets from the structural walk; the
-    # ``Section`` the walk threads out is consumed by the columnar pass's
-    # caller, not here. (The walk's own ``parse_section_bin`` is the single
-    # boundary-finding parse; the columnar parser below is a separate,
-    # vectorised decoder over the same starts.)
-    section_starts = [start for start, _section in
-                      walk_parsed_sections(blob_view, region_start)]
-    if not section_starts:
+    # it needs only the section START offsets. The boundary-only walk finds
+    # them from header + jump-table reads (no per-section ``Section`` build);
+    # the columnar parser below is the separate vectorised field decoder
+    # over the same starts.
+    section_starts = walk_section_starts(blob_view, region_start)
+    if section_starts.size == 0:
         return _empty_catalog()
     # ``parse_sections_columnar`` wants a uint8 ndarray; ``raw`` is the
     # ``np.memmap(uint8)`` backing the section-start offsets the walk just
     # produced, so ``np.asarray`` is a zero-copy view that keeps the read
     # lazy (the columnar parser pages in only the bytes it indexes).
     blob = np.asarray(raw)
-    cols = parse_sections_columnar(
-        blob, np.asarray(section_starts, dtype=np.int64)
-    )
+    cols = parse_sections_columnar(blob, section_starts)
     return _from_columns(cols.var_offsets, cols.var_data_offset_shifted)
