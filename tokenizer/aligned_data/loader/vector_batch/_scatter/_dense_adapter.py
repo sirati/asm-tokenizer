@@ -102,6 +102,14 @@ def build_stage2_batch(
         expanded.runlen_number_flat,
         expanded.raw_record_offsets,
     )
+    # B-S1: per-section ``list[CallTarget]`` cache. ``_call_targets_section``
+    # is called once per EMITTED NODE but a section's call_targets table is
+    # node-invariant, so nodes of the same section share ONE frozen
+    # read-only list (the redundancy is ~5x at B70 / ~8.5x at B1120). The
+    # downstream consumers (``_function_name_ptrs_per_category``, the
+    # dedup-map capacity estimate) only read it, never mutate, so sharing
+    # the same object is byte-identical.
+    ct_section_cache: dict[int, List[CallTarget]] = {}
 
     sections: List[Stage2Section] = []
     for r in range(n_rows):
@@ -110,7 +118,10 @@ def build_stage2_batch(
         s2_cts: List[Stage2CallTarget] = []
         for e in range(lo, hi):
             sec = int(section_of_node[e])
-            ct_section = _call_targets_section(cols, ct_offsets, sec)
+            ct_section = ct_section_cache.get(sec)
+            if ct_section is None:
+                ct_section = _call_targets_section(cols, ct_offsets, sec)
+                ct_section_cache[sec] = ct_section
             s1_ct = Stage1CallTarget(
                 function_data=_function_data_for(
                     expanded.states[e].raw_tokens,
