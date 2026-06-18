@@ -206,11 +206,31 @@ class _UnmatchedLoadMixin:
         differ; an equality assertion against ``starts[idx]`` would FALSELY
         reject correctly-written corpora rather than guard corruption.
         """
-        section_idx = self._unmatched_section_idx(arm, idx)
-        section_starts = getattr(arm, "section_starts", None)
-        section_offset = int(section_starts[section_idx])
+        section_offset = self._unmatched_section_offset(idx)
         section = self._parse_section_at(section_offset)
         return section, section_offset
+
+    def _unmatched_section_offset(  # type: ignore[no-untyped-def]
+        self, idx: int
+    ) -> int:
+        """BIN byte offset of the section owning per-record ``idx`` -- NO parse.
+
+        Resolves the record's owning section via the arm's pre-cached
+        ``record_to_section_idx`` (O(1)) and reads its offset from
+        ``section_starts`` -- the parse-free half of
+        :py:meth:`_unmatched_section_for_record`. The single source of
+        truth for the unmatched ``record idx -> section_offset`` map:
+        both the parse-paying meta path and the parse-free vector_batch
+        geometry resolve key off this. Raises :class:`IndexError` on an
+        out-of-range record idx (same wording the meta path used).
+        """
+        arm = self._meta_get("unmatched_arm")
+        starts = arm_arrays(arm, "unmatched", self._binary_name)
+        if idx >= len(starts):
+            raise IndexError(f"Index {idx} out of bounds for unmatched functions")
+        section_idx = self._unmatched_section_idx(arm, idx)
+        section_starts = getattr(arm, "section_starts", None)
+        return int(section_starts[section_idx])
 
     def _unmatched_func_name(  # type: ignore[no-untyped-def]
         self, arm: Any, idx: int

@@ -34,12 +34,10 @@ from typing import List, Optional, Union
 
 import numpy as np
 
-from tokenizer.aligned_data.loader.batch_decode._resolve_pointers import (
-    resolve_section_pointers,
-)
 from tokenizer.aligned_data.loader.batch_decode._batch_layout import (
     compute_batch_idx_mapping,
 )
+from ._resolve_geometry import resolve_section_geometry
 from tokenizer.aligned_data.loader.batch_decode._types import (
     SectionPointerSpec,
     VariantPadding,
@@ -140,15 +138,19 @@ def vector_batch_tokens(
     # The sampler + batch_idx layout are ARM-AGNOSTIC: one shared draw
     # spans both arms, so the per-arm runs assemble against the SAME
     # canonical mapping batch_decode produced.
-    resolved = resolve_section_pointers(
+    # The vector_batch dispatch reads only each root's ARM, BIN
+    # section_offset, and RNG-sampled variant indices -- never a parsed
+    # ``Section`` object. Geometry-only resolve gathers exactly those via
+    # parse-free offset lookups + ONE vectorized header read for the
+    # per-section variant counts, skipping the ~B full
+    # ``parse_section_bin`` walks ``resolve_section_pointers`` pays. The
+    # RNG draw stays in lockstep with that resolver (same order, same
+    # n_variants), so the sample is byte-identical to ``batch_decode``.
+    resolved = resolve_section_geometry(
         session,
         section_pointers,
         num_variants_per_section=num_variants_per_section,
         rng=rng,
-        # vector_batch gathers bodies via the RLG3 geometry / scatter and
-        # never reads ``function_data_per_sampled_variant``; skip the dead
-        # per-sampled-variant body parse + category-count.
-        load_bodies=False,
     )
     batch_idx_to_section_variant, batch_size = compute_batch_idx_mapping(
         resolved,

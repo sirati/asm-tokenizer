@@ -42,7 +42,11 @@ from .matched_sections_bin import (
 )
 
 
-__all__ = ["ColumnarSections", "parse_sections_columnar"]
+__all__ = [
+    "ColumnarSections",
+    "parse_sections_columnar",
+    "read_n_variants_columnar",
+]
 
 
 # Flag-field bit layout mirror (kept in lockstep with
@@ -210,6 +214,36 @@ def _flat_member_addresses(
     )
     addr = base_per_parent[parent].astype(np.uint32) + np.uint32(stride) * within
     return parent, addr
+
+
+def read_n_variants_columnar(
+    blob_u8: np.ndarray,
+    section_offsets: np.ndarray,
+) -> np.ndarray:
+    """Per-section variant count at ``section_offsets`` -- header-only.
+
+    The ``n_variants`` field is the section header's third member
+    (``<IHH`` = raw_fid, n_call_targets, n_variants), i.e. a u16 at
+    ``offset + 6`` -- so the whole batch's counts are one vectorized
+    :func:`_u16` gather, reading NO jump table / call_target table /
+    variant block. The header-only twin of :func:`parse_sections_columnar`
+    for a consumer that needs only ``n_variants`` (the vector_batch
+    resolve's variant-sampling driver): it pays neither the full scalar
+    :func:`...matched_sections_bin.parse_section_bin` object build per
+    section NOR the columnar decoder's jump-table / table / per-call
+    walk, both of which are dead work when only the count is wanted.
+
+    The ``+ 6`` field offset is the same one
+    :func:`parse_sections_columnar` reads (``_u16(b, offs + 6)``); both
+    mirror the scalar ``<IHH`` unpack in
+    :func:`...matched_sections_bin.parse_section_bin`. ``blob_u8`` is the
+    whole-file uint8 array; ``section_offsets`` are absolute file
+    offsets. Returns ``i64[len(section_offsets)]`` parallel to the input.
+    """
+    offs = np.asarray(section_offsets, dtype=np.int64).reshape(-1)
+    if offs.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    return _u16(blob_u8, offs + 6).astype(np.int64)
 
 
 def parse_sections_columnar(

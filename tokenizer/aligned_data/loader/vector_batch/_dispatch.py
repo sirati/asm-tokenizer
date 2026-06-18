@@ -367,14 +367,13 @@ def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_of
     variant index + the DECIDER-ROOT group id.
 
     The catalog section index is recovered ARM-AGNOSTICALLY: a section's
-    BIN byte offset (``rs.section.section_offset``) is its universal key,
-    and ``section_offsets`` (parallel to ``cols``, the same array the
+    BIN byte offset (``rs.section_offset``) is its universal key, and
+    ``section_offsets`` (parallel to ``cols``, the same array the
     :class:`LiveNodeAdjacency` ``_sec_map`` is built from) maps it to the
-    columnar position. ``rs.idx`` is NOT used: it is the per-arm load
-    index, which equals the columnar section idx for the matched arm but
-    is the per-RECORD idx for the unmatched arm (record idx != section
-    idx once a function carries multiple versions). The byte-offset
-    lookup is the single source of truth both arms share.
+    columnar position. The geometry resolve carries the offset directly
+    (no parsed ``Section``), so the dispatch never needs the catalog
+    object. The byte-offset lookup is the single source of truth both
+    arms share.
 
     The decider-root group is the RESOLVED-ENTRY index (mapping column 0)
     -- the originating ``batch_decode`` ``walk_section_callees_pending``
@@ -393,7 +392,7 @@ def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_of
     grp_out = np.empty(real.shape[0], dtype=np.int64)
     for i, (resolved_pos, slot) in enumerate(real.tolist()):
         rs = resolved[resolved_pos]
-        sec_out[i] = _columnar_section_idx(offsets, rs.section.section_offset)
+        sec_out[i] = _columnar_section_idx(offsets, rs.section_offset)
         var_out[i] = int(rs.sampled_variant_indices[slot])
         grp_out[i] = int(resolved_pos)
     return sec_out, var_out, grp_out

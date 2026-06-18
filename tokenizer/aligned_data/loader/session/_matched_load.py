@@ -74,6 +74,24 @@ class _MatchedLoadMixin:
         )
         return section, section_offset, matched
 
+    def _matched_section_offset(  # type: ignore[no-untyped-def]
+        self, idx: int
+    ) -> int:
+        """BIN byte offset of the matched section at ``idx`` -- NO parse.
+
+        The matched locator stores the section offset directly
+        (``bin_starts[idx]``), so this is a pure O(1) index lookup that
+        never touches ``_sections.bin``. The single source of truth for
+        the matched ``idx -> section_offset`` map: both the parse-paying
+        :py:meth:`_matched_section_meta` and the parse-free
+        vector_batch geometry resolve key off this.
+        """
+        arm = self._meta_get("matched_arm")
+        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if idx >= len(bin_starts):
+            raise IndexError(f"Index {idx} out of bounds for matched functions")
+        return int(bin_starts[idx])
+
     def _matched_section_meta(  # type: ignore[no-untyped-def]
         self, idx: int
     ) -> Tuple[Section, int]:
@@ -88,11 +106,7 @@ class _MatchedLoadMixin:
         so the body load is deferred to the survivors via
         :py:meth:`_load_matched_variant_body`.
         """
-        arm = self._meta_get("matched_arm")
-        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
-        if idx >= len(bin_starts):
-            raise IndexError(f"Index {idx} out of bounds for matched functions")
-        section_offset = int(bin_starts[idx])
+        section_offset = self._matched_section_offset(idx)
         section = self._parse_section_at(section_offset)
         return section, section_offset
 

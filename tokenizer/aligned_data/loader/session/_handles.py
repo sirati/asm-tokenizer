@@ -78,6 +78,23 @@ class _HandlesMixin:
         self._sections_bin_view = view
         return view
 
+    def _sections_bin_u8(  # type: ignore[no-untyped-def]
+        self,
+    ) -> np.ndarray:
+        """The section catalog as a 1-D ``uint8`` array (zero-copy).
+
+        Ensures the catalog is mapped (via :py:meth:`_open_sections_bin`,
+        which pins the prelude-validated ``np.memmap``) and surfaces that
+        same backing ``np.memmap`` -- already a ``uint8`` ndarray over the
+        whole file with absolute offsets. The vectorized columnar readers
+        (:func:`...matched_sections_columnar.read_n_variants_columnar`)
+        gather over a uint8 array, not the parser's ``memoryview``; this
+        accessor hands them the cached mapping so a header-only batch read
+        pages in only the touched section headers -- no full parse.
+        """
+        self._open_sections_bin()
+        return self._sections_bin_blob
+
     def _parse_section_at(  # type: ignore[no-untyped-def]
         self, offset: int
     ) -> Section:
