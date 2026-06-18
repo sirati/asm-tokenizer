@@ -32,7 +32,7 @@ from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
     _CALL_TARGET_TYPE_TO_CATEGORY,
 )
 from tokenizer.aligned_data.loader.batch_decode._surviving_counts import (
-    count_surviving,
+    count_surviving_batched,
 )
 from tokenizer.aligned_data.loader.batch_decode._types import (
     Stage1Batch,
@@ -118,6 +118,16 @@ def build_stage2_batch(
     # ``CallTargetType`` enum + dict lookup per emitted node.
     encounter_category_per_node = _encounter_category_per_node(edge_type)
 
+    # B-S1: per-node surviving identity / number-chunk counts for EVERY
+    # emitted node in ONE segmented band-mask reduction over the flat
+    # ``expanded`` stream, instead of a per-node :func:`count_surviving`
+    # numpy call. ``surviving_id[e]`` / ``surviving_num[e]`` are node ``e``'s
+    # band cardinalities over its surviving prefix -- the same two integers
+    # :func:`count_surviving_batched` returns, computed batch-wide.
+    surviving_id, surviving_num = count_surviving_batched(
+        expanded_flat, node_off, surviving
+    )
+
     # B-S1: per-section ``list[CallTarget]`` cache. ``_call_targets_section``
     # is called once per EMITTED NODE but a section's call_targets table is
     # node-invariant, so nodes of the same section share ONE frozen
@@ -165,6 +175,8 @@ def build_stage2_batch(
                     extra_value_v2_mask=expanded.extra_value_v2_masks[e],
                     extra_f128_mask=expanded.extra_f128_masks[e],
                     surviving_token_count=int(surviving[e]),
+                    surviving_identity_count=int(surviving_id[e]),
+                    surviving_number_chunk_count=int(surviving_num[e]),
                 )
             )
         sections.append(_stage2_section(r, s2_cts))
@@ -272,18 +284,19 @@ def _stage2_call_target(
     extra_value_v2_mask: np.ndarray,
     extra_f128_mask: np.ndarray,
     surviving_token_count: int,
+    surviving_identity_count: int,
+    surviving_number_chunk_count: int,
 ) -> Stage2CallTarget:
     """Wrap one node's expansion as a ``Stage2CallTarget``.
 
     ``partial_cut_length == surviving_token_count`` (the row-level cut at
     the token level is already encoded in the per-node surviving count);
     ``is_cut`` is True iff the node was truncated below its full length.
-    The surviving identity / number-chunk counts come from the SHARED
-    band-mask kernel (:func:`count_surviving`) over the surviving prefix
-    -- the same kernel Stage-2c uses.
+    The surviving identity / number-chunk counts are this node's slice of
+    the batch-wide :func:`_surviving_counts_batched` band-mask reduction
+    -- the same two integers :func:`count_surviving` returns per node.
     """
     predicted = int(expanded_token_ids.shape[0])
-    counts = count_surviving(expanded_token_ids, surviving_token_count)
     return Stage2CallTarget(
         stage1=s1_ct,
         expanded_token_ids=expanded_token_ids,
@@ -291,8 +304,8 @@ def _stage2_call_target(
         extra_f128_mask=extra_f128_mask,
         predicted_full_length=predicted,
         surviving_token_count=surviving_token_count,
-        surviving_identity_count=counts.surviving_identity_count,
-        surviving_number_chunk_count=counts.surviving_number_chunk_count,
+        surviving_identity_count=surviving_identity_count,
+        surviving_number_chunk_count=surviving_number_chunk_count,
         is_cut=surviving_token_count < predicted,
         partial_cut_length=surviving_token_count,
     )
