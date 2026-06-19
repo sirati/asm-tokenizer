@@ -20,6 +20,7 @@ from . import _native as _native
 from ._native import *  # noqa: F401,F403 — re-export every generated class
 from ._native import (
     apply_remap_walk,
+    build_carrier_signs_kernel,
     build_number_idx_2d_kernel,
     segment_distinct_count,
 )
@@ -36,6 +37,7 @@ __all__ = list(_native.__all__) + [
     "PlainBool",
     "PlainInt",
     "apply_remap_walk",
+    "build_carrier_signs_kernel",
     "build_number_idx_2d_kernel",
     "segment_distinct_count",
 ]
