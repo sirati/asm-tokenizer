@@ -29,21 +29,51 @@ silently drops a splice edge -- a data-quality defect worth surfacing).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Tuple
 
 import numpy as np
 
-from dedup_hashmap import HashMapU32U32, LiveAdjacencyKernel
+from dedup_hashmap import (
+    HashMapU32U32,
+    LiveAdjacencyKernel,
+    compute_row_inclusions_kernel,
+)
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 
-__all__ = ["LiveNodeAdjacency"]
+__all__ = ["InclusionCSR", "LiveNodeAdjacency"]
+
+
+@dataclass(frozen=True)
+class InclusionCSR:
+    """The fused inclusion-BFS kernel's per-row emitted + pool CSR.
+
+    Flat, row-major CSR over the batch's ``B`` rows: ``emitted_offsets`` /
+    ``pool_offsets`` are ``int64[B + 1]`` slice bounds into the parallel
+    ``*_nodes`` / ``*_types`` value arrays. Row ``r``'s emitted nodes are
+    ``emitted_nodes[emitted_offsets[r] : emitted_offsets[r + 1]]`` (root at
+    slot 0), and likewise for the excluded-pool. The caller slices this into
+    its own :class:`RowInclusion` records.
+    """
+
+    emitted_offsets: np.ndarray  # int64[B + 1]
+    emitted_nodes: np.ndarray  # int64[sum k] -- BFS emission order
+    emitted_types: np.ndarray  # uint8[sum k] -- edge CallTargetType per node
+    pool_offsets: np.ndarray  # int64[B + 1]
+    pool_nodes: np.ndarray  # int64[sum m] -- ascending-unique pool per row
+    pool_types: np.ndarray  # uint8[sum m] -- edge CallTargetType per pool node
 
 
 logger = logging.getLogger(__name__)
+
+
+#: ``HashMapU32U32.lookup_ndarray`` miss sentinel (all-ones u32) -- a
+#: ``function_section_ptr`` not in the offset->idx map maps to no section.
+_U32_MISS = np.uint32(0xFFFFFFFF)
 
 
 class LiveNodeAdjacency:
@@ -230,6 +260,160 @@ class LiveNodeAdjacency:
             self._sec_of_var,
             np.uint8(int(CallTargetType.EXTERN)),
             np.uint16(int(MISSING_VARIANT_INDEX)),
+        )
+
+    def ensure_inclusion_closure(
+        self, root_sections: np.ndarray, max_depth: int
+    ) -> None:
+        """Materialise every section the splice BFS from these roots can touch.
+
+        The fused inclusion-BFS kernel
+        (:func:`~dedup_hashmap.compute_row_inclusions_kernel`) runs the WHOLE
+        traversal under one GIL release and so cannot drive the lazy catalog's
+        per-level :meth:`ColumnarSections.ensure_sections` mid-BFS. This
+        pre-pass fills the closure first: a section-level reachability walk
+        (NO inclusion pruning) over the call graph from ``root_sections`` to
+        ``max_depth``, so every section the real BFS could reach as a parent
+        is resident before the kernel runs. Reachability is a SUPERSET of the
+        inclusion-touched sections (pruning only removes work), so the
+        resident arrays are complete for the fused traversal -- and a no-op on
+        the eager catalog (nothing left to fill).
+
+        WHY section-level (not node-level): the kernel reads only a parent's
+        heavy ``pce_*`` / ``ct_*`` columns, which are filled per SECTION; a
+        section-frontier walk bounds the pre-pass to ``<= n_sections`` work
+        regardless of variant fan-out, touching only the ``ct_function_
+        section_ptr`` callee pointers to advance.
+
+        Short-circuited on a fully-resident catalog (the eager catalog
+        always, a lazy catalog once warm): when nothing is left to fill the
+        whole walk is skipped, so the GIL-released kernel's per-call Python
+        overhead is just the array marshalling -- never a section traversal.
+        """
+        if self._cols.all_sections_resident():
+            return
+        if max_depth <= 0:
+            # depth 0 splices nothing; only the roots' own sections are read
+            # (the kernel seeds the roots but never expands them).
+            self._cols.ensure_sections(
+                np.asarray(root_sections, dtype=np.int64).reshape(-1)
+            )
+            return
+        cols = self._cols
+        n_sections = int(cols.n_variants.size)
+        reached = np.zeros(n_sections, dtype=bool)
+        frontier = np.unique(
+            np.asarray(root_sections, dtype=np.int64).reshape(-1)
+        )
+        reached[frontier] = True
+        for _depth in range(max_depth):
+            if frontier.size == 0:
+                break
+            # Fill the frontier sections, then read their call-target callee
+            # pointers to find the next section frontier.
+            cols.ensure_sections(frontier)
+            callee_secs: list = []
+            for sec in frontier.tolist():
+                ct_lo = int(cols.ct_offsets[sec])
+                ct_hi = int(cols.ct_offsets[sec + 1])
+                if ct_hi <= ct_lo:
+                    continue
+                ptrs = cols.ct_function_section_ptr[ct_lo:ct_hi]
+                # #69 explicit-zero pointers resolve to no section.
+                ptrs = ptrs[ptrs != 0]
+                if ptrs.size == 0:
+                    continue
+                hits = self._sec_map.lookup_ndarray(ptrs.astype(np.uint32))
+                callee_secs.append(hits[hits != _U32_MISS].astype(np.int64))
+            if not callee_secs:
+                break
+            nxt = np.unique(np.concatenate(callee_secs))
+            nxt = nxt[~reached[nxt]]
+            reached[nxt] = True
+            frontier = nxt
+
+    def compute_row_inclusions_csr(
+        self,
+        *,
+        root_sections: np.ndarray,
+        root_sampled_variants: np.ndarray,
+        root_groups: np.ndarray,
+        max_depth: int,
+        need_excluded_pool: bool,
+        root_edge_type: int,
+    ) -> InclusionCSR:
+        """Run the WHOLE inclusion BFS for one batch under ONE GIL release.
+
+        The fused Stage-3 port of the loader's per-root-group + per-depth
+        splice BFS. Drives the GIL-released
+        :func:`~dedup_hashmap.compute_row_inclusions_kernel`, which reuses
+        THIS adjacency's :class:`LiveAdjacencyKernel` (so the frontier
+        resolution, gates, and J-fallback share the SAME ``sec_map`` /
+        ``fallback_cache`` -- no drift) and an internal decider mirroring
+        :class:`OnceOnlyInclusion`. Returns the per-row emitted + excluded-
+        pool :class:`InclusionCSR`; the caller slices it into its records.
+
+        ``root_edge_type`` is the :class:`CallTargetType` the caller seeds
+        every row's ROOT node with (the loader's ``_ROOT_EDGE_TYPE``), passed
+        in so the wire constant stays owned by the loader, never restated
+        here.
+
+        Lazy-catalog safe: the reachable section closure is materialised
+        (:meth:`ensure_inclusion_closure`) BEFORE the GIL-released kernel,
+        which reads the catalog resident and never re-acquires the GIL to
+        fill a section mid-BFS.
+        """
+        if max_depth < 0:
+            raise ValueError(f"max_depth must be >= 0; got {max_depth}")
+        sec = np.asarray(root_sections, dtype=np.int64).reshape(-1)
+        smp = np.asarray(root_sampled_variants, dtype=np.int64).reshape(-1)
+        grp = np.asarray(root_groups, dtype=np.int64).reshape(-1)
+        if not (sec.shape == smp.shape == grp.shape):
+            raise ValueError(
+                "root_sections, root_sampled_variants and root_groups must "
+                f"be parallel; got {sec.shape} vs {smp.shape} vs {grp.shape}"
+            )
+        # Pre-fill the BFS-reachable closure so the resident kernel sees every
+        # parent section's heavy columns (a no-op on the eager catalog).
+        self.ensure_inclusion_closure(sec, max_depth)
+
+        cols = self._cols
+        (
+            emitted_offsets,
+            emitted_nodes,
+            emitted_types,
+            pool_offsets,
+            pool_nodes,
+            pool_types,
+        ) = compute_row_inclusions_kernel(
+            self._kernel,
+            cols.pce_offsets,
+            cols.pce_called_idx,
+            cols.pce_section_variant_index,
+            cols.ct_offsets,
+            cols.ct_type,
+            cols.ct_function_section_ptr,
+            cols.ct_is_matched,
+            cols.var_offsets,
+            cols.n_call_targets,
+            self._sec_of_var,
+            sec,
+            smp,
+            grp,
+            int(max_depth),
+            bool(need_excluded_pool),
+            np.uint8(int(CallTargetType.EXTERN)),
+            np.uint16(int(MISSING_VARIANT_INDEX)),
+            np.uint8(int(root_edge_type)),
+            64,
+        )
+        return InclusionCSR(
+            emitted_offsets=emitted_offsets,
+            emitted_nodes=emitted_nodes,
+            emitted_types=emitted_types,
+            pool_offsets=pool_offsets,
+            pool_nodes=pool_nodes,
+            pool_types=pool_types,
         )
 
     @staticmethod

@@ -21,7 +21,7 @@ from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
 )
 from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 
-from ._bfs import _bfs_emit, _bfs_full_included
+from ._bfs import _ROOT_EDGE_TYPE, _bfs_emit, _bfs_full_included
 from ._row_inclusion import RowInclusion
 
 
@@ -119,6 +119,24 @@ def compute_row_inclusions(
     n_rows = sec.size
     if adjacency is None:
         adjacency = LiveNodeAdjacency(cols, section_offsets, cols.sec_of_var)
+
+    # The whole per-group + per-depth BFS runs in ONE GIL-released Rust
+    # kernel (the fused Stage-3 port), reusing this adjacency's Stage-1/2
+    # cores in-Rust. The opt-in unmatched-outline inlining is a recursive,
+    # Python-callback-driven graph transform (:mod:`...splice_inclusion.
+    # _unmatched_expand`) that cannot run under the single GIL release, so
+    # that path keeps the per-group Python drive below; the production
+    # default (``unmatched_inline=False``) takes the fused kernel.
+    if not unmatched_inline:
+        return _fused_row_inclusions(
+            adjacency,
+            sec=sec,
+            smp=smp,
+            grp=grp,
+            max_depth=max_depth,
+            need_excluded_pool=need_excluded_pool,
+        )
+
     decider = OnceOnlyInclusion()
 
     # Group batch rows by DECIDER-ROOT group, NOT by catalog section. Every
@@ -200,3 +218,48 @@ def compute_row_inclusions(
                 excluded_edge_types=pool_types,
             )
     return out  # type: ignore[return-value]
+
+
+def _fused_row_inclusions(
+    adjacency: LiveNodeAdjacency,
+    *,
+    sec: np.ndarray,
+    smp: np.ndarray,
+    grp: np.ndarray,
+    max_depth: int,
+    need_excluded_pool: bool,
+) -> List[RowInclusion]:
+    """Slice the fused GIL-released kernel's CSR into per-row records.
+
+    Delegates the WHOLE per-group + per-depth BFS to the adjacency's fused
+    kernel (:meth:`LiveNodeAdjacency.compute_row_inclusions_csr`), which runs
+    it under one GIL release reusing the shared Stage-1/2 cores, then carves
+    the returned :class:`InclusionCSR` into one :class:`RowInclusion` per
+    batch row. The CSR slices ARE the row's emitted-node / pool views (root
+    at emitted slot 0; the pool is ascending-unique with parallel edge
+    types), so the assembly is a pure boundary translation -- no inclusion
+    logic lives here.
+    """
+    csr = adjacency.compute_row_inclusions_csr(
+        root_sections=sec,
+        root_sampled_variants=smp,
+        root_groups=grp,
+        max_depth=max_depth,
+        need_excluded_pool=need_excluded_pool,
+        root_edge_type=_ROOT_EDGE_TYPE,
+    )
+    e_off = csr.emitted_offsets
+    p_off = csr.pool_offsets
+    out: List[RowInclusion] = []
+    for r in range(sec.size):
+        e0, e1 = int(e_off[r]), int(e_off[r + 1])
+        p0, p1 = int(p_off[r]), int(p_off[r + 1])
+        out.append(
+            RowInclusion(
+                emitted_nodes=csr.emitted_nodes[e0:e1],
+                emitted_edge_types=csr.emitted_types[e0:e1],
+                excluded_nodes=csr.pool_nodes[p0:p1],
+                excluded_edge_types=csr.pool_types[p0:p1],
+            )
+        )
+    return out
