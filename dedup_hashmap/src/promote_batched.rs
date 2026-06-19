@@ -136,12 +136,16 @@ fn run_kernel(
     }
 
     // --- F128 promotion --------------------------------------------------
-    // Reads the ORIGINAL high/low bytes (the VC2 paint above never touches an
-    // F128 carrier's payload: distinct vocab ids, node-local non-overlapping
-    // runs), matching numpy which evaluates the NaN/Inf test against the same
-    // already-VC2-painted `working` buffer.
+    // Detect carriers against the INPUT `working` (numpy freezes the carrier
+    // set with `np.nonzero` BEFORE any paint), so an F128 carrier's own
+    // painted continuation slot can never be re-detected as a new carrier.
+    // The carrier test is byte-equivalent to reading the VC2-painted buffer
+    // (VC2 paint writes only `vc2_vocab_id`, never `f128_vocab_id`), but the
+    // input read avoids the self-re-detection the mutated buffer would cause.
+    // The high/low byte READS below stay on `out.working` (post-VC2), matching
+    // numpy which evaluates the NaN/Inf test against the VC2-painted stream.
     for p in 0..total {
-        if !(real_mask[p] && out.working[p] == f128_vocab_id) {
+        if !(real_mask[p] && working[p] == f128_vocab_id) {
             continue;
         }
         let e = node_of[p] as usize;
@@ -306,6 +310,35 @@ mod tests {
         assert_eq!(out.working, vec![F128, F128, 0xff, 0]);
         assert_eq!(out.extra_f128_raw, vec![false, true, false, false]);
         assert_eq!(out.extra_vc2_raw, vec![false; 4]);
+    }
+
+    #[test]
+    fn f128_painted_slot_is_not_re_detected_as_carrier() {
+        // Regression: the F128 loop must detect carriers against the INPUT
+        // `working`, not the mutated `out.working`. A finite F128 carrier at
+        // p=0 paints slot 1 to F128; if detection read the mutated buffer it
+        // would re-detect slot 1 as a new carrier and either spuriously paint
+        // slot 2 or false-raise the tail guard. numpy freezes the carrier set
+        // before painting, so only slot 1 is ever painted. Here slot 1 carries
+        // `real_mask=true` (the trigger) -- a single-carrier 5-slot node, high
+        // u16 = 0x3fff (finite).
+        let working = [F128, 0x3fu16, 0xffu16, 0u16, 0u16];
+        let out = run_kernel(
+            &working,
+            &[true, true, false, false, false],
+            &[0, 0, 0, 0, 0],
+            &single_node(5),
+            &[0],
+            &[5],
+            VC2,
+            F128,
+        )
+        .unwrap();
+        // ONLY slot 1 painted (the original carrier's continuation); slot 2
+        // stays its original byte, never re-painted.
+        assert_eq!(out.working, vec![F128, F128, 0xff, 0, 0]);
+        assert_eq!(out.extra_f128_raw, vec![false, true, false, false, false]);
+        assert_eq!(out.extra_vc2_raw, vec![false; 5]);
     }
 
     #[test]
