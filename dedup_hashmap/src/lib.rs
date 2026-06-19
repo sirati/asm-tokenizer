@@ -37,6 +37,7 @@
 mod carrier_signs;
 mod hashmap_macro;
 mod identity_gather;
+mod inline_bytes;
 mod number_idx_2d;
 mod remap_walk;
 mod segment_distinct;
@@ -44,6 +45,7 @@ mod segment_distinct;
 use carrier_signs::build_carrier_signs_kernel;
 use hashmap_macro::define_hashmap;
 use identity_gather::build_identity_carriers_kernel;
+use inline_bytes::build_inline_bytes_kernel;
 use number_idx_2d::build_number_idx_2d_kernel;
 use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
@@ -313,6 +315,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Stage-3b identity carrier gather kernel (ALG-5 front matter). See
     // `identity_gather.rs`.
     m.add_function(wrap_pyfunction!(build_identity_carriers_kernel, m)?)?;
+
+    // Stage-3a surviving inline-byte gather kernel (ALG-1). See
+    // `inline_bytes.rs`.
+    m.add_function(wrap_pyfunction!(build_inline_bytes_kernel, m)?)?;
 
     Ok(())
 }
