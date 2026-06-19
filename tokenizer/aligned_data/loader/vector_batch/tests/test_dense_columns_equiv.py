@@ -635,10 +635,19 @@ def test_dense_columns_equiv_live_binary(context_len, max_depth, tmp_path):
 
     assert captured, "build_stage2_batch was never called -- no rows decoded"
     any_nonempty = False
-    for expanded, surviving, stage2 in captured:
+    for expanded, surviving, _slim_stage2 in captured:
         batched, raw_flat, rec = _rederive_batched(expanded)
+        # The production adapter ``stage2`` is SLIMMED (step-5 object-tree
+        # elimination): its level-4 ``state`` / ``function_data`` /
+        # promotion-mask fields are shared empty singletons (the vector
+        # dense path reads those bodies columnar, not off the tree). This
+        # gate proves the COLUMNAR ``DenseColumns`` reproduces the per-CT
+        # tree front-matter, so its oracle must be the FULL tree built from
+        # the SAME captured ``(batched, surviving)`` -- not the slim
+        # production tree (which carries no per-CT body to compare).
+        full_stage2 = _stage2_from_batched(batched, raw_flat, rec, surviving)
         dense = build_dense_columns(batched, raw_flat, rec, surviving)
-        _assert_full_equivalence(stage2, dense)
+        _assert_full_equivalence(full_stage2, dense)
         if dense.raw_tokens.shape[0] > 0 and dense.kept_node_index.shape[0] > 0:
             any_nonempty = True
     assert any_nonempty, "live capture carried no real content -- vacuous"

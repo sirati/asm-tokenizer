@@ -1,19 +1,34 @@
 """Flat vector emission -> staged ``Stage2Batch`` adapter (dense pass).
 
-Single concern: build the ``Stage2Batch`` hierarchy the ``batch_decode``
-dense kernels consume, sourcing EVERY per-call-target field from the
-vector path's already-computed state -- never a fresh BIN parse and never
-a re-expansion of ``_data.bin``.
+Single concern: build the SLIM ``Stage2Batch`` topology + scalars +
+CSR offsets the vector dense path's downstream stages need, sourcing
+each from the vector path's already-computed columnar state -- never a
+fresh BIN parse and never a re-expansion of ``_data.bin``.
 
 Adapter shape: one level-2 "section" per NON-PADDING batch row; its
 single level-3 variant's ``call_targets`` are that row's emitted nodes in
-BFS emission order. Each level-4 ``Stage2CallTarget`` carries the vector
-path's threaded per-node ``state`` + promotion masks + surviving counts,
-and a ``Stage1CallTarget`` whose ``call_targets_section`` /
-``function_name_ptr`` / ``encounter_category`` come from the columnar
-catalog (the same fields the decode walker loads, body-free) and whose
-``function_data.metadata["category_counts"]`` is decoded from the
-already-gathered body (no BIN parse).
+BFS emission order. Each level-4 ``Stage2CallTarget`` carries the node's
+``expanded_token_ids`` slice + the surviving counts + ``is_cut`` /
+``partial_cut_length``, and a ``Stage1CallTarget`` whose
+``call_targets_section`` / ``function_name_ptr`` / ``encounter_category``
+come from the columnar catalog (the same fields the decode walker loads,
+body-free).
+
+SLIMMED (step-5 object-tree elimination): the per-node ``state``
+(:class:`InlineDecodeState`) + the ``extra_value_v2_mask`` /
+``extra_f128_mask`` promotion-mask views are NO LONGER materialised per
+call target -- the vector dense path's consumers (the four stage-3 sites,
+the per-row remap, the per-source sign collection, the number-chunk
+stream, the hierarchy assembly) read those bodies COLUMNAR from the
+retained ``BatchedExpansion`` flats / the shared :class:`DenseColumns`, so
+the level-4 tree's ``state`` + promotion-mask fields are dead weight on
+this path. They stay on the frozen shared dataclasses (the staged
+``batch_decode`` path populates + reads them), but here they are threaded
+as shared empty singletons (:data:`_EMPTY_DECODE_STATE` /
+:data:`_EMPTY_BOOL`). ``function_data`` is kept, carrying only
+``category_counts`` (+ empty ``tokens``): a small scalar-per-Category dict
+a tree-walk equivalence peer reads for the ALG-4 COUNTER bump -- not a
+``_slice_per_node`` state nor a per-CT array.
 
 The synthetic ``batch_idx_to_section_variant`` is the IDENTITY over
 non-padding rows (section ``r`` == non-padding row ``r``, variant 0) so
@@ -40,7 +55,9 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     Stage2Section,
     Stage2Variant,
 )
-from tokenizer.tokens import Category
+from tokenizer.aligned_data.loader.decoded._inline_decode_state import (
+    InlineDecodeState,
+)
 from tokenizer.aligned_data.loader.function_data import FunctionData
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import CallTarget, Section
@@ -54,6 +71,37 @@ __all__ = ["build_stage2_batch"]
 
 
 _PADDING_SENTINEL = int(np.iinfo(np.uint32).max)
+
+# ---------------------------------------------------------------------------
+# Slimmed level-4 placeholders (step-5 object-tree elimination).
+#
+# The vector dense path's downstream consumers read the per-node BODIES
+# COLUMNAR -- from the retained ``BatchedExpansion`` flats / the shared
+# :class:`DenseColumns`, NOT off the per-call-target tree. So the level-4
+# ``state`` (:class:`InlineDecodeState`) + the ``extra_*_mask`` promotion
+# views the staged ``Stage1CallTarget`` / ``Stage2CallTarget`` carry are
+# DEAD on this path (no kernel, remap, sidecar concat, or hierarchy
+# assembly reads them -- the remap-input + sign collection + number-chunk
+# stream all source the flats / columns directly). They stay on the frozen
+# shared dataclasses (the staged ``batch_decode`` path DOES populate +
+# read them), but the adapter no longer MATERIALISES a distinct per-node
+# ``InlineDecodeState`` / promotion-mask view per call target; it threads
+# these shared empty singletons instead, dropping the per-node
+# ``_slice_per_node`` walk. ``function_data`` is KEPT (carrying only
+# ``category_counts`` + empty ``tokens``) -- a small scalar-per-Category
+# dict a tree-walk peer reads for the ALG-4 COUNTER bump, not a
+# ``_slice_per_node`` state nor a per-CT array.
+_EMPTY_BOOL = np.zeros(0, dtype=np.bool_)
+_EMPTY_DECODE_STATE = InlineDecodeState(
+    raw_tokens=np.zeros(0, dtype=np.uint16),
+    real_mask=_EMPTY_BOOL,
+    number_mask=_EMPTY_BOOL,
+    runlen_number=np.zeros(0, dtype=np.uint16),
+    runlen_value=np.zeros(0, dtype=np.uint16),
+    carries_inline_mask=_EMPTY_BOOL,
+    is_negative_per_position=_EMPTY_BOOL,
+    digit_cumsum=np.zeros(0, dtype=np.int64),
+)
 
 
 def build_stage2_batch(
@@ -88,10 +136,14 @@ def build_stage2_batch(
     n_rows = int(geometry.n_rows)
 
     section_of_node = catalog.section_of_node
-    # ``per_node_counts[category][e]`` is node ``e``'s count. The shared
-    # catalog carries the (category, column) pairs already, so the per-node
-    # dict build is a flat zip over scalars -- no per-node re-iteration of
-    # the dict keys nor re-hashing of the Category enums.
+    # ``category_counts`` per node: a flat zip over the catalog's
+    # (Category, column) pairs -- the ALG-4 COUNTER offset bump source the
+    # staged ``extract_flat_remap_inputs`` reads off the level-4
+    # ``function_data``. KEPT (it is a small scalar-per-Category dict, NOT a
+    # ``_slice_per_node`` state nor a per-CT ARRAY); the vector path's
+    # columnar remap re-derives the same counts from the catalog, but the
+    # tree must still carry them so a tree-walk peer reads consistent
+    # values.
     count_cats = catalog.counter_count_categories
     count_cols = catalog.counter_count_columns
     encounter_category_per_node = catalog.encounter_category
@@ -117,13 +169,12 @@ def build_stage2_batch(
             ct_section = catalog.call_targets_section(sec)
             s1_ct = Stage1CallTarget(
                 function_data=_function_data_for(
-                    expanded.states[e].raw_tokens,
                     {
                         cat: int(col[e])
                         for cat, col in zip(count_cats, count_cols)
-                    },
+                    }
                 ),
-                state=expanded.states[e],
+                state=_EMPTY_DECODE_STATE,
                 call_targets_section=ct_section,
                 encounter_category=encounter_category_per_node[e],
                 parent_call_target_index=None if e == lo else 0,
@@ -136,8 +187,8 @@ def build_stage2_batch(
                     expanded_token_ids=(
                         expanded_flat[node_off[e] : node_off[e + 1]]
                     ),
-                    extra_value_v2_mask=expanded.extra_value_v2_masks[e],
-                    extra_f128_mask=expanded.extra_f128_masks[e],
+                    extra_value_v2_mask=_EMPTY_BOOL,
+                    extra_f128_mask=_EMPTY_BOOL,
                     surviving_token_count=int(surviving[e]),
                     surviving_identity_count=int(surviving_id[e]),
                     surviving_number_chunk_count=int(surviving_num[e]),
@@ -160,24 +211,23 @@ def build_stage2_batch(
     )
 
 
-def _function_data_for(
-    raw_tokens: np.ndarray, category_counts: dict[Category, int]
-) -> FunctionData:
-    """A minimal :class:`FunctionData` carrying ``category_counts``.
+def _function_data_for(category_counts: dict) -> FunctionData:
+    """A minimal :class:`FunctionData` carrying only ``category_counts``.
 
-    The dense kernels read ONLY ``function_data.metadata['category_counts']``
-    (the ALG-4 COUNTER offset bump) off the level-4 ``function_data``;
-    the runlength sidecar (off by default) would also read ``tokens`` /
-    ``*_runlength``. The COUNTER counts are this node's slice of the
-    batch-wide :func:`category_counts_from_runlen_batched` reduction
-    (decoded from the SAME raw body the expansion already gathered, no
-    BIN re-parse, no second ``InlineDecodeState`` rebuild), exactly as
-    the loader's :func:`compute_category_counts` would per node.
+    SLIMMED: ``tokens`` / ``*_runlength`` / ``variant_tokens`` stay empty
+    (the vector dense path reads no per-node body off ``function_data`` --
+    it sources every body columnar). Only ``metadata['category_counts']``
+    is populated: a tree-walk peer (e.g. the staged
+    ``extract_flat_remap_inputs`` an equivalence gate drives over this
+    tree) reads it for the ALG-4 COUNTER offset bump. The counts come from
+    the catalog's per-node COUNTER columns -- the SAME counts the vector
+    path's columnar remap re-derives -- so the tree + columnar values
+    agree.
     """
     return FunctionData(
         func_name="",
         metadata={"category_counts": category_counts},
-        tokens=raw_tokens,
+        tokens=np.zeros(0, dtype=np.uint16),
         insn_runlength=np.zeros(0, dtype=np.int64),
         block_runlength=np.zeros(0, dtype=np.int64),
         variant_tokens=np.zeros(0, dtype=np.uint16),

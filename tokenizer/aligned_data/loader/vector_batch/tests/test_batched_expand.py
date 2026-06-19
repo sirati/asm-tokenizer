@@ -151,8 +151,14 @@ def test_batched_expand_matches_scalar_per_node():
     )
     assert np.array_equal(exp.expanded, ref_flat)
     assert np.array_equal(exp.node_offsets, ref_off)
+    # Bind the lazy per-node view lists ONCE (each property access re-slices
+    # the batched arrays); the dense path never reads them, but this kernel-
+    # equivalence pin still validates the slicer.
+    got_states = exp.states
+    got_vc2 = exp.extra_value_v2_masks
+    got_f128 = exp.extra_f128_masks
     for i, st in enumerate(ref_states):
-        got = exp.states[i]
+        got = got_states[i]
         assert np.array_equal(got.raw_tokens, st.raw_tokens), i
         assert np.array_equal(got.real_mask, st.real_mask), i
         assert np.array_equal(got.number_mask, st.number_mask), i
@@ -165,8 +171,8 @@ def test_batched_expand_matches_scalar_per_node():
             got.is_negative_per_position, st.is_negative_per_position
         ), i
         assert np.array_equal(got.digit_cumsum, st.digit_cumsum), i
-        assert np.array_equal(exp.extra_value_v2_masks[i], ref_vc2[i]), i
-        assert np.array_equal(exp.extra_f128_masks[i], ref_f128[i]), i
+        assert np.array_equal(got_vc2[i], ref_vc2[i]), i
+        assert np.array_equal(got_f128[i], ref_f128[i]), i
 
 
 def test_batched_expand_empty_batch():
@@ -207,6 +213,7 @@ def test_batched_expand_empty_node_neighbors_stay_boundary_local():
     own = np.diff(exp.node_offsets)
     assert own.tolist() == [1, 2, 1, 2, 1]  # node1: VC2+1 painted; node3: ident
 
+    got_states = exp.states  # bind the lazy view list once
     for i, body in enumerate(bodies):
         if not body:
             continue
@@ -214,7 +221,7 @@ def test_batched_expand_empty_node_neighbors_stay_boundary_local():
             np.asarray(body, dtype=np.uint16), format_version=1
         )
         assert np.array_equal(
-            exp.states[i].runlen_number, st.runlen_number
+            got_states[i].runlen_number, st.runlen_number
         ), i
-        assert np.array_equal(exp.states[i].digit_cumsum, st.digit_cumsum), i
-        assert np.array_equal(exp.states[i].real_mask, st.real_mask), i
+        assert np.array_equal(got_states[i].digit_cumsum, st.digit_cumsum), i
+        assert np.array_equal(got_states[i].real_mask, st.real_mask), i
