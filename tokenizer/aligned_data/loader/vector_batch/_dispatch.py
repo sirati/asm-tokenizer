@@ -392,32 +392,46 @@ def _rows_to_catalog_nodes(batch_idx_to_section_variant, resolved, *, section_of
     offsets = np.asarray(section_offsets, dtype=np.int64).reshape(-1)
     is_padding = mapping[:, 0] == int(_PADDING_SENTINEL)
     real = mapping[~is_padding]
-    sec_out = np.empty(real.shape[0], dtype=np.int64)
-    var_out = np.empty(real.shape[0], dtype=np.int64)
-    grp_out = np.empty(real.shape[0], dtype=np.int64)
+    n = real.shape[0]
+    grp_out = np.ascontiguousarray(real[:, 0], dtype=np.int64)
+    # The only per-row Python touches: read ``section_offset`` and the
+    # SLOT-selected native variant off each resolved entry. Gather both in
+    # ONE pass, then vectorize the byte-offset->columnar searchsorted and
+    # the validity guard over the whole batch (vs. a scalar lookup/row).
+    sec_offs = np.empty(n, dtype=np.int64)
+    var_out = np.empty(n, dtype=np.int64)
     for i, (resolved_pos, slot) in enumerate(real.tolist()):
         rs = resolved[resolved_pos]
-        sec_out[i] = _columnar_section_idx(offsets, rs.section_offset)
-        var_out[i] = int(rs.sampled_variant_indices[slot])
-        grp_out[i] = int(resolved_pos)
+        sec_offs[i] = rs.section_offset
+        var_out[i] = rs.sampled_variant_indices[slot]
+    sec_out = _columnar_section_idx(offsets, sec_offs)
     return sec_out, var_out, grp_out
 
 
-def _columnar_section_idx(section_offsets: np.ndarray, section_offset: int) -> int:
-    """Position of ``section_offset`` in the arm's ``section_offsets``.
+def _columnar_section_idx(
+    section_offsets: np.ndarray, section_offset: np.ndarray
+) -> np.ndarray:
+    """Columnar positions of ``section_offset`` in the arm's ``section_offsets``.
 
     ``section_offsets`` is ascending (catalog / BIN order), so a binary
-    search recovers the columnar index; a miss is a corpus / handle-arm
-    mismatch and is raised loudly rather than silently returning a bogus
-    neighbour.
+    search recovers each columnar index; a miss is a corpus / handle-arm
+    mismatch and is raised loudly (referencing the first offending offset)
+    rather than silently returning a bogus neighbour. ``section_offset`` is
+    a batched int64 array -- the whole column is resolved in one
+    ``searchsorted`` rather than a scalar lookup per row.
     """
-    pos = int(np.searchsorted(section_offsets, int(section_offset)))
-    if pos >= section_offsets.size or int(section_offsets[pos]) != int(section_offset):
+    offsets = np.asarray(section_offset, dtype=np.int64).reshape(-1)
+    pos = np.searchsorted(section_offsets, offsets)
+    in_range = pos < section_offsets.size
+    miss = ~in_range
+    miss[in_range] = section_offsets[pos[in_range]] != offsets[in_range]
+    if miss.any():
+        bad = int(offsets[np.argmax(miss)])
         raise ValueError(
-            f"section_offset {int(section_offset)} not in this arm's "
+            f"section_offset {bad} not in this arm's "
             f"section_offsets (wrong-arm handles?)"
         )
-    return pos
+    return pos.astype(np.int64, copy=False)
 
 
 def _depth_per_row_for_partial(
