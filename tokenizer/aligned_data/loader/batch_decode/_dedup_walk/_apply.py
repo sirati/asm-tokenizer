@@ -91,6 +91,7 @@ def apply_per_row_remap(
     *,
     collect_fid_sidecar: bool = False,
     flat: Optional[FlatRemapInputs] = None,
+    variants_per_section: Optional[np.ndarray] = None,
 ) -> tuple[
     np.ndarray,
     Optional[np.ndarray],
@@ -153,6 +154,15 @@ def apply_per_row_remap(
         the same ``(section_idx, slot_idx)`` the pass-2 sidecar lookup
         uses; both builders walk referenced variants in section -> slot
         order, so they line up byte-for-byte.
+    variants_per_section
+        Optionally, the per-section variant counts pass 2 uses to build
+        the per-unique-variant sidecar cache + the per-row variant lookup.
+        The STAGED path leaves this ``None`` and reads it off
+        ``stage3_batch.sections``. The vector dense path lays ONE variant
+        per synthetic section (one section per non-padding row), so it
+        threads ``np.ones(n_rows, int)`` columnar -- pass 2 then never
+        reaches into the object tree. Must enumerate sections in the same
+        ``section_idx`` order ``flat.row_keys`` / the staged tree use.
 
     Returns
     -------
@@ -236,12 +246,20 @@ def apply_per_row_remap(
     # because the dedup walk extends each Category's inverse list by
     # exactly the count of fresh ids minted, so list length equals
     # ``next_fresh_id`` at the end of the walk.
+    # The per-section variant counts: read off the tree (staged) or
+    # threaded columnar (vector dense path, one variant per synthetic
+    # section), in ``section_idx`` order. Pass 2 reaches the object tree
+    # ONLY through this -- a threaded count fully decouples it.
+    section_variant_counts = (
+        [len(s.variants) for s in stage3_batch.sections]
+        if variants_per_section is None
+        else [int(n) for n in np.asarray(variants_per_section)]
+    )
+
     per_variant_sidecar: list[np.ndarray] = []
     per_variant_category_counts: list[tuple[int, int, int]] = []
-    variants_per_section: list[int] = []
-    for section_idx, stage3_section in enumerate(stage3_batch.sections):
-        variants_per_section.append(len(stage3_section.variants))
-        for slot_idx in range(len(stage3_section.variants)):
+    for section_idx, n_variants in enumerate(section_variant_counts):
+        for slot_idx in range(n_variants):
             per_variant = fid_inverse_per_variant.get(
                 (section_idx, slot_idx)
             )
@@ -261,7 +279,7 @@ def apply_per_row_remap(
             )
 
     per_row_variant_idx, is_padding = build_per_row_variant_lookup(
-        stage1_batch.batch_idx_to_section_variant, variants_per_section
+        stage1_batch.batch_idx_to_section_variant, section_variant_counts
     )
     fid_sidecar, fid_row_offsets = concat_per_row(
         per_variant_sidecar,

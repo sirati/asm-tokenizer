@@ -177,6 +177,17 @@ def build_dense_sidecars(
         else None
     )
 
+    # The remap's FID-sidecar pass-2 (only on ``include_fid_sidecar``) reads
+    # the per-section variant counts; the vector dense path lays ONE variant
+    # per synthetic section (one section per non-padding row), so it threads
+    # the all-ones counts columnar -- pass-2 then never reaches the object
+    # tree. ``None`` when no FID sidecar (pass-2 is not run).
+    variants_per_section = (
+        np.ones(int(geometry.n_rows), dtype=np.int64)
+        if include_fid_sidecar
+        else None
+    )
+
     (
         row_identities,
         row_fid_sidecar,
@@ -186,6 +197,7 @@ def build_dense_sidecars(
         stage3,
         collect_fid_sidecar=include_fid_sidecar,
         flat=flat,
+        variants_per_section=variants_per_section,
     )
     row_numbers_sig, row_numbers_sex = assemble_number_sidecars(
         stage3, numbers

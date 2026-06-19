@@ -108,7 +108,10 @@ def test_flat_remap_inputs_equiv_live_binary(
     captured: list = []
     real_remap = _dense_mod.apply_per_row_remap
 
-    def _capturing(stage3, *, collect_fid_sidecar=False, flat=None):
+    def _capturing(
+        stage3, *, collect_fid_sidecar=False, flat=None,
+        variants_per_section=None,
+    ):
         # The re-point ALWAYS supplies a columnar ``flat`` on a non-empty
         # batch; capture it alongside the tree-walk oracle built from the
         # same ``stage3``.
@@ -116,7 +119,10 @@ def test_flat_remap_inputs_equiv_live_binary(
             oracle = extract_flat_remap_inputs(stage3)
             captured.append((oracle, flat))
         return real_remap(
-            stage3, collect_fid_sidecar=collect_fid_sidecar, flat=flat
+            stage3,
+            collect_fid_sidecar=collect_fid_sidecar,
+            flat=flat,
+            variants_per_section=variants_per_section,
         )
 
     pointers = [
