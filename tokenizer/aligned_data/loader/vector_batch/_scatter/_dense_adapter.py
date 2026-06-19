@@ -27,10 +27,6 @@ from typing import List
 
 import numpy as np
 
-from tokenizer.aligned_data.call_target_type import CallTargetType
-from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
-    _CALL_TARGET_TYPE_TO_CATEGORY,
-)
 from tokenizer.aligned_data.loader.batch_decode._surviving_counts import (
     count_surviving_batched,
 )
@@ -44,16 +40,13 @@ from tokenizer.aligned_data.loader.batch_decode._types import (
     Stage2Section,
     Stage2Variant,
 )
-from tokenizer.aligned_data.loader.category_counts import (
-    category_counts_from_runlen_batched,
-)
 from tokenizer.tokens import Category
 from tokenizer.aligned_data.loader.function_data import FunctionData
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import CallTarget, Section
-from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 from .._types import BatchGeometry
+from ._catalog_columns import CatalogColumns
 from ._expand import ExpandedBatch
 
 
@@ -67,15 +60,21 @@ def build_stage2_batch(
     geometry: BatchGeometry,
     expanded: ExpandedBatch,
     *,
-    cols: ColumnarSections,
+    catalog: CatalogColumns,
     surviving: np.ndarray,
 ) -> Stage2Batch:
     """Adapt the flat vector emission into a ``Stage2Batch``.
 
     Parameters
     ----------
-    geometry / expanded / cols:
+    geometry / expanded:
         See :func:`._dense.build_dense_sidecars`.
+    catalog:
+        The shared per-emitted-node :class:`CatalogColumns` (section index,
+        root FID, encounter Category, COUNTER counts, per-section CT table)
+        -- built ONCE by :func:`._catalog_columns.build_catalog_columns` and
+        threaded to both this adapter and the remap-input builder, so the
+        two never re-derive the catalog columns independently.
     surviving:
         ``int64[n_emitted]`` -- the per-node surviving token count from
         the shared straddler cut (:func:`._surviving.
@@ -84,39 +83,19 @@ def build_stage2_batch(
     """
     emission = geometry.emission
     roff = np.asarray(emission.row_offsets, dtype=np.int64)
-    edge_type = np.asarray(emission.edge_type, dtype=np.uint8)
     node_off = np.asarray(expanded.node_offsets, dtype=np.int64)
     expanded_flat = expanded.expanded
     n_rows = int(geometry.n_rows)
 
-    section_of_node = _section_of_node(geometry, cols)
-    ct_offsets = np.asarray(cols.ct_offsets, dtype=np.int64)
-    section_fid = np.asarray(cols.function_name_ptr)
-
-    # Per-node COUNTER counts for EVERY emitted node in one batched
-    # reduction (over the flat raw body the per-node ``states`` views
-    # slice), instead of a scalar ``category_counts_from_runlen`` per
-    # node. ``per_node_counts[category][e]`` is node ``e``'s count.
-    per_node_counts = category_counts_from_runlen_batched(
-        expanded.raw_flat,
-        expanded.runlen_number_flat,
-        expanded.raw_record_offsets,
-    )
-    # B-S1: hoist the COUNTER-category-counts dict shape out of the per-node
-    # loop. ``per_node_counts`` is ``dict[Category, int64[n_emitted]]``; the
-    # per-node ``function_data.metadata['category_counts']`` is one column
-    # slice of it. Precompute the (category, column) pairs ONCE so the per-
-    # node dict build is a flat zip over scalars -- no per-node re-iteration
-    # of the dict keys nor re-hashing of the Category enums.
-    count_cats = tuple(per_node_counts)
-    count_cols = tuple(per_node_counts[cat] for cat in count_cats)
-
-    # B-S1: per-node ``encounter_category`` as one precomputed column. The
-    # node's edge type (0/1/2) maps through ``_CALL_TARGET_TYPE_TO_CATEGORY``
-    # -- a 3-entry table -- so resolve it via a length-3 lookup indexed by
-    # the (already-int) ``edge_type`` array instead of constructing a
-    # ``CallTargetType`` enum + dict lookup per emitted node.
-    encounter_category_per_node = _encounter_category_per_node(edge_type)
+    section_of_node = catalog.section_of_node
+    # ``per_node_counts[category][e]`` is node ``e``'s count. The shared
+    # catalog carries the (category, column) pairs already, so the per-node
+    # dict build is a flat zip over scalars -- no per-node re-iteration of
+    # the dict keys nor re-hashing of the Category enums.
+    count_cats = catalog.counter_count_categories
+    count_cols = catalog.counter_count_columns
+    encounter_category_per_node = catalog.encounter_category
+    section_fid_int = catalog.section_root_fid
 
     # B-S1: per-node surviving identity / number-chunk counts for EVERY
     # emitted node in ONE segmented band-mask reduction over the flat
@@ -128,18 +107,6 @@ def build_stage2_batch(
         expanded_flat, node_off, surviving
     )
 
-    # B-S1: per-section ``list[CallTarget]`` cache. ``_call_targets_section``
-    # is called once per EMITTED NODE but a section's call_targets table is
-    # node-invariant, so nodes of the same section share ONE frozen
-    # read-only list (the redundancy is ~5x at B70 / ~8.5x at B1120). The
-    # downstream consumers (``_function_name_ptrs_per_category``, the
-    # dedup-map capacity estimate) only read it, never mutate, so sharing
-    # the same object is byte-identical.
-    ct_section_cache: dict[int, List[CallTarget]] = {}
-    # B-S1: per-section root FID as a Python-int column (one ``int()`` per
-    # distinct section instead of per emitted node).
-    section_fid_int = section_fid.tolist()
-
     sections: List[Stage2Section] = []
     for r in range(n_rows):
         lo = int(roff[r])
@@ -147,10 +114,7 @@ def build_stage2_batch(
         s2_cts: List[Stage2CallTarget] = []
         for e in range(lo, hi):
             sec = int(section_of_node[e])
-            ct_section = ct_section_cache.get(sec)
-            if ct_section is None:
-                ct_section = _call_targets_section(cols, ct_offsets, sec)
-                ct_section_cache[sec] = ct_section
+            ct_section = catalog.call_targets_section(sec)
             s1_ct = Stage1CallTarget(
                 function_data=_function_data_for(
                     expanded.states[e].raw_tokens,
@@ -194,63 +158,6 @@ def build_stage2_batch(
         identity_row_offsets=identity_row_offsets,
         number_row_offsets=number_row_offsets,
     )
-
-
-def _encounter_category_per_node(edge_type: np.ndarray) -> List[Category]:
-    """Per-node ``encounter_category`` resolved via a length-3 lookup.
-
-    Each node's ``edge_type`` (the int value of its :class:`CallTargetType`)
-    maps to a FUNCTION :class:`Category` through
-    ``_CALL_TARGET_TYPE_TO_CATEGORY``. Resolving that 3-entry table once and
-    indexing it by the (already-int) ``edge_type`` reproduces the per-node
-    ``_CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(int(edge_type[e]))]``
-    byte-for-byte, without an enum construction + dict lookup per node.
-    """
-    table = [
-        _CALL_TARGET_TYPE_TO_CATEGORY[CallTargetType(t)]
-        for t in range(len(CallTargetType))
-    ]
-    return [table[t] for t in edge_type.tolist()]
-
-
-def _section_of_node(
-    geometry: BatchGeometry, cols: ColumnarSections
-) -> np.ndarray:
-    """``int64[n_emitted]`` -- the catalog section index owning each node.
-
-    The emission ``node`` axis is ``var_offsets``-major; the owning
-    section is the CSR bucket of ``cols.var_offsets`` the node falls into.
-    """
-    nodes = np.asarray(geometry.emission.node, dtype=np.int64)
-    var_offsets = np.asarray(cols.var_offsets, dtype=np.int64)
-    return np.searchsorted(var_offsets, nodes, side="right") - 1
-
-
-def _call_targets_section(
-    cols: ColumnarSections, ct_offsets: np.ndarray, sec: int
-) -> List[CallTarget]:
-    """The section's parsed ``call_targets`` table from the catalog.
-
-    Rebuilds the ``list[CallTarget]`` the decode walker passes from the
-    columnar ``ct_*`` slices -- the encoder's LOCAL->PLT->EXTERN grouping
-    (and within-group order) is preserved by the catalog, so the per-
-    Category caller-local id density the dedup walk relies on holds.
-    """
-    lo = int(ct_offsets[sec])
-    hi = int(ct_offsets[sec + 1])
-    fids = cols.ct_function_name_ptr[lo:hi]
-    secptrs = cols.ct_function_section_ptr[lo:hi]
-    types = cols.ct_type[lo:hi]
-    matched = cols.ct_is_matched[lo:hi]
-    return [
-        CallTarget(
-            function_name_ptr=int(fids[i]),
-            function_section_ptr=int(secptrs[i]),
-            type=CallTargetType(int(types[i])),
-            is_matched=bool(matched[i]),
-        )
-        for i in range(hi - lo)
-    ]
 
 
 def _function_data_for(

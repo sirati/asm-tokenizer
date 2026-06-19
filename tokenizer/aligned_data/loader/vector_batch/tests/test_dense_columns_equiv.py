@@ -607,8 +607,10 @@ def test_dense_columns_equiv_live_binary(context_len, max_depth, tmp_path):
     captured: list = []
     real_build = _dense_mod.build_stage2_batch
 
-    def _capturing(geometry, expanded, *, cols, surviving):
-        stage2 = real_build(geometry, expanded, cols=cols, surviving=surviving)
+    def _capturing(geometry, expanded, *, catalog, surviving):
+        stage2 = real_build(
+            geometry, expanded, catalog=catalog, surviving=surviving
+        )
         captured.append((expanded, np.asarray(surviving), stage2))
         return stage2
 
