@@ -33,7 +33,7 @@ from typing import Tuple
 
 import numpy as np
 
-from dedup_hashmap import HashMapU32U32
+from dedup_hashmap import HashMapU32U32, LiveAdjacencyKernel
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_bin import MISSING_VARIANT_INDEX
@@ -44,8 +44,6 @@ __all__ = ["LiveNodeAdjacency"]
 
 
 logger = logging.getLogger(__name__)
-
-_U32_MISS = np.uint32(0xFFFFFFFF)
 
 
 class LiveNodeAdjacency:
@@ -78,6 +76,14 @@ class LiveNodeAdjacency:
             offs.astype(np.uint32),
             np.arange(n_sections, dtype=np.uint32),
         )
+        # The GIL-released frontier-expansion kernel owns the SAME
+        # offset->idx map + per-section fallback-J cache for the batched
+        # :meth:`expand_batch` path (the loader inclusion-BFS + the
+        # sorted-index length build both drive it, so they can never
+        # drift). The Python ``_sec_map`` / ``_fallback_cache`` below remain
+        # the INDEPENDENT scalar :meth:`__call__` reference the equivalence
+        # test pins ``expand_batch`` against.
+        self._kernel = LiveAdjacencyKernel(offs.astype(np.uint32))
         # Per-section lazy fallback-J table cache: section idx -> dense
         # ``int64[n_call_targets]`` whose entry at ``called_idx`` is the
         # lowest-sibling-variant usable J for that slot (-1 if none).
@@ -187,11 +193,14 @@ class LiveNodeAdjacency:
         the concatenation order, which the relaxed-order contract leaves
         free to the decider).
 
-        No Python per-node call: the children of ALL parents are gathered
-        through CSR offsets, sorted+deduped per parent, gated, and
-        J-resolved as flat numpy arrays. The only per-section work is the
-        lazy fallback-table fetch (cached, vectorized) for the sections
-        that actually take the fallback arm.
+        No Python per-node call: the GIL-released
+        :class:`~dedup_hashmap.LiveAdjacencyKernel` resolves every parent's
+        children over the catalog's flat columns in one pass (CSR gather,
+        per-parent ascending-unique slot with first-own_J tie-break, the
+        EXTERN / explicit-zero-ptr / map-miss gates, and the per-section
+        J-fallback table). The kernel reads ONLY the parent sections' heavy
+        columns, so the lazy-fill below (the parents' OWN sections) is the
+        only materialisation the batch needs.
         """
         cols = self._cols
         parents = np.asarray(parent_nodes, dtype=np.int64).reshape(-1)
@@ -201,151 +210,27 @@ class LiveNodeAdjacency:
         # Bound the columnar parse to the sections this frontier touches:
         # the parents' OWN sections must be materialised before their
         # per-call-entry rows are read (a no-op on the eager catalog; the
-        # lazy catalog fills them here). Callee sections are ensured later,
-        # after the offset->idx resolve discovers them.
+        # lazy catalog fills them here). The kernel never reads an unfilled
+        # callee section's heavy columns (it derives child nodes from the
+        # eager ``var_offsets`` / ``sec_of_var``), so no callee-section fill
+        # is needed.
         cols.ensure_sections(self._sec_of_var[parents])
 
-        # CSR-gather every parent's per-call entries in one shot. ``pos`` is
-        # the parent INDEX each gathered entry belongs to; the entries are
-        # laid out parent-major (parent 0's pce range, then parent 1's, ...).
-        p0 = cols.pce_offsets[parents]
-        p1 = cols.pce_offsets[parents + 1]
-        counts = (p1 - p0).astype(np.int64)
-        total = int(counts.sum())
-        if total == 0:
-            return self._empty_batch()
-        pos = np.repeat(np.arange(parents.size, dtype=np.int64), counts)
-        # Per-entry flat pce index: parent's p0 + within-parent offset.
-        starts = np.zeros(parents.size, dtype=np.int64)
-        np.cumsum(counts[:-1], out=starts[1:])
-        within = np.arange(total, dtype=np.int64) - starts[pos]
-        entry = p0[pos] + within
-
-        called = cols.pce_called_idx[entry].astype(np.int64)
-        own_J = cols.pce_section_variant_index[entry].astype(np.int64)
-        parent_sec = self._sec_of_var[parents][pos]
-
-        # Per-parent ascending-unique called slot, first own_J wins -- the
-        # scalar path's stable argsort + unique. A composite key keeps the
-        # group (pos) major and called minor; a stable sort then preserves
-        # on-disk order within a (pos, called) tie so the EARLIEST entry's
-        # own_J survives the unique (matching the scalar first-wins).
-        ncall_max = int(called.max()) + 1 if total else 1
-        key = pos * ncall_max + called
-        order = np.argsort(key, kind="stable")
-        pos_s = pos[order]
-        called_s = called[order]
-        own_J_s = own_J[order]
-        sec_s = parent_sec[order]
-        uniq = np.ones(total, dtype=bool)
-        same = (pos_s[1:] == pos_s[:-1]) & (called_s[1:] == called_s[:-1])
-        uniq[1:] = ~same
-        pos_u = pos_s[uniq]
-        called_u = called_s[uniq]
-        own_J_u = own_J_s[uniq]
-        sec_u = sec_s[uniq]
-
-        return self._resolve_batch(pos_u, called_u, own_J_u, sec_u)
-
-    def _resolve_batch(
-        self,
-        pos: np.ndarray,
-        called: np.ndarray,
-        own_J: np.ndarray,
-        sec: np.ndarray,
-    ) -> Tuple[
-        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
-    ]:
-        """Vectorized :meth:`_resolve_slot` over the deduped (pos, slot) set.
-
-        ``pos`` / ``called`` / ``own_J`` / ``sec`` are parallel ascending-
-        unique per-parent slot arrays (sec = the parent's section). Mirrors
-        the scalar gate order: slot-in-range -> EXTERN -> ptr!=0 -> sec_map
-        hit -> own-J usable else per-section fallback table -> drop on no
-        usable J. Returns the surviving edges' ``(pos, child_secs,
-        child_nodes, child_types, child_is_matched)``.
-        """
-        cols = self._cols
-        ct_lo = cols.ct_offsets[sec]
-        ct_hi = cols.ct_offsets[sec + 1]
-        slot = ct_lo + called
-        keep = slot < ct_hi
-        if not bool(keep.any()):
-            return self._empty_batch()
-        pos = pos[keep]
-        called = called[keep]
-        own_J = own_J[keep]
-        sec = sec[keep]
-        slot = slot[keep]
-
-        ct_type = cols.ct_type[slot]
-        keep = ct_type != np.uint8(int(CallTargetType.EXTERN))
-        ptr = cols.ct_function_section_ptr[slot]
-        keep &= ptr != 0
-        # Resolve the callee section via the offset->idx hashmap. Misses
-        # (ptr not a known section start) drop, mirroring ``_sec_map.get``
-        # returning ``None``.
-        hit = self._sec_map.lookup_ndarray(ptr.astype(np.uint32)).astype(
-            np.int64
+        return self._kernel.expand_batch(
+            parents,
+            cols.pce_offsets,
+            cols.pce_called_idx,
+            cols.pce_section_variant_index,
+            cols.ct_offsets,
+            cols.ct_type,
+            cols.ct_function_section_ptr,
+            cols.ct_is_matched,
+            cols.var_offsets,
+            cols.n_call_targets,
+            self._sec_of_var,
+            np.uint8(int(CallTargetType.EXTERN)),
+            np.uint16(int(MISSING_VARIANT_INDEX)),
         )
-        keep &= hit != int(_U32_MISS)
-        if not bool(keep.any()):
-            return self._empty_batch()
-        pos = pos[keep]
-        called = called[keep]
-        own_J = own_J[keep]
-        sec = sec[keep]
-        slot = slot[keep]
-        callee_sec = hit[keep]
-
-        # J selection: own J if usable, else the per-section fallback-table
-        # J for (sec, called); a -1 fallback drops the edge.
-        J = own_J.copy()
-        need_fb = own_J == int(MISSING_VARIANT_INDEX)
-        if bool(need_fb.any()):
-            J[need_fb] = self._fallback_J_batch(
-                sec[need_fb], called[need_fb]
-            )
-        keep = J >= 0
-        if not bool(keep.any()):
-            return self._empty_batch()
-        pos = pos[keep]
-        slot = slot[keep]
-        callee_sec = callee_sec[keep]
-        J = J[keep]
-
-        child_nodes = cols.var_offsets[callee_sec] + J
-        child_secs = self._sec_of_var[child_nodes].astype(np.uint32)
-        child_types = cols.ct_type[slot].astype(np.uint8)
-        child_matched = cols.ct_is_matched[slot].astype(bool)
-        return (
-            pos.astype(np.int64),
-            child_secs,
-            child_nodes.astype(np.int64),
-            child_types,
-            child_matched,
-        )
-
-    def _fallback_J_batch(
-        self, sec: np.ndarray, called: np.ndarray
-    ) -> np.ndarray:
-        """Per-section fallback-J for parallel ``(sec, called)`` pairs.
-
-        Fetches each distinct section's cached fallback table once
-        (:meth:`_fallback_table`, vectorized + memoised) and gathers the
-        per-pair J, returning -1 for an out-of-range ``called`` -- exactly
-        :meth:`_fallback_J`'s per-slot result, batched."""
-        out = np.full(sec.size, -1, dtype=np.int64)
-        for s in np.unique(sec):
-            table = self._fallback_table(int(s))
-            mask = sec == s
-            ci = called[mask]
-            in_range = (ci >= 0) & (ci < table.size)
-            vals = np.full(ci.size, -1, dtype=np.int64)
-            if bool(in_range.any()):
-                vals[in_range] = table[ci[in_range]]
-            out[mask] = vals
-        return out
 
     @staticmethod
     def _empty_batch() -> Tuple[

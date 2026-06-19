@@ -34,6 +34,7 @@
 //! Callers should check membership with `__contains__` / `lookup` when
 //! the sentinel value is itself a legitimate entry value.
 
+mod adjacency_expand;
 mod carrier_signs;
 mod flat_segments;
 mod hashmap_macro;
@@ -43,6 +44,7 @@ mod number_idx_2d;
 mod remap_walk;
 mod segment_distinct;
 
+use adjacency_expand::LiveAdjacencyKernel;
 use carrier_signs::build_carrier_signs_kernel;
 use flat_segments::build_flat_segments_kernel;
 use hashmap_macro::define_hashmap;
@@ -326,6 +328,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // DenseColumns slice + concat feeding the number idx_2d kernel). See
     // `flat_segments.rs`.
     m.add_function(wrap_pyfunction!(build_flat_segments_kernel, m)?)?;
+
+    // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
+    // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.
+    m.add_class::<LiveAdjacencyKernel>()?;
 
     Ok(())
 }
