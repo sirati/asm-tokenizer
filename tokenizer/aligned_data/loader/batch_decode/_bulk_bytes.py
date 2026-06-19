@@ -243,9 +243,31 @@ def build_bulk_bytes(
         numbers_per_TokenType=numbers_per_TokenType,
         identity_idx_2d=identity_idx_2d,
         number_idx_2d_per_TokenType=idx_2d_per_type,
+        number_chunk_slice_starts_per_type=_chunk_slice_starts(
+            number_chunk_slices_per_type
+        ),
         vc2_chunk_exponent_sidecar=vc2_chunk_exponent_sidecar,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
     )
+
+
+def _chunk_slice_starts(
+    number_chunk_slices_per_type: dict[TokenType, list[slice]],
+) -> dict[TokenType, np.ndarray]:
+    """Flatten the per-call_target chunk slices to their ``.start`` arrays.
+
+    The columnar twin of :attr:`Stage3CallTarget.number_chunk_slices`'
+    ``.start`` -- one ``int64[n_total_cts]`` per :class:`TokenType`, in the
+    DFS call_target order :func:`_reconstruct_per_ct_slices` built. Exposed
+    flat on :class:`Stage3Batch` so the vector dense path's number-sidecar
+    concat reads the chunk-slice bases without re-walking the object tree.
+    """
+    return {
+        token_type: np.asarray(
+            [sl.start for sl in slices], dtype=np.int64
+        )
+        for token_type, slices in number_chunk_slices_per_type.items()
+    }
 
 
 # ---------------------------------------------------------------------------

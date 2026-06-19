@@ -38,7 +38,7 @@ The plan reserves ``call_targets[0]`` per variant for the root body;
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -484,6 +484,19 @@ class Stage3Batch:
     emits LSB-then-MSB in stream-emission order, and the mid-cut
     source is by construction the last F128 in the last surviving
     CT)."""
+
+    number_chunk_slice_starts_per_type: dict[TokenType, np.ndarray] = field(
+        default_factory=dict
+    )
+    """Per-:class:`TokenType` ``int64[n_total_cts]`` -- the per-DFS-
+    call_target chunk-slice ``.start`` into the corresponding entry of
+    :attr:`numbers_per_TokenType`. The columnar twin of the per-call_target
+    :attr:`Stage3CallTarget.number_chunk_slices` ``.start`` values, exposed
+    flat so the vector dense path's number-sidecar concat can build its
+    chunk columns without re-walking the object tree. Entry ``[T][e]`` ==
+    ``sections[..].variants[..].call_targets[e_in_dfs].number_chunk_slices
+    [T].start``. Defaults to an empty mapping for fixtures that build a
+    :class:`Stage3Batch` directly without the chunk-slice front-matter."""
 
 
 # ---------------------------------------------------------------------------

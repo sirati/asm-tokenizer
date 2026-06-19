@@ -48,6 +48,7 @@ from ._catalog_columns import build_catalog_columns
 from ._dense_adapter import build_stage2_batch
 from ._dense_columns import build_dense_columns
 from ._expand import ExpandedBatch
+from ._number_chunk_columns import build_number_chunk_columns
 from ._remap_inputs import build_flat_remap_inputs
 from ._surviving import surviving_token_counts
 
@@ -160,6 +161,22 @@ def build_dense_sidecars(
 
     # --- run the OWNED decode kernels (byte-identical by construction) ---
     stage3 = build_bulk_bytes(stage2, dense)
+
+    # The number-sidecar concat's per-chunk stream built COLUMNAR from
+    # ``dense`` (the surviving NUMBER-band slots) + the kernel-built
+    # per-call_target chunk-slice ``.start`` arrays (exposed flat on
+    # ``stage3``) + the emission row CSR -- skips the GIL-bound per-call-
+    # target object-tree walk (:func:`_build_global_chunk_stream`). The
+    # empty-batch path (``dense is None``) leaves ``numbers`` ``None`` so
+    # ``assemble_number_sidecars`` walks the (empty) tree itself.
+    numbers = (
+        build_number_chunk_columns(
+            geometry, dense, stage3.number_chunk_slice_starts_per_type
+        )
+        if dense is not None
+        else None
+    )
+
     (
         row_identities,
         row_fid_sidecar,
@@ -170,7 +187,9 @@ def build_dense_sidecars(
         collect_fid_sidecar=include_fid_sidecar,
         flat=flat,
     )
-    row_numbers_sig, row_numbers_sex = assemble_number_sidecars(stage3)
+    row_numbers_sig, row_numbers_sex = assemble_number_sidecars(
+        stage3, numbers
+    )
 
     # The adapter's mapping is the IDENTITY over non-padding rows (section
     # i == non-padding row i, variant 0), so the kernels' per-row offsets
