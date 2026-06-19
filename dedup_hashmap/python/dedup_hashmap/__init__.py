@@ -18,15 +18,18 @@ from __future__ import annotations
 
 from . import _native as _native
 from ._native import *  # noqa: F401,F403 — re-export every generated class
+from ._native import segment_distinct_count
 from .typed import IntDtype, IntEnumHashMap, PlainBool, PlainInt
 
 
 # ``_native.__all__`` is set by PyO3 and lists every generated
 # ``HashMap<K><V>`` class; extend it with the pure-Python typed surface
-# so ``from dedup_hashmap import *`` covers both layers.
+# plus the free ``segment_distinct_count`` kernel so
+# ``from dedup_hashmap import *`` covers all layers.
 __all__ = list(_native.__all__) + [
     "IntDtype",
     "IntEnumHashMap",
     "PlainBool",
     "PlainInt",
+    "segment_distinct_count",
 ]

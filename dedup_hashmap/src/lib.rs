@@ -35,9 +35,11 @@
 //! the sentinel value is itself a legitimate entry value.
 
 mod hashmap_macro;
+mod segment_distinct;
 
 use hashmap_macro::define_hashmap;
 use pyo3::prelude::*;
+use segment_distinct::segment_distinct_count;
 
 // -- Generated classes -----------------------------------------------------
 //
@@ -283,6 +285,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HashMapU64U64>()?;
     m.add_class::<HashMapU64F32>()?;
     m.add_class::<HashMapU64F64>()?;
+
+    // Per-segment distinct-value count kernel (CSR-grouped np.unique
+    // replacement). See `segment_distinct.rs`.
+    m.add_function(wrap_pyfunction!(segment_distinct_count, m)?)?;
 
     Ok(())
 }

@@ -24,12 +24,27 @@ side ``FunctionData.metadata["category_counts"]`` contract.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
+
+from dedup_hashmap import segment_distinct_count
 
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Category
 
 from .decoded._inline_decode_state import build_inline_decode_state
+
+
+# Bring-up flag: when set, the per-node distinct-count reduction in
+# :func:`_count_distinct_caller_local_ids_per_node` falls back to the
+# global ``np.unique`` + ``bincount`` path instead of the Rust
+# per-segment kernel. The two are byte-identical (set-semantics); the
+# flag exists only so the numpy reference stays exercisable for the
+# byte-identity gate during bring-up. Default = Rust.
+_USE_NUMPY_SEGMENT_DISTINCT = bool(
+    os.environ.get("CATEGORY_COUNTS_NUMPY_UNIQUE")
+)
 
 
 __all__ = [
@@ -274,16 +289,23 @@ def _count_distinct_caller_local_ids_per_node(
             "payloads to {0, 1, 2} bytes."
         )
 
-    # Distinct count per node = number of unique ``(node, id)`` pairs that
-    # land in each node. Dedup the pairs, then bincount the surviving node
-    # labels. ``unique`` over a single composite key is order-independent,
-    # so the per-node count matches the scalar ``np.unique(ids).size``.
-    key = node.astype(np.int64) * np.int64(1 << 16) + ids.astype(np.int64)
-    distinct_keys = np.unique(key)
-    distinct_node = distinct_keys >> np.int64(16)
-    counts = np.bincount(distinct_node, minlength=n_nodes)
-    out[: counts.size] = counts.astype(np.int64)
-    return out
+    # Distinct count per node = number of distinct decoded ids that land
+    # in each node. The per-segment Rust kernel groups the ``(node, id)``
+    # pairs by node into per-segment hash-sets and returns each set's
+    # size -- byte-identical to ``np.unique`` per segment (set membership
+    # is order-independent), but without the single global sort.
+    node_i64 = node.astype(np.int64, copy=False)
+    ids_i64 = ids.astype(np.int64)
+    if _USE_NUMPY_SEGMENT_DISTINCT:
+        # Reference path (flag-gated): one global sort over the composite
+        # ``node * 2^16 + id`` key, then bincount the surviving labels.
+        key = node_i64 * np.int64(1 << 16) + ids_i64
+        distinct_keys = np.unique(key)
+        distinct_node = distinct_keys >> np.int64(16)
+        counts = np.bincount(distinct_node, minlength=n_nodes)
+        out[: counts.size] = counts.astype(np.int64)
+        return out
+    return segment_distinct_count(node_i64, ids_i64, n_nodes)
 
 
 # ---------------------------------------------------------------------------
