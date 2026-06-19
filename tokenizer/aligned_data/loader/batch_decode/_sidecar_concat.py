@@ -37,10 +37,11 @@ batch (DFS encounter order). The per-call_target per-:class:`TokenType`
 stream-order scatter becomes a segmented gather: each surviving
 number-band slot's source index is ``number_chunk_slices[T][ct].start +
 rank-within-(ct, T)``, and a per-type boolean gather fills the global
-stream in one shot. The per-variant buffers are then contiguous slices
-of that global stream (DFS order groups call_targets by variant), fed to
-the shared :func:`._row_expand.concat_per_row` for the variant -> row
-expansion.
+stream in one shot. The global stream + its per-variant CSR are then fed
+straight to the shared
+:func:`._row_expand.concat_per_row_from_buffer` for the variant -> row
+expansion (the buffer IS the variant-ordered concatenation, so no
+per-variant slice list is materialised and re-concatenated).
 """
 
 from __future__ import annotations
@@ -52,7 +53,10 @@ import numpy as np
 
 from tokenizer.tokens import TokenType
 
-from ._row_expand import build_per_row_variant_lookup, concat_per_row
+from ._row_expand import (
+    build_per_row_variant_lookup,
+    concat_per_row_from_buffer,
+)
 
 if TYPE_CHECKING:
     from ._types import Stage3Batch
@@ -366,20 +370,17 @@ def assemble_number_sidecars(
         stage3_batch, numbers
     )
 
-    # Per-unique-variant ``(sig, sex)`` slices of the global stream, in
-    # flat ``section -> slot`` order -- ``variant_chunk_offsets`` already
-    # enumerates the variants in DFS (== section -> slot) order, so the
-    # per-variant slicing is a plain range over the CSR. The variants
-    # never cross the CSR's variant axis, so this matches the tree's
-    # ``sections -> variants`` slice walk byte-for-byte.
+    # ``variant_chunk_offsets`` is the per-variant CSR over the global
+    # ``sig_flat`` / ``sex_flat`` streams, in flat ``section -> slot``
+    # (DFS) order, and tiles ``[0, len(stream)]`` exactly -- so each
+    # stream IS the variant-ordered concatenation of its per-variant
+    # slices. Feeding the buffer + CSR straight to the buffer-input
+    # expansion entry drops the per-variant slice-list loop (and the
+    # ``np.concatenate`` that re-joined the slices back into the stream
+    # inside the list-input path); the variants never cross the CSR's
+    # variant axis, so this matches the tree's ``sections -> variants``
+    # slice walk byte-for-byte.
     n_variants = int(variant_chunk_offsets.shape[0]) - 1
-    per_variant_sig: List[np.ndarray] = []
-    per_variant_sex: List[np.ndarray] = []
-    for v in range(n_variants):
-        lo = int(variant_chunk_offsets[v])
-        hi = int(variant_chunk_offsets[v + 1])
-        per_variant_sig.append(sig_flat[lo:hi])
-        per_variant_sex.append(sex_flat[lo:hi])
 
     # ``variants_per_section`` for the per-row lookup: the staged path
     # reads it off the tree; the vector dense path lays one variant per
@@ -394,15 +395,17 @@ def assemble_number_sidecars(
         stage1_batch.batch_idx_to_section_variant, variants_per_section
     )
 
-    sig_out, _ = concat_per_row(
-        per_variant_sig,
+    sig_out, _ = concat_per_row_from_buffer(
+        sig_flat,
+        variant_chunk_offsets,
         per_row_variant_idx,
         is_padding,
         dtype=np.dtype(np.uint64),
         expected_row_offsets=number_row_offsets,
     )
-    sex_out, _ = concat_per_row(
-        per_variant_sex,
+    sex_out, _ = concat_per_row_from_buffer(
+        sex_flat,
+        variant_chunk_offsets,
         per_row_variant_idx,
         is_padding,
         dtype=np.dtype(np.uint32),
