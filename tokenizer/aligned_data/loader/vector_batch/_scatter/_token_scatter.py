@@ -30,6 +30,7 @@ slot writes, matching the zero-allocation.
 from __future__ import annotations
 
 import numpy as np
+from dedup_hashmap import build_token_scatter_kernel
 
 from ._expand import ExpandedBatch
 from ._surviving import row_of_node as _row_of_node
@@ -75,13 +76,11 @@ def scatter_tokens(
     """
     n_rows = int(geometry.n_rows)
     seq_len = int(geometry.layout.seq_len)
-    tokens = np.zeros((n_rows, seq_len), dtype=np.uint16)
     if n_rows == 0 or seq_len == 0:
-        return tokens
+        return np.zeros((n_rows, seq_len), dtype=np.uint16)
 
     emission = geometry.emission
     layout = geometry.layout
-    roff = np.asarray(emission.row_offsets, dtype=np.int64)
     own = np.asarray(emission.own_length, dtype=np.int64)
     node_off = np.asarray(expanded.node_offsets, dtype=np.int64)
     n_emitted = own.size
@@ -91,127 +90,26 @@ def scatter_tokens(
             f"has {n_emitted}"
         )
 
-    pref = np.asarray(layout.prefix_len, dtype=np.int64)
-
-    # --- per-emitted-node geometry ---------------------------------------
-    row_of_node = _row_of_node(geometry)
-    local_idx = np.arange(n_emitted, dtype=np.int64) - roff[row_of_node]
-    # Body-relative start column of each node = own-length prefix-sum of
-    # the row's prior nodes (global cumsum minus the row's base cumsum).
-    gcum = np.concatenate(([0], np.cumsum(own)))
-    body_base = gcum[roff[:-1]]
-    body_start = gcum[:-1] - body_base[row_of_node]  # int64[n_emitted]
-
-    # --- per-node surviving column count ---------------------------------
-    # The straddler keeps only its partial_cut prefix; nodes after the
-    # straddler keep nothing; full rows keep every node whole. Shared with
-    # the dense-sidecar pass (:mod:`._surviving`) so the cut can never
-    # drift between the two arms.
+    # The per-node surviving column count (the straddler cut) and per-node
+    # owning row stay python-side -- separate concerns shared with the
+    # dense-sidecar pass (:mod:`._surviving`) so the cut can never drift.
     surviving = surviving_token_counts(geometry)
+    row_of_node = _row_of_node(geometry)
 
-    # --- flat (row, col, value) of every surviving body slot -------------
-    rows_flat, cols_flat, vals_flat = _flatten_node_writes(
-        expanded.expanded,
-        node_off,
-        surviving,
-        row_of_node,
-        dest_col_base=pref[row_of_node] + body_start,
-    )
-
-    # --- per-row variant prefix slots ------------------------------------
-    p_rows, p_cols, p_vals = _flatten_prefix_writes(
-        variant_prefix_tokens,
-        np.asarray(variant_prefix_offsets, dtype=np.int64),
+    # The kernel OWNS the body-start cumsum + index arithmetic + the ordered
+    # (prefix-then-body, last-writer-wins) scatter into the dense u16[B, L]
+    # buffer; we only extract the geometry arrays + coerce dtypes here.
+    flat = build_token_scatter_kernel(
+        n_rows,
         seq_len,
+        np.ascontiguousarray(emission.row_offsets, dtype=np.int64),
+        np.ascontiguousarray(own, dtype=np.int64),
+        np.ascontiguousarray(expanded.expanded, dtype=np.uint16),
+        np.ascontiguousarray(node_off, dtype=np.int64),
+        np.ascontiguousarray(layout.prefix_len, dtype=np.int64),
+        np.ascontiguousarray(surviving, dtype=np.int64),
+        np.ascontiguousarray(row_of_node, dtype=np.int64),
+        np.ascontiguousarray(variant_prefix_tokens, dtype=np.uint16),
+        np.ascontiguousarray(variant_prefix_offsets, dtype=np.int64),
     )
-
-    all_rows = np.concatenate([p_rows, rows_flat])
-    all_cols = np.concatenate([p_cols, cols_flat])
-    all_vals = np.concatenate([p_vals, vals_flat])
-
-    # Defensive: every destination column is < seq_len by construction
-    # (the straddler cut + body prefix-sum keep writes inside L, and the
-    # prefix write is capped). Guard against any upstream drift rather
-    # than silently writing out of bounds.
-    in_bounds = (all_cols >= 0) & (all_cols < seq_len)
-    if not bool(in_bounds.all()):
-        all_rows = all_rows[in_bounds]
-        all_cols = all_cols[in_bounds]
-        all_vals = all_vals[in_bounds]
-
-    tokens[all_rows, all_cols] = all_vals
-    return tokens
-
-
-def _flatten_node_writes(
-    expanded: np.ndarray,
-    node_off: np.ndarray,
-    surviving: np.ndarray,
-    row_of_node: np.ndarray,
-    dest_col_base: np.ndarray,
-):
-    """Flat ``(rows, cols, values)`` for every surviving body slot.
-
-    For node ``e`` keeping ``surviving[e]`` of its ``expanded`` slots:
-    the kept values are ``expanded[node_off[e] : node_off[e] +
-    surviving[e]]``, destined for row ``row_of_node[e]`` at columns
-    ``dest_col_base[e] + (0 .. surviving[e] - 1)``. Built with the
-    cumulative-offset arange (no per-node Python loop).
-    """
-    total = int(surviving.sum())
-    if total == 0:
-        z = np.zeros(0, dtype=np.int64)
-        return z, z.copy(), np.zeros(0, dtype=np.uint16)
-
-    keep = surviving > 0
-    src_base = node_off[:-1][keep]
-    surv = surviving[keep]
-    col_base = dest_col_base[keep]
-    rows = row_of_node[keep]
-
-    # Per-kept-slot within-node offset 0,1,...,surv[i]-1 via arange minus
-    # the repeated segment start.
-    seg_start = np.concatenate(([0], np.cumsum(surv)))
-    within = np.arange(total, dtype=np.int64) - np.repeat(
-        seg_start[:-1], surv
-    )
-    src_idx = np.repeat(src_base, surv) + within
-    cols = np.repeat(col_base, surv) + within
-    rows_flat = np.repeat(rows, surv)
-    vals = expanded[src_idx]
-    return rows_flat, cols, vals
-
-
-def _flatten_prefix_writes(
-    prefix_tokens: np.ndarray,
-    prefix_offsets: np.ndarray,
-    seq_len: int,
-):
-    """Flat ``(rows, cols, values)`` for every variant-prefix slot.
-
-    Row ``r``'s prefix is ``prefix_tokens[prefix_offsets[r] :
-    prefix_offsets[r + 1]]`` written at columns ``0 .. width - 1``,
-    capped at ``seq_len`` (a degenerate prefix wider than the budget is
-    truncated, matching the scalar assembler's ``min(n_axis,
-    context_len)``).
-    """
-    n_rows = prefix_offsets.size - 1
-    widths = np.diff(prefix_offsets)
-    capped = np.minimum(widths, seq_len)
-    total = int(capped.sum())
-    if total == 0:
-        z = np.zeros(0, dtype=np.int64)
-        return z, z.copy(), np.zeros(0, dtype=np.uint16)
-
-    keep = capped > 0
-    base = prefix_offsets[:-1][keep]
-    cap = capped[keep]
-    rows = np.arange(n_rows, dtype=np.int64)[keep]
-
-    seg_start = np.concatenate(([0], np.cumsum(cap)))
-    within = np.arange(total, dtype=np.int64) - np.repeat(seg_start[:-1], cap)
-    src_idx = np.repeat(base, cap) + within
-    cols = within  # prefix always starts at column 0
-    rows_flat = np.repeat(rows, cap)
-    vals = prefix_tokens[src_idx]
-    return rows_flat, cols, vals
+    return flat.reshape(n_rows, seq_len)

@@ -48,6 +48,7 @@ mod remap_walk;
 mod row_inclusions;
 mod segment_distinct;
 mod strip_shift_prepend;
+mod token_scatter;
 
 use adjacency_expand::LiveAdjacencyKernel;
 use once_only_inclusion::OnceOnlyInclusionKernel;
@@ -64,6 +65,7 @@ use remap_walk::apply_remap_walk;
 use row_inclusions::compute_row_inclusions_kernel;
 use segment_distinct::segment_distinct_count;
 use strip_shift_prepend::build_strip_shift_prepend_kernel;
+use token_scatter::build_token_scatter_kernel;
 
 // -- Generated classes -----------------------------------------------------
 //
@@ -355,6 +357,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // run_lengths, the packed per-node digit cumsum, and is_negative — one
     // CSR walk over the flat raw stream). See `inline_state_fields.rs`.
     m.add_function(wrap_pyfunction!(build_inline_state_fields_kernel, m)?)?;
+
+    // Fully-vectorized token scatter into the dense u16[B, L] token tensor
+    // (the GIL-released `scatter_tokens` twin: body-start cumsum + prefix +
+    // ordered prefix-then-body scatter under the straddler cut). See
+    // `token_scatter.rs`.
+    m.add_function(wrap_pyfunction!(build_token_scatter_kernel, m)?)?;
 
     // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
     // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.
