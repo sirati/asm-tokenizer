@@ -34,10 +34,12 @@ import numpy as np
 
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
+from .._prefetch import prefetch_willneed
 from .._types import BatchGeometry
 from ._body_load import gather_node_bodies
 from ._expand import ExpandedBatch, expand_node_bodies
 from ._locator import node_token_spans
+from ._prefetch_spans import estimate_body_prefetch_ranges
 from ._prefix_values import variant_prefix_values
 from ._token_scatter import scatter_tokens
 
@@ -91,6 +93,14 @@ def scatter_batch_tokens(
     """
     emission = geometry.emission
     nodes = np.asarray(emission.node, dtype=np.int64)
+
+    # Advisory page-prefetch of the body byte ranges the gather below is
+    # about to read, estimated from sidecar counts (no _data.bin touch).
+    # No-op for a plain ndarray (no ``_mmap``); cannot change the output.
+    starts_pf, spans_pf = estimate_body_prefetch_ranges(cols, emission)
+    mm = getattr(data_u8, "_mmap", None)
+    if mm is not None:
+        prefetch_willneed(mm, starts_pf, spans_pf)
 
     starts, counts = node_token_spans(cols, data_u8, nodes)
     bodies = gather_node_bodies(data_u8, starts, counts)
