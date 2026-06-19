@@ -42,6 +42,7 @@ mod flat_segments;
 mod gather_bodies;
 mod hashmap_macro;
 mod identity_gather;
+mod inclusion_closure;
 mod inline_bytes;
 mod inline_state_fields;
 mod node_ct_csr;

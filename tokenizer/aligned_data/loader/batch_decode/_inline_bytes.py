@@ -2,8 +2,8 @@
 
 Single concern: lift the surviving inline-digit byte payloads from every
 level-4 call_target in a :class:`Stage2Batch` into ONE flat ``u8`` array
-with a leading-zero pad at index 0, and emit a parallel list of per-call
-target slices into that array.
+with a leading-zero pad at index 0, and emit a parallel per-call-target
+CSR of start offsets into that array.
 
 The narrowing-assignment trick (plan ALG-1): assigning a ``u16`` numpy
 array into a ``u8`` destination truncates the high byte. For inline-band
@@ -49,9 +49,9 @@ Output layout
 -------------
 ``inline_bytes`` is ``u8[1 + total_buffered_bytes]``. Index 0 is the
 leading-zero pad consumed by short-payload ``idx_2d`` gathers (plan D9
-+ Stage 3 step 1). Each per-call-target slice starts at
-``previous.stop`` (or ``1`` for the first call_target) so that the
-slice union is exactly ``[1, len(inline_bytes))``.
++ Stage 3 step 1). Each per-call-target start offset abuts the
+previous call_target's end (or ``1`` for the first call_target) so that
+the per-call-target ranges tile exactly ``[1, len(inline_bytes))``.
 
 Plan reference: ``batch_decode_plan.md`` -- ALG-1 + ALG-2 + ALG-8 +
 ``## Stages -- algorithm sketch`` Stage 3 step 2.
@@ -71,7 +71,7 @@ __all__ = ["build_inline_bytes"]
 
 # ---------------------------------------------------------------------------
 # Public entry point: feed the dense columns to the GIL-released gather
-# kernel + build the per-call-target slice list from the returned counts.
+# kernel + build the per-call-target start-offset CSR from the counts.
 #
 # The per-call-target surviving-byte extraction (the old per-node
 # ``_surviving_bytes`` Python loop with masks) is now ONE ``py.detach``
@@ -85,7 +85,7 @@ __all__ = ["build_inline_bytes"]
 
 def build_inline_bytes(
     dense: DenseColumns,
-) -> tuple[np.ndarray, list[slice]]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Concatenate surviving inline bytes across the batch (ALG-1).
 
     Reads the shared :class:`DenseColumns` front-matter in DFS
@@ -95,21 +95,27 @@ def build_inline_bytes(
     * ``inline_bytes`` -- ``u8`` array of length
       ``1 + total_surviving_bytes``. Index 0 is the leading-zero pad
       (consumed by short-payload ``idx_2d`` gathers per plan D9).
-    * ``inline_byte_slices`` -- one :class:`slice` per level-4
-      call_target, parallel to the DFS node axis. The first slice
-      starts at ``1`` (past the pad); each subsequent slice starts at
-      the previous slice's ``.stop``. Fully-dropped call_targets get
-      a zero-length slice (``stop == start``).
+    * ``inline_byte_starts`` -- ``int64[n_call_targets]``, one start
+      offset per level-4 call_target, parallel to the DFS node axis.
+      Entry 0 is ``1`` (past the pad); each subsequent entry abuts the
+      previous call_target's end (``start[i] = start[i-1] + count[i-1]``).
+      A fully-dropped call_target contributes ``count == 0`` so its
+      start equals the next call_target's start (zero-length range).
+      The per-call-target ``slice`` objects the staged hierarchy needs
+      are materialised leaf-locally from these starts (the only
+      consumer of real ``slice`` objects) -- the vector hot path threads
+      the start array directly into the idx_2d builders.
 
     GIL-released (B-S3): the per-node ``_surviving_bytes`` Python gather
     loop (per-CT masked digit pick + the cut-path carrier walk) is a
     single ``py.detach`` Rust kernel reading the flat
     :class:`DenseColumns` columns directly. The kernel returns the flat
     ``inline_bytes`` buffer (leading-zero pad included) + the per-node
-    contributed byte count; this entry point derives the abutting slice
-    list from the counts. The narrowing-assignment trick (ALG-1) lives
-    in the kernel (``raw_token as u8`` keeps the low byte; inline-band
-    ids ``< 256`` so it is lossless).
+    contributed byte count; this entry point derives the abutting start
+    offsets from the counts with a vectorised leading-1 + exclusive
+    prefix sum (no per-call-target Python loop). The narrowing-assignment
+    trick (ALG-1) lives in the kernel (``raw_token as u8`` keeps the low
+    byte; inline-band ids ``< 256`` so it is lossless).
 
     Parameters
     ----------
@@ -120,8 +126,8 @@ def build_inline_bytes(
 
     Returns
     -------
-    tuple of ``(np.ndarray[np.uint8], list[slice])``
-        The flat byte buffer and the per-call-target slice list.
+    tuple of ``(np.ndarray[np.uint8], np.ndarray[np.int64])``
+        The flat byte buffer and the per-call-target start-offset CSR.
     """
     inline_bytes, per_call_target_counts = build_inline_bytes_kernel(
         np.ascontiguousarray(dense.raw_tokens, dtype=np.uint16),
@@ -136,14 +142,12 @@ def build_inline_bytes(
         np.ascontiguousarray(dense.node_offsets, dtype=np.int64),
     )
 
-    # Per-call-target slices into ``inline_bytes``. First slice starts
-    # past the leading-zero pad (offset 1); subsequent slices abut the
-    # previous stop. Fully-dropped call_targets get a zero-length slice.
-    inline_byte_slices: list[slice] = []
-    cursor = 1
-    for count in per_call_target_counts:
-        n = int(count)
-        inline_byte_slices.append(slice(cursor, cursor + n))
-        cursor += n
+    # Per-call-target start offsets into ``inline_bytes``. Entry 0 starts
+    # past the leading-zero pad (offset 1); subsequent entries abut the
+    # previous call_target's end. Vectorised leading-1 + exclusive prefix
+    # sum of the per-call-target byte counts -- byte-identical to the old
+    # ``cursor = 1; for count: append(cursor); cursor += count`` loop.
+    counts = np.ascontiguousarray(per_call_target_counts, dtype=np.int64)
+    inline_byte_starts = 1 + (np.cumsum(counts) - counts)
 
-    return inline_bytes, inline_byte_slices
+    return inline_bytes, inline_byte_starts

@@ -1,7 +1,7 @@
 """Cross-call_target NUMBER-band flat-segment extraction (batched B-S2).
 
 Single concern: given a :class:`Stage2Batch` + the per-DFS-call_target
-``inline_byte_slices``, walk the shared Step-1 call_target columns ONCE
+``inline_byte_starts``, walk the shared Step-1 call_target columns ONCE
 and concatenate the per-segment context arrays the GIL-released number
 emission kernel (``dedup_hashmap.build_number_idx_2d_kernel``) consumes.
 
@@ -11,7 +11,7 @@ byte-offset arithmetic) and the per-:class:`TokenType` ALG-2/7/8 row
 emission run inside the kernel over these flat arrays.
 
 Boundary crossed (design-first sentence): *given the Stage2 DFS
-call_target hierarchy + per-call_target byte slices, produce the flat
+call_target hierarchy + per-call_target byte start offsets, produce the flat
 per-segment NUMBER-band context arrays (body expanded/painted axis,
 per-segment CSR bases over the real-position / digit_cumsum /
 runlen_number / painted-prefix / f128-full concatenations) the emission
@@ -23,7 +23,6 @@ concatenates the columns.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
 
 import numpy as np
 
@@ -67,7 +66,7 @@ class FlatSegments:
         per-segment CSR base. ``carrier_byte = seg_slice_start[seg] +
         digit_flat[digit_base[seg] + raw + 1]``.
     seg_slice_start:
-        ``int64[n_kept]`` -- each segment's ``inline_byte_slices.start``.
+        ``int64[n_kept]`` -- each segment's ``inline_byte_starts`` entry.
     seg_painted_vc2_flat / seg_painted_offsets / seg_surviving:
         ``int64`` -- VC2 trailing-painted-run context: the per-segment
         ``extra_value_v2_mask[:surviving]`` concatenation, its CSR
@@ -106,7 +105,7 @@ class FlatSegments:
 
 def build_flat_segments(
     dense: DenseColumns,
-    inline_byte_slices: List[slice],
+    inline_byte_starts: np.ndarray,
 ) -> FlatSegments:
     """Concatenate the per-segment NUMBER-band context, batched.
 
@@ -117,16 +116,16 @@ def build_flat_segments(
     arithmetic, and per-type emission all run in the kernel over these
     arrays.
     """
-    n_total_cts = len(inline_byte_slices)
+    slice_start_per_node = np.ascontiguousarray(
+        inline_byte_starts, dtype=np.int64
+    )
+    n_total_cts = int(slice_start_per_node.shape[0])
     ct_index = np.asarray(dense.kept_node_index, dtype=np.int64)
 
-    # Per-FULL-DFS-node ``inline_byte_slices.start`` column the kernel reads
-    # as ``seg_slice_start[i] = slice_start_per_node[kept_node_index[i]]``.
-    slice_start_per_node = np.fromiter(
-        (s.start for s in inline_byte_slices),
-        dtype=np.int64,
-        count=n_total_cts,
-    )
+    # Per-FULL-DFS-node start-offset column the kernel reads as
+    # ``seg_slice_start[i] = slice_start_per_node[kept_node_index[i]]`` --
+    # the stage-3a CSR ``inline_byte_starts`` array threaded directly (no
+    # per-call_target slice-list re-extraction).
 
     # GIL-released Rust kernel: the per-kept-node ``DenseColumns`` slice +
     # concat (body axis / real-position / digit_cumsum / runlen / painted

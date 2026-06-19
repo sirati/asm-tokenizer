@@ -45,7 +45,10 @@ use pyo3::types::PyTuple;
 
 /// `0xFFFFFFFF` — the `HashMapU32U32` miss sentinel the Python path checks
 /// `hit != _U32_MISS` against. Resolution drops a map miss.
-const U32_MISS: u32 = u32::MAX;
+///
+/// `pub(crate)` so the inclusion-closure frontier-advance shares the SAME
+/// sentinel as `resolve_one_parent`'s map-miss gate.
+pub(crate) const U32_MISS: u32 = u32::MAX;
 
 /// The callee section the kernel cares about per slot, mirroring the
 /// numpy gate cascade evaluated per (deduped) parent-slot pair.
@@ -104,7 +107,11 @@ pub(crate) struct GateConstants {
 #[pyclass(module = "dedup_hashmap._native")]
 pub struct LiveAdjacencyKernel {
     /// `function_section_ptr -> section idx` (the Python `_sec_map`).
-    sec_map: HashMap<u32, u32>,
+    ///
+    /// `pub(crate)` so the GIL-released inclusion-closure frontier-advance
+    /// (`inclusion_closure.rs`) resolves callee pointers through the SAME
+    /// offset->idx map — it can never drift from `resolve_frontier`.
+    pub(crate) sec_map: HashMap<u32, u32>,
     /// Per-section dense fallback-J table: section idx -> `i64[n_cts]`
     /// whose entry at `called_idx` is the earliest-flat-order usable J for
     /// that slot (-1 when none). Filled on first fallback for a section
@@ -195,9 +202,53 @@ impl LiveAdjacencyKernel {
         )?;
         Ok(tup)
     }
+
+    /// Advance the inclusion-closure section frontier one level (the
+    /// GIL-released port of `ensure_inclusion_closure`'s inner per-section
+    /// pointer-gather + `_sec_map` lookup + `np.unique(np.concatenate(...))`
+    /// reduction). Returns the SORTED-UNIQUE `i64` callee sections the given
+    /// `frontier` reaches through its `ct_function_section_ptr` pointers (#69
+    /// explicit-zero pointers and map misses dropped). The `reached`-mask
+    /// filter + per-level `ensure_sections` lazy-fill stay on the Python side
+    /// (they depend on per-batch state / drive the lazy catalog). See
+    /// `inclusion_closure.rs` for the contract.
+    fn advance_inclusion_frontier<'py>(
+        &self,
+        py: Python<'py>,
+        frontier: PyReadonlyArray1<'py, i64>,
+        ct_offsets: PyReadonlyArray1<'py, i64>,
+        ct_function_section_ptr: PyReadonlyArray1<'py, u32>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let frontier = frontier.as_slice()?;
+        let ct_offsets = ct_offsets.as_slice()?;
+        let ct_function_section_ptr = ct_function_section_ptr.as_slice()?;
+        let next = py.detach(|| {
+            self.advance_inclusion_frontier_impl(
+                frontier,
+                ct_offsets,
+                ct_function_section_ptr,
+            )
+        });
+        let next = next.map_err(PyValueError::new_err)?;
+        Ok(PyArray1::from_vec(py, next))
+    }
 }
 
 impl LiveAdjacencyKernel {
+    /// Test-only constructor from raw parts — lets the inclusion-closure
+    /// unit tests (in `inclusion_closure.rs`) build a kernel without going
+    /// through `new`'s ndarray path, while keeping the fields private.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        sec_map: HashMap<u32, u32>,
+        fallback_cache: Mutex<HashMap<i64, Vec<i64>>>,
+    ) -> Self {
+        LiveAdjacencyKernel {
+            sec_map,
+            fallback_cache,
+        }
+    }
+
     /// GIL-released frontier resolution. Walks parents in ascending order;
     /// per parent emits its ascending-unique-slot edges that survive the
     /// gate cascade, preserving the exact `expand_batch` flattening order.
