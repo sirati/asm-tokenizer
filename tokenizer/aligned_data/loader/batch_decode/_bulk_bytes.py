@@ -170,11 +170,11 @@ def build_bulk_bytes(
     )
 
     # 4. number idx_2d (3c): per-TokenType u32[n_chunks_of_T, payload_T]
-    #    arrays + per-call-target chunk slices + sidecars (NaN/Inf
-    #    dispatch flag + VC2 chunk-exponent indices).
+    #    arrays + per-call-target chunk-slice CSR boundaries + sidecars
+    #    (NaN/Inf dispatch flag + VC2 chunk-exponent indices).
     (
         idx_2d_per_type,
-        number_chunk_slices_per_type,
+        number_chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
     ) = build_number_idx_2d(dense, inline_bytes, inline_byte_slices)
@@ -262,7 +262,7 @@ def build_bulk_bytes(
             stage2=stage2,
             inline_byte_slices=inline_byte_slices,
             identity_slices=identity_slices,
-            number_chunk_slices_per_type=number_chunk_slices_per_type,
+            number_chunk_boundaries_per_type=number_chunk_boundaries_per_type,
         )
         if build_hierarchy
         else ()
@@ -277,7 +277,7 @@ def build_bulk_bytes(
         identity_idx_2d=identity_idx_2d,
         number_idx_2d_per_TokenType=idx_2d_per_type,
         number_chunk_slice_starts_per_type=_chunk_slice_starts(
-            number_chunk_slices_per_type
+            number_chunk_boundaries_per_type
         ),
         vc2_chunk_exponent_sidecar=vc2_chunk_exponent_sidecar,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
@@ -285,21 +285,22 @@ def build_bulk_bytes(
 
 
 def _chunk_slice_starts(
-    number_chunk_slices_per_type: dict[TokenType, list[slice]],
+    number_chunk_boundaries_per_type: dict[TokenType, np.ndarray],
 ) -> dict[TokenType, np.ndarray]:
-    """Flatten the per-call_target chunk slices to their ``.start`` arrays.
+    """Flatten the per-call_target chunk boundaries to their ``.start`` arrays.
 
     The columnar twin of :attr:`Stage3CallTarget.number_chunk_slices`'
     ``.start`` -- one ``int64[n_total_cts]`` per :class:`TokenType`, in the
-    DFS call_target order :func:`_reconstruct_per_ct_slices` built. Exposed
-    flat on :class:`Stage3Batch` so the vector dense path's number-sidecar
-    concat reads the chunk-slice bases without re-walking the object tree.
+    DFS call_target order :func:`_reconstruct_per_ct_boundaries` built. The
+    per-call_target slice ``.start`` IS the abutting CSR boundary
+    ``bnd[i]``, so the flat starts are the boundary array minus its final
+    sentinel (``bnd[:-1]``). Exposed flat on :class:`Stage3Batch` so the
+    vector dense path's number-sidecar concat reads the chunk-slice bases
+    without re-walking the object tree.
     """
     return {
-        token_type: np.asarray(
-            [sl.start for sl in slices], dtype=np.int64
-        )
-        for token_type, slices in number_chunk_slices_per_type.items()
+        token_type: np.asarray(boundaries[:-1], dtype=np.int64)
+        for token_type, boundaries in number_chunk_boundaries_per_type.items()
     }
 
 
@@ -401,13 +402,18 @@ def _assemble_hierarchy(
     stage2: "Stage2Batch",
     inline_byte_slices: list[slice],
     identity_slices: list[slice],
-    number_chunk_slices_per_type: dict[TokenType, list[slice]],
+    number_chunk_boundaries_per_type: dict[TokenType, np.ndarray],
 ) -> list[Stage3Section]:
     """Build the level-2 / level-3 / level-4 Stage3 wrappers.
 
-    All per-call-target slice lists are in DFS encounter order; we walk
-    the stage-2 hierarchy in the same order so a single positional
-    cursor lines up each call_target's slice lookups.
+    All per-call-target geometry is in DFS encounter order; we walk the
+    stage-2 hierarchy in the same order so a single positional cursor
+    lines up each call_target's lookups. The per-:class:`TokenType`
+    chunk ranges arrive as CSR boundary arrays; the per-call_target
+    ``slice`` objects :class:`Stage3CallTarget` exposes are materialised
+    leaf-locally here (the only consumer that needs ``slice`` objects --
+    the staged tree-walk -- and the only path that builds this hierarchy
+    at all, ``build_hierarchy``), keeping them off the vector hot path.
     """
     ct_cursor = 0
     sections: list[Stage3Section] = []
@@ -417,7 +423,10 @@ def _assemble_hierarchy(
             stage3_cts: list[Stage3CallTarget] = []
             for stage2_ct in stage2_variant.call_targets:
                 per_type_slice: dict[TokenType, slice] = {
-                    T: number_chunk_slices_per_type[T][ct_cursor]
+                    T: slice(
+                        int(number_chunk_boundaries_per_type[T][ct_cursor]),
+                        int(number_chunk_boundaries_per_type[T][ct_cursor + 1]),
+                    )
                     for T in _NUMBER_BLOCK_TOKEN_TYPES
                 }
                 stage3_cts.append(

@@ -81,8 +81,6 @@ Plan refs: ``batch_decode_plan.md`` ALG-7 + ALG-8 + Stage 3 step 4.
 
 from __future__ import annotations
 
-from typing import List
-
 import numpy as np
 
 from dedup_hashmap import build_number_idx_2d_kernel
@@ -108,7 +106,7 @@ def build_number_idx_2d(
     inline_byte_slices: list[slice],
 ) -> tuple[
     dict[TokenType, np.ndarray],
-    dict[TokenType, list[slice]],
+    dict[TokenType, np.ndarray],
     np.ndarray,
     np.ndarray,
 ]:
@@ -140,9 +138,12 @@ def build_number_idx_2d(
         ``dict[TokenType, np.ndarray]`` with every NUMBER-block
         TokenType always present (empty types get zero-row arrays of
         the canonical row width).
-    number_chunk_slices_per_type
-        ``dict[TokenType, list[slice]]``; entry ``[T][i]`` is the
-        slice into ``idx_2d_per_type[T]`` owned by call_target ``i``.
+    number_chunk_boundaries_per_type
+        ``dict[TokenType, np.ndarray]``; entry ``[T]`` is an
+        ``int64[n_total_cts + 1]`` CSR boundary array, so call_target
+        ``i`` owns rows ``[bnd[i] : bnd[i + 1]]`` of
+        ``idx_2d_per_type[T]`` (the abutting per-call_target slice
+        boundaries -- no Python ``slice`` objects materialised here).
     f128_is_nan_or_inf
         ``bool[n_f128_sources]``. One entry per F128 SOURCE (not
         chunk); routes 3d's per-chunk dispatch (NaN/Inf path vs
@@ -207,7 +208,7 @@ def build_number_idx_2d(
             else np.empty(0, dtype=np.int64)
         )
 
-    chunk_slices_per_type = _reconstruct_per_ct_slices(
+    chunk_boundaries_per_type = _reconstruct_per_ct_boundaries(
         n_total_cts=flat.n_total_cts,
         rows_per_carrier_per_type=rows_per_carrier_per_type,
         carrier_dfs_ct_per_type=carrier_dfs_ct_per_type,
@@ -215,31 +216,36 @@ def build_number_idx_2d(
 
     return (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_indices.astype(np.uint32, copy=False),
     )
 
 
-def _reconstruct_per_ct_slices(
+def _reconstruct_per_ct_boundaries(
     *,
     n_total_cts: int,
     rows_per_carrier_per_type: dict[TokenType, np.ndarray],
     carrier_dfs_ct_per_type: dict[TokenType, np.ndarray],
-) -> dict[TokenType, list[slice]]:
-    """Rebuild per-DFS-call_target chunk slices from per-carrier ROW counts.
+) -> dict[TokenType, np.ndarray]:
+    """Rebuild per-DFS-call_target chunk-slice boundaries from row counts.
 
     The scalar entry produced ``chunk_slices_per_type[T][i] = slice(
     pre_counts[T], running_counts[T])`` -- the per-DFS-call_target run of
     type ``T``'s rows. Here we segment-sum each type's per-carrier row
     counts into per-DFS-call_target totals (``np.add.at`` over the
     carrier's owning DFS index), then ``cumsum`` to the abutting slice
-    boundaries over the FULL DFS enumeration (dropped call_targets get a
-    zero-length slice ``slice(c, c)`` at their cursor, exactly as the
-    scalar walk emitted for a ``surviving_token_count == 0`` or
-    no-carrier call_target).
+    boundaries over the FULL DFS enumeration. The result is the raw CSR
+    boundary array ``int64[n_total_cts + 1]`` -- call_target ``i`` owns
+    rows ``[bnd[i] : bnd[i + 1]]`` (a dropped call_target gets the
+    zero-length run ``bnd[i] == bnd[i + 1]`` at its cursor, exactly as
+    the scalar walk emitted for a ``surviving_token_count == 0`` or
+    no-carrier call_target). No per-call_target Python ``slice`` object
+    is materialised; consumers index the boundary array (the vector path
+    reads ``bnd[:-1]`` flat; the staged hierarchy builds slice objects
+    leaf-locally).
     """
-    chunk_slices_per_type: dict[TokenType, list[slice]] = {}
+    chunk_boundaries_per_type: dict[TokenType, np.ndarray] = {}
     for token_type in _NUMBER_BLOCK_TOKEN_TYPES:
         per_ct_rows = np.zeros(n_total_cts, dtype=np.int64)
         rows_per_carrier = rows_per_carrier_per_type[token_type]
@@ -248,9 +254,5 @@ def _reconstruct_per_ct_slices(
             np.add.at(per_ct_rows, dfs_ct, rows_per_carrier)
         boundaries = np.zeros(n_total_cts + 1, dtype=np.int64)
         np.cumsum(per_ct_rows, out=boundaries[1:])
-        slices: List[slice] = [
-            slice(int(boundaries[i]), int(boundaries[i + 1]))
-            for i in range(n_total_cts)
-        ]
-        chunk_slices_per_type[token_type] = slices
-    return chunk_slices_per_type
+        chunk_boundaries_per_type[token_type] = boundaries
+    return chunk_boundaries_per_type
