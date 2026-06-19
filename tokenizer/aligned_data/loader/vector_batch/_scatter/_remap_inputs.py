@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk import (
     FlatRemapInputs,
 )
@@ -69,6 +70,15 @@ __all__ = ["build_flat_remap_inputs"]
 # :func:`_surviving_in_stream_token_ids` masks.
 _IDENTITY_BAND_LO = np.uint16(8)
 _IDENTITY_BAND_HI = np.uint16(16)
+
+# ``CallTargetType`` int value -> FUNCTION slot, as a dense int64 LUT the
+# per-node CT CSR kernel indexes by ``ct_type``. Built off the same
+# ``_CT_TYPE_TO_FUNC_SLOT`` map the object walk uses, so a layout change
+# reshapes both. Length == number of ``CallTargetType`` members.
+_CT_TYPE_FUNC_SLOT_LUT = np.asarray(
+    [_CT_TYPE_TO_FUNC_SLOT[CallTargetType(t)] for t in range(len(CallTargetType))],
+    dtype=np.int64,
+)
 
 
 def build_flat_remap_inputs(
@@ -185,47 +195,16 @@ def _build_ct_columns(
     (the tree walk reads ``stage1.call_targets_section`` -- the same
     node-invariant per-section list). ``ct_off`` is the per-node CSR;
     ``ct_fid`` / ``ct_func_slot`` are the concatenated per-entry columns.
-    The per-section ``(fid, func_slot)`` arrays are built ONCE per distinct
-    section (the catalog caches the parsed list) and gathered per node.
+
+    The per-section ``(fid, func_slot)`` slices are gathered per node by the
+    GIL-released :meth:`CatalogColumns.node_ct_csr` kernel directly off the
+    columnar ``ct_*`` flats -- no ``CallTarget`` object is materialised. The
+    fid is ``ct_function_name_ptr`` widened to int64; the slot is
+    ``_CT_TYPE_FUNC_SLOT_LUT[ct_type]``, the same pair the object walk
+    extracts from each parsed ``CallTarget``.
     """
-    ct_off = np.zeros(n_nodes + 1, dtype=np.int64)
-    fid_pieces: list[np.ndarray] = []
-    slot_pieces: list[np.ndarray] = []
-
-    # Per-section (fid, func_slot) cache -- one parse + slot map per distinct
-    # section, gathered per node (sections repeat across a row's nodes).
-    section_cols: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    for e in range(n_nodes):
-        sec = int(section_of_node[e])
-        cols = section_cols.get(sec)
-        if cols is None:
-            ct_section = catalog.call_targets_section(sec)
-            fids = np.asarray(
-                [int(ct.function_name_ptr) for ct in ct_section],
-                dtype=np.int64,
-            )
-            slots = np.asarray(
-                [_CT_TYPE_TO_FUNC_SLOT[ct.type] for ct in ct_section],
-                dtype=np.int64,
-            )
-            cols = (fids, slots)
-            section_cols[sec] = cols
-        fids, slots = cols
-        fid_pieces.append(fids)
-        slot_pieces.append(slots)
-        ct_off[e + 1] = ct_off[e] + int(fids.shape[0])
-
-    ct_fid = (
-        np.concatenate(fid_pieces)
-        if fid_pieces
-        else np.zeros(0, dtype=np.int64)
-    )
-    ct_func_slot = (
-        np.concatenate(slot_pieces)
-        if slot_pieces
-        else np.zeros(0, dtype=np.int64)
-    )
-    return ct_off, ct_fid, ct_func_slot
+    del n_nodes  # node count is carried by section_of_node's length.
+    return catalog.node_ct_csr(section_of_node, _CT_TYPE_FUNC_SLOT_LUT)
 
 
 def _build_instream_columns(

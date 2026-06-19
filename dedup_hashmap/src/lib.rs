@@ -40,6 +40,7 @@ mod flat_segments;
 mod hashmap_macro;
 mod identity_gather;
 mod inline_bytes;
+mod node_ct_csr;
 mod number_idx_2d;
 mod once_only_inclusion;
 mod remap_walk;
@@ -53,6 +54,7 @@ use flat_segments::build_flat_segments_kernel;
 use hashmap_macro::define_hashmap;
 use identity_gather::build_identity_carriers_kernel;
 use inline_bytes::build_inline_bytes_kernel;
+use node_ct_csr::build_node_ct_csr_kernel;
 use number_idx_2d::build_number_idx_2d_kernel;
 use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
@@ -332,6 +334,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // DenseColumns slice + concat feeding the number idx_2d kernel). See
     // `flat_segments.rs`.
     m.add_function(wrap_pyfunction!(build_flat_segments_kernel, m)?)?;
+
+    // Per-node call-target-section CSR build (the vector remap path's
+    // object-tree-free `_build_ct_columns` replacement: columnar ct_*
+    // slices + section_of_node -> per-node CT CSR). See `node_ct_csr.rs`.
+    m.add_function(wrap_pyfunction!(build_node_ct_csr_kernel, m)?)?;
 
     // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
     // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.

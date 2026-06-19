@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 import numpy as np
+from dedup_hashmap import build_node_ct_csr_kernel
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
@@ -106,6 +107,40 @@ class CatalogColumns:
             )
             self._ct_section_cache[sec] = ct_section
         return ct_section
+
+    def node_ct_csr(
+        self,
+        section_of_node: np.ndarray,
+        func_slot_lut: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-node call-target-section CSR ``(ct_off, ct_fid, ct_func_slot)``.
+
+        Each node emits its OWNING section's call_target table in section
+        order; the per-entry ``(fid, func_slot)`` is ``ct_function_name_ptr``
+        widened to int64 + ``func_slot_lut[ct_type]``. This is the GIL-
+        released, object-tree-free twin of gathering a parsed
+        ``list[CallTarget]`` per node (:meth:`call_targets_section`) and
+        re-extracting those two ints -- it slices the SAME columnar ``ct_*``
+        flats the parse reads, in the SAME node order, so the concatenation
+        is byte-identical.
+
+        Parameters
+        ----------
+        section_of_node:
+            ``int64[n_nodes]`` -- each node's owning catalog section index
+            (:attr:`section_of_node`).
+        func_slot_lut:
+            ``int64[n_call_target_types]`` -- the ``CallTargetType`` int
+            value to FUNCTION slot lookup (the caller's remap slot map). The
+            kernel indexes it by ``ct_type``.
+        """
+        return build_node_ct_csr_kernel(
+            np.ascontiguousarray(self._cols.ct_function_name_ptr, dtype=np.uint32),
+            np.ascontiguousarray(self._cols.ct_type, dtype=np.uint8),
+            np.ascontiguousarray(self._ct_offsets, dtype=np.int64),
+            np.ascontiguousarray(section_of_node, dtype=np.int64),
+            np.ascontiguousarray(func_slot_lut, dtype=np.int64),
+        )
 
 
 def build_catalog_columns(
