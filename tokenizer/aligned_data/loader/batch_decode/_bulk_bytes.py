@@ -160,7 +160,7 @@ def build_bulk_bytes(
         number_chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
-    ) = build_number_idx_2d(stage2, inline_bytes, inline_byte_slices)
+    ) = build_number_idx_2d(dense, inline_bytes, inline_byte_slices)
 
     # 5. Per-source signs grouped by TokenType, in the same stream-source
     #    order the per-type idx_2d arrays use. Reads

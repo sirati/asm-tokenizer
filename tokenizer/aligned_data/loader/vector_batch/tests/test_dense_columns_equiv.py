@@ -348,7 +348,7 @@ def _assert_kept_index(stage2: Stage2Batch, dense: DenseColumns) -> None:
         "kept_node_index diverges from flatten_call_targets.ct_index"
     )
     seg = build_flat_segments(
-        stage2, build_inline_bytes(dense)[1]
+        dense, build_inline_bytes(dense)[1]
     )
     assert np.array_equal(dense.kept_node_index, seg.ct_index)
 
@@ -374,7 +374,7 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
     )
     assert len(id_slices) == dense.n_nodes
 
-    seg = build_flat_segments(stage2, inline_slices)
+    seg = build_flat_segments(dense, inline_slices)
     assert np.array_equal(seg.ct_index, dense.kept_node_index)
     # seg.seg_surviving is the kept nodes' surviving_token_count, in dense
     # kept order.

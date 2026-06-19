@@ -26,6 +26,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from tokenizer.aligned_data.loader.batch_decode._flat_call_targets import (
+    dense_columns_from_stage2,
+)
 from tokenizer.aligned_data.loader.batch_decode._number_decode import (
     _NUMBER_BLOCK_TOKEN_TYPES,
     build_number_idx_2d,
@@ -265,7 +268,7 @@ def test_empty_batch_emits_all_empty_arrays() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [slice(1, 1)])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [slice(1, 1)])
 
     # All TokenType keys are present, all empty.
     for T in _NUMBER_BLOCK_TOKEN_TYPES:
@@ -303,7 +306,7 @@ def test_f32_single_source_one_row_four_bytes() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.FLOAT32],
@@ -354,7 +357,7 @@ def test_fixed_width_fp_single_source(
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[token_type],
@@ -405,7 +408,7 @@ def test_f128_finite_single_source_two_chunks() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.FLOAT128],
@@ -463,7 +466,7 @@ def test_f128_finite_mid_cut_still_emits_both_chunks() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # Both chunks present. LSB row first (bytes 9..16), then MSB row
     # (bytes 1..8) -- matches the LSB-first stream emission order.
@@ -510,7 +513,7 @@ def test_f128_nan_or_inf_single_source_one_chunk() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.FLOAT128],
@@ -570,7 +573,7 @@ def test_vc2_L17_three_chunks_with_msb_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     expected_rows = np.array(
         [
@@ -614,7 +617,7 @@ def test_vc2_L8_one_chunk_no_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     expected_rows = np.array(
         [[p, p + 1, p + 2, p + 3, p + 4, p + 5, p + 6, p + 7]],
@@ -657,7 +660,7 @@ def test_vc2_L0_one_chunk_all_pad() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # VC2 chunk: all 8 pad zeros.
     np.testing.assert_array_equal(
@@ -713,7 +716,7 @@ def test_vc2_mid_cut_drops_msb_chunk() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     expected_rows = np.array(
         [
@@ -830,7 +833,7 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct0_slice, ct1_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct0_slice, ct1_slice])
 
     # CT0's F32 row.
     np.testing.assert_array_equal(
@@ -890,7 +893,7 @@ def test_dtypes_and_sidecar_widths() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     for T, arr in idx_2d_per_type.items():
         assert arr.dtype == np.uint32, f"{T} idx_2d dtype = {arr.dtype}"
@@ -931,7 +934,7 @@ def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
         chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # Only F16 emits; everything else empty.
     np.testing.assert_array_equal(
@@ -1065,7 +1068,7 @@ def test_terminal_vc2_carrier_no_oob_or_neighbor_misread() -> None:
         _f128,
         vc2_sidecar,
     ) = build_number_idx_2d(
-        stage2_batch, inline_bytes, [ct0_slice, ct1_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct0_slice, ct1_slice]
     )
 
     vc2_rows = idx_2d_per_type[TokenType.VALUED_CONST_V2]
@@ -1106,7 +1109,7 @@ def test_in_bounds_vc2_carrier_reads_real_length() -> None:
         _slices,
         _f128,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.VALUED_CONST_V2],

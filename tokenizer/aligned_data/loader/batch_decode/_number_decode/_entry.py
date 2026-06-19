@@ -81,7 +81,7 @@ Plan refs: ``batch_decode_plan.md`` ALG-7 + ALG-8 + Stage 3 step 4.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import List
 
 import numpy as np
 
@@ -95,17 +95,15 @@ from ._band_constants import (
     _NUMBER_BAND_LO_SHIFTED,
     _NUMBER_BLOCK_TOKEN_TYPES,
 )
+from .._dense_columns import DenseColumns
 from ._flat_segments import build_flat_segments
-
-if TYPE_CHECKING:
-    from .._types import Stage2Batch
 
 
 __all__ = ["build_number_idx_2d"]
 
 
 def build_number_idx_2d(
-    stage2_batch: "Stage2Batch",
+    dense: DenseColumns,
     inline_bytes: np.ndarray,
     inline_byte_slices: list[slice],
 ) -> tuple[
@@ -124,11 +122,11 @@ def build_number_idx_2d(
 
     Parameters
     ----------
-    stage2_batch
-        Per-call_target reads pull ``stage1.state`` (raw_tokens, masks,
-        runlen_number) -- the byte-width / payload-length data lives
-        in the ORIGINAL pre-promotion stream, while expansion identifies
-        which positions are chunk-carriers.
+    dense
+        The shared :class:`DenseColumns` front-matter; the per-node reads
+        pull ``raw_tokens`` / masks / ``runlen_number`` -- the byte-width /
+        payload-length data lives in the ORIGINAL pre-promotion stream,
+        while expansion identifies which positions are chunk-carriers.
     inline_bytes
         3a's flat ``u8`` buffer (index 0 = leading-zero pad). Not
         mutated here -- the rows we emit are gather offsets into it.
@@ -160,7 +158,7 @@ def build_number_idx_2d(
         ``exponent_base``.
     """
 
-    flat = build_flat_segments(stage2_batch, inline_byte_slices)
+    flat = build_flat_segments(dense, inline_byte_slices)
 
     # Per-block fixed widths, in the canonical NUMBER-block order. VC2 +
     # F128 emit 8-byte chunk rows; the fixed-width types emit their full
