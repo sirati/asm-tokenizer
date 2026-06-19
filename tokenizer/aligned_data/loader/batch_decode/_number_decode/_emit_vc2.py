@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ._seg_lengths import seg_lengths_from_base
+
 
 __all__ = ["emit_vc2_rows"]
 
@@ -116,7 +118,25 @@ def emit_vc2_rows(
         )
 
     # ALG-8: ``L = runlen_number[p_carrier + 1]`` from the owning segment.
-    L = runlen_number_flat[seg_runlen_base[carrier_seg] + p_carriers + 1]
+    # ``runlen_number`` is length ``N`` (only ``digit_cumsum`` is ``N+1``),
+    # so the ``+1`` lookahead must be bounds-guarded against the carrier's
+    # OWN segment -- mirrors the F128 emitter's per-segment guard. A VC2
+    # carrier at the segment's final raw position has no ``+1`` slot; its
+    # value is zero-length, giving ``L = 0`` (then ``K_full = max(1, 0) =
+    # 1``, the single LSB chunk -- the correct ALG-8 zero-payload result).
+    # Without the guard this either reads off the end of the flat array
+    # (terminal carrier in the LAST segment -> IndexError) or silently
+    # misreads the NEIGHBOUR segment's value (terminal in a non-last
+    # segment).
+    seg_runlen_len = seg_lengths_from_base(
+        seg_runlen_base, int(runlen_number_flat.shape[0])
+    )
+    lookahead_raw = p_carriers + 1
+    in_seg = lookahead_raw < seg_runlen_len[carrier_seg]
+    L = np.zeros(n_carriers, dtype=np.int64)
+    L[in_seg] = runlen_number_flat[
+        seg_runlen_base[carrier_seg[in_seg]] + lookahead_raw[in_seg]
+    ]
     K_full = np.maximum(1, (L + 7) // 8)
 
     # Segmented trailing-painted-run, then per-carrier lookahead at

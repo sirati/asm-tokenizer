@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ._seg_lengths import seg_lengths_from_base
+
 
 __all__ = ["emit_f128_rows"]
 
@@ -71,10 +73,8 @@ def emit_f128_rows(
     # a finite carrier (the painting placed a slot there); a carrier at
     # the segment's final FULL slot has no ``+1`` slot and is NaN/Inf.
     seg_base = seg_f128_base[carrier_seg]
-    seg_full_len = np.diff(
-        np.concatenate(
-            [seg_f128_base, np.array([f128_full_mask_flat.shape[0]], dtype=np.int64)]
-        )
+    seg_full_len = seg_lengths_from_base(
+        seg_f128_base, int(f128_full_mask_flat.shape[0])
     )
     lookahead_local = expanded_positions + 1
     in_range = lookahead_local < seg_full_len[carrier_seg]
