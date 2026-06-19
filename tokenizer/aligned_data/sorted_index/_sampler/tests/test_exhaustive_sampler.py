@@ -91,7 +91,13 @@ def _materialize(pointers) -> List[Tuple[str, int, Tuple[int, ...]]]:
 def test_completeness_every_section_once_all_variants(tmp_path: Path) -> None:
     # Two binaries, sections spread across MULTIPLE length buckets to prove
     # the full band ``EXCLUDED_LENGTH+1 .. max_length`` enumerates them all.
-    alpha = _make_reader(tmp_path, "alpha", np.array([5, 9, 5, 12], np.uint32))
+    # ``alpha`` deliberately places a section at the LOWEST in-band length
+    # ``EXCLUDED_LENGTH + 1`` so the band's ``lo`` edge is actually
+    # exercised (a +1 off-by-one in ``lo`` would silently drop it).
+    low = EXCLUDED_LENGTH + 1
+    alpha = _make_reader(
+        tmp_path, "alpha", np.array([5, 9, low, 12], np.uint32)
+    )
     beta = _make_reader(tmp_path, "beta", np.array([3, 7], np.uint32))
     counts = {
         "alpha": {0: 1, 1: 3, 2: 4, 3: 2},
@@ -102,22 +108,24 @@ def test_completeness_every_section_once_all_variants(tmp_path: Path) -> None:
 
     pointers = all_section_pointers(readers, provider)
 
-    # Cross-check against enumerate_in_band over the FULL band per reader:
-    # the emitted (binary, section) set EQUALS the reader's full-band set,
-    # exactly once, no dups, no drops.
-    for name, reader in (("alpha", alpha), ("beta", beta)):
-        full_band = set(
-            int(i)
-            for i in reader.enumerate_in_band(
-                EXCLUDED_LENGTH + 1, reader.max_length
-            )
-        )
+    # Cross-check against an INDEPENDENT expected full-band set built from
+    # the lengths arrays directly (NOT from enumerate_in_band, so a band
+    # ``lo`` off-by-one in the module is detectable rather than mirrored by
+    # the reference): every section whose length is in the non-excluded
+    # band must appear EXACTLY once -- no dups, no drops.
+    expected = {
+        "alpha": {2},  # the length-1 (lowest-edge) section MUST appear.
+        "beta": set(),
+    }
+    expected["alpha"].update({0, 1, 3})  # lengths 5, 9, 12 are all in-band.
+    expected["beta"].update({0, 1})  # lengths 3, 7 are all in-band.
+    for name in ("alpha", "beta"):
         emitted = [
             p.section_pointer.idx for p in pointers if p.binary_name == name
         ]
-        assert sorted(emitted) == sorted(full_band)  # same set
+        assert sorted(emitted) == sorted(expected[name])  # same set
         assert len(emitted) == len(set(emitted))  # no dups
-        assert set(emitted) == full_band  # no drops
+        assert set(emitted) == expected[name]  # no drops
 
     # Each pointer carries ALL variants in ascending raw order.
     for p in pointers:
@@ -194,6 +202,25 @@ def test_order_binary_input_then_enumeration_then_variants(
 # ---------------------------------------------------------------------------
 # BAND EDGES + EMPTY / SINGLE-VARIANT EDGE CASES
 # ---------------------------------------------------------------------------
+
+
+def test_lowest_inband_edge_enumerated_once(tmp_path: Path) -> None:
+    # Sections at the LOWEST in-band length ``EXCLUDED_LENGTH + 1`` must be
+    # enumerated exactly once -- this pins the band ``lo`` edge so a +1
+    # off-by-one (``EXCLUDED_LENGTH + 1`` -> ``EXCLUDED_LENGTH + 2``) that
+    # silently drops them is caught. The expected idx set is built
+    # INDEPENDENTLY from the lengths array, not from enumerate_in_band, so
+    # the reference cannot mirror a module-side ``lo`` mistake.
+    low = EXCLUDED_LENGTH + 1
+    rdr = _make_reader(tmp_path, "x", np.array([low, 5, low], np.uint32))
+    counts = {"x": {0: 2, 1: 3, 2: 1}}
+    provider = _count_provider_from(counts)
+
+    pointers = all_section_pointers([("x", _SPEC, rdr)], provider)
+    emitted = {p.section_pointer.idx for p in pointers}
+    # idx 0 and 2 sit at the lowest in-band length; idx 1 at length 5.
+    assert emitted == {0, 1, 2}
+    assert {0, 2} <= emitted  # explicit lowest-edge inclusion
 
 
 def test_excluded_length_bucket_never_enumerated(tmp_path: Path) -> None:
