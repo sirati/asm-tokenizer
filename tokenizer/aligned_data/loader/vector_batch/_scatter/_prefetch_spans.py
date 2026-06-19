@@ -9,17 +9,16 @@ before reading it).
 
 The formula is a DELIBERATE SAFE OVER-ESTIMATE of each stored record's
 body byte span. Validated corpus-wide (4 binaries incl z3, 17.3M
-records): it UNDER-estimates only ~0.0005% of records (the metric that
+records): it UNDER-estimates only ~0.0021% of records (the metric that
 matters -- a rare under-estimate just faults the missed tail naturally,
-never a correctness effect), at ~45% mean over-read. The ``+ 256`` term
-covers very short functions almost for free (their const-vector body
-mostly shares the record's first page), which is what crushes the
-under-estimate rate on the small-record tail:
+never a correctness effect, worst miss ~84 bytes), at just ~4.6% over-
+read in PAGES (the only over-read that costs a real page-in; the 26%
+BYTE over-read mostly lands inside already-faulted pages):
 
     body_len   = own_length - 1            (own_length = 1 self + body)
     span_bytes = ceil((body_len
-                       + value_total * 3.5
-                       + id_total * 1.25) * 2 * 1.101 + 256)
+                       + value_total * 4
+                       + id_total * 2) * 2 * 1.101 + 25)
 
 ``2`` is ``bytes_per_token``: body tokens are always u16 (there is no
 variable token width). The exact stored span is intentionally NOT
@@ -72,6 +71,6 @@ def estimate_body_prefetch_ranges(cols, emission) -> Tuple[np.ndarray, np.ndarra
     value_total = emission.value_total.astype(np.int64)
     id_total = emission.id_total.astype(np.int64)
     span = np.ceil(
-        (body_len + value_total * 3.5 + id_total * 1.25) * 2 * 1.101 + 256
+        (body_len + value_total * 4 + id_total * 2) * 2 * 1.101 + 25
     ).astype(np.int64)
     return starts, span
