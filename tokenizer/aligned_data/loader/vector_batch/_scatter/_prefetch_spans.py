@@ -14,7 +14,7 @@ z3, 14.86M records):
     body_len   = own_length - 1            (own_length = 1 self + body)
     span_bytes = ceil((body_len
                        + value_total * 8
-                       + id_total * 2) * 2 * 1.11 + 30)
+                       + id_total * 2) * 2 * 1.101 + 25)
 
 ``2`` is ``bytes_per_token``: body tokens are always u16 (there is no
 variable token width). The exact stored span is intentionally NOT
@@ -67,6 +67,6 @@ def estimate_body_prefetch_ranges(cols, emission) -> Tuple[np.ndarray, np.ndarra
     value_total = emission.value_total.astype(np.int64)
     id_total = emission.id_total.astype(np.int64)
     span = np.ceil(
-        (body_len + value_total * 8 + id_total * 2) * 2 * 1.11 + 30
+        (body_len + value_total * 8 + id_total * 2) * 2 * 1.101 + 25
     ).astype(np.int64)
     return starts, span
