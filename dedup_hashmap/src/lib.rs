@@ -46,6 +46,7 @@ mod once_only_inclusion;
 mod remap_walk;
 mod row_inclusions;
 mod segment_distinct;
+mod strip_shift_prepend;
 
 use adjacency_expand::LiveAdjacencyKernel;
 use once_only_inclusion::OnceOnlyInclusionKernel;
@@ -60,6 +61,7 @@ use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
 use row_inclusions::compute_row_inclusions_kernel;
 use segment_distinct::segment_distinct_count;
+use strip_shift_prepend::build_strip_shift_prepend_kernel;
 
 // -- Generated classes -----------------------------------------------------
 //
@@ -339,6 +341,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // object-tree-free `_build_ct_columns` replacement: columnar ct_*
     // slices + section_of_node -> per-node CT CSR). See `node_ct_csr.rs`.
     m.add_function(wrap_pyfunction!(build_node_ct_csr_kernel, m)?)?;
+
+    // Batched strip + shift + prepend over the painted raw working stream
+    // (the GIL-released `_strip_shift_prepend` twin: drop the <=256 band,
+    // shift survivors down 256, prepend each node's self-token). See
+    // `strip_shift_prepend.rs`.
+    m.add_function(wrap_pyfunction!(build_strip_shift_prepend_kernel, m)?)?;
 
     // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
     // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.

@@ -28,6 +28,7 @@ from ._native import (
     build_inline_bytes_kernel,
     build_node_ct_csr_kernel,
     build_number_idx_2d_kernel,
+    build_strip_shift_prepend_kernel,
     compute_row_inclusions_kernel,
     segment_distinct_count,
 )
@@ -52,6 +53,7 @@ __all__ = list(_native.__all__) + [
     "build_inline_bytes_kernel",
     "build_node_ct_csr_kernel",
     "build_number_idx_2d_kernel",
+    "build_strip_shift_prepend_kernel",
     "compute_row_inclusions_kernel",
     "segment_distinct_count",
 ]

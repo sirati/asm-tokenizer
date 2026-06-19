@@ -149,10 +149,8 @@ def batched_expand(
         working,
         extra_vc2_raw,
         extra_f128_raw,
-        node_of,
         rec_starts,
         counts,
-        n_nodes,
         self_token_ids,
     )
 

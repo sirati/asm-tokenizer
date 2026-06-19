@@ -14,6 +14,7 @@ orchestration from :mod:`._expansion`.
 from __future__ import annotations
 
 import numpy as np
+from dedup_hashmap import build_strip_shift_prepend_kernel
 
 from ._constants import (
     _FLOAT128_VOCAB_ID,
@@ -112,10 +113,8 @@ def _strip_shift_prepend(
     working: np.ndarray,
     extra_vc2_raw: np.ndarray,
     extra_f128_raw: np.ndarray,
-    node_of: np.ndarray,
     rec_starts: np.ndarray,
     counts: np.ndarray,
-    n_nodes: int,
     self_token_ids: np.ndarray,
 ):
     """Strip ``<= 256`` slots, shift surviving ids, prepend self-tokens.
@@ -128,48 +127,25 @@ def _strip_shift_prepend(
     Returns ``(expanded, node_offsets, extra_value_v2_mask,
     extra_f128_mask)`` over the EXPANDED stream (slot 0 per node = the
     prepended self-token, both masks False there).
+
+    The keep-filter + shift + scatter is performed by the GIL-released
+    :func:`build_strip_shift_prepend_kernel` over the per-node CSR windows
+    (``rec_starts`` + ``counts``); the kernel derives each survivor's
+    intra-node rank from its window scan, so ``node_of`` is no longer read
+    here (the per-node window IS the segmentation). The #92 per-node-length
+    discipline is preserved: each node's body length is the count of
+    survivors in its own raw window, so consecutive empty bodies never
+    merge.
     """
-    total = working.shape[0]
-    node_offsets = np.zeros(n_nodes + 1, dtype=np.int64)
-    if n_nodes == 0:
-        return (
-            np.zeros(0, dtype=np.uint16),
-            node_offsets,
-            np.zeros(0, dtype=bool),
-            np.zeros(0, dtype=bool),
+    expanded, node_offsets, extra_value_v2_mask, extra_f128_mask = (
+        build_strip_shift_prepend_kernel(
+            np.ascontiguousarray(working, dtype=np.uint16),
+            np.ascontiguousarray(extra_vc2_raw, dtype=bool),
+            np.ascontiguousarray(extra_f128_raw, dtype=bool),
+            np.ascontiguousarray(rec_starts, dtype=np.int64),
+            np.ascontiguousarray(counts, dtype=np.int64),
+            np.ascontiguousarray(self_token_ids, dtype=np.uint16),
+            int(_V2_RESERVED_DIGIT_COUNT),
         )
-
-    keep = working > _V2_RESERVED_DIGIT_COUNT  # bool[total]
-
-    # Per-node surviving body length via cumsum-diff at the node bounds.
-    surv_cum = np.zeros(total + 1, dtype=np.int64)
-    if total > 0:
-        np.cumsum(keep.view(np.uint8), out=surv_cum[1:])
-    rec_ends = rec_starts + counts
-    body_len = surv_cum[rec_ends] - surv_cum[rec_starts]  # int64[n_nodes]
-    own_length = body_len + 1  # + the prepended self-token
-
-    np.cumsum(own_length, out=node_offsets[1:])
-    total_expanded = int(node_offsets[-1])
-
-    expanded = np.empty(total_expanded, dtype=np.uint16)
-    extra_value_v2_mask = np.zeros(total_expanded, dtype=bool)
-    extra_f128_mask = np.zeros(total_expanded, dtype=bool)
-
-    # Self-token at each node's slot 0 (both masks already False there).
-    expanded[node_offsets[:-1]] = self_token_ids.astype(np.uint16, copy=False)
-
-    # Surviving body ids land at slots [node_offset + 1 + body_rank]; the
-    # rank within the node's surviving body is the local survivor cumsum.
-    if total > 0:
-        kept_idx = np.nonzero(keep)[0]
-        node_k = node_of[kept_idx]
-        body_rank = surv_cum[kept_idx] - surv_cum[rec_starts[node_k]]
-        dst = node_offsets[node_k] + 1 + body_rank
-        expanded[dst] = (
-            working[kept_idx] - _V2_RESERVED_DIGIT_COUNT
-        ).astype(np.uint16)
-        extra_value_v2_mask[dst] = extra_vc2_raw[kept_idx]
-        extra_f128_mask[dst] = extra_f128_raw[kept_idx]
-
+    )
     return expanded, node_offsets, extra_value_v2_mask, extra_f128_mask
