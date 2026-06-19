@@ -363,7 +363,10 @@ class GpuBatchPrefetcher:
 
             kind, value = payload
             if kind == "err":
-                self._pending[seq] = DecodeWorkerError(value)
+                # ``value`` is a WorkerExcInfo carrying the worker-side
+                # formatted traceback; surface it in the re-raised error
+                # so the internal frame isn't lost across the spawn.
+                self._pending[seq] = DecodeWorkerError(value.as_message())
             else:
                 self._pending[seq] = value
 

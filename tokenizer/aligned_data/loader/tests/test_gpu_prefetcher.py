@@ -162,6 +162,18 @@ def _produce_raises(src, request):
     return {"request": request, "worker_pid": os.getpid()}
 
 
+def _inner_boom():
+    # A NAMED inner frame so the worker-side traceback that crosses the
+    # spawn boundary has a recognisable function name to assert on.
+    raise RuntimeError("deep worker failure")
+
+
+def _produce_raises_nested(src, request):
+    if request == "boom":
+        _inner_boom()
+    return {"request": request, "worker_pid": os.getpid()}
+
+
 def _noop_to_device(t, device):  # records nothing; batches carry no tensors
     return t
 
@@ -317,6 +329,36 @@ def test_orchestration_worker_exception_propagates_not_hang():
         # The pipeline keeps serving after the error.
         third = p.get()
         assert third["request"] == "ok-2"
+
+
+def test_orchestration_worker_exception_carries_worker_traceback():
+    # A worker ``produce`` exception must surface in the main process WITH
+    # the worker-side formatted traceback (the internal frame that died in
+    # the worker), not just ``repr(exc)`` -- else a debug round-trip is lost
+    # across the spawn boundary. The re-raised error names both the inner
+    # frame (``_inner_boom``) and the original exception type/message.
+    with GpuBatchPrefetcher(
+        make_source=_make_source,
+        produce=_produce_raises_nested,
+        device="cpu",
+        decode_workers=1,
+        decode_ahead=2,
+        gpu_ahead=1,
+        start_method="spawn",
+        to_device=_noop_to_device,
+        is_leaf=_never_leaf,
+    ) as p:
+        p.submit("boom")
+        with pytest.raises(RuntimeError) as excinfo:
+            p.get()
+        msg = str(excinfo.value)
+        # The original exception type + message.
+        assert "RuntimeError" in msg
+        assert "deep worker failure" in msg
+        # The worker-side traceback (the inner frame that raised) -- this is
+        # what ``repr(exc)`` alone dropped.
+        assert "_inner_boom" in msg
+        assert "Traceback" in msg
 
 
 # ==========================================================================
