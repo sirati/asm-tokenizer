@@ -87,26 +87,28 @@ def prefetch_willneed(
         return
 
     # (4) Coalesce: sort by aligned start, merge ranges whose intervals
-    # touch or overlap (next_start <= running_end) into single runs.
+    # touch or overlap into single runs -- fully vectorized. A new run
+    # starts wherever a range's start exceeds the running max-end of all
+    # earlier ranges; ``reduceat`` then takes each run's first start and
+    # its max end. Only the (few) merged runs reach Python for the
+    # madvise calls -- adjacent records coalesce heavily, so this is a
+    # handful of syscalls regardless of batch size.
     order = np.argsort(aligned, kind="stable")
     aligned = aligned[order]
     ends = ends[order]
 
-    run_starts = aligned
-    run_ends = ends
-    cur_start = int(run_starts[0])
-    cur_end = int(run_ends[0])
-    for i in range(1, run_starts.size):
-        s = int(run_starts[i])
-        e = int(run_ends[i])
-        if s <= cur_end:
-            if e > cur_end:
-                cur_end = e
-        else:
-            _advise(mm, cur_start, cur_end - cur_start)
-            cur_start = s
-            cur_end = e
-    _advise(mm, cur_start, cur_end - cur_start)
+    # Running max-end of everything strictly before each range.
+    prev_max_end = np.empty_like(ends)
+    prev_max_end[0] = aligned[0]  # first range always opens a run
+    np.maximum.accumulate(ends[:-1], out=prev_max_end[1:])
+    run_open = aligned > prev_max_end  # True => this range begins a new run
+    run_open[0] = True
+    run_first = np.flatnonzero(run_open)  # index of each run's first range
+    run_starts = aligned[run_first]
+    run_ends = np.maximum.reduceat(ends, run_first)
+
+    for start, end in zip(run_starts.tolist(), run_ends.tolist()):
+        _advise(mm, start, end - start)
 
 
 def _advise(mm: mmap.mmap, start: int, length: int) -> None:
