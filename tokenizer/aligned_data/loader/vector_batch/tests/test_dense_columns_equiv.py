@@ -367,10 +367,10 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
 
     # 3b carriers + 3c segments + sign all key off the kept axis.
     carrier_off, carrier_L, carrier_pos = _gather_identity_carriers(
-        stage2, inline_slices
+        dense, inline_slices
     )
     idx_2d, id_slices = build_identity_idx_2d(
-        stage2, inline_bytes, inline_slices
+        dense, inline_bytes, inline_slices
     )
     assert len(id_slices) == dense.n_nodes
 

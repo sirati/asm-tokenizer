@@ -142,7 +142,7 @@ def build_bulk_bytes(
     #    inline_bytes; per-call-target identity_slices INCLUDE the
     #    prepend slot at slice.start.
     identity_idx_2d, identity_slices = build_identity_idx_2d(
-        stage2, inline_bytes, inline_byte_slices
+        dense, inline_bytes, inline_byte_slices
     )
 
     # 3. view-cast 3b's idx_2d to u16 in-stream caller-local ids. NO
