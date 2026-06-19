@@ -66,6 +66,62 @@ from ._rich_corpus import build_rich_splice_fixture
 
 _TRIPLE_FIELDS = ("out_block", "slice_start", "ct_ordinal")
 
+# Canonical NUMBER-block indices (``shifted_id - 1``): block 0 = VC2,
+# block 6 = F128 (the sharp edges the gate must exercise).
+_VC2_BLOCK = 0
+_F128_BLOCK = 6
+
+
+def _edge_coverage(stage3, columnar):
+    """What sharp edges this captured batch exercises.
+
+    Returns ``(has_f128, has_vc2_multichunk, has_f128_midcut)``:
+
+    * ``has_f128`` -- a block-6 chunk is present at all.
+    * ``has_vc2_multichunk`` -- a per-(ct, VC2) rank >= 1 occurs, i.e. a
+      call_target carries >= 2 surviving VC2 chunks (a >8-byte K>=2
+      source or two VC2 sources -- either way the rank reset is
+      load-bearing).
+    * ``has_f128_midcut`` -- some call_target emits MORE F128 idx_2d rows
+      (kernel slice length) than it has surviving F128 chunks in the
+      stream: the 2-rows / 1-surviving-slot mid-cut edge whose row count
+      the re-derivation bug under-counts (shifting later F128 bases).
+    """
+    from tokenizer.tokens import TokenType
+
+    out_block = np.asarray(columnar.out_block)
+    ct_ordinal = np.asarray(columnar.ct_ordinal)
+    has_f128 = bool((out_block == _F128_BLOCK).any())
+
+    # VC2 multichunk: a ct with >= 2 surviving VC2 chunks.
+    has_vc2_multichunk = False
+    f128_starts = np.asarray(
+        stage3.number_chunk_slice_starts_per_type[TokenType.FLOAT128]
+    )
+    # Per-ct kernel F128 row count = the slice length implied by the
+    # abutting per-ct ``.start`` boundaries (last ct's length is whatever
+    # the global F128 table holds beyond its start; a mid-cut still leaves
+    # a non-final ct whose start gap exceeds its surviving chunk count).
+    n_cts = int(f128_starts.shape[0])
+    f128_rows_per_ct = np.diff(
+        np.concatenate([f128_starts, f128_starts[-1:]])
+    ) if n_cts else np.empty(0, dtype=np.int64)
+    has_f128_midcut = False
+    for ct in np.unique(ct_ordinal):
+        ct = int(ct)
+        vc2_here = int(((out_block == _VC2_BLOCK) & (ct_ordinal == ct)).sum())
+        if vc2_here >= 2:
+            has_vc2_multichunk = True
+        f128_here = int(((out_block == _F128_BLOCK) & (ct_ordinal == ct)).sum())
+        if 0 < ct < n_cts and f128_here > 0:
+            if int(f128_rows_per_ct[ct]) > f128_here:
+                has_f128_midcut = True
+        # ct 0's row count is the gap to ct 1's start; check it directly.
+        if ct == 0 and n_cts >= 2 and f128_here > 0:
+            if int(f128_starts[1] - f128_starts[0]) > f128_here:
+                has_f128_midcut = True
+    return has_f128, has_vc2_multichunk, has_f128_midcut
+
 
 def _assert_chunk_columns_equal(
     tree: NumberChunkColumns, columnar: NumberChunkColumns
@@ -133,6 +189,9 @@ def test_number_chunk_columns_equiv_live_binary(
 
     assert captured, "the columnar number-sidecar path was never exercised"
     any_chunks = False
+    saw_f128 = False
+    saw_vc2_multichunk = False
+    saw_f128_midcut = False
     for stage3, tree, columnar in captured:
         _assert_chunk_columns_equal(tree, columnar)
 
@@ -147,7 +206,29 @@ def test_number_chunk_columns_equiv_live_binary(
 
         if tree.out_block.shape[0] > 0:
             any_chunks = True
+        f128, vc2_mc, f128_midcut = _edge_coverage(stage3, columnar)
+        saw_f128 |= f128
+        saw_vc2_multichunk |= vc2_mc
+        saw_f128_midcut |= f128_midcut
     assert any_chunks, "live capture carried no number chunks -- vacuous gate"
+
+    # Teeth on the sharp edges (the whole point of the rich corpus): the
+    # gate must actually EXERCISE the F128 block + the VC2 K>=2 rank reset
+    # on every grid point, else the equivalence is proven only on the
+    # trivial single-chunk arms (the audit's blind-spot).
+    assert saw_f128, "no F128 (block 6) chunk exercised -- vacuous F128 arm"
+    assert saw_vc2_multichunk, (
+        "no per-(ct, VC2) rank >= 1 exercised -- vacuous VC2 multi-chunk arm"
+    )
+    # Only the cut grid point straddles the F128 mid-body: there the
+    # 2-rows / 1-surviving-slot edge (a kernel F128 slice longer than the
+    # surviving chunk count) MUST appear -- the precise edge a slice-start
+    # re-derivation would mis-count.
+    if max_depth == 3 and context_len == 7:
+        assert saw_f128_midcut, (
+            "the mid-cut F128 (2 idx_2d rows, 1 surviving slot) was not "
+            "exercised -- the slice-base re-derivation hazard is untested"
+        )
 
 
 # ---------------------------------------------------------------------------
