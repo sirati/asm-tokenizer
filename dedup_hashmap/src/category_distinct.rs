@@ -53,6 +53,7 @@ use pyo3::prelude::*;
 enum Decoded {
     Id { node: usize, id: u16 },
     BadWidth { pos: usize, length: u16 },
+    TruncatedPayload { pos: usize, length: u16 },
 }
 
 /// Per-category, per-node distinct caller-local-id counts.
@@ -152,6 +153,14 @@ fn count_grid(
                              restricts identity payloads to {{0, 1, 2}} bytes."
                         )));
                     }
+                    Decoded::TruncatedPayload { pos, length } => {
+                        return Err(PyValueError::new_err(format!(
+                            "Identity carrier id {carrier_id} at raw position \
+                             {pos} declared payload length {length} but its \
+                             payload byte(s) fall outside the owning node / \
+                             stream -- truncated v2 stream (corrupt locator)."
+                        )));
+                    }
                 }
             }
         }
@@ -175,13 +184,29 @@ fn decode_carrier(
     let length: u16 = if p + 1 < node_end { runlen[p + 1] } else { 0 };
     match length {
         0 => Decoded::Id { node, id: 0 },
-        1 => Decoded::Id {
-            node,
-            id: raw[p + 1],
-        },
+        1 => {
+            // 1-byte payload reads `raw[p + 1]`. On well-formed v2 the
+            // length-1 run guarantees that slot is in-node; a truncated
+            // stream is a corrupt locator, surfaced as a catchable error
+            // (mirrors the numpy oracle's `IndexError` on the same gather
+            // and the sibling gather_bodies kernel's checked-OOB stance)
+            // rather than an unchecked index panic.
+            if p + 1 >= node_end || p + 1 >= raw.len() {
+                return Decoded::TruncatedPayload { pos: p, length: 1 };
+            }
+            Decoded::Id {
+                node,
+                id: raw[p + 1],
+            }
+        }
         2 => {
             // The 2-long inline run that produced `length == 2` lives
-            // within the node, so `p + 2 < node_end` holds.
+            // within the node on well-formed v2 (`p + 2 < node_end`); a
+            // tail-truncated 2-byte carrier is corrupt input -> catchable
+            // error, not an unchecked-index panic.
+            if p + 2 >= node_end || p + 2 >= raw.len() {
+                return Decoded::TruncatedPayload { pos: p, length: 2 };
+            }
             let hi = raw[p + 1];
             let lo = raw[p + 2];
             Decoded::Id {
@@ -315,6 +340,40 @@ mod tests {
         let carriers = [264u16];
         let err = count_grid(&raw, &runlen, &rec, &carriers, 1);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn truncated_two_byte_payload_raises() {
+        // A 2-byte-declared carrier whose 2nd payload word (p+2) falls
+        // past the owning node end. On well-formed v2 a length-2 run
+        // guarantees p+2 < node_end; a truncated tail is corrupt input.
+        // Must return a catchable Err (mirrors the numpy oracle's
+        // IndexError on the same gather) rather than panic on an
+        // unchecked index.
+        let raw = [264u16, 5];
+        let runlen = [0u16, 2];
+        let rec = [0i64, 2];
+        let carriers = [264u16];
+        let err = count_grid(&raw, &runlen, &rec, &carriers, 1);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn truncated_one_byte_payload_raises() {
+        // A carrier at the node's last slot whose runlen there is 1
+        // (declaring a 1-byte payload that reads p+1) but p+1 is the
+        // NEXT node / past the stream. The has_p1 guard makes length 0
+        // here (no in-node p+1), so this decodes as a 0-byte id 0, NOT a
+        // truncation -- length is read from runlen[p+1] only when in-node.
+        // Construct the genuine truncation: carrier mid-node with runlen
+        // p+1 == 1 but p+1 is the node's exclusive end.
+        let raw = [99u16, 264u16];
+        let runlen = [0u16, 0u16]; // p+1 (==2) is out of node, length->0
+        let rec = [0i64, 2];
+        let carriers = [264u16];
+        // Carrier at p=1, node_end=2 -> p+1>=node_end -> length 0 -> id 0.
+        let out = count_grid(&raw, &runlen, &rec, &carriers, 1).unwrap();
+        assert_eq!(out, vec![1]);
     }
 
     #[test]
