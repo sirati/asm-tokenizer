@@ -76,12 +76,12 @@ struct FlatSegmentsOut {
 #[allow(clippy::too_many_arguments)]
 fn run_kernel(
     surviving_token_count: &[i64],
-    expanded: &[i64],
+    expanded: &[u16],
     extra_value_v2_mask: &[bool],
     extra_f128_mask: &[bool],
     real_mask: &[bool],
-    runlen_number: &[i64],
-    digit_cumsum: &[i64],
+    runlen_number: &[u16],
+    digit_cumsum: &[u32],
     raw_offsets: &[i64],
     digit_offsets: &[i64],
     node_offsets: &[i64],
@@ -194,7 +194,7 @@ fn run_kernel(
         let body_start = exp_lo + 1;
         let body_end = exp_lo + surviving_u; // == body_start + body
         for p in body_start..body_end {
-            out.expanded_body.push(expanded[p]);
+            out.expanded_body.push(i64::from(expanded[p]));
             out.painted_body
                 .push(extra_value_v2_mask[p] || extra_f128_mask[p]);
         }
@@ -222,14 +222,14 @@ fn run_kernel(
         // digit_cumsum (N + 1 slots per segment).
         out.digit_base.push(digit_running);
         for p in dig_lo..dig_hi {
-            out.digit_flat.push(digit_cumsum[p]);
+            out.digit_flat.push(i64::from(digit_cumsum[p]));
         }
         digit_running += (dig_hi - dig_lo) as i64;
 
         // runlen_number over the raw slice.
         out.seg_runlen_base.push(runlen_running);
         for p in raw_lo..raw_hi {
-            out.runlen_number_flat.push(runlen_number[p]);
+            out.runlen_number_flat.push(i64::from(runlen_number[p]));
         }
         runlen_running += (raw_hi - raw_lo) as i64;
 
@@ -253,12 +253,12 @@ fn run_kernel(
 pub fn build_flat_segments_kernel<'py>(
     py: Python<'py>,
     surviving_token_count: numpy::PyReadonlyArray1<'py, i64>,
-    expanded: numpy::PyReadonlyArray1<'py, i64>,
+    expanded: numpy::PyReadonlyArray1<'py, u16>,
     extra_value_v2_mask: numpy::PyReadonlyArray1<'py, bool>,
     extra_f128_mask: numpy::PyReadonlyArray1<'py, bool>,
     real_mask: numpy::PyReadonlyArray1<'py, bool>,
-    runlen_number: numpy::PyReadonlyArray1<'py, i64>,
-    digit_cumsum: numpy::PyReadonlyArray1<'py, i64>,
+    runlen_number: numpy::PyReadonlyArray1<'py, u16>,
+    digit_cumsum: numpy::PyReadonlyArray1<'py, u32>,
     raw_offsets: numpy::PyReadonlyArray1<'py, i64>,
     digit_offsets: numpy::PyReadonlyArray1<'py, i64>,
     node_offsets: numpy::PyReadonlyArray1<'py, i64>,
@@ -327,12 +327,12 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn one_node(
         surviving: i64,
-        expanded: Vec<i64>,
+        expanded: Vec<u16>,
         extra_vc2: Vec<bool>,
         extra_f128: Vec<bool>,
         real_mask: Vec<bool>,
-        runlen_number: Vec<i64>,
-        digit_cumsum: Vec<i64>,
+        runlen_number: Vec<u16>,
+        digit_cumsum: Vec<u32>,
         slice_start: i64,
     ) -> FlatSegmentsOut {
         let n_raw = real_mask.len() as i64;

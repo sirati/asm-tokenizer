@@ -124,10 +124,10 @@ def build_inline_bytes(
         The flat byte buffer and the per-call-target slice list.
     """
     inline_bytes, per_call_target_counts = build_inline_bytes_kernel(
-        np.ascontiguousarray(dense.raw_tokens, dtype=np.int64),
+        np.ascontiguousarray(dense.raw_tokens, dtype=np.uint16),
         np.ascontiguousarray(dense.number_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
-        np.ascontiguousarray(dense.runlen_number, dtype=np.int64),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.uint16),
         np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.is_cut, dtype=np.bool_),

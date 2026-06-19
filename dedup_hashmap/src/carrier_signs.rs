@@ -51,7 +51,7 @@ fn csr_slice(base: &[i64], e: usize) -> (usize, usize) {
 /// DFS-then-stream encounter order.
 #[allow(clippy::too_many_arguments)]
 fn run_kernel(
-    expanded: &[i64],
+    expanded: &[u16],
     extra_value_v2_mask: &[bool],
     extra_f128_mask: &[bool],
     node_offsets: &[i64],
@@ -112,7 +112,7 @@ fn run_kernel(
             if is_real {
                 real_running += 1;
             }
-            let shifted = expanded[body_start + j];
+            let shifted = expanded[body_start + j] as i64;
             let in_band = shifted >= band_lo && shifted < band_hi;
             if in_band && is_real {
                 // real_idx_local = within-seg cumsum(is_real) - 1; the
@@ -152,7 +152,7 @@ fn run_kernel(
 #[allow(clippy::too_many_arguments)]
 pub fn build_carrier_signs_kernel<'py>(
     py: Python<'py>,
-    expanded: numpy::PyReadonlyArray1<'py, i64>,
+    expanded: numpy::PyReadonlyArray1<'py, u16>,
     extra_value_v2_mask: numpy::PyReadonlyArray1<'py, bool>,
     extra_f128_mask: numpy::PyReadonlyArray1<'py, bool>,
     node_offsets: numpy::PyReadonlyArray1<'py, i64>,
@@ -206,7 +206,7 @@ mod tests {
     /// straight off per-node Vecs, to cross-check `run_kernel`.
     #[allow(clippy::too_many_arguments)]
     fn one_node(
-        expanded_full: Vec<i64>,
+        expanded_full: Vec<u16>,
         extra_vc2: Vec<bool>,
         extra_f128: Vec<bool>,
         real_mask: Vec<bool>,

@@ -130,9 +130,10 @@ def build_flat_segments(
 
     # GIL-released Rust kernel: the per-kept-node ``DenseColumns`` slice +
     # concat (body axis / real-position / digit_cumsum / runlen / painted
-    # prefix / FULL f128) in one ``py.detach`` pass. The uint16 / uint32
-    # source columns are widened to int64 up front (the numpy twin
-    # ``.astype(np.int64)``-ed them per chunk); the masks stay bool.
+    # prefix / FULL f128) in one ``py.detach`` pass. The native-dtype
+    # source columns (expanded / runlen uint16, digit_cumsum uint32) cross
+    # the boundary un-widened -- the kernel widens to i64 internally where
+    # it accumulates; the masks stay bool.
     (
         expanded_body,
         painted_body,
@@ -151,12 +152,12 @@ def build_flat_segments(
         f128_full_mask_flat,
     ) = build_flat_segments_kernel(
         np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
-        np.ascontiguousarray(dense.expanded, dtype=np.int64),
+        np.ascontiguousarray(dense.expanded, dtype=np.uint16),
         np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
-        np.ascontiguousarray(dense.runlen_number, dtype=np.int64),
-        np.ascontiguousarray(dense.digit_cumsum, dtype=np.int64),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.uint16),
+        np.ascontiguousarray(dense.digit_cumsum, dtype=np.uint32),
         np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
         np.ascontiguousarray(dense.digit_offsets, dtype=np.int64),
         np.ascontiguousarray(dense.node_offsets, dtype=np.int64),

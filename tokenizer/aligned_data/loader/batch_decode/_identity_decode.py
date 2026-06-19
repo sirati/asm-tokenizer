@@ -210,11 +210,11 @@ def _gather_identity_carriers(
         count=len(inline_byte_slices),
     )
     return build_identity_carriers_kernel(
-        np.ascontiguousarray(dense.raw_tokens, dtype=np.int64),
+        np.ascontiguousarray(dense.raw_tokens, dtype=np.uint16),
         np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
-        np.ascontiguousarray(dense.runlen_number, dtype=np.int64),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.uint16),
         np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
-        np.ascontiguousarray(dense.digit_cumsum, dtype=np.int64),
+        np.ascontiguousarray(dense.digit_cumsum, dtype=np.uint32),
         np.ascontiguousarray(dense.digit_offsets, dtype=np.int64),
         np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
         np.ascontiguousarray(dense.surviving_identity_count, dtype=np.int64),

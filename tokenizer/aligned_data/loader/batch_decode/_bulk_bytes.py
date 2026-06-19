@@ -377,7 +377,7 @@ def _batched_carrier_signs(
     path did, in the same kept-DFS-then-stream order, byte-identically.
     """
     block_idx, signs = build_carrier_signs_kernel(
-        np.ascontiguousarray(dense.expanded, dtype=np.int64),
+        np.ascontiguousarray(dense.expanded, dtype=np.uint16),
         np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
         np.ascontiguousarray(dense.node_offsets, dtype=np.int64),

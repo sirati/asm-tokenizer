@@ -37,11 +37,11 @@ fn csr_slice(base: &[i64], e: usize) -> (usize, usize) {
 /// `i64`, in DFS-then-stream carrier order.
 #[allow(clippy::too_many_arguments)]
 fn run_kernel(
-    raw_tokens: &[i64],
+    raw_tokens: &[u16],
     real_mask: &[bool],
-    runlen_number: &[i64],
+    runlen_number: &[u16],
     raw_offsets: &[i64],
-    digit_cumsum: &[i64],
+    digit_cumsum: &[u32],
     digit_offsets: &[i64],
     surviving_token_count: &[i64],
     surviving_identity_count: &[i64],
@@ -100,24 +100,25 @@ fn run_kernel(
         let mut taken: i64 = 0;
         for local in 0..(n as usize) {
             let p_abs = raw_lo + local;
-            let tok = raw_tokens[p_abs];
+            let tok = i64::from(raw_tokens[p_abs]);
             if real_mask[p_abs] && tok >= id_lo && tok < id_hi {
                 let p = local as i64;
                 // L = runlen_number[p + 1] when p < n - 1 else 0.
-                let l = if p < n - 1 {
+                let l: i64 = if p < n - 1 {
                     let idx = raw_lo + (p as usize) + 1;
                     if idx >= runlen_number.len() {
                         return Err(format!(
                             "node {e} runlen idx {idx} out of bounds"
                         ));
                     }
-                    runlen_number[idx]
+                    i64::from(runlen_number[idx])
                 } else {
                     0
                 };
                 // first_payload_offset = digit_cumsum_node[p + 1] +
                 // slice_start. The node-local digit slice base is dig_lo.
-                let off = digit_cumsum[dig_lo + (p as usize) + 1] + slice_start;
+                let off =
+                    i64::from(digit_cumsum[dig_lo + (p as usize) + 1]) + slice_start;
                 offsets.push(off);
                 lengths.push(l);
                 positions.push(p);
@@ -138,11 +139,11 @@ fn run_kernel(
 #[allow(clippy::too_many_arguments)]
 pub fn build_identity_carriers_kernel<'py>(
     py: Python<'py>,
-    raw_tokens: numpy::PyReadonlyArray1<'py, i64>,
+    raw_tokens: numpy::PyReadonlyArray1<'py, u16>,
     real_mask: numpy::PyReadonlyArray1<'py, bool>,
-    runlen_number: numpy::PyReadonlyArray1<'py, i64>,
+    runlen_number: numpy::PyReadonlyArray1<'py, u16>,
     raw_offsets: numpy::PyReadonlyArray1<'py, i64>,
-    digit_cumsum: numpy::PyReadonlyArray1<'py, i64>,
+    digit_cumsum: numpy::PyReadonlyArray1<'py, u32>,
     digit_offsets: numpy::PyReadonlyArray1<'py, i64>,
     surviving_token_count: numpy::PyReadonlyArray1<'py, i64>,
     surviving_identity_count: numpy::PyReadonlyArray1<'py, i64>,
@@ -194,10 +195,10 @@ mod tests {
     // Identity band [264, 272). Build single-node inputs.
     #[allow(clippy::too_many_arguments)]
     fn one_node(
-        raw_tokens: Vec<i64>,
+        raw_tokens: Vec<u16>,
         real_mask: Vec<bool>,
-        runlen_number: Vec<i64>,
-        digit_cumsum: Vec<i64>,
+        runlen_number: Vec<u16>,
+        digit_cumsum: Vec<u32>,
         surviving_token_count: i64,
         surviving_identity_count: i64,
         slice_start: i64,

@@ -53,10 +53,10 @@ fn csr_slice(base: &[i64], e: usize) -> (usize, usize) {
 /// a leading-zero pad and the per-node contributed byte count.
 #[allow(clippy::too_many_arguments)]
 fn run_kernel(
-    raw_tokens: &[i64],
+    raw_tokens: &[u16],
     number_mask: &[bool],
     real_mask: &[bool],
-    runlen_number: &[i64],
+    runlen_number: &[u16],
     extra_value_v2_mask: &[bool],
     extra_f128_mask: &[bool],
     is_cut: &[bool],
@@ -168,14 +168,14 @@ fn run_kernel(
         })?;
 
         // L_last = runlen_number[p_last + 1] when p_last + 1 < N else 0.
-        let l_last = if p_last + 1 < n {
+        let l_last: i64 = if p_last + 1 < n {
             let idx = raw_lo + p_last + 1;
             if idx >= runlen_number.len() {
                 return Err(format!(
                     "node {e} runlen idx {idx} out of bounds"
                 ));
             }
-            runlen_number[idx]
+            i64::from(runlen_number[idx])
         } else {
             0
         };
@@ -204,10 +204,10 @@ fn run_kernel(
 #[allow(clippy::too_many_arguments)]
 pub fn build_inline_bytes_kernel<'py>(
     py: Python<'py>,
-    raw_tokens: numpy::PyReadonlyArray1<'py, i64>,
+    raw_tokens: numpy::PyReadonlyArray1<'py, u16>,
     number_mask: numpy::PyReadonlyArray1<'py, bool>,
     real_mask: numpy::PyReadonlyArray1<'py, bool>,
-    runlen_number: numpy::PyReadonlyArray1<'py, i64>,
+    runlen_number: numpy::PyReadonlyArray1<'py, u16>,
     extra_value_v2_mask: numpy::PyReadonlyArray1<'py, bool>,
     extra_f128_mask: numpy::PyReadonlyArray1<'py, bool>,
     is_cut: numpy::PyReadonlyArray1<'py, bool>,
@@ -258,7 +258,7 @@ mod tests {
     /// real = `tok > 256`. `runlen_number` is the run-start length of the
     /// `number_mask` runs (production `run_lengths(number_mask)`).
     fn one_node(
-        raw: Vec<i64>,
+        raw: Vec<u16>,
         extra_vc2: Vec<bool>,
         extra_f128: Vec<bool>,
         is_cut: bool,
@@ -288,8 +288,8 @@ mod tests {
 
     /// Reference `run_lengths`: for a boolean mask, each run-start slot
     /// carries the run length, other slots carry 0 (production semantics).
-    fn run_lengths(mask: &[bool]) -> Vec<i64> {
-        let mut out = vec![0i64; mask.len()];
+    fn run_lengths(mask: &[bool]) -> Vec<u16> {
+        let mut out = vec![0u16; mask.len()];
         let mut i = 0;
         while i < mask.len() {
             if mask[i] {
@@ -297,7 +297,7 @@ mod tests {
                 while i < mask.len() && mask[i] {
                     i += 1;
                 }
-                out[start] = (i - start) as i64;
+                out[start] = (i - start) as u16;
             } else {
                 i += 1;
             }
@@ -363,8 +363,8 @@ mod tests {
         // VC2 L=17 (K=3): body=[prepend,carrier,painted1,painted2]. Cut
         // surviving=3 -> body[1:3]=[carrier,painted1]; 1 non-painted ->
         // 1 carrier consumed; p_last=0, L_last=17 -> all 17 bytes kept.
-        let payload: Vec<i64> = (1..=17).collect();
-        let mut raw = vec![257i64];
+        let payload: Vec<u16> = (1..=17).collect();
+        let mut raw = vec![257u16];
         raw.extend(payload.iter());
         let (bytes, counts) = one_node(
             raw,
