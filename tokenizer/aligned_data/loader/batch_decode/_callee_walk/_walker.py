@@ -160,15 +160,13 @@ def _load_root_bodies(
     idx = session._idx_for_section_offset(
         int(section.section_offset), arm.value
     )
+    slots = range(len(section.variants))
     if arm is SectionKind.MATCHED:
-        return [
-            session._load_matched_variant_body(idx, v, section)
-            for v in range(len(section.variants))
-        ]
-    return [
-        session._load_unmatched_variant_body(idx, v, section)
-        for v in range(len(section.variants))
-    ]
+        return session._load_matched_variant_bodies(idx, section, slots)
+    # The unmatched plural loader builds the section-wide resolve bundle
+    # ONCE and threads it into every slot (O(V) instead of the per-slot
+    # whole-section rebuild, O(V²)).
+    return session._load_unmatched_variant_bodies(idx, section, slots)
 
 
 @dataclass

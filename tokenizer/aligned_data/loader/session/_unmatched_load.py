@@ -14,13 +14,18 @@ this class holds no state.
 
 from __future__ import annotations
 
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
 from ...index_format import ALIGNMENT_SHIFT
 from ...matched_sections_bin import Section
-from .._session_parsers import arm_arrays, build_unmatched_function_data
+from .._session_parsers import (
+    UnmatchedSectionData,
+    arm_arrays,
+    build_unmatched_function_data,
+    build_unmatched_section_data,
+)
 from ..function_data import FunctionData
 
 
@@ -70,8 +75,32 @@ class _UnmatchedLoadMixin:
         fd = self._load_unmatched_variant_body(base, variant_slot, section)
         return section, section_offset, fd
 
+    def _unmatched_section_data(  # type: ignore[no-untyped-def]
+        self, section: Section
+    ) -> UnmatchedSectionData:
+        """Compute a section's shared unmatched metadata ONCE.
+
+        Wraps :func:`build_unmatched_section_data` with the session-owned
+        variant resolver + ``line_to_name`` so a caller iterating a
+        section's variant slots can build this O(V) bundle once and thread
+        it into every :py:meth:`_load_unmatched_variant_body` call,
+        collapsing the legacy per-slot whole-section rebuild (O(V²)) to
+        O(V). Single-slot callers may omit it; the body loader then builds
+        a one-shot bundle for that lone slot.
+        """
+        line_to_name = self._meta_get("line_to_name") or {}
+        return build_unmatched_section_data(
+            section,
+            resolve_ref=self.get_variant_by_ref,
+            line_to_name=line_to_name,
+        )
+
     def _load_unmatched_variant_body(  # type: ignore[no-untyped-def]
-        self, idx: int, variant_index: int, section: Section
+        self,
+        idx: int,
+        variant_index: int,
+        section: Section,
+        section_data: Optional[UnmatchedSectionData] = None,
     ) -> FunctionData:
         """Load ONE unmatched section variant body, reusing the section.
 
@@ -80,6 +109,14 @@ class _UnmatchedLoadMixin:
         the callee walk's :class:`ResolvedCalleeMeta`), so this load does
         NOT re-derive it via :py:meth:`_unmatched_section_for_record` (no
         ``_sections.bin`` re-parse).
+
+        ``section_data`` is the section-wide resolve bundle
+        (:py:meth:`_unmatched_section_data`); a caller looping over a
+        section's variant slots builds it ONCE and threads it into every
+        slot's load so the whole-section variant resolve + call_target
+        flatten happens once per section, not once per slot. When omitted
+        (single-slot callee loads) it is built here for this lone slot --
+        byte-identical, just without the cross-slot sharing.
 
         The data record is sliced at ``section.variants[variant_index]``'s
         OWN ``data_offset_shifted << ALIGNMENT_SHIFT`` -- the SAME way the
@@ -112,16 +149,36 @@ class _UnmatchedLoadMixin:
         )
         data_mmap = self._open_data("unmatched")
         insn_rl, block_rl, tokens = self._slice_data_record(data_mmap, start)
-        line_to_name = self._meta_get("line_to_name") or {}
+        if section_data is None:
+            section_data = self._unmatched_section_data(section)
         return build_unmatched_function_data(
             section,
             self._unmatched_func_name(arm, idx),
             start,
             tokens, insn_rl, block_rl,
             variant_slot=variant_index,
-            resolve_ref=self.get_variant_by_ref,
-            line_to_name=line_to_name,
+            section_data=section_data,
         )
+
+    def _load_unmatched_variant_bodies(  # type: ignore[no-untyped-def]
+        self, idx: int, section: Section, variant_indices
+    ) -> "list[FunctionData]":
+        """Load several unmatched variant bodies of one section, O(V) total.
+
+        Parallel to ``variant_indices``. Builds the section-wide resolve
+        bundle (:py:meth:`_unmatched_section_data`) ONCE and threads it into
+        every slot's :py:meth:`_load_unmatched_variant_body`, so the
+        whole-section variant resolve + call_target flatten happens once per
+        section rather than once per slot (collapsing the legacy O(V²) to
+        O(V)). Each body is byte-identical to the per-slot path -- the only
+        change is that the shared section-wide metadata is computed once and
+        shared (read-only) across the returned bodies.
+        """
+        section_data = self._unmatched_section_data(section)
+        return [
+            self._load_unmatched_variant_body(idx, v, section, section_data)
+            for v in variant_indices
+        ]
 
     def _unmatched_section_meta(  # type: ignore[no-untyped-def]
         self, idx: int
@@ -176,10 +233,12 @@ class _UnmatchedLoadMixin:
                 f"(section[{section_idx}] base={base}); got idx={idx}"
             )
         section, section_offset = self._unmatched_section_for_record(arm, base)
-        variants = [
-            self._load_unmatched_variant_body(base, slot, section)
-            for slot in range(len(section.variants))
-        ]
+        # Plural loader builds the section-wide resolve bundle ONCE and
+        # threads it into every slot (O(V) total instead of the legacy
+        # per-slot whole-section rebuild, O(V²)).
+        variants = self._load_unmatched_variant_bodies(
+            base, section, range(len(section.variants))
+        )
         return section, section_offset, variants
 
     def _unmatched_section_for_record(  # type: ignore[no-untyped-def]

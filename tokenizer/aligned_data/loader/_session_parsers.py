@@ -9,6 +9,7 @@ exercise these helpers without standing up a full session.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -144,69 +145,65 @@ def parse_matched_section(
     return MatchedFunction(func_name, variants)
 
 
-def build_unmatched_function_data(
+@dataclass(frozen=True)
+class UnmatchedSectionData:
+    """Section-wide unmatched metadata shared by every variant slot.
+
+    Built ONCE per unmatched section by :func:`build_unmatched_section_data`
+    and threaded into the per-slot :func:`build_unmatched_function_data`
+    assembly, collapsing the legacy per-slot whole-section rebuild
+    (resolving all V refs + flattening all call_targets for each of the V
+    slots = O(V²)) down to O(V). Every field here is identical across the
+    section's slots; only ``resolved_per_ref[variant_slot]`` differs per
+    slot (and is read positionally, not rebuilt).
+
+    Attributes:
+        variant_refs: Hex strings from each variant block's
+            ``variant_ref_offset`` (parallel to ``section.variants``).
+        resolved_per_ref: Resolver output for each ref, KEEPING ``None``
+            positions (parallel to ``variant_refs``). The per-slot
+            assembly indexes this to recover THIS slot's variant row
+            without a second resolve; the section-wide ``variants`` list
+            is the ``None``-dropped view of it.
+        variants: Resolver dicts for every ref that resolved (legacy
+            datasets without ``_variants.bin`` see an empty list).
+        called: Function names recovered from each call_target's
+            ``function_name_ptr`` via ``line_to_name``.
+        call_targets: ``[[called_idx, function_section_ptr,
+            section_variant_index, is_matched_int]]`` flattened across
+            every variant's ``per_call_entries``. Records are
+            self-describing in ``_data.bin`` so no length / overlong flag
+            crosses this boundary.
+    """
+
+    variant_refs: List[str]
+    resolved_per_ref: List[Optional[Dict[str, Any]]]
+    variants: List[Dict[str, Any]]
+    called: List[str]
+    call_targets: List[List[int]]
+
+
+def build_unmatched_section_data(
     section: Section,
-    func_name: str,
-    start: int,
-    tokens,
-    insn_rl,
-    block_rl,
     *,
-    variant_slot: int,
     resolve_ref: Callable,
     line_to_name: Dict[int, str],
-) -> FunctionData:
-    """Assemble an unmatched ``FunctionData`` from its BIN section + bytes.
+) -> UnmatchedSectionData:
+    """Compute the section-wide unmatched metadata ONCE for all slots.
 
-    ``variant_slot`` indexes into ``section.variants`` and identifies
-    THIS record's variant (unmatched sections store one record per
-    variant). Its ``variant_ref_offset`` is resolved to pull the
-    canonical-4 axes (``arch / compiler / compilerversion / opt``) and
-    the variant's prefix-token stream out of ``_variants.bin``; the
-    metadata dict that lands on :class:`FunctionData` carries those
-    per-record axes directly, NOT the unmatched-arm ``"unknown"``
-    placeholder. Downstream consumers (inspector, variant-identity
-    factory) read the canonical axes off ``FunctionData.metadata``
-    without knowing this is the unmatched arm.
-
-    Output dict carries ``arch``/``compiler``/``compilerversion``/``opt``
-    (recovered per-slot), ``variant_refs``, ``variants``, ``called``,
-    ``call_targets``, and ``data_offset``. Fields derive from
-    ``section``'s parsed call_target table + per-variant blocks:
-
-    * ``variant_refs`` -- hex strings from each variant block's
-      ``variant_ref_offset``.
-    * ``variants`` -- resolver dicts for every ref that resolved
-      (legacy datasets without ``_variants.bin`` see an empty list).
-    * ``called`` -- function names recovered from each call_target's
-      ``function_name_ptr`` via ``line_to_name``.
-    * ``call_targets`` -- ``[[called_idx, function_section_ptr,
-      section_variant_index, is_matched_int]]`` flattened across every
-      variant's ``per_call_entries``. Records are self-describing in
-      ``_data.bin`` so no length / overlong flag crosses this boundary.
-    * ``data_offset`` -- the per-record offset the session passed in
-      (from ``unmatched_index.bin``).
-
-    The ``variant_refs`` / ``variants`` / ``call_targets`` lists are
-    still section-wide (every variant block), preserving the legacy
-    metadata contract; the per-record axes ride alongside them.
+    Depends only on the parsed ``section`` + the variant resolver +
+    ``line_to_name``; carries nothing slot-specific. Each ref is resolved
+    exactly ONCE (``resolved_per_ref``); the per-slot assembly reads its
+    own row out of that list positionally rather than re-resolving (which
+    the legacy per-slot path did, on top of re-resolving the whole list).
+    The resolve order + ``None``-drop rule are preserved byte-for-byte:
+    ``variants`` is ``[r for r in resolved_per_ref if r is not None]`` and
+    each ``resolved_per_ref[slot]`` is exactly the legacy
+    ``resolve_ref(variant_refs[slot])``.
     """
     variant_refs = [f"{v.variant_ref_offset:x}" for v in section.variants]
-    variants = [
-        v for v in (resolve_ref(r) for r in variant_refs) if v is not None
-    ]
-    if variant_slot < 0 or variant_slot >= len(section.variants):
-        raise IndexError(
-            f"unmatched variant_slot={variant_slot} out of bounds for "
-            f"section with {len(section.variants)} variants"
-        )
-    # Resolve THIS record's variant directly — its ``variant_ref_offset``
-    # may differ from neighbouring section variants (cross-arch / cross-
-    # compiler variants in the same unmatched section), so picking the
-    # first resolved entry of ``variants`` would mis-label every slot
-    # past 0. Falling back to ``None`` keeps legacy datasets without a
-    # ``_variants.bin`` sidecar (resolver returns ``None``) working.
-    this_variant_row = resolve_ref(variant_refs[variant_slot])
+    resolved_per_ref = [resolve_ref(r) for r in variant_refs]
+    variants = [v for v in resolved_per_ref if v is not None]
     called: List[str] = []
     for ct in section.call_targets:
         name = line_to_name.get(ct.function_name_ptr)
@@ -224,12 +221,69 @@ def build_unmatched_function_data(
                     1 if ct.is_matched else 0,
                 ]
             )
+    return UnmatchedSectionData(
+        variant_refs=variant_refs,
+        resolved_per_ref=resolved_per_ref,
+        variants=variants,
+        called=called,
+        call_targets=call_targets,
+    )
+
+
+def build_unmatched_function_data(
+    section: Section,
+    func_name: str,
+    start: int,
+    tokens,
+    insn_rl,
+    block_rl,
+    *,
+    variant_slot: int,
+    section_data: UnmatchedSectionData,
+) -> FunctionData:
+    """Assemble an unmatched ``FunctionData`` from its BIN section + bytes.
+
+    ``variant_slot`` indexes into ``section.variants`` and identifies
+    THIS record's variant (unmatched sections store one record per
+    variant). Its ``variant_ref_offset`` is resolved to pull the
+    canonical-4 axes (``arch / compiler / compilerversion / opt``) and
+    the variant's prefix-token stream out of ``_variants.bin``; the
+    metadata dict that lands on :class:`FunctionData` carries those
+    per-record axes directly, NOT the unmatched-arm ``"unknown"``
+    placeholder. Downstream consumers (inspector, variant-identity
+    factory) read the canonical axes off ``FunctionData.metadata``
+    without knowing this is the unmatched arm.
+
+    ``section_data`` is the section-wide metadata
+    :func:`build_unmatched_section_data` computed ONCE for the whole
+    section; this assembly only picks THIS slot's row out of it (no
+    whole-section resolve / call_target rebuild per slot). Output dict
+    carries ``arch``/``compiler``/``compilerversion``/``opt`` (recovered
+    per-slot), plus the section-wide ``variant_refs``/``variants``/
+    ``called``/``call_targets`` and the per-record ``data_offset``.
+
+    The ``variant_refs`` / ``variants`` / ``call_targets`` lists are
+    still section-wide (every variant block), preserving the legacy
+    metadata contract; the per-record axes ride alongside them.
+    """
+    if variant_slot < 0 or variant_slot >= len(section.variants):
+        raise IndexError(
+            f"unmatched variant_slot={variant_slot} out of bounds for "
+            f"section with {len(section.variants)} variants"
+        )
+    # THIS record's variant row, read positionally from the once-resolved
+    # list — its ``variant_ref_offset`` may differ from neighbouring
+    # section variants (cross-arch / cross-compiler variants in the same
+    # unmatched section), so picking the first resolved entry of
+    # ``variants`` would mis-label every slot past 0. ``None`` keeps legacy
+    # datasets without a ``_variants.bin`` sidecar working.
+    this_variant_row = section_data.resolved_per_ref[variant_slot]
 
     metadata: Dict[str, Any] = {
-        "variant_refs": variant_refs,
-        "variants": variants,
-        "called": called,
-        "call_targets": call_targets,
+        "variant_refs": section_data.variant_refs,
+        "variants": section_data.variants,
+        "called": section_data.called,
+        "call_targets": section_data.call_targets,
         "data_offset": start,
         # Per-function COUNTER-Category unique-id counts feed Stage 4a's
         # ALG-4 offset bump. Loader-side single source of truth; the

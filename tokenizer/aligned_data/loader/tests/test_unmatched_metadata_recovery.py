@@ -21,6 +21,7 @@ import numpy as np
 
 from tokenizer.aligned_data.loader._session_parsers import (
     build_unmatched_function_data,
+    build_unmatched_section_data,
 )
 from tokenizer.aligned_data.matched_sections_bin import (
     CallTarget,
@@ -36,6 +37,25 @@ def _make_resolve_ref(table: dict[str, dict]) -> "callable":
     def _resolve(ref: str):
         return table.get(ref)
     return _resolve
+
+
+def _build_fd(
+    section, func_name, *, start, tokens, insn_rl, block_rl,
+    variant_slot, resolve_ref, line_to_name,
+):
+    """Build a section's shared resolve bundle once, then assemble a slot.
+
+    Mirrors the session's two-step path (``build_unmatched_section_data``
+    then per-slot ``build_unmatched_function_data``) so the tests exercise
+    the same compute-once boundary the loader does.
+    """
+    section_data = build_unmatched_section_data(
+        section, resolve_ref=resolve_ref, line_to_name=line_to_name
+    )
+    return build_unmatched_function_data(
+        section, func_name, start, tokens, insn_rl, block_rl,
+        variant_slot=variant_slot, section_data=section_data,
+    )
 
 
 def _make_section(
@@ -88,7 +108,7 @@ def test_unmatched_metadata_recovers_per_slot_axes():
         },
     })
 
-    fd_arm = build_unmatched_function_data(
+    fd_arm = _build_fd(
         section,
         "die",
         start=0x100,
@@ -99,7 +119,7 @@ def test_unmatched_metadata_recovers_per_slot_axes():
         resolve_ref=resolve_ref,
         line_to_name={},
     )
-    fd_x86 = build_unmatched_function_data(
+    fd_x86 = _build_fd(
         section,
         "die",
         start=0x200,
@@ -147,7 +167,7 @@ def test_unmatched_metadata_falls_back_to_unknown_on_resolver_miss():
     section = _make_section(variant_refs=[0xA])
     resolve_ref = _make_resolve_ref({})  # nothing resolves
 
-    fd = build_unmatched_function_data(
+    fd = _build_fd(
         section,
         "die",
         start=0x100,
@@ -213,7 +233,7 @@ def test_unmatched_metadata_preserves_legacy_section_wide_fields():
             "variant_tokens": np.array([500], dtype=np.uint16),
         },
     })
-    fd = build_unmatched_function_data(
+    fd = _build_fd(
         section,
         "f",
         start=0x100,
