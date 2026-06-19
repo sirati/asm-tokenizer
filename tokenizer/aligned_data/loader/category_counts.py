@@ -230,8 +230,11 @@ def _count_distinct_caller_local_ids_per_node(
     over every node at once. Carrier positions are located in the flat
     stream, attributed to their owning node via the CSR ``record_offsets``,
     decoded per the ALG-5 payload-width table (0/1/2 bytes), and the
-    distinct ``(node, id)`` pairs are reduced to a per-node count by a
-    single ``unique`` + ``bincount``.
+    distinct ``(node, id)`` pairs are reduced to a per-node count by the
+    per-segment :func:`dedup_hashmap.segment_distinct_count` Rust kernel
+    (per-node hash-sets, no global sort). The numpy global-``unique`` +
+    ``bincount`` path is kept byte-identical behind
+    :data:`_USE_NUMPY_SEGMENT_DISTINCT` as the reference.
     """
     out = np.zeros(n_nodes, dtype=np.int64)
     carrier_pos = np.flatnonzero(raw_flat == np.uint16(carrier_id))
