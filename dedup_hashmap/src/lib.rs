@@ -40,6 +40,7 @@ mod flat_segments;
 mod hashmap_macro;
 mod identity_gather;
 mod inline_bytes;
+mod inline_state_fields;
 mod node_ct_csr;
 mod number_idx_2d;
 mod once_only_inclusion;
@@ -55,6 +56,7 @@ use flat_segments::build_flat_segments_kernel;
 use hashmap_macro::define_hashmap;
 use identity_gather::build_identity_carriers_kernel;
 use inline_bytes::build_inline_bytes_kernel;
+use inline_state_fields::build_inline_state_fields_kernel;
 use node_ct_csr::build_node_ct_csr_kernel;
 use number_idx_2d::build_number_idx_2d_kernel;
 use pyo3::prelude::*;
@@ -347,6 +349,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // shift survivors down 256, prepend each node's self-token). See
     // `strip_shift_prepend.rs`.
     m.add_function(wrap_pyfunction!(build_strip_shift_prepend_kernel, m)?)?;
+
+    // Fused boundary-aware InlineDecodeState field kernel (the GIL-released
+    // `_state_fields.py` trio twin: runlen_number/runlen_value via per-node
+    // run_lengths, the packed per-node digit cumsum, and is_negative — one
+    // CSR walk over the flat raw stream). See `inline_state_fields.rs`.
+    m.add_function(wrap_pyfunction!(build_inline_state_fields_kernel, m)?)?;
 
     // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
     // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.

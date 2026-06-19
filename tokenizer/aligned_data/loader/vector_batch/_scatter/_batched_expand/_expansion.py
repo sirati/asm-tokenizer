@@ -23,11 +23,7 @@ from ._constants import (
     _VC2_VOCAB_ID,
 )
 from ._rewrite import _promote_batched, _strip_shift_prepend
-from ._state_fields import (
-    _batched_is_negative,
-    _boundary_run_lengths,
-    _per_node_digit_cumsum,
-)
+from ._state_fields import build_inline_state_fields
 
 
 __all__ = ["BatchedExpansion", "batched_expand"]
@@ -108,23 +104,19 @@ def batched_expand(
     )
 
     # --- per-position InlineDecodeState fields (boundary-aware) ----------
+    # The run-length / digit-cumsum / is-negative fields come from the fused
+    # GIL-released kernel (it derives its own inline-band / value / carrier
+    # masks from ``raw`` internally). The promotion masks below are this
+    # module's own concern (carrier detection + the BatchedExpansion record).
+    (
+        runlen_number,
+        runlen_value,
+        digit_cumsum,
+        is_negative_per_position,
+    ) = build_inline_state_fields(raw, rec_starts, counts)
     real_mask = raw > _V2_VALUE_NEGATIVE_TOKEN_ID
     number_mask = raw < _V2_RESERVED_DIGIT_COUNT
-    value_mask = ~real_mask
-    runlen_number = _boundary_run_lengths(number_mask, rec_starts, counts)
-    runlen_value = _boundary_run_lengths(value_mask, rec_starts, counts)
     carries_inline_mask = real_mask & (raw < _V2_EAGER_BLOCK_END)
-    digit_cumsum = _per_node_digit_cumsum(
-        number_mask, rec_starts, counts, n_nodes
-    )
-    is_negative_per_position = _batched_is_negative(
-        runlen_number=runlen_number,
-        runlen_value=runlen_value,
-        carries_inline_mask=carries_inline_mask,
-        rec_starts=rec_starts,
-        counts=counts,
-        total=total,
-    )
 
     # --- promotion (paint into a working copy of raw) --------------------
     # The promotion paint is the ONLY mutation of the raw stream, and it
