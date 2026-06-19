@@ -383,7 +383,7 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
         dense.surviving_token_count[dense.kept_node_index],
     )
 
-    block_idx, signs = _batched_carrier_signs(stage2)
+    block_idx, signs = _batched_carrier_signs(dense)
     # Signs are per surviving NUMBER carrier; count must equal the number
     # of NUMBER-band non-painted slots over each kept node's surviving body
     # derived from dense (a coarse but non-vacuous cross-check).
