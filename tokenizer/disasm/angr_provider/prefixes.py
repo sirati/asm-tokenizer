@@ -226,16 +226,48 @@ def _build_prefixes_arm(cs_insn: Any) -> list[InstructionPrefixView]:
     return out
 
 
+# Capstone's ``ppc_bc`` enum is version-specific: Capstone 4.x numbered the
+# conditions 1..10, but 5.x renumbered them (``PPC_BC_LT=12``,
+# ``PPC_BC_EQ=76``, ...). ``PpcBranchConditionPrefixView.bc`` carries the
+# STABLE contract value (1..10) that the PPC provider's ``_PPC_BC_NAMES``
+# table renders and the Ghidra prefix builder also emits, so the raw
+# Capstone value must be translated to that contract -- keyed on the
+# symbolic ``PPC_BC_*`` constants so the mapping survives Capstone enum
+# renumbering. ``capstone`` is imported lazily (the angr PPC path requires
+# it; the non-angr import paths that pull in this module must not).
+_PPC_BC_TO_CONTRACT: dict[int, int] | None = None
+
+
+def _ppc_bc_contract(bc_raw: int) -> int | None:
+    """Translate a Capstone ``ppc_bc`` value to the stable bc contract.
+
+    Returns the 1..10 contract value (``_PPC_BC_NAMES`` key) for a
+    recognized condition, else ``None`` (``PPC_BC_INVALID`` / unconditional).
+    """
+    global _PPC_BC_TO_CONTRACT
+    if _PPC_BC_TO_CONTRACT is None:
+        from capstone import ppc_const as _c
+
+        _PPC_BC_TO_CONTRACT = {
+            _c.PPC_BC_LT: 1, _c.PPC_BC_LE: 2, _c.PPC_BC_EQ: 3,
+            _c.PPC_BC_GE: 4, _c.PPC_BC_GT: 5, _c.PPC_BC_NE: 6,
+            _c.PPC_BC_UN: 7, _c.PPC_BC_NU: 8, _c.PPC_BC_SO: 9,
+            _c.PPC_BC_NS: 10,
+        }
+    return _PPC_BC_TO_CONTRACT.get(bc_raw)
+
+
 def _build_prefixes_ppc(cs_insn: Any) -> list[InstructionPrefixView]:
     """Extract typed PPC prefixes from a Capstone instruction.
 
     PPC's per-instruction modifiers are the branch-condition field
-    (``cs_insn.bc``, integer) and the CR0-update Rc bit
-    (``cs_insn.update_cr0``).
+    (``cs_insn.bc``, a version-specific Capstone ``ppc_bc`` enum value
+    translated to the stable bc contract via ``_ppc_bc_contract``) and the
+    CR0-update Rc bit (``cs_insn.update_cr0``).
     """
     out: list[InstructionPrefixView] = []
-    bc = int(getattr(cs_insn, "bc", 0) or 0)
-    if bc != 0:
+    bc = _ppc_bc_contract(int(getattr(cs_insn, "bc", 0) or 0))
+    if bc is not None:
         out.append(_PpcBranchConditionPrefix(bc=bc))
     if bool(getattr(cs_insn, "update_cr0", False)):
         out.append(PpcUpdateCr0PrefixView())
