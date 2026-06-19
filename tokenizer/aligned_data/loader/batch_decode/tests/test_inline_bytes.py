@@ -59,6 +59,21 @@ from tokenizer.aligned_data.matched_sections_bin import Section
 from tokenizer.tokens import Category
 
 
+def _build_inline_bytes_slices(dense):
+    """``build_inline_bytes`` -> ``(inline_bytes, list[slice])`` adapter.
+
+    Stage 3a now returns ``inline_byte_starts`` (the per-call-target
+    start-offset CSR). The slice contract these unit tests pin is the old
+    abutting slice list: ``slice(starts[i], starts[i + 1])`` with the last
+    stop at ``len(inline_bytes)``. Reconstructed here so the byte-layout
+    assertions exercise the new CSR start array byte-for-byte.
+    """
+    inline_bytes, starts = build_inline_bytes(dense)
+    stops = list(starts[1:]) + [inline_bytes.shape[0]]
+    slices = [slice(int(s), int(e)) for s, e in zip(starts, stops)]
+    return inline_bytes, slices
+
+
 # Identity-band sample carrier id used for "non-multi-chunk identity" fixtures.
 # Per the plan vocab table the IDENTITY block starts at id 264; BLOCK_V2 is
 # the first slot. Identity carriers carry an inline-byte payload (0..2
@@ -306,7 +321,7 @@ def _make_batch(
 def test_empty_batch_yields_only_pad():
     """No call_targets -> just the leading-zero pad, no slices."""
     batch = _make_batch([])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1,)
     assert inline_bytes.dtype == np.uint8
     assert inline_bytes[0] == 0
@@ -336,7 +351,7 @@ def test_single_call_target_no_cut_concats_in_raw_order():
     )
     ct = _make_stage2_ct(raw)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
 
     assert inline_bytes.shape == (1 + 3,)
     assert inline_bytes[0] == 0  # leading pad
@@ -359,7 +374,7 @@ def test_two_call_targets_no_cut_abutting_slices():
     ct_b = _make_stage2_ct(raw_b)
     batch = _make_batch([[ct_a, ct_b]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 2 + 8,)
     assert slices == [slice(1, 3), slice(3, 11)]
     np.testing.assert_array_equal(inline_bytes[slices[0]], [0x01, 0x02])
@@ -390,7 +405,7 @@ def test_cut_drops_trailing_call_targets_with_zero_slices():
     ct_b = _make_stage2_ct(raw_b, partial_cut_length=0)
     batch = _make_batch([[ct_a, ct_b]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     # Only the leading-zero pad survives; both call_targets contribute
     # zero bytes.
     assert inline_bytes.shape == (1,)
@@ -427,7 +442,7 @@ def test_vc2_mid_cut_keeps_full_payload():
     ct = _make_stage2_ct(raw, partial_cut_length=3)
     batch = _make_batch([[ct]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 17,)
     assert slices == [slice(1, 18)]
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
@@ -446,7 +461,7 @@ def test_vc2_mid_cut_single_visible_chunk_still_keeps_full_payload():
     ct = _make_stage2_ct(raw, partial_cut_length=2)
     batch = _make_batch([[ct]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 17,)
     assert slices == [slice(1, 18)]
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
@@ -467,7 +482,7 @@ def test_f128_finite_full_contributes_16_bytes():
     ct = _make_stage2_ct(raw)  # fully included
     batch = _make_batch([[ct]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 16,)
     assert slices == [slice(1, 17)]
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
@@ -487,7 +502,7 @@ def test_f128_finite_mid_cut_keeps_full_payload():
     ct = _make_stage2_ct(raw, partial_cut_length=2)
     batch = _make_batch([[ct]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 16,)
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
@@ -509,7 +524,7 @@ def test_f128_nan_inf_contributes_16_bytes():
     ct = _make_stage2_ct(raw)  # fully included
     batch = _make_batch([[ct]])
 
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 16,)
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
@@ -520,7 +535,7 @@ def test_f128_inf_contributes_16_bytes():
     raw = _u16(_FLOAT128_VOCAB_ID, *payload)
     ct = _make_stage2_ct(raw)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1 + 16,)
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
@@ -544,7 +559,7 @@ def test_narrowing_assignment_preserves_inline_band_values():
     raw = _u16(_F64_VOCAB_ID, *payload)
     ct = _make_stage2_ct(raw)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
     # The dtype is u8 -- the narrowing trick is the documented
     # implementation.
@@ -567,7 +582,7 @@ def test_slice_union_covers_entire_inline_bytes_post_pad():
     ct_c = _make_stage2_ct(raw_c)
     # Multiple variants to also exercise the DFS walk order.
     batch = _make_batch([[ct_a], [ct_b, ct_c]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
 
     # Slices abut without gaps.
     assert slices[0].start == 1
@@ -589,7 +604,7 @@ def test_dtype_is_uint8_and_pad_index_zero():
     raw = _u16(_F16_VOCAB_ID, 0x01, 0x02)
     ct = _make_stage2_ct(raw)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.dtype == np.uint8
     assert inline_bytes[0] == 0
     # Slice never starts at 0 -- the pad lives outside every per-call
@@ -608,7 +623,7 @@ def test_empty_call_target_contributes_zero_bytes():
     raw = _u16()  # empty raw stream
     ct = _make_stage2_ct(raw)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1,)
     assert slices == [slice(1, 1)]
 
@@ -623,7 +638,7 @@ def test_vc2_single_chunk_cut_to_zero_yields_no_bytes():
     raw = _u16(_VC2_VOCAB_ID, 0x11, 0x22, 0x33)  # L=3, K=1
     ct = _make_stage2_ct(raw, partial_cut_length=1)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     assert inline_bytes.shape == (1,)
     assert slices == [slice(1, 1)]
 
@@ -634,7 +649,7 @@ def test_vc2_single_chunk_full_keeps_all_payload():
     raw = _u16(_VC2_VOCAB_ID, *payload)
     ct = _make_stage2_ct(raw)  # fully included
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
 
@@ -644,7 +659,7 @@ def test_vc2_three_chunks_fully_included_keeps_all_bytes():
     raw = _u16(_VC2_VOCAB_ID, *payload)
     ct = _make_stage2_ct(raw)
     batch = _make_batch([[ct]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     np.testing.assert_array_equal(inline_bytes[slices[0]], payload)
 
 
@@ -660,7 +675,7 @@ def test_cut_inside_second_call_target_keeps_first_fully():
     # L=17-byte payload; 3c emits 1 idx_2d row (the LSB chunk).
     ct_b = _make_stage2_ct(raw_b, partial_cut_length=2)
     batch = _make_batch([[ct_a, ct_b]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     expected_a = [0x01, 0x02]
     expected_b = list(range(1, 18))  # full 17-byte payload of the VC2
     assert inline_bytes.shape == (1 + 2 + 17,)
@@ -680,6 +695,6 @@ def test_multi_variant_dfs_order():
     ct_v0 = _make_stage2_ct(raw_v0)
     ct_v1 = _make_stage2_ct(raw_v1)
     batch = _make_batch([[ct_v0], [ct_v1]])
-    inline_bytes, slices = build_inline_bytes(dense_columns_from_stage2(batch))
+    inline_bytes, slices = _build_inline_bytes_slices(dense_columns_from_stage2(batch))
     np.testing.assert_array_equal(inline_bytes[slices[0]], [0xA1, 0xA2])
     np.testing.assert_array_equal(inline_bytes[slices[1]], [0xB1, 0xB2])

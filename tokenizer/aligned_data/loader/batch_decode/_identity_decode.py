@@ -97,7 +97,7 @@ _V2_EAGER_BLOCK_END = VocabularyManager._V2_EAGER_BLOCK_END  # 272
 def build_identity_idx_2d(
     dense: DenseColumns,
     inline_bytes: np.ndarray,
-    inline_byte_slices: list[slice],
+    inline_byte_starts: np.ndarray,
 ) -> tuple[np.ndarray, "IdentitySlicesCSR"]:
     """Build the identity-token idx_2d table per ALG-5.
 
@@ -121,13 +121,13 @@ def build_identity_idx_2d(
         index 0 is the leading zero pad). Only its shape is consulted
         (the byte values are gathered later via fancy-indexing during
         the view-cast step).
-    inline_byte_slices
-        Stage 3a's per-call-target byte slices, ONE entry per level-4
-        call_target in DFS encounter order. Slice length 0 is valid
-        (drop / no surviving inline bytes); the corresponding identity
-        slice will have length equal to ``surviving_identity_count``
-        (zero when the call_target is fully dropped, ``1 + in_stream``
-        otherwise).
+    inline_byte_starts
+        Stage 3a's per-call-target byte start offsets (``int64``), ONE
+        entry per level-4 call_target in DFS encounter order. A zero-byte
+        call_target is valid (drop / no surviving inline bytes); the
+        corresponding identity slice will have length equal to
+        ``surviving_identity_count`` (zero when the call_target is fully
+        dropped, ``1 + in_stream`` otherwise).
 
     Returns
     -------
@@ -138,7 +138,7 @@ def build_identity_idx_2d(
         ``identities_flat_caller_local`` directly per ALG-9).
     identity_slices : IdentitySlicesCSR
         Lazy per-call_target identity CSR (one entry per level-4
-        call_target, matching the order of ``inline_byte_slices``).
+        call_target, matching the order of ``inline_byte_starts``).
         Indexing yields a ``slice`` into the level-1
         ``identities_flat_caller_local`` array that INCLUDES the prepend
         slot at ``slice.start``; the range length =
@@ -164,7 +164,7 @@ def build_identity_idx_2d(
         carrier_offsets,
         carrier_L,
         carrier_raw_positions,
-    ) = _gather_identity_carriers(dense, inline_byte_slices)
+    ) = _gather_identity_carriers(dense, inline_byte_starts)
 
     identity_idx_2d = _identity_rows_from_carriers(
         carrier_offsets, carrier_L, carrier_raw_positions
@@ -280,7 +280,7 @@ def _identity_slices_python_oracle(dense: DenseColumns) -> IdentitySlicesCSR:
 
 def _gather_identity_carriers(
     dense: DenseColumns,
-    inline_byte_slices: list[slice],
+    inline_byte_starts: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Flat per-carrier ``(first_payload_offset, L, raw_position)``.
 
@@ -295,12 +295,12 @@ def _gather_identity_carriers(
     / ``digit_cumsum`` gathers) is a single ``py.detach`` Rust kernel
     reading the flat :class:`DenseColumns` columns directly. The ALG-5
     row build (:func:`_identity_rows_from_carriers`) stays in numpy --
-    it is already one vectorised pass over these flat triples.
+    it is already one vectorised pass over these flat triples. The
+    per-call-target byte start offsets arrive as the stage-3a CSR
+    ``inline_byte_starts`` array directly (no slice-list re-extraction).
     """
-    inline_slice_start = np.fromiter(
-        (sl.start for sl in inline_byte_slices),
-        dtype=np.int64,
-        count=len(inline_byte_slices),
+    inline_slice_start = np.ascontiguousarray(
+        inline_byte_starts, dtype=np.int64
     )
     return build_identity_carriers_kernel(
         np.ascontiguousarray(dense.raw_tokens, dtype=np.uint16),

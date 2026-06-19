@@ -71,11 +71,6 @@ class InclusionCSR:
 logger = logging.getLogger(__name__)
 
 
-#: ``HashMapU32U32.lookup_ndarray`` miss sentinel (all-ones u32) -- a
-#: ``function_section_ptr`` not in the offset->idx map maps to no section.
-_U32_MISS = np.uint32(0xFFFFFFFF)
-
-
 class LiveNodeAdjacency:
     """Per-node direct-call children, resolved live from the catalog.
 
@@ -310,24 +305,20 @@ class LiveNodeAdjacency:
             if frontier.size == 0:
                 break
             # Fill the frontier sections, then read their call-target callee
-            # pointers to find the next section frontier.
+            # pointers to find the next section frontier. The inner per-section
+            # pointer-gather + offset->idx lookup + sorted-unique reduction is
+            # the GIL-released kernel hop (it shares the kernel's SAME sec_map
+            # as the inclusion BFS, so the pre-pass can never resolve a pointer
+            # differently); the lazy-fill above and the reached-mask filter
+            # below stay here -- they drive the lazy catalog / depend on the
+            # per-batch reached set.
             cols.ensure_sections(frontier)
-            callee_secs: list = []
-            for sec in frontier.tolist():
-                ct_lo = int(cols.ct_offsets[sec])
-                ct_hi = int(cols.ct_offsets[sec + 1])
-                if ct_hi <= ct_lo:
-                    continue
-                ptrs = cols.ct_function_section_ptr[ct_lo:ct_hi]
-                # #69 explicit-zero pointers resolve to no section.
-                ptrs = ptrs[ptrs != 0]
-                if ptrs.size == 0:
-                    continue
-                hits = self._sec_map.lookup_ndarray(ptrs.astype(np.uint32))
-                callee_secs.append(hits[hits != _U32_MISS].astype(np.int64))
-            if not callee_secs:
+            nxt = self._kernel.advance_inclusion_frontier(
+                frontier, cols.ct_offsets, cols.ct_function_section_ptr
+            )
+            # An empty hop reaches no new section -- the closure is complete.
+            if nxt.size == 0:
                 break
-            nxt = np.unique(np.concatenate(callee_secs))
             nxt = nxt[~reached[nxt]]
             reached[nxt] = True
             frontier = nxt

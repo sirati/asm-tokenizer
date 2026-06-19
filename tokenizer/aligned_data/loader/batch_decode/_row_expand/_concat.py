@@ -1,36 +1,24 @@
-"""Shared per-variant -> per-row expansion helper.
+"""Per-row flat concatenation of per-variant payloads.
 
-Single concern: take a per-unique-variant payload (one scalar count per
-variant, or one ``np.ndarray`` per variant) plus the canonical
-``Stage1Batch.batch_idx_to_section_variant`` mapping, and emit either:
+Single concern: scatter per-unique-variant payloads to a per-row flat
+stream via the :func:`build_per_row_variant_lookup` mapping + the per-row
+length cumsum. Two input shapes feed the SAME vectorised ``np.repeat`` /
+``arange`` fill core (:func:`_concat_per_row_core`):
 
-* per-row length cumsum (``u32[batch_size + 1]`` ``row_offsets``), or
-* per-row flat concatenation (``flat`` + ``row_offsets``).
-
-Used by four downstream stage modules that all share the same per-row
-scalar walk pattern -- pre-vectorization, each of them rolled its own
-``for row in range(batch_size)`` loop over the mapping, looking up the
-per-variant value at ``sections[section_idx].variants[slot_idx]`` and
-accumulating into a flat output. Post-vectorization, every such walk
-becomes ``np.repeat`` + ``np.cumsum`` + (optionally) ``np.concatenate``,
-with the Python loop reduced to a per-unique-variant outer build of the
-per-variant payload (length-bounded by ``num_unique_variants``, NOT
-``batch_size``).
+* :func:`concat_per_row` -- a ``list`` of one ``np.ndarray`` per variant.
+* :func:`concat_per_row_from_buffer` -- one already-concatenated
+  variant-ordered ``variant_buffer`` + its per-variant CSR offsets (the
+  global per-chunk stream's native shape; avoids a redundant re-slice +
+  ``np.concatenate`` round-trip).
 
 Multi-row mapping (RESAMPLE / REDISTRIBUTE) is handled naturally: each
 referencing row reads the same per-variant payload through the same
 ``per_row_variant_idx`` value; the resulting flat output duplicates the
 variant's contribution once per referencing row, matching the per-row
-``row_offsets`` cumsum.
-
-Padding rows (sentinel ``(UINT32_MAX, UINT32_MAX)`` in the mapping)
-contribute zero length and zero flat bytes. Both columns of the mapping
-are checked for the sentinel; ALG-10 pairs them together but the
-OR-check is the defensible reading of "is this a real mapping entry".
+``row_offsets`` cumsum. Padding rows contribute zero length / zero bytes.
 
 Plan reference: ``batch_decode_plan.md`` ``## Stages -- algorithm
-sketch`` Stage 2 (row-offset cumsum) + Stage 4 (per-row sidecar
-concatenation).
+sketch`` Stage 4 (per-row sidecar concatenation).
 """
 
 from __future__ import annotations
@@ -39,146 +27,13 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from ._batch_layout import UINT32_MAX
+from ._sizing import row_offsets_from_per_variant_lengths
 
 
 __all__ = [
-    "build_per_row_variant_lookup",
     "concat_per_row",
-    "row_offsets_from_per_variant_lengths",
+    "concat_per_row_from_buffer",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Per-row variant lookup (shared step #1 of every downstream concern).
-# ---------------------------------------------------------------------------
-
-
-def build_per_row_variant_lookup(
-    batch_idx_to_section_variant: np.ndarray,
-    variants_per_section: List[int],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Vectorized ``(section_idx, slot_idx) -> flat_variant_idx`` lookup.
-
-    Builds the per-row flat variant index plus the padding mask in a
-    single ``np.repeat`` + fancy-index step; no Python loop over
-    ``batch_size``.
-
-    Parameters
-    ----------
-    batch_idx_to_section_variant:
-        ``u32[batch_size, 2]`` mapping from :class:`Stage1Batch`. Padding
-        rows hold ``(UINT32_MAX, UINT32_MAX)`` per plan ALG-10.
-    variants_per_section:
-        ``len(stage.sections)``-long list of per-section variant counts
-        (i.e. ``len(section.variants)`` for each section, in section
-        order). Used to build the flat variant offset table; a section
-        with zero variants contributes zero to the offset.
-
-    Returns
-    -------
-    (per_row_variant_idx, is_padding):
-        ``per_row_variant_idx`` is ``u32[batch_size]`` -- the flat index
-        into a per-unique-variant array (built by following the same
-        section -> variant order). Padding rows are clamped to ``0`` so
-        the array stays in-bounds; callers MUST mask via ``is_padding``
-        before using the value. ``is_padding`` is ``bool[batch_size]``
-        -- True where either column of the mapping is the
-        ``UINT32_MAX`` sentinel.
-    """
-
-    if batch_idx_to_section_variant.ndim != 2 or (
-        batch_idx_to_section_variant.shape[1] != 2
-    ):
-        raise ValueError(
-            "batch_idx_to_section_variant must be u32[batch_size, 2]; "
-            f"got shape {batch_idx_to_section_variant.shape!r}"
-        )
-
-    sentinel = UINT32_MAX
-    section_col = batch_idx_to_section_variant[:, 0]
-    slot_col = batch_idx_to_section_variant[:, 1]
-    is_padding = (section_col == sentinel) | (slot_col == sentinel)
-
-    # Variant offset table: cumulative count of variants up to (but not
-    # including) section ``i``. A ``[0]`` prepend keeps ``offset[0] = 0``
-    # so ``offset[section_idx] + slot_idx`` lands the right flat
-    # variant index for ANY ``(section_idx, slot_idx)`` pair within
-    # bounds. Allocated as int64 to keep the running sum safe across
-    # very large batches; downcast to u32 after the per-row lookup.
-    variant_counts = np.asarray(variants_per_section, dtype=np.int64)
-    variant_section_offsets = np.empty(
-        variant_counts.shape[0] + 1, dtype=np.int64
-    )
-    variant_section_offsets[0] = 0
-    np.cumsum(variant_counts, out=variant_section_offsets[1:])
-
-    # Clamp padding rows so the fancy-index stays in bounds; the value
-    # is irrelevant (masked) but we still need a valid index. Use a
-    # safe section idx of 0 for padding rows.
-    safe_section = np.where(is_padding, np.uint32(0), section_col).astype(
-        np.int64
-    )
-    safe_slot = np.where(is_padding, np.uint32(0), slot_col).astype(np.int64)
-    per_row_variant_idx = (
-        variant_section_offsets[safe_section] + safe_slot
-    ).astype(np.uint32)
-    return per_row_variant_idx, is_padding
-
-
-# ---------------------------------------------------------------------------
-# Length-only mode (row_offsets cumsum without materialising a flat array).
-# ---------------------------------------------------------------------------
-
-
-def row_offsets_from_per_variant_lengths(
-    per_variant_lengths: np.ndarray,
-    per_row_variant_idx: np.ndarray,
-    is_padding: np.ndarray,
-) -> np.ndarray:
-    """Build ``u32[batch_size + 1]`` cumsum-of-per-row-lengths.
-
-    Parameters
-    ----------
-    per_variant_lengths:
-        ``u32[num_unique_variants]`` -- one entry per unique variant in
-        the flat order produced by :func:`build_per_row_variant_lookup`.
-        For scalar-count concerns (e.g. surviving identity / number
-        counts) this IS the per-variant payload; for array concerns it
-        is ``[a.shape[0] for a in per_variant_arrays]``.
-    per_row_variant_idx:
-        ``u32[batch_size]`` -- output of
-        :func:`build_per_row_variant_lookup`.
-    is_padding:
-        ``bool[batch_size]`` -- output of
-        :func:`build_per_row_variant_lookup`. Padding rows contribute
-        zero length regardless of the (clamped) variant index.
-
-    Returns
-    -------
-    np.ndarray
-        ``u32[batch_size + 1]``; ``[0]`` is always 0; ``[i + 1] =
-        [i] + per_row_length_at_i``.
-    """
-
-    batch_size = per_row_variant_idx.shape[0]
-    if per_variant_lengths.shape[0] == 0:
-        # No variants exist at all -- every row is either padding or
-        # has clamped index 0 with no backing entry. Per-row length
-        # is uniformly 0; skip the fancy-index to avoid an out-of-bounds
-        # access on the empty per_variant_lengths array.
-        per_row_lengths = np.zeros(batch_size, dtype=np.uint32)
-    else:
-        per_row_lengths = np.where(
-            is_padding,
-            np.uint32(0),
-            per_variant_lengths[per_row_variant_idx],
-        ).astype(np.uint32, copy=False)
-
-    row_offsets = np.empty(batch_size + 1, dtype=np.uint32)
-    row_offsets[0] = 0
-    np.cumsum(per_row_lengths, out=row_offsets[1:])
-    return row_offsets
 
 
 # ---------------------------------------------------------------------------
@@ -241,22 +96,13 @@ def concat_per_row(
         ``u32[batch_size + 1]``; ``row_offsets[-1] == flat.shape[0]``.
     """
 
-    # ----- Per-variant lengths + per-row length expansion. -----
+    # ----- Per-variant lengths + per-variant buffer/CSR. -----
     per_variant_lengths = np.array(
         [a.shape[0] for a in per_variant_arrays], dtype=np.uint32
     )
-    row_offsets = row_offsets_from_per_variant_lengths(
-        per_variant_lengths, per_row_variant_idx, is_padding
-    )
 
-    if expected_row_offsets is not None:
-        _assert_row_offsets_match(
-            row_offsets, expected_row_offsets, is_padding
-        )
-
-    total = int(row_offsets[-1])
-
-    # ----- Dtype inference + empty fast-path. -----
+    # Dtype inference must run on the list (the buffer-input entry takes a
+    # ready-typed buffer instead) before concatenation collapses it.
     out_dtype = dtype
     if out_dtype is None:
         for a in per_variant_arrays:
@@ -272,6 +118,98 @@ def concat_per_row(
         # only reachable when the caller knows the output is empty.
         out_dtype = np.uint8
 
+    variant_buffer = np.concatenate(per_variant_arrays) if any(
+        a.shape[0] > 0 for a in per_variant_arrays
+    ) else np.empty(0, dtype=out_dtype)
+
+    variant_offsets = np.empty(
+        per_variant_lengths.shape[0] + 1, dtype=np.int64
+    )
+    variant_offsets[0] = 0
+    np.cumsum(per_variant_lengths.astype(np.int64), out=variant_offsets[1:])
+
+    return _concat_per_row_core(
+        variant_buffer,
+        variant_offsets,
+        per_variant_lengths,
+        per_row_variant_idx,
+        is_padding,
+        out_dtype=out_dtype,
+        expected_row_offsets=expected_row_offsets,
+    )
+
+
+def concat_per_row_from_buffer(
+    variant_buffer: np.ndarray,
+    variant_offsets: np.ndarray,
+    per_row_variant_idx: np.ndarray,
+    is_padding: np.ndarray,
+    *,
+    dtype: Optional[np.dtype] = None,
+    expected_row_offsets: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-row concatenation from an ALREADY-concatenated variant buffer.
+
+    Byte-identical to :func:`concat_per_row`, but the caller supplies the
+    variant payloads as one flat ``variant_buffer`` (1D) grouped in
+    variant order, plus its per-variant CSR ``variant_offsets`` (``int``;
+    ``variant_offsets[v + 1] - variant_offsets[v]`` is variant ``v``'s
+    length). This is the form the global per-chunk stream already has --
+    ``concat_per_row`` would otherwise re-slice the buffer into a list
+    and ``np.concatenate`` it straight back, a redundant round-trip.
+
+    Parameters mirror :func:`concat_per_row`; ``variant_buffer`` +
+    ``variant_offsets`` replace ``per_variant_arrays``. ``dtype`` overrides
+    the output dtype (defaults to ``variant_buffer.dtype``).
+    """
+    variant_offsets = np.ascontiguousarray(variant_offsets, dtype=np.int64)
+    per_variant_lengths = (
+        variant_offsets[1:] - variant_offsets[:-1]
+    ).astype(np.uint32)
+    out_dtype = dtype if dtype is not None else variant_buffer.dtype
+
+    return _concat_per_row_core(
+        variant_buffer,
+        variant_offsets,
+        per_variant_lengths,
+        per_row_variant_idx,
+        is_padding,
+        out_dtype=out_dtype,
+        expected_row_offsets=expected_row_offsets,
+    )
+
+
+def _concat_per_row_core(
+    variant_buffer: np.ndarray,
+    variant_start_offset: np.ndarray,
+    per_variant_lengths: np.ndarray,
+    per_row_variant_idx: np.ndarray,
+    is_padding: np.ndarray,
+    *,
+    out_dtype: np.dtype,
+    expected_row_offsets: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Shared tail: scatter a variant buffer to per-row flat output.
+
+    Single source of truth for the vectorised ``np.repeat`` / ``arange``
+    per-row fill used by both the list-input (:func:`concat_per_row`) and
+    buffer-input (:func:`concat_per_row_from_buffer`) entries. Given the
+    per-variant lengths, the variant-ordered ``variant_buffer``, and its
+    prefix-sum CSR ``variant_start_offset``, produces ``(flat,
+    row_offsets)`` identical to the original monolithic body.
+    """
+    # ----- Per-row length expansion + optional sizing check. -----
+    row_offsets = row_offsets_from_per_variant_lengths(
+        per_variant_lengths, per_row_variant_idx, is_padding
+    )
+
+    if expected_row_offsets is not None:
+        _assert_row_offsets_match(
+            row_offsets, expected_row_offsets, is_padding
+        )
+
+    total = int(row_offsets[-1])
+
     flat = np.empty(total, dtype=out_dtype)
     if total == 0:
         return flat, row_offsets
@@ -281,11 +219,9 @@ def concat_per_row(
     # L_r, the flat output positions [row_offsets[r], row_offsets[r] +
     # L_r) take the per-variant array at v_r in order. We need a
     # ``src_idx[k]`` array of length ``total`` whose entries point into
-    # a single concatenated per-variant buffer.
+    # the single variant-ordered ``variant_buffer``.
     #
     # Build:
-    #   variant_buffer = concatenate(per_variant_arrays)  # len = sum(per_variant_lengths)
-    #   variant_start_offset = cumsum-prefix(per_variant_lengths)
     #   per_row_variant_start = variant_start_offset[per_row_variant_idx]  # zeroed for padding
     #   src_idx_per_row_base = repeat(per_row_variant_start, per_row_lengths)  # length = total
     #   src_idx_within_row = arange-per-row-pattern             # length = total
@@ -297,16 +233,6 @@ def concat_per_row(
     # offsets per output position". The within-row offsets ``0, 1, ...,
     # L_r - 1`` for each row are built via ``arange(total) -
     # repeat(row_offsets[:-1], per_row_lengths)`` -- standard trick.
-
-    variant_buffer = np.concatenate(per_variant_arrays) if any(
-        a.shape[0] > 0 for a in per_variant_arrays
-    ) else np.empty(0, dtype=out_dtype)
-
-    variant_start_offset = np.empty(
-        per_variant_lengths.shape[0] + 1, dtype=np.int64
-    )
-    variant_start_offset[0] = 0
-    np.cumsum(per_variant_lengths.astype(np.int64), out=variant_start_offset[1:])
 
     # Per-row variant start offset; padding rows have per_row_lengths==0
     # so their start value never gets repeated (np.repeat with count 0

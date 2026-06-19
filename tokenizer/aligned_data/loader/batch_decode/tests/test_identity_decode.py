@@ -288,6 +288,16 @@ def _build_inline_bytes_3a_oracle(
     return inline_bytes, slices
 
 
+def _starts(slices: list[slice]) -> np.ndarray:
+    """Per-call-target ``inline_byte_starts`` array from the oracle slices.
+
+    ``build_identity_idx_2d`` now takes the stage-3a start-offset CSR
+    (``int64[n_call_targets]``) in place of the abutting slice list; the
+    oracle's ``slice.start`` sequence IS that array.
+    """
+    return np.array([s.start for s in slices], dtype=np.int64)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -311,7 +321,7 @@ def test_zero_identity_tokens_produces_empty_idx_2d() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     assert idx_2d.shape == (0, 2)
     assert idx_2d.dtype == np.uint32
@@ -339,7 +349,7 @@ def test_single_2byte_identity_carrier() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
 
     # Expected inline_bytes layout: [0 (pad), 0xAB, 0xCD]
@@ -374,7 +384,7 @@ def test_single_1byte_identity_carrier() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
 
     assert list(inline_bytes) == [0, 0x42]
@@ -398,7 +408,7 @@ def test_single_0byte_identity_carrier() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
 
     # inline_bytes = [0] (just the pad).
@@ -427,7 +437,7 @@ def test_mixed_payload_widths_in_single_function() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
 
     # inline_bytes = [0 (pad), 0x12, 0x34, 0x77]
@@ -480,7 +490,7 @@ def test_multiple_call_targets_slice_continuity() -> None:
     assert slices[1] == slice(3, 4)
 
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
 
     # Row 0 -> A's carrier (offsets 1, 2)
@@ -524,7 +534,7 @@ def test_identity_slice_includes_prepend_reservation() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     # 3 in-stream + 1 prepend = 4.
     assert identity_slices[0].stop - identity_slices[0].start == 4
@@ -564,7 +574,7 @@ def test_cut_call_target_drops_post_cut_identities() -> None:
     assert slices[0] == slice(1, 3)
 
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     # Only ONE in-stream identity (c0) -> 1 idx_2d row.
     assert idx_2d.shape == (1, 2)
@@ -588,7 +598,7 @@ def test_dtype_check_u32_idx_2d_u16_view_cast() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, _identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     assert idx_2d.dtype == np.uint32
     u16_view = view_cast_identities(idx_2d, inline_bytes)
@@ -608,7 +618,7 @@ def test_view_cast_endianness_is_big_endian() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, _identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     u16_view = view_cast_identities(idx_2d, inline_bytes)
     # 0xAABB -- if the cast were little-endian we'd see 0xBBAA.
@@ -639,7 +649,7 @@ def test_fully_dropped_call_target_empty_identity_slice() -> None:
     assert slices[1].stop - slices[1].start == 0
 
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     # Only A's carrier contributes.
     assert idx_2d.shape == (1, 2)
@@ -661,7 +671,7 @@ def test_plt_func_encounter_category_handled() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     # Same shape regardless of PLT vs LOCAL prepend: 1 in-stream
     # carrier + prepend reservation.
@@ -687,7 +697,7 @@ def test_zero_in_stream_but_surviving_call_target() -> None:
     batch = _wrap_stage2_batch([s2])
     inline_bytes, slices = _build_inline_bytes_3a_oracle([s2])
     idx_2d, identity_slices = build_identity_idx_2d(
-        dense_columns_from_stage2(batch), inline_bytes, slices
+        dense_columns_from_stage2(batch), inline_bytes, _starts(slices)
     )
     assert idx_2d.shape == (0, 2)
     # Slice length 1 (just the prepend reservation).
