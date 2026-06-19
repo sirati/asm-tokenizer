@@ -148,3 +148,20 @@ class _MatchedLoadMixin:
             data_slice=lambda o: self._slice_data_record(data_mmap, o),
             resolve_ref=self.get_variant_by_ref,
         )
+
+    def _load_matched_variant_bodies(  # type: ignore[no-untyped-def]
+        self, idx: int, section: Section, variant_indices
+    ) -> "list[FunctionData]":
+        """Load several matched variant bodies of one section.
+
+        Parallel to ``variant_indices`` (the plural counterpart the
+        resolver's batch body load dispatches to). The matched arm carries
+        no per-slot whole-section rebuild, so this is a plain loop over
+        :py:meth:`_load_matched_variant_body` -- the symmetry with the
+        unmatched plural loader keeps the resolver arm-agnostic, with no
+        shared bundle to thread.
+        """
+        return [
+            self._load_matched_variant_body(idx, v, section)
+            for v in variant_indices
+        ]
