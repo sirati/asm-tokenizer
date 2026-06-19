@@ -23,13 +23,18 @@ from ._sample import (
     MultiBinarySortedIndexSampler,
     sample_section_pointers,
 )
+from ._validation import SequentialValidationSampler, ValidationBatch
+from ._validation_batch import open_validation_batches
 
 
 __all__ = [
     "CrossSpecSortedIndexSampler",
     "DecodeEngine",
     "MultiBinarySortedIndexSampler",
+    "SequentialValidationSampler",
+    "ValidationBatch",
     "decode_pointer_batch",
     "open_length_bucketed_batch",
+    "open_validation_batches",
     "sample_section_pointers",
 ]

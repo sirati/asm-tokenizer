@@ -14,7 +14,10 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import numpy as np
+
 from ...matched_sections_bin import Section
+from ...matched_sections_columnar import read_n_variants_columnar
 from .._session_parsers import (
     arm_arrays,
     parse_matched_section,
@@ -109,6 +112,42 @@ class _MatchedLoadMixin:
         section_offset = self._matched_section_offset(idx)
         section = self._parse_section_at(section_offset)
         return section, section_offset
+
+    def _matched_section_variant_counts(  # type: ignore[no-untyped-def]
+        self, section_indices: np.ndarray
+    ) -> np.ndarray:
+        """Per-section variant count for matched ``section_indices`` -- header-only.
+
+        Maps each matched section idx to its ``bin_starts`` byte offset
+        (the same ``idx -> section_offset`` source of truth
+        :py:meth:`_matched_section_offset` owns) and reads the count via
+        the header-only :func:`...matched_sections_columnar.read_n_variants_columnar`
+        gather over the cached ``_sections.bin`` uint8 mapping. Body-free:
+        it pages in only the touched section headers (the ``n_variants``
+        u16 at ``offset + 6``), never a jump table / call_target table /
+        variant block -- the cheapest way to get a whole batch's variant
+        counts without the per-section :func:`parse_section_bin` object
+        build.
+
+        ``section_indices`` is an integer ndarray of matched section idx;
+        returns ``int64[len(section_indices)]`` parallel to the input.
+        Raises :class:`IndexError` if any idx is out of range for the
+        matched arm.
+        """
+        idx = np.asarray(section_indices, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            return np.zeros(0, dtype=np.int64)
+        arm = self._meta_get("matched_arm")
+        bin_starts, _bin_lengths = arm_arrays(arm, "matched", self._binary_name)
+        if int(idx.max()) >= len(bin_starts):
+            raise IndexError(
+                f"matched section idx {int(idx.max())} out of bounds "
+                f"(have {len(bin_starts)} matched sections)"
+            )
+        section_offsets = np.asarray(bin_starts, dtype=np.int64)[idx]
+        return read_n_variants_columnar(
+            self._sections_bin_u8(), section_offsets
+        )
 
     def _load_matched_variant_body(  # type: ignore[no-untyped-def]
         self, idx: int, variant_index: int, section: Section
