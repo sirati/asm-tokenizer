@@ -35,6 +35,8 @@ from tokenizer.aligned_data.loader.vector_batch._inclusion import (
 )
 from tokenizer.aligned_data.loader.vector_batch._inclusion._bfs import (
     _ROOT_EDGE_TYPE,
+    _bfs_emit,
+    _bfs_full_included,
 )
 from tokenizer.aligned_data.matched_sections_columnar import (
     parse_sections_columnar,
@@ -150,6 +152,90 @@ def _reference_emit(cols, adj, section_idx, sampled, max_depth, *, reverse=False
         [np.asarray(e, dtype=np.int64) for e in emitted],
         [np.asarray(t, dtype=np.uint8) for t in etypes],
     )
+
+
+def _reference_pool(cols, adj, section_idx, sampled, max_depth):
+    """Legacy Python remembered-excluded pool per row (the oracle).
+
+    The pool is the FULL-variant-set-included callee set MINUS this row's
+    subset-emitted nodes -- exactly the diff ``_compute.py`` itself computes
+    for the (non-fused) Python drive. Drives the SAME production
+    ``_bfs_emit`` + ``_bfs_full_included`` + ``OnceOnlyInclusion`` the fused
+    kernel ports, with ``unmatched_inline=False`` (the production default the
+    fused kernel runs), so the two pools are comparable value-for-value.
+
+    Returns ``(pool_nodes_per_row, pool_types_per_row)`` parallel to
+    ``sampled`` -- each pool ascending-unique with the FULL-set edge
+    :class:`CallTargetType` gathered per pool node (the very ct_type a re-
+    inlined pool node carries through backfill).
+    """
+    decider = OnceOnlyInclusion()
+    emitted_per_row, _etypes, _u = _bfs_emit(
+        section_idx=section_idx,
+        sampled_variants=sampled,
+        cols=cols,
+        adjacency=adj,
+        decider=decider,
+        max_depth=max_depth,
+    )
+    included_full, full_edge_type = _bfs_full_included(
+        section_idx=section_idx,
+        cols=cols,
+        adjacency=adj,
+        decider=decider,
+        max_depth=max_depth,
+    )
+    pool_nodes, pool_types = [], []
+    for emitted in emitted_per_row:
+        pool = np.setdiff1d(
+            included_full, emitted, assume_unique=False
+        ).astype(np.int64)
+        ptypes = (
+            full_edge_type[pool] if pool.size else np.zeros(0, dtype=np.uint8)
+        )
+        pool_nodes.append(pool)
+        pool_types.append(ptypes)
+    return pool_nodes, pool_types
+
+
+def test_fused_excluded_pool_matches_legacy_python(tmp_path):
+    """Byte-identity gate: fused kernel excluded-pool VALUES vs the oracle.
+
+    The emitted-node gate above pins the emission; this pins the OTHER fused
+    output -- the remembered-excluded backfill pool (nodes AND per-pool-node
+    edge types) -- against the legacy Python full-set-minus-subset oracle,
+    over the cross-depth diamond fixture. Non-vacuous: at least one row's
+    pool is asserted non-empty so the gate has teeth (a kernel that emitted
+    an empty pool would still pass a row-by-row equality if every oracle pool
+    were empty too).
+    """
+    cols, starts, adj = _build(tmp_path)
+    section_idx = 0
+    sampled = np.array([0, 1, 2], dtype=np.int64)
+    max_depth = 5
+
+    incs = RowInclusionView(compute_row_inclusions(
+        cols,
+        starts,
+        root_sections=np.full(3, section_idx, dtype=np.int64),
+        root_sampled_variants=sampled,
+        root_groups=np.zeros(3, dtype=np.int64),
+        max_depth=max_depth,
+        need_excluded_pool=True,
+        adjacency=adj,
+    ))
+    ref_pool, ref_pool_types = _reference_pool(
+        cols, adj, section_idx, sampled, max_depth
+    )
+    assert any(p.size for p in ref_pool), (
+        "every oracle pool is empty on this fixture -- the pool gate is "
+        "vacuous; pick a depth/fixture where the subset prunes a callee"
+    )
+    for i in range(sampled.size):
+        np.testing.assert_array_equal(incs[i].excluded_nodes, ref_pool[i])
+        np.testing.assert_array_equal(
+            incs[i].excluded_edge_types, ref_pool_types[i]
+        )
 
 
 def test_fused_matches_per_level_reference(tmp_path):
