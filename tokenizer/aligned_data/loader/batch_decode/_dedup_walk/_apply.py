@@ -76,7 +76,7 @@ from ._constants import (
     FUNCTION_CATEGORIES,
     ROOT_FUNC_SLOT,
 )
-from ._flat_extract import extract_flat_remap_inputs
+from ._flat_extract import FlatRemapInputs, extract_flat_remap_inputs
 
 
 if TYPE_CHECKING:
@@ -90,6 +90,7 @@ def apply_per_row_remap(
     stage3_batch: "Stage3Batch",
     *,
     collect_fid_sidecar: bool = False,
+    flat: Optional[FlatRemapInputs] = None,
 ) -> tuple[
     np.ndarray,
     Optional[np.ndarray],
@@ -140,6 +141,18 @@ def apply_per_row_remap(
         PLT_FUNC, EXT_FUNC) counter-id-sorted concatenation; the row
         is fully self-describing via ``fid_row_offsets``. Multi-mapped
         rows each get a full copy of the variant's sidecar content.
+    flat
+        Optionally, the pre-built :class:`FlatRemapInputs` for this
+        batch. The STAGED ``batch_decode`` path leaves this ``None`` and
+        flattens ``stage3_batch``'s real object tree here via
+        :func:`extract_flat_remap_inputs`. The vector dense path builds
+        the SAME flat arrays COLUMNAR from its already-computed dense +
+        catalog columns (:func:`...vector_batch._scatter._remap_inputs.
+        build_flat_remap_inputs`) and threads them in, skipping the
+        GIL-bound per-call-target tree walk. The ``row_keys`` MUST key
+        the same ``(section_idx, slot_idx)`` the pass-2 sidecar lookup
+        uses; both builders walk referenced variants in section -> slot
+        order, so they line up byte-for-byte.
 
     Returns
     -------
@@ -167,7 +180,8 @@ def apply_per_row_remap(
     # FID inverse back into the ``(section_idx, slot_idx) -> {Category:
     # array}`` cache that pass 2 consumes. The kernel owns its own per-row
     # FUNCTION-Category hashmaps -- no caller-provided dedup-map pool.
-    flat = extract_flat_remap_inputs(stage3_batch)
+    if flat is None:
+        flat = extract_flat_remap_inputs(stage3_batch)
     per_row_fid_inverse = apply_remap_walk(
         flat.n_rows,
         len(FUNCTION_CATEGORIES),

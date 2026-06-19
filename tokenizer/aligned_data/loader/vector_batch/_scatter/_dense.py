@@ -44,9 +44,11 @@ from tokenizer.aligned_data.loader.batch_decode._sidecar_concat import (
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 from .._types import BatchGeometry
+from ._catalog_columns import build_catalog_columns
 from ._dense_adapter import build_stage2_batch
 from ._dense_columns import build_dense_columns
 from ._expand import ExpandedBatch
+from ._remap_inputs import build_flat_remap_inputs
 from ._surviving import surviving_token_counts
 
 
@@ -120,8 +122,13 @@ def build_dense_sidecars(
         The per-batch-row dense identity + numeric sidecars.
     """
     surviving = surviving_token_counts(geometry)
+    # Per-emitted-node CATALOG columns built ONCE (section index, root FID,
+    # encounter Category, COUNTER counts, per-section CT table) and threaded
+    # to BOTH the tree adapter and the remap-input builder -- a single
+    # source, no re-derived catalog walk on either consumer.
+    catalog = build_catalog_columns(geometry, expanded, cols=cols)
     stage2 = build_stage2_batch(
-        geometry, expanded, cols=cols, surviving=surviving
+        geometry, expanded, catalog=catalog, surviving=surviving
     )
 
     # Build the shared stage-3 front-matter ONCE, DIRECTLY from the
@@ -140,6 +147,17 @@ def build_dense_sidecars(
         else None
     )
 
+    # The remap kernel's flat int arrays built COLUMNAR from ``dense`` +
+    # ``catalog`` + the emission row CSR -- skips the GIL-bound per-call-
+    # target object-tree walk (:func:`extract_flat_remap_inputs`). The
+    # empty-batch path (``dense is None``) leaves ``flat`` ``None`` so
+    # ``apply_per_row_remap`` flattens the (empty) tree itself.
+    flat = (
+        build_flat_remap_inputs(geometry, dense, catalog)
+        if dense is not None
+        else None
+    )
+
     # --- run the OWNED decode kernels (byte-identical by construction) ---
     stage3 = build_bulk_bytes(stage2, dense)
     (
@@ -150,6 +168,7 @@ def build_dense_sidecars(
     ) = apply_per_row_remap(
         stage3,
         collect_fid_sidecar=include_fid_sidecar,
+        flat=flat,
     )
     row_numbers_sig, row_numbers_sex = assemble_number_sidecars(stage3)
 

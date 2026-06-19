@@ -30,11 +30,13 @@ from ._constants import (
     _CALL_TARGET_TYPE_TO_CATEGORY,
     _CATEGORY_TO_SHIFTED_ID,
 )
+from ._flat_extract import FlatRemapInputs
 
 
 __all__ = [
     "COUNTER_CATEGORIES",
     "FUNCTION_CATEGORIES",
+    "FlatRemapInputs",
     "NOT_FOUND_U16",
     "_CALL_TARGET_TYPE_TO_CATEGORY",
     "_CATEGORY_TO_SHIFTED_ID",
