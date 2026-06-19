@@ -51,12 +51,13 @@ from tokenizer.aligned_data.loader.batch_decode._dedup_walk._constants import (
     _FUNCTION_CATEGORY_TO_SLOT,
 )
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk._flat_extract import (
-    _COUNTER_SHIFTED_TO_SLOT,
     _CT_TYPE_TO_FUNC_SLOT,
-    _FUNC_SHIFTED_TO_SLOT,
 )
 from tokenizer.aligned_data.loader.batch_decode._dense_columns import (
     DenseColumns,
+)
+from tokenizer.aligned_data.loader.batch_decode._family_band_reduction import (
+    family_band_reduction,
 )
 
 from .._types import BatchGeometry
@@ -65,11 +66,6 @@ from ._catalog_columns import CatalogColumns
 
 __all__ = ["build_flat_remap_inputs"]
 
-
-# IDENTITY block shifted span [8, 16) -- the same band
-# :func:`_surviving_in_stream_token_ids` masks.
-_IDENTITY_BAND_LO = np.uint16(8)
-_IDENTITY_BAND_HI = np.uint16(16)
 
 # ``CallTargetType`` int value -> FUNCTION slot, as a dense int64 LUT the
 # per-node CT CSR kernel indexes by ``ct_type``. Built off the same
@@ -212,84 +208,26 @@ def _build_instream_columns(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-node in-stream identity slot CSR over the surviving prefix.
 
-    Reproduces :func:`_surviving_in_stream_token_ids` +
-    :func:`_instream_slots` for every node in one segmented pass: gather
-    each node's surviving-prefix IDENTITY-band ids, DROP the first per node
-    (the prepend slot at ``expanded`` position 0 is itself an identity
-    token), and map each remaining id to a FUNCTION slot (COUNTER ``-1``)
-    or a COUNTER slot (FUNCTION ``-1``). ``instream_off`` is the per-node
-    CSR; the two slot columns are parallel over the flat in-stream axis.
+    Thin adapter over the shared segmented band-reduction kernel
+    (:func:`...batch_decode._family_band_reduction.family_band_reduction`):
+    the kernel gathers each node's surviving-prefix IDENTITY-band ids, DROPS
+    the first per node (the prepend slot), and maps each remaining id to a
+    FUNCTION slot (COUNTER ``-1``) or a COUNTER slot (FUNCTION ``-1``) via
+    the same ``_FUNC_SHIFTED_TO_SLOT`` / ``_COUNTER_SHIFTED_TO_SLOT`` maps the
+    object walk uses. This adapter only slices the kernel's in-stream columns
+    (``instream_off`` CSR + the two parallel slot columns) -- it re-derives
+    NONE of the preamble or the prepend-drop.
     """
-    expanded = np.asarray(dense.expanded).reshape(-1)
-    node_offsets = np.asarray(dense.node_offsets, dtype=np.int64)
-    surviving = np.asarray(dense.surviving_token_count, dtype=np.int64)
-    n_nodes = node_offsets.shape[0] - 1
-
-    if n_nodes <= 0 or expanded.shape[0] == 0:
-        return (
-            np.zeros(n_nodes + 1, dtype=np.int64),
-            np.zeros(0, dtype=np.int64),
-            np.zeros(0, dtype=np.int64),
-        )
-
-    # Per-position owning node + offset within its node (the same segmented
-    # form ``count_surviving_batched`` uses).
-    node_len = np.diff(node_offsets)
-    pos = np.arange(expanded.shape[0], dtype=np.int64)
-    node_id = np.repeat(np.arange(n_nodes, dtype=np.int64), node_len)
-    offset_in_node = pos - node_offsets[node_id]
-
-    # An IDENTITY-band position is in-stream iff it survives AND it is NOT
-    # the first IDENTITY-band position of its node (the prepend). The
-    # surviving clip is ``offset_in_node < surviving[node_id]``; the first
-    # IDENTITY position per node is the prepend (always position 0's self
-    # token band-wise), so within each node we drop the FIRST surviving
-    # IDENTITY position.
-    within = offset_in_node < surviving[node_id]
-    is_identity = (expanded >= _IDENTITY_BAND_LO) & (
-        expanded < _IDENTITY_BAND_HI
+    result = family_band_reduction(
+        dense.expanded,
+        np.asarray(dense.node_offsets, dtype=np.int64),
+        np.asarray(dense.surviving_token_count, dtype=np.int64),
     )
-    surviving_identity = within & is_identity
-
-    # The selected positions are in node-major ascending order (``pos`` is
-    # ascending and ``node_id`` is ``np.repeat`` of ascending nodes). The
-    # FIRST selected position of each node is its prepend slot (the
-    # identity token at ``expanded`` position 0) -- :func:
-    # `_surviving_in_stream_token_ids` drops it (``identity_token_ids[1:]``).
-    # A selected position is first-of-node iff its node differs from the
-    # previous selected position's node.
-    sel_node = node_id[surviving_identity]
-    sel_ids = expanded[surviving_identity]
-    if sel_node.shape[0]:
-        is_first_of_node = np.ones(sel_node.shape[0], dtype=bool)
-        is_first_of_node[1:] = sel_node[1:] != sel_node[:-1]
-        in_stream_mask = ~is_first_of_node
-    else:
-        in_stream_mask = np.zeros(0, dtype=bool)
-
-    # The in-stream token ids (post prepend drop), in node-major order.
-    instream_ids = sel_ids[in_stream_mask]
-    instream_node = sel_node[in_stream_mask]
-
-    # Per-node in-stream count == surviving identity count - 1 for surviving
-    # nodes, 0 for dropped -- the CSR offsets.
-    per_node_instream = np.bincount(instream_node, minlength=n_nodes).astype(
-        np.int64
+    return (
+        result.instream_off,
+        result.instream_func_slot,
+        result.instream_counter_slot,
     )
-    instream_off = np.zeros(n_nodes + 1, dtype=np.int64)
-    np.cumsum(per_node_instream, out=instream_off[1:])
-
-    # Map each id to a FUNCTION slot (COUNTER -1) or COUNTER slot
-    # (FUNCTION -1); the two columns are disjoint by the IDENTITY-band
-    # partition.
-    func_slot = np.full(instream_ids.shape[0], -1, dtype=np.int64)
-    counter_slot = np.full(instream_ids.shape[0], -1, dtype=np.int64)
-    for shifted, slot in _FUNC_SHIFTED_TO_SLOT.items():
-        func_slot[instream_ids == np.uint16(shifted)] = slot
-    for shifted, slot in _COUNTER_SHIFTED_TO_SLOT.items():
-        counter_slot[instream_ids == np.uint16(shifted)] = slot
-
-    return instream_off, func_slot, counter_slot
 
 
 def _build_counter_counts(

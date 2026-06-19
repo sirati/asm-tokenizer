@@ -57,11 +57,12 @@ import numpy as np
 from tokenizer.aligned_data.loader.batch_decode._sidecar_concat import (
     NumberChunkColumns,
     _NUMBER_BLOCK_TOKEN_TYPES,
-    _SHIFTED_NUMBER_BAND_HI,
-    _SHIFTED_NUMBER_BAND_LO,
 )
 from tokenizer.aligned_data.loader.batch_decode._dense_columns import (
     DenseColumns,
+)
+from tokenizer.aligned_data.loader.batch_decode._family_band_reduction import (
+    family_band_reduction,
 )
 
 from .._types import BatchGeometry
@@ -105,36 +106,24 @@ def build_number_chunk_columns(
     n_rows = max(int(row_offsets.shape[0]) - 1, 0)
     n_nodes = int(dense.n_nodes)
 
-    expanded = np.asarray(dense.expanded).reshape(-1)
-    node_offsets = np.asarray(dense.node_offsets, dtype=np.int64)
-    surviving = np.asarray(dense.surviving_token_count, dtype=np.int64)
-
     # ----- per-chunk selection: surviving NUMBER-band expanded slots -----
-    # A position is a chunk iff it is in the node's SURVIVING prefix
-    # (offset_in_node < surviving[node]) AND its expanded id is in the
-    # post-shift NUMBER band [LO, HI). Ascending position order groups the
-    # chunks by node (DFS) and, within a node, by stream order -- exactly
-    # the tree walk's ``expanded_token_ids[:partial_cut_length]`` scan.
-    if n_nodes <= 0 or expanded.shape[0] == 0:
-        out_block = np.empty(0, dtype=np.int64)
+    # The shared segmented band-reduction kernel selects, in ascending
+    # (DFS-then-stream) position order, every surviving NUMBER-band slot and
+    # emits its ``out_block = expanded - NUMBER_LO`` + owning ``ct_ordinal``
+    # (== node id). This adapter re-derives NEITHER the preamble nor the band
+    # mask; it only gathers the per-(block, node) slice start + builds the
+    # variant CSR (a different concern that stays in Python).
+    reduction = family_band_reduction(
+        dense.expanded,
+        np.asarray(dense.node_offsets, dtype=np.int64),
+        np.asarray(dense.surviving_token_count, dtype=np.int64),
+    )
+    out_block = reduction.number_out_block
+    ct_ordinal = reduction.number_ct_ordinal
+
+    if n_nodes <= 0 or out_block.shape[0] == 0:
         slice_start = np.empty(0, dtype=np.int64)
-        ct_ordinal = np.empty(0, dtype=np.int64)
     else:
-        node_len = np.diff(node_offsets)
-        node_id = np.repeat(np.arange(n_nodes, dtype=np.int64), node_len)
-        offset_in_node = (
-            np.arange(expanded.shape[0], dtype=np.int64)
-            - node_offsets[node_id]
-        )
-        within = offset_in_node < surviving[node_id]
-        in_band = (expanded >= _SHIFTED_NUMBER_BAND_LO) & (
-            expanded < _SHIFTED_NUMBER_BAND_HI
-        )
-        sel = within & in_band
-
-        out_block = expanded[sel].astype(np.int64) - _SHIFTED_NUMBER_BAND_LO
-        ct_ordinal = node_id[sel]
-
         # Per-chunk source base = the owning call_target's per-block slice
         # ``.start`` (the kernel's boundary array), selected by the chunk's
         # block. Stacked ``[n_blocks, n_nodes]`` so the per-chunk gather is

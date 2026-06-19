@@ -36,6 +36,7 @@
 
 mod adjacency_expand;
 mod carrier_signs;
+mod family_band_reduction;
 mod flat_segments;
 mod hashmap_macro;
 mod identity_gather;
@@ -53,6 +54,7 @@ mod token_scatter;
 use adjacency_expand::LiveAdjacencyKernel;
 use once_only_inclusion::OnceOnlyInclusionKernel;
 use carrier_signs::build_carrier_signs_kernel;
+use family_band_reduction::build_family_band_reduction_kernel;
 use flat_segments::build_flat_segments_kernel;
 use hashmap_macro::define_hashmap;
 use identity_gather::build_identity_carriers_kernel;
@@ -351,6 +353,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // shift survivors down 256, prepend each node's self-token). See
     // `strip_shift_prepend.rs`.
     m.add_function(wrap_pyfunction!(build_strip_shift_prepend_kernel, m)?)?;
+
+    // Single GIL-free segmented band-reduction over the per-node surviving
+    // prefix, shared by the three vector-decode call sites (the preamble
+    // `count_surviving_batched` / `_build_instream_columns` /
+    // `build_number_chunk_columns` each recompute). See
+    // `family_band_reduction.rs`.
+    m.add_function(wrap_pyfunction!(build_family_band_reduction_kernel, m)?)?;
 
     // Fused boundary-aware InlineDecodeState field kernel (the GIL-released
     // `_state_fields.py` trio twin: runlen_number/runlen_value via per-node
