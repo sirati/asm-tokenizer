@@ -61,6 +61,10 @@ from tokenizer.aligned_data.sorted_index.tests.fixtures import (
 )
 
 from ._byte_identity_harness import _nonempty_matched_idxs, _prepare
+from ._full_tree_oracle import (
+    build_full_tree_stage3,
+    capture_columnar_inputs,
+)
 from ._rich_corpus import build_rich_splice_fixture
 
 
@@ -96,16 +100,16 @@ def test_number_chunk_columns_equiv_live_binary(
     base = _prepare(build_rich_splice_fixture, tmp_path)
     idxs = _nonempty_matched_idxs(base)
 
-    captured: list = []
+    # Capture the production columnar ``numbers``. The tree-walk ORACLE is
+    # rebuilt independently from the captured ``(geometry, dense, catalog)``
+    # (the production tree is now SLIM -- step-5 object-tree elimination --
+    # so there is no ``stage3.sections`` to walk on the production object).
+    numbers_capture: list = []
     real_assemble = _dense_mod.assemble_number_sidecars
 
     def _capturing(stage3, numbers=None):
-        # The re-point ALWAYS supplies columnar ``numbers`` on a non-empty
-        # batch; capture it alongside the tree-walk oracle built from the
-        # same ``stage3``.
         if numbers is not None:
-            tree = _tree_chunk_columns(stage3)
-            captured.append((stage3, tree, numbers))
+            numbers_capture.append(numbers)
         return real_assemble(stage3, numbers)
 
     pointers = [
@@ -114,32 +118,43 @@ def test_number_chunk_columns_equiv_live_binary(
     dataset = BinaryDataset(
         base, "sortbin", vocab_manager=make_test_vocab_manager()
     )
-    with _mock.patch.object(
-        _dense_mod, "assemble_number_sidecars", _capturing
-    ):
-        with dataset.open_session() as session:
-            with open_vector_batch_handles(base, "sortbin") as handles:
-                vector_batch_tokens(
-                    session,
-                    pointers,
-                    handles=handles,
-                    num_variants_per_section=2,
-                    context_len=context_len,
-                    max_depth=max_depth,
-                    variant_padding=VariantPadding.PAD_NULL,
-                    include_fid_sidecar=True,
-                    rng=np.random.default_rng(0),
-                )
+    with capture_columnar_inputs() as columnar_inputs:
+        with _mock.patch.object(
+            _dense_mod, "assemble_number_sidecars", _capturing
+        ):
+            with dataset.open_session() as session:
+                with open_vector_batch_handles(base, "sortbin") as handles:
+                    vector_batch_tokens(
+                        session,
+                        pointers,
+                        handles=handles,
+                        num_variants_per_section=2,
+                        context_len=context_len,
+                        max_depth=max_depth,
+                        variant_padding=VariantPadding.PAD_NULL,
+                        include_fid_sidecar=True,
+                        rng=np.random.default_rng(0),
+                    )
 
-    assert captured, "the columnar number-sidecar path was never exercised"
+    assert numbers_capture, (
+        "the columnar number-sidecar path was never exercised"
+    )
+    assert len(numbers_capture) == len(columnar_inputs), (
+        "columnar-input capture / numbers capture lengths diverge: "
+        f"{len(columnar_inputs)} vs {len(numbers_capture)}"
+    )
     any_chunks = False
-    for stage3, tree, columnar in captured:
+    for (geometry, dense, catalog), columnar in zip(
+        columnar_inputs, numbers_capture
+    ):
+        full_stage3 = build_full_tree_stage3(geometry, dense, catalog)
+        tree = _tree_chunk_columns(full_stage3)
         _assert_chunk_columns_equal(tree, columnar)
 
         # Full sidecar byte-identity: the shared rank + gather tail must
         # produce the same (sig, sex) from either source.
-        tree_sig, tree_sex = assemble_number_sidecars(stage3)
-        col_sig, col_sex = assemble_number_sidecars(stage3, columnar)
+        tree_sig, tree_sex = assemble_number_sidecars(full_stage3)
+        col_sig, col_sex = assemble_number_sidecars(full_stage3, columnar)
         assert np.array_equal(tree_sig, col_sig), "numbers_significant diverged"
         assert np.array_equal(
             tree_sex, col_sex

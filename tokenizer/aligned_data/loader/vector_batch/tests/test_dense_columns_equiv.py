@@ -551,28 +551,6 @@ def test_teeth_permuted_surviving_fails():
 # ---------------------------------------------------------------------------
 
 
-def _rederive_batched(expanded) -> tuple[BatchedExpansion, np.ndarray, np.ndarray]:
-    """Re-run ``batched_expand`` from the ``ExpandedBatch`` raw flats.
-
-    ``ExpandedBatch`` retains ``raw_flat`` / ``raw_record_offsets`` (the
-    exact inputs ``expand_node_bodies`` fed ``batched_expand``); re-running
-    the owned expansion reproduces the SAME ``BatchedExpansion`` the
-    production path sliced its per-node ``states`` from. The self-token
-    ids are recovered from the per-node prepend slot (expanded slot 0 of
-    each node), which ``batched_expand`` writes verbatim."""
-    raw_flat = np.asarray(expanded.raw_flat, dtype=np.uint16)
-    rec = np.asarray(expanded.raw_record_offsets, dtype=np.int64)
-    node_off = np.asarray(expanded.node_offsets, dtype=np.int64)
-    n_nodes = rec.shape[0] - 1
-    # Each node's prepend self-token is expanded slot 0 of the node.
-    self_token_ids = expanded.expanded[node_off[:-1]].astype(np.uint16)
-    if n_nodes == 0:
-        self_token_ids = np.zeros(0, dtype=np.uint16)
-    batched = batched_expand(raw_flat, rec, self_token_ids)
-    assert np.array_equal(batched.expanded, expanded.expanded), (
-        "re-derived BatchedExpansion diverges from the production expansion"
-    )
-    return batched, raw_flat, rec
 
 
 @pytest.mark.parametrize("context_len,max_depth", [(4096, 3), (7, 3), (256, 0)])
@@ -605,20 +583,28 @@ def test_dense_columns_equiv_live_binary(context_len, max_depth, tmp_path):
     idxs = _nonempty_matched_idxs(base)
 
     captured: list = []
-    real_build = _dense_mod.build_stage2_batch
+    # Step-5 object-tree elimination dropped ``build_stage2_batch`` from the
+    # production vector path; capture the columnar ``build_dense_columns``
+    # inputs instead (it receives exactly ``(batched, raw_flat, rec,
+    # surviving)`` -- no expansion re-derivation needed).
+    real_build = _dense_mod.build_dense_columns
 
-    def _capturing(geometry, expanded, *, catalog, surviving):
-        stage2 = real_build(
-            geometry, expanded, catalog=catalog, surviving=surviving
+    def _capturing(batched, raw_flat, record_offsets, surviving):
+        captured.append(
+            (
+                batched,
+                np.asarray(raw_flat),
+                np.asarray(record_offsets),
+                np.asarray(surviving),
+            )
         )
-        captured.append((expanded, np.asarray(surviving), stage2))
-        return stage2
+        return real_build(batched, raw_flat, record_offsets, surviving)
 
     pointers = [SectionPointerSpec(arm=SectionKind.MATCHED, idx=int(i)) for i in idxs]
     dataset = BinaryDataset(base, "sortbin", vocab_manager=make_test_vocab_manager())
     import unittest.mock as _mock
 
-    with _mock.patch.object(_dense_mod, "build_stage2_batch", _capturing):
+    with _mock.patch.object(_dense_mod, "build_dense_columns", _capturing):
         with dataset.open_session() as session:
             with open_vector_batch_handles(base, "sortbin") as handles:
                 vector_batch_tokens(
@@ -633,18 +619,12 @@ def test_dense_columns_equiv_live_binary(context_len, max_depth, tmp_path):
                     rng=np.random.default_rng(0),
                 )
 
-    assert captured, "build_stage2_batch was never called -- no rows decoded"
+    assert captured, "build_dense_columns was never called -- no rows decoded"
     any_nonempty = False
-    for expanded, surviving, _slim_stage2 in captured:
-        batched, raw_flat, rec = _rederive_batched(expanded)
-        # The production adapter ``stage2`` is SLIMMED (step-5 object-tree
-        # elimination): its level-4 ``state`` / ``function_data`` /
-        # promotion-mask fields are shared empty singletons (the vector
-        # dense path reads those bodies columnar, not off the tree). This
-        # gate proves the COLUMNAR ``DenseColumns`` reproduces the per-CT
-        # tree front-matter, so its oracle must be the FULL tree built from
-        # the SAME captured ``(batched, surviving)`` -- not the slim
-        # production tree (which carries no per-CT body to compare).
+    for batched, raw_flat, rec, surviving in captured:
+        # The oracle is the FULL per-CT tree built from the SAME captured
+        # ``(batched, surviving)``; this gate proves the COLUMNAR
+        # ``DenseColumns`` reproduces that per-CT tree front-matter.
         full_stage2 = _stage2_from_batched(batched, raw_flat, rec, surviving)
         dense = build_dense_columns(batched, raw_flat, rec, surviving)
         _assert_full_equivalence(full_stage2, dense)

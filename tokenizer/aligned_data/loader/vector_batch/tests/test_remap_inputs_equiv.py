@@ -52,6 +52,10 @@ from tokenizer.aligned_data.sorted_index.tests.fixtures import (
 )
 
 from ._byte_identity_harness import _nonempty_matched_idxs, _prepare
+from ._full_tree_oracle import (
+    build_full_tree_stage3,
+    capture_columnar_inputs,
+)
 from ._rich_corpus import build_rich_splice_fixture
 
 
@@ -105,19 +109,20 @@ def test_flat_remap_inputs_equiv_live_binary(
     base = _prepare(build_rich_splice_fixture, tmp_path)
     idxs = _nonempty_matched_idxs(base)
 
-    captured: list = []
+    # Capture the production columnar ``flat`` (the re-point's threaded
+    # kernel input). The tree-walk ORACLE is rebuilt independently from the
+    # captured ``(geometry, dense, catalog)`` (the production tree is now
+    # SLIM -- step-5 object-tree elimination -- so we cannot read it off the
+    # production ``stage3`` any more).
+    flats: list = []
     real_remap = _dense_mod.apply_per_row_remap
 
     def _capturing(
         stage3, *, collect_fid_sidecar=False, flat=None,
         variants_per_section=None,
     ):
-        # The re-point ALWAYS supplies a columnar ``flat`` on a non-empty
-        # batch; capture it alongside the tree-walk oracle built from the
-        # same ``stage3``.
         if flat is not None:
-            oracle = extract_flat_remap_inputs(stage3)
-            captured.append((oracle, flat))
+            flats.append(flat)
         return real_remap(
             stage3,
             collect_fid_sidecar=collect_fid_sidecar,
@@ -131,24 +136,34 @@ def test_flat_remap_inputs_equiv_live_binary(
     dataset = BinaryDataset(
         base, "sortbin", vocab_manager=make_test_vocab_manager()
     )
-    with _mock.patch.object(_dense_mod, "apply_per_row_remap", _capturing):
-        with dataset.open_session() as session:
-            with open_vector_batch_handles(base, "sortbin") as handles:
-                vector_batch_tokens(
-                    session,
-                    pointers,
-                    handles=handles,
-                    num_variants_per_section=2,
-                    context_len=context_len,
-                    max_depth=max_depth,
-                    variant_padding=VariantPadding.PAD_NULL,
-                    include_fid_sidecar=True,
-                    rng=np.random.default_rng(0),
-                )
+    with capture_columnar_inputs() as columnar_inputs:
+        with _mock.patch.object(
+            _dense_mod, "apply_per_row_remap", _capturing
+        ):
+            with dataset.open_session() as session:
+                with open_vector_batch_handles(base, "sortbin") as handles:
+                    vector_batch_tokens(
+                        session,
+                        pointers,
+                        handles=handles,
+                        num_variants_per_section=2,
+                        context_len=context_len,
+                        max_depth=max_depth,
+                        variant_padding=VariantPadding.PAD_NULL,
+                        include_fid_sidecar=True,
+                        rng=np.random.default_rng(0),
+                    )
 
-    assert captured, "the columnar remap path was never exercised"
+    assert flats, "the columnar remap path was never exercised"
+    assert len(flats) == len(columnar_inputs), (
+        "columnar-input capture / flat capture lengths diverge: "
+        f"{len(columnar_inputs)} vs {len(flats)}"
+    )
     any_nodes = False
-    for oracle, columnar in captured:
+    for (geometry, dense, catalog), columnar in zip(columnar_inputs, flats):
+        oracle = extract_flat_remap_inputs(
+            build_full_tree_stage3(geometry, dense, catalog)
+        )
         _assert_flat_equal(oracle, columnar)
         if oracle.node_row.shape[0] > 0:
             any_nodes = True
