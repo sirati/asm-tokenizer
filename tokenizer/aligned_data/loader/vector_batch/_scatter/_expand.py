@@ -157,6 +157,14 @@ class ExpandedBatch:
     aligned to ``raw_flat`` (the batch-wide twin of each state's
     ``runlen_number`` view)."""
 
+    batched: "BatchedExpansion | None" = None
+    """The flat :class:`._batched_expand.BatchedExpansion` the per-node
+    ``states`` / masks were sliced from. Retained (not re-derived) so the
+    dense pass can build the shared :class:`DenseColumns` front-matter
+    DIRECTLY from these flats (one columnar build feeding the four stage-3
+    sites) instead of re-walking the per-node tree. ``None`` for the
+    token-only test constructors that skip the dense pass."""
+
 
 def expand_node_bodies(
     bodies: GatheredBodies,
@@ -228,6 +236,7 @@ def expand_node_bodies(
         raw_flat=raw_flat,
         raw_record_offsets=rec,
         runlen_number_flat=batched.runlen_number,
+        batched=batched,
     )
 
 

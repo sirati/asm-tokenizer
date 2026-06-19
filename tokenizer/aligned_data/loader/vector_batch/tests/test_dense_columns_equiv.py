@@ -348,7 +348,7 @@ def _assert_kept_index(stage2: Stage2Batch, dense: DenseColumns) -> None:
         "kept_node_index diverges from flatten_call_targets.ct_index"
     )
     seg = build_flat_segments(
-        stage2, build_inline_bytes(stage2)[1]
+        stage2, build_inline_bytes(dense)[1]
     )
     assert np.array_equal(dense.kept_node_index, seg.ct_index)
 
@@ -361,7 +361,7 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
     construction; here we additionally pin the cross-cutting flat axes the
     sites expose so a future view-shape drift surfaces.
     """
-    inline_bytes, inline_slices = build_inline_bytes(stage2)
+    inline_bytes, inline_slices = build_inline_bytes(dense)
     # 3a: per-CT byte slice lengths must align with the full DFS node axis.
     assert len(inline_slices) == dense.n_nodes
 

@@ -46,7 +46,11 @@ import numpy as np
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
-from ._flat_call_targets import iter_call_target_columns
+from ._dense_columns import DenseColumns
+from ._flat_call_targets import (
+    dense_columns_from_stage2,
+    iter_call_target_columns,
+)
 from ._fp_normalize import normalize_per_token_type
 from ._identity_decode import build_identity_idx_2d, view_cast_identities
 from ._inline_bytes import build_inline_bytes
@@ -99,6 +103,7 @@ _NUMBER_BLOCK_TOKEN_TYPES: tuple[TokenType, ...] = (
 
 def build_bulk_bytes(
     stage2: "Stage2Batch",
+    dense: "DenseColumns | None" = None,
 ) -> Stage3Batch:
     """Compose 3a + 3b + 3c + 3d into a :class:`Stage3Batch`.
 
@@ -113,6 +118,12 @@ def build_bulk_bytes(
         Output of stage 2 (length-predict + cutoff walk). Provides the
         4-level hierarchy + per-call-target expanded streams + masks +
         surviving counts.
+    dense
+        The shared :class:`DenseColumns` front-matter, when a caller has
+        already built it (the vector dense path builds it ONCE from the
+        ``BatchedExpansion``, collapsing the four tree-walks). Omitted by
+        the staged ``batch_decode`` path, which builds it here with a
+        single DFS walk of ``stage2``.
 
     Returns
     -------
@@ -120,10 +131,12 @@ def build_bulk_bytes(
         Level-1 batch with batch-shared bulk arrays + the 4-level
         Stage3 mirror carrying per-call-target slices into them.
     """
+    if dense is None:
+        dense = dense_columns_from_stage2(stage2)
 
     # 1. inline_bytes (3a): per-call-target u8 byte slices into a flat
     #    buffer with a leading zero pad at index 0.
-    inline_bytes, inline_byte_slices = build_inline_bytes(stage2)
+    inline_bytes, inline_byte_slices = build_inline_bytes(dense)
 
     # 2. identity idx_2d (3b): u32[N_in_stream, 2] of byte offsets into
     #    inline_bytes; per-call-target identity_slices INCLUDE the

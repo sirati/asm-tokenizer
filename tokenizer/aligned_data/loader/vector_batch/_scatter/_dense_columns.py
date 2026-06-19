@@ -56,10 +56,11 @@ sign array's ``surviving == 1`` empty-body segments).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
+from tokenizer.aligned_data.loader.batch_decode._dense_columns import (
+    DenseColumns,
+)
 from tokenizer.aligned_data.loader.batch_decode._surviving_counts import (
     count_surviving_batched,
 )
@@ -68,116 +69,6 @@ from ._batched_expand import BatchedExpansion
 
 
 __all__ = ["DenseColumns", "build_dense_columns"]
-
-
-@dataclass(frozen=True)
-class DenseColumns:
-    """The flat dense front-matter the 4 stage-3 sites consume.
-
-    Built once from :class:`BatchedExpansion` + ``surviving`` in emitted-
-    node order (== the canonical stage-3 DFS call_target order). Every
-    array is a VIEW or a fresh concatenation over the batched flats -- the
-    same data the per-call_target sites slice off the adapter's
-    ``Stage2CallTarget`` / ``Stage1CallTarget.state`` views.
-
-    Per-node scalar columns (FULL DFS axis, length ``n_nodes``)
-    -----------------------------------------------------------
-    surviving_token_count:
-        ``int64[n_nodes]`` -- node ``e``'s surviving prefix length (the
-        adapter's ``Stage2CallTarget.surviving_token_count`` /
-        ``partial_cut_length``); the cut clip.
-    predicted_full_length:
-        ``int64[n_nodes]`` -- node ``e``'s full ``expanded`` length
-        (``node_offsets`` diff); ``Stage2CallTarget.predicted_full_length``.
-    is_cut:
-        ``bool[n_nodes]`` -- ``surviving_token_count < predicted_full_length``
-        (the adapter's ``is_cut``).
-    surviving_identity_count / surviving_number_chunk_count:
-        ``int64[n_nodes]`` -- the per-node IDENTITY / NUMBER band
-        cardinalities over the surviving prefix (the adapter's
-        homonymous scalar fields).
-
-    RAW-space CSR (FULL DFS axis)
-    -----------------------------
-    raw_tokens / real_mask / number_mask / runlen_number /
-    is_negative_per_position:
-        The flat ``BatchedExpansion`` raw-space arrays (VIEWS, no copy).
-    raw_offsets:
-        ``int64[n_nodes + 1]`` -- the raw-space CSR (``BatchedExpansion``'s
-        ``record_offsets``); node ``e`` owns ``raw_tokens[raw_offsets[e] :
-        raw_offsets[e + 1]]``.
-    digit_cumsum:
-        The flat ``digit_cumsum`` (VIEW). Node ``e``'s ``N + 1`` block is
-        ``digit_cumsum[digit_offsets[e] : digit_offsets[e + 1]]``.
-    digit_offsets:
-        ``int64[n_nodes + 1]`` -- the digit-cumsum CSR
-        (``raw_offsets + arange(n_nodes + 1)``, the per-node ``+1``-slot
-        packing).
-
-    EXPANDED-space CSR (FULL DFS axis)
-    ----------------------------------
-    expanded / extra_value_v2_mask / extra_f128_mask:
-        The flat ``BatchedExpansion`` expanded-space arrays (VIEWS).
-    node_offsets:
-        ``int64[n_nodes + 1]`` -- the expanded-space CSR.
-
-    Kept subset (``surviving_token_count > 0``, DFS order)
-    ------------------------------------------------------
-    kept_node_index:
-        ``int64[n_kept]`` -- the FULL-DFS node index of each kept node
-        (the ``dfs_index`` / ``ct_index`` the per-DFS-call_target slice
-        lists are keyed by). Equals ``flatten_call_targets`` / 3c /
-        sign's ``ct_index``.
-    """
-
-    surviving_token_count: np.ndarray
-    predicted_full_length: np.ndarray
-    is_cut: np.ndarray
-    surviving_identity_count: np.ndarray
-    surviving_number_chunk_count: np.ndarray
-
-    raw_tokens: np.ndarray
-    real_mask: np.ndarray
-    number_mask: np.ndarray
-    runlen_number: np.ndarray
-    is_negative_per_position: np.ndarray
-    raw_offsets: np.ndarray
-    digit_cumsum: np.ndarray
-    digit_offsets: np.ndarray
-
-    expanded: np.ndarray
-    extra_value_v2_mask: np.ndarray
-    extra_f128_mask: np.ndarray
-    node_offsets: np.ndarray
-
-    kept_node_index: np.ndarray
-
-    # ------------------------------------------------------------------
-    # Per-node VIEW accessors -- the lazy column read each stage-3 site
-    # does off the adapter's ``Stage2CallTarget`` / ``state``. Object
-    # reuse is irrelevant here (these are cheap numpy slices, no wrapper
-    # materialisation); they exist so a site reads a node's columns
-    # without re-deriving the CSR base every call.
-    # ------------------------------------------------------------------
-
-    @property
-    def n_nodes(self) -> int:
-        """Number of nodes in the full DFS enumeration (slice axis)."""
-        return int(self.surviving_token_count.shape[0])
-
-    def node_raw_slice(self, e: int) -> slice:
-        """RAW-space slice of node ``e`` (``raw_tokens`` etc.)."""
-        return slice(int(self.raw_offsets[e]), int(self.raw_offsets[e + 1]))
-
-    def node_digit_slice(self, e: int) -> slice:
-        """DIGIT-cumsum slice of node ``e`` (``N + 1`` slots)."""
-        return slice(
-            int(self.digit_offsets[e]), int(self.digit_offsets[e + 1])
-        )
-
-    def node_expanded_slice(self, e: int) -> slice:
-        """EXPANDED-space slice of node ``e`` (``expanded`` / masks)."""
-        return slice(int(self.node_offsets[e]), int(self.node_offsets[e + 1]))
 
 
 # ---------------------------------------------------------------------------
