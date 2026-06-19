@@ -41,7 +41,6 @@ from typing import TYPE_CHECKING, List
 import numpy as np
 
 from ..metadata_loader import SectionKind
-from .._session_helpers import _select_variant_indices
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     from ..function_data import FunctionData
@@ -49,6 +48,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
 
 from ...matched_sections_bin import Section
 from ._types import SectionPointerSpec
+from ._variant_selection import CountThenRNGSelection
 
 
 __all__ = [
@@ -173,11 +173,18 @@ def resolve_section_pointers(
     resolved: List[ResolvedSection] = []
     for pointer in section_pointers:
         section = _parse_section_catalog(session, pointer)
-        sampled = _select_variant_indices(
-            n_variants=len(section.variants),
-            max_variants=num_variants_per_section,
-            rng=rng,
+        # Null-object collapse: a pointer that pins no explicit selection
+        # falls back to the count-then-RNG strategy with the request's
+        # ``num_variants_per_section``. The default branch hits
+        # ``CountThenRNGSelection`` -> ``_select_variant_indices`` with the
+        # identical arguments the resolver passed before this seam existed,
+        # so the count path stays byte-identical. The validation path rides
+        # an ``ExplicitIndicesSelection`` on the pointer instead -- this
+        # resolver never learns which it got.
+        selection = pointer.variant_selection or CountThenRNGSelection(
+            num_variants_per_section
         )
+        sampled = selection.select(n_variants=len(section.variants), rng=rng)
         # ``_select_variant_indices`` returns ``np.ndarray[int64]``;
         # convert each element to a Python ``int`` so the downstream
         # 1d wiring can use the indices as plain list indices without

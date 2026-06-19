@@ -40,9 +40,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+    # Imported under TYPE_CHECKING so the runtime backbone shape module
+    # never pulls in the selection-strategy module (which imports the
+    # session helpers); the field is a forward reference only.
+    from ._variant_selection import VariantSelection
 
 # Existing types this module references.
 # NOTE: the plan section D9 names the parsed call_target row
@@ -128,10 +134,20 @@ class SectionPointerSpec:
     :meth:`BinarySession._load_unmatched_for_splice` (which takes
     ``idx``) -- i.e. the same ``(arm, idx)`` keying every per-arm
     loader already uses.
+
+    ``variant_selection`` is the OPTIONAL per-section variant-index
+    selection strategy (a :class:`._variant_selection.VariantSelection`).
+    It is ``None`` for every count-based construction (the historical
+    path); the resolver substitutes the count-then-RNG null object in
+    that case, so the count path is byte-identical. The validation path
+    stamps an ``ExplicitIndicesSelection`` here to pin a deterministic
+    variant subset. Declared LAST with a ``None`` default so every
+    existing construction is unchanged.
     """
 
     arm: SectionKind
     idx: int  # per-arm function/section idx
+    variant_selection: Optional["VariantSelection"] = None
 
 
 # ---------------------------------------------------------------------------
