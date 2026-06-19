@@ -121,11 +121,14 @@ def _capture_one(
     return captured
 
 
-def _run_sweep(out_dir: Path, npz_path: Path) -> None:
+def _run_sweep(
+    out_dir: Path, npz_path: Path, binaries: list[str] | None = None
+) -> None:
     vocab_path = resolve_unified_vocab_path(out_dir)
     vocab_manager = load_and_validate_unified_vocab(vocab_path)
 
-    binaries = ["nping", "openssl", "minigzip64", "libcrypto.so.3", "z3"]
+    if binaries is None:
+        binaries = ["nping", "openssl", "minigzip64", "libcrypto.so.3", "z3"]
     depths = [1, 3]
     batch_caps = [64, 256]
     context_len = 1024
@@ -191,10 +194,21 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--npz", type=Path, required=True)
     ap.add_argument("--compare", type=Path, default=None)
+    ap.add_argument(
+        "--binaries",
+        type=str,
+        default=None,
+        help="comma-separated binary names (default: the #91 corpus set)",
+    )
     args = ap.parse_args()
     if args.compare is not None:
         return 1 if _compare(args.compare, args.npz) else 0
-    _run_sweep(args.out_dir, args.npz)
+    binaries = (
+        [b for b in args.binaries.split(",") if b]
+        if args.binaries is not None
+        else None
+    )
+    _run_sweep(args.out_dir, args.npz, binaries)
     return 0
 
 

@@ -37,14 +37,14 @@ from typing import TYPE_CHECKING, List
 
 import numpy as np
 
-from .._flat_call_targets import surviving_call_targets
+from .._flat_call_targets import iter_call_target_columns
 from ._band_constants import (
     _NUMBER_BAND_HI_SHIFTED,
     _NUMBER_BAND_LO_SHIFTED,
 )
 
 if TYPE_CHECKING:
-    from .._types import Stage2Batch, Stage2CallTarget
+    from .._types import Stage2Batch
 
 
 __all__ = [
@@ -179,7 +179,14 @@ def build_batched_carriers(
     Returns the carrier table + ``ct_index`` (the kept call_targets' DFS
     indices, for the entry's per-DFS-call_target slice reconstruction).
     """
-    kept, ct_index = surviving_call_targets(stage2)
+    kept = [
+        cols
+        for cols in iter_call_target_columns(stage2)
+        if cols.surviving_token_count > 0
+    ]
+    ct_index = np.asarray(
+        [cols.dfs_index for cols in kept], dtype=np.int64
+    )
     n_kept = len(kept)
 
     # --- per-segment concatenations -----------------------------------
@@ -203,38 +210,37 @@ def build_batched_carriers(
     digit_running = 0
     runlen_running = 0
     f128_running = 0
-    for i, ct in enumerate(kept):
-        surviving = int(ct.surviving_token_count)
+    for i, cols in enumerate(kept):
+        surviving = cols.surviving_token_count
         seg_surviving[i] = surviving
-        seg_slice_start[i] = int(inline_byte_slices[int(ct_index[i])].start)
+        seg_slice_start[i] = int(inline_byte_slices[cols.dfs_index].start)
         body = max(surviving - 1, 0)
         body_seg_len[i] = body
         # Body axis: ``expanded[1:surviving]`` + the two extra masks over
         # the same body positions (slot j == ``expanded[j + 1]``).
         expanded_body_chunks.append(
-            ct.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
+            cols.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
         )
         painted_body_chunks.append(
-            ct.extra_value_v2_mask[1:surviving]
-            | ct.extra_f128_mask[1:surviving]
+            cols.extra_value_v2_mask[1:surviving]
+            | cols.extra_f128_mask[1:surviving]
         )
         # Surviving-prefix VC2 painted mask (axis ``[:surviving]``); the
         # VC2 emitter's trailing-run lookahead indexes carrier expanded
         # positions directly into this prefix.
         painted_vc2_prefix_chunks.append(
-            ct.extra_value_v2_mask[:surviving].astype(np.int64, copy=False)
+            cols.extra_value_v2_mask[:surviving].astype(np.int64, copy=False)
         )
         painted_prefix_seg_len[i] = surviving
-        state = ct.stage1.state
-        real_positions = np.nonzero(state.real_mask)[0]
+        real_positions = np.nonzero(cols.real_mask)[0]
         real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
         real_seg_base[i] = real_running
         real_running += int(real_positions.shape[0])
-        dc = state.digit_cumsum.astype(np.int64, copy=False)
+        dc = cols.digit_cumsum.astype(np.int64, copy=False)
         digit_chunks.append(dc)
         digit_base[i] = digit_running
         digit_running += int(dc.shape[0])
-        rl = state.runlen_number.astype(np.int64, copy=False)
+        rl = cols.runlen_number.astype(np.int64, copy=False)
         runlen_chunks.append(rl)
         seg_runlen_base[i] = runlen_running
         runlen_running += int(rl.shape[0])
@@ -242,7 +248,7 @@ def build_batched_carriers(
         # signal reads ``extra_f128_mask[expanded_pos + 1]`` against the
         # full mask per ALG-2 (a mid-cut finite source still reports
         # finite even when its painted MSB slot is past the cut).
-        ef = ct.extra_f128_mask
+        ef = cols.extra_f128_mask
         f128_full_chunks.append(ef)
         seg_f128_base[i] = f128_running
         f128_running += int(ef.shape[0])

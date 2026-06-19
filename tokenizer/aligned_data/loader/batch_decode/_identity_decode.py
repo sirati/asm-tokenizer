@@ -55,6 +55,8 @@ import numpy as np
 
 from tokenizer.token_manager import VocabularyManager
 
+from ._flat_call_targets import iter_call_target_columns
+
 if TYPE_CHECKING:
     from ._types import Stage2Batch
 
@@ -170,22 +172,20 @@ def _identity_slices(stage2_batch: "Stage2Batch") -> list[slice]:
     """
     slices: list[slice] = []
     level1_offset = 0
-    for stage2_section in stage2_batch.sections:
-        for stage2_variant in stage2_section.variants:
-            for stage2_ct in stage2_variant.call_targets:
-                sic = int(stage2_ct.surviving_identity_count)
-                if int(stage2_ct.surviving_token_count) == 0:
-                    # Defensive: a fully-dropped call_target also has zero
-                    # surviving identity tokens (the prepend at expanded
-                    # position 0 is itself an identity token).
-                    assert sic == 0, (
-                        "Stage 2 invariant violated: a call_target with "
-                        "surviving_token_count == 0 must also have "
-                        "surviving_identity_count == 0 (the prepend at "
-                        "expanded position 0 is itself an identity token)."
-                    )
-                slices.append(slice(level1_offset, level1_offset + sic))
-                level1_offset += sic
+    for cols in iter_call_target_columns(stage2_batch):
+        sic = cols.surviving_identity_count
+        if cols.surviving_token_count == 0:
+            # Defensive: a fully-dropped call_target also has zero
+            # surviving identity tokens (the prepend at expanded
+            # position 0 is itself an identity token).
+            assert sic == 0, (
+                "Stage 2 invariant violated: a call_target with "
+                "surviving_token_count == 0 must also have "
+                "surviving_identity_count == 0 (the prepend at "
+                "expanded position 0 is itself an identity token)."
+            )
+        slices.append(slice(level1_offset, level1_offset + sic))
+        level1_offset += sic
     return slices
 
 
@@ -207,58 +207,47 @@ def _gather_identity_carriers(
     L_chunks: list[np.ndarray] = []
     pos_chunks: list[np.ndarray] = []
 
-    ct_iter_idx = 0
-    for stage2_section in stage2_batch.sections:
-        for stage2_variant in stage2_section.variants:
-            for stage2_ct in stage2_variant.call_targets:
-                inline_byte_slice = inline_byte_slices[ct_iter_idx]
-                ct_iter_idx += 1
+    for cols in iter_call_target_columns(stage2_batch):
+        inline_byte_slice = inline_byte_slices[cols.dfs_index]
 
-                if int(stage2_ct.surviving_token_count) == 0:
-                    continue
-                in_stream_id_count = (
-                    int(stage2_ct.surviving_identity_count) - 1
-                )
-                if in_stream_id_count <= 0:
-                    continue
+        if cols.surviving_token_count == 0:
+            continue
+        in_stream_id_count = cols.surviving_identity_count - 1
+        if in_stream_id_count <= 0:
+            continue
 
-                state = stage2_ct.stage1.state
-                raw_tokens = state.raw_tokens
+        raw_tokens = cols.raw_tokens
 
-                # Identity tokens are NEVER promoted, so the surviving
-                # in-stream carriers are the FIRST ``in_stream_id_count``
-                # identity-band real tokens in raw order (the cut chops
-                # later carriers but never reorders).
-                identity_carrier_mask = state.real_mask & (
-                    (raw_tokens >= _V2_IDENTITY_BLOCK_START)
-                    & (raw_tokens < _V2_EAGER_BLOCK_END)
-                )
-                identity_carrier_positions = np.nonzero(
-                    identity_carrier_mask
-                )[0]
-                p = identity_carrier_positions[
-                    :in_stream_id_count
-                ].astype(np.int64)
+        # Identity tokens are NEVER promoted, so the surviving
+        # in-stream carriers are the FIRST ``in_stream_id_count``
+        # identity-band real tokens in raw order (the cut chops
+        # later carriers but never reorders).
+        identity_carrier_mask = cols.real_mask & (
+            (raw_tokens >= _V2_IDENTITY_BLOCK_START)
+            & (raw_tokens < _V2_EAGER_BLOCK_END)
+        )
+        identity_carrier_positions = np.nonzero(identity_carrier_mask)[0]
+        p = identity_carrier_positions[:in_stream_id_count].astype(np.int64)
 
-                n = int(raw_tokens.shape[0])
-                runlen_number = state.runlen_number
-                # Payload length L = runlen_number[p+1] when p+1 in
-                # bounds (else 0; a carrier at the last raw slot has no
-                # payload). np.where avoids the OOB gather.
-                has_p1 = p < (n - 1)
-                safe_p1 = np.where(has_p1, p + 1, np.int64(0))
-                L_raw = runlen_number[safe_p1].astype(np.int64)
-                L = np.where(has_p1, L_raw, np.int64(0))
+        n = int(raw_tokens.shape[0])
+        runlen_number = cols.runlen_number
+        # Payload length L = runlen_number[p+1] when p+1 in
+        # bounds (else 0; a carrier at the last raw slot has no
+        # payload). np.where avoids the OOB gather.
+        has_p1 = p < (n - 1)
+        safe_p1 = np.where(has_p1, p + 1, np.int64(0))
+        L_raw = runlen_number[safe_p1].astype(np.int64)
+        L = np.where(has_p1, L_raw, np.int64(0))
 
-                # First payload byte = exclusive digit cumsum at p+1 +
-                # the call_target's inline-byte base.
-                first_payload_offset = state.digit_cumsum[p + 1].astype(
-                    np.int64
-                ) + np.int64(inline_byte_slice.start)
+        # First payload byte = exclusive digit cumsum at p+1 +
+        # the call_target's inline-byte base.
+        first_payload_offset = cols.digit_cumsum[p + 1].astype(
+            np.int64
+        ) + np.int64(inline_byte_slice.start)
 
-                offset_chunks.append(first_payload_offset)
-                L_chunks.append(L)
-                pos_chunks.append(p)
+        offset_chunks.append(first_payload_offset)
+        L_chunks.append(L)
+        pos_chunks.append(p)
 
     if not offset_chunks:
         empty_i = np.empty(0, dtype=np.int64)

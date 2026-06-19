@@ -46,7 +46,7 @@ import numpy as np
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
-from ._flat_call_targets import surviving_call_targets
+from ._flat_call_targets import iter_call_target_columns
 from ._fp_normalize import normalize_per_token_type
 from ._identity_decode import build_identity_idx_2d, view_cast_identities
 from ._inline_bytes import build_inline_bytes
@@ -301,7 +301,11 @@ def _batched_carrier_signs(
     entries (a painted slot borrows its carrier's raw position; the
     prepend lives in the IDENTITY band).
     """
-    kept, _kept_idx = surviving_call_targets(stage2)
+    kept = [
+        cols
+        for cols in iter_call_target_columns(stage2)
+        if cols.surviving_token_count > 0
+    ]
     if not kept:
         return (
             np.empty(0, dtype=np.int64),
@@ -318,21 +322,20 @@ def _batched_carrier_signs(
     real_seg_base = np.empty(len(kept), dtype=np.int64)
 
     real_running = 0
-    for i, ct in enumerate(kept):
-        surviving = int(ct.surviving_token_count)
-        state = ct.stage1.state
+    for i, cols in enumerate(kept):
+        surviving = cols.surviving_token_count
         expanded_chunks.append(
-            ct.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
+            cols.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
         )
         painted_chunks.append(
-            ct.extra_value_v2_mask[1:surviving]
-            | ct.extra_f128_mask[1:surviving]
+            cols.extra_value_v2_mask[1:surviving]
+            | cols.extra_f128_mask[1:surviving]
         )
         exp_seg_len[i] = max(surviving - 1, 0)
-        real_positions = np.nonzero(state.real_mask)[0]
+        real_positions = np.nonzero(cols.real_mask)[0]
         real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
         is_neg_chunks.append(
-            state.is_negative_per_position[real_positions]
+            cols.is_negative_per_position[real_positions]
         )
         real_seg_base[i] = real_running
         real_running += int(real_positions.shape[0])

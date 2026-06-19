@@ -1,29 +1,34 @@
 """Flatten the DFS call_target stream into CSR-shaped flat arrays.
 
-Single concern: given a :class:`Stage2Batch`, gather every level-4
-call_target's per-stream numpy fields into FLAT concatenations carrying a
-per-call_target CSR (segment offsets), in the SAME DFS encounter order the
-stage-3 kernels walk. This is the substrate B-S2 batches over: the
-per-call_target Python ``for`` loops in the sign-collection / number-emit /
-identity-emit kernels become single vectorised passes over these flat
-arrays + a segmented cumsum, instead of one compute pass per call_target.
+Single concern: given a :class:`Stage2Batch`, walk every level-4
+call_target ONCE in DFS encounter order and surface each one's per-stream
+numpy column views + scalar metadata, in the SAME order the stage-3
+dense-byte-stream kernels walk. This is the one shared collection the
+stage-3 sites (inline-byte concat, identity carriers + slices, number
+carriers, sign collection, chunk-slice reconstruction) all consume
+instead of each re-walking ``sections -> variants -> call_targets`` and
+re-grabbing the same overlapping per-call_target columns.
 
-This module owns ONLY the flattening (array-collection + CSR construction);
-it re-implements no decode rule. The carrier identification, byte-offset
-arithmetic, and per-:class:`TokenType` emission stay with the owning
-kernels -- they consume the flat arrays the same way they consumed the
-per-call_target slices, but in one batched pass.
+This module owns ONLY the walk + column surfacing (the per-call_target
+``state`` field views + scalar metadata); it re-implements no decode rule.
+The carrier identification, byte-offset arithmetic, per-segment CSR
+construction, and per-:class:`TokenType` emission stay with the owning
+kernels -- they consume the shared columns the same way they consumed the
+per-call_target ``ct`` / ``ct.stage1.state`` reads, but the DFS walk runs
+once.
 
 Boundary crossed (design-first sentence): *given the Stage2 DFS call_target
-hierarchy, produce the flat per-call_target CSR arrays the stage-3 number /
-sign kernels batch over.* The per-call_target compute is the kernels'
-concern; this module only laces their inputs into flat carriers.
+hierarchy, produce the per-call_target column views + scalar metadata (and
+the flat CSR view over surviving prefixes) the stage-3 dense-byte-stream
+sites consume.* What each site does with those columns (concat, carrier
+mask, segmented cumsum, slice math) is the site's concern; this module
+only walks once and surfaces the columns.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Iterator, List
 
 import numpy as np
 
@@ -32,10 +37,110 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "CallTargetColumns",
     "FlatCallTargets",
     "flatten_call_targets",
+    "iter_call_target_columns",
     "surviving_call_targets",
 ]
+
+
+@dataclass(frozen=True)
+class CallTargetColumns:
+    """Per-call_target column views + scalar metadata (DFS order).
+
+    One instance per level-4 call_target in the canonical stage-3 DFS
+    enumeration (``sections -> variants -> call_targets``, root-first),
+    INCLUDING fully-dropped (``surviving_token_count == 0``) targets so
+    the ``dfs_index`` aligns 1:1 with the per-DFS-call_target slice lists
+    (``inline_byte_slices`` etc.). Every ``np.ndarray`` field is a VIEW
+    into the batched expansion's flat arrays (no copy) -- the same view
+    the per-call_target site read off ``ct`` / ``ct.stage1.state``.
+
+    A site that processes only surviving call_targets filters on
+    ``surviving_token_count > 0``; a site that processes every target
+    (inline bytes, identity slices) reads every record.
+
+    Fields
+    ------
+    dfs_index:
+        Position in the full DFS enumeration (the ordinal the
+        per-DFS-call_target slice lists are keyed by).
+    call_target:
+        The owning :class:`Stage2CallTarget` (back-pointer for the few
+        scalar reads not surfaced as columns, e.g. ``is_cut``).
+    expanded_token_ids / extra_value_v2_mask / extra_f128_mask:
+        Expanded-space columns (parallel to ``expanded_token_ids``).
+    raw_tokens / real_mask / number_mask / runlen_number / digit_cumsum /
+    is_negative_per_position:
+        Raw-space :class:`InlineDecodeState` column views.
+    surviving_token_count / surviving_identity_count / partial_cut_length:
+        The cutoff-aware scalar counts.
+    is_cut:
+        Whether the per-row cutoff falls inside this call_target's body.
+    """
+
+    dfs_index: int
+    call_target: "Stage2CallTarget"
+
+    expanded_token_ids: np.ndarray
+    extra_value_v2_mask: np.ndarray
+    extra_f128_mask: np.ndarray
+
+    raw_tokens: np.ndarray
+    real_mask: np.ndarray
+    number_mask: np.ndarray
+    runlen_number: np.ndarray
+    digit_cumsum: np.ndarray
+    is_negative_per_position: np.ndarray
+
+    surviving_token_count: int
+    surviving_identity_count: int
+    partial_cut_length: int
+    is_cut: bool
+
+
+def iter_call_target_columns(
+    stage2: "Stage2Batch",
+) -> Iterator[CallTargetColumns]:
+    """Yield one :class:`CallTargetColumns` per level-4 call_target.
+
+    The SINGLE shared DFS walk the stage-3 dense-byte-stream sites consume
+    instead of each re-walking ``sections -> variants -> call_targets``.
+    Yields in DFS encounter order, INCLUDING fully-dropped targets, so a
+    consumer's enumeration index equals the ``dfs_index`` the
+    per-DFS-call_target slice lists are keyed by.
+
+    Each yielded record carries the per-call_target column VIEWS (no copy)
+    + scalar metadata -- the same fields the per-call_target loops read off
+    ``ct`` / ``ct.stage1.state``. The records are produced lazily; a
+    consumer that needs a list materialises one with ``list(...)``.
+    """
+    dfs_index = 0
+    for section in stage2.sections:
+        for variant in section.variants:
+            for ct in variant.call_targets:
+                state = ct.stage1.state
+                yield CallTargetColumns(
+                    dfs_index=dfs_index,
+                    call_target=ct,
+                    expanded_token_ids=ct.expanded_token_ids,
+                    extra_value_v2_mask=ct.extra_value_v2_mask,
+                    extra_f128_mask=ct.extra_f128_mask,
+                    raw_tokens=state.raw_tokens,
+                    real_mask=state.real_mask,
+                    number_mask=state.number_mask,
+                    runlen_number=state.runlen_number,
+                    digit_cumsum=state.digit_cumsum,
+                    is_negative_per_position=state.is_negative_per_position,
+                    surviving_token_count=int(ct.surviving_token_count),
+                    surviving_identity_count=int(
+                        ct.surviving_identity_count
+                    ),
+                    partial_cut_length=int(ct.partial_cut_length),
+                    is_cut=bool(ct.is_cut),
+                )
+                dfs_index += 1
 
 
 @dataclass(frozen=True)
@@ -93,14 +198,10 @@ def surviving_call_targets(
     """
     kept: List["Stage2CallTarget"] = []
     kept_idx: List[int] = []
-    dfs_idx = 0
-    for section in stage2.sections:
-        for variant in section.variants:
-            for ct in variant.call_targets:
-                if int(ct.surviving_token_count) > 0:
-                    kept.append(ct)
-                    kept_idx.append(dfs_idx)
-                dfs_idx += 1
+    for cols in iter_call_target_columns(stage2):
+        if cols.surviving_token_count > 0:
+            kept.append(cols.call_target)
+            kept_idx.append(cols.dfs_index)
     return kept, np.asarray(kept_idx, dtype=np.int64)
 
 

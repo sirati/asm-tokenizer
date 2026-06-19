@@ -63,9 +63,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from ._flat_call_targets import CallTargetColumns, iter_call_target_columns
+
 
 if TYPE_CHECKING:
-    from ._types import Stage2Batch, Stage2CallTarget
+    from ._types import Stage2Batch
 
 
 __all__ = ["build_inline_bytes"]
@@ -79,7 +81,7 @@ __all__ = ["build_inline_bytes"]
 # ---------------------------------------------------------------------------
 
 
-def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
+def _surviving_bytes(cols: CallTargetColumns) -> np.ndarray:
     """Buffered inline bytes for one call_target as a ``u8`` array.
 
     Returns the raw inline-digit values (already truncated to ``u8``)
@@ -92,10 +94,10 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
 
     Parameters
     ----------
-    stage2_call_target
-        Reads ``stage1.state.raw_tokens`` / ``.number_mask`` /
-        ``.real_mask`` / ``.runlen_number`` plus this stage's
-        ``expanded_token_ids`` / ``extra_value_v2_mask`` /
+    cols
+        The shared per-call_target columns (:class:`CallTargetColumns`).
+        Reads ``raw_tokens`` / ``number_mask`` / ``real_mask`` /
+        ``runlen_number`` plus ``extra_value_v2_mask`` /
         ``extra_f128_mask`` / ``partial_cut_length`` / ``is_cut``.
 
     Returns
@@ -113,12 +115,11 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
     on the temporary. For inline-band ids (``< 256``) the cast is
     lossless.
     """
-    state = stage2_call_target.stage1.state
-    raw_tokens = state.raw_tokens
-    number_mask = state.number_mask
+    raw_tokens = cols.raw_tokens
+    number_mask = cols.number_mask
 
     # ---- fully-included path ------------------------------------------------
-    if not stage2_call_target.is_cut:
+    if not cols.is_cut:
         # All inline-digit positions of the raw stream survive. The
         # ``raw_tokens > number_mask`` boolean index returns a fresh
         # copy already; the ``.astype(np.uint8)`` narrows the dtype
@@ -132,12 +133,12 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
     # prepend (no inline bytes); slots [1, partial_cut_length) are the
     # surviving body. A cut at or before slot 1 contributes no inline
     # bytes (only the prepend or nothing survives).
-    partial_cut_length = stage2_call_target.partial_cut_length
+    partial_cut_length = cols.partial_cut_length
     if partial_cut_length <= 1:
         return np.empty(0, dtype=np.uint8)
 
-    extra_vc2_mask = stage2_call_target.extra_value_v2_mask
-    extra_f128_mask = stage2_call_target.extra_f128_mask
+    extra_vc2_mask = cols.extra_value_v2_mask
+    extra_f128_mask = cols.extra_f128_mask
 
     # Within the visible body [1, partial_cut_length), a slot is either
     # a "painted continuation" (extra_*_mask True -- it was an inline-
@@ -159,7 +160,7 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
         return np.empty(0, dtype=np.uint8)
 
     # Raw positions of all carriers in raw-stream order.
-    carrier_positions = np.nonzero(state.real_mask)[0]
+    carrier_positions = np.nonzero(cols.real_mask)[0]
     # The last raw carrier consumed by the visible body.
     p_last = int(carrier_positions[n_carriers_consumed - 1])
 
@@ -170,7 +171,7 @@ def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
     # will skip emitting ``idx_2d`` rows for dropped chunks, but the
     # ALG-8 per-chunk offset formula assumes the full payload is
     # addressable in the buffer regardless of which chunks survived.
-    runlen_number = state.runlen_number
+    runlen_number = cols.runlen_number
     if p_last + 1 < runlen_number.shape[0]:
         L_last = int(runlen_number[p_last + 1])
     else:
@@ -229,13 +230,12 @@ def build_inline_bytes(
     tuple of ``(np.ndarray[np.uint8], list[slice])``
         The flat byte buffer and the per-call-target slice list.
     """
-    # Per-call-target byte arrays, parallel to the DFS walk order.
-    per_call_target_bytes: list[np.ndarray] = []
-
-    for stage2_section in stage2_batch.sections:
-        for stage2_variant in stage2_section.variants:
-            for stage2_call_target in stage2_variant.call_targets:
-                per_call_target_bytes.append(_surviving_bytes(stage2_call_target))
+    # Per-call-target byte arrays, parallel to the DFS walk order. The
+    # shared columnar walk yields one record per call_target in DFS order.
+    per_call_target_bytes: list[np.ndarray] = [
+        _surviving_bytes(cols)
+        for cols in iter_call_target_columns(stage2_batch)
+    ]
 
     # Length budget: 1 (leading-zero pad) + sum of per-call-target byte
     # counts. Pre-allocating avoids a second pass over the per-call-
