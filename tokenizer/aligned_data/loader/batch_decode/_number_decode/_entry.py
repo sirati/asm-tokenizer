@@ -103,7 +103,7 @@ __all__ = ["build_number_idx_2d"]
 def build_number_idx_2d(
     dense: DenseColumns,
     inline_bytes: np.ndarray,
-    inline_byte_slices: list[slice],
+    inline_byte_starts: np.ndarray,
 ) -> tuple[
     dict[TokenType, np.ndarray],
     dict[TokenType, np.ndarray],
@@ -128,9 +128,10 @@ def build_number_idx_2d(
     inline_bytes
         3a's flat ``u8`` buffer (index 0 = leading-zero pad). Not
         mutated here -- the rows we emit are gather offsets into it.
-    inline_byte_slices
-        Parallel to the DFS-flat call_target enumeration: entry ``i``
-        is the range in ``inline_bytes`` owned by call_target ``i``.
+    inline_byte_starts
+        Parallel to the DFS-flat call_target enumeration (``int64``):
+        entry ``i`` is the start offset in ``inline_bytes`` owned by
+        call_target ``i``.
 
     Returns
     -------
@@ -159,7 +160,7 @@ def build_number_idx_2d(
         ``exponent_base``.
     """
 
-    flat = build_flat_segments(dense, inline_byte_slices)
+    flat = build_flat_segments(dense, inline_byte_starts)
 
     # Per-block fixed widths, in the canonical NUMBER-block order. VC2 +
     # F128 emit 8-byte chunk rows; the fixed-width types emit their full
