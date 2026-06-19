@@ -18,6 +18,9 @@ import numpy as np
 
 from number_kernel_byte_identity import _build_batch, _gen_ct
 
+from tokenizer.aligned_data.loader.batch_decode._flat_call_targets import (
+    dense_columns_from_stage2,
+)
 from tokenizer.aligned_data.loader.batch_decode._number_decode import (
     build_number_idx_2d,
 )
@@ -43,14 +46,14 @@ def main() -> int:
     batches = _make_batches(args.seed, args.batches, args.cts)
     # warm-up
     for stage2, inline_bytes, slices in batches:
-        build_number_idx_2d(stage2, inline_bytes, slices)
+        build_number_idx_2d(dense_columns_from_stage2(stage2), inline_bytes, slices)
 
     best = float("inf")
     times = []
     for _ in range(args.reps):
         t0 = time.perf_counter()
         for stage2, inline_bytes, slices in batches:
-            build_number_idx_2d(stage2, inline_bytes, slices)
+            build_number_idx_2d(dense_columns_from_stage2(stage2), inline_bytes, slices)
         dt = time.perf_counter() - t0
         times.append(dt)
         best = min(best, dt)

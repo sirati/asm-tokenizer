@@ -25,6 +25,9 @@ from pathlib import Path
 
 import numpy as np
 
+from tokenizer.aligned_data.loader.batch_decode._flat_call_targets import (
+    dense_columns_from_stage2,
+)
 from tokenizer.aligned_data.loader.batch_decode._number_decode import (
     _NUMBER_BLOCK_TOKEN_TYPES,
     build_number_idx_2d,
@@ -310,7 +313,7 @@ def _capture(seed: int, n_cases: int) -> dict[str, np.ndarray]:
             chunk_slices_per_type,
             f128_flag,
             vc2_sidecar,
-        ) = build_number_idx_2d(stage2, inline_bytes, slices)
+        ) = build_number_idx_2d(dense_columns_from_stage2(stage2), inline_bytes, slices)
         pre = f"case{case:04d}"
         for T in _NUMBER_BLOCK_TOKEN_TYPES:
             bundle[f"{pre}|rows|{T.name}"] = np.asarray(idx_2d_per_type[T])

@@ -23,14 +23,11 @@ concatenates the columns.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import List
 
 import numpy as np
 
-from .._flat_call_targets import iter_call_target_columns
-
-if TYPE_CHECKING:
-    from .._types import Stage2Batch
+from .._dense_columns import DenseColumns
 
 
 __all__ = [
@@ -106,28 +103,21 @@ class FlatSegments:
 
 
 def build_flat_segments(
-    stage2: "Stage2Batch",
+    dense: DenseColumns,
     inline_byte_slices: List[slice],
 ) -> FlatSegments:
     """Concatenate the per-segment NUMBER-band context, batched.
 
-    Walks every kept (``surviving_token_count > 0``) call_target's shared
-    Step-1 columns once and concatenates the body axis + per-segment CSR
-    context the emission kernel reads. No decode rule runs here -- the
-    carrier mask, segmented expanded->raw recovery, byte-offset
+    Walks every kept (``surviving_token_count > 0``) node's shared
+    :class:`DenseColumns` columns once and concatenates the body axis +
+    per-segment CSR context the emission kernel reads. No decode rule runs
+    here -- the carrier mask, segmented expanded->raw recovery, byte-offset
     arithmetic, and per-type emission all run in the kernel over these
     arrays.
     """
     n_total_cts = len(inline_byte_slices)
-    kept = [
-        cols
-        for cols in iter_call_target_columns(stage2)
-        if cols.surviving_token_count > 0
-    ]
-    ct_index = np.asarray(
-        [cols.dfs_index for cols in kept], dtype=np.int64
-    )
-    n_kept = len(kept)
+    ct_index = np.asarray(dense.kept_node_index, dtype=np.int64)
+    n_kept = int(ct_index.shape[0])
 
     expanded_body_chunks: List[np.ndarray] = []
     painted_body_chunks: List[np.ndarray] = []
@@ -149,37 +139,44 @@ def build_flat_segments(
     digit_running = 0
     runlen_running = 0
     f128_running = 0
-    for i, cols in enumerate(kept):
-        surviving = cols.surviving_token_count
+    for i, e in enumerate(ct_index.tolist()):
+        raw_slice = dense.node_raw_slice(e)
+        expanded_slice = dense.node_expanded_slice(e)
+        surviving = int(dense.surviving_token_count[e])
         seg_surviving[i] = surviving
-        seg_slice_start[i] = int(inline_byte_slices[cols.dfs_index].start)
+        seg_slice_start[i] = int(inline_byte_slices[e].start)
         body = max(surviving - 1, 0)
         body_seg_len[i] = body
+        expanded_ids = dense.expanded[expanded_slice]
+        extra_value_v2_mask = dense.extra_value_v2_mask[expanded_slice]
+        extra_f128_mask = dense.extra_f128_mask[expanded_slice]
         # Body axis: ``expanded[1:surviving]`` + the two extra masks over
         # the same body positions (slot j == ``expanded[j + 1]``).
         expanded_body_chunks.append(
-            cols.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
+            expanded_ids[1:surviving].astype(np.int64, copy=False)
         )
         painted_body_chunks.append(
-            cols.extra_value_v2_mask[1:surviving]
-            | cols.extra_f128_mask[1:surviving]
+            extra_value_v2_mask[1:surviving]
+            | extra_f128_mask[1:surviving]
         )
         # Surviving-prefix VC2 painted mask (axis ``[:surviving]``); the
         # VC2 emitter's trailing-run lookahead indexes carrier expanded
         # positions directly into this prefix.
         painted_vc2_prefix_chunks.append(
-            cols.extra_value_v2_mask[:surviving].astype(np.int64, copy=False)
+            extra_value_v2_mask[:surviving].astype(np.int64, copy=False)
         )
         painted_prefix_seg_len[i] = surviving
-        real_positions = np.nonzero(cols.real_mask)[0]
+        real_positions = np.nonzero(dense.real_mask[raw_slice])[0]
         real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
         real_seg_base[i] = real_running
         real_running += int(real_positions.shape[0])
-        dc = cols.digit_cumsum.astype(np.int64, copy=False)
+        dc = dense.digit_cumsum[dense.node_digit_slice(e)].astype(
+            np.int64, copy=False
+        )
         digit_chunks.append(dc)
         digit_base[i] = digit_running
         digit_running += int(dc.shape[0])
-        rl = cols.runlen_number.astype(np.int64, copy=False)
+        rl = dense.runlen_number[raw_slice].astype(np.int64, copy=False)
         runlen_chunks.append(rl)
         seg_runlen_base[i] = runlen_running
         runlen_running += int(rl.shape[0])
@@ -187,7 +184,7 @@ def build_flat_segments(
         # signal reads ``extra_f128_mask[expanded_pos + 1]`` against the
         # full mask per ALG-2 (a mid-cut finite source still reports
         # finite even when its painted MSB slot is past the cut).
-        ef = cols.extra_f128_mask
+        ef = extra_f128_mask
         f128_full_chunks.append(ef)
         seg_f128_base[i] = f128_running
         f128_running += int(ef.shape[0])

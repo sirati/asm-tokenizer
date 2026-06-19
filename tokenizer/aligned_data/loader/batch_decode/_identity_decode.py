@@ -49,16 +49,11 @@ in a single vectorised pass.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import numpy as np
 
 from tokenizer.token_manager import VocabularyManager
 
-from ._flat_call_targets import iter_call_target_columns
-
-if TYPE_CHECKING:
-    from ._types import Stage2Batch
+from ._dense_columns import DenseColumns
 
 
 __all__ = ["build_identity_idx_2d", "view_cast_identities"]
@@ -83,27 +78,26 @@ _V2_EAGER_BLOCK_END = VocabularyManager._V2_EAGER_BLOCK_END  # 272
 
 
 def build_identity_idx_2d(
-    stage2_batch: "Stage2Batch",
+    dense: DenseColumns,
     inline_bytes: np.ndarray,
     inline_byte_slices: list[slice],
 ) -> tuple[np.ndarray, list[slice]]:
     """Build the identity-token idx_2d table per ALG-5.
 
-    Walks sections -> variants -> call_targets in DFS encounter order
-    (the linearisation stage 1 produced + stage 2 mirrors). For each
-    SURVIVING identity carrier in each call_target's raw token stream
-    emits one row into ``identity_idx_2d`` that points (in
-    ``inline_bytes`` coordinates) at the carrier's payload bytes.
+    Reads the shared :class:`DenseColumns` front-matter over the DFS
+    (== emitted-node) node axis. For each SURVIVING identity carrier in
+    each call_target's raw token stream emits one row into
+    ``identity_idx_2d`` that points (in ``inline_bytes`` coordinates) at
+    the carrier's payload bytes.
 
     Excludes prepend slots: stage 4 writes them directly per ALG-9.
 
     Parameters
     ----------
-    stage2_batch
-        The level-1 stage-2 result. The walk only reads
-        ``stage1.state.raw_tokens`` / ``runlen_number`` /
-        ``number_mask`` / ``carries_inline_mask`` (via the level-4
-        ``stage1.state`` back-pointer) and the per-call-target
+    dense
+        The shared dense front-matter (:class:`DenseColumns`). The walk
+        reads each node's ``raw_tokens`` / ``runlen_number`` /
+        ``real_mask`` / ``digit_cumsum`` and its per-node
         ``surviving_token_count`` / ``surviving_identity_count``.
     inline_bytes
         The u8 array stage 3a produced (size ``1 + total_surviving_bytes``;
@@ -145,13 +139,13 @@ def build_identity_idx_2d(
     # CSR arrays. Output ``identity_idx_2d`` rows stay in DFS-then-stream
     # encounter order -- byte-identical to the per-call_target walk.
     # ------------------------------------------------------------------
-    identity_slices = _identity_slices(stage2_batch)
+    identity_slices = _identity_slices(dense)
 
     (
         carrier_offsets,
         carrier_L,
         carrier_raw_positions,
-    ) = _gather_identity_carriers(stage2_batch, inline_byte_slices)
+    ) = _gather_identity_carriers(dense, inline_byte_slices)
 
     identity_idx_2d = _identity_rows_from_carriers(
         carrier_offsets, carrier_L, carrier_raw_positions
@@ -160,21 +154,21 @@ def build_identity_idx_2d(
     return identity_idx_2d, identity_slices
 
 
-def _identity_slices(stage2_batch: "Stage2Batch") -> list[slice]:
+def _identity_slices(dense: DenseColumns) -> list[slice]:
     """Per-call_target ``identity_slice`` list (DFS order, all targets).
 
     Each slice covers ``surviving_identity_count`` entries (INCLUDING the
     prepend slot) into the level-1 ``identities_flat_caller_local`` array;
     fully-dropped call_targets get a zero-length slice at the running
-    offset. This is a plain cumsum over the per-call_target surviving
-    identity counts -- the same offsets the per-call_target walk produced,
-    one ``slice`` object per target.
+    offset. This is a plain cumsum over the per-node surviving identity
+    counts -- the same offsets the per-call_target walk produced, one
+    ``slice`` object per node.
     """
     slices: list[slice] = []
     level1_offset = 0
-    for cols in iter_call_target_columns(stage2_batch):
-        sic = cols.surviving_identity_count
-        if cols.surviving_token_count == 0:
+    for e in range(dense.n_nodes):
+        sic = int(dense.surviving_identity_count[e])
+        if int(dense.surviving_token_count[e]) == 0:
             # Defensive: a fully-dropped call_target also has zero
             # surviving identity tokens (the prepend at expanded
             # position 0 is itself an identity token).
@@ -190,15 +184,15 @@ def _identity_slices(stage2_batch: "Stage2Batch") -> list[slice]:
 
 
 def _gather_identity_carriers(
-    stage2_batch: "Stage2Batch",
+    dense: DenseColumns,
     inline_byte_slices: list[slice],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Flat per-carrier ``(first_payload_offset, L, raw_position)``.
 
-    Walks the DFS call_target stream collecting, for each SURVIVING
-    in-stream identity carrier (the first ``surviving_identity_count - 1``
-    identity-band real tokens of each surviving call_target's raw stream),
-    its absolute first-payload byte offset into ``inline_bytes`` and its
+    Walks the DFS node axis collecting, for each SURVIVING in-stream
+    identity carrier (the first ``surviving_identity_count - 1``
+    identity-band real tokens of each surviving node's raw stream), its
+    absolute first-payload byte offset into ``inline_bytes`` and its
     payload length ``L`` (per the ALG-5 width table). The gather is a pure
     array-collection loop (one ``np.concatenate`` per output); the ALG-5
     row build runs once over the flat arrays.
@@ -207,22 +201,23 @@ def _gather_identity_carriers(
     L_chunks: list[np.ndarray] = []
     pos_chunks: list[np.ndarray] = []
 
-    for cols in iter_call_target_columns(stage2_batch):
-        inline_byte_slice = inline_byte_slices[cols.dfs_index]
+    for e in range(dense.n_nodes):
+        inline_byte_slice = inline_byte_slices[e]
 
-        if cols.surviving_token_count == 0:
+        if int(dense.surviving_token_count[e]) == 0:
             continue
-        in_stream_id_count = cols.surviving_identity_count - 1
+        in_stream_id_count = int(dense.surviving_identity_count[e]) - 1
         if in_stream_id_count <= 0:
             continue
 
-        raw_tokens = cols.raw_tokens
+        raw_slice = dense.node_raw_slice(e)
+        raw_tokens = dense.raw_tokens[raw_slice]
 
         # Identity tokens are NEVER promoted, so the surviving
         # in-stream carriers are the FIRST ``in_stream_id_count``
         # identity-band real tokens in raw order (the cut chops
         # later carriers but never reorders).
-        identity_carrier_mask = cols.real_mask & (
+        identity_carrier_mask = dense.real_mask[raw_slice] & (
             (raw_tokens >= _V2_IDENTITY_BLOCK_START)
             & (raw_tokens < _V2_EAGER_BLOCK_END)
         )
@@ -230,7 +225,7 @@ def _gather_identity_carriers(
         p = identity_carrier_positions[:in_stream_id_count].astype(np.int64)
 
         n = int(raw_tokens.shape[0])
-        runlen_number = cols.runlen_number
+        runlen_number = dense.runlen_number[raw_slice]
         # Payload length L = runlen_number[p+1] when p+1 in
         # bounds (else 0; a carrier at the last raw slot has no
         # payload). np.where avoids the OOB gather.
@@ -241,9 +236,9 @@ def _gather_identity_carriers(
 
         # First payload byte = exclusive digit cumsum at p+1 +
         # the call_target's inline-byte base.
-        first_payload_offset = cols.digit_cumsum[p + 1].astype(
-            np.int64
-        ) + np.int64(inline_byte_slice.start)
+        first_payload_offset = dense.digit_cumsum[dense.node_digit_slice(e)][
+            p + 1
+        ].astype(np.int64) + np.int64(inline_byte_slice.start)
 
         offset_chunks.append(first_payload_offset)
         L_chunks.append(L)

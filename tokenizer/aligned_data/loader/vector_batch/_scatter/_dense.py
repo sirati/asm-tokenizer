@@ -45,6 +45,7 @@ from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 from .._types import BatchGeometry
 from ._dense_adapter import build_stage2_batch
+from ._dense_columns import build_dense_columns
 from ._expand import ExpandedBatch
 from ._surviving import surviving_token_counts
 
@@ -123,8 +124,24 @@ def build_dense_sidecars(
         geometry, expanded, cols=cols, surviving=surviving
     )
 
+    # Build the shared stage-3 front-matter ONCE, DIRECTLY from the
+    # retained ``BatchedExpansion`` flats + the per-node cut -- the four
+    # stage-3 sites read this columnar object instead of each re-walking
+    # the per-node tree. The empty-batch path (``batched is None``) lets
+    # ``build_bulk_bytes`` build the (empty) front-matter from ``stage2``.
+    dense = (
+        build_dense_columns(
+            expanded.batched,
+            expanded.raw_flat,
+            expanded.raw_record_offsets,
+            surviving,
+        )
+        if expanded.batched is not None
+        else None
+    )
+
     # --- run the OWNED decode kernels (byte-identical by construction) ---
-    stage3 = build_bulk_bytes(stage2)
+    stage3 = build_bulk_bytes(stage2, dense)
     (
         row_identities,
         row_fid_sidecar,

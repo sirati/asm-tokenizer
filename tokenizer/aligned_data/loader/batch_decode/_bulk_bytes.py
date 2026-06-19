@@ -46,7 +46,8 @@ import numpy as np
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
-from ._flat_call_targets import iter_call_target_columns
+from ._dense_columns import DenseColumns
+from ._flat_call_targets import dense_columns_from_stage2
 from ._fp_normalize import normalize_per_token_type
 from ._identity_decode import build_identity_idx_2d, view_cast_identities
 from ._inline_bytes import build_inline_bytes
@@ -99,6 +100,7 @@ _NUMBER_BLOCK_TOKEN_TYPES: tuple[TokenType, ...] = (
 
 def build_bulk_bytes(
     stage2: "Stage2Batch",
+    dense: "DenseColumns | None" = None,
 ) -> Stage3Batch:
     """Compose 3a + 3b + 3c + 3d into a :class:`Stage3Batch`.
 
@@ -113,6 +115,12 @@ def build_bulk_bytes(
         Output of stage 2 (length-predict + cutoff walk). Provides the
         4-level hierarchy + per-call-target expanded streams + masks +
         surviving counts.
+    dense
+        The shared :class:`DenseColumns` front-matter, when a caller has
+        already built it (the vector dense path builds it ONCE from the
+        ``BatchedExpansion``, collapsing the four tree-walks). Omitted by
+        the staged ``batch_decode`` path, which builds it here with a
+        single DFS walk of ``stage2``.
 
     Returns
     -------
@@ -120,16 +128,18 @@ def build_bulk_bytes(
         Level-1 batch with batch-shared bulk arrays + the 4-level
         Stage3 mirror carrying per-call-target slices into them.
     """
+    if dense is None:
+        dense = dense_columns_from_stage2(stage2)
 
     # 1. inline_bytes (3a): per-call-target u8 byte slices into a flat
     #    buffer with a leading zero pad at index 0.
-    inline_bytes, inline_byte_slices = build_inline_bytes(stage2)
+    inline_bytes, inline_byte_slices = build_inline_bytes(dense)
 
     # 2. identity idx_2d (3b): u32[N_in_stream, 2] of byte offsets into
     #    inline_bytes; per-call-target identity_slices INCLUDE the
     #    prepend slot at slice.start.
     identity_idx_2d, identity_slices = build_identity_idx_2d(
-        stage2, inline_bytes, inline_byte_slices
+        dense, inline_bytes, inline_byte_slices
     )
 
     # 3. view-cast 3b's idx_2d to u16 in-stream caller-local ids. NO
@@ -147,7 +157,7 @@ def build_bulk_bytes(
         number_chunk_slices_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
-    ) = build_number_idx_2d(stage2, inline_bytes, inline_byte_slices)
+    ) = build_number_idx_2d(dense, inline_bytes, inline_byte_slices)
 
     # 5. Per-source signs grouped by TokenType, in the same stream-source
     #    order the per-type idx_2d arrays use. Reads
@@ -157,7 +167,7 @@ def build_bulk_bytes(
     #    expands per-source to per-chunk via the
     #    ``vc2_chunk_exponent_sidecar``.
     is_negative_per_source_per_type = _collect_is_negative_per_source_per_type(
-        stage2
+        dense
     )
 
     # 6. Vectorised per-TokenType FP normalisation (3d).
@@ -242,7 +252,7 @@ def build_bulk_bytes(
 
 
 def _collect_is_negative_per_source_per_type(
-    stage2: "Stage2Batch",
+    dense: "DenseColumns",
 ) -> dict[TokenType, np.ndarray]:
     """Group per-source ``is_negative`` flags by :class:`TokenType`.
 
@@ -277,7 +287,7 @@ def _collect_is_negative_per_source_per_type(
     a single global gather recovers every carrier's raw position.
     """
 
-    carrier_block_idx, carrier_signs = _batched_carrier_signs(stage2)
+    carrier_block_idx, carrier_signs = _batched_carrier_signs(dense)
 
     out: dict[TokenType, np.ndarray] = {}
     for block_idx, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
@@ -290,23 +300,20 @@ def _collect_is_negative_per_source_per_type(
 
 
 def _batched_carrier_signs(
-    stage2: "Stage2Batch",
+    dense: "DenseColumns",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """One-pass carrier ``(block_idx, sign)`` over all call_targets.
+    """One-pass carrier ``(block_idx, sign)`` over all kept nodes.
 
     Returns two parallel ``int64`` / ``bool`` arrays in DFS-then-stream
     encounter order: ``carrier_block_idx`` (0 = VC2, 1 = F16, ..., 6 =
     F128) and ``carrier_signs`` (the per-source negative flag). Painted
-    continuation slots and the per-call_target prepend slot contribute no
-    entries (a painted slot borrows its carrier's raw position; the
-    prepend lives in the IDENTITY band).
+    continuation slots and the per-node prepend slot contribute no entries
+    (a painted slot borrows its carrier's raw position; the prepend lives
+    in the IDENTITY band).
     """
-    kept = [
-        cols
-        for cols in iter_call_target_columns(stage2)
-        if cols.surviving_token_count > 0
-    ]
-    if not kept:
+    kept_idx = np.asarray(dense.kept_node_index, dtype=np.int64).tolist()
+    n_kept = len(kept_idx)
+    if n_kept == 0:
         return (
             np.empty(0, dtype=np.int64),
             np.empty(0, dtype=np.bool_),
@@ -315,27 +322,31 @@ def _batched_carrier_signs(
     # --- flat ``expanded[1:surviving]`` concatenation (slot 0 dropped) ---
     expanded_chunks: list[np.ndarray] = []
     painted_chunks: list[np.ndarray] = []
-    # --- flat per-call_target ``real_positions`` + ``is_negative`` ---
+    # --- flat per-node ``real_positions`` + ``is_negative`` ---
     real_pos_chunks: list[np.ndarray] = []
     is_neg_chunks: list[np.ndarray] = []
-    exp_seg_len = np.empty(len(kept), dtype=np.int64)
-    real_seg_base = np.empty(len(kept), dtype=np.int64)
+    exp_seg_len = np.empty(n_kept, dtype=np.int64)
+    real_seg_base = np.empty(n_kept, dtype=np.int64)
 
     real_running = 0
-    for i, cols in enumerate(kept):
-        surviving = cols.surviving_token_count
+    for i, e in enumerate(kept_idx):
+        surviving = int(dense.surviving_token_count[e])
+        raw_slice = dense.node_raw_slice(e)
+        expanded_slice = dense.node_expanded_slice(e)
         expanded_chunks.append(
-            cols.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
+            dense.expanded[expanded_slice][1:surviving].astype(
+                np.int64, copy=False
+            )
         )
         painted_chunks.append(
-            cols.extra_value_v2_mask[1:surviving]
-            | cols.extra_f128_mask[1:surviving]
+            dense.extra_value_v2_mask[expanded_slice][1:surviving]
+            | dense.extra_f128_mask[expanded_slice][1:surviving]
         )
         exp_seg_len[i] = max(surviving - 1, 0)
-        real_positions = np.nonzero(cols.real_mask)[0]
+        real_positions = np.nonzero(dense.real_mask[raw_slice])[0]
         real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
         is_neg_chunks.append(
-            cols.is_negative_per_position[real_positions]
+            dense.is_negative_per_position[raw_slice][real_positions]
         )
         real_seg_base[i] = real_running
         real_running += int(real_positions.shape[0])
@@ -359,9 +370,9 @@ def _batched_carrier_signs(
     # lengths yields the per-slot segment id correctly even for those empty
     # segments (the mark-and-cumsum CSR expansion would silently MERGE
     # consecutive zero-length boundaries, shifting all later segment ids).
-    exp_seg_offsets = np.zeros(len(kept) + 1, dtype=np.int64)
+    exp_seg_offsets = np.zeros(n_kept + 1, dtype=np.int64)
     np.cumsum(exp_seg_len, out=exp_seg_offsets[1:])
-    seg_id = np.repeat(np.arange(len(kept), dtype=np.int64), exp_seg_len)
+    seg_id = np.repeat(np.arange(n_kept, dtype=np.int64), exp_seg_len)
 
     # SEGMENTED ``cumsum(is_real) - 1`` per call_target. A global cumsum
     # carries the running real-count across segment boundaries; subtract

@@ -348,7 +348,7 @@ def _assert_kept_index(stage2: Stage2Batch, dense: DenseColumns) -> None:
         "kept_node_index diverges from flatten_call_targets.ct_index"
     )
     seg = build_flat_segments(
-        stage2, build_inline_bytes(stage2)[1]
+        dense, build_inline_bytes(dense)[1]
     )
     assert np.array_equal(dense.kept_node_index, seg.ct_index)
 
@@ -361,20 +361,20 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
     construction; here we additionally pin the cross-cutting flat axes the
     sites expose so a future view-shape drift surfaces.
     """
-    inline_bytes, inline_slices = build_inline_bytes(stage2)
+    inline_bytes, inline_slices = build_inline_bytes(dense)
     # 3a: per-CT byte slice lengths must align with the full DFS node axis.
     assert len(inline_slices) == dense.n_nodes
 
     # 3b carriers + 3c segments + sign all key off the kept axis.
     carrier_off, carrier_L, carrier_pos = _gather_identity_carriers(
-        stage2, inline_slices
+        dense, inline_slices
     )
     idx_2d, id_slices = build_identity_idx_2d(
-        stage2, inline_bytes, inline_slices
+        dense, inline_bytes, inline_slices
     )
     assert len(id_slices) == dense.n_nodes
 
-    seg = build_flat_segments(stage2, inline_slices)
+    seg = build_flat_segments(dense, inline_slices)
     assert np.array_equal(seg.ct_index, dense.kept_node_index)
     # seg.seg_surviving is the kept nodes' surviving_token_count, in dense
     # kept order.
@@ -383,7 +383,7 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
         dense.surviving_token_count[dense.kept_node_index],
     )
 
-    block_idx, signs = _batched_carrier_signs(stage2)
+    block_idx, signs = _batched_carrier_signs(dense)
     # Signs are per surviving NUMBER carrier; count must equal the number
     # of NUMBER-band non-painted slots over each kept node's surviving body
     # derived from dense (a coarse but non-vacuous cross-check).

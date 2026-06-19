@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Iterator, List
 
 import numpy as np
 
+from ._dense_columns import DenseColumns
+
 if TYPE_CHECKING:
     from ._types import Stage2Batch, Stage2CallTarget
 
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CallTargetColumns",
     "FlatCallTargets",
+    "dense_columns_from_stage2",
     "flatten_call_targets",
     "iter_call_target_columns",
     "surviving_call_targets",
@@ -250,4 +253,102 @@ def flatten_call_targets(stage2: "Stage2Batch") -> FlatCallTargets:
         seg_offsets=seg_offsets,
         seg_len=seg_len,
         ct_index=ct_index,
+    )
+
+
+def dense_columns_from_stage2(stage2: "Stage2Batch") -> DenseColumns:
+    """Build the :class:`DenseColumns` front-matter from a ``Stage2Batch``.
+
+    The staged ``batch_decode`` path has no ``BatchedExpansion`` to build
+    :class:`DenseColumns` from directly (the vector dense path does); it
+    has a real ``Stage2Batch`` parsed from the BIN. This walks that tree
+    ONCE -- the single shared DFS walk the four stage-3 dense sites used
+    to each repeat -- and concatenates the same flat CSR columns + per-node
+    scalars + kept-node index :class:`DenseColumns` carries, in DFS
+    (== emitted-node) order.
+
+    Re-implements no decode rule: every column is a VIEW or concatenation
+    of the per-call_target ``state`` / expanded views the sites already
+    read, so the resulting :class:`DenseColumns` is byte-identical to the
+    one the vector path builds from the same nodes (the per-CT view
+    equivalence the step-2 gate proves).
+    """
+    raw_chunks: List[np.ndarray] = []
+    real_chunks: List[np.ndarray] = []
+    number_chunks: List[np.ndarray] = []
+    runlen_chunks: List[np.ndarray] = []
+    is_neg_chunks: List[np.ndarray] = []
+    digit_chunks: List[np.ndarray] = []
+    expanded_chunks: List[np.ndarray] = []
+    vc2_chunks: List[np.ndarray] = []
+    f128_chunks: List[np.ndarray] = []
+
+    surviving_list: List[int] = []
+    predicted_list: List[int] = []
+    is_cut_list: List[bool] = []
+    surv_id_list: List[int] = []
+    surv_num_list: List[int] = []
+
+    raw_lens: List[int] = []
+    expanded_lens: List[int] = []
+
+    for cols in iter_call_target_columns(stage2):
+        ct = cols.call_target
+        raw_chunks.append(np.asarray(cols.raw_tokens))
+        real_chunks.append(np.asarray(cols.real_mask))
+        number_chunks.append(np.asarray(cols.number_mask))
+        runlen_chunks.append(np.asarray(cols.runlen_number))
+        is_neg_chunks.append(np.asarray(cols.is_negative_per_position))
+        digit_chunks.append(np.asarray(cols.digit_cumsum))
+        expanded_chunks.append(np.asarray(cols.expanded_token_ids))
+        vc2_chunks.append(np.asarray(cols.extra_value_v2_mask))
+        f128_chunks.append(np.asarray(cols.extra_f128_mask))
+
+        surviving_list.append(int(ct.surviving_token_count))
+        predicted_list.append(int(ct.predicted_full_length))
+        is_cut_list.append(bool(ct.is_cut))
+        surv_id_list.append(int(ct.surviving_identity_count))
+        surv_num_list.append(int(ct.surviving_number_chunk_count))
+
+        raw_lens.append(int(np.asarray(cols.raw_tokens).shape[0]))
+        expanded_lens.append(int(np.asarray(cols.expanded_token_ids).shape[0]))
+
+    n_nodes = len(surviving_list)
+
+    raw_offsets = np.zeros(n_nodes + 1, dtype=np.int64)
+    np.cumsum(np.asarray(raw_lens, dtype=np.int64), out=raw_offsets[1:])
+    node_offsets = np.zeros(n_nodes + 1, dtype=np.int64)
+    np.cumsum(np.asarray(expanded_lens, dtype=np.int64), out=node_offsets[1:])
+    # DIGIT-cumsum CSR: ``N + 1`` slots per node (the per-node trailing-slot
+    # packing), so the digit offsets are ``raw_offsets + arange``.
+    digit_offsets = raw_offsets + np.arange(n_nodes + 1, dtype=np.int64)
+
+    surviving = np.asarray(surviving_list, dtype=np.int64)
+    # Kept = nodes with at least one surviving token, in DFS order.
+    kept_node_index = np.flatnonzero(surviving > 0).astype(np.int64)
+
+    def _concat(chunks: List[np.ndarray], dtype) -> np.ndarray:
+        return (
+            np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)
+        )
+
+    return DenseColumns(
+        surviving_token_count=surviving,
+        predicted_full_length=np.asarray(predicted_list, dtype=np.int64),
+        is_cut=np.asarray(is_cut_list, dtype=np.bool_),
+        surviving_identity_count=np.asarray(surv_id_list, dtype=np.int64),
+        surviving_number_chunk_count=np.asarray(surv_num_list, dtype=np.int64),
+        raw_tokens=_concat(raw_chunks, np.uint16),
+        real_mask=_concat(real_chunks, np.bool_),
+        number_mask=_concat(number_chunks, np.bool_),
+        runlen_number=_concat(runlen_chunks, np.int64),
+        is_negative_per_position=_concat(is_neg_chunks, np.bool_),
+        raw_offsets=raw_offsets,
+        digit_cumsum=_concat(digit_chunks, np.int64),
+        digit_offsets=digit_offsets,
+        expanded=_concat(expanded_chunks, np.int64),
+        extra_value_v2_mask=_concat(vc2_chunks, np.bool_),
+        extra_f128_mask=_concat(f128_chunks, np.bool_),
+        node_offsets=node_offsets,
+        kept_node_index=kept_node_index,
     )
