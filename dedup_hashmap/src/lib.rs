@@ -43,6 +43,7 @@ mod inline_bytes;
 mod number_idx_2d;
 mod once_only_inclusion;
 mod remap_walk;
+mod row_inclusions;
 mod segment_distinct;
 
 use adjacency_expand::LiveAdjacencyKernel;
@@ -55,6 +56,7 @@ use inline_bytes::build_inline_bytes_kernel;
 use number_idx_2d::build_number_idx_2d_kernel;
 use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
+use row_inclusions::compute_row_inclusions_kernel;
 use segment_distinct::segment_distinct_count;
 
 // -- Generated classes -----------------------------------------------------
@@ -338,6 +340,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Inclusion-BFS per-level once-only / columnwise-ALL decider (the Rust
     // port of `OnceOnlyInclusion`). See `once_only_inclusion.rs`.
     m.add_class::<OnceOnlyInclusionKernel>()?;
+
+    // Stage-3 FUSED inclusion-BFS kernel (the whole per-group + per-depth
+    // loader BFS under one GIL release, reusing the Stage-1/2 cores in-Rust).
+    // See `row_inclusions.rs`.
+    m.add_function(wrap_pyfunction!(compute_row_inclusions_kernel, m)?)?;
 
     Ok(())
 }

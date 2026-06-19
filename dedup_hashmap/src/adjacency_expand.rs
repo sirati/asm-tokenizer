@@ -49,50 +49,56 @@ const U32_MISS: u32 = u32::MAX;
 
 /// The callee section the kernel cares about per slot, mirroring the
 /// numpy gate cascade evaluated per (deduped) parent-slot pair.
-struct ResolvedEdge {
-    parent_pos: i64,
-    child_sec: u32,
-    child_node: i64,
-    child_type: u8,
-    child_matched: bool,
+///
+/// `pub(crate)` so the fused inclusion-BFS kernel (`row_inclusions.rs`) can
+/// drive the SAME per-parent resolution in-Rust (no Python round-trip).
+pub(crate) struct ResolvedEdge {
+    pub(crate) parent_pos: i64,
+    pub(crate) child_sec: u32,
+    pub(crate) child_node: i64,
+    pub(crate) child_type: u8,
+    pub(crate) child_matched: bool,
 }
 
 /// The borrowed columnar slices `expand_batch` resolves over. All arrays
 /// are the catalog's GLOBAL backing (full-length); the kernel indexes them
 /// by global slot / variant / entry, exactly as the numpy path does.
-struct Columns<'a> {
+///
+/// `pub(crate)` so the fused inclusion-BFS kernel can pass the same flat
+/// catalog columns straight to `resolve_frontier` without re-marshalling.
+pub(crate) struct Columns<'a> {
     /// `i64[total_variants + 1]` per-call-entry CSR (global).
-    pce_offsets: &'a [i64],
+    pub(crate) pce_offsets: &'a [i64],
     /// `u16[total_entries]` -> the called slot idx within the section.
-    pce_called_idx: &'a [u16],
+    pub(crate) pce_called_idx: &'a [u16],
     /// `u16[total_entries]` -> the entry's own resolved callee variant J.
-    pce_section_variant_index: &'a [u16],
+    pub(crate) pce_section_variant_index: &'a [u16],
     /// `i64[n_sections + 1]` call_target CSR (global).
-    ct_offsets: &'a [i64],
+    pub(crate) ct_offsets: &'a [i64],
     /// `u8[total_cts]` raw `CallTargetType`.
-    ct_type: &'a [u8],
+    pub(crate) ct_type: &'a [u8],
     /// `u32[total_cts]` callee section byte pointer (#69 explicit-zero
     /// sentinel rides here).
-    ct_function_section_ptr: &'a [u32],
+    pub(crate) ct_function_section_ptr: &'a [u32],
     /// `bool[total_cts]` parent slot is_matched flag.
-    ct_is_matched: &'a [bool],
+    pub(crate) ct_is_matched: &'a [bool],
     /// `i64[n_sections + 1]` variant CSR (global, eager).
-    var_offsets: &'a [i64],
+    pub(crate) var_offsets: &'a [i64],
     /// `i64[n_sections]` per-section call_target count.
-    n_call_targets: &'a [i64],
+    pub(crate) n_call_targets: &'a [i64],
     /// `i64[total_variants]` owning section per flat variant (eager).
-    sec_of_var: &'a [i64],
+    pub(crate) sec_of_var: &'a [i64],
 }
 
 /// The integer constants the gate cascade needs, threaded from Python so
 /// the wire-format enum/sentinel values are single-sourced (never restated
-/// in Rust).
-struct GateConstants {
+/// in Rust). `pub(crate)` for the fused kernel's reuse.
+pub(crate) struct GateConstants {
     /// `CallTargetType.EXTERN` raw value — an EXTERN edge is gated out.
-    extern_type: u8,
+    pub(crate) extern_type: u8,
     /// `MISSING_VARIANT_INDEX` — an own_J equal to this takes the fallback
     /// arm; a fallback table entry equal to this is unusable.
-    missing_variant_index: u16,
+    pub(crate) missing_variant_index: u16,
 }
 
 #[pyclass(module = "dedup_hashmap._native")]
@@ -195,7 +201,12 @@ impl LiveAdjacencyKernel {
     /// GIL-released frontier resolution. Walks parents in ascending order;
     /// per parent emits its ascending-unique-slot edges that survive the
     /// gate cascade, preserving the exact `expand_batch` flattening order.
-    fn resolve_frontier(
+    ///
+    /// `pub(crate)` so the fused inclusion-BFS kernel reuses this exact
+    /// per-level resolution in-Rust — the SAME gates, J-fallback, ordering,
+    /// and the SAME `sec_map` / `fallback_cache` state — guaranteeing the
+    /// fused path can never drift from the standalone Stage-1 kernel.
+    pub(crate) fn resolve_frontier(
         &self,
         parents: &[i64],
         cols: &Columns,

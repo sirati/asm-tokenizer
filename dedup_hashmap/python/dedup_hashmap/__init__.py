@@ -27,6 +27,7 @@ from ._native import (
     build_identity_carriers_kernel,
     build_inline_bytes_kernel,
     build_number_idx_2d_kernel,
+    compute_row_inclusions_kernel,
     segment_distinct_count,
 )
 from .typed import IntDtype, IntEnumHashMap, PlainBool, PlainInt
@@ -49,5 +50,6 @@ __all__ = list(_native.__all__) + [
     "build_identity_carriers_kernel",
     "build_inline_bytes_kernel",
     "build_number_idx_2d_kernel",
+    "compute_row_inclusions_kernel",
     "segment_distinct_count",
 ]

@@ -65,7 +65,13 @@ const U32_MISS: u32 = u32::MAX;
 /// `&self` with the GIL released. Each `OnceOnlyInclusion` Python instance
 /// owns ONE kernel and is driven single-threaded (one BFS level at a time),
 /// so the lock is uncontended.
-struct DeciderState {
+///
+/// `pub(crate)` so the fused inclusion-BFS kernel (`row_inclusions.rs`) can
+/// own a `DeciderState` directly and drive `begin_root` / `step_level` for
+/// the whole BFS in-Rust — reusing the EXACT once-only / columnwise-ALL
+/// state machine, so the fused path can never drift from the standalone
+/// Stage-2 decider kernel.
+pub(crate) struct DeciderState {
     /// `function_id -> dense column index`, cleared per root.
     fid_to_col: HashMap<u32, u32>,
     /// Flat row-major `[rows_cap, cols_cap]` inclusion mask. The used
@@ -83,7 +89,7 @@ struct DeciderState {
 }
 
 impl DeciderState {
-    fn new(initial_cols: usize) -> Self {
+    pub(crate) fn new(initial_cols: usize) -> Self {
         let cols_cap = initial_cols.max(1);
         let rows_cap = 1usize;
         DeciderState {
@@ -132,7 +138,7 @@ impl DeciderState {
 
     /// Reset for a new root; seed the root body at column 0 for every
     /// variant (mirrors `begin_root`). The root's column is always 0.
-    fn begin_root(&mut self, n_variants: usize, root_function_id: u32) {
+    pub(crate) fn begin_root(&mut self, n_variants: usize, root_function_id: u32) {
         self.fid_to_col.clear();
         self.ensure_capacity(n_variants, 1);
         // Zero ONLY the previously-used region (the linearity guard pins
@@ -197,7 +203,7 @@ impl DeciderState {
 
     /// One level's inclusion + survival decision (mirrors `step_level`).
     /// `variant` / `fids` are parallel emission-order pair arrays.
-    fn step_level(
+    pub(crate) fn step_level(
         &mut self,
         variant: &[i64],
         fids: &[u32],
