@@ -45,6 +45,7 @@ from ._batch_layout import UINT32_MAX
 __all__ = [
     "build_per_row_variant_lookup",
     "concat_per_row",
+    "concat_per_row_from_buffer",
     "row_offsets_from_per_variant_lengths",
 ]
 
@@ -241,22 +242,13 @@ def concat_per_row(
         ``u32[batch_size + 1]``; ``row_offsets[-1] == flat.shape[0]``.
     """
 
-    # ----- Per-variant lengths + per-row length expansion. -----
+    # ----- Per-variant lengths + per-variant buffer/CSR. -----
     per_variant_lengths = np.array(
         [a.shape[0] for a in per_variant_arrays], dtype=np.uint32
     )
-    row_offsets = row_offsets_from_per_variant_lengths(
-        per_variant_lengths, per_row_variant_idx, is_padding
-    )
 
-    if expected_row_offsets is not None:
-        _assert_row_offsets_match(
-            row_offsets, expected_row_offsets, is_padding
-        )
-
-    total = int(row_offsets[-1])
-
-    # ----- Dtype inference + empty fast-path. -----
+    # Dtype inference must run on the list (the buffer-input entry takes a
+    # ready-typed buffer instead) before concatenation collapses it.
     out_dtype = dtype
     if out_dtype is None:
         for a in per_variant_arrays:
@@ -272,6 +264,98 @@ def concat_per_row(
         # only reachable when the caller knows the output is empty.
         out_dtype = np.uint8
 
+    variant_buffer = np.concatenate(per_variant_arrays) if any(
+        a.shape[0] > 0 for a in per_variant_arrays
+    ) else np.empty(0, dtype=out_dtype)
+
+    variant_offsets = np.empty(
+        per_variant_lengths.shape[0] + 1, dtype=np.int64
+    )
+    variant_offsets[0] = 0
+    np.cumsum(per_variant_lengths.astype(np.int64), out=variant_offsets[1:])
+
+    return _concat_per_row_core(
+        variant_buffer,
+        variant_offsets,
+        per_variant_lengths,
+        per_row_variant_idx,
+        is_padding,
+        out_dtype=out_dtype,
+        expected_row_offsets=expected_row_offsets,
+    )
+
+
+def concat_per_row_from_buffer(
+    variant_buffer: np.ndarray,
+    variant_offsets: np.ndarray,
+    per_row_variant_idx: np.ndarray,
+    is_padding: np.ndarray,
+    *,
+    dtype: Optional[np.dtype] = None,
+    expected_row_offsets: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-row concatenation from an ALREADY-concatenated variant buffer.
+
+    Byte-identical to :func:`concat_per_row`, but the caller supplies the
+    variant payloads as one flat ``variant_buffer`` (1D) grouped in
+    variant order, plus its per-variant CSR ``variant_offsets`` (``int``;
+    ``variant_offsets[v + 1] - variant_offsets[v]`` is variant ``v``'s
+    length). This is the form the global per-chunk stream already has --
+    ``concat_per_row`` would otherwise re-slice the buffer into a list
+    and ``np.concatenate`` it straight back, a redundant round-trip.
+
+    Parameters mirror :func:`concat_per_row`; ``variant_buffer`` +
+    ``variant_offsets`` replace ``per_variant_arrays``. ``dtype`` overrides
+    the output dtype (defaults to ``variant_buffer.dtype``).
+    """
+    variant_offsets = np.ascontiguousarray(variant_offsets, dtype=np.int64)
+    per_variant_lengths = (
+        variant_offsets[1:] - variant_offsets[:-1]
+    ).astype(np.uint32)
+    out_dtype = dtype if dtype is not None else variant_buffer.dtype
+
+    return _concat_per_row_core(
+        variant_buffer,
+        variant_offsets,
+        per_variant_lengths,
+        per_row_variant_idx,
+        is_padding,
+        out_dtype=out_dtype,
+        expected_row_offsets=expected_row_offsets,
+    )
+
+
+def _concat_per_row_core(
+    variant_buffer: np.ndarray,
+    variant_start_offset: np.ndarray,
+    per_variant_lengths: np.ndarray,
+    per_row_variant_idx: np.ndarray,
+    is_padding: np.ndarray,
+    *,
+    out_dtype: np.dtype,
+    expected_row_offsets: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Shared tail: scatter a variant buffer to per-row flat output.
+
+    Single source of truth for the vectorised ``np.repeat`` / ``arange``
+    per-row fill used by both the list-input (:func:`concat_per_row`) and
+    buffer-input (:func:`concat_per_row_from_buffer`) entries. Given the
+    per-variant lengths, the variant-ordered ``variant_buffer``, and its
+    prefix-sum CSR ``variant_start_offset``, produces ``(flat,
+    row_offsets)`` identical to the original monolithic body.
+    """
+    # ----- Per-row length expansion + optional sizing check. -----
+    row_offsets = row_offsets_from_per_variant_lengths(
+        per_variant_lengths, per_row_variant_idx, is_padding
+    )
+
+    if expected_row_offsets is not None:
+        _assert_row_offsets_match(
+            row_offsets, expected_row_offsets, is_padding
+        )
+
+    total = int(row_offsets[-1])
+
     flat = np.empty(total, dtype=out_dtype)
     if total == 0:
         return flat, row_offsets
@@ -281,11 +365,9 @@ def concat_per_row(
     # L_r, the flat output positions [row_offsets[r], row_offsets[r] +
     # L_r) take the per-variant array at v_r in order. We need a
     # ``src_idx[k]`` array of length ``total`` whose entries point into
-    # a single concatenated per-variant buffer.
+    # the single variant-ordered ``variant_buffer``.
     #
     # Build:
-    #   variant_buffer = concatenate(per_variant_arrays)  # len = sum(per_variant_lengths)
-    #   variant_start_offset = cumsum-prefix(per_variant_lengths)
     #   per_row_variant_start = variant_start_offset[per_row_variant_idx]  # zeroed for padding
     #   src_idx_per_row_base = repeat(per_row_variant_start, per_row_lengths)  # length = total
     #   src_idx_within_row = arange-per-row-pattern             # length = total
@@ -297,16 +379,6 @@ def concat_per_row(
     # offsets per output position". The within-row offsets ``0, 1, ...,
     # L_r - 1`` for each row are built via ``arange(total) -
     # repeat(row_offsets[:-1], per_row_lengths)`` -- standard trick.
-
-    variant_buffer = np.concatenate(per_variant_arrays) if any(
-        a.shape[0] > 0 for a in per_variant_arrays
-    ) else np.empty(0, dtype=out_dtype)
-
-    variant_start_offset = np.empty(
-        per_variant_lengths.shape[0] + 1, dtype=np.int64
-    )
-    variant_start_offset[0] = 0
-    np.cumsum(per_variant_lengths.astype(np.int64), out=variant_start_offset[1:])
 
     # Per-row variant start offset; padding rows have per_row_lengths==0
     # so their start value never gets repeated (np.repeat with count 0

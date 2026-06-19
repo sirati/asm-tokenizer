@@ -361,20 +361,20 @@ def _assert_consumers(stage2: Stage2Batch, dense: DenseColumns) -> None:
     construction; here we additionally pin the cross-cutting flat axes the
     sites expose so a future view-shape drift surfaces.
     """
-    inline_bytes, inline_slices = build_inline_bytes(dense)
-    # 3a: per-CT byte slice lengths must align with the full DFS node axis.
-    assert len(inline_slices) == dense.n_nodes
+    inline_bytes, inline_byte_starts = build_inline_bytes(dense)
+    # 3a: per-CT byte start CSR must align with the full DFS node axis.
+    assert inline_byte_starts.shape[0] == dense.n_nodes
 
     # 3b carriers + 3c segments + sign all key off the kept axis.
     carrier_off, carrier_L, carrier_pos = _gather_identity_carriers(
-        dense, inline_slices
+        dense, inline_byte_starts
     )
     idx_2d, id_slices = build_identity_idx_2d(
-        dense, inline_bytes, inline_slices
+        dense, inline_bytes, inline_byte_starts
     )
     assert len(id_slices) == dense.n_nodes
 
-    seg = build_flat_segments(dense, inline_slices)
+    seg = build_flat_segments(dense, inline_byte_starts)
     assert np.array_equal(seg.ct_index, dense.kept_node_index)
     # seg.seg_surviving is the kept nodes' surviving_token_count, in dense
     # kept order.

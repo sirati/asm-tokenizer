@@ -227,6 +227,16 @@ def _build_inline_bytes_from_raw(
     return inline_bytes, slice(1, 1 + payload.shape[0])
 
 
+def _starts(*slices: slice) -> np.ndarray:
+    """Per-call-target ``inline_byte_starts`` from the synthetic slices.
+
+    ``build_number_idx_2d`` now takes the stage-3a start-offset CSR
+    (``int64[n_call_targets]``) instead of the abutting slice list; each
+    call_target's ``slice.start`` IS its entry in that array.
+    """
+    return np.array([s.start for s in slices], dtype=np.int64)
+
+
 # ---------------------------------------------------------------------------
 # F128 stream builders.
 # ---------------------------------------------------------------------------
@@ -377,7 +387,7 @@ def test_f128_3c_to_3d_chain_byte_equivalent(
         f128_is_nan_or_inf,
         vc2_sidecar,
     ) = build_number_idx_2d(
-        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, _starts(ct_slice)
     )
 
     # Sanity: f128_is_nan_or_inf length = n_sources; idx_2d row count =
@@ -481,7 +491,7 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
         f128_is_nan_or_inf,
         vc2_sidecar,
     ) = build_number_idx_2d(
-        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, _starts(ct_slice)
     )
 
     n_f128_sources = len(f128_values)
@@ -608,7 +618,7 @@ def test_f128_mid_cut_finite_emits_both_chunks_without_assertion() -> None:
         _,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, _starts(ct_slice))
 
     # 3c contract: 2 finite F128 sources, each contributes 2 chunks
     # (LSB + MSB) INDEPENDENT of the cut. Total rows = 2 + 2 = 4.
@@ -728,7 +738,7 @@ def test_f128_midcut_finite_3d_emits_both_chunks_byte_equivalent() -> None:
     )
 
     idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
-        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, _starts(ct_slice)
     )
 
     # 3c emits BOTH chunks even though only the LSB chunk is stream-
@@ -788,7 +798,7 @@ def test_f128_midcut_finite_nonzero_lsb_lsb_chunk_is_correctly_normalized() -> N
 
     stage2_batch, inline_bytes, ct_slice = _build_f128_midcut_stream(bits)
     idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
-        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, _starts(ct_slice)
     )
     out = normalize_per_token_type(
         idx_2d_per_type=idx_2d_per_type,

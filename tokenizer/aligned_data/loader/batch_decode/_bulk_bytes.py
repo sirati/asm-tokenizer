@@ -158,13 +158,13 @@ def build_bulk_bytes(
 
     # 1. inline_bytes (3a): per-call-target u8 byte slices into a flat
     #    buffer with a leading zero pad at index 0.
-    inline_bytes, inline_byte_slices = build_inline_bytes(dense)
+    inline_bytes, inline_byte_starts = build_inline_bytes(dense)
 
     # 2. identity idx_2d (3b): u32[N_in_stream, 2] of byte offsets into
     #    inline_bytes; per-call-target identity_slices INCLUDE the
     #    prepend slot at slice.start.
     identity_idx_2d, identity_slices = build_identity_idx_2d(
-        dense, inline_bytes, inline_byte_slices
+        dense, inline_bytes, inline_byte_starts
     )
 
     # 3. view-cast 3b's idx_2d to u16 in-stream caller-local ids. NO
@@ -182,7 +182,7 @@ def build_bulk_bytes(
         number_chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
-    ) = build_number_idx_2d(dense, inline_bytes, inline_byte_slices)
+    ) = build_number_idx_2d(dense, inline_bytes, inline_byte_starts)
 
     # 5. Per-source signs grouped by TokenType, in the same stream-source
     #    order the per-type idx_2d arrays use. Reads
@@ -235,7 +235,8 @@ def build_bulk_bytes(
     sections = (
         _assemble_hierarchy(
             stage2=stage2,
-            inline_byte_slices=inline_byte_slices,
+            inline_byte_starts=inline_byte_starts,
+            inline_bytes_len=int(inline_bytes.shape[0]),
             identity_slices=identity_slices,
             number_chunk_boundaries_per_type=number_chunk_boundaries_per_type,
         )
@@ -375,7 +376,8 @@ def _batched_carrier_signs(
 def _assemble_hierarchy(
     *,
     stage2: "Stage2Batch",
-    inline_byte_slices: list[slice],
+    inline_byte_starts: np.ndarray,
+    inline_bytes_len: int,
     identity_slices: "IdentitySlicesCSR",
     number_chunk_boundaries_per_type: dict[TokenType, np.ndarray],
 ) -> list[Stage3Section]:
@@ -389,7 +391,15 @@ def _assemble_hierarchy(
     leaf-locally here (the only consumer that needs ``slice`` objects --
     the staged tree-walk -- and the only path that builds this hierarchy
     at all, ``build_hierarchy``), keeping them off the vector hot path.
+    The ``inline_byte`` slices are reconstructed from the per-call-target
+    ``inline_byte_starts`` CSR: call_target ``i``'s slice runs from
+    ``starts[i]`` to the next call_target's start (or ``inline_bytes_len``
+    for the last), byte-identical to stage 3a's old abutting slice list.
     """
+    inline_byte_stops = np.empty_like(inline_byte_starts)
+    if inline_byte_stops.shape[0] > 0:
+        inline_byte_stops[:-1] = inline_byte_starts[1:]
+        inline_byte_stops[-1] = inline_bytes_len
     ct_cursor = 0
     sections: list[Stage3Section] = []
     for stage2_section in stage2.sections:
@@ -407,7 +417,10 @@ def _assemble_hierarchy(
                 stage3_cts.append(
                     Stage3CallTarget(
                         stage2=stage2_ct,
-                        inline_byte_slice=inline_byte_slices[ct_cursor],
+                        inline_byte_slice=slice(
+                            int(inline_byte_starts[ct_cursor]),
+                            int(inline_byte_stops[ct_cursor]),
+                        ),
                         identity_slice=identity_slices[ct_cursor],
                         number_chunk_slices=per_type_slice,
                     )
