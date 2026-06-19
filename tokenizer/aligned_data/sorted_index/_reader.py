@@ -162,7 +162,7 @@ class SortedIndexReader:
     ) -> np.ndarray:
         """Uniform sample without replacement from all buckets in ``[lo, hi]``.
 
-        Concatenates every section index from every length-bucket in the
+        Gathers every section index from every length-bucket in the
         range ``[lo, hi]`` (intersected with the reader's valid range)
         into a single pool, then draws ``min(count, pool_size)`` entries
         uniformly without replacement via ``rng.choice``.
@@ -180,26 +180,25 @@ class SortedIndexReader:
         if lo_idx > hi_idx:
             return np.empty(0, dtype=np.uint32)
 
-        # Collect all section indices from every bucket in the band.
-        parts = []
-        for idx in range(lo_idx, hi_idx + 1):
-            bc = int(self._counts[idx])
-            if bc == 0:
-                continue
-            body_offset = int(self._bucket_body_offsets[idx])
-            bucket = np.frombuffer(
-                self._blob,
-                dtype=np.uint32,
-                count=bc,
-                offset=body_offset,
-            )
-            # Copy so the pool array is independent of the blob.
-            parts.append(bucket.copy())
-
-        if not parts:
+        # The body is length-bucketed in stable-sorted order (see
+        # :func:`.._wire.encode_sorted_index`), so the buckets spanning
+        # ``[lo_idx, hi_idx]`` form ONE contiguous u32 span. Read the
+        # whole band pool with a single ``frombuffer`` -- element-for-
+        # element identical to the old per-bucket concat (same order),
+        # so ``rng.choice`` over the same ``pool_size`` draws the same
+        # indices. This avoids O(band-width) Python iterations + one
+        # ``frombuffer`` per bucket on wide cross-depth bands.
+        n = int(self._counts[lo_idx : hi_idx + 1].sum())
+        if n == 0:
             return np.empty(0, dtype=np.uint32)
-
-        pool = np.concatenate(parts)
+        start_off = int(self._bucket_body_offsets[lo_idx])
+        # Copy so the pool array is independent of the blob.
+        pool = np.frombuffer(
+            self._blob,
+            dtype=np.uint32,
+            count=n,
+            offset=start_off,
+        ).copy()
         pool_size = pool.size
         k = min(count, pool_size)
         if k == pool_size:
