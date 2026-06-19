@@ -35,10 +35,12 @@
 //! the sentinel value is itself a legitimate entry value.
 
 mod hashmap_macro;
+mod number_idx_2d;
 mod remap_walk;
 mod segment_distinct;
 
 use hashmap_macro::define_hashmap;
+use number_idx_2d::build_number_idx_2d_kernel;
 use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
 use segment_distinct::segment_distinct_count;
@@ -295,6 +297,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Per-row identity FID/counter remap walk kernel (ALG-3/4/9). See
     // `remap_walk.rs`.
     m.add_function(wrap_pyfunction!(apply_remap_walk, m)?)?;
+
+    // Stage-3c NUMBER-band idx_2d emission kernel (ALG-2/7/8). See
+    // `number_idx_2d.rs`.
+    m.add_function(wrap_pyfunction!(build_number_idx_2d_kernel, m)?)?;
 
     Ok(())
 }
