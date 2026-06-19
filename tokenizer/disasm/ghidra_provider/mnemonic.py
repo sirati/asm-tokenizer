@@ -261,3 +261,82 @@ def _strip_arm_cc_suffix(
         if stem in _ARM_COND_MNEMONIC_ALLOWLIST:
             return (stem, cc_enum)
     return (mnemonic, None)
+
+
+# ---------------------------------------------------------------------------
+# PowerPC branch-condition + CR0-update (Rc) mnemonic-suffix detection
+# ---------------------------------------------------------------------------
+# Ghidra's PowerPC SLEIGH spec folds the branch condition into the
+# displayed mnemonic via the ``CC`` subtable (``ppc_common.sinc``:
+# ``CC: "lt"|"le"|"eq"|"ge"|"gt"|"ne"|"so"|"ns"``) concatenated as
+# ``b^CC^...``. So ``getMnemonicString()`` returns forms such as ``beq``,
+# ``bne``, ``blt``, plus the link / absolute / register variants
+# ``beql`` / ``beqa`` / ``beqla`` / ``beqlr`` / ``beqlrl`` / ``beqctr`` /
+# ``beqctrl``. The Rc bit (CR0 update) is rendered as a literal trailing
+# ``.`` baked directly into the mnemonic (``add.``, ``or.``, ``rlwinm.``).
+#
+# Both signals are recovered by inspecting the mnemonic string -- the same
+# idiom ARM uses (``_strip_arm_cc_suffix``) -- because Ghidra exposes
+# neither the BO/BI fields nor the Rc bit as a typed operand on the
+# instruction: the condition is folded into the mnemonic via the CC
+# subtable and the Rc bit into the mnemonic spelling.
+#
+# The returned ``bc`` integer matches the Capstone-4.x ``ppc_bc`` small
+# enum (lt=1..ns=10) that the PPC architecture provider's ``_PPC_BC_NAMES``
+# table consumes -- the typed ``PpcBranchConditionPrefixView.bc`` contract
+# value, NOT a Ghidra-internal code -- so the Ghidra and angr paths feed
+# the same downstream rendering table.
+#
+# Ghidra renders only ``so`` / ``ns`` (never the ``un`` / ``nu`` unordered
+# aliases), so those two contract values (7/8) are unreachable from this
+# path -- as they are from the Ghidra mnemonic itself.
+_PPC_CC_LITERAL_TO_BC: dict[str, int] = {
+    "lt": 1, "le": 2, "eq": 3, "ge": 4, "gt": 5,
+    "ne": 6, "so": 9, "ns": 10,
+}
+
+# Suffixes the ``b^CC^...`` constructs append after the two-char condition:
+# "" (relative), "a" (absolute), "l"/"la" (link), and the register-branch
+# tails "lr"/"lrl"/"ctr"/"ctrl". Enumerated explicitly so the recognized
+# conditional-branch mnemonic set is exact -- a blind ``b``-prefix +
+# cc-substring strip would false-positive on unconditional ``b`` / ``bl`` /
+# ``blr`` / ``bctr`` / CTR-decrement ``bdnz`` (whose condition, on the
+# ``bdnzt`` / ``bdnzf`` forms, is a separate operand Ghidra does NOT fold
+# into the mnemonic and which this path therefore does not surface).
+_PPC_BRANCH_COND_SUFFIXES: tuple[str, ...] = (
+    "", "a", "l", "la", "lr", "lrl", "ctr", "ctrl",
+)
+
+# Exact recognized conditional-branch mnemonic -> bc contract value.
+# Built as the cross product {cc} x {suffix}; membership is the sole
+# discriminator, so there is no fragile substring stripping.
+_PPC_BRANCH_MNEMONIC_TO_BC: dict[str, int] = {
+    f"b{cc}{suffix}": bc
+    for cc, bc in _PPC_CC_LITERAL_TO_BC.items()
+    for suffix in _PPC_BRANCH_COND_SUFFIXES
+}
+
+
+def _ppc_branch_condition(mnemonic: str) -> int | None:
+    """Return the ``bc`` contract value for a Ghidra PPC conditional branch.
+
+    ``mnemonic`` is ``getMnemonicString()`` lowercased. Returns the
+    Capstone-4.x ``ppc_bc`` small-enum integer (lt=1..ns=10) consumed by
+    the PPC provider's ``_PPC_BC_NAMES`` table when ``mnemonic`` is one of
+    the recognized ``b^CC^...`` conditional-branch forms, else ``None``
+    (unconditional ``b`` / ``bl`` / ``blr`` / ``bctr`` and the
+    CTR-decrement ``bdnz`` family, none of which fold a condition into the
+    mnemonic).
+    """
+    return _PPC_BRANCH_MNEMONIC_TO_BC.get(mnemonic)
+
+
+def _ppc_has_cr0_update(mnemonic: str) -> bool:
+    """True iff the Ghidra PPC mnemonic carries the Rc-bit ``.`` suffix.
+
+    Ghidra bakes the record-condition (Rc) bit directly into the displayed
+    mnemonic as a trailing ``.`` (``add.``, ``or.``, ``rlwinm.``), the same
+    bit Capstone surfaces as ``cs_insn.update_cr0``. The non-Rc CR writers
+    (``cmpw`` and friends) carry no ``.`` and so are correctly excluded.
+    """
+    return mnemonic.endswith(".")
