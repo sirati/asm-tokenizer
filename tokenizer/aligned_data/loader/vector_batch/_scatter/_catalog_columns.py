@@ -75,8 +75,10 @@ class CatalogColumns:
     Per-section data
     ----------------
     section_root_fid:
-        ``list[int]`` of length ``n_sections`` -- section ``s``'s root
-        ``function_name_ptr`` as a Python int (``cols.function_name_ptr``).
+        ``int64[n_sections]`` -- section ``s``'s root ``function_name_ptr``
+        (``cols.function_name_ptr``). Kept as the typed numpy column the
+        hot remap consumer fancy-indexes directly; the tree-parity adapter
+        coerces a scalar to a Python ``int`` locally at its leaf.
     call_targets_section:
         Returns a section's parsed ``call_targets`` table, cached by
         section index. Node-invariant per section, so a section's nodes
@@ -88,7 +90,7 @@ class CatalogColumns:
     encounter_category: List[Category]
     counter_count_categories: tuple[Category, ...]
     counter_count_columns: tuple[np.ndarray, ...]
-    section_root_fid: List[int]
+    section_root_fid: np.ndarray
 
     #: Source handles for the lazy per-section ``call_targets`` parse + the
     #: cache it populates. Not part of the per-node column surface.
@@ -183,8 +185,9 @@ def build_catalog_columns(
     # lookup indexed by the already-int ``edge_type``).
     encounter_category = _encounter_category_per_node(edge_type)
 
-    # Per-section root FID as a Python-int column (one ``int()`` per section).
-    section_root_fid = np.asarray(cols.function_name_ptr).tolist()
+    # Per-section root FID as the typed int64 column the remap consumer
+    # fancy-indexes directly (no Python-list round-trip).
+    section_root_fid = np.asarray(cols.function_name_ptr, dtype=np.int64)
 
     return CatalogColumns(
         section_of_node=section_of_node,

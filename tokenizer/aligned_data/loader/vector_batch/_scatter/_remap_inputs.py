@@ -136,7 +136,7 @@ def build_flat_remap_inputs(
 
     # node_fid / node_enc_func_slot from the shared catalog columns.
     section_of_node = np.asarray(catalog.section_of_node, dtype=np.int64)
-    section_root_fid = np.asarray(catalog.section_root_fid, dtype=np.int64)
+    section_root_fid = catalog.section_root_fid
     node_fid = (
         section_root_fid[section_of_node]
         if n_nodes

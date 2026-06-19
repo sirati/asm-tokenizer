@@ -190,7 +190,7 @@ def build_stage2_batch(
                 call_targets_section=ct_section,
                 encounter_category=encounter_category_per_node[e],
                 parent_call_target_index=None if e == lo else 0,
-                function_name_ptr=section_fid_int[sec],
+                function_name_ptr=int(section_fid_int[sec]),
                 path_depth=0 if e == lo else 1,
             )
             s2_cts.append(
