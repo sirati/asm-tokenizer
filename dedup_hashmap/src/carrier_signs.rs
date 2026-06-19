@@ -33,7 +33,7 @@
 //! (ascending). Identical to the numpy boolean-mask gather, which preserves
 //! that scan order.
 
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::PyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
