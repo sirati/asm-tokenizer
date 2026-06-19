@@ -225,3 +225,206 @@ def test_exhaustive_batches_fixed_grouping_no_drop(tmp_path: Path) -> None:
     assert sorted(decoded) == sorted(expected)  # no (matched, variant) lost
     assert len(set(decoded)) == len(expected)  # no dup row
     assert decoded == expected  # section-major / variant-ascending order
+
+
+def _fixture_session_factory(base: Path, vocab_manager):
+    @contextmanager
+    def session_factory(binary_name: str) -> Iterator[BinarySession]:
+        dataset = BinaryDataset(
+            base, binary_name, vocab_manager=vocab_manager
+        )
+        with dataset.open_session() as session:
+            yield session
+
+    return session_factory
+
+
+def _collect_batches(session_factory, sampler, *, group_size, pointer_filter):
+    """Materialize every batch as a comparable (mapping, tokens) tuple list.
+
+    Captures the FULL decoded shape the eval consumes -- the
+    ``batch_idx_to_section_variant`` mapping and the token matrix -- so a
+    byte-for-byte comparison across runs / against the unfiltered pass is
+    possible without re-deriving anything.
+    """
+    results = list(
+        open_exhaustive_batches(
+            session_factory,
+            sampler,
+            group_size=group_size,
+            context_len=32,
+            max_depth=2,
+            rng=np.random.default_rng(0),
+            pointer_filter=pointer_filter,
+        )
+    )
+    captured = []
+    for result in results:
+        inner = result.inner
+        captured.append(
+            (
+                inner.batch_idx_to_section_variant.copy(),
+                inner.tokens.copy(),
+            )
+        )
+    return captured
+
+
+def _assert_batches_equal(left, right) -> None:
+    assert len(left) == len(right)
+    for (lmap, ltok), (rmap, rtok) in zip(left, right):
+        assert np.array_equal(lmap, rmap)
+        assert np.array_equal(ltok, rtok)
+
+
+def test_pointer_filter_none_preserves_as_landed_batches(
+    tmp_path: Path,
+) -> None:
+    """``pointer_filter=None`` == omitting it == the as-landed batches.
+
+    The no-op-preservation gate: the whole-corpus pass with the hook left at
+    its default must be byte-for-byte the SAME sequence of decoded groups as
+    omitting the parameter entirely (the original wire behavior).
+    """
+    vocab_manager = make_test_vocab_manager()
+    base = build_combined_fixture_with_variants(tmp_path, vocab_manager)
+    reader = _write_all_sections_idx(base)
+    session_factory = _fixture_session_factory(base, vocab_manager)
+    sampler = ExhaustiveSectionSampler([(_BINARY_NAME, _SPEC, reader)])
+
+    # Omitting the parameter -> the original signature path.
+    omitted = list(
+        open_exhaustive_batches(
+            session_factory,
+            sampler,
+            group_size=3,
+            context_len=32,
+            max_depth=2,
+            rng=np.random.default_rng(0),
+        )
+    )
+    omitted_captured = [
+        (
+            r.inner.batch_idx_to_section_variant.copy(),
+            r.inner.tokens.copy(),
+        )
+        for r in omitted
+    ]
+
+    explicit_none = _collect_batches(
+        session_factory, sampler, group_size=3, pointer_filter=None
+    )
+
+    _assert_batches_equal(omitted_captured, explicit_none)
+    assert len(omitted_captured) > 0  # non-degenerate gate
+
+
+def test_pointer_filter_subset_decodes_only_survivors(tmp_path: Path) -> None:
+    """A subset filter -> ONLY surviving sections/variants are decoded.
+
+    Carve the eval set down to the multi-variant sections (matched idx 2 and
+    4) at the pointer level; the decoded rows must be EXACTLY those pointers'
+    ``(matched_idx, variant)`` -- nothing surviving dropped, RAGGED
+    preserved, grouping respecting the FILTERED length.
+    """
+    vocab_manager = make_test_vocab_manager()
+    base = build_combined_fixture_with_variants(tmp_path, vocab_manager)
+    reader = _write_all_sections_idx(base)
+    session_factory = _fixture_session_factory(base, vocab_manager)
+    sampler = ExhaustiveSectionSampler([(_BINARY_NAME, _SPEC, reader)])
+
+    keep = {2, 4}
+
+    def pointer_filter(pointers):
+        return [p for p in pointers if p.section_pointer.idx in keep]
+
+    group_size = 8  # > survivor count -> single RAGGED group over survivors.
+    sentinel = np.iinfo(np.uint32).max
+    results = list(
+        open_exhaustive_batches(
+            session_factory,
+            sampler,
+            group_size=group_size,
+            context_len=32,
+            max_depth=2,
+            rng=np.random.default_rng(0),
+            pointer_filter=pointer_filter,
+        )
+    )
+
+    # Rebuild the survivor pointer order to map group-local pos -> matched.
+    with session_factory(_BINARY_NAME) as count_session:
+
+        def count_provider(binary_name, section_indices):
+            return count_session._matched_section_variant_counts(
+                section_indices
+            )
+
+        survivors = pointer_filter(sampler.all_pointers(count_provider))
+
+    groups = [
+        survivors[s : s + group_size]
+        for s in range(0, len(survivors), group_size)
+    ]
+    assert len(results) == len(groups)
+
+    decoded: List[Tuple[int, int]] = []
+    for group, result in zip(groups, results):
+        mapping = result.inner.batch_idx_to_section_variant
+        assert int((mapping == sentinel).sum()) == 0  # RAGGED, no padding
+        for r in range(mapping.shape[0]):
+            matched_idx = group[int(mapping[r, 0])].section_pointer.idx
+            decoded.append((matched_idx, int(mapping[r, 1])))
+
+    expected = [
+        (idx, var)
+        for idx in sorted(keep)
+        for var in range(_FIXTURE_VARIANT_COUNTS[idx])
+    ]
+    assert decoded == expected  # only survivors, section-major / ascending
+    assert {idx for idx, _ in decoded} == keep  # excluded sections gone
+
+
+def test_pointer_filter_deterministic_across_repeated_calls(
+    tmp_path: Path,
+) -> None:
+    """Same (corpus, filter) -> identical batch sequence across calls."""
+    vocab_manager = make_test_vocab_manager()
+    base = build_combined_fixture_with_variants(tmp_path, vocab_manager)
+    reader = _write_all_sections_idx(base)
+    session_factory = _fixture_session_factory(base, vocab_manager)
+    sampler = ExhaustiveSectionSampler([(_BINARY_NAME, _SPEC, reader)])
+
+    def pointer_filter(pointers):
+        return [p for p in pointers if p.section_pointer.idx in {2, 3, 4}]
+
+    first = _collect_batches(
+        session_factory, sampler, group_size=2, pointer_filter=pointer_filter
+    )
+    second = _collect_batches(
+        session_factory, sampler, group_size=2, pointer_filter=pointer_filter
+    )
+    _assert_batches_equal(first, second)
+    assert len(first) > 0  # non-degenerate gate
+
+
+def test_pointer_filter_empty_yields_no_batches(tmp_path: Path) -> None:
+    """A filter returning empty -> no batches, cleanly (no error)."""
+    vocab_manager = make_test_vocab_manager()
+    base = build_combined_fixture_with_variants(tmp_path, vocab_manager)
+    reader = _write_all_sections_idx(base)
+    session_factory = _fixture_session_factory(base, vocab_manager)
+    sampler = ExhaustiveSectionSampler([(_BINARY_NAME, _SPEC, reader)])
+
+    results = list(
+        open_exhaustive_batches(
+            session_factory,
+            sampler,
+            group_size=4,
+            context_len=32,
+            max_depth=2,
+            rng=np.random.default_rng(0),
+            pointer_filter=lambda pointers: [],
+        )
+    )
+    assert results == []

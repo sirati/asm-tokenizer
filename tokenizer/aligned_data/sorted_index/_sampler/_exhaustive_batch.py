@@ -33,7 +33,15 @@ Concern boundaries:
 from __future__ import annotations
 
 from contextlib import ExitStack
-from typing import Callable, ContextManager, Dict, Iterator, List, Sequence
+from typing import (
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+)
 
 import numpy as np
 
@@ -56,6 +64,12 @@ def open_exhaustive_batches(
     context_len: int,
     max_depth: int,
     rng: np.random.Generator,
+    pointer_filter: Optional[
+        Callable[
+            [Sequence[MultiBinarySectionPointer]],
+            Sequence[MultiBinarySectionPointer],
+        ]
+    ] = None,
     include_fid_sidecar: bool = False,
     inlined_equivalent_call_targets_only: bool = True,
 ) -> Iterator[MultiBinaryBatchDecodeResult]:
@@ -80,6 +94,18 @@ def open_exhaustive_batches(
     sampler's deterministic canonical order. The generator keeps every
     session open until exhausted (or the caller closes it), since each
     yielded result reads session-backed numpy views.
+
+    ``pointer_filter`` is an OPTIONAL pluggable sequence->sequence transform
+    over the enumerated pointers, applied AFTER the deterministic
+    enumeration (so it receives the canonical/stable pointer order) and
+    BEFORE the fixed-size grouping (so it shapes which sections/variants get
+    batched -- e.g. carving an eval subset). ``None`` (the default) is the
+    whole-corpus pass and is byte-for-byte identical to the unfiltered
+    behavior. Only the surviving pointers are grouped (RAGGED + no-drop on
+    whatever survives); returning an empty sequence yields no batches. Any
+    determinism of the result beyond the canonical enumeration order is the
+    caller's responsibility -- the filter is applied verbatim, so a
+    non-deterministic filter makes the batch sequence non-deterministic.
     """
     if group_size < 1:
         raise ValueError(f"group_size must be >= 1, got {group_size}")
@@ -104,6 +130,8 @@ def open_exhaustive_batches(
             )._matched_section_variant_counts(section_indices)
 
         pointers = sampler.all_pointers(count_provider)
+        if pointer_filter is not None:
+            pointers = pointer_filter(pointers)
         for group in _group(pointers, group_size):
             sessions = {
                 ptr.binary_name: get_session(ptr.binary_name)
