@@ -55,11 +55,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from dedup_hashmap import HashMapU32U16
-
-from tokenizer.tokens import Category
-
-from ._dedup_walk import FUNCTION_CATEGORIES, apply_per_row_remap
+from ._dedup_walk import apply_per_row_remap
 from ._runlengths import compute_metatoken_runlengths
 from ._sidecar_concat import assemble_number_sidecars
 from ._token_assembly import assemble_tokens
@@ -70,37 +66,6 @@ if TYPE_CHECKING:
 
 
 __all__ = ["assemble_batch"]
-
-
-def _build_dedup_maps(stage3_batch: "Stage3Batch") -> dict[Category, HashMapU32U16]:
-    """Allocate the three FUNCTION-Category :class:`HashMapU32U16`
-    instances needed by :func:`apply_per_row_remap`.
-
-    Each map is pre-sized to an upper bound on the per-row FID-count it
-    will see. The upper bound is the total number of call_targets in any
-    one section header (across the whole batch) -- per-row maps see at
-    most the call_targets_section of a single root variant plus the
-    call_targets_section of every inlined callee. Sizing on the
-    sum-across-the-batch is a safe overshoot; the hashmap's ``clean()``
-    only resets occupancy, not capacity, so the same allocation backs
-    every row.
-
-    Plan reference: ``feedback_no_parallel_indexing`` -- never build a
-    cache that memoises parsed state when the bytes are already
-    addressable. Here we look at the section headers' call_targets list
-    sizes (already in memory on every Stage1Section.section); no parsing.
-    """
-    # Walk Stage1 sections to estimate capacity. The plan's Rust-
-    # allocation hot-path discipline calls for reusing across rows;
-    # we allocate once per :func:`assemble_batch` invocation. Pre-sizing
-    # avoids rehashing on the first few inserts of each row.
-    estimated_cap = 0
-    for stage1_section in stage3_batch.stage2.stage1.sections:
-        estimated_cap += len(stage1_section.section.call_targets)
-    # Floor on a reasonable starting capacity for the typical small case.
-    if estimated_cap < 8:
-        estimated_cap = 8
-    return {cat: HashMapU32U16(capacity=estimated_cap) for cat in FUNCTION_CATEGORIES}
 
 
 def assemble_batch(
@@ -164,7 +129,6 @@ def assemble_batch(
     # the returned reference because ``BatchDecodeResult`` stores it
     # under a different field name (``identities`` vs the stage-3
     # ``identities_flat_caller_local``).
-    dedup_maps = _build_dedup_maps(stage3)
     (
         identities,
         fid_sidecar,
@@ -172,7 +136,6 @@ def assemble_batch(
         fid_per_category_counts,
     ) = apply_per_row_remap(
         stage3,
-        dedup_maps=dedup_maps,
         collect_fid_sidecar=include_fid_sidecar,
     )
 

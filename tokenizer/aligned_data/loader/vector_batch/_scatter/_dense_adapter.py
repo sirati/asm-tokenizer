@@ -349,9 +349,10 @@ def _stage2_section(r: int, s2_cts: List[Stage2CallTarget]) -> Stage2Section:
     """Build the level-2 ``Stage2Section`` for non-padding batch row ``r``.
 
     The level-2 ``section`` is a minimal :class:`Section` carrying the
-    row's union ``call_targets`` -- read ONLY by the dedup-map capacity
-    estimate (:func:`...batch_decode._assemble._build_dedup_maps`), an
-    upper bound, so the per-row union is a faithful (and tight) source.
+    row's union ``call_targets`` -- a faithful (and tight) reconstruction
+    of the section header's call-target table the staged ``batch_decode``
+    pipeline carries, kept so the adapter's :class:`Stage2Section` is a
+    full peer of the staged one.
     """
     s2_variant = _stage2_variant(s2_cts, batch_idx=r)
     union_call_targets: List[CallTarget] = []

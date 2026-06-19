@@ -1,20 +1,21 @@
 """Stage 4 step 1 package: per-row identity remap walk.
 
 Re-exports the public entry :func:`apply_per_row_remap` and the
-shared Category-partition constants. The package is split into one
-submodule per concern:
+shared Category-partition constants. The ALG-3/4/9 remap LOGIC lives in
+the Rust kernel ``dedup_hashmap.apply_remap_walk``; this package owns
+the object-tree -> flat-int-array ADAPTER + the FID-sidecar pass-2
+emission that the kernel's per-row output feeds. The package is split
+into one submodule per concern:
 
 * :mod:`._constants` — Category partition tables + shifted-id map +
-  call-target-type -> Category map + ``NOT_FOUND_U16`` sentinel.
-* :mod:`._helpers` — :func:`_surviving_in_stream_token_ids` (shared
-  between FUNCTION + COUNTER dispatch).
-* :mod:`._row_state` — :class:`_RowState` per-row mutable state.
-* :mod:`._function_remap` — ALG-3 FUNCTION-category dedup.
-* :mod:`._counter_bump` — ALG-4 COUNTER-category offset bump.
-* :mod:`._prepend_slot` — ALG-9 prepend self-counter write +
-  LOCAL_FUNC root seed.
-* :mod:`._apply` — :func:`apply_per_row_remap` public entry + the
-  batch-row loop.
+  call-target-type -> Category map + per-partition slot codes +
+  ``NOT_FOUND_U16`` sentinel.
+* :mod:`._helpers` — :func:`_surviving_in_stream_token_ids` (the
+  per-call-target in-stream identity-band token id extractor).
+* :mod:`._flat_extract` — the object-tree -> flat-int-array extractor
+  feeding the Rust kernel (:func:`extract_flat_remap_inputs`).
+* :mod:`._apply` — :func:`apply_per_row_remap` public entry: extract
+  flat arrays, call the kernel, emit the row-keyed FID sidecar.
 
 See :mod:`._apply` for the full algorithmic docstring.
 """

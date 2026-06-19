@@ -32,9 +32,6 @@ from typing import Optional
 
 import numpy as np
 
-from tokenizer.aligned_data.loader.batch_decode._assemble import (
-    _build_dedup_maps,
-)
 from tokenizer.aligned_data.loader.batch_decode._bulk_bytes import (
     build_bulk_bytes,
 )
@@ -128,7 +125,6 @@ def build_dense_sidecars(
 
     # --- run the OWNED decode kernels (byte-identical by construction) ---
     stage3 = build_bulk_bytes(stage2)
-    dedup_maps = _build_dedup_maps(stage3)
     (
         row_identities,
         row_fid_sidecar,
@@ -136,7 +132,6 @@ def build_dense_sidecars(
         row_fid_per_category_counts,
     ) = apply_per_row_remap(
         stage3,
-        dedup_maps=dedup_maps,
         collect_fid_sidecar=include_fid_sidecar,
     )
     row_numbers_sig, row_numbers_sex = assemble_number_sidecars(stage3)

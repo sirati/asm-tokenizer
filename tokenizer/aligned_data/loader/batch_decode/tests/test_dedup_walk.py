@@ -24,13 +24,9 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
-import pytest
-
-from dedup_hashmap import HashMapU32U16
 
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.loader.batch_decode._dedup_walk import (
-    FUNCTION_CATEGORIES,
     _CATEGORY_TO_SHIFTED_ID,
     apply_per_row_remap,
 )
@@ -313,10 +309,6 @@ def _wrap_variant_into_batch(
     )
 
 
-def _make_dedup_maps() -> dict[Category, HashMapU32U16]:
-    return {cat: HashMapU32U16(capacity=8) for cat in FUNCTION_CATEGORIES}
-
-
 # ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
@@ -352,7 +344,7 @@ def test_single_call_target_function_dedup_three_distinct_fids():
     )
 
     remapped, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
-        stage3_batch, dedup_maps=_make_dedup_maps()
+        stage3_batch
     )
 
     assert remapped is identities
@@ -391,7 +383,7 @@ def test_root_self_recursion_dedupes_to_counter_zero():
         stage3_variant, identities, batch_size=1
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     assert int(identities[slices[0].start]) == 0
     assert identities[slices[0].start + 1 : slices[0].stop].tolist() == [0, 0]
@@ -449,7 +441,7 @@ def test_multi_call_target_dedup_b_and_c_share_callee_counter():
         stage3_variant, identities, batch_size=1
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     # Root prepend = counter 0.
     assert int(identities[slices[0].start]) == 0
@@ -497,7 +489,7 @@ def test_plt_local_independent_counter_spaces():
         stage3_variant, identities, batch_size=1
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     # Root prepend = LOCAL_FUNC counter 0.
     assert int(identities[slices[0].start]) == 0
@@ -539,7 +531,7 @@ def test_counter_category_block_offset_bump():
         stage3_variant, identities, batch_size=1
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     # First function: no offset, BLOCK ids stay 0/1/2.
     assert identities[slices[0].start + 1 : slices[0].stop].tolist() == [
@@ -607,7 +599,7 @@ def test_mixed_function_and_counter_categories():
         stage3_variant, identities, batch_size=1
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     # Root prepend = counter 0.
     assert int(identities[slices[0].start]) == 0
@@ -623,9 +615,9 @@ def test_mixed_function_and_counter_categories():
     assert identities[slices[1].start + 1 : slices[1].stop].tolist() == [2, 2]
 
 
-def test_dedup_maps_clean_between_rows():
-    """Row 2's dedup state is INDEPENDENT of row 1: ``clean()`` resets
-    the FUNCTION dedup maps before walking each row."""
+def test_dedup_state_independent_between_rows():
+    """Row 2's dedup state is INDEPENDENT of row 1: the kernel resets its
+    per-row FUNCTION dedup maps + counters at each row boundary."""
 
     # Build a 2-row Stage3Batch where both rows use the same root FID
     # (but different caller-local stream content). Row 2 should see
@@ -742,7 +734,7 @@ def test_dedup_maps_clean_between_rows():
         f128_is_nan_or_inf=np.zeros(0, dtype=np.bool_),
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     # Row 1: prepend = 0, in-stream self-ref = 0.
     assert int(combined_identities[slices1[0].start]) == 0
@@ -796,7 +788,6 @@ def test_fid_sidecar_collects_counter_to_fid_mapping():
 
     _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
-        dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
     )
 
@@ -829,7 +820,7 @@ def test_fid_sidecar_default_off_returns_none():
     )
 
     _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
-        stage3_batch, dedup_maps=_make_dedup_maps()
+        stage3_batch
     )
 
     assert fid_sidecar is None
@@ -876,7 +867,6 @@ def test_non_call_target_identity_gets_dense_counter_and_unknown_fid():
     _, fid_sidecar, fid_row_offsets, fid_per_category_counts = (
         apply_per_row_remap(
             stage3_batch,
-            dedup_maps=_make_dedup_maps(),
             collect_fid_sidecar=True,
         )
     )
@@ -927,7 +917,6 @@ def test_category_with_zero_call_targets_carries_data_ref_identity():
     _, fid_sidecar, fid_row_offsets, fid_per_category_counts = (
         apply_per_row_remap(
             stage3_batch,
-            dedup_maps=_make_dedup_maps(),
             collect_fid_sidecar=True,
         )
     )
@@ -938,34 +927,6 @@ def test_category_with_zero_call_targets_carries_data_ref_identity():
     assert fid_sidecar.tolist() == [100, 0]
     assert fid_per_category_counts is not None
     assert fid_per_category_counts[0].tolist() == [1, 1, 0]
-
-
-def test_missing_dedup_map_raises():
-    """The caller must supply one dedup_map per FUNCTION Category;
-    omitting one is a wiring bug and surfaces as AssertionError."""
-
-    root = _CallTargetBuild(
-        fid=100,
-        encounter_category=Category.LOCAL_FUNC,
-        in_stream_caller_local_ids=[],
-        in_stream_categories=[],
-        section_call_targets=[],
-        counter_counts={},
-    )
-    stage3_variant, identities, _ = _make_stage3_variant_from_calls(
-        [root], batch_idx=0
-    )
-    stage3_batch = _wrap_variant_into_batch(
-        stage3_variant, identities, batch_size=1
-    )
-
-    incomplete = {
-        Category.LOCAL_FUNC: HashMapU32U16(capacity=8),
-        Category.PLT_FUNC: HashMapU32U16(capacity=8),
-        # EXT_FUNC missing
-    }
-    with pytest.raises(AssertionError, match="EXT_FUNC"):
-        apply_per_row_remap(stage3_batch, dedup_maps=incomplete)
 
 
 def test_padding_row_skipped():
@@ -1045,7 +1006,6 @@ def test_padding_row_skipped():
 
     _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
-        dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
     )
 
@@ -1095,7 +1055,7 @@ def test_counter_offset_skipped_when_zero():
         stage3_variant, identities, batch_size=1
     )
 
-    apply_per_row_remap(stage3_batch, dedup_maps=_make_dedup_maps())
+    apply_per_row_remap(stage3_batch)
 
     # Callee's in-stream BLOCK ids [0, 1] -> offset 5 -> [5, 6].
     assert identities[slices[1].start + 1 : slices[1].stop].tolist() == [5, 6]
@@ -1204,7 +1164,6 @@ def test_resample_multi_mapped_rows_both_get_fid_sidecar():
 
     _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
-        dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
     )
 
@@ -1256,7 +1215,6 @@ def test_resample_multi_mapped_rows_with_padding_and_real_mix():
 
     _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
-        dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
     )
 
@@ -1298,7 +1256,6 @@ def test_redistribute_three_rows_same_variant_get_identical_sidecar():
 
     _, fid_sidecar, fid_row_offsets, _ = apply_per_row_remap(
         stage3_batch,
-        dedup_maps=_make_dedup_maps(),
         collect_fid_sidecar=True,
     )
 
