@@ -117,7 +117,7 @@ def _fused(cols, starts, adj, sec, smp, grp, max_depth):
         need_excluded_pool=True,
         adjacency=adj,
     )
-    return sum(int(i.emitted_nodes.size) for i in incs)
+    return int(incs.emitted_nodes.size)
 
 
 def _time(fn, reps):

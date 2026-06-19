@@ -30,6 +30,7 @@ from tokenizer.aligned_data.loader.tests._corpus import (
     make_simple_variant,
 )
 from tokenizer.aligned_data.loader.vector_batch._inclusion import (
+    RowInclusionView,
     compute_row_inclusions,
 )
 from tokenizer.aligned_data.loader.vector_batch._inclusion._bfs import (
@@ -157,7 +158,7 @@ def test_fused_matches_per_level_reference(tmp_path):
     sampled = np.array([0, 1, 2], dtype=np.int64)
     max_depth = 5
 
-    incs = compute_row_inclusions(
+    incs = RowInclusionView(compute_row_inclusions(
         cols,
         starts,
         root_sections=np.full(3, section_idx, dtype=np.int64),
@@ -166,7 +167,7 @@ def test_fused_matches_per_level_reference(tmp_path):
         max_depth=max_depth,
         need_excluded_pool=True,
         adjacency=adj,
-    )
+    ))
     ref_nodes, ref_types = _reference_emit(
         cols, adj, section_idx, sampled, max_depth
     )
@@ -196,7 +197,7 @@ def test_reversed_intra_level_order_diverges(tmp_path):
     sampled = np.array([0, 1, 2], dtype=np.int64)
     max_depth = 5
 
-    incs = compute_row_inclusions(
+    incs = RowInclusionView(compute_row_inclusions(
         cols,
         starts,
         root_sections=np.full(3, section_idx, dtype=np.int64),
@@ -205,7 +206,7 @@ def test_reversed_intra_level_order_diverges(tmp_path):
         max_depth=max_depth,
         need_excluded_pool=False,
         adjacency=adj,
-    )
+    ))
     rev_nodes, _rev_types = _reference_emit(
         cols, adj, section_idx, sampled, max_depth, reverse=True
     )

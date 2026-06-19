@@ -34,8 +34,6 @@ contract -- TC3 owns the sampler call, this prepass owns the geometry.
 
 from __future__ import annotations
 
-from typing import List
-
 import numpy as np
 
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
@@ -46,7 +44,7 @@ from tokenizer.aligned_data.realized_lengths._geometry_reader import (
     RealizedGeometryReader,
 )
 
-from ._inclusion import RowInclusion, compute_row_inclusions
+from ._inclusion import InclusionCSR, compute_row_inclusions
 from ._layout import compute_token_layout
 from ._prefix import variant_prefix_lengths
 from ._reserve import compute_dense_reservation
@@ -134,7 +132,7 @@ def compute_batch_geometry(
             f"body={body_axis.size} id={id_axis.size} value={value_axis.size}"
         )
 
-    inclusions: List[RowInclusion] = compute_row_inclusions(
+    inclusions: InclusionCSR = compute_row_inclusions(
         cols,
         section_offsets,
         root_sections=root_sections,
@@ -146,7 +144,7 @@ def compute_batch_geometry(
         unmatched_inline=unmatched_inline,
         unmatched_inline_depth=unmatched_inline_depth,
     )
-    n_rows = len(inclusions)
+    n_rows = int(inclusions.emitted_offsets.size - 1)
 
     emission, root_nodes = _flatten_emission(
         inclusions, body_axis, id_axis, value_axis
@@ -178,9 +176,9 @@ def compute_batch_geometry(
             value_total=emission.value_total,
             row_offsets=emission.row_offsets,
         )
-        excluded_pool, excluded_offsets, excluded_edge_type = _flatten_excluded(
-            inclusions
-        )
+        excluded_pool = inclusions.pool_nodes
+        excluded_offsets = inclusions.pool_offsets
+        excluded_edge_type = inclusions.pool_types
     else:
         reservation = _empty_reservation(n_rows)
         excluded_pool = np.zeros(0, dtype=np.int64)
@@ -199,31 +197,29 @@ def compute_batch_geometry(
 
 
 def _flatten_emission(
-    inclusions: List[RowInclusion],
+    inclusions: InclusionCSR,
     body_axis: np.ndarray,
     id_axis: np.ndarray,
     value_axis: np.ndarray,
 ):
-    """Concatenate per-row emitted nodes into the flat CSR emission.
+    """Read the flat emission CSR into the typed ``BatchRowEmission``.
 
-    Returns ``(BatchRowEmission, root_nodes)`` where ``root_nodes`` is
-    the per-row first emitted node (the root carrying the variant
-    prefix). ``own_length = 1 + body_len`` composes the self-token at the
-    flat gather site -- the SAME ``own = body + 1`` convention the
-    length twin (``...compute_node_lengths``) uses.
+    The fused inclusion kernel ALREADY emits the row-major flat CSR (its
+    ``emitted_offsets`` are exactly the per-row ``row_offsets``, and
+    ``emitted_nodes`` / ``emitted_types`` are the flat node / edge value
+    arrays), so this is a pure field read -- no per-row Python object, no
+    re-concatenate, no cumsum. ``own_length = 1 + body_len`` composes the
+    self-token at the flat gather site -- the SAME ``own = body + 1``
+    convention the length twin (``...compute_node_lengths``) uses.
+
+    Returns ``(BatchRowEmission, root_nodes)`` where ``root_nodes`` is the
+    per-row first emitted node (the root carrying the variant prefix) --
+    gathered at each row's CSR start offset (begin_root seeds the root at
+    ``emitted_nodes[emitted_offsets[r]]``, so every row is non-empty).
     """
-    per_row = [inc.emitted_nodes for inc in inclusions]
-    per_row_types = [inc.emitted_edge_types for inc in inclusions]
-    lengths = np.array([e.size for e in per_row], dtype=np.int64)
-    row_offsets = np.zeros(lengths.size + 1, dtype=np.int64)
-    np.cumsum(lengths, out=row_offsets[1:])
-
-    if per_row:
-        node = np.concatenate(per_row).astype(np.int64)
-        edge_type = np.concatenate(per_row_types).astype(np.uint8)
-    else:
-        node = np.zeros(0, dtype=np.int64)
-        edge_type = np.zeros(0, dtype=np.uint8)
+    row_offsets = inclusions.emitted_offsets
+    node = inclusions.emitted_nodes
+    edge_type = inclusions.emitted_types
 
     # The variant-token row PREFIX is a per-row quantity (kept OUT of
     # own_length); own_length is the self-token + the realized body span.
@@ -231,11 +227,9 @@ def _flatten_emission(
     id_total = id_axis[node].astype(np.int64)
     value_total = value_axis[node].astype(np.int64)
 
-    # Each row's first emitted node is the root (always present;
-    # begin_root seeds it as emitted_nodes[0]).
-    root_nodes = np.array(
-        [e[0] for e in per_row] if per_row else [], dtype=np.int64
-    )
+    # Each row's first emitted node is the root (always present; begin_root
+    # seeds it at the row's CSR start offset).
+    root_nodes = node[row_offsets[:-1]]
 
     emission = BatchRowEmission(
         row_offsets=row_offsets,
@@ -263,25 +257,3 @@ def _empty_reservation(n_rows: int) -> DenseReservation:
         value_reserved=zeros_rows.copy(),
         value_offsets=zeros_off.copy(),
     )
-
-
-def _flatten_excluded(inclusions: List[RowInclusion]):
-    """Concatenate per-row remembered-excluded pools into flat CSR.
-
-    Returns ``(pool, offsets, edge_type)`` -- the flat node pool, its CSR
-    offsets, and the PARALLEL per-pool-node edge ct_type (concatenated in
-    the SAME row-major order as ``pool``), so backfill can carry each
-    re-inlined node's true parent-slot edge type.
-    """
-    per_row = [inc.excluded_nodes for inc in inclusions]
-    per_row_types = [inc.excluded_edge_types for inc in inclusions]
-    lengths = np.array([e.size for e in per_row], dtype=np.int64)
-    offsets = np.zeros(lengths.size + 1, dtype=np.int64)
-    np.cumsum(lengths, out=offsets[1:])
-    if per_row:
-        pool = np.concatenate(per_row).astype(np.int64)
-        edge_type = np.concatenate(per_row_types).astype(np.uint8)
-    else:
-        pool = np.zeros(0, dtype=np.int64)
-        edge_type = np.zeros(0, dtype=np.uint8)
-    return pool, offsets, edge_type

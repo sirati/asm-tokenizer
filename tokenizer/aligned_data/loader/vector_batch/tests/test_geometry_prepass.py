@@ -24,6 +24,7 @@ import numpy as np
 
 from tokenizer.aligned_data.loader.vector_batch import compute_batch_geometry
 from tokenizer.aligned_data.loader.vector_batch._inclusion import (
+    RowInclusionView,
     compute_row_inclusions,
 )
 from tokenizer.aligned_data.sorted_index._graph_lengths import (
@@ -93,14 +94,14 @@ def test_inclusion_matches_length_twin():
         c.cols, c.section_offsets, c.body_len, depths=[2]
     )[2]
     own = c.body_len + 1
-    incs = compute_row_inclusions(
+    incs = RowInclusionView(compute_row_inclusions(
         c.cols,
         c.section_offsets,
         root_sections=np.array([0, 0]),
         root_sampled_variants=np.array([0, 1]),
         root_groups=np.array([0, 0]),
         max_depth=2,
-    )
+    ))
     # root_v0 node = 0, root_v1 node = 1.
     assert int(own[incs[0].emitted_nodes].sum()) == int(twin[0])
     assert int(own[incs[1].emitted_nodes].sum()) == int(twin[1])
