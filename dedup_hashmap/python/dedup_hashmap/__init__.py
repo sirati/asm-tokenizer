@@ -31,6 +31,7 @@ from ._native import (
     build_strip_shift_prepend_kernel,
     compute_row_inclusions_kernel,
     segment_distinct_count,
+    variant_shuffle_chunk_kernel,
 )
 from .typed import IntDtype, IntEnumHashMap, PlainBool, PlainInt
 
@@ -56,4 +57,5 @@ __all__ = list(_native.__all__) + [
     "build_strip_shift_prepend_kernel",
     "compute_row_inclusions_kernel",
     "segment_distinct_count",
+    "variant_shuffle_chunk_kernel",
 ]

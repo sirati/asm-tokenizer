@@ -51,6 +51,7 @@ mod row_inclusions;
 mod segment_distinct;
 mod strip_shift_prepend;
 mod token_scatter;
+mod variant_shuffle_chunk;
 
 use adjacency_expand::LiveAdjacencyKernel;
 use once_only_inclusion::OnceOnlyInclusionKernel;
@@ -70,6 +71,7 @@ use row_inclusions::compute_row_inclusions_kernel;
 use segment_distinct::segment_distinct_count;
 use strip_shift_prepend::build_strip_shift_prepend_kernel;
 use token_scatter::build_token_scatter_kernel;
+use variant_shuffle_chunk::variant_shuffle_chunk_kernel;
 
 // -- Generated classes -----------------------------------------------------
 //
@@ -393,6 +395,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // loader BFS under one GIL release, reusing the Stage-1/2 cores in-Rust).
     // See `row_inclusions.rs`.
     m.add_function(wrap_pyfunction!(compute_row_inclusions_kernel, m)?)?;
+
+    // Deterministic validation-sampler core: per in-band section
+    // Fisher-Yates shuffle (one shared, threaded xoshiro256** stream) +
+    // floor(n/B)*B chunk + short-section drop, returning the flat kept
+    // variant indices, per-bunch CSR boundaries, owning section per bunch,
+    // and the advanced RNG state. See `variant_shuffle_chunk.rs`.
+    m.add_function(wrap_pyfunction!(variant_shuffle_chunk_kernel, m)?)?;
 
     Ok(())
 }
