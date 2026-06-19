@@ -30,9 +30,6 @@ from tokenizer.aligned_data.loader.batch_decode._number_decode import (
     _NUMBER_BLOCK_TOKEN_TYPES,
     build_number_idx_2d,
 )
-from tokenizer.aligned_data.loader.batch_decode._number_decode._emit_vc2 import (
-    emit_vc2_rows,
-)
 from tokenizer.aligned_data.loader.batch_decode._types import (
     Stage1Batch,
     Stage1CallTarget,
@@ -948,122 +945,173 @@ def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Direct emit_vc2_rows tests for the per-segment ``+1`` lookahead guard.
+# End-to-end tests for the per-segment ``+1`` lookahead guard (the kernel's
+# VC2 ``L`` recovery).
 #
-# ``runlen_number_flat`` is the per-segment concatenation of each kept
-# call_target's ``state.runlen_number`` -- each segment has length N (only
-# ``digit_cumsum`` is N+1). A VC2 carrier at the LAST raw position of a
-# segment has ``p_carrier + 1 == N_seg``, so the un-guarded ALG-8 gather
-# ``runlen_number_flat[seg_runlen_base[seg] + p_carrier + 1]`` either runs
-# off the end of the flat array (terminal carrier in the LAST segment ->
-# IndexError) or silently misreads the NEIGHBOUR segment's value (terminal
-# carrier in a non-last segment). The guard reads ``L`` only where the
-# lookahead is within the carrier's OWN segment and defaults out-of-range
-# to ``L = 0`` (zero-length value -> ``K_full = max(1, 0) = 1``, the single
-# LSB chunk = all-pad). These tests call ``emit_vc2_rows`` directly with
-# two kept segments to pin both failure modes.
+# ``runlen_number`` is per-call_target length N (only ``digit_cumsum`` is
+# N+1). A VC2 carrier at the LAST raw position of a call_target has
+# ``p_carrier + 1 == N_seg``, so the un-guarded ALG-8 gather would run off
+# the end of the per-segment ``runlen_number`` (terminal carrier in the
+# LAST kept call_target -> OOB) or silently misread the NEIGHBOUR
+# call_target's value (terminal in a non-last call_target). The kernel
+# reads ``L`` only where the lookahead is within the carrier's OWN segment
+# and defaults out-of-range to ``L = 0`` (zero-length value -> ``K_full =
+# max(1, 0) = 1``, a single all-pad LSB chunk). These tests build a real
+# two-call_target batch whose first AND last call_target each END with a
+# terminal VC2 carrier, exercising both failure modes through the public
+# :func:`build_number_idx_2d`.
 # ---------------------------------------------------------------------------
 
 
-def _two_segment_terminal_vc2_inputs() -> dict:
-    """Two kept segments (N=3 each), each with one VC2 carrier at its
-    LAST raw position (``p_carrier == N_seg - 1``).
+def _terminal_vc2_call_target() -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    """A call_target ending with a terminal VC2 carrier.
 
-    * ``runlen_number_flat`` = ``[5, 0, 0,  5, 0, 0]`` (seg0 || seg1).
-      The leading ``5`` of EACH segment is the value the un-guarded
-      gather would wrongly read: seg0's terminal carrier would read
-      ``flat[0 + 2 + 1] = flat[3] = 5`` (seg1's first entry -- the
-      cross-segment misread); seg1's terminal carrier would read
-      ``flat[3 + 2 + 1] = flat[6]`` -- one past the end (IndexError).
-    * No painted continuation slots and ``surviving == N`` per segment,
-      so ``K_full - 1 == 0`` and each carrier emits exactly one chunk.
+    Stream: a leading F32 source (so the call_target carries inline bytes
+    + a non-VC2 carrier) followed by a VC2 carrier as the FINAL raw token
+    (no trailing inline-digit byte). The VC2 carrier's ``runlen_number
+    [carrier + 1]`` lookahead is OUT of its own segment -> L = 0 -> a
+    single all-pad chunk; the neighbour call_target's runlen must NOT leak
+    in.
     """
-    return dict(
-        # carrier raw position within its segment (last = N-1 = 2).
-        p_carriers=np.array([2, 2], dtype=np.int64),
-        # byte offset into inline_bytes (arbitrary; only the pad path runs
-        # for a zero-length value, so the exact offset is immaterial).
-        p_carrier_bytes=np.array([1, 1], dtype=np.int64),
-        # expanded position == surviving-1 so the lookahead is out of the
-        # surviving prefix and the trailing-run contributes nothing.
-        expanded_positions=np.array([2, 2], dtype=np.int64),
-        carrier_seg=np.array([0, 1], dtype=np.int64),
-        seg_painted_offsets=np.array([0, 3, 6], dtype=np.int64),
-        seg_painted_vc2_flat=np.zeros(6, dtype=np.int64),
-        seg_surviving=np.array([3, 3], dtype=np.int64),
-        seg_runlen_base=np.array([0, 3], dtype=np.int64),
-        runlen_number_flat=np.array([5, 0, 0, 5, 0, 0], dtype=np.int64),
+    raw_tokens = np.array(
+        [_F32_RAW, 0xA0, 0xA1, 0xA2, 0xA3, _VC2_RAW], dtype=np.uint16
     )
-
-
-def test_emit_vc2_terminal_carrier_last_segment_no_oob() -> None:
-    """A VC2 carrier terminal in the LAST kept segment used to gather one
-    past the end of ``runlen_number_flat`` (IndexError). With the guard it
-    decodes to the zero-payload result: K_visible == 1, an all-pad row.
-
-    Pre-fix this raised ``IndexError: index 6 out of bounds for axis 0
-    with size 6`` (confirmed by temporarily reverting the guard).
-    """
-    rows, rows_per_carrier, chunk_indices = emit_vc2_rows(
-        **_two_segment_terminal_vc2_inputs()
+    expanded = np.array(
+        [_LOCAL_FUNC_SHIFTED, _F32_SHIFTED, _VC2_SHIFTED], dtype=np.uint16
     )
-
-    # Carrier 1 (last segment) -> single all-pad chunk.
-    assert rows_per_carrier[1] == 1
-    # rows_per_carrier sums: carrier0 also emits 1 -> rows for carrier1 is
-    # the second row.
-    np.testing.assert_array_equal(rows[1], np.zeros(8, dtype=np.uint32))
-    # LSB chunk index for the single-chunk carrier.
-    assert chunk_indices[int(rows_per_carrier[0])] == 0
+    extra_vc2 = np.array([False, False, False], dtype=bool)
+    extra_f128 = np.array([False, False, False], dtype=bool)
+    return raw_tokens, expanded, extra_vc2, extra_f128
 
 
-def test_emit_vc2_terminal_carrier_non_last_segment_no_neighbor_misread() -> None:
-    """A VC2 carrier terminal in a NON-last segment used to read the
-    NEIGHBOUR segment's first ``runlen_number`` value (here ``5``). With
-    the guard it reads ``L = 0`` (its OWN out-of-range lookahead), emitting
-    the zero-payload all-pad row -- NOT a 5-byte (``L=5``) value row.
-    """
-    rows, rows_per_carrier, _ = emit_vc2_rows(
-        **_two_segment_terminal_vc2_inputs()
+def _build_two_call_target_batch(
+    cts: list[Stage2CallTarget], slices: list[slice]
+) -> Stage2Batch:
+    """Stitch a list of Stage2CallTargets into one variant/section/batch."""
+    stage1_variant = Stage1Variant(
+        variant_idx=0,
+        variant_ref_offset=0,
+        batch_idx=0,
+        call_targets=[c.stage1 for c in cts],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
     )
-
-    # Carrier 0 (non-last segment) -> single chunk (L=0 -> K_full=1).
-    assert rows_per_carrier[0] == 1
-    # All-pad row -- if the neighbour's L=5 had leaked through, the row
-    # would reference real byte offsets (>= p_carrier_bytes), not zeros.
-    np.testing.assert_array_equal(rows[0], np.zeros(8, dtype=np.uint32))
-
-
-def test_emit_vc2_in_bounds_carrier_byte_identical_to_unguarded() -> None:
-    """The guard is byte-identical for an in-bounds (non-terminal) carrier:
-    a VC2 carrier with a real ``L`` lookahead within its own segment still
-    reads that ``L`` and emits the same chunk rows as before the guard.
-
-    Single segment, carrier at raw position 0, ``runlen_number[1] = 8``
-    (L=8 -> one 8-byte chunk, no pad). Mirrors ``test_vc2_L8`` but exercised
-    directly through ``emit_vc2_rows``.
-    """
-    p_byte = 1
-    rows, rows_per_carrier, chunk_indices = emit_vc2_rows(
-        p_carriers=np.array([0], dtype=np.int64),
-        p_carrier_bytes=np.array([p_byte], dtype=np.int64),
-        expanded_positions=np.array([0], dtype=np.int64),
-        carrier_seg=np.array([0], dtype=np.int64),
-        seg_painted_offsets=np.array([0, 2], dtype=np.int64),
-        seg_painted_vc2_flat=np.zeros(2, dtype=np.int64),
-        seg_surviving=np.array([2], dtype=np.int64),
-        seg_runlen_base=np.array([0], dtype=np.int64),
-        # N=2: runlen_number[1] = 8 -> L=8 (in-bounds lookahead).
-        runlen_number_flat=np.array([0, 8], dtype=np.int64),
+    stage1_section = Stage1Section(
+        arm=SectionKind.MATCHED,
+        idx=0,
+        section=_empty_section(),
+        variants=[stage1_variant],
     )
-
-    assert rows_per_carrier[0] == 1
-    np.testing.assert_array_equal(
-        rows,
-        np.array(
-            [[p_byte + i for i in range(8)]], dtype=np.uint32
+    stage1_batch = Stage1Batch(
+        sections=[stage1_section],
+        batch_idx_to_section_variant=np.array([[0, 0]], dtype=np.uint32),
+        batch_size=1,
+    )
+    stage2_variant = Stage2Variant(
+        stage1=stage1_variant,
+        call_targets=cts,
+        cut_call_target_index=len(cts),
+        total_surviving_token_count=sum(
+            c.surviving_token_count for c in cts
         ),
+        total_surviving_identity_count=0,
+        total_surviving_number_chunk_count=0,
+    )
+    stage2_section = Stage2Section(
+        stage1=stage1_section, variants=[stage2_variant]
+    )
+    return Stage2Batch(
+        stage1=stage1_batch,
+        sections=[stage2_section],
+        identity_row_offsets=np.zeros(2, dtype=np.uint32),
+        number_row_offsets=np.zeros(2, dtype=np.uint32),
+    )
+
+
+def test_terminal_vc2_carrier_no_oob_or_neighbor_misread() -> None:
+    """Two call_targets, each ENDING with a terminal VC2 carrier.
+
+    CT0 (non-last): its terminal VC2 carrier's ``+1`` lookahead would
+    otherwise read CT1's first ``runlen_number`` value -- the kernel reads
+    L = 0 instead, emitting an all-pad chunk. CT1 (last): the lookahead
+    would otherwise run off the end of CT1's runlen -- the kernel again
+    reads L = 0. Both VC2 carriers -> one all-pad row each.
+    """
+    raw0, exp0, vc20, f1280 = _terminal_vc2_call_target()
+    raw1, exp1, vc21, f1281 = _terminal_vc2_call_target()
+    ct0 = _make_call_target(raw0, exp0, vc20, f1280)
+    ct1 = _make_call_target(raw1, exp1, vc21, f1281)
+
+    payload0 = raw0[raw0 < 256].astype(np.uint8)
+    payload1 = raw1[raw1 < 256].astype(np.uint8)
+    inline_bytes = np.zeros(
+        1 + payload0.shape[0] + payload1.shape[0], dtype=np.uint8
+    )
+    inline_bytes[1 : 1 + payload0.shape[0]] = payload0
+    inline_bytes[1 + payload0.shape[0] :] = payload1
+    ct0_slice = slice(1, 1 + payload0.shape[0])
+    ct1_slice = slice(
+        1 + payload0.shape[0],
+        1 + payload0.shape[0] + payload1.shape[0],
+    )
+    stage2_batch = _build_two_call_target_batch(
+        [ct0, ct1], [ct0_slice, ct1_slice]
+    )
+
+    (
+        idx_2d_per_type,
+        chunk_slices_per_type,
+        _f128,
+        vc2_sidecar,
+    ) = build_number_idx_2d(
+        stage2_batch, inline_bytes, [ct0_slice, ct1_slice]
+    )
+
+    vc2_rows = idx_2d_per_type[TokenType.VALUED_CONST_V2]
+    # Two terminal VC2 carriers -> two all-pad rows (L=0 each). If a
+    # neighbour's L had leaked in, a row would reference real byte offsets
+    # (>= the call_target's slice start), not zeros.
+    np.testing.assert_array_equal(vc2_rows, np.zeros((2, 8), dtype=np.uint32))
+    np.testing.assert_array_equal(
+        vc2_sidecar, np.array([0, 0], dtype=np.uint32)
+    )
+    # One VC2 chunk per call_target.
+    assert chunk_slices_per_type[TokenType.VALUED_CONST_V2] == [
+        slice(0, 1),
+        slice(1, 2),
+    ]
+
+
+def test_in_bounds_vc2_carrier_reads_real_length() -> None:
+    """A non-terminal VC2 carrier (a real ``L`` lookahead within its own
+    call_target) still reads that ``L`` and emits the value chunk -- the
+    guard is byte-identical for the in-bounds case.
+
+    Single VC2 L=8 source: carrier at raw 0, ``runlen_number[1] = 8`` ->
+    one 8-byte chunk, no pad (mirrors ``test_vc2_L8`` end-to-end).
+    """
+    L = 8
+    raw_tokens = _vc2_raw_tokens(L)
+    expanded = np.array([_LOCAL_FUNC_SHIFTED, _VC2_SHIFTED], dtype=np.uint16)
+    extra_vc2 = np.array([False, False], dtype=bool)
+    extra_f128 = np.array([False, False], dtype=bool)
+    stage2_ct = _make_call_target(raw_tokens, expanded, extra_vc2, extra_f128)
+    stage2_batch = _wrap_single_call_target(stage2_ct)
+    inline_bytes, ct_slice = _build_inline_bytes_from_raw(raw_tokens)
+    p = ct_slice.start
+
+    (
+        idx_2d_per_type,
+        _slices,
+        _f128,
+        vc2_sidecar,
+    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+
+    np.testing.assert_array_equal(
+        idx_2d_per_type[TokenType.VALUED_CONST_V2],
+        np.array([[p + i for i in range(8)]], dtype=np.uint32),
     )
     np.testing.assert_array_equal(
-        chunk_indices, np.array([0], dtype=np.int64)
+        vc2_sidecar, np.array([0], dtype=np.uint32)
     )
