@@ -131,8 +131,12 @@ def _is_elf_binary(path: Path) -> bool:
     so shared objects (``libz.so.1.3.2``) and differently-named tools
     (``sqlite3``) qualify uniformly while a README / packing manifest
     does not. ``*.debug`` files are ELF but carry only split debug
-    symbols, not a real binary — excluded by name."""
-    if path.name.endswith(_DEBUG_SUFFIX):
+    symbols, not a real binary — excluded by name. Hidden files (leading
+    dot) are likewise excluded by name: a real binary never starts with a
+    dot, and an atomic-publish leftover such as
+    ``.<name>.publish-tmp.<host>.<pid>.<nanos>`` is a full ELF *copy* of
+    the binary that must NOT be enumerated as a second binary."""
+    if path.name.startswith(".") or path.name.endswith(_DEBUG_SUFFIX):
         return False
     try:
         with path.open("rb") as fh:

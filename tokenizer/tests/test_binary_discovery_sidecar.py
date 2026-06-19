@@ -88,6 +88,24 @@ def test_multi_binary_folder_yields_all_elf_excludes_debug_and_nonelf(
         assert handle.variant_dir == folder
 
 
+def test_publish_tmp_and_hidden_dotfiles_excluded(tmp_path: Path) -> None:
+    # gen-binary-dataset's atomic-publish leaks ``.<name>.publish-tmp.
+    # <host>.<pid>.<nanos>`` files — full ELF *copies* of the real binary.
+    # They are ELF, so without the leading-dot exclusion they'd be
+    # enumerated as spurious extra binaries (and tokenized).
+    folder = _sidecar_folder(tmp_path, "bzip2", pkg="bzip2")
+    (folder / "bzip2").write_bytes(_ELF)
+    (folder / "libbz2.so.1.0.8").write_bytes(_ELF)
+    (
+        folder
+        / ".bzip2.publish-tmp.krater03_cip_ifi_lmu_de.338026.1781179676194698924"
+    ).write_bytes(_ELF)
+    (folder / ".hidden").write_bytes(_ELF)
+
+    pairs = list(walk_dataset(tmp_path))
+    assert _names(pairs) == ["bzip2", "libbz2.so.1.0.8"]
+
+
 def test_library_only_folder_yields_single_so(tmp_path: Path) -> None:
     folder = _sidecar_folder(tmp_path, "zlib", pkg="zlib")
     (folder / "libz.so.1.3.2").write_bytes(_ELF)
