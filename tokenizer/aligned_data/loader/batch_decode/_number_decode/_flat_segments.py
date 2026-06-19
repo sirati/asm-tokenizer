@@ -27,6 +27,8 @@ from typing import List
 
 import numpy as np
 
+from dedup_hashmap import build_flat_segments_kernel
+
 from .._dense_columns import DenseColumns
 
 
@@ -117,105 +119,67 @@ def build_flat_segments(
     """
     n_total_cts = len(inline_byte_slices)
     ct_index = np.asarray(dense.kept_node_index, dtype=np.int64)
-    n_kept = int(ct_index.shape[0])
 
-    expanded_body_chunks: List[np.ndarray] = []
-    painted_body_chunks: List[np.ndarray] = []
-    painted_vc2_prefix_chunks: List[np.ndarray] = []
-    real_pos_chunks: List[np.ndarray] = []
-    digit_chunks: List[np.ndarray] = []
-    runlen_chunks: List[np.ndarray] = []
-    f128_full_chunks: List[np.ndarray] = []
-    body_seg_len = np.empty(n_kept, dtype=np.int64)
-    painted_prefix_seg_len = np.empty(n_kept, dtype=np.int64)
-    real_seg_base = np.empty(n_kept, dtype=np.int64)
-    digit_base = np.empty(n_kept, dtype=np.int64)
-    seg_runlen_base = np.empty(n_kept, dtype=np.int64)
-    seg_f128_base = np.empty(n_kept, dtype=np.int64)
-    seg_surviving = np.empty(n_kept, dtype=np.int64)
-    seg_slice_start = np.empty(n_kept, dtype=np.int64)
+    # Per-FULL-DFS-node ``inline_byte_slices.start`` column the kernel reads
+    # as ``seg_slice_start[i] = slice_start_per_node[kept_node_index[i]]``.
+    slice_start_per_node = np.fromiter(
+        (s.start for s in inline_byte_slices),
+        dtype=np.int64,
+        count=n_total_cts,
+    )
 
-    real_running = 0
-    digit_running = 0
-    runlen_running = 0
-    f128_running = 0
-    for i, e in enumerate(ct_index.tolist()):
-        raw_slice = dense.node_raw_slice(e)
-        expanded_slice = dense.node_expanded_slice(e)
-        surviving = int(dense.surviving_token_count[e])
-        seg_surviving[i] = surviving
-        seg_slice_start[i] = int(inline_byte_slices[e].start)
-        body = max(surviving - 1, 0)
-        body_seg_len[i] = body
-        expanded_ids = dense.expanded[expanded_slice]
-        extra_value_v2_mask = dense.extra_value_v2_mask[expanded_slice]
-        extra_f128_mask = dense.extra_f128_mask[expanded_slice]
-        # Body axis: ``expanded[1:surviving]`` + the two extra masks over
-        # the same body positions (slot j == ``expanded[j + 1]``).
-        expanded_body_chunks.append(
-            expanded_ids[1:surviving].astype(np.int64, copy=False)
-        )
-        painted_body_chunks.append(
-            extra_value_v2_mask[1:surviving]
-            | extra_f128_mask[1:surviving]
-        )
-        # Surviving-prefix VC2 painted mask (axis ``[:surviving]``); the
-        # VC2 emitter's trailing-run lookahead indexes carrier expanded
-        # positions directly into this prefix.
-        painted_vc2_prefix_chunks.append(
-            extra_value_v2_mask[:surviving].astype(np.int64, copy=False)
-        )
-        painted_prefix_seg_len[i] = surviving
-        real_positions = np.nonzero(dense.real_mask[raw_slice])[0]
-        real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
-        real_seg_base[i] = real_running
-        real_running += int(real_positions.shape[0])
-        dc = dense.digit_cumsum[dense.node_digit_slice(e)].astype(
-            np.int64, copy=False
-        )
-        digit_chunks.append(dc)
-        digit_base[i] = digit_running
-        digit_running += int(dc.shape[0])
-        rl = dense.runlen_number[raw_slice].astype(np.int64, copy=False)
-        runlen_chunks.append(rl)
-        seg_runlen_base[i] = runlen_running
-        runlen_running += int(rl.shape[0])
-        # FULL ``extra_f128_mask`` (not surviving-clipped): the F128 finite
-        # signal reads ``extra_f128_mask[expanded_pos + 1]`` against the
-        # full mask per ALG-2 (a mid-cut finite source still reports
-        # finite even when its painted MSB slot is past the cut).
-        ef = extra_f128_mask
-        f128_full_chunks.append(ef)
-        seg_f128_base[i] = f128_running
-        f128_running += int(ef.shape[0])
-
-    seg_painted_offsets = np.zeros(n_kept + 1, dtype=np.int64)
-    if n_kept > 0:
-        np.cumsum(painted_prefix_seg_len, out=seg_painted_offsets[1:])
-
-    def _concat(chunks: List[np.ndarray], dtype) -> np.ndarray:
-        return (
-            np.concatenate(chunks)
-            if chunks
-            else np.empty(0, dtype=dtype)
-        )
+    # GIL-released Rust kernel: the per-kept-node ``DenseColumns`` slice +
+    # concat (body axis / real-position / digit_cumsum / runlen / painted
+    # prefix / FULL f128) in one ``py.detach`` pass. The uint16 / uint32
+    # source columns are widened to int64 up front (the numpy twin
+    # ``.astype(np.int64)``-ed them per chunk); the masks stay bool.
+    (
+        expanded_body,
+        painted_body,
+        body_seg_len,
+        real_pos_flat,
+        real_seg_base,
+        digit_flat,
+        digit_base,
+        seg_slice_start,
+        seg_painted_vc2_flat,
+        seg_painted_offsets,
+        seg_surviving,
+        seg_runlen_base,
+        runlen_number_flat,
+        seg_f128_base,
+        f128_full_mask_flat,
+    ) = build_flat_segments_kernel(
+        np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
+        np.ascontiguousarray(dense.expanded, dtype=np.int64),
+        np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.int64),
+        np.ascontiguousarray(dense.digit_cumsum, dtype=np.int64),
+        np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.digit_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.node_offsets, dtype=np.int64),
+        ct_index,
+        slice_start_per_node,
+    )
 
     return FlatSegments(
-        expanded_body=_concat(expanded_body_chunks, np.int64),
-        painted_body=_concat(painted_body_chunks, np.bool_),
+        expanded_body=expanded_body,
+        painted_body=painted_body,
         body_seg_len=body_seg_len,
-        real_pos_flat=_concat(real_pos_chunks, np.int64),
+        real_pos_flat=real_pos_flat,
         real_seg_base=real_seg_base,
-        digit_flat=_concat(digit_chunks, np.int64),
+        digit_flat=digit_flat,
         digit_base=digit_base,
         seg_slice_start=seg_slice_start,
-        seg_painted_vc2_flat=_concat(painted_vc2_prefix_chunks, np.int64),
+        seg_painted_vc2_flat=seg_painted_vc2_flat,
         seg_painted_offsets=seg_painted_offsets,
         seg_surviving=seg_surviving,
         seg_runlen_base=seg_runlen_base,
-        runlen_number_flat=_concat(runlen_chunks, np.int64),
+        runlen_number_flat=runlen_number_flat,
         seg_f128_base=seg_f128_base,
-        f128_full_mask_flat=_concat(f128_full_chunks, np.bool_),
+        f128_full_mask_flat=f128_full_mask_flat,
         ct_index=ct_index,
         n_total_cts=n_total_cts,
     )

@@ -35,6 +35,7 @@
 //! the sentinel value is itself a legitimate entry value.
 
 mod carrier_signs;
+mod flat_segments;
 mod hashmap_macro;
 mod identity_gather;
 mod inline_bytes;
@@ -43,6 +44,7 @@ mod remap_walk;
 mod segment_distinct;
 
 use carrier_signs::build_carrier_signs_kernel;
+use flat_segments::build_flat_segments_kernel;
 use hashmap_macro::define_hashmap;
 use identity_gather::build_identity_carriers_kernel;
 use inline_bytes::build_inline_bytes_kernel;
@@ -319,6 +321,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Stage-3a surviving inline-byte gather kernel (ALG-1). See
     // `inline_bytes.rs`.
     m.add_function(wrap_pyfunction!(build_inline_bytes_kernel, m)?)?;
+
+    // Stage-3c NUMBER-band flat-segment column build (the per-kept-node
+    // DenseColumns slice + concat feeding the number idx_2d kernel). See
+    // `flat_segments.rs`.
+    m.add_function(wrap_pyfunction!(build_flat_segments_kernel, m)?)?;
 
     Ok(())
 }
