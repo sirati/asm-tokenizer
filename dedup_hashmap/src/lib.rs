@@ -45,6 +45,7 @@ mod inline_state_fields;
 mod node_ct_csr;
 mod number_idx_2d;
 mod once_only_inclusion;
+mod promote_batched;
 mod remap_walk;
 mod row_inclusions;
 mod segment_distinct;
@@ -62,6 +63,7 @@ use inline_bytes::build_inline_bytes_kernel;
 use inline_state_fields::build_inline_state_fields_kernel;
 use node_ct_csr::build_node_ct_csr_kernel;
 use number_idx_2d::build_number_idx_2d_kernel;
+use promote_batched::build_promote_batched_kernel;
 use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
 use row_inclusions::compute_row_inclusions_kernel;
@@ -347,6 +349,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // object-tree-free `_build_ct_columns` replacement: columnar ct_*
     // slices + section_of_node -> per-node CT CSR). See `node_ct_csr.rs`.
     m.add_function(wrap_pyfunction!(build_node_ct_csr_kernel, m)?)?;
+
+    // Batched VC2 / F128 continuation-slot paint over the raw working stream
+    // (the GIL-released `_promote_batched` twin: per-carrier ceil-div chunk
+    // count + node-local bounds guards + segment paint, F128 NaN/Inf finite
+    // filter). See `promote_batched.rs`.
+    m.add_function(wrap_pyfunction!(build_promote_batched_kernel, m)?)?;
 
     // Batched strip + shift + prepend over the painted raw working stream
     // (the GIL-released `_strip_shift_prepend` twin: drop the <=256 band,

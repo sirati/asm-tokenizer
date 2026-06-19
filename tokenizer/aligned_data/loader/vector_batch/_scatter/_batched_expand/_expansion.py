@@ -16,11 +16,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._constants import (
-    _FLOAT128_VOCAB_ID,
     _V2_EAGER_BLOCK_END,
     _V2_RESERVED_DIGIT_COUNT,
     _V2_VALUE_NEGATIVE_TOKEN_ID,
-    _VC2_VOCAB_ID,
 )
 from ._rewrite import _promote_batched, _strip_shift_prepend
 from ._state_fields import build_inline_state_fields
@@ -118,17 +116,13 @@ def batched_expand(
     number_mask = raw < _V2_RESERVED_DIGIT_COUNT
     carries_inline_mask = real_mask & (raw < _V2_EAGER_BLOCK_END)
 
-    # --- promotion (paint into a working copy of raw) --------------------
-    # The promotion paint is the ONLY mutation of the raw stream, and it
-    # only fires when a VC2 / F128 carrier token is present. With no carrier
-    # the working stream is never written, so the defensive copy is dead --
-    # alias ``raw`` directly (the downstream strip/shift only READS it).
-    has_carrier = bool(
-        (real_mask & ((raw == _VC2_VOCAB_ID) | (raw == _FLOAT128_VOCAB_ID))).any()
-    )
-    working = raw.copy() if has_carrier else raw
-    extra_vc2_raw, extra_f128_raw = _promote_batched(
-        working, real_mask, runlen_number, node_of, rec_starts, counts
+    # --- promotion (paint into a fresh working stream) -------------------
+    # The promotion kernel returns a FRESH painted copy of ``raw`` (it never
+    # mutates its input), so the orchestrator no carrier-detection / defensive
+    # copy is needed -- hand ``raw`` straight in and pass the painted result
+    # to the downstream strip/shift.
+    working, extra_vc2_raw, extra_f128_raw = _promote_batched(
+        raw, real_mask, runlen_number, node_of, rec_starts, counts
     )
 
     # --- strip + shift + prepend self-token ------------------------------

@@ -14,7 +14,10 @@ orchestration from :mod:`._expansion`.
 from __future__ import annotations
 
 import numpy as np
-from dedup_hashmap import build_strip_shift_prepend_kernel
+from dedup_hashmap import (
+    build_promote_batched_kernel,
+    build_strip_shift_prepend_kernel,
+)
 
 from ._constants import (
     _FLOAT128_VOCAB_ID,
@@ -36,77 +39,34 @@ def _promote_batched(
 ):
     """Paint VC2 + F128 continuation slots over the flat working stream.
 
-    Returns ``(extra_vc2_raw, extra_f128_raw)`` boolean masks over the
-    raw-stream index space, True at painted continuation slots. Mirrors
+    Returns ``(working_painted, extra_vc2_raw, extra_f128_raw)``: a FRESH
+    painted copy of ``working`` (the input is not mutated) plus the two
+    boolean masks over the raw-stream index space, True at painted
+    continuation slots. Mirrors
     :func:`...batch_decode._expand_tokens._promote_vc2` / ``_promote_f128``
-    per node, batched: per-source chunk counts + flat painted indices,
-    with the SAME malformed-stream tail guards (now node-local). Painted
-    indices never cross a node boundary -- the bounds check uses the
-    per-node tail.
+    per node, batched, with the SAME malformed-stream tail guards (now
+    node-local). Painted indices never cross a node boundary -- the bounds
+    check uses the per-node tail.
+
+    The per-carrier ceil-div chunk count + node-local bounds guards +
+    segment paint and the F128 NaN/Inf finite filter are performed by the
+    GIL-released :func:`build_promote_batched_kernel`; the malformed-stream
+    guards surface as :class:`AssertionError` (the same contract the scalar
+    twin raises).
     """
-    total = working.shape[0]
-    extra_vc2_raw = np.zeros(total, dtype=bool)
-    extra_f128_raw = np.zeros(total, dtype=bool)
-    if total == 0:
-        return extra_vc2_raw, extra_f128_raw
-
-    # --- VC2 promotion ---------------------------------------------------
-    vc2_pos = np.nonzero(real_mask & (working == _VC2_VOCAB_ID))[0]
-    if vc2_pos.size:
-        node = node_of[vc2_pos]
-        local = vc2_pos - rec_starts[node]
-        if bool((local >= counts[node] - 1).any()):
-            raise AssertionError(
-                "VC2 carrier at the last raw-stream position -- malformed "
-                "v2 stream (carrier needs a p+1 slot for the payload "
-                "inline-digit run)."
-            )
-        payload_len = runlen_number[vc2_pos + 1].astype(np.int64)
-        chunk_counts = np.maximum(np.int64(1), (payload_len + 7) // 8)
-        node_tail = rec_starts[node] + counts[node]
-        ends = vc2_pos.astype(np.int64) + chunk_counts
-        if bool((ends > node_tail).any()):
-            bad = int(np.nonzero(ends > node_tail)[0][0])
-            p = int(vc2_pos[bad])
-            raise AssertionError(
-                f"VC2 carrier at position {p} declares "
-                f"{int(chunk_counts[bad])} chunks but only "
-                f"{int(node_tail[bad]) - p} raw-stream slots remain -- "
-                "malformed v2 stream."
-            )
-        paint_lens = chunk_counts - np.int64(1)  # >= 0
-        total_paint = int(paint_lens.sum())
-        if total_paint > 0:
-            base = np.repeat(vc2_pos.astype(np.int64) + 1, paint_lens)
-            cum = np.cumsum(paint_lens)
-            within = np.arange(total_paint, dtype=np.int64) - np.repeat(
-                cum - paint_lens, paint_lens
-            )
-            flat = base + within
-            working[flat] = _VC2_VOCAB_ID
-            extra_vc2_raw[flat] = True
-
-    # --- F128 promotion --------------------------------------------------
-    f128_pos = np.nonzero(real_mask & (working == _FLOAT128_VOCAB_ID))[0]
-    if f128_pos.size:
-        node = node_of[f128_pos]
-        local = f128_pos - rec_starts[node]
-        if bool((local >= counts[node] - 2).any()):
-            raise AssertionError(
-                "F128 carrier within 2 positions of the raw-stream tail -- "
-                "malformed v2 stream (ALG-2 needs the high u16 of the "
-                "binary128 payload at p+1, p+2)."
-            )
-        high = working[f128_pos + 1].astype(np.uint16) << np.uint16(8)
-        low = working[f128_pos + 2].astype(np.uint16)
-        is_nan_or_inf = ((high | low) & np.uint16(0x7FFF)) == np.uint16(0x7FFF)
-        finite = f128_pos[~is_nan_or_inf]
-        if finite.size:
-            targets = finite + 1
-            working[targets] = _FLOAT128_VOCAB_ID
-            extra_f128_raw[targets] = True
-
-    return extra_vc2_raw, extra_f128_raw
+    working_painted, extra_vc2_raw, extra_f128_raw = (
+        build_promote_batched_kernel(
+            np.ascontiguousarray(working, dtype=np.uint16),
+            np.ascontiguousarray(real_mask, dtype=bool),
+            np.ascontiguousarray(runlen_number, dtype=np.uint16),
+            np.ascontiguousarray(node_of, dtype=np.int64),
+            np.ascontiguousarray(rec_starts, dtype=np.int64),
+            np.ascontiguousarray(counts, dtype=np.int64),
+            int(_VC2_VOCAB_ID),
+            int(_FLOAT128_VOCAB_ID),
+        )
+    )
+    return working_painted, extra_vc2_raw, extra_f128_raw
 
 
 def _strip_shift_prepend(
