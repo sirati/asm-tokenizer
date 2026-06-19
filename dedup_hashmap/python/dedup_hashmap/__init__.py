@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from . import _native as _native
 from ._native import *  # noqa: F401,F403 — re-export every generated class
-from ._native import segment_distinct_count
+from ._native import apply_remap_walk, segment_distinct_count
 from .typed import IntDtype, IntEnumHashMap, PlainBool, PlainInt
 
 
@@ -31,5 +31,6 @@ __all__ = list(_native.__all__) + [
     "IntEnumHashMap",
     "PlainBool",
     "PlainInt",
+    "apply_remap_walk",
     "segment_distinct_count",
 ]

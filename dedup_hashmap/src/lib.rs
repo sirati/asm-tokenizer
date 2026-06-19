@@ -35,10 +35,12 @@
 //! the sentinel value is itself a legitimate entry value.
 
 mod hashmap_macro;
+mod remap_walk;
 mod segment_distinct;
 
 use hashmap_macro::define_hashmap;
 use pyo3::prelude::*;
+use remap_walk::apply_remap_walk;
 use segment_distinct::segment_distinct_count;
 
 // -- Generated classes -----------------------------------------------------
@@ -289,6 +291,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Per-segment distinct-value count kernel (CSR-grouped np.unique
     // replacement). See `segment_distinct.rs`.
     m.add_function(wrap_pyfunction!(segment_distinct_count, m)?)?;
+
+    // Per-row identity FID/counter remap walk kernel (ALG-3/4/9). See
+    // `remap_walk.rs`.
+    m.add_function(wrap_pyfunction!(apply_remap_walk, m)?)?;
 
     Ok(())
 }
