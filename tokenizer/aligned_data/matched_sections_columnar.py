@@ -181,6 +181,19 @@ class ColumnarSections:
         """
         return None
 
+    def all_sections_resident(self) -> bool:
+        """Whether EVERY section's heavy columns are already materialised.
+
+        ``True`` for the eager catalog (it parses the whole blob at open).
+        The lazy twin overrides this to report whether its on-demand fill
+        has covered every section yet. Consumers that must read arbitrary
+        sections with the GIL released (the fused inclusion-BFS kernel) use
+        this to skip a closure pre-fill walk when nothing is left to fill --
+        a no-op short-circuit on the eager catalog and on a fully-warmed
+        lazy one.
+        """
+        return True
+
 
 def _u16(b: np.ndarray, idx: np.ndarray) -> np.ndarray:
     """Gather little-endian u16 values at byte indices ``idx``.

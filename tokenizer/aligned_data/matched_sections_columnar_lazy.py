@@ -309,6 +309,17 @@ class LazyColumnarSections:
         self._filled[secs] = True
         self._tally_missing(sub)
 
+    def all_sections_resident(self) -> bool:
+        """Whether the on-demand fill has covered every section yet.
+
+        ``True`` once every section's heavy columns are materialised (the
+        whole ``_filled`` mask is set), so a consumer that pre-fills a
+        reachability closure before a GIL-released read can skip the walk
+        entirely on a fully-warmed catalog -- the common steady state after
+        a binary's touched closure is resident.
+        """
+        return bool(self._filled.all())
+
     def _tally_missing(self, sub: ColumnarSections) -> None:
         """Accumulate + log the MISSING-edge count for the just-filled set.
 
