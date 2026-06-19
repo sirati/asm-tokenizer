@@ -254,3 +254,88 @@ def test_unmatched_metadata_preserves_legacy_section_wide_fields():
         [0, 0x1000, 3, 1],
     ]
     assert fd.metadata["called"] == ["callee"]
+
+
+def test_unmatched_section_wide_lists_shared_across_slots():
+    """The section-wide ``variant_refs`` / ``variants`` / ``called`` /
+    ``call_targets`` lists are the SAME object across every slot's
+    metadata — the build-once-then-per-slot flow
+    (``_load_unmatched_variant_bodies``) shares one
+    :class:`UnmatchedSectionData`'s lists into each slot, NOT a per-slot
+    rebuild. This pins the sharing as intentional + read-only: a future
+    per-slot rebuild (loses ``is`` identity) or an in-place mutation of a
+    shared list (corrupts sibling slots) is caught here.
+
+    Mirrors ``_unmatched_load.py::_load_unmatched_variant_bodies``: build
+    the bundle ONCE, then assemble each slot off the SAME bundle.
+    """
+    call_targets = [
+        CallTarget(
+            function_name_ptr=42,
+            function_section_ptr=0x1000,
+            type=CallTargetType.LOCAL,
+            is_matched=True,
+        ),
+    ]
+    section = Section(
+        function_name_ptr=0,
+        section_offset=0,
+        call_targets=call_targets,
+        variants=[
+            VariantBlock(
+                variant_ref_offset=0xA,
+                data_offset_shifted=0,
+                per_call_entries=[(0, 7)],
+            ),
+            VariantBlock(
+                variant_ref_offset=0xB,
+                data_offset_shifted=0,
+                per_call_entries=[(0, 3)],
+            ),
+        ],
+    )
+    resolve_ref = _make_resolve_ref({
+        "a": {
+            "arch": "arm32", "compiler": "clang",
+            "compilerversion": "5.0", "opt": "O0",
+            "filename": "f-arm32",
+            "variant_tokens": np.array([400], dtype=np.uint16),
+        },
+        "b": {
+            "arch": "x86", "compiler": "gcc",
+            "compilerversion": "13", "opt": "O2",
+            "filename": "f-x86",
+            "variant_tokens": np.array([500], dtype=np.uint16),
+        },
+    })
+
+    # Build the section-wide bundle ONCE, then thread it into BOTH slots
+    # (the loader's O(V) build-once flow).
+    section_data = build_unmatched_section_data(
+        section, resolve_ref=resolve_ref, line_to_name={42: "callee"}
+    )
+    fd0 = build_unmatched_function_data(
+        section, "f", 0x100, _tokens_stub(),
+        np.array([1, 2], dtype=np.uint8), np.array([3], dtype=np.uint8),
+        variant_slot=0, section_data=section_data,
+    )
+    fd1 = build_unmatched_function_data(
+        section, "f", 0x200, _tokens_stub(),
+        np.array([1, 2], dtype=np.uint8), np.array([3], dtype=np.uint8),
+        variant_slot=1, section_data=section_data,
+    )
+
+    # SAME object across the two slots (intentional read-only sharing).
+    for key in ("variant_refs", "variants", "called", "call_targets"):
+        assert fd0.metadata[key] is fd1.metadata[key], (
+            f"metadata[{key!r}] must be SHARED across slots"
+        )
+
+    # And value-correct (the sharing carries the right section-wide data).
+    assert fd0.metadata["variant_refs"] == ["a", "b"]
+    assert len(fd0.metadata["variants"]) == 2
+    assert fd0.metadata["called"] == ["callee"]
+    assert fd0.metadata["call_targets"] == [
+        [0, 0x1000, 7, 1],
+        [0, 0x1000, 3, 1],
+    ]

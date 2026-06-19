@@ -191,7 +191,7 @@ def test_batch_decode_rejects_per_pointer_depth_array() -> None:
 # a SYNTHETIC corpus (no shared build_memmap needed) and decode it through
 # BOTH engines so a regression in the VC2 ``+1`` bounds guard surfaces here:
 #
-# * BATCH_DECODE routes the multi-section concat through ``emit_vc2_rows``
+# * BATCH_DECODE routes the multi-section concat through ``build_number_idx_2d_kernel``
 #   (the emitter under fix); the per-segment guard makes a terminal carrier
 #   read ``L = 0`` instead of the neighbour segment's value / off-the-end.
 # * load_batch_cross_depth (VECTOR_BATCH-only) mixes depths {0,1,3} so a
@@ -274,7 +274,7 @@ def test_vc2_terminal_section_batch_decode_decodes(tmp_path: Path) -> None:
     """BATCH_DECODE over a multi-section concat with a VC2-terminal section
     decodes (no IndexError / neighbour-misread) and emits VC2 number rows.
 
-    This is the engine that routes through ``emit_vc2_rows``; the per-segment
+    This is the engine that routes through ``build_number_idx_2d_kernel``; the per-segment
     ``+1`` lookahead guard keeps a VC2 carrier at a segment tail reading a
     zero-length payload instead of running off the flat runlength array.
     """

@@ -279,6 +279,12 @@ def build_unmatched_function_data(
     # datasets without a ``_variants.bin`` sidecar working.
     this_variant_row = section_data.resolved_per_ref[variant_slot]
 
+    # These four section-wide lists are the SAME instances across every
+    # slot's metadata (the legacy per-slot rebuild is collapsed to one
+    # build). They are READ-ONLY shared: no consumer may mutate them
+    # in place or rely on per-slot identity. A future per-slot rebuild or
+    # in-place mutation is pinned against by the shared-aliasing test in
+    # tests/test_unmatched_metadata_recovery.py.
     metadata: Dict[str, Any] = {
         "variant_refs": section_data.variant_refs,
         "variants": section_data.variants,
