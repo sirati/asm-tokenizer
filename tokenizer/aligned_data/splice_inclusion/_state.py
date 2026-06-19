@@ -46,15 +46,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dedup_hashmap import HashMapU32U32
+from dedup_hashmap import OnceOnlyInclusionKernel
 
 
 __all__ = ["LevelResult", "OnceOnlyInclusion"]
-
-
-#: ``lookup_ndarray`` miss sentinel (the U32U32 map returns 0xFFFFFFFF
-#: for keys it does not contain).
-_U32_MISS = np.uint32(0xFFFFFFFF)
 
 
 @dataclass(frozen=True)
@@ -91,44 +86,39 @@ class OnceOnlyInclusion:
     :meth:`step_level` is called once per splice level in increasing
     depth order, threading the previous level's survivors as the next
     level's parents (the caller resolves each survivor's callees).
+
+    The whole per-level state machine -- the ``function_id -> dense
+    column`` map, the reused ``[n_variants, n_cols]`` inclusion mask, and
+    the columnwise-ALL FLAG-A / read-before-write FLAG-B decision -- is the
+    GIL-released :class:`~dedup_hashmap.OnceOnlyInclusionKernel`. This class
+    is the thin Python facade that owns the kernel and translates the
+    ndarray pair arrays at the boundary; the buffer-reuse discipline (mask
+    grown geometrically, zeroed not re-allocated per root) lives in the
+    kernel's Rust-local state. Both consumers -- the loader inclusion-BFS
+    and the sorted-index length build -- drive THIS one class, which holds
+    ONE kernel, so their inclusion semantics can never drift.
     """
 
     def __init__(self, *, initial_cols: int = 64) -> None:
-        # function_id -> dense column index, cleared per root.
-        self._fid_to_col = HashMapU32U32(capacity=max(8, initial_cols * 2))
-        # [n_variants, n_cols] inclusion mask; geometric growth, zeroed
-        # (not re-allocated) per root over its used region.
-        self._mask = np.zeros((1, max(1, initial_cols)), dtype=bool)
-        self._n_variants = 0
-        self._n_cols = 0
+        # The GIL-released Rust decider owns the fid->col map + reused mask
+        # as Rust-local state; this facade holds the single instance.
+        self._kernel = OnceOnlyInclusionKernel(max(1, initial_cols))
 
     # -- per-root lifecycle ------------------------------------------------
 
     def begin_root(self, n_variants: int, root_function_id: int) -> int:
         """Reset for a new root; seed the root body at column 0.
 
-        ``mask[:, 0] = True`` for every variant: the root body is always
-        included exactly once as the root, so any deeper call resolving
-        to ``root_function_id`` is already-included (self / mutual
-        recursion never re-splices). Returns the root's column (always
-        0).
-
-        Clears the hashmap and zeroes only the used mask region; the
-        mask is grown (never shrunk) to fit ``n_variants`` rows.
+        The root body is always included exactly once as the root, so any
+        deeper call resolving to ``root_function_id`` is already-included
+        (self / mutual recursion never re-splices). Returns the root's
+        column (always 0). Delegates to the kernel, which clears the
+        fid->col map and zeroes only the previously-used mask region (the
+        mask is grown, never shrunk, to fit ``n_variants`` rows).
         """
-        if n_variants <= 0:
-            raise ValueError(f"n_variants must be >= 1; got {n_variants}")
-        self._fid_to_col.clean()
-        self._ensure_capacity(n_variants, 1)
-        # Zero the previously-used region, then seed root col 0.
-        self._mask[: self._n_variants, : self._n_cols] = False
-        self._n_variants = n_variants
-        self._n_cols = 1
-        self._mask[:n_variants, 0] = True
-        self._fid_to_col.insert(
-            np.uint32(root_function_id), np.uint32(0)
+        return int(
+            self._kernel.begin_root(int(n_variants), np.uint32(root_function_id))
         )
-        return 0
 
     # -- per-level step ----------------------------------------------------
 
@@ -151,21 +141,15 @@ class OnceOnlyInclusion:
         Both arrays are parallel; ordering is the caller's emission
         order (the returned ``included`` mask is index-aligned to it).
 
-        Algorithm (owner's spec, per level):
-
-        1. Map each callee FID to its dense column (insert-or-get;
-           previously-unseen FIDs take fresh ascending columns).
-        2. Snapshot each pair's PRE-mark cell (the once-only test reads
-           the cell BEFORE this level writes it -- a function reached by
-           a variant for the FIRST time at this level has a False
-           pre-cell).
-        3. Mark ``mask[variant, col] = True`` for every pair.
-        4. Columnwise ALL over the variant axis on the columns touched
-           THIS level: a column all-True across every variant is
-           excluded (not included, pruned).
-        5. ``included = pre_cell_false & ~excluded[col]``.
-        6. Survivors = function_ids that some variant newly-included and
-           that are not excluded; one representative pair each.
+        The per-level decision runs in the GIL-released kernel; this
+        method only normalises the input dtypes at the boundary and wraps
+        the kernel's ``(included, survivor_pairs)`` pair into a
+        :class:`LevelResult`. The kernel preserves the owner's spec
+        verbatim: dense-column assignment (ascending-FID new columns),
+        the pre-mark snapshot (FLAG-B read-before-write), the
+        first-in-level dedup (earliest emission wins), the columnwise-ALL
+        exclusion over the touched columns (FLAG-A), and the ascending
+        survivor index.
         """
         variant = np.asarray(variant, dtype=np.int64).reshape(-1)
         fids = np.asarray(callee_function_id, dtype=np.uint32).reshape(-1)
@@ -174,120 +158,5 @@ class OnceOnlyInclusion:
                 "variant and callee_function_id must be parallel; got "
                 f"{variant.shape} vs {fids.shape}"
             )
-        n_pairs = fids.shape[0]
-        if n_pairs == 0:
-            empty_b = np.zeros(0, dtype=bool)
-            empty_i = np.zeros(0, dtype=np.int64)
-            return LevelResult(included=empty_b, survivor_pairs=empty_i)
-
-        cols = self._assign_columns(fids)
-        self._ensure_capacity(self._n_variants, self._n_cols)
-
-        # (2) pre-mark snapshot, then (3) mark. ``pre_cell`` reads the
-        # mask BEFORE this level writes it. A ``(variant, col)`` pair may
-        # repeat WITHIN this level (a variant calls the same function via
-        # two call_target slots, or two distinct call slots resolve to
-        # the same callee); only the FIRST occurrence in emission order
-        # includes the body, the rest are repeats.
-        pre_cell = self._mask[variant, cols]
-        first_in_level = self._first_occurrence(variant, cols)
-        self._mask[variant, cols] = True
-
-        # (4) columnwise ALL over EVERY variant, restricted to the
-        # columns this level touched. A column is excluded iff all
-        # ``n_variants`` rows are True.
-        #
-        # FLAG-A (single-decision-site, one-line flip): ``.all(axis=0)``
-        # over a single-variant root's ONE row is trivially True for
-        # every touched column, so single-variant sections splice
-        # nothing. To make single-variant roots splice everything
-        # instead, gate this exclusion on ``self._n_variants > 1``.
-        touched = np.unique(cols)
-        col_all = self._mask[: self._n_variants, touched].all(axis=0)
-        excluded_col = np.zeros(self._n_cols, dtype=bool)
-        excluded_col[touched] = col_all
-        pair_excluded = excluded_col[cols]
-
-        # (5) once-only inclusion: first encounter for this variant
-        # (across prior levels AND within this level) AND not excluded by
-        # the all-variants test.
-        #
-        # FLAG-B (single-decision-site): ``~pre_cell`` reads the mask
-        # BEFORE this level's marking, so a variant reaching a function
-        # LATE (column already True from earlier variants, becoming
-        # all-True this level) is excluded here and does NOT include it.
-        # To instead let a late variant include a function it reaches
-        # before the column converges, the test would read the cell
-        # value as of a prior level rather than the live ``pre_cell``.
-        included = (~pre_cell) & first_in_level & (~pair_excluded)
-
-        # (6) survivors: descent is per-variant -- every INCLUDED pair
-        # expands at the next level with its own variant's callee
-        # choice. (An excluded function is pruned for every variant; a
-        # repeat-encounter pair already expanded at its first encounter.)
-        survivor_pairs = np.nonzero(included)[0]
+        included, survivor_pairs = self._kernel.step_level(variant, fids)
         return LevelResult(included=included, survivor_pairs=survivor_pairs)
-
-    # -- internals ---------------------------------------------------------
-
-    def _first_occurrence(
-        self, variant: np.ndarray, cols: np.ndarray
-    ) -> np.ndarray:
-        """``bool[n_pairs]`` -- True at the first ``(variant, col)`` in
-        emission order, False on later repeats of the same pair.
-
-        Within one level the same ``(variant, function)`` may appear
-        through multiple call_target slots; the once-only rule includes
-        the body once, on the earliest pair. Keyed on
-        ``variant * n_cols + col`` (both bounded) so the dedup is a
-        single stable group scan.
-        """
-        key = variant.astype(np.int64) * self._n_cols + cols
-        order = np.argsort(key, kind="stable")
-        sorted_key = key[order]
-        first_sorted = np.ones(sorted_key.size, dtype=bool)
-        first_sorted[1:] = sorted_key[1:] != sorted_key[:-1]
-        out = np.zeros(key.size, dtype=bool)
-        out[order[first_sorted]] = True
-        return out
-
-    def _assign_columns(self, fids: np.ndarray) -> np.ndarray:
-        """Insert-or-get dense columns for ``fids`` (last-write-safe).
-
-        The native ``insert`` is last-write-wins, so a blind insert would
-        clobber an existing column. We look up first, then assign fresh
-        ascending columns ONLY to the genuinely-new FIDs (deduped within
-        the batch so repeats in one level share a column).
-        """
-        existing = self._fid_to_col.lookup_ndarray(fids).astype(np.int64)
-        miss = existing == int(_U32_MISS)
-        if bool(miss.any()):
-            new_fids = fids[miss]
-            uniq, inverse = np.unique(new_fids, return_inverse=True)
-            base = self._n_cols
-            new_cols = base + np.arange(uniq.size, dtype=np.int64)
-            self._fid_to_col.insert_ndarray(
-                uniq, new_cols.astype(np.uint32)
-            )
-            existing[miss] = new_cols[inverse]
-            self._n_cols = base + int(uniq.size)
-        return existing
-
-    def _ensure_capacity(self, n_variants: int, n_cols: int) -> None:
-        """Grow the mask geometrically to fit ``(n_variants, n_cols)``.
-
-        Preserves the already-marked region; growth doubles the deficient
-        axis so amortised reallocation is O(1) per added row/column.
-        """
-        rows, mcols = self._mask.shape
-        if n_variants <= rows and n_cols <= mcols:
-            return
-        new_rows = rows
-        while new_rows < n_variants:
-            new_rows *= 2
-        new_cols = mcols
-        while new_cols < n_cols:
-            new_cols *= 2
-        grown = np.zeros((new_rows, new_cols), dtype=bool)
-        grown[:rows, :mcols] = self._mask
-        self._mask = grown
