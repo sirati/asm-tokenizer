@@ -38,6 +38,7 @@ mod adjacency_expand;
 mod carrier_signs;
 mod family_band_reduction;
 mod flat_segments;
+mod gather_bodies;
 mod hashmap_macro;
 mod identity_gather;
 mod inline_bytes;
@@ -58,6 +59,7 @@ use once_only_inclusion::OnceOnlyInclusionKernel;
 use carrier_signs::build_carrier_signs_kernel;
 use family_band_reduction::build_family_band_reduction_kernel;
 use flat_segments::build_flat_segments_kernel;
+use gather_bodies::build_gather_bodies_kernel;
 use hashmap_macro::define_hashmap;
 use identity_gather::build_identity_carriers_kernel;
 use inline_bytes::build_inline_bytes_kernel;
@@ -351,6 +353,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // object-tree-free `_build_ct_columns` replacement: columnar ct_*
     // slices + section_of_node -> per-node CT CSR). See `node_ct_csr.rs`.
     m.add_function(wrap_pyfunction!(build_node_ct_csr_kernel, m)?)?;
+
+    // Batched single-pass node-body gather (the GIL-released
+    // `gather_node_bodies` twin: even-offset validation + counts cumsum CSR +
+    // per-node LE-u16 region gather out of the `_data.bin` mmap view). See
+    // `gather_bodies.rs`.
+    m.add_function(wrap_pyfunction!(build_gather_bodies_kernel, m)?)?;
 
     // Batched VC2 / F128 continuation-slot paint over the raw working stream
     // (the GIL-released `_promote_batched` twin: per-carrier ceil-div chunk

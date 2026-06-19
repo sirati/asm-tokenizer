@@ -24,9 +24,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from dedup_hashmap import build_gather_bodies_kernel
 
 
 __all__ = ["GatheredBodies", "gather_node_bodies"]
+
+
+# Correctness-gate flag: when True, the gather runs the verbatim numpy
+# reference below instead of the GIL-free Rust kernel. The kernel path must
+# be ``np.array_equal`` to this oracle on both ``raw`` and ``record_offsets``.
+_USE_NUMPY_GATHER_BODIES = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,31 @@ def gather_node_bodies(
     GatheredBodies
         The flat ``raw`` u16 stream + the CSR ``record_offsets``.
     """
+    if _USE_NUMPY_GATHER_BODIES:
+        return _gather_node_bodies_numpy(data_u8, token_starts, token_counts)
+
+    # The kernel OWNS the even-offset validation + the counts cumsum CSR +
+    # the per-node LE-u16 region gather out of the ``_data.bin`` mmap view,
+    # all under one GIL release; we only coerce the span dtypes here. The
+    # ``data_u8`` mmap view is read directly by rust-numpy (no copy).
+    raw, record_offsets = build_gather_bodies_kernel(
+        np.ascontiguousarray(np.asarray(data_u8).reshape(-1), dtype=np.uint8),
+        np.ascontiguousarray(
+            np.asarray(token_starts, dtype=np.int64).reshape(-1)
+        ),
+        np.ascontiguousarray(
+            np.asarray(token_counts, dtype=np.int64).reshape(-1)
+        ),
+    )
+    return GatheredBodies(raw=raw, record_offsets=record_offsets)
+
+
+def _gather_node_bodies_numpy(
+    data_u8: np.ndarray,
+    token_starts: np.ndarray,
+    token_counts: np.ndarray,
+) -> GatheredBodies:
+    """Verbatim numpy reference (the correctness-gate oracle)."""
     starts = np.asarray(token_starts, dtype=np.int64).reshape(-1)
     counts = np.asarray(token_counts, dtype=np.int64).reshape(-1)
     if starts.shape != counts.shape:
