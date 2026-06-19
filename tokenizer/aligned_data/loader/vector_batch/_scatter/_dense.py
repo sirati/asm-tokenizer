@@ -45,11 +45,11 @@ from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 from .._types import BatchGeometry
 from ._catalog_columns import build_catalog_columns
-from ._dense_adapter import build_stage2_batch
 from ._dense_columns import build_dense_columns
 from ._expand import ExpandedBatch
 from ._number_chunk_columns import build_number_chunk_columns
 from ._remap_inputs import build_flat_remap_inputs
+from ._slim_stage2 import build_slim_stage2_batch
 from ._surviving import surviving_token_counts
 
 
@@ -124,13 +124,9 @@ def build_dense_sidecars(
     """
     surviving = surviving_token_counts(geometry)
     # Per-emitted-node CATALOG columns built ONCE (section index, root FID,
-    # encounter Category, COUNTER counts, per-section CT table) and threaded
-    # to BOTH the tree adapter and the remap-input builder -- a single
-    # source, no re-derived catalog walk on either consumer.
+    # encounter Category, COUNTER counts, per-section CT table) -- the
+    # remap-input builder's columnar source (no re-derived catalog walk).
     catalog = build_catalog_columns(geometry, expanded, cols=cols)
-    stage2 = build_stage2_batch(
-        geometry, expanded, catalog=catalog, surviving=surviving
-    )
 
     # Build the shared stage-3 front-matter ONCE, DIRECTLY from the
     # retained ``BatchedExpansion`` flats + the per-node cut -- the four
@@ -147,6 +143,14 @@ def build_dense_sidecars(
         if expanded.batched is not None
         else None
     )
+
+    # The SLIM (tree-free) ``Stage2Batch`` carries only the three columnar
+    # arrays the downstream stages read -- the identity row->section/variant
+    # mapping + the per-row identity / number-chunk CSR offsets -- reduced
+    # from ``dense``'s per-node surviving counts. The per-call-target object
+    # tree the old adapter built fed ONLY the (now-skipped) Stage3 hierarchy
+    # assembly, so it is dropped here (step-5 object-tree elimination).
+    stage2 = build_slim_stage2_batch(geometry, dense)
 
     # The remap kernel's flat int arrays built COLUMNAR from ``dense`` +
     # ``catalog`` + the emission row CSR -- skips the GIL-bound per-call-

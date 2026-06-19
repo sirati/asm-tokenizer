@@ -1,9 +1,21 @@
-"""Flat vector emission -> staged ``Stage2Batch`` adapter (dense pass).
+"""Flat vector emission -> full per-CT ``Stage2Batch`` tree (ORACLE only).
 
-Single concern: build the SLIM ``Stage2Batch`` topology + scalars +
-CSR offsets the vector dense path's downstream stages need, sourcing
-each from the vector path's already-computed columnar state -- never a
-fresh BIN parse and never a re-expansion of ``_data.bin``.
+Single concern: build the per-call-target ``Stage2Batch`` object tree the
+EQUIVALENCE GATES diff their columnar production outputs against -- one
+synthetic ``Stage2CallTarget`` per emitted node, in emission order = DFS
+order, sourcing each topology + scalar field from the vector path's
+already-computed columnar state (never a fresh BIN parse / re-expansion).
+
+NO LONGER ON THE PRODUCTION VECTOR PATH (step-5 object-tree elimination):
+:mod:`._dense` builds the SLIM tree-free :class:`._slim_stage2` batch and
+:func:`...batch_decode._bulk_bytes.build_bulk_bytes` skips the Stage3
+hierarchy when a columnar ``dense`` is supplied -- so the per-CT dataclass
+ctor loop here is no longer in the hot path. It is RETAINED purely as the
+tree-walk ORACLE the ``test_*_equiv`` gates rebuild (via
+:func:`...tests._full_tree_oracle.build_full_tree_stage3`) from the SAME
+columnar inputs, to prove the columnar front-matter reproduces the tree
+walk byte-for-byte. The staged ``batch_decode`` path builds its own real
+tree from the BIN parse and does NOT use this adapter.
 
 Adapter shape: one level-2 "section" per NON-PADDING batch row; its
 single level-3 variant's ``call_targets`` are that row's emitted nodes in

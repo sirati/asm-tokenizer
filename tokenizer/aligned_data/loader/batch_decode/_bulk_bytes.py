@@ -103,6 +103,8 @@ _NUMBER_BLOCK_TOKEN_TYPES: tuple[TokenType, ...] = (
 def build_bulk_bytes(
     stage2: "Stage2Batch",
     dense: "DenseColumns | None" = None,
+    *,
+    build_hierarchy: "bool | None" = None,
 ) -> Stage3Batch:
     """Compose 3a + 3b + 3c + 3d into a :class:`Stage3Batch`.
 
@@ -123,13 +125,29 @@ def build_bulk_bytes(
         ``BatchedExpansion``, collapsing the four tree-walks). Omitted by
         the staged ``batch_decode`` path, which builds it here with a
         single DFS walk of ``stage2``.
+    build_hierarchy
+        Whether to assemble the per-call-target ``Stage3Section`` tree
+        (step 9+10). ``None`` (default) derives it from ``dense``: the
+        VECTOR dense path supplies ``dense`` AND threads its own columnar
+        ``variants_per_section`` / ``numbers`` downstream, so the tree is
+        vestigial there and is SKIPPED (``Stage3Batch.sections == ()``);
+        the STAGED path leaves ``dense`` ``None`` and builds the tree (its
+        ``assemble_batch`` walks ``stage3.sections``). The equivalence
+        gates pass ``True`` WITH a ``dense`` to rebuild the full tree as
+        their tree-walk oracle.
 
     Returns
     -------
     Stage3Batch
-        Level-1 batch with batch-shared bulk arrays + the 4-level
-        Stage3 mirror carrying per-call-target slices into them.
+        Level-1 batch with batch-shared bulk arrays + (when built) the
+        4-level Stage3 mirror carrying per-call-target slices into them.
     """
+    columnar = dense is not None
+    if build_hierarchy is None:
+        # Default: build the tree exactly when no columnar ``dense`` was
+        # supplied (the STAGED path). The vector dense path supplies
+        # ``dense`` -> skips the vestigial tree.
+        build_hierarchy = not columnar
     if dense is None:
         dense = dense_columns_from_stage2(stage2)
 
@@ -228,11 +246,26 @@ def build_bulk_bytes(
     #         wrappers. DFS encounter order matches every sub-stage's
     #         output, so a single positional cursor lines up the slice
     #         lookups.
-    sections = _assemble_hierarchy(
-        stage2=stage2,
-        inline_byte_slices=inline_byte_slices,
-        identity_slices=identity_slices,
-        number_chunk_slices_per_type=number_chunk_slices_per_type,
+    #
+    # SKIPPED on the vector dense path (``build_hierarchy`` False): that
+    # path's downstream consumers (the per-row remap + the number-chunk
+    # stream) read the columnar front-matter (the threaded
+    # ``variants_per_section`` / ``numbers``), NOT these ``Stage3Section``
+    # wrappers -- so the per-call-target hierarchy build (the ~24.7%
+    # GIL-held Stage2/Stage3 tree ctor loop) is vestigial there and is
+    # dropped (step-5 object-tree elimination). The STAGED ``batch_decode``
+    # path keeps the full assembly (its ``assemble_batch`` walks
+    # ``stage3.sections``); the equivalence gates also request it (with a
+    # ``dense``) to rebuild the tree-walk oracle.
+    sections = (
+        _assemble_hierarchy(
+            stage2=stage2,
+            inline_byte_slices=inline_byte_slices,
+            identity_slices=identity_slices,
+            number_chunk_slices_per_type=number_chunk_slices_per_type,
+        )
+        if build_hierarchy
+        else ()
     )
 
     return Stage3Batch(
