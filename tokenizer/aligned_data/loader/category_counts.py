@@ -28,7 +28,7 @@ import os
 
 import numpy as np
 
-from dedup_hashmap import segment_distinct_count
+from dedup_hashmap import category_distinct_count, segment_distinct_count
 
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Category
@@ -44,6 +44,18 @@ from .decoded._inline_decode_state import build_inline_decode_state
 # byte-identity gate during bring-up. Default = Rust.
 _USE_NUMPY_SEGMENT_DISTINCT = bool(
     os.environ.get("CATEGORY_COUNTS_NUMPY_UNIQUE")
+)
+
+
+# Bring-up flag: when set, :func:`category_counts_from_runlen_batched`
+# performs the carrier-locate + ALG-5 payload decode + per-node distinct
+# reduction in numpy (per Category, via
+# :func:`_count_distinct_caller_local_ids_per_node`) instead of the fused
+# GIL-free :func:`dedup_hashmap.category_distinct_count` Rust kernel. The
+# two are byte-identical; the flag pins the numpy prep as the reference
+# oracle for the byte-identity gate. Default = Rust.
+_USE_NUMPY_CATEGORY_DISTINCT = bool(
+    os.environ.get("CATEGORY_COUNTS_NUMPY_PREP")
 )
 
 
@@ -209,11 +221,37 @@ def category_counts_from_runlen_batched(
     runlen_number_flat = np.asarray(runlen_number_flat).reshape(-1)
     rec = np.asarray(record_offsets, dtype=np.int64).reshape(-1)
     n_nodes = int(rec.size) - 1
+
+    if _USE_NUMPY_CATEGORY_DISTINCT:
+        # Reference path (flag-gated): per-Category numpy carrier-locate +
+        # ALG-5 decode + per-node distinct reduction. Pinned as the oracle
+        # the fused kernel must stay byte-identical to.
+        return {
+            category: _count_distinct_caller_local_ids_per_node(
+                raw_flat, runlen_number_flat, rec, n_nodes, carrier_id
+            )
+            for category, carrier_id in _COUNTER_CATEGORY_TO_RAW_ID.items()
+        }
+
+    # Fused GIL-free path: decode every Category's carriers + reduce to
+    # per-node distinct counts in ONE detached CSR walk. The kernel returns
+    # ``int64[n_categories, n_nodes]`` row-major in the carrier-id order it
+    # received; row ``c`` is category ``COUNTER_CATEGORIES[c]``.
+    carrier_ids = np.fromiter(
+        _COUNTER_CATEGORY_TO_RAW_ID.values(),
+        dtype=np.uint16,
+        count=len(_COUNTER_CATEGORY_TO_RAW_ID),
+    )
+    grid = category_distinct_count(
+        raw_flat,
+        np.ascontiguousarray(runlen_number_flat, dtype=np.uint16),
+        rec,
+        carrier_ids,
+        n_nodes,
+    )
     return {
-        category: _count_distinct_caller_local_ids_per_node(
-            raw_flat, runlen_number_flat, rec, n_nodes, carrier_id
-        )
-        for category, carrier_id in _COUNTER_CATEGORY_TO_RAW_ID.items()
+        category: grid[row]
+        for row, category in enumerate(_COUNTER_CATEGORY_TO_RAW_ID)
     }
 
 
