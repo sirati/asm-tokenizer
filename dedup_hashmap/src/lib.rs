@@ -41,10 +41,12 @@ mod hashmap_macro;
 mod identity_gather;
 mod inline_bytes;
 mod number_idx_2d;
+mod once_only_inclusion;
 mod remap_walk;
 mod segment_distinct;
 
 use adjacency_expand::LiveAdjacencyKernel;
+use once_only_inclusion::OnceOnlyInclusionKernel;
 use carrier_signs::build_carrier_signs_kernel;
 use flat_segments::build_flat_segments_kernel;
 use hashmap_macro::define_hashmap;
@@ -332,6 +334,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
     // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.
     m.add_class::<LiveAdjacencyKernel>()?;
+
+    // Inclusion-BFS per-level once-only / columnwise-ALL decider (the Rust
+    // port of `OnceOnlyInclusion`). See `once_only_inclusion.rs`.
+    m.add_class::<OnceOnlyInclusionKernel>()?;
 
     Ok(())
 }

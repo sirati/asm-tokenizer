@@ -20,6 +20,7 @@ from . import _native as _native
 from ._native import *  # noqa: F401,F403 — re-export every generated class
 from ._native import (
     LiveAdjacencyKernel,
+    OnceOnlyInclusionKernel,
     apply_remap_walk,
     build_carrier_signs_kernel,
     build_flat_segments_kernel,
@@ -39,6 +40,7 @@ __all__ = list(_native.__all__) + [
     "IntDtype",
     "IntEnumHashMap",
     "LiveAdjacencyKernel",
+    "OnceOnlyInclusionKernel",
     "PlainBool",
     "PlainInt",
     "apply_remap_walk",
