@@ -51,7 +51,11 @@ from tokenizer.tokens import TokenType
 from ._dense_columns import DenseColumns
 from ._flat_call_targets import dense_columns_from_stage2
 from ._fp_normalize import normalize_per_token_type
-from ._identity_decode import build_identity_idx_2d, view_cast_identities
+from ._identity_decode import (
+    build_identity_idx_2d,
+    scatter_in_stream_identities,
+    view_cast_identities,
+)
 from ._inline_bytes import build_inline_bytes
 from ._number_decode import build_number_idx_2d
 from ._types import (
@@ -62,6 +66,7 @@ from ._types import (
 )
 
 if TYPE_CHECKING:
+    from ._identity_decode import IdentitySlicesCSR
     from ._types import (
         Stage2Batch,
         Stage2Section,
@@ -199,48 +204,18 @@ def build_bulk_bytes(
         is_negative_per_source_per_type=is_negative_per_source_per_type,
     )
 
-    # 7. Allocate the level-1 identities array. Length = sum of each
-    #    call_target's ``surviving_identity_count`` (which already
-    #    INCLUDES the +1 prepend per Stage 2's count semantics). Prepend
-    #    slots stay 0; stage 4 writes them per ALG-9.
-    total_surviving_identity_tokens = (
-        identity_slices[-1].stop if identity_slices else 0
+    # 7 + 8. Allocate the level-1 identities array (length = sum of each
+    #    call_target's ``surviving_identity_count``, which already INCLUDES
+    #    the +1 prepend per Stage 2's count semantics; prepend slots stay 0
+    #    for stage 4 per ALG-9) and scatter the in-stream u16 ids into the
+    #    POST-PREPEND sub-range ``[start + 1 : stop]`` of every surviving
+    #    call_target. The 3b walk's emission order is "all in-stream
+    #    identities of call_target 0, then 1, ..." -- the identity CSR
+    #    drives the vectorised cumulative-offset scatter in a single
+    #    fancy-index assignment (no per-call_target Python loop).
+    identities_flat_caller_local = scatter_in_stream_identities(
+        identity_slices, identities_in_stream
     )
-    identities_flat_caller_local = np.zeros(
-        total_surviving_identity_tokens, dtype=np.uint16
-    )
-
-    # 8. Scatter in-stream u16 ids into the post-prepend sub-slice of
-    #    each call_target's identity_slice. The 3b walk's emission order
-    #    is "all in-stream identities of call_target 0, then 1, then 2,
-    #    ..." -- a flat list whose per-call-target lengths are
-    #    ``surviving_identity_count - 1`` for surviving call_targets and
-    #    0 for fully-dropped ones. We re-derive the per-call-target
-    #    cumulative offsets from the identity_slices and copy in one
-    #    pass per call_target (no per-token loop).
-    in_stream_cursor = 0
-    for sl in identity_slices:
-        slice_len = sl.stop - sl.start
-        if slice_len == 0:
-            continue
-        # In a surviving call_target the slice is [prepend, in_stream_0,
-        # in_stream_1, ...]; slot 0 = prepend (stage 4), slots 1..end =
-        # in-stream caller-local ids from the view-cast.
-        in_stream_len = slice_len - 1
-        if in_stream_len > 0:
-            identities_flat_caller_local[sl.start + 1 : sl.stop] = (
-                identities_in_stream[
-                    in_stream_cursor : in_stream_cursor + in_stream_len
-                ]
-            )
-            in_stream_cursor += in_stream_len
-    # Sanity: the view-cast emitted exactly as many u16s as we scattered.
-    if in_stream_cursor != identities_in_stream.shape[0]:
-        raise AssertionError(
-            f"identity in-stream count mismatch: scattered "
-            f"{in_stream_cursor} u16 ids but the view-cast produced "
-            f"{identities_in_stream.shape[0]}"
-        )
 
     # 9 + 10. Assemble the per-call-target / per-variant / per-section
     #         wrappers. DFS encounter order matches every sub-stage's
@@ -401,7 +376,7 @@ def _assemble_hierarchy(
     *,
     stage2: "Stage2Batch",
     inline_byte_slices: list[slice],
-    identity_slices: list[slice],
+    identity_slices: "IdentitySlicesCSR",
     number_chunk_boundaries_per_type: dict[TokenType, np.ndarray],
 ) -> list[Stage3Section]:
     """Build the level-2 / level-3 / level-4 Stage3 wrappers.
