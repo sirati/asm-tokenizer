@@ -113,26 +113,6 @@ class ExpandedBatch:
     expanded: np.ndarray  # uint16[total_expanded]
     node_offsets: np.ndarray  # int64[n_nodes + 1] -- CSR into ``expanded``
 
-    states: list = field(default_factory=list)
-    """Per-emitted-node :class:`~tokenizer.aligned_data.loader.decoded.
-    _inline_decode_state.InlineDecodeState`, parallel to
-    ``geometry.emission.node``. Built once here (over the gathered raw
-    body); the dense pass (:mod:`._dense`) reads ``raw_tokens`` /
-    ``runlen_number`` / ``digit_cumsum`` / ``real_mask`` /
-    ``is_negative_per_position`` off it instead of re-parsing the body
-    (no re-parse in the call chain). Defaults empty for the token-only
-    test constructors that do not exercise the dense pass."""
-
-    extra_value_v2_masks: list = field(default_factory=list)
-    """Per-node VC2 promotion mask from ``expand_tokens`` (slot 0 =
-    prepend, always False). The dense number-decode kernel reads it to
-    skip painted VC2 continuation slots."""
-
-    extra_f128_masks: list = field(default_factory=list)
-    """Per-node F128 promotion mask from ``expand_tokens`` (slot 0 =
-    prepend, always False). The dense number-decode kernel reads it to
-    skip painted F128 continuation slots + detect finite F128 sources."""
-
     raw_flat: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.uint16)
     )
@@ -156,6 +136,58 @@ class ExpandedBatch:
     """The flat ``InlineDecodeState.runlen_number`` over every node,
     aligned to ``raw_flat`` (the batch-wide twin of each state's
     ``runlen_number`` view)."""
+
+    batched: "BatchedExpansion | None" = None
+    """The flat :class:`._batched_expand.BatchedExpansion` the per-node
+    ``states`` / masks views slice. Retained (not re-derived) so the dense
+    pass can build the shared :class:`DenseColumns` front-matter DIRECTLY
+    from these flats (one columnar build feeding the four stage-3 sites)
+    instead of re-walking the per-node tree, AND so the per-node
+    :attr:`states` / :attr:`extra_value_v2_masks` / :attr:`extra_f128_masks`
+    views (kept LAZY -- see below) can be sliced on demand. ``None`` for
+    the token-only test constructors that skip the dense pass."""
+
+    @property
+    def states(self) -> list:
+        """Per-emitted-node :class:`~tokenizer.aligned_data.loader.decoded.
+        _inline_decode_state.InlineDecodeState` views, parallel to
+        ``geometry.emission.node`` -- sliced LAZILY from :attr:`batched`.
+
+        The vector dense path NO LONGER reads these (it builds the shared
+        :class:`DenseColumns` front-matter directly from the retained
+        flats); they remain a lazy view for the kernel-equivalence tests
+        + any future per-node consumer. Empty for token-only constructors
+        (``batched is None``)."""
+        if self.batched is None:
+            return []
+        return self._sliced_views()[0]
+
+    @property
+    def extra_value_v2_masks(self) -> list:
+        """Per-node VC2 promotion mask views (slot 0 = prepend, always
+        False) -- sliced LAZILY from :attr:`batched`. Empty for token-only
+        constructors (``batched is None``)."""
+        if self.batched is None:
+            return []
+        return self._sliced_views()[1]
+
+    @property
+    def extra_f128_masks(self) -> list:
+        """Per-node F128 promotion mask views (slot 0 = prepend, always
+        False) -- sliced LAZILY from :attr:`batched`. Empty for token-only
+        constructors (``batched is None``)."""
+        if self.batched is None:
+            return []
+        return self._sliced_views()[2]
+
+    def _sliced_views(self) -> tuple[list, list, list]:
+        """Slice :attr:`batched` into the per-node ``(states, vc2_masks,
+        f128_masks)`` view lists -- the lazy backing for the three
+        properties above. Computed on access (the vector dense path never
+        calls it; only the equivalence tests do)."""
+        return _slice_per_node(
+            self.batched, self.raw_flat, self.raw_record_offsets
+        )
 
 
 def expand_node_bodies(
@@ -194,9 +226,6 @@ def expand_node_bodies(
         return ExpandedBatch(
             expanded=np.zeros(0, dtype=np.uint16),
             node_offsets=np.zeros(1, dtype=np.int64),
-            states=[],
-            extra_value_v2_masks=[],
-            extra_f128_masks=[],
         )
 
     # Collapse the edge axis to per-node shifted self-token ids via the
@@ -216,18 +245,17 @@ def expand_node_bodies(
 
     raw_flat = np.asarray(raw, dtype=np.uint16).reshape(-1)
     batched = batched_expand(raw, rec, self_token_ids)
-    states, extra_value_v2_masks, extra_f128_masks = _slice_per_node(
-        batched, raw_flat, rec
-    )
+    # The per-node ``states`` / promotion-mask views are NOT sliced here:
+    # the vector dense pass builds its front-matter columnar from the
+    # retained ``batched`` flats, and the equivalence tests pull the
+    # views LAZILY off the returned ``ExpandedBatch`` (properties).
     return ExpandedBatch(
         expanded=batched.expanded,
         node_offsets=batched.node_offsets,
-        states=states,
-        extra_value_v2_masks=extra_value_v2_masks,
-        extra_f128_masks=extra_f128_masks,
         raw_flat=raw_flat,
         raw_record_offsets=rec,
         runlen_number_flat=batched.runlen_number,
+        batched=batched,
     )
 
 
@@ -236,9 +264,13 @@ def _slice_per_node(
 ) -> tuple[list, list, list]:
     """Slice the batched arrays into the per-node list contract.
 
-    The dense pass (:mod:`._dense_adapter`) reads per-node
+    The LAZY backing for :attr:`ExpandedBatch.states` /
+    ``extra_value_v2_masks`` / ``extra_f128_masks`` -- the per-node
     :class:`InlineDecodeState` objects + the per-node expanded-space
-    promotion masks. Each is a contiguous VIEW into the batched arrays
+    promotion masks. The vector dense pass NO LONGER drives this (it
+    builds its front-matter columnar from the retained ``batched``
+    flats); only the kernel-equivalence tests slice it, on demand. Each
+    entry is a contiguous VIEW into the batched arrays
     (no per-node ``run_lengths`` / cumsum dispatch -- the batched twin
     computed them once): the raw-space fields slice by the body CSR
     ``rec``; the masks slice by the expanded CSR ``node_offsets``; the

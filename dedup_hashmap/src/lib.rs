@@ -34,10 +34,48 @@
 //! Callers should check membership with `__contains__` / `lookup` when
 //! the sentinel value is itself a legitimate entry value.
 
+mod adjacency_expand;
+mod carrier_signs;
+mod category_distinct;
+mod family_band_reduction;
+mod flat_segments;
+mod gather_bodies;
 mod hashmap_macro;
+mod identity_gather;
+mod inline_bytes;
+mod inline_state_fields;
+mod node_ct_csr;
+mod number_idx_2d;
+mod once_only_inclusion;
+mod promote_batched;
+mod remap_walk;
+mod row_inclusions;
+mod segment_distinct;
+mod strip_shift_prepend;
+mod token_scatter;
+mod variant_shuffle_chunk;
 
+use adjacency_expand::LiveAdjacencyKernel;
+use once_only_inclusion::OnceOnlyInclusionKernel;
+use carrier_signs::build_carrier_signs_kernel;
+use category_distinct::category_distinct_count;
+use family_band_reduction::build_family_band_reduction_kernel;
+use flat_segments::build_flat_segments_kernel;
+use gather_bodies::build_gather_bodies_kernel;
 use hashmap_macro::define_hashmap;
+use identity_gather::build_identity_carriers_kernel;
+use inline_bytes::build_inline_bytes_kernel;
+use inline_state_fields::build_inline_state_fields_kernel;
+use node_ct_csr::build_node_ct_csr_kernel;
+use number_idx_2d::build_number_idx_2d_kernel;
+use promote_batched::build_promote_batched_kernel;
 use pyo3::prelude::*;
+use remap_walk::apply_remap_walk;
+use row_inclusions::compute_row_inclusions_kernel;
+use segment_distinct::segment_distinct_count;
+use strip_shift_prepend::build_strip_shift_prepend_kernel;
+use token_scatter::build_token_scatter_kernel;
+use variant_shuffle_chunk::variant_shuffle_chunk_kernel;
 
 // -- Generated classes -----------------------------------------------------
 //
@@ -283,6 +321,103 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HashMapU64U64>()?;
     m.add_class::<HashMapU64F32>()?;
     m.add_class::<HashMapU64F64>()?;
+
+    // Per-segment distinct-value count kernel (CSR-grouped np.unique
+    // replacement). See `segment_distinct.rs`.
+    m.add_function(wrap_pyfunction!(segment_distinct_count, m)?)?;
+
+    // Fused per-node, per-COUNTER-Category distinct caller-local-id count
+    // straight off the flat v2 stream (the GIL-released carrier-locate +
+    // ALG-5 payload decode + per-segment distinct reduction, all categories
+    // in ONE detached CSR walk). See `category_distinct.rs`.
+    m.add_function(wrap_pyfunction!(category_distinct_count, m)?)?;
+
+    // Per-row identity FID/counter remap walk kernel (ALG-3/4/9). See
+    // `remap_walk.rs`.
+    m.add_function(wrap_pyfunction!(apply_remap_walk, m)?)?;
+
+    // Stage-3c NUMBER-band idx_2d emission kernel (ALG-2/7/8). See
+    // `number_idx_2d.rs`.
+    m.add_function(wrap_pyfunction!(build_number_idx_2d_kernel, m)?)?;
+
+    // Stage-3 per-source carrier-sign collection kernel. See
+    // `carrier_signs.rs`.
+    m.add_function(wrap_pyfunction!(build_carrier_signs_kernel, m)?)?;
+
+    // Stage-3b identity carrier gather kernel (ALG-5 front matter). See
+    // `identity_gather.rs`.
+    m.add_function(wrap_pyfunction!(build_identity_carriers_kernel, m)?)?;
+
+    // Stage-3a surviving inline-byte gather kernel (ALG-1). See
+    // `inline_bytes.rs`.
+    m.add_function(wrap_pyfunction!(build_inline_bytes_kernel, m)?)?;
+
+    // Stage-3c NUMBER-band flat-segment column build (the per-kept-node
+    // DenseColumns slice + concat feeding the number idx_2d kernel). See
+    // `flat_segments.rs`.
+    m.add_function(wrap_pyfunction!(build_flat_segments_kernel, m)?)?;
+
+    // Per-node call-target-section CSR build (the vector remap path's
+    // object-tree-free `_build_ct_columns` replacement: columnar ct_*
+    // slices + section_of_node -> per-node CT CSR). See `node_ct_csr.rs`.
+    m.add_function(wrap_pyfunction!(build_node_ct_csr_kernel, m)?)?;
+
+    // Batched single-pass node-body gather (the GIL-released
+    // `gather_node_bodies` twin: even-offset validation + counts cumsum CSR +
+    // per-node LE-u16 region gather out of the `_data.bin` mmap view). See
+    // `gather_bodies.rs`.
+    m.add_function(wrap_pyfunction!(build_gather_bodies_kernel, m)?)?;
+
+    // Batched VC2 / F128 continuation-slot paint over the raw working stream
+    // (the GIL-released `_promote_batched` twin: per-carrier ceil-div chunk
+    // count + node-local bounds guards + segment paint, F128 NaN/Inf finite
+    // filter). See `promote_batched.rs`.
+    m.add_function(wrap_pyfunction!(build_promote_batched_kernel, m)?)?;
+
+    // Batched strip + shift + prepend over the painted raw working stream
+    // (the GIL-released `_strip_shift_prepend` twin: drop the <=256 band,
+    // shift survivors down 256, prepend each node's self-token). See
+    // `strip_shift_prepend.rs`.
+    m.add_function(wrap_pyfunction!(build_strip_shift_prepend_kernel, m)?)?;
+
+    // Single GIL-free segmented band-reduction over the per-node surviving
+    // prefix, shared by the three vector-decode call sites (the preamble
+    // `count_surviving_batched` / `_build_instream_columns` /
+    // `build_number_chunk_columns` each recompute). See
+    // `family_band_reduction.rs`.
+    m.add_function(wrap_pyfunction!(build_family_band_reduction_kernel, m)?)?;
+
+    // Fused boundary-aware InlineDecodeState field kernel (the GIL-released
+    // `_state_fields.py` trio twin: runlen_number/runlen_value via per-node
+    // run_lengths, the packed per-node digit cumsum, and is_negative — one
+    // CSR walk over the flat raw stream). See `inline_state_fields.rs`.
+    m.add_function(wrap_pyfunction!(build_inline_state_fields_kernel, m)?)?;
+
+    // Fully-vectorized token scatter into the dense u16[B, L] token tensor
+    // (the GIL-released `scatter_tokens` twin: body-start cumsum + prefix +
+    // ordered prefix-then-body scatter under the straddler cut). See
+    // `token_scatter.rs`.
+    m.add_function(wrap_pyfunction!(build_token_scatter_kernel, m)?)?;
+
+    // Inclusion-BFS per-level CSR frontier expansion kernel (the Rust port
+    // of `LiveNodeAdjacency.expand_batch`). See `adjacency_expand.rs`.
+    m.add_class::<LiveAdjacencyKernel>()?;
+
+    // Inclusion-BFS per-level once-only / columnwise-ALL decider (the Rust
+    // port of `OnceOnlyInclusion`). See `once_only_inclusion.rs`.
+    m.add_class::<OnceOnlyInclusionKernel>()?;
+
+    // Stage-3 FUSED inclusion-BFS kernel (the whole per-group + per-depth
+    // loader BFS under one GIL release, reusing the Stage-1/2 cores in-Rust).
+    // See `row_inclusions.rs`.
+    m.add_function(wrap_pyfunction!(compute_row_inclusions_kernel, m)?)?;
+
+    // Deterministic validation-sampler core: per in-band section
+    // Fisher-Yates shuffle (one shared, threaded xoshiro256** stream) +
+    // floor(n/B)*B chunk + short-section drop, returning the flat kept
+    // variant indices, per-bunch CSR boundaries, owning section per bunch,
+    // and the advanced RNG state. See `variant_shuffle_chunk.rs`.
+    m.add_function(wrap_pyfunction!(variant_shuffle_chunk_kernel, m)?)?;
 
     Ok(())
 }

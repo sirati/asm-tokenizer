@@ -2,26 +2,28 @@
 
 Single concern: rewrite ``stage3_batch.identities_flat_caller_local`` IN
 PLACE from per-function caller-local ids to **variant-global counter
-ids per Category**, applying:
+ids per Category**. The remap LOGIC is a deterministic integer state
+machine that lives in the Rust kernel
+``dedup_hashmap.apply_remap_walk``; this module ADAPTS the referenced-
+variant object-tree into the kernel's flat int arrays
+(:func:`._flat_extract.extract_flat_remap_inputs`), drives the kernel,
+and emits the row-keyed FID sidecar from the kernel's per-row output.
+The kernel applies:
 
 * ALG-3 (FUNCTION categories — ``LOCAL_FUNC`` / ``PLT_FUNC`` /
-  ``EXT_FUNC``): hole-free dedup keyed on ``function_name_ptr``. One
-  ``HashMapU32U16`` per Category, reused across rows via ``clean()``
-  per the dedup-walk hot-path discipline (Rust hashmap allocations
-  would dominate otherwise).
+  ``EXT_FUNC``): hole-free dedup keyed on ``function_name_ptr``, one
+  per-row hashmap per FUNCTION Category (owned by the kernel).
 * ALG-4 (COUNTER categories — ``BLOCK`` / ``STRING_PTR`` /
   ``RO_DATA_PTR`` / ``RW_DATA_PTR`` / ``JUMP_TABLE``): pure offset bump
   per call_target, no dedup lookup.
+* ALG-9 prepend slots (the leading ``identity_slice.start`` entry for
+  each call_target): the self-counter is the kernel's dedup-map entry
+  for the call_target's ``function_name_ptr`` in its
+  ``encounter_category`` space.
 
-Prepend slots (the leading ``identity_slice.start`` entry for each
-call_target — ALG-9) are written here too, since the self-counter
-needed for the prepend is exactly the dedup map's entry for the
-call_target's ``function_name_ptr`` in its ``encounter_category``
-space, and that value is computed as part of this walk.
-
-This module owns ONLY the per-row remap; the token-tensor assembly +
-number-chunk sidecar concatenation + variant-padding policy live in
-their own stage-4 modules.
+This module owns ONLY the per-row remap adapter + sidecar emission; the
+token-tensor assembly + number-chunk sidecar concatenation + variant-
+padding policy live in their own stage-4 modules.
 
 Iteration order — variant-keyed walk + row-keyed FID sidecar
 ------------------------------------------------------------
@@ -65,23 +67,20 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from dedup_hashmap import HashMapU32U16
+from dedup_hashmap import apply_remap_walk
 
 from tokenizer.tokens import Category
 
 from .._row_expand import build_per_row_variant_lookup, concat_per_row
 from ._constants import (
-    COUNTER_CATEGORIES,
     FUNCTION_CATEGORIES,
+    ROOT_FUNC_SLOT,
 )
-from ._counter_bump import _bump_counter_category
-from ._function_remap import _remap_function_category
-from ._prepend_slot import _seed_local_func_root, _write_prepend_slot
-from ._row_state import _RowState
+from ._flat_extract import FlatRemapInputs, extract_flat_remap_inputs
 
 
 if TYPE_CHECKING:
-    from .._types import Stage3Batch, Stage3Variant
+    from .._types import Stage3Batch
 
 
 __all__ = ["apply_per_row_remap"]
@@ -90,8 +89,9 @@ __all__ = ["apply_per_row_remap"]
 def apply_per_row_remap(
     stage3_batch: "Stage3Batch",
     *,
-    dedup_maps: dict[Category, HashMapU32U16],
     collect_fid_sidecar: bool = False,
+    flat: Optional[FlatRemapInputs] = None,
+    variants_per_section: Optional[np.ndarray] = None,
 ) -> tuple[
     np.ndarray,
     Optional[np.ndarray],
@@ -102,23 +102,26 @@ def apply_per_row_remap(
 
     Two passes:
 
-    Pass 1 (variant-keyed) — walks every :class:`Stage3Variant` whose
-    ``stage1.batch_idx is not None`` (i.e. referenced by at least one
-    batch row). For each such variant:
+    Pass 1 (variant-keyed) — flattens every referenced
+    :class:`Stage3Variant` (``stage1.batch_idx is not None``) into the
+    Rust kernel's flat int arrays and runs
+    ``dedup_hashmap.apply_remap_walk``. The kernel, per variant in
+    encounter order over its call_targets (skipping
+    ``surviving_token_count == 0`` call_targets):
 
-    1. Reset the 3 FUNCTION-category hashmaps via ``clean()``.
-    2. Seed LOCAL_FUNC with ``{root.function_name_ptr: 0}``; reset
+    1. Seeds LOCAL_FUNC with ``{root.function_name_ptr: 0}``; resets
        per-Category COUNTER offsets to 0.
-    3. For each call_target in encounter order whose
-       ``surviving_token_count > 0``:
-         - Write the prepend slot (ALG-9: self-counter at
-           ``identity_slice.start``).
-         - Run ALG-3 dedup over every FUNCTION Category present in
-           the call_target's ``call_targets_section``; apply remap
-           to the in-stream identity slice (skipping the prepend).
-         - Run ALG-4 offset bump over every COUNTER Category; apply
-           offset to the in-stream identity slice.
-    4. Cache the per-variant FID inverse map for pass 2.
+    2. Writes the prepend slot (ALG-9: self-counter at
+       ``identity_slice.start``).
+    3. Runs ALG-3 dedup over every FUNCTION Category present in the
+       call_target's ``call_targets_section``; applies the remap to the
+       in-stream identity slice (skipping the prepend).
+    4. Runs ALG-4 offset bump over every COUNTER Category; applies the
+       offset to the in-stream identity slice.
+
+    The kernel returns the per-variant FID inverse map, reshaped here
+    into the ``(section_idx, slot_idx) -> {Category: array}`` cache that
+    pass 2 consumes.
 
     Pass 2 (row-keyed) — walks ``batch_idx_to_section_variant`` and
     emits the per-row FID sidecar contribution by looking up the
@@ -133,19 +136,33 @@ def apply_per_row_remap(
         Owns the batch-shared ``identities_flat_caller_local`` array
         that this function mutates IN PLACE. Returned unchanged in
         the function's first tuple element.
-    dedup_maps
-        Caller-provided pool: one :class:`HashMapU32U16` per FUNCTION
-        Category (LOCAL_FUNC, PLT_FUNC, EXT_FUNC). The caller owns
-        these so they can be reused across :func:`batch_decode` calls
-        (per the plan's Rust-allocation hot-path discipline).
-        ``clean()`` is called per row, NOT per batch — the caller can
-        pre-size each map with ``HashMapU32U16(capacity=expected_K)``.
     collect_fid_sidecar
         When True, returns ``fid_sidecar`` + ``fid_row_offsets``
         arrays per plan D5. Layout per row is the (LOCAL_FUNC,
         PLT_FUNC, EXT_FUNC) counter-id-sorted concatenation; the row
         is fully self-describing via ``fid_row_offsets``. Multi-mapped
         rows each get a full copy of the variant's sidecar content.
+    flat
+        Optionally, the pre-built :class:`FlatRemapInputs` for this
+        batch. The STAGED ``batch_decode`` path leaves this ``None`` and
+        flattens ``stage3_batch``'s real object tree here via
+        :func:`extract_flat_remap_inputs`. The vector dense path builds
+        the SAME flat arrays COLUMNAR from its already-computed dense +
+        catalog columns (:func:`...vector_batch._scatter._remap_inputs.
+        build_flat_remap_inputs`) and threads them in, skipping the
+        GIL-bound per-call-target tree walk. The ``row_keys`` MUST key
+        the same ``(section_idx, slot_idx)`` the pass-2 sidecar lookup
+        uses; both builders walk referenced variants in section -> slot
+        order, so they line up byte-for-byte.
+    variants_per_section
+        Optionally, the per-section variant counts pass 2 uses to build
+        the per-unique-variant sidecar cache + the per-row variant lookup.
+        The STAGED path leaves this ``None`` and reads it off
+        ``stage3_batch.sections``. The vector dense path lays ONE variant
+        per synthetic section (one section per non-padding row), so it
+        threads ``np.ones(n_rows, int)`` columnar -- pass 2 then never
+        reaches into the object tree. Must enumerate sections in the same
+        ``section_idx`` order ``flat.row_keys`` / the staged tree use.
 
     Returns
     -------
@@ -163,53 +180,57 @@ def apply_per_row_remap(
         number of FID sidecar entries the row contributes to each
         Category. Padding rows are ``(0, 0, 0)``.
     """
-    # Validate the dedup_maps shape: the caller must provide exactly
-    # one map per FUNCTION Category. A missing map is a wiring bug;
-    # surfacing it here keeps the per-row code free of the check.
-    for cat in FUNCTION_CATEGORIES:
-        if cat not in dedup_maps:
-            raise AssertionError(
-                f"apply_per_row_remap: dedup_maps is missing the "
-                f"required FUNCTION-Category map for {cat!r}; provide "
-                f"one HashMapU32U16 per Category in {FUNCTION_CATEGORIES}."
-            )
-
     identities_flat = stage3_batch.identities_flat_caller_local
     stage1_batch = stage3_batch.stage2.stage1
 
-    # Per-variant FID inverse cache keyed on (section_idx, slot_idx).
-    # Populated in pass 1 ONLY when the sidecar is requested — pass 1
-    # otherwise does not need to track the inverse map.
-    fid_inverse_per_variant: Optional[
-        dict[tuple[int, int], dict[Category, np.ndarray]]
-    ] = {} if collect_fid_sidecar else None
-
-    # ----- Pass 1: variant-keyed dedup walk. -----
-    for section_idx, stage3_section in enumerate(stage3_batch.sections):
-        for slot_idx, stage3_variant in enumerate(stage3_section.variants):
-            if stage3_variant.stage2.stage1.batch_idx is None:
-                # Variant slot not referenced by any batch row (RAGGED
-                # post-cutoff drop, or PAD_NULL / RESAMPLE empty-source
-                # fallback). Identity slice for every call_target has
-                # length 0 (stage 2's surviving counts dropped it), so
-                # there is nothing to remap.
-                continue
-
-            row_chunks = _walk_one_variant(
-                stage3_variant,
-                dedup_maps,
-                identities_flat,
-                collect_fid_sidecar=collect_fid_sidecar,
-            )
-            if fid_inverse_per_variant is not None:
-                fid_inverse_per_variant[(section_idx, slot_idx)] = row_chunks
+    # ----- Pass 1: variant-keyed dedup walk (Rust kernel). -----
+    # The remap LOGIC lives in ``dedup_hashmap.apply_remap_walk``; here we
+    # only adapt the object-tree subtree into the kernel's flat int arrays
+    # (:func:`extract_flat_remap_inputs`) and reshape the kernel's per-row
+    # FID inverse back into the ``(section_idx, slot_idx) -> {Category:
+    # array}`` cache that pass 2 consumes. The kernel owns its own per-row
+    # FUNCTION-Category hashmaps -- no caller-provided dedup-map pool.
+    if flat is None:
+        flat = extract_flat_remap_inputs(stage3_batch)
+    per_row_fid_inverse = apply_remap_walk(
+        flat.n_rows,
+        len(FUNCTION_CATEGORIES),
+        ROOT_FUNC_SLOT,
+        identities_flat,
+        flat.node_row,
+        flat.node_skip,
+        flat.node_prepend_pos,
+        flat.node_fid,
+        flat.node_enc_func_slot,
+        flat.ct_off,
+        flat.ct_fid,
+        flat.ct_func_slot,
+        flat.instream_off,
+        flat.instream_func_slot,
+        flat.instream_counter_slot,
+        flat.counter_counts,
+        collect_fid_sidecar,
+    )
 
     if not collect_fid_sidecar:
         return identities_flat, None, None, None
 
-    # ----- Pass 2: row-keyed FID sidecar emission. -----
-    assert fid_inverse_per_variant is not None  # for type-checker
+    # Reshape the per-row kernel output (list[list[u32 ndarray]], outer =
+    # row, inner = FUNCTION slot) into the per-variant cache keyed on
+    # ``(section_idx, slot_idx)``. The kernel's row order matches
+    # ``flat.row_keys`` (both walk referenced variants in section -> slot
+    # order); the inner per-slot order matches ``FUNCTION_CATEGORIES``.
+    assert per_row_fid_inverse is not None  # collect_fid_sidecar=True
+    fid_inverse_per_variant: dict[
+        tuple[int, int], dict[Category, np.ndarray]
+    ] = {}
+    for key, row_inverse in zip(flat.row_keys, per_row_fid_inverse):
+        fid_inverse_per_variant[key] = {
+            cat: np.asarray(row_inverse[slot], dtype=np.uint32)
+            for slot, cat in enumerate(FUNCTION_CATEGORIES)
+        }
 
+    # ----- Pass 2: row-keyed FID sidecar emission. -----
     # Build per-unique-variant flat sidecar arrays in section -> slot
     # order. Variants that pass 1 skipped (``batch_idx is None``) get
     # an empty u32 array -- they cannot be referenced by any batch row,
@@ -225,12 +246,20 @@ def apply_per_row_remap(
     # because the dedup walk extends each Category's inverse list by
     # exactly the count of fresh ids minted, so list length equals
     # ``next_fresh_id`` at the end of the walk.
+    # The per-section variant counts: read off the tree (staged) or
+    # threaded columnar (vector dense path, one variant per synthetic
+    # section), in ``section_idx`` order. Pass 2 reaches the object tree
+    # ONLY through this -- a threaded count fully decouples it.
+    section_variant_counts = (
+        [len(s.variants) for s in stage3_batch.sections]
+        if variants_per_section is None
+        else [int(n) for n in np.asarray(variants_per_section)]
+    )
+
     per_variant_sidecar: list[np.ndarray] = []
     per_variant_category_counts: list[tuple[int, int, int]] = []
-    variants_per_section: list[int] = []
-    for section_idx, stage3_section in enumerate(stage3_batch.sections):
-        variants_per_section.append(len(stage3_section.variants))
-        for slot_idx in range(len(stage3_section.variants)):
+    for section_idx, n_variants in enumerate(section_variant_counts):
+        for slot_idx in range(n_variants):
             per_variant = fid_inverse_per_variant.get(
                 (section_idx, slot_idx)
             )
@@ -250,7 +279,7 @@ def apply_per_row_remap(
             )
 
     per_row_variant_idx, is_padding = build_per_row_variant_lookup(
-        stage1_batch.batch_idx_to_section_variant, variants_per_section
+        stage1_batch.batch_idx_to_section_variant, section_variant_counts
     )
     fid_sidecar, fid_row_offsets = concat_per_row(
         per_variant_sidecar,
@@ -293,85 +322,3 @@ def _expand_per_category_counts_to_rows(
         np.uint32(0),
         per_row,
     ).astype(np.uint32, copy=False)
-
-
-def _walk_one_variant(
-    stage3_variant: "Stage3Variant",
-    dedup_maps: dict[Category, HashMapU32U16],
-    identities_flat: np.ndarray,
-    *,
-    collect_fid_sidecar: bool,
-) -> dict[Category, np.ndarray]:
-    """Per-variant dedup walk.
-
-    Runs the per-Category dedup + prepend write pipeline over one
-    variant's call_targets (in encounter order). Mutates
-    ``identities_flat`` in place. Returns a dict from FUNCTION
-    Category to the per-variant inverse-map array
-    (``u32[counter_count]``: ``counter_id -> function_name_ptr``, in
-    dense counter-id order). When ``collect_fid_sidecar=False``, each
-    entry is an empty u32 array — the dict shape is preserved so the
-    caller's concatenation path stays uniform.
-
-    The dedup state (FUNCTION hashmaps + :class:`_RowState`) is
-    reset per call to this function. Under multi-row mapping the
-    caller invokes this ONCE per unique variant; the per-row sidecar
-    contribution is the same as the per-variant inverse map (the
-    dedup walk is deterministic given the variant's call_targets
-    encounter order + fresh-state-per-row contract).
-    """
-    # Reset the FUNCTION dedup maps for this variant. ``clean()``
-    # retains the hashmap's bucket allocation per the plan's hot-path
-    # discipline.
-    for cat in FUNCTION_CATEGORIES:
-        dedup_maps[cat].clean()
-
-    state = _RowState(collect_fid_sidecar=collect_fid_sidecar)
-
-    # Plan ALG-3 + ALG-9: seed LOCAL_FUNC with the root function's FID
-    # at counter id 0. The root is ``call_targets[0]`` per plan D9.
-    root_call_target = stage3_variant.call_targets[0]
-    root_fn_name_ptr = int(
-        root_call_target.stage2.stage1.function_name_ptr
-    )
-    _seed_local_func_root(
-        state, dedup_maps[Category.LOCAL_FUNC], root_fn_name_ptr
-    )
-
-    for call_target in stage3_variant.call_targets:
-        if call_target.stage2.surviving_token_count == 0:
-            # Cut by context_len at this call_target's boundary or
-            # later — no surviving tokens, no remap work.
-            continue
-
-        # Prepend first: the prepend slot's self-counter lives in the
-        # dedup map for ``encounter_category``, which was populated by
-        # either the variant-level seed (for the root) or the parent
-        # call_target's ALG-3 walk (for inlined callees). The
-        # call_target's own ALG-3 walk happens after, so the prepend
-        # write reads a counter the map already holds before the walk
-        # mints any new ids for THIS call_target.
-        _write_prepend_slot(dedup_maps, call_target, identities_flat)
-
-        for cat in FUNCTION_CATEGORIES:
-            _remap_function_category(
-                state,
-                dedup_maps[cat],
-                cat,
-                call_target,
-                identities_flat,
-            )
-
-        # COUNTER Categories: ALG-4 offset bump. Order is independent
-        # of FUNCTION dedup since the two groups address disjoint
-        # shifted token ids.
-        for cat in COUNTER_CATEGORIES:
-            _bump_counter_category(state, cat, call_target, identities_flat)
-
-    # Snapshot the per-Category inverse maps for the fid sidecar.
-    if state.fid_inverse is not None:
-        return {
-            cat: np.asarray(state.fid_inverse[cat], dtype=np.uint32)
-            for cat in FUNCTION_CATEGORIES
-        }
-    return {cat: np.zeros(0, dtype=np.uint32) for cat in FUNCTION_CATEGORIES}

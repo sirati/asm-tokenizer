@@ -22,13 +22,20 @@ adjacency; neither touches ``_data.bin``.
 
 Package layout:
 
-* :mod:`._row_inclusion` -- the immutable :class:`RowInclusion` result.
+* :mod:`._row_inclusion` -- the :class:`RowInclusion` record + the lazy
+  :class:`RowInclusionView` over the flat CSR.
 * :mod:`._bfs` -- the level-synchronous subset / full-set BFS passes.
-* :mod:`._compute` -- the per-row drive (:func:`compute_row_inclusions`).
+* :mod:`._compute` -- the per-row drive (:func:`compute_row_inclusions`),
+  which returns the flat :class:`InclusionCSR`.
 """
 
-from ._compute import compute_row_inclusions
-from ._row_inclusion import RowInclusion
+from ._compute import InclusionCSR, compute_row_inclusions
+from ._row_inclusion import RowInclusion, RowInclusionView
 
 
-__all__ = ["RowInclusion", "compute_row_inclusions"]
+__all__ = [
+    "InclusionCSR",
+    "RowInclusion",
+    "RowInclusionView",
+    "compute_row_inclusions",
+]

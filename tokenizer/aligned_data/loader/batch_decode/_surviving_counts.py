@@ -62,6 +62,8 @@ import numpy as np
 
 from tokenizer.token_manager import VocabularyManager
 
+from ._family_band_reduction import family_band_reduction
+
 
 __all__ = ["SurvivingCounts", "count_surviving", "count_surviving_batched"]
 
@@ -218,36 +220,15 @@ def count_surviving_batched(
         zeros = np.zeros(max(n_nodes, 0), dtype=np.int64)
         return zeros, zeros.copy()
 
-    # Per-flat-position owning node id (CSR -> dense via repeat) and the
-    # position's offset within its node.
-    node_len = np.diff(node_offsets)
-    node_id = np.repeat(np.arange(n_nodes, dtype=np.int64), node_len)
-    pos = np.arange(expanded_flat.shape[0], dtype=np.int64)
-    offset_in_node = pos - node_offsets[node_id]
-
-    # A position counts iff it falls in the node's surviving prefix
-    # (offset < clamped surviving length). The clamp to node length is
-    # implicit: offsets only range over the node's own span, so an
-    # over-long ``surviving`` simply includes the whole node.
-    surviving = np.asarray(surviving_token_counts, dtype=np.int64)
-    within = offset_in_node < surviving[node_id]
-
-    ids = expanded_flat
-    identity_mask = (
-        (ids >= _IDENTITY_BAND_LO_SHIFTED)
-        & (ids < _IDENTITY_BAND_HI_SHIFTED)
-        & within
+    # Thin adapter over the shared segmented band-reduction kernel: the
+    # IDENTITY-band / NUMBER-band cardinalities are the first two columns of
+    # the single pass. The preamble (node_id / offset_in_node / surviving
+    # clip) and both band masks live once in the kernel -- never re-derived
+    # here.
+    result = family_band_reduction(
+        expanded_flat, node_offsets, surviving_token_counts
     )
-    number_mask = (
-        (ids >= _NUMBER_BAND_LO_SHIFTED)
-        & (ids < _NUMBER_BAND_HI_SHIFTED)
-        & within
+    return (
+        result.surviving_identity_count,
+        result.surviving_number_chunk_count,
     )
-
-    surviving_identity_count = np.bincount(
-        node_id[identity_mask], minlength=n_nodes
-    ).astype(np.int64)
-    surviving_number_chunk_count = np.bincount(
-        node_id[number_mask], minlength=n_nodes
-    ).astype(np.int64)
-    return surviving_identity_count, surviving_number_chunk_count

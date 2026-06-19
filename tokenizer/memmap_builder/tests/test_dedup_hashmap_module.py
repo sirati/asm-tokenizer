@@ -26,7 +26,28 @@ from dedup_hashmap import (
     HashMapU32U16,
     HashMapU32U32,
     HashMapU64U32,
+    segment_distinct_count,
 )
+
+
+def _numpy_segment_distinct(node, ids, n_nodes):
+    """Reference: per-segment distinct count via the global-unique path.
+
+    Mirrors the byte-identity reference the loader's category-counts
+    module keeps behind ``_USE_NUMPY_SEGMENT_DISTINCT``: one global
+    ``np.unique`` over the composite ``node * 2^16 + id`` key, then
+    ``bincount`` of the surviving node labels.
+    """
+    out = np.zeros(n_nodes, dtype=np.int64)
+    node = np.asarray(node, dtype=np.int64)
+    ids = np.asarray(ids, dtype=np.int64)
+    if node.size == 0:
+        return out
+    key = node * np.int64(1 << 16) + ids
+    distinct_node = np.unique(key) >> np.int64(16)
+    counts = np.bincount(distinct_node, minlength=n_nodes)
+    out[: counts.size] = counts.astype(np.int64)
+    return out
 
 
 class TestHashMapU64U32:
@@ -279,3 +300,53 @@ class TestHashMapBoolBool:
         assert out.dtype == np.bool_
         assert out[0]
         assert not out[1]
+
+
+class TestSegmentDistinctCount:
+    """Per-segment distinct-value count kernel (np.unique replacement)."""
+
+    def test_empty(self) -> None:
+        out = segment_distinct_count(
+            np.array([], dtype=np.int64), np.array([], dtype=np.int64), 3
+        )
+        assert out.dtype == np.int64
+        assert out.tolist() == [0, 0, 0]
+
+    def test_single_segment_dups(self) -> None:
+        node = np.array([0, 0, 0, 0, 0], dtype=np.int64)
+        ids = np.array([5, 5, 7, 5, 7], dtype=np.int64)
+        assert segment_distinct_count(node, ids, 1).tolist() == [2]
+
+    def test_segment_with_gap_stays_zero(self) -> None:
+        node = np.array([0, 0, 2, 2, 2], dtype=np.int64)
+        ids = np.array([9, 9, 1, 2, 1], dtype=np.int64)
+        # seg0 {9}=1, seg1 (no elements)=0, seg2 {1,2}=2.
+        assert segment_distinct_count(node, ids, 3).tolist() == [1, 0, 2]
+
+    def test_same_id_across_segments_independent(self) -> None:
+        node = np.array([0, 1, 0, 1], dtype=np.int64)
+        ids = np.array([4, 4, 4, 4], dtype=np.int64)
+        assert segment_distinct_count(node, ids, 2).tolist() == [1, 1]
+
+    def test_byte_identical_to_numpy_reference(self) -> None:
+        rng = np.random.default_rng(7)
+        n_nodes = 53
+        node = rng.integers(0, n_nodes, size=20000).astype(np.int64)
+        ids = rng.integers(0, 64, size=20000).astype(np.int64)
+        rust = segment_distinct_count(node, ids, n_nodes)
+        ref = _numpy_segment_distinct(node, ids, n_nodes)
+        assert np.array_equal(rust, ref)
+
+    def test_out_of_range_label_raises(self) -> None:
+        node = np.array([0, 2], dtype=np.int64)
+        ids = np.array([1, 1], dtype=np.int64)
+        with pytest.raises(ValueError):
+            segment_distinct_count(node, ids, 2)
+
+    def test_length_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError):
+            segment_distinct_count(
+                np.array([0, 1], dtype=np.int64),
+                np.array([0], dtype=np.int64),
+                2,
+            )

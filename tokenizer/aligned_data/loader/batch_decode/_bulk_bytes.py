@@ -43,12 +43,19 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dedup_hashmap import build_carrier_signs_kernel
+
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
-from ._flat_call_targets import surviving_call_targets
+from ._dense_columns import DenseColumns
+from ._flat_call_targets import dense_columns_from_stage2
 from ._fp_normalize import normalize_per_token_type
-from ._identity_decode import build_identity_idx_2d, view_cast_identities
+from ._identity_decode import (
+    build_identity_idx_2d,
+    scatter_in_stream_identities,
+    view_cast_identities,
+)
 from ._inline_bytes import build_inline_bytes
 from ._number_decode import build_number_idx_2d
 from ._types import (
@@ -59,6 +66,7 @@ from ._types import (
 )
 
 if TYPE_CHECKING:
+    from ._identity_decode import IdentitySlicesCSR
     from ._types import (
         Stage2Batch,
         Stage2Section,
@@ -99,6 +107,9 @@ _NUMBER_BLOCK_TOKEN_TYPES: tuple[TokenType, ...] = (
 
 def build_bulk_bytes(
     stage2: "Stage2Batch",
+    dense: "DenseColumns | None" = None,
+    *,
+    build_hierarchy: "bool | None" = None,
 ) -> Stage3Batch:
     """Compose 3a + 3b + 3c + 3d into a :class:`Stage3Batch`.
 
@@ -113,23 +124,47 @@ def build_bulk_bytes(
         Output of stage 2 (length-predict + cutoff walk). Provides the
         4-level hierarchy + per-call-target expanded streams + masks +
         surviving counts.
+    dense
+        The shared :class:`DenseColumns` front-matter, when a caller has
+        already built it (the vector dense path builds it ONCE from the
+        ``BatchedExpansion``, collapsing the four tree-walks). Omitted by
+        the staged ``batch_decode`` path, which builds it here with a
+        single DFS walk of ``stage2``.
+    build_hierarchy
+        Whether to assemble the per-call-target ``Stage3Section`` tree
+        (step 9+10). ``None`` (default) derives it from ``dense``: the
+        VECTOR dense path supplies ``dense`` AND threads its own columnar
+        ``variants_per_section`` / ``numbers`` downstream, so the tree is
+        vestigial there and is SKIPPED (``Stage3Batch.sections == ()``);
+        the STAGED path leaves ``dense`` ``None`` and builds the tree (its
+        ``assemble_batch`` walks ``stage3.sections``). The equivalence
+        gates pass ``True`` WITH a ``dense`` to rebuild the full tree as
+        their tree-walk oracle.
 
     Returns
     -------
     Stage3Batch
-        Level-1 batch with batch-shared bulk arrays + the 4-level
-        Stage3 mirror carrying per-call-target slices into them.
+        Level-1 batch with batch-shared bulk arrays + (when built) the
+        4-level Stage3 mirror carrying per-call-target slices into them.
     """
+    columnar = dense is not None
+    if build_hierarchy is None:
+        # Default: build the tree exactly when no columnar ``dense`` was
+        # supplied (the STAGED path). The vector dense path supplies
+        # ``dense`` -> skips the vestigial tree.
+        build_hierarchy = not columnar
+    if dense is None:
+        dense = dense_columns_from_stage2(stage2)
 
     # 1. inline_bytes (3a): per-call-target u8 byte slices into a flat
     #    buffer with a leading zero pad at index 0.
-    inline_bytes, inline_byte_slices = build_inline_bytes(stage2)
+    inline_bytes, inline_byte_slices = build_inline_bytes(dense)
 
     # 2. identity idx_2d (3b): u32[N_in_stream, 2] of byte offsets into
     #    inline_bytes; per-call-target identity_slices INCLUDE the
     #    prepend slot at slice.start.
     identity_idx_2d, identity_slices = build_identity_idx_2d(
-        stage2, inline_bytes, inline_byte_slices
+        dense, inline_bytes, inline_byte_slices
     )
 
     # 3. view-cast 3b's idx_2d to u16 in-stream caller-local ids. NO
@@ -140,14 +175,14 @@ def build_bulk_bytes(
     )
 
     # 4. number idx_2d (3c): per-TokenType u32[n_chunks_of_T, payload_T]
-    #    arrays + per-call-target chunk slices + sidecars (NaN/Inf
-    #    dispatch flag + VC2 chunk-exponent indices).
+    #    arrays + per-call-target chunk-slice CSR boundaries + sidecars
+    #    (NaN/Inf dispatch flag + VC2 chunk-exponent indices).
     (
         idx_2d_per_type,
-        number_chunk_slices_per_type,
+        number_chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_chunk_exponent_sidecar,
-    ) = build_number_idx_2d(stage2, inline_bytes, inline_byte_slices)
+    ) = build_number_idx_2d(dense, inline_bytes, inline_byte_slices)
 
     # 5. Per-source signs grouped by TokenType, in the same stream-source
     #    order the per-type idx_2d arrays use. Reads
@@ -157,7 +192,7 @@ def build_bulk_bytes(
     #    expands per-source to per-chunk via the
     #    ``vc2_chunk_exponent_sidecar``.
     is_negative_per_source_per_type = _collect_is_negative_per_source_per_type(
-        stage2
+        dense
     )
 
     # 6. Vectorised per-TokenType FP normalisation (3d).
@@ -169,58 +204,43 @@ def build_bulk_bytes(
         is_negative_per_source_per_type=is_negative_per_source_per_type,
     )
 
-    # 7. Allocate the level-1 identities array. Length = sum of each
-    #    call_target's ``surviving_identity_count`` (which already
-    #    INCLUDES the +1 prepend per Stage 2's count semantics). Prepend
-    #    slots stay 0; stage 4 writes them per ALG-9.
-    total_surviving_identity_tokens = (
-        identity_slices[-1].stop if identity_slices else 0
+    # 7 + 8. Allocate the level-1 identities array (length = sum of each
+    #    call_target's ``surviving_identity_count``, which already INCLUDES
+    #    the +1 prepend per Stage 2's count semantics; prepend slots stay 0
+    #    for stage 4 per ALG-9) and scatter the in-stream u16 ids into the
+    #    POST-PREPEND sub-range ``[start + 1 : stop]`` of every surviving
+    #    call_target. The 3b walk's emission order is "all in-stream
+    #    identities of call_target 0, then 1, ..." -- the identity CSR
+    #    drives the vectorised cumulative-offset scatter in a single
+    #    fancy-index assignment (no per-call_target Python loop).
+    identities_flat_caller_local = scatter_in_stream_identities(
+        identity_slices, identities_in_stream
     )
-    identities_flat_caller_local = np.zeros(
-        total_surviving_identity_tokens, dtype=np.uint16
-    )
-
-    # 8. Scatter in-stream u16 ids into the post-prepend sub-slice of
-    #    each call_target's identity_slice. The 3b walk's emission order
-    #    is "all in-stream identities of call_target 0, then 1, then 2,
-    #    ..." -- a flat list whose per-call-target lengths are
-    #    ``surviving_identity_count - 1`` for surviving call_targets and
-    #    0 for fully-dropped ones. We re-derive the per-call-target
-    #    cumulative offsets from the identity_slices and copy in one
-    #    pass per call_target (no per-token loop).
-    in_stream_cursor = 0
-    for sl in identity_slices:
-        slice_len = sl.stop - sl.start
-        if slice_len == 0:
-            continue
-        # In a surviving call_target the slice is [prepend, in_stream_0,
-        # in_stream_1, ...]; slot 0 = prepend (stage 4), slots 1..end =
-        # in-stream caller-local ids from the view-cast.
-        in_stream_len = slice_len - 1
-        if in_stream_len > 0:
-            identities_flat_caller_local[sl.start + 1 : sl.stop] = (
-                identities_in_stream[
-                    in_stream_cursor : in_stream_cursor + in_stream_len
-                ]
-            )
-            in_stream_cursor += in_stream_len
-    # Sanity: the view-cast emitted exactly as many u16s as we scattered.
-    if in_stream_cursor != identities_in_stream.shape[0]:
-        raise AssertionError(
-            f"identity in-stream count mismatch: scattered "
-            f"{in_stream_cursor} u16 ids but the view-cast produced "
-            f"{identities_in_stream.shape[0]}"
-        )
 
     # 9 + 10. Assemble the per-call-target / per-variant / per-section
     #         wrappers. DFS encounter order matches every sub-stage's
     #         output, so a single positional cursor lines up the slice
     #         lookups.
-    sections = _assemble_hierarchy(
-        stage2=stage2,
-        inline_byte_slices=inline_byte_slices,
-        identity_slices=identity_slices,
-        number_chunk_slices_per_type=number_chunk_slices_per_type,
+    #
+    # SKIPPED on the vector dense path (``build_hierarchy`` False): that
+    # path's downstream consumers (the per-row remap + the number-chunk
+    # stream) read the columnar front-matter (the threaded
+    # ``variants_per_section`` / ``numbers``), NOT these ``Stage3Section``
+    # wrappers -- so the per-call-target hierarchy build (the ~24.7%
+    # GIL-held Stage2/Stage3 tree ctor loop) is vestigial there and is
+    # dropped (step-5 object-tree elimination). The STAGED ``batch_decode``
+    # path keeps the full assembly (its ``assemble_batch`` walks
+    # ``stage3.sections``); the equivalence gates also request it (with a
+    # ``dense``) to rebuild the tree-walk oracle.
+    sections = (
+        _assemble_hierarchy(
+            stage2=stage2,
+            inline_byte_slices=inline_byte_slices,
+            identity_slices=identity_slices,
+            number_chunk_boundaries_per_type=number_chunk_boundaries_per_type,
+        )
+        if build_hierarchy
+        else ()
     )
 
     return Stage3Batch(
@@ -231,9 +251,32 @@ def build_bulk_bytes(
         numbers_per_TokenType=numbers_per_TokenType,
         identity_idx_2d=identity_idx_2d,
         number_idx_2d_per_TokenType=idx_2d_per_type,
+        number_chunk_slice_starts_per_type=_chunk_slice_starts(
+            number_chunk_boundaries_per_type
+        ),
         vc2_chunk_exponent_sidecar=vc2_chunk_exponent_sidecar,
         f128_is_nan_or_inf=f128_is_nan_or_inf,
     )
+
+
+def _chunk_slice_starts(
+    number_chunk_boundaries_per_type: dict[TokenType, np.ndarray],
+) -> dict[TokenType, np.ndarray]:
+    """Flatten the per-call_target chunk boundaries to their ``.start`` arrays.
+
+    The columnar twin of :attr:`Stage3CallTarget.number_chunk_slices`'
+    ``.start`` -- one ``int64[n_total_cts]`` per :class:`TokenType`, in the
+    DFS call_target order :func:`_reconstruct_per_ct_boundaries` built. The
+    per-call_target slice ``.start`` IS the abutting CSR boundary
+    ``bnd[i]``, so the flat starts are the boundary array minus its final
+    sentinel (``bnd[:-1]``). Exposed flat on :class:`Stage3Batch` so the
+    vector dense path's number-sidecar concat reads the chunk-slice bases
+    without re-walking the object tree.
+    """
+    return {
+        token_type: np.asarray(boundaries[:-1], dtype=np.int64)
+        for token_type, boundaries in number_chunk_boundaries_per_type.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +285,7 @@ def build_bulk_bytes(
 
 
 def _collect_is_negative_per_source_per_type(
-    stage2: "Stage2Batch",
+    dense: "DenseColumns",
 ) -> dict[TokenType, np.ndarray]:
     """Group per-source ``is_negative`` flags by :class:`TokenType`.
 
@@ -277,7 +320,7 @@ def _collect_is_negative_per_source_per_type(
     a single global gather recovers every carrier's raw position.
     """
 
-    carrier_block_idx, carrier_signs = _batched_carrier_signs(stage2)
+    carrier_block_idx, carrier_signs = _batched_carrier_signs(dense)
 
     out: dict[TokenType, np.ndarray] = {}
     for block_idx, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
@@ -290,124 +333,38 @@ def _collect_is_negative_per_source_per_type(
 
 
 def _batched_carrier_signs(
-    stage2: "Stage2Batch",
+    dense: "DenseColumns",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """One-pass carrier ``(block_idx, sign)`` over all call_targets.
+    """One-pass carrier ``(block_idx, sign)`` over all kept nodes.
 
     Returns two parallel ``int64`` / ``bool`` arrays in DFS-then-stream
     encounter order: ``carrier_block_idx`` (0 = VC2, 1 = F16, ..., 6 =
     F128) and ``carrier_signs`` (the per-source negative flag). Painted
-    continuation slots and the per-call_target prepend slot contribute no
-    entries (a painted slot borrows its carrier's raw position; the
-    prepend lives in the IDENTITY band).
+    continuation slots and the per-node prepend slot contribute no entries
+    (a painted slot borrows its carrier's raw position; the prepend lives
+    in the IDENTITY band).
+
+    GIL-released (B-S3): the per-kept-node Python gather loop (slicing
+    ``expanded[1:surviving]`` + ``np.nonzero(real_mask)`` per node, then
+    the segmented ``cumsum(is_real) - 1`` carrier walk) is now a single
+    ``py.detach`` Rust kernel reading the flat :class:`DenseColumns`
+    columns directly. The kernel reproduces the same arithmetic the numpy
+    path did, in the same kept-DFS-then-stream order, byte-identically.
     """
-    kept, _kept_idx = surviving_call_targets(stage2)
-    if not kept:
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.bool_),
-        )
-
-    # --- flat ``expanded[1:surviving]`` concatenation (slot 0 dropped) ---
-    expanded_chunks: list[np.ndarray] = []
-    painted_chunks: list[np.ndarray] = []
-    # --- flat per-call_target ``real_positions`` + ``is_negative`` ---
-    real_pos_chunks: list[np.ndarray] = []
-    is_neg_chunks: list[np.ndarray] = []
-    exp_seg_len = np.empty(len(kept), dtype=np.int64)
-    real_seg_base = np.empty(len(kept), dtype=np.int64)
-
-    real_running = 0
-    for i, ct in enumerate(kept):
-        surviving = int(ct.surviving_token_count)
-        state = ct.stage1.state
-        expanded_chunks.append(
-            ct.expanded_token_ids[1:surviving].astype(np.int64, copy=False)
-        )
-        painted_chunks.append(
-            ct.extra_value_v2_mask[1:surviving]
-            | ct.extra_f128_mask[1:surviving]
-        )
-        exp_seg_len[i] = max(surviving - 1, 0)
-        real_positions = np.nonzero(state.real_mask)[0]
-        real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
-        is_neg_chunks.append(
-            state.is_negative_per_position[real_positions]
-        )
-        real_seg_base[i] = real_running
-        real_running += int(real_positions.shape[0])
-
-    expanded_flat = np.concatenate(expanded_chunks)
-    is_painted_flat = np.concatenate(painted_chunks)
-    is_real_flat = ~is_painted_flat
-    real_pos_flat = np.concatenate(real_pos_chunks)
-    is_neg_at_real_flat = np.concatenate(is_neg_chunks)
-
-    if expanded_flat.shape[0] == 0:
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.bool_),
-        )
-
-    # CSR over the expanded-prefix axis (segment i = call_target i). A
-    # kept call_target with ``surviving == 1`` has a ZERO-LENGTH body
-    # segment (its only surviving slot is the prepend, dropped from the
-    # ``[1:surviving]`` body axis); ``np.repeat`` over the per-segment
-    # lengths yields the per-slot segment id correctly even for those empty
-    # segments (the mark-and-cumsum CSR expansion would silently MERGE
-    # consecutive zero-length boundaries, shifting all later segment ids).
-    exp_seg_offsets = np.zeros(len(kept) + 1, dtype=np.int64)
-    np.cumsum(exp_seg_len, out=exp_seg_offsets[1:])
-    seg_id = np.repeat(np.arange(len(kept), dtype=np.int64), exp_seg_len)
-
-    # SEGMENTED ``cumsum(is_real) - 1`` per call_target. A global cumsum
-    # carries the running real-count across segment boundaries; subtract
-    # the cumulative value carried in at each segment's exclusive start to
-    # reset it to the per-call_target ``cumsum(is_real) - 1`` the scalar
-    # walk uses. The per-segment carry-in is the INCLUSIVE global cum at
-    # the previous flat element (0 for the first segment), broadcast over
-    # the segment via ``seg_id``. ``global_cum_excl`` is the exclusive
-    # prefix sum, so its value at each segment's first flat index is
-    # exactly that carry-in.
-    is_real_i64 = is_real_flat.astype(np.int64)
-    global_cum = np.cumsum(is_real_i64)
-    global_cum_excl = global_cum - is_real_i64
-    # ``seg_carry_in[seg]`` = exclusive global cum at the segment's first
-    # element. ``exp_seg_offsets[:-1]`` is the first flat index of each
-    # segment; for a zero-length segment that index coincides with the
-    # next segment's start (no flat element belongs to it, so it is never
-    # read through ``seg_id`` anyway). Trailing zero-length segments would
-    # push the index to ``total``; clip to keep the gather in-bounds (the
-    # clipped value is unused).
-    first_idx = np.minimum(
-        exp_seg_offsets[:-1], int(global_cum_excl.shape[0]) - 1
+    block_idx, signs = build_carrier_signs_kernel(
+        np.ascontiguousarray(dense.expanded, dtype=np.uint16),
+        np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.node_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.is_negative_per_position, dtype=np.bool_),
+        np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
+        np.ascontiguousarray(dense.kept_node_index, dtype=np.int64),
+        int(_NUMBER_BAND_LO_SHIFTED),
+        int(_NUMBER_BAND_HI_SHIFTED),
     )
-    seg_carry_in = global_cum_excl[first_idx]
-    real_idx_inclusive = global_cum - 1 - seg_carry_in[seg_id]
-
-    # NUMBER-band non-painted carriers.
-    in_number_band = (expanded_flat >= _NUMBER_BAND_LO_SHIFTED) & (
-        expanded_flat < _NUMBER_BAND_HI_SHIFTED
-    )
-    carrier_mask = in_number_band & is_real_flat
-    if not carrier_mask.any():
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.bool_),
-        )
-
-    carrier_seg = seg_id[carrier_mask]
-    # Global index into the concatenated ``real_pos`` / ``is_neg`` arrays
-    # = per-call_target base + per-call_target real index.
-    carrier_real_global = (
-        real_seg_base[carrier_seg]
-        + real_idx_inclusive[carrier_mask]
-    )
-    carrier_signs = is_neg_at_real_flat[carrier_real_global]
-    carrier_block_idx = (
-        expanded_flat[carrier_mask] - _NUMBER_BAND_LO_SHIFTED
-    )
-    return carrier_block_idx, carrier_signs
+    return block_idx, signs
 
 
 # ---------------------------------------------------------------------------
@@ -419,14 +376,19 @@ def _assemble_hierarchy(
     *,
     stage2: "Stage2Batch",
     inline_byte_slices: list[slice],
-    identity_slices: list[slice],
-    number_chunk_slices_per_type: dict[TokenType, list[slice]],
+    identity_slices: "IdentitySlicesCSR",
+    number_chunk_boundaries_per_type: dict[TokenType, np.ndarray],
 ) -> list[Stage3Section]:
     """Build the level-2 / level-3 / level-4 Stage3 wrappers.
 
-    All per-call-target slice lists are in DFS encounter order; we walk
-    the stage-2 hierarchy in the same order so a single positional
-    cursor lines up each call_target's slice lookups.
+    All per-call-target geometry is in DFS encounter order; we walk the
+    stage-2 hierarchy in the same order so a single positional cursor
+    lines up each call_target's lookups. The per-:class:`TokenType`
+    chunk ranges arrive as CSR boundary arrays; the per-call_target
+    ``slice`` objects :class:`Stage3CallTarget` exposes are materialised
+    leaf-locally here (the only consumer that needs ``slice`` objects --
+    the staged tree-walk -- and the only path that builds this hierarchy
+    at all, ``build_hierarchy``), keeping them off the vector hot path.
     """
     ct_cursor = 0
     sections: list[Stage3Section] = []
@@ -436,7 +398,10 @@ def _assemble_hierarchy(
             stage3_cts: list[Stage3CallTarget] = []
             for stage2_ct in stage2_variant.call_targets:
                 per_type_slice: dict[TokenType, slice] = {
-                    T: number_chunk_slices_per_type[T][ct_cursor]
+                    T: slice(
+                        int(number_chunk_boundaries_per_type[T][ct_cursor]),
+                        int(number_chunk_boundaries_per_type[T][ct_cursor + 1]),
+                    )
                     for T in _NUMBER_BLOCK_TOKEN_TYPES
                 }
                 stage3_cts.append(

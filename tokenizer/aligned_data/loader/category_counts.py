@@ -24,12 +24,39 @@ side ``FunctionData.metadata["category_counts"]`` contract.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
+
+from dedup_hashmap import category_distinct_count, segment_distinct_count
 
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import Category
 
 from .decoded._inline_decode_state import build_inline_decode_state
+
+
+# Bring-up flag: when set, the per-node distinct-count reduction in
+# :func:`_count_distinct_caller_local_ids_per_node` falls back to the
+# global ``np.unique`` + ``bincount`` path instead of the Rust
+# per-segment kernel. The two are byte-identical (set-semantics); the
+# flag exists only so the numpy reference stays exercisable for the
+# byte-identity gate during bring-up. Default = Rust.
+_USE_NUMPY_SEGMENT_DISTINCT = bool(
+    os.environ.get("CATEGORY_COUNTS_NUMPY_UNIQUE")
+)
+
+
+# Bring-up flag: when set, :func:`category_counts_from_runlen_batched`
+# performs the carrier-locate + ALG-5 payload decode + per-node distinct
+# reduction in numpy (per Category, via
+# :func:`_count_distinct_caller_local_ids_per_node`) instead of the fused
+# GIL-free :func:`dedup_hashmap.category_distinct_count` Rust kernel. The
+# two are byte-identical; the flag pins the numpy prep as the reference
+# oracle for the byte-identity gate. Default = Rust.
+_USE_NUMPY_CATEGORY_DISTINCT = bool(
+    os.environ.get("CATEGORY_COUNTS_NUMPY_PREP")
+)
 
 
 __all__ = [
@@ -194,11 +221,37 @@ def category_counts_from_runlen_batched(
     runlen_number_flat = np.asarray(runlen_number_flat).reshape(-1)
     rec = np.asarray(record_offsets, dtype=np.int64).reshape(-1)
     n_nodes = int(rec.size) - 1
+
+    if _USE_NUMPY_CATEGORY_DISTINCT:
+        # Reference path (flag-gated): per-Category numpy carrier-locate +
+        # ALG-5 decode + per-node distinct reduction. Pinned as the oracle
+        # the fused kernel must stay byte-identical to.
+        return {
+            category: _count_distinct_caller_local_ids_per_node(
+                raw_flat, runlen_number_flat, rec, n_nodes, carrier_id
+            )
+            for category, carrier_id in _COUNTER_CATEGORY_TO_RAW_ID.items()
+        }
+
+    # Fused GIL-free path: decode every Category's carriers + reduce to
+    # per-node distinct counts in ONE detached CSR walk. The kernel returns
+    # ``int64[n_categories, n_nodes]`` row-major in the carrier-id order it
+    # received; row ``c`` is category ``COUNTER_CATEGORIES[c]``.
+    carrier_ids = np.fromiter(
+        _COUNTER_CATEGORY_TO_RAW_ID.values(),
+        dtype=np.uint16,
+        count=len(_COUNTER_CATEGORY_TO_RAW_ID),
+    )
+    grid = category_distinct_count(
+        raw_flat,
+        np.ascontiguousarray(runlen_number_flat, dtype=np.uint16),
+        rec,
+        carrier_ids,
+        n_nodes,
+    )
     return {
-        category: _count_distinct_caller_local_ids_per_node(
-            raw_flat, runlen_number_flat, rec, n_nodes, carrier_id
-        )
-        for category, carrier_id in _COUNTER_CATEGORY_TO_RAW_ID.items()
+        category: grid[row]
+        for row, category in enumerate(_COUNTER_CATEGORY_TO_RAW_ID)
     }
 
 
@@ -215,8 +268,11 @@ def _count_distinct_caller_local_ids_per_node(
     over every node at once. Carrier positions are located in the flat
     stream, attributed to their owning node via the CSR ``record_offsets``,
     decoded per the ALG-5 payload-width table (0/1/2 bytes), and the
-    distinct ``(node, id)`` pairs are reduced to a per-node count by a
-    single ``unique`` + ``bincount``.
+    distinct ``(node, id)`` pairs are reduced to a per-node count by the
+    per-segment :func:`dedup_hashmap.segment_distinct_count` Rust kernel
+    (per-node hash-sets, no global sort). The numpy global-``unique`` +
+    ``bincount`` path is kept byte-identical behind
+    :data:`_USE_NUMPY_SEGMENT_DISTINCT` as the reference.
     """
     out = np.zeros(n_nodes, dtype=np.int64)
     carrier_pos = np.flatnonzero(raw_flat == np.uint16(carrier_id))
@@ -274,16 +330,23 @@ def _count_distinct_caller_local_ids_per_node(
             "payloads to {0, 1, 2} bytes."
         )
 
-    # Distinct count per node = number of unique ``(node, id)`` pairs that
-    # land in each node. Dedup the pairs, then bincount the surviving node
-    # labels. ``unique`` over a single composite key is order-independent,
-    # so the per-node count matches the scalar ``np.unique(ids).size``.
-    key = node.astype(np.int64) * np.int64(1 << 16) + ids.astype(np.int64)
-    distinct_keys = np.unique(key)
-    distinct_node = distinct_keys >> np.int64(16)
-    counts = np.bincount(distinct_node, minlength=n_nodes)
-    out[: counts.size] = counts.astype(np.int64)
-    return out
+    # Distinct count per node = number of distinct decoded ids that land
+    # in each node. The per-segment Rust kernel groups the ``(node, id)``
+    # pairs by node into per-segment hash-sets and returns each set's
+    # size -- byte-identical to ``np.unique`` per segment (set membership
+    # is order-independent), but without the single global sort.
+    node_i64 = node.astype(np.int64, copy=False)
+    ids_i64 = ids.astype(np.int64)
+    if _USE_NUMPY_SEGMENT_DISTINCT:
+        # Reference path (flag-gated): one global sort over the composite
+        # ``node * 2^16 + id`` key, then bincount the surviving labels.
+        key = node_i64 * np.int64(1 << 16) + ids_i64
+        distinct_keys = np.unique(key)
+        distinct_node = distinct_keys >> np.int64(16)
+        counts = np.bincount(distinct_node, minlength=n_nodes)
+        out[: counts.size] = counts.astype(np.int64)
+        return out
+    return segment_distinct_count(node_i64, ids_i64, n_nodes)
 
 
 # ---------------------------------------------------------------------------

@@ -18,15 +18,48 @@ from __future__ import annotations
 
 from . import _native as _native
 from ._native import *  # noqa: F401,F403 — re-export every generated class
+from ._native import (
+    LiveAdjacencyKernel,
+    OnceOnlyInclusionKernel,
+    apply_remap_walk,
+    build_carrier_signs_kernel,
+    build_flat_segments_kernel,
+    build_gather_bodies_kernel,
+    build_identity_carriers_kernel,
+    build_inline_bytes_kernel,
+    build_node_ct_csr_kernel,
+    build_number_idx_2d_kernel,
+    build_strip_shift_prepend_kernel,
+    category_distinct_count,
+    compute_row_inclusions_kernel,
+    segment_distinct_count,
+    variant_shuffle_chunk_kernel,
+)
 from .typed import IntDtype, IntEnumHashMap, PlainBool, PlainInt
 
 
 # ``_native.__all__`` is set by PyO3 and lists every generated
 # ``HashMap<K><V>`` class; extend it with the pure-Python typed surface
-# so ``from dedup_hashmap import *`` covers both layers.
+# plus the free ``segment_distinct_count`` kernel so
+# ``from dedup_hashmap import *`` covers all layers.
 __all__ = list(_native.__all__) + [
     "IntDtype",
     "IntEnumHashMap",
+    "LiveAdjacencyKernel",
+    "OnceOnlyInclusionKernel",
     "PlainBool",
     "PlainInt",
+    "apply_remap_walk",
+    "build_carrier_signs_kernel",
+    "build_flat_segments_kernel",
+    "build_gather_bodies_kernel",
+    "build_identity_carriers_kernel",
+    "build_inline_bytes_kernel",
+    "build_node_ct_csr_kernel",
+    "build_number_idx_2d_kernel",
+    "build_strip_shift_prepend_kernel",
+    "category_distinct_count",
+    "compute_row_inclusions_kernel",
+    "segment_distinct_count",
+    "variant_shuffle_chunk_kernel",
 ]

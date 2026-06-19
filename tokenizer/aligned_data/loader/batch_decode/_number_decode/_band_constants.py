@@ -2,9 +2,9 @@
 
 Single concern: derive band boundaries + canonical TokenType ordering
 from :class:`VocabularyManager`'s source of truth so a vocab-layout shift
-surfaces in one place instead of N. Module-local widths that don't cross
-the package boundary (e.g. ``_emit_fixed_fp``'s payload widths) stay in
-their owner module.
+surfaces in one place instead of N. The per-type row widths
+(``_FIXED_ROW_WIDTH``) cross into :func:`._entry.build_number_idx_2d`,
+which threads them to the emission kernel.
 """
 
 from __future__ import annotations

@@ -26,6 +26,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from tokenizer.aligned_data.loader.batch_decode._flat_call_targets import (
+    dense_columns_from_stage2,
+)
 from tokenizer.aligned_data.loader.batch_decode._number_decode import (
     _NUMBER_BLOCK_TOKEN_TYPES,
     build_number_idx_2d,
@@ -48,6 +51,22 @@ from tokenizer.aligned_data.loader.function_data import FunctionData
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
 from tokenizer.aligned_data.matched_sections_bin import Section
 from tokenizer.tokens import Category, TokenType
+
+
+def _slices(boundaries: np.ndarray) -> list[slice]:
+    """Read a per-call_target CSR boundary array as its slice list.
+
+    ``build_number_idx_2d`` returns per-:class:`TokenType` CSR boundary
+    arrays (``int64[n_total_cts + 1]``); call_target ``i`` owns rows
+    ``[bnd[i] : bnd[i + 1]]``. This expands that boundary contract back
+    to the per-call_target ``slice`` list these byte-layout assertions
+    pin, so each test reads exactly as before while the production hot
+    path keeps only the boundary arrays.
+    """
+    bnd = np.asarray(boundaries)
+    return [
+        slice(int(bnd[i]), int(bnd[i + 1])) for i in range(bnd.shape[0] - 1)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +281,15 @@ def test_empty_batch_emits_all_empty_arrays() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [slice(1, 1)])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [slice(1, 1)])
 
     # All TokenType keys are present, all empty.
     for T in _NUMBER_BLOCK_TOKEN_TYPES:
         assert idx_2d_per_type[T].shape[0] == 0
-        assert chunk_slices_per_type[T] == [slice(0, 0)]
+        assert _slices(chunk_boundaries_per_type[T]) == [slice(0, 0)]
     assert f128_is_nan_or_inf.shape == (0,)
     assert vc2_sidecar.shape == (0,)
 
@@ -300,16 +319,16 @@ def test_f32_single_source_one_row_four_bytes() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.FLOAT32],
         np.array([[1, 2, 3, 4]], dtype=np.uint32),
     )
-    assert chunk_slices_per_type[TokenType.FLOAT32] == [slice(0, 1)]
+    assert _slices(chunk_boundaries_per_type[TokenType.FLOAT32]) == [slice(0, 1)]
     # All other TokenType arrays empty.
     for T in _NUMBER_BLOCK_TOKEN_TYPES:
         if T is TokenType.FLOAT32:
@@ -351,16 +370,16 @@ def test_fixed_width_fp_single_source(
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[token_type],
         np.arange(1, 1 + width, dtype=np.uint32)[np.newaxis, :],
     )
-    assert chunk_slices_per_type[token_type] == [slice(0, 1)]
+    assert _slices(chunk_boundaries_per_type[token_type]) == [slice(0, 1)]
     assert f128_is_nan_or_inf.shape == (0,)
     assert vc2_sidecar.shape == (0,)
 
@@ -402,10 +421,10 @@ def test_f128_finite_single_source_two_chunks() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.FLOAT128],
@@ -417,7 +436,7 @@ def test_f128_finite_single_source_two_chunks() -> None:
             dtype=np.uint32,
         ),
     )
-    assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 2)]
+    assert _slices(chunk_boundaries_per_type[TokenType.FLOAT128]) == [slice(0, 2)]
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([False], dtype=np.bool_)
     )
@@ -460,10 +479,10 @@ def test_f128_finite_mid_cut_still_emits_both_chunks() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # Both chunks present. LSB row first (bytes 9..16), then MSB row
     # (bytes 1..8) -- matches the LSB-first stream emission order.
@@ -477,7 +496,7 @@ def test_f128_finite_mid_cut_still_emits_both_chunks() -> None:
             dtype=np.uint32,
         ),
     )
-    assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 2)]
+    assert _slices(chunk_boundaries_per_type[TokenType.FLOAT128]) == [slice(0, 2)]
     # Source is finite; the painted slot is the ALG-2 finite signal
     # (read against the FULL mask, not the surviving prefix).
     np.testing.assert_array_equal(
@@ -507,16 +526,16 @@ def test_f128_nan_or_inf_single_source_one_chunk() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.FLOAT128],
         np.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=np.uint32),
     )
-    assert chunk_slices_per_type[TokenType.FLOAT128] == [slice(0, 1)]
+    assert _slices(chunk_boundaries_per_type[TokenType.FLOAT128]) == [slice(0, 1)]
     np.testing.assert_array_equal(
         f128_is_nan_or_inf, np.array([True], dtype=np.bool_)
     )
@@ -567,10 +586,10 @@ def test_vc2_L17_three_chunks_with_msb_pad() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     expected_rows = np.array(
         [
@@ -586,7 +605,7 @@ def test_vc2_L17_three_chunks_with_msb_pad() -> None:
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.VALUED_CONST_V2], expected_rows
     )
-    assert chunk_slices_per_type[TokenType.VALUED_CONST_V2] == [slice(0, 3)]
+    assert _slices(chunk_boundaries_per_type[TokenType.VALUED_CONST_V2]) == [slice(0, 3)]
     np.testing.assert_array_equal(
         vc2_sidecar, np.array([0, 1, 2], dtype=np.uint32)
     )
@@ -611,10 +630,10 @@ def test_vc2_L8_one_chunk_no_pad() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     expected_rows = np.array(
         [[p, p + 1, p + 2, p + 3, p + 4, p + 5, p + 6, p + 7]],
@@ -654,10 +673,10 @@ def test_vc2_L0_one_chunk_all_pad() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # VC2 chunk: all 8 pad zeros.
     np.testing.assert_array_equal(
@@ -710,10 +729,10 @@ def test_vc2_mid_cut_drops_msb_chunk() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     expected_rows = np.array(
         [
@@ -725,7 +744,7 @@ def test_vc2_mid_cut_drops_msb_chunk() -> None:
     np.testing.assert_array_equal(
         idx_2d_per_type[TokenType.VALUED_CONST_V2], expected_rows
     )
-    assert chunk_slices_per_type[TokenType.VALUED_CONST_V2] == [slice(0, 2)]
+    assert _slices(chunk_boundaries_per_type[TokenType.VALUED_CONST_V2]) == [slice(0, 2)]
     np.testing.assert_array_equal(
         vc2_sidecar, np.array([0, 1], dtype=np.uint32)
     )
@@ -827,10 +846,10 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct0_slice, ct1_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct0_slice, ct1_slice])
 
     # CT0's F32 row.
     np.testing.assert_array_equal(
@@ -853,11 +872,11 @@ def test_per_call_target_slices_across_two_call_targets() -> None:
     )
 
     # Per-CT slices.
-    assert chunk_slices_per_type[TokenType.FLOAT32] == [
+    assert _slices(chunk_boundaries_per_type[TokenType.FLOAT32]) == [
         slice(0, 1),  # CT0 contributes 1 F32 row
         slice(1, 1),  # CT1 contributes nothing
     ]
-    assert chunk_slices_per_type[TokenType.VALUED_CONST_V2] == [
+    assert _slices(chunk_boundaries_per_type[TokenType.VALUED_CONST_V2]) == [
         slice(0, 0),  # CT0 contributes nothing
         slice(0, 2),  # CT1 contributes 2 VC2 rows
     ]
@@ -887,10 +906,10 @@ def test_dtypes_and_sidecar_widths() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     for T, arr in idx_2d_per_type.items():
         assert arr.dtype == np.uint32, f"{T} idx_2d dtype = {arr.dtype}"
@@ -928,10 +947,10 @@ def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
 
     (
         idx_2d_per_type,
-        chunk_slices_per_type,
+        chunk_boundaries_per_type,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # Only F16 emits; everything else empty.
     np.testing.assert_array_equal(
@@ -942,3 +961,176 @@ def test_prepend_slot_does_not_appear_in_number_idx_2d() -> None:
         if T is TokenType.FLOAT16:
             continue
         assert idx_2d_per_type[T].shape[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# End-to-end tests for the per-segment ``+1`` lookahead guard (the kernel's
+# VC2 ``L`` recovery).
+#
+# ``runlen_number`` is per-call_target length N (only ``digit_cumsum`` is
+# N+1). A VC2 carrier at the LAST raw position of a call_target has
+# ``p_carrier + 1 == N_seg``, so the un-guarded ALG-8 gather would run off
+# the end of the per-segment ``runlen_number`` (terminal carrier in the
+# LAST kept call_target -> OOB) or silently misread the NEIGHBOUR
+# call_target's value (terminal in a non-last call_target). The kernel
+# reads ``L`` only where the lookahead is within the carrier's OWN segment
+# and defaults out-of-range to ``L = 0`` (zero-length value -> ``K_full =
+# max(1, 0) = 1``, a single all-pad LSB chunk). These tests build a real
+# two-call_target batch whose first AND last call_target each END with a
+# terminal VC2 carrier, exercising both failure modes through the public
+# :func:`build_number_idx_2d`.
+# ---------------------------------------------------------------------------
+
+
+def _terminal_vc2_call_target() -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    """A call_target ending with a terminal VC2 carrier.
+
+    Stream: a leading F32 source (so the call_target carries inline bytes
+    + a non-VC2 carrier) followed by a VC2 carrier as the FINAL raw token
+    (no trailing inline-digit byte). The VC2 carrier's ``runlen_number
+    [carrier + 1]`` lookahead is OUT of its own segment -> L = 0 -> a
+    single all-pad chunk; the neighbour call_target's runlen must NOT leak
+    in.
+    """
+    raw_tokens = np.array(
+        [_F32_RAW, 0xA0, 0xA1, 0xA2, 0xA3, _VC2_RAW], dtype=np.uint16
+    )
+    expanded = np.array(
+        [_LOCAL_FUNC_SHIFTED, _F32_SHIFTED, _VC2_SHIFTED], dtype=np.uint16
+    )
+    extra_vc2 = np.array([False, False, False], dtype=bool)
+    extra_f128 = np.array([False, False, False], dtype=bool)
+    return raw_tokens, expanded, extra_vc2, extra_f128
+
+
+def _build_two_call_target_batch(
+    cts: list[Stage2CallTarget], slices: list[slice]
+) -> Stage2Batch:
+    """Stitch a list of Stage2CallTargets into one variant/section/batch."""
+    stage1_variant = Stage1Variant(
+        variant_idx=0,
+        variant_ref_offset=0,
+        batch_idx=0,
+        call_targets=[c.stage1 for c in cts],
+        variant_tokens=np.zeros(0, dtype=np.uint16),
+    )
+    stage1_section = Stage1Section(
+        arm=SectionKind.MATCHED,
+        idx=0,
+        section=_empty_section(),
+        variants=[stage1_variant],
+    )
+    stage1_batch = Stage1Batch(
+        sections=[stage1_section],
+        batch_idx_to_section_variant=np.array([[0, 0]], dtype=np.uint32),
+        batch_size=1,
+    )
+    stage2_variant = Stage2Variant(
+        stage1=stage1_variant,
+        call_targets=cts,
+        cut_call_target_index=len(cts),
+        total_surviving_token_count=sum(
+            c.surviving_token_count for c in cts
+        ),
+        total_surviving_identity_count=0,
+        total_surviving_number_chunk_count=0,
+    )
+    stage2_section = Stage2Section(
+        stage1=stage1_section, variants=[stage2_variant]
+    )
+    return Stage2Batch(
+        stage1=stage1_batch,
+        sections=[stage2_section],
+        identity_row_offsets=np.zeros(2, dtype=np.uint32),
+        number_row_offsets=np.zeros(2, dtype=np.uint32),
+    )
+
+
+def test_terminal_vc2_carrier_no_oob_or_neighbor_misread() -> None:
+    """Two call_targets, each ENDING with a terminal VC2 carrier.
+
+    CT0 (non-last): its terminal VC2 carrier's ``+1`` lookahead would
+    otherwise read CT1's first ``runlen_number`` value -- the kernel reads
+    L = 0 instead, emitting an all-pad chunk. CT1 (last): the lookahead
+    would otherwise run off the end of CT1's runlen -- the kernel again
+    reads L = 0. Both VC2 carriers -> one all-pad row each.
+    """
+    raw0, exp0, vc20, f1280 = _terminal_vc2_call_target()
+    raw1, exp1, vc21, f1281 = _terminal_vc2_call_target()
+    ct0 = _make_call_target(raw0, exp0, vc20, f1280)
+    ct1 = _make_call_target(raw1, exp1, vc21, f1281)
+
+    payload0 = raw0[raw0 < 256].astype(np.uint8)
+    payload1 = raw1[raw1 < 256].astype(np.uint8)
+    inline_bytes = np.zeros(
+        1 + payload0.shape[0] + payload1.shape[0], dtype=np.uint8
+    )
+    inline_bytes[1 : 1 + payload0.shape[0]] = payload0
+    inline_bytes[1 + payload0.shape[0] :] = payload1
+    ct0_slice = slice(1, 1 + payload0.shape[0])
+    ct1_slice = slice(
+        1 + payload0.shape[0],
+        1 + payload0.shape[0] + payload1.shape[0],
+    )
+    stage2_batch = _build_two_call_target_batch(
+        [ct0, ct1], [ct0_slice, ct1_slice]
+    )
+
+    (
+        idx_2d_per_type,
+        chunk_boundaries_per_type,
+        _f128,
+        vc2_sidecar,
+    ) = build_number_idx_2d(
+        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct0_slice, ct1_slice]
+    )
+
+    vc2_rows = idx_2d_per_type[TokenType.VALUED_CONST_V2]
+    # Two terminal VC2 carriers -> two all-pad rows (L=0 each). If a
+    # neighbour's L had leaked in, a row would reference real byte offsets
+    # (>= the call_target's slice start), not zeros.
+    np.testing.assert_array_equal(vc2_rows, np.zeros((2, 8), dtype=np.uint32))
+    np.testing.assert_array_equal(
+        vc2_sidecar, np.array([0, 0], dtype=np.uint32)
+    )
+    # One VC2 chunk per call_target.
+    assert _slices(chunk_boundaries_per_type[TokenType.VALUED_CONST_V2]) == [
+        slice(0, 1),
+        slice(1, 2),
+    ]
+
+
+def test_in_bounds_vc2_carrier_reads_real_length() -> None:
+    """A non-terminal VC2 carrier (a real ``L`` lookahead within its own
+    call_target) still reads that ``L`` and emits the value chunk -- the
+    guard is byte-identical for the in-bounds case.
+
+    Single VC2 L=8 source: carrier at raw 0, ``runlen_number[1] = 8`` ->
+    one 8-byte chunk, no pad (mirrors ``test_vc2_L8`` end-to-end).
+    """
+    L = 8
+    raw_tokens = _vc2_raw_tokens(L)
+    expanded = np.array([_LOCAL_FUNC_SHIFTED, _VC2_SHIFTED], dtype=np.uint16)
+    extra_vc2 = np.array([False, False], dtype=bool)
+    extra_f128 = np.array([False, False], dtype=bool)
+    stage2_ct = _make_call_target(raw_tokens, expanded, extra_vc2, extra_f128)
+    stage2_batch = _wrap_single_call_target(stage2_ct)
+    inline_bytes, ct_slice = _build_inline_bytes_from_raw(raw_tokens)
+    p = ct_slice.start
+
+    (
+        idx_2d_per_type,
+        _slices,
+        _f128,
+        vc2_sidecar,
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
+
+    np.testing.assert_array_equal(
+        idx_2d_per_type[TokenType.VALUED_CONST_V2],
+        np.array([[p + i for i in range(8)]], dtype=np.uint32),
+    )
+    np.testing.assert_array_equal(
+        vc2_sidecar, np.array([0], dtype=np.uint32)
+    )

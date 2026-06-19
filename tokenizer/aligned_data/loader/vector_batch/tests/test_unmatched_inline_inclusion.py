@@ -23,6 +23,7 @@ import numpy as np
 from tokenizer.aligned_data.call_target_type import CallTargetType
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 from tokenizer.aligned_data.loader.vector_batch._inclusion import (
+    RowInclusionView,
     compute_row_inclusions,
 )
 
@@ -85,7 +86,7 @@ def _run(cols, section_offsets, *, unmatched_inline, depth=3):
     # Root section 0, two sampled variants (v0, v1) forming ONE decider
     # group. Two rows so columnwise-ALL does not trivially exclude a callee
     # reached by only one variant.
-    return compute_row_inclusions(
+    return RowInclusionView(compute_row_inclusions(
         cols,
         section_offsets,
         root_sections=np.array([0, 0], dtype=np.int64),
@@ -95,7 +96,7 @@ def _run(cols, section_offsets, *, unmatched_inline, depth=3):
         need_excluded_pool=False,
         unmatched_inline=unmatched_inline,
         unmatched_inline_depth=depth,
-    )
+    ))
 
 
 def test_unmatched_to_matched_surfaces_under_flag():

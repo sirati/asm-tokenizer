@@ -22,8 +22,11 @@ __all__ = [
     "COUNTER_CATEGORIES",
     "FUNCTION_CATEGORIES",
     "NOT_FOUND_U16",
+    "ROOT_FUNC_SLOT",
     "_CALL_TARGET_TYPE_TO_CATEGORY",
     "_CATEGORY_TO_SHIFTED_ID",
+    "_COUNTER_CATEGORY_TO_SLOT",
+    "_FUNCTION_CATEGORY_TO_SLOT",
     "_SHIFTED_ID_TO_CATEGORY",
 ]
 
@@ -132,3 +135,34 @@ _CALL_TARGET_TYPE_TO_CATEGORY: dict[CallTargetType, Category] = {
 # ``dedup_hashmap/src/lib.rs`` miss-sentinel table for unsigned ints =
 # ``<dtype>::MAX``).
 NOT_FOUND_U16: np.uint16 = np.uint16(0xFFFF)
+
+
+# ---------------------------------------------------------------------------
+# Dense per-partition Category -> slot codes for the Rust remap kernel.
+#
+# The kernel (``dedup_hashmap.apply_remap_walk``) addresses FUNCTION and
+# COUNTER categories by a dense int slot, NOT the ``Category`` enum -- it
+# only needs the partition + a per-category counter space. These two maps
+# are the SINGLE site that assigns the slots; the order MUST match
+# ``FUNCTION_CATEGORIES`` / ``COUNTER_CATEGORIES`` so the kernel's per-slot
+# FID-inverse output lines up with the pass-2 ``[per_variant[cat] for cat
+# in FUNCTION_CATEGORIES]`` concatenation byte-for-byte. The maps are
+# total + collision-checked below.
+# ---------------------------------------------------------------------------
+_FUNCTION_CATEGORY_TO_SLOT: dict[Category, int] = {
+    cat: slot for slot, cat in enumerate(FUNCTION_CATEGORIES)
+}
+_COUNTER_CATEGORY_TO_SLOT: dict[Category, int] = {
+    cat: slot for slot, cat in enumerate(COUNTER_CATEGORIES)
+}
+assert len(_FUNCTION_CATEGORY_TO_SLOT) == len(FUNCTION_CATEGORIES), (
+    "FUNCTION_CATEGORIES has a duplicate Category; the kernel slot map "
+    "must be total + collision-free"
+)
+assert len(_COUNTER_CATEGORY_TO_SLOT) == len(COUNTER_CATEGORIES), (
+    "COUNTER_CATEGORIES has a duplicate Category; the kernel slot map "
+    "must be total + collision-free"
+)
+# The LOCAL_FUNC root-seed slot (ALG-3 + ALG-9). LOCAL_FUNC is
+# ``FUNCTION_CATEGORIES[0]`` by the canonical layout.
+ROOT_FUNC_SLOT: int = _FUNCTION_CATEGORY_TO_SLOT[Category.LOCAL_FUNC]

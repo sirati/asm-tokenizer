@@ -153,6 +153,47 @@ class SortedIndexReader:
             return 0
         return int(self._counts[lo_idx : hi_idx + 1].sum())
 
+    def enumerate_in_band(self, lo: int, hi: int) -> np.ndarray:
+        """All section indices for lengths in ``[lo, hi]`` in sorted-index order.
+
+        The read-only in-band ENUMERATION primitive: gathers every
+        section index from every length-bucket in ``[lo, hi]``
+        (intersected with the reader's valid range) into a single fresh
+        ``u32`` pool, in the body's stable-sorted layout order. No RNG,
+        no sampling -- the deterministic validation sampler enumerates the
+        whole band and chunks it itself; :meth:`sample_section_indices_in_band`
+        layers its ``rng.choice`` on top.
+
+        The body is length-bucketed in stable-sorted order (see
+        :func:`.._wire.encode_sorted_index`), so the buckets spanning
+        ``[lo_idx, hi_idx]`` form ONE contiguous u32 span. The whole pool
+        is read with a single ``frombuffer`` + ``.copy()`` so the result
+        is independent of the eager blob.
+
+        Returns a fresh ``u32`` ndarray (never a view of the blob); an
+        empty array when the band is out of range or the pool is empty.
+
+        :data:`.._wire.EXCLUDED_LENGTH` is the index's EXCLUSION
+        marker (see :meth:`count_in_band`); the band is clamped past it
+        so excluded sections are never enumerated.
+        """
+        lo = max(lo, EXCLUDED_LENGTH + 1)
+        lo_idx = max(0, lo - self._min_length)
+        hi_idx = min(self._counts.size - 1, hi - self._min_length)
+        if lo_idx > hi_idx:
+            return np.empty(0, dtype=np.uint32)
+        n = int(self._counts[lo_idx : hi_idx + 1].sum())
+        if n == 0:
+            return np.empty(0, dtype=np.uint32)
+        start_off = int(self._bucket_body_offsets[lo_idx])
+        # Copy so the pool array is independent of the blob.
+        return np.frombuffer(
+            self._blob,
+            dtype=np.uint32,
+            count=n,
+            offset=start_off,
+        ).copy()
+
     def sample_section_indices_in_band(
         self,
         lo: int,
@@ -162,45 +203,21 @@ class SortedIndexReader:
     ) -> np.ndarray:
         """Uniform sample without replacement from all buckets in ``[lo, hi]``.
 
-        Concatenates every section index from every length-bucket in the
-        range ``[lo, hi]`` (intersected with the reader's valid range)
-        into a single pool, then draws ``min(count, pool_size)`` entries
-        uniformly without replacement via ``rng.choice``.
+        Enumerates the whole band pool via :meth:`enumerate_in_band`
+        (the single-``frombuffer`` in-band read), then draws
+        ``min(count, pool_size)`` entries uniformly without replacement
+        via ``rng.choice``. The enumeration order is the body's stable-
+        sorted layout, so ``rng.choice`` over the same ``pool_size`` draws
+        the same indices it did before this method delegated to
+        :meth:`enumerate_in_band`.
 
         Returns a fresh ``u32`` ndarray (never a view of the blob).
         Returns an empty array when the band pool is empty.
-
-        :data:`.._wire.EXCLUDED_LENGTH` is the index's EXCLUSION
-        marker (see :meth:`count_in_band`); the band is clamped past
-        it so excluded sections are never drawn.
         """
-        lo = max(lo, EXCLUDED_LENGTH + 1)
-        lo_idx = max(0, lo - self._min_length)
-        hi_idx = min(self._counts.size - 1, hi - self._min_length)
-        if lo_idx > hi_idx:
-            return np.empty(0, dtype=np.uint32)
-
-        # Collect all section indices from every bucket in the band.
-        parts = []
-        for idx in range(lo_idx, hi_idx + 1):
-            bc = int(self._counts[idx])
-            if bc == 0:
-                continue
-            body_offset = int(self._bucket_body_offsets[idx])
-            bucket = np.frombuffer(
-                self._blob,
-                dtype=np.uint32,
-                count=bc,
-                offset=body_offset,
-            )
-            # Copy so the pool array is independent of the blob.
-            parts.append(bucket.copy())
-
-        if not parts:
-            return np.empty(0, dtype=np.uint32)
-
-        pool = np.concatenate(parts)
+        pool = self.enumerate_in_band(lo, hi)
         pool_size = pool.size
+        if pool_size == 0:
+            return pool
         k = min(count, pool_size)
         if k == pool_size:
             return pool

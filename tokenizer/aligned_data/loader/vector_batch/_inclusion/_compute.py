@@ -17,15 +17,15 @@ import numpy as np
 
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 from tokenizer.aligned_data.sorted_index._graph_lengths._adjacency import (
+    InclusionCSR,
     LiveNodeAdjacency,
 )
 from tokenizer.aligned_data.splice_inclusion import OnceOnlyInclusion
 
-from ._bfs import _bfs_emit, _bfs_full_included
-from ._row_inclusion import RowInclusion
+from ._bfs import _ROOT_EDGE_TYPE, _bfs_emit, _bfs_full_included
 
 
-__all__ = ["RowInclusion", "compute_row_inclusions"]
+__all__ = ["InclusionCSR", "compute_row_inclusions"]
 
 
 def compute_row_inclusions(
@@ -40,7 +40,7 @@ def compute_row_inclusions(
     adjacency: LiveNodeAdjacency | None = None,
     unmatched_inline: bool = False,
     unmatched_inline_depth: int = 3,
-) -> List[RowInclusion]:
+) -> InclusionCSR:
     """Per-row ordered emitted nodes + remembered-excluded pool.
 
     Parameters
@@ -96,9 +96,16 @@ def compute_row_inclusions(
 
     Returns
     -------
-    list[RowInclusion]
-        One per batch row, in input order. ``emitted_nodes[0]`` is always
-        the root node ``var_offsets[section] + sampled_variant``.
+    InclusionCSR
+        The flat, row-major CSR over the batch's ``B`` rows -- the fused
+        kernel's native shape (``emitted_offsets`` / ``pool_offsets`` slice
+        the parallel ``*_nodes`` / ``*_types`` value arrays). Row ``r``'s
+        emitted nodes are ``emitted_nodes[emitted_offsets[r] :
+        emitted_offsets[r + 1]]`` (root at slot 0). Callers wanting per-row
+        :class:`RowInclusion` records wrap it in :class:`RowInclusionView`
+        (a lazy, no-copy slice view); the production geometry consumer reads
+        the flat arrays directly. ``emitted_nodes[emitted_offsets[r]]`` is
+        always the root node ``var_offsets[section] + sampled_variant``.
 
     Notes
     -----
@@ -119,6 +126,27 @@ def compute_row_inclusions(
     n_rows = sec.size
     if adjacency is None:
         adjacency = LiveNodeAdjacency(cols, section_offsets, cols.sec_of_var)
+
+    # The whole per-group + per-depth BFS runs in ONE GIL-released Rust
+    # kernel (the fused Stage-3 port), reusing this adjacency's Stage-1/2
+    # cores in-Rust. The opt-in unmatched-outline inlining is a recursive,
+    # Python-callback-driven graph transform (:mod:`...splice_inclusion.
+    # _unmatched_expand`) that cannot run under the single GIL release, so
+    # that path keeps the per-group Python drive below; the production
+    # default (``unmatched_inline=False``) takes the fused kernel.
+    if not unmatched_inline:
+        # The fused kernel ALREADY returns the canonical flat CSR; the
+        # production geometry consumer reads it directly, so we return it
+        # verbatim -- no per-row Python object is materialised.
+        return adjacency.compute_row_inclusions_csr(
+            root_sections=sec,
+            root_sampled_variants=smp,
+            root_groups=grp,
+            max_depth=max_depth,
+            need_excluded_pool=need_excluded_pool,
+            root_edge_type=_ROOT_EDGE_TYPE,
+        )
+
     decider = OnceOnlyInclusion()
 
     # Group batch rows by DECIDER-ROOT group, NOT by catalog section. Every
@@ -130,7 +158,12 @@ def compute_row_inclusions(
     # the same physical section but came from different roots carry
     # DIFFERENT group ids, so each is its own root and never conflates the
     # other's variants into its mask (the #67 fix).
-    out: List[RowInclusion] = [None] * n_rows  # type: ignore[list-item]
+    # Per-row emitted / pool arrays in INPUT order; assembled into the flat
+    # CSR (the same contract the fused kernel returns) once at the end.
+    emitted_rows: List[np.ndarray] = [None] * n_rows  # type: ignore[list-item]
+    emitted_type_rows: List[np.ndarray] = [None] * n_rows  # type: ignore[list-item]
+    pool_rows: List[np.ndarray] = [None] * n_rows  # type: ignore[list-item]
+    pool_type_rows: List[np.ndarray] = [None] * n_rows  # type: ignore[list-item]
     rows_by_group: Dict[int, List[int]] = {}
     for r in range(n_rows):
         rows_by_group.setdefault(int(grp[r]), []).append(r)
@@ -193,10 +226,50 @@ def compute_row_inclusions(
             else:
                 pool = np.zeros(0, dtype=np.int64)
                 pool_types = np.zeros(0, dtype=np.uint8)
-            out[r] = RowInclusion(
-                emitted_nodes=emitted,
-                emitted_edge_types=emitted_types,
-                excluded_nodes=pool,
-                excluded_edge_types=pool_types,
-            )
-    return out  # type: ignore[return-value]
+            emitted_rows[r] = emitted
+            emitted_type_rows[r] = emitted_types
+            pool_rows[r] = pool
+            pool_type_rows[r] = pool_types
+    return _csr_from_rows(
+        emitted_rows, emitted_type_rows, pool_rows, pool_type_rows
+    )
+
+
+def _csr_from_rows(
+    emitted_rows: List[np.ndarray],
+    emitted_type_rows: List[np.ndarray],
+    pool_rows: List[np.ndarray],
+    pool_type_rows: List[np.ndarray],
+) -> InclusionCSR:
+    """Pack per-row emitted / pool arrays into the flat :class:`InclusionCSR`.
+
+    The unmatched-outline inlining path drives the BFS in Python (a recursive
+    callback transform that cannot run under the single fused GIL release), so
+    it produces per-row arrays. This packs them into the SAME flat CSR shape
+    the fused kernel returns -- one concatenate + one cumsum per axis -- so
+    BOTH paths hand the consumer the identical contract.
+    """
+    e_lens = np.array([e.size for e in emitted_rows], dtype=np.int64)
+    e_off = np.zeros(e_lens.size + 1, dtype=np.int64)
+    np.cumsum(e_lens, out=e_off[1:])
+    p_lens = np.array([p.size for p in pool_rows], dtype=np.int64)
+    p_off = np.zeros(p_lens.size + 1, dtype=np.int64)
+    np.cumsum(p_lens, out=p_off[1:])
+    if emitted_rows:
+        emitted_nodes = np.concatenate(emitted_rows).astype(np.int64)
+        emitted_types = np.concatenate(emitted_type_rows).astype(np.uint8)
+        pool_nodes = np.concatenate(pool_rows).astype(np.int64)
+        pool_types = np.concatenate(pool_type_rows).astype(np.uint8)
+    else:
+        emitted_nodes = np.zeros(0, dtype=np.int64)
+        emitted_types = np.zeros(0, dtype=np.uint8)
+        pool_nodes = np.zeros(0, dtype=np.int64)
+        pool_types = np.zeros(0, dtype=np.uint8)
+    return InclusionCSR(
+        emitted_offsets=e_off,
+        emitted_nodes=emitted_nodes,
+        emitted_types=emitted_types,
+        pool_offsets=p_off,
+        pool_nodes=pool_nodes,
+        pool_types=pool_types,
+    )

@@ -45,7 +45,8 @@ expansion.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 
@@ -59,7 +60,42 @@ if TYPE_CHECKING:
 
 __all__ = [
     "assemble_number_sidecars",
+    "NumberChunkColumns",
 ]
+
+
+@dataclass(frozen=True)
+class NumberChunkColumns:
+    """Columnar replacement for the per-chunk tree-walk loop output.
+
+    A caller that has already laid out its surviving NUMBER-band chunks
+    columnar (the vector dense path) supplies this instead of letting
+    :func:`_build_global_chunk_stream` walk the ``sections -> variants ->
+    call_targets`` object tree. The fields ARE the tree walk's per-chunk
+    loop output, in the SAME DFS-then-stream order, so the shared rank +
+    per-type gather tail produces a byte-identical ``(sig_flat, sex_flat,
+    variant_chunk_offsets)``.
+
+    out_block:
+        ``int64[total_chunks]`` -- each chunk's NUMBER block index
+        (``shifted_id - 1``; 0 = VC2, ..., 6 = F128).
+    slice_start:
+        ``int64[total_chunks]`` -- each chunk's owning call_target's
+        per-block source ``.start`` into ``numbers_per_TokenType[T]``
+        (the tree's ``number_chunk_slices[T].start``).
+    ct_ordinal:
+        ``int64[total_chunks]`` -- each chunk's owning DFS call_target
+        ordinal (the per-(ct, block) rank reset key).
+    variant_chunk_offsets:
+        ``int64[n_variants + 1]`` -- the per-variant chunk CSR over the
+        global stream (DFS order groups a variant's call_targets into a
+        contiguous run).
+    """
+
+    out_block: np.ndarray
+    slice_start: np.ndarray
+    ct_ordinal: np.ndarray
+    variant_chunk_offsets: np.ndarray
 
 
 # ---------------------------------------------------------------------------
@@ -96,19 +132,21 @@ _NUMBER_BLOCK_TOKEN_TYPES: tuple[TokenType, ...] = (
 
 def _build_global_chunk_stream(
     stage3_batch: "Stage3Batch",
+    numbers: Optional[NumberChunkColumns] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build the flat per-chunk ``(significand, sign_exp)`` stream over
     every call_target in DFS encounter order, plus per-variant CSR.
 
-    Walks ``sections -> variants -> call_targets`` once, concatenating
-    each call_target's surviving number-band ids
-    (``expanded[:partial_cut_length]`` filtered to the band) into a flat
-    ``out_block`` stream (block index = ``shifted_id - 1``), tagged with
-    each chunk's owning call_target ordinal. The per-chunk SOURCE index
-    into ``numbers_per_TokenType[T]`` is then
-    ``number_chunk_slices[T][ct].start + rank-within-(ct, T)`` -- a
-    per-(call_target, type) segmented arange. A single per-type boolean
-    gather fills the global ``(sig, sex)`` stream.
+    The per-chunk ``(out_block, slice_start, ct_ordinal)`` triple + the
+    per-variant CSR are produced once -- by walking ``sections ->
+    variants -> call_targets`` (the staged path, ``numbers is None``) OR
+    consumed pre-built columnar from ``numbers`` (the vector dense path,
+    which laid them out from its dense columns). The per-chunk SOURCE
+    index into ``numbers_per_TokenType[T]`` is then
+    ``slice_start + rank-within-(ct, T)`` -- a per-(call_target, type)
+    segmented arange. A single per-type boolean gather fills the global
+    ``(sig, sex)`` stream. The rank + gather TAIL is shared by both
+    sources, so the columnar path is byte-identical by construction.
 
     Returns ``(sig_flat, sex_flat, variant_chunk_offsets)`` where
     ``variant_chunk_offsets`` is the CSR over the global stream keyed by
@@ -117,7 +155,56 @@ def _build_global_chunk_stream(
     """
     numbers_per_TokenType = stage3_batch.numbers_per_TokenType
 
-    # --- flat per-chunk concatenation over DFS call_targets -----------
+    chunks = (
+        _tree_chunk_columns(stage3_batch) if numbers is None else numbers
+    )
+    variant_chunk_offsets = chunks.variant_chunk_offsets
+
+    out_block = chunks.out_block
+    total = int(out_block.shape[0])
+    if total == 0:
+        return (
+            np.empty(0, dtype=np.uint64),
+            np.empty(0, dtype=np.uint32),
+            variant_chunk_offsets,
+        )
+
+    # rank-within-(call_target, block): the chunks are in (ct, stream)
+    # order, so for a fixed block the type-T subsequence is ordered by
+    # call_target; the per-(ct, block) rank is the within-segment arange
+    # where a segment = a maximal run of identical (ct_ordinal, block).
+    # Build it by a group-key reset: a new segment starts where either
+    # the ct ordinal or the block changes vs the previous chunk.
+    rank = _segmented_rank(chunks.ct_ordinal, out_block)
+    src_idx = chunks.slice_start + rank
+
+    sig_flat = np.empty(total, dtype=np.uint64)
+    sex_flat = np.empty(total, dtype=np.uint32)
+    for b, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
+        type_mask = out_block == b
+        if not type_mask.any():
+            continue
+        sig_for_type, sex_for_type = numbers_per_TokenType[token_type]
+        src = src_idx[type_mask]
+        sig_flat[type_mask] = sig_for_type[src]
+        sex_flat[type_mask] = sex_for_type[src]
+
+    return sig_flat, sex_flat, variant_chunk_offsets
+
+
+def _tree_chunk_columns(
+    stage3_batch: "Stage3Batch",
+) -> NumberChunkColumns:
+    """Walk the object tree into the per-chunk :class:`NumberChunkColumns`.
+
+    The staged ``batch_decode`` path's source of the per-chunk
+    ``(out_block, slice_start, ct_ordinal)`` triple + variant CSR:
+    concatenates each call_target's surviving number-band ids
+    (``expanded[:partial_cut_length]`` filtered to the band) into the flat
+    ``out_block`` stream (block index = ``shifted_id - 1``), tagged with
+    each chunk's owning call_target ordinal + its per-block slice
+    ``.start`` (the source base into ``numbers_per_TokenType[T]``).
+    """
     block_chunks: List[np.ndarray] = []
     # Per-chunk source-slice base = the owning call_target's per-type
     # slice start (selected per chunk by its block). Built per type as a
@@ -180,38 +267,19 @@ def _build_global_chunk_stream(
         )
 
     if not block_chunks:
-        return (
-            np.empty(0, dtype=np.uint64),
-            np.empty(0, dtype=np.uint32),
-            variant_chunk_offsets,
+        return NumberChunkColumns(
+            out_block=np.empty(0, dtype=np.int64),
+            slice_start=np.empty(0, dtype=np.int64),
+            ct_ordinal=np.empty(0, dtype=np.int64),
+            variant_chunk_offsets=variant_chunk_offsets,
         )
 
-    out_block = np.concatenate(block_chunks)
-    slice_start = np.concatenate(slice_start_per_block_chunks)
-    ct_ordinal_flat = np.concatenate(ct_ordinal_chunks)
-    total = int(out_block.shape[0])
-
-    # rank-within-(call_target, block): the chunks are in (ct, stream)
-    # order, so for a fixed block the type-T subsequence is ordered by
-    # call_target; the per-(ct, block) rank is the within-segment arange
-    # where a segment = a maximal run of identical (ct_ordinal, block).
-    # Build it by a group-key reset: a new segment starts where either
-    # the ct ordinal or the block changes vs the previous chunk.
-    rank = _segmented_rank(ct_ordinal_flat, out_block)
-    src_idx = slice_start + rank
-
-    sig_flat = np.empty(total, dtype=np.uint64)
-    sex_flat = np.empty(total, dtype=np.uint32)
-    for b, token_type in enumerate(_NUMBER_BLOCK_TOKEN_TYPES):
-        type_mask = out_block == b
-        if not type_mask.any():
-            continue
-        sig_for_type, sex_for_type = numbers_per_TokenType[token_type]
-        src = src_idx[type_mask]
-        sig_flat[type_mask] = sig_for_type[src]
-        sex_flat[type_mask] = sex_for_type[src]
-
-    return sig_flat, sex_flat, variant_chunk_offsets
+    return NumberChunkColumns(
+        out_block=np.concatenate(block_chunks),
+        slice_start=np.concatenate(slice_start_per_block_chunks),
+        ct_ordinal=np.concatenate(ct_ordinal_chunks),
+        variant_chunk_offsets=variant_chunk_offsets,
+    )
 
 
 def _segmented_rank(
@@ -265,6 +333,7 @@ def _segmented_rank(
 
 def assemble_number_sidecars(
     stage3_batch: "Stage3Batch",
+    numbers: Optional[NumberChunkColumns] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Concatenate per-:class:`TokenType` ``(significand, sign_exp)``
     chunks into the global row-major number sidecars.
@@ -294,23 +363,32 @@ def assemble_number_sidecars(
     number_row_offsets = stage2_batch.number_row_offsets
 
     sig_flat, sex_flat, variant_chunk_offsets = _build_global_chunk_stream(
-        stage3_batch
+        stage3_batch, numbers
     )
 
     # Per-unique-variant ``(sig, sex)`` slices of the global stream, in
-    # flat ``section -> slot`` order (the same order DFS produced them).
-    variants_per_section: List[int] = []
+    # flat ``section -> slot`` order -- ``variant_chunk_offsets`` already
+    # enumerates the variants in DFS (== section -> slot) order, so the
+    # per-variant slicing is a plain range over the CSR. The variants
+    # never cross the CSR's variant axis, so this matches the tree's
+    # ``sections -> variants`` slice walk byte-for-byte.
+    n_variants = int(variant_chunk_offsets.shape[0]) - 1
     per_variant_sig: List[np.ndarray] = []
     per_variant_sex: List[np.ndarray] = []
-    v = 0
-    for stage3_section in stage3_batch.sections:
-        variants_per_section.append(len(stage3_section.variants))
-        for _stage3_variant in stage3_section.variants:
-            lo = int(variant_chunk_offsets[v])
-            hi = int(variant_chunk_offsets[v + 1])
-            per_variant_sig.append(sig_flat[lo:hi])
-            per_variant_sex.append(sex_flat[lo:hi])
-            v += 1
+    for v in range(n_variants):
+        lo = int(variant_chunk_offsets[v])
+        hi = int(variant_chunk_offsets[v + 1])
+        per_variant_sig.append(sig_flat[lo:hi])
+        per_variant_sex.append(sex_flat[lo:hi])
+
+    # ``variants_per_section`` for the per-row lookup: the staged path
+    # reads it off the tree; the vector dense path lays one variant per
+    # synthetic section (one section per row), so it is all-ones.
+    variants_per_section = (
+        [len(s.variants) for s in stage3_batch.sections]
+        if numbers is None
+        else [1] * n_variants
+    )
 
     per_row_variant_idx, is_padding = build_per_row_variant_lookup(
         stage1_batch.batch_idx_to_section_variant, variants_per_section

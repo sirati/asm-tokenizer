@@ -19,8 +19,11 @@ Single-concern submodules:
   straddler cut.
 * :mod:`._surviving` -- the per-node surviving-column count under the
   straddler cut (shared by the token scatter + the dense pass).
-* :mod:`._dense_adapter` -- flat emission -> staged ``Stage2Batch`` for
-  the dense kernels.
+* :mod:`._slim_stage2` -- flat emission -> SLIM (tree-free) ``Stage2Batch``
+  (the per-row offsets + identity mapping the dense kernels read).
+* :mod:`._dense_adapter` -- the full per-CT ``Stage2Batch`` tree, RETAINED
+  only as the equivalence-gate oracle (no longer on the production path
+  since step-5 object-tree elimination).
 * :mod:`._dense` -- the dense identity + numeric sidecar producer (reuses
   the ``batch_decode`` decode kernels; byte-identical with backfill OFF).
 * :mod:`._scatter` -- the orchestrator.

@@ -38,6 +38,7 @@ from tokenizer.aligned_data.realized_lengths._geometry_format import (
 from tokenizer.aligned_data.sorted_index._prepass import (
     read_region_section_variant_info_lazy,
 )
+from ._geometry_consistency import check_geometry_matches_catalog
 
 
 __all__ = [
@@ -174,6 +175,16 @@ def open_vector_batch_handles(
         base_path, binary_name, arm.region
     )
     geometry = RealizedGeometryReader.open(base_path, binary_name, arm)
+    # Cross-axis stale-sidecar guard: the catalog + the geometry reader are
+    # opened INDEPENDENTLY (one from ``_sections.bin``, the other from the
+    # ``_realized.bin`` pair), and each only self-validates. A geometry
+    # sidecar stale relative to a rebuilt (longer) catalog would otherwise
+    # slip through here and surface as a bare ``IndexError`` deep in the
+    # prepass's node-indexed axis gather. The READ-side twin of the build
+    # side's ``_builder`` contract, fired for EVERY arm this function opens.
+    check_geometry_matches_catalog(
+        info.cols, geometry, binary_name=binary_name, arm_name=arm.name
+    )
     # An ABSENT ``_variants.bin`` is valid: the session's variant resolver
     # treats it as "no variant-prefix records" (empty ``variant_tokens``).
     # Hand the prefix readers an empty buffer so they mirror that exactly

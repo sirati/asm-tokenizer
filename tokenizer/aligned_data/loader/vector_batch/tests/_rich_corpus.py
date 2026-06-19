@@ -59,9 +59,49 @@ _BLOCK = _IDENTITY_START + 0  # COUNTER category
 _LOCAL_FUNC = _IDENTITY_START + 1  # FUNCTION category
 _VC2 = _NUMBER_START  # first NUMBER carrier
 _FLOAT16 = _NUMBER_START + 1
+_FLOAT128 = _NUMBER_START + VocabularyManager._V2_NUMBER_BLOCK_COUNT - 1  # last NUMBER carrier (263)
 
 
-def _rich_body(*, instr_base: int, with_negative: bool) -> np.ndarray:
+# A FINITE binary128 high u16 (bytes 0,1): exponent != all-ones, so ALG-2
+# detects 2 chunks (LSB limb then MSB limb). 0x3FFF & 0x7FFF != 0x7FFF.
+_F128_FINITE_HI = (0x3F, 0xFF)
+# Distinct LSB-limb leading bytes per carrier so a mis-routed gather
+# (wrong slice base) reads a different significand than the right one.
+_F128_PAYLOAD_TAIL = tuple(range(14))  # 14 bytes -> 16-byte payload total
+
+
+def _vc2_multichunk(*, lsb: int) -> list[int]:
+    """A VC2 carrier with a >8-byte payload -> ``K = ceil(L/8) >= 2``.
+
+    ``L = 9`` inline-digit bytes follow the carrier, so the source spans
+    TWO 8-byte chunks (carrier slot = chunk 0 / LSB, one painted
+    continuation slot = chunk 1 / MSB). This drives a real per-(ct, VC2)
+    rank >= 1 on a fully-surviving body -- the multi-chunk-per-ct edge the
+    single-chunk VC2 never reached. ``lsb`` varies the payload's least
+    byte so a mis-routed gather reads a distinguishable significand.
+    """
+    payload = [0x00] * 8 + [lsb & 0xFF]  # L = 9 -> K = 2
+    return [_VC2, *payload]
+
+
+def _f128_finite(*, lsb: int) -> list[int]:
+    """A FINITE binary128 carrier -> ALG-2 emits 2 idx_2d rows (LSB+MSB).
+
+    16 inline-digit payload bytes; the high u16 (bytes 0,1) is a finite
+    exponent so ``expand_tokens`` paints the second (MSB-limb) chunk slot.
+    In the expanded stream this is 2 NUMBER-band slots (carrier = LSB
+    chunk, painted continuation = MSB chunk); the kernel ALWAYS emits both
+    idx_2d rows (the slice has 2 rows) even when a mid-body cut drops the
+    MSB slot -- the 2-rows / 1-surviving-slot edge. ``lsb`` distinguishes
+    the LSB-limb significand so a wrong slice base reads a different value.
+    """
+    payload = [*_F128_FINITE_HI, *_F128_PAYLOAD_TAIL]
+    payload[-1] = lsb & 0xFF
+    assert len(payload) == 16
+    return [_FLOAT128, *payload]
+
+
+def _rich_body(*, instr_base: int, with_negative: bool, f128_lsb: int) -> np.ndarray:
     """A v2 wire body exercising every dense-decode arm.
 
     Layout (carriers + payloads, then an instruction-rep token):
@@ -72,9 +112,24 @@ def _rich_body(*, instr_base: int, with_negative: bool) -> np.ndarray:
       LOCAL call target = the leaf) -> ALG-3 FUNCTION dedup arm.
     * a VC2 NUMBER carrier with a 2-byte payload (optionally negated) ->
       VC2 significand + sign arm.
+    * a VC2 multi-chunk carrier (L=9 -> K=2) -> the VC2 per-(ct, block)
+      rank >= 1 arm (a real multi-chunk source).
+    * a FINITE F128 carrier (2 idx_2d rows) -> the F128 multi-row /
+      slice-base arm. Its LSB (carrier) slot sits at the surviving prefix
+      boundary the ``context_len=7`` grid point cuts at, so the MSB-limb
+      continuation slot is dropped while the LSB survives -- the 2-rows /
+      1-surviving-slot mid-cut edge (emitting 2 idx_2d rows, surviving 1
+      slot, which shifts every LATER call_target's F128 slice base). On
+      the wide-context grid points the same source fully survives.
     * an F16 NUMBER carrier with a 2-byte payload -> IEEE-narrow arm.
     * an instruction-rep token (band ``>= _EAGER_END``) so the stream is
       not pure-carriers.
+
+    Expanded-slot layout (post strip+shift+prepend), indices:
+    ``0`` self, ``1`` BLOCK, ``2`` LOCAL_FUNC, ``3`` VC2, ``4``/``5`` the
+    VC2 K=2 pair, ``6`` F128 LSB (carrier), ``7`` F128 MSB (painted),
+    ``8`` F16, ``9`` instr. The ``context_len=7`` cut keeps indices
+    ``0..6`` -> F128 LSB survives, F128 MSB (index 7) is dropped.
     """
     pieces: list[int] = []
     # BLOCK COUNTER carrier, caller-local id 3 (1-byte payload).
@@ -85,6 +140,11 @@ def _rich_body(*, instr_base: int, with_negative: bool) -> np.ndarray:
     pieces += [_VC2, 0x01, 0x02]
     if with_negative:
         pieces += [_SIGN]
+    # VC2 multi-chunk carrier (L=9 -> K=2).
+    pieces += _vc2_multichunk(lsb=f128_lsb ^ 0x55)
+    # FINITE F128 carrier (2 idx_2d rows); its LSB slot lands on the
+    # context_len=7 surviving boundary (the mid-cut edge).
+    pieces += _f128_finite(lsb=f128_lsb)
     # F16 carrier, 2-byte payload 0x3C00 (= 1.0).
     pieces += [_FLOAT16, 0x3C, 0x00]
     # An instruction-rep token.
@@ -92,9 +152,20 @@ def _rich_body(*, instr_base: int, with_negative: bool) -> np.ndarray:
     return np.asarray(pieces, dtype=np.uint16)
 
 
-def _leaf_body(*, instr_base: int) -> np.ndarray:
+def _leaf_body(*, instr_base: int, f128_lsb: int) -> np.ndarray:
     """A leaf body carrying its own carriers (so the inlined callee adds
-    fresh dense entries)."""
+    fresh dense entries), ending in a FINITE F128 whose MSB-limb chunk is
+    the body's last NUMBER slot.
+
+    When the leaf is inlined as the cut call_target under a tight
+    ``context_len``, the cut lands between the F128's LSB (carrier) slot
+    and its painted MSB-limb slot: only the LSB slot survives, yet the
+    kernel still emits BOTH idx_2d rows for the source. That 2-rows /
+    1-surviving-slot gap is what shifts every LATER call_target's F128
+    slice base -- the exact re-derivation hazard the 5a code guards
+    against by consuming the kernel's ``.start`` instead of recounting
+    surviving slots.
+    """
     pieces: list[int] = []
     # A second BLOCK COUNTER carrier (caller-local id 1) -> the offset
     # bump must shift it past the root's BLOCK count.
@@ -102,6 +173,10 @@ def _leaf_body(*, instr_base: int) -> np.ndarray:
     # A VC2 carrier with a different 2-byte payload.
     pieces += [_VC2, 0x00, 0x05]
     pieces += [instr_base]
+    # FINITE F128 carrier LAST: its painted MSB-limb continuation slot is
+    # the body's trailing NUMBER slot, so a mid-body cut drops it while
+    # keeping the carrier (LSB) slot.
+    pieces += _f128_finite(lsb=f128_lsb)
     return np.asarray(pieces, dtype=np.uint16)
 
 
@@ -131,18 +206,26 @@ def build_rich_splice_fixture(tmp_path: Path) -> Path:
     root_variants = (
         _spec_variant(
             ("V", 0),
-            _rich_body(instr_base=_EAGER_END + 5, with_negative=True),
+            _rich_body(
+                instr_base=_EAGER_END + 5, with_negative=True, f128_lsb=0xA1
+            ),
             called=("leaf",),
         ),
         _spec_variant(
             ("V", 1),
-            _rich_body(instr_base=_EAGER_END + 9, with_negative=False),
+            _rich_body(
+                instr_base=_EAGER_END + 9, with_negative=False, f128_lsb=0xB2
+            ),
             called=(),
         ),
     )
     leaf_variants = (
-        _spec_variant(("V", 0), _leaf_body(instr_base=_EAGER_END + 13)),
-        _spec_variant(("V", 1), _leaf_body(instr_base=_EAGER_END + 17)),
+        _spec_variant(
+            ("V", 0), _leaf_body(instr_base=_EAGER_END + 13, f128_lsb=0xC3)
+        ),
+        _spec_variant(
+            ("V", 1), _leaf_body(instr_base=_EAGER_END + 17, f128_lsb=0xD4)
+        ),
     )
     solo_variants = (
         make_simple_variant(("solo", 0), token_seed=50, n_tokens=6),

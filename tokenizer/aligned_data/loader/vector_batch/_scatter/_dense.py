@@ -32,9 +32,6 @@ from typing import Optional
 
 import numpy as np
 
-from tokenizer.aligned_data.loader.batch_decode._assemble import (
-    _build_dedup_maps,
-)
 from tokenizer.aligned_data.loader.batch_decode._bulk_bytes import (
     build_bulk_bytes,
 )
@@ -47,8 +44,12 @@ from tokenizer.aligned_data.loader.batch_decode._sidecar_concat import (
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 
 from .._types import BatchGeometry
-from ._dense_adapter import build_stage2_batch
+from ._catalog_columns import build_catalog_columns
+from ._dense_columns import build_dense_columns
 from ._expand import ExpandedBatch
+from ._number_chunk_columns import build_number_chunk_columns
+from ._remap_inputs import build_flat_remap_inputs
+from ._slim_stage2 import build_slim_stage2_batch
 from ._surviving import surviving_token_counts
 
 
@@ -122,13 +123,75 @@ def build_dense_sidecars(
         The per-batch-row dense identity + numeric sidecars.
     """
     surviving = surviving_token_counts(geometry)
-    stage2 = build_stage2_batch(
-        geometry, expanded, cols=cols, surviving=surviving
+    # Per-emitted-node CATALOG columns built ONCE (section index, root FID,
+    # encounter Category, COUNTER counts, per-section CT table) -- the
+    # remap-input builder's columnar source (no re-derived catalog walk).
+    catalog = build_catalog_columns(geometry, expanded, cols=cols)
+
+    # Build the shared stage-3 front-matter ONCE, DIRECTLY from the
+    # retained ``BatchedExpansion`` flats + the per-node cut -- the four
+    # stage-3 sites read this columnar object instead of each re-walking
+    # the per-node tree. The empty-batch path (``batched is None``) lets
+    # ``build_bulk_bytes`` build the (empty) front-matter from ``stage2``.
+    dense = (
+        build_dense_columns(
+            expanded.batched,
+            expanded.raw_flat,
+            expanded.raw_record_offsets,
+            surviving,
+        )
+        if expanded.batched is not None
+        else None
+    )
+
+    # The SLIM (tree-free) ``Stage2Batch`` carries only the three columnar
+    # arrays the downstream stages read -- the identity row->section/variant
+    # mapping + the per-row identity / number-chunk CSR offsets -- reduced
+    # from ``dense``'s per-node surviving counts. The per-call-target object
+    # tree the old adapter built fed ONLY the (now-skipped) Stage3 hierarchy
+    # assembly, so it is dropped here (step-5 object-tree elimination).
+    stage2 = build_slim_stage2_batch(geometry, dense)
+
+    # The remap kernel's flat int arrays built COLUMNAR from ``dense`` +
+    # ``catalog`` + the emission row CSR -- skips the GIL-bound per-call-
+    # target object-tree walk (:func:`extract_flat_remap_inputs`). The
+    # empty-batch path (``dense is None``) leaves ``flat`` ``None`` so
+    # ``apply_per_row_remap`` flattens the (empty) tree itself.
+    flat = (
+        build_flat_remap_inputs(geometry, dense, catalog)
+        if dense is not None
+        else None
     )
 
     # --- run the OWNED decode kernels (byte-identical by construction) ---
-    stage3 = build_bulk_bytes(stage2)
-    dedup_maps = _build_dedup_maps(stage3)
+    stage3 = build_bulk_bytes(stage2, dense)
+
+    # The number-sidecar concat's per-chunk stream built COLUMNAR from
+    # ``dense`` (the surviving NUMBER-band slots) + the kernel-built
+    # per-call_target chunk-slice ``.start`` arrays (exposed flat on
+    # ``stage3``) + the emission row CSR -- skips the GIL-bound per-call-
+    # target object-tree walk (:func:`_build_global_chunk_stream`). The
+    # empty-batch path (``dense is None``) leaves ``numbers`` ``None`` so
+    # ``assemble_number_sidecars`` walks the (empty) tree itself.
+    numbers = (
+        build_number_chunk_columns(
+            geometry, dense, stage3.number_chunk_slice_starts_per_type
+        )
+        if dense is not None
+        else None
+    )
+
+    # The remap's FID-sidecar pass-2 (only on ``include_fid_sidecar``) reads
+    # the per-section variant counts; the vector dense path lays ONE variant
+    # per synthetic section (one section per non-padding row), so it threads
+    # the all-ones counts columnar -- pass-2 then never reaches the object
+    # tree. ``None`` when no FID sidecar (pass-2 is not run).
+    variants_per_section = (
+        np.ones(int(geometry.n_rows), dtype=np.int64)
+        if include_fid_sidecar
+        else None
+    )
+
     (
         row_identities,
         row_fid_sidecar,
@@ -136,10 +199,13 @@ def build_dense_sidecars(
         row_fid_per_category_counts,
     ) = apply_per_row_remap(
         stage3,
-        dedup_maps=dedup_maps,
         collect_fid_sidecar=include_fid_sidecar,
+        flat=flat,
+        variants_per_section=variants_per_section,
     )
-    row_numbers_sig, row_numbers_sex = assemble_number_sidecars(stage3)
+    row_numbers_sig, row_numbers_sex = assemble_number_sidecars(
+        stage3, numbers
+    )
 
     # The adapter's mapping is the IDENTITY over non-padding rows (section
     # i == non-padding row i, variant 0), so the kernels' per-row offsets

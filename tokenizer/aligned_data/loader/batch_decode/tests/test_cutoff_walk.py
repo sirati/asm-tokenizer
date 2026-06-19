@@ -9,11 +9,13 @@ cut convention at exact boundaries.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from tokenizer.aligned_data.loader.batch_decode._cutoff_walk import (
     CutoffResult,
     walk_cutoff,
+    walk_cutoff_batched,
 )
 
 
@@ -291,3 +293,88 @@ def test_invariants_hold_across_grid(predicted: list[int], context_len: int) -> 
 
     result = walk_cutoff(predicted, context_len=context_len)
     _assert_invariants(predicted, context_len, result)
+
+
+# ---------------------------------------------------------------------------
+# Batched walk: a LATER variant must cut with its own per-variant-LOCAL
+# cumsum reset (the path production uses exclusively via _length_predict.py).
+# ---------------------------------------------------------------------------
+
+
+def test_batched_later_variant_cuts_with_local_cumsum_reset() -> None:
+    """Two variants where the SECOND one cuts, exercising the per-variant
+    base subtraction (``- variant_base[ct_variant]``) and the overflow
+    counter reset (``- over_base[ct_variant]``) that single-variant tests
+    can never reach (with one variant both bases are zero, so the resets
+    are no-ops).
+
+    Flat layout (variant-then-DFS order)::
+
+        lengths = [3, 3, 3, 5, 2]
+        variant_offsets = [0, 3, 5]
+        context_lens = [4, 6]
+
+    Variant 0 (lengths [3,3,3], budget 4):
+        cumsum_after = [3, 6, 9]; first > 4 is index 1 (6 > 4).
+        partial = budget - cumsum_before = 4 - 3 = 1.
+        surviving = [3, 1, 0]; is_cut = [F, T, F]; cut_idx = 1.
+
+    Variant 1 (lengths [5,2], budget 6):
+        LOCAL cumsum_after = [5, 7]; first > 6 is index 1 (7 > 6).
+        partial = 6 - 5 = 1. surviving = [5, 1]; is_cut = [F, T];
+        cut_idx = 1.
+
+    Without the ``variant_base`` reset, variant 1's GLOBAL cumsum_before
+    would be [9, 14] -> budget 6 minus that clamps surviving to [0, 0]
+    and shifts the overflow to index 0. Without the ``over_base`` reset,
+    variant 1's overflow counter is already non-zero (variant 0 cut), so
+    ``excl_over == 0`` never holds and variant 1 records NO cut. Either
+    mutation changes the asserted values below.
+    """
+
+    lengths = np.array([3, 3, 3, 5, 2], dtype=np.int64)
+    variant_offsets = np.array([0, 3, 5], dtype=np.int64)
+    context_lens = np.array([4, 6], dtype=np.int64)
+
+    columns = walk_cutoff_batched(lengths, variant_offsets, context_lens)
+
+    # Flat per-call-target columns.
+    np.testing.assert_array_equal(
+        columns.surviving_token_counts,
+        np.array([3, 1, 0, 5, 1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        columns.is_cut_flags,
+        np.array([False, True, False, False, True], dtype=np.bool_),
+    )
+
+    # Per-variant scalars (LOCAL cut index + partial).
+    np.testing.assert_array_equal(
+        columns.cut_call_target_index,
+        np.array([1, 1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        columns.partial_cut_length,
+        np.array([1, 1], dtype=np.int64),
+    )
+
+    # Cross-check: each variant's columnar slice equals the scalar walk's
+    # per-variant CutoffResult (the documented byte-for-byte equivalence).
+    for v, (lo, hi, budget) in enumerate(
+        [(0, 3, 4), (3, 5, 6)]
+    ):
+        scalar = walk_cutoff(
+            [int(x) for x in lengths[lo:hi]], context_len=budget
+        )
+        np.testing.assert_array_equal(
+            columns.surviving_token_counts[lo:hi],
+            np.array(scalar.surviving_token_counts, dtype=np.int64),
+        )
+        np.testing.assert_array_equal(
+            columns.is_cut_flags[lo:hi],
+            np.array(scalar.is_cut_flags, dtype=np.bool_),
+        )
+        assert int(columns.cut_call_target_index[v]) == (
+            scalar.cut_call_target_index
+        )
+        assert int(columns.partial_cut_length[v]) == scalar.partial_cut_length

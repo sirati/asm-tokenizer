@@ -1,0 +1,328 @@
+"""Equivalence gate: columnar number-sidecar stream == the tree-walk's.
+
+The object-tree-elimination plan (step 5a) re-points the number-sidecar
+concat on the vector dense path to feed the per-chunk stream from a
+COLUMNAR :class:`NumberChunkColumns` (:func:`...vector_batch._scatter.
+_number_chunk_columns.build_number_chunk_columns`, built from the dense
+columns + the kernel-built per-call_target chunk-slice ``.start`` arrays +
+the emission row CSR) instead of the GIL-bound ``sections -> variants ->
+call_targets`` object-tree walk (:func:`...batch_decode._sidecar_concat.
+_tree_chunk_columns`).
+
+This module pins that re-point DIRECTLY: on the live rich-splice binary it
+captures, from inside the real vector path, the columnar ``numbers`` the
+re-point threads AND the ``stage3`` tree the staged walk consumes, then
+asserts:
+
+1. The per-chunk :class:`NumberChunkColumns` triple (``out_block``,
+   ``slice_start``, ``ct_ordinal``) + the variant CSR are ``np.array_equal``
+   to the tree walk's, AND
+2. the FULL ``assemble_number_sidecars`` output (``numbers_significant`` /
+   ``numbers_sign_exponent``) is byte-identical between the two sources.
+
+Driven over the same context_len x depth grid the byte-identity harness
+uses (full fit, mid-body straddler cut, depth-0 root-only) so the
+surviving clip + the VC2/F128 multi-chunk per-(ct, block) rank + the
+mid-cut F128 invisible-MSB drop are all exercised on real content. The
+teeth case proves a deliberate slice-start / rank perturbation FAILS.
+"""
+
+from __future__ import annotations
+
+import unittest.mock as _mock
+
+import numpy as np
+import pytest
+
+from tokenizer.aligned_data.loader.batch_decode import (
+    SectionPointerSpec,
+    VariantPadding,
+)
+from tokenizer.aligned_data.loader.batch_decode._sidecar_concat import (
+    NumberChunkColumns,
+    _NUMBER_BLOCK_TOKEN_TYPES,
+    _build_global_chunk_stream,
+    _tree_chunk_columns,
+    assemble_number_sidecars,
+)
+from tokenizer.aligned_data.loader.binary_dataset import BinaryDataset
+from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.aligned_data.loader.vector_batch._entry import (
+    vector_batch_tokens,
+)
+from tokenizer.aligned_data.loader.vector_batch._scatter import (
+    _dense as _dense_mod,
+)
+from tokenizer.aligned_data.loader.vector_batch.session_handles import (
+    open_vector_batch_handles,
+)
+from tokenizer.aligned_data.sorted_index.tests.fixtures import (
+    make_test_vocab_manager,
+)
+
+from ._byte_identity_harness import _nonempty_matched_idxs, _prepare
+from ._full_tree_oracle import (
+    build_full_tree_stage3,
+    capture_columnar_inputs,
+)
+from ._rich_corpus import build_rich_splice_fixture
+
+
+_TRIPLE_FIELDS = ("out_block", "slice_start", "ct_ordinal")
+
+# Canonical NUMBER-block indices (``shifted_id - 1``): block 0 = VC2,
+# block 6 = F128 (the sharp edges the gate must exercise).
+_VC2_BLOCK = 0
+_F128_BLOCK = 6
+
+
+def _edge_coverage(stage3, columnar):
+    """What sharp edges this captured batch exercises.
+
+    Returns ``(has_f128, has_vc2_multichunk, has_f128_midcut)``:
+
+    * ``has_f128`` -- a block-6 chunk is present at all.
+    * ``has_vc2_multichunk`` -- a per-(ct, VC2) rank >= 1 occurs, i.e. a
+      call_target carries >= 2 surviving VC2 chunks (a >8-byte K>=2
+      source or two VC2 sources -- either way the rank reset is
+      load-bearing).
+    * ``has_f128_midcut`` -- some call_target emits MORE F128 idx_2d rows
+      (kernel slice length) than it has surviving F128 chunks in the
+      stream: the 2-rows / 1-surviving-slot mid-cut edge whose row count
+      the re-derivation bug under-counts (shifting later F128 bases).
+    """
+    from tokenizer.tokens import TokenType
+
+    out_block = np.asarray(columnar.out_block)
+    ct_ordinal = np.asarray(columnar.ct_ordinal)
+    has_f128 = bool((out_block == _F128_BLOCK).any())
+
+    # VC2 multichunk: a ct with >= 2 surviving VC2 chunks.
+    has_vc2_multichunk = False
+    f128_starts = np.asarray(
+        stage3.number_chunk_slice_starts_per_type[TokenType.FLOAT128]
+    )
+    # Per-ct kernel F128 row count = the slice length implied by the
+    # abutting per-ct ``.start`` boundaries (last ct's length is whatever
+    # the global F128 table holds beyond its start; a mid-cut still leaves
+    # a non-final ct whose start gap exceeds its surviving chunk count).
+    n_cts = int(f128_starts.shape[0])
+    f128_rows_per_ct = np.diff(
+        np.concatenate([f128_starts, f128_starts[-1:]])
+    ) if n_cts else np.empty(0, dtype=np.int64)
+    has_f128_midcut = False
+    for ct in np.unique(ct_ordinal):
+        ct = int(ct)
+        vc2_here = int(((out_block == _VC2_BLOCK) & (ct_ordinal == ct)).sum())
+        if vc2_here >= 2:
+            has_vc2_multichunk = True
+        f128_here = int(((out_block == _F128_BLOCK) & (ct_ordinal == ct)).sum())
+        if 0 < ct < n_cts and f128_here > 0:
+            if int(f128_rows_per_ct[ct]) > f128_here:
+                has_f128_midcut = True
+        # ct 0's row count is the gap to ct 1's start; check it directly.
+        if ct == 0 and n_cts >= 2 and f128_here > 0:
+            if int(f128_starts[1] - f128_starts[0]) > f128_here:
+                has_f128_midcut = True
+    return has_f128, has_vc2_multichunk, has_f128_midcut
+
+
+def _assert_chunk_columns_equal(
+    tree: NumberChunkColumns, columnar: NumberChunkColumns
+) -> None:
+    """Assert the per-chunk triple + the variant CSR equal (tree vs columnar)."""
+    for name in _TRIPLE_FIELDS + ("variant_chunk_offsets",):
+        t = np.asarray(getattr(tree, name))
+        c = np.asarray(getattr(columnar, name))
+        assert c.shape == t.shape, (
+            f"{name} shape: columnar {c.shape} vs tree {t.shape}"
+        )
+        if not np.array_equal(c, t):
+            diff = np.nonzero(c.reshape(-1) != t.reshape(-1))[0]
+            k = int(diff[0])
+            raise AssertionError(
+                f"{name} differs at {diff.size} pos; first flat idx {k}: "
+                f"tree={t.reshape(-1)[k]!r} columnar={c.reshape(-1)[k]!r}"
+            )
+
+
+@pytest.mark.parametrize(
+    "context_len,max_depth", [(4096, 3), (7, 3), (256, 0)]
+)
+def test_number_chunk_columns_equiv_live_binary(
+    context_len, max_depth, tmp_path
+):
+    """Columnar number-sidecar stream == the staged tree-walk's, per batch."""
+    base = _prepare(build_rich_splice_fixture, tmp_path)
+    idxs = _nonempty_matched_idxs(base)
+
+    # Capture the production columnar ``numbers``. The tree-walk ORACLE is
+    # rebuilt independently from the captured ``(geometry, dense, catalog)``
+    # (the production tree is now SLIM -- step-5 object-tree elimination --
+    # so there is no ``stage3.sections`` to walk on the production object).
+    numbers_capture: list = []
+    real_assemble = _dense_mod.assemble_number_sidecars
+
+    def _capturing(stage3, numbers=None):
+        if numbers is not None:
+            numbers_capture.append(numbers)
+        return real_assemble(stage3, numbers)
+
+    pointers = [
+        SectionPointerSpec(arm=SectionKind.MATCHED, idx=int(i)) for i in idxs
+    ]
+    dataset = BinaryDataset(
+        base, "sortbin", vocab_manager=make_test_vocab_manager()
+    )
+    with capture_columnar_inputs() as columnar_inputs:
+        with _mock.patch.object(
+            _dense_mod, "assemble_number_sidecars", _capturing
+        ):
+            with dataset.open_session() as session:
+                with open_vector_batch_handles(base, "sortbin") as handles:
+                    vector_batch_tokens(
+                        session,
+                        pointers,
+                        handles=handles,
+                        num_variants_per_section=2,
+                        context_len=context_len,
+                        max_depth=max_depth,
+                        variant_padding=VariantPadding.PAD_NULL,
+                        include_fid_sidecar=True,
+                        rng=np.random.default_rng(0),
+                    )
+
+    assert numbers_capture, (
+        "the columnar number-sidecar path was never exercised"
+    )
+    assert len(numbers_capture) == len(columnar_inputs), (
+        "columnar-input capture / numbers capture lengths diverge: "
+        f"{len(columnar_inputs)} vs {len(numbers_capture)}"
+    )
+    any_chunks = False
+    saw_f128 = False
+    saw_vc2_multichunk = False
+    saw_f128_midcut = False
+    for (geometry, dense, catalog), columnar in zip(
+        columnar_inputs, numbers_capture
+    ):
+        full_stage3 = build_full_tree_stage3(geometry, dense, catalog)
+        tree = _tree_chunk_columns(full_stage3)
+        _assert_chunk_columns_equal(tree, columnar)
+
+        # Full sidecar byte-identity: the shared rank + gather tail must
+        # produce the same (sig, sex) from either source.
+        tree_sig, tree_sex = assemble_number_sidecars(full_stage3)
+        col_sig, col_sex = assemble_number_sidecars(full_stage3, columnar)
+        assert np.array_equal(tree_sig, col_sig), "numbers_significant diverged"
+        assert np.array_equal(
+            tree_sex, col_sex
+        ), "numbers_sign_exponent diverged"
+
+        if tree.out_block.shape[0] > 0:
+            any_chunks = True
+        f128, vc2_mc, f128_midcut = _edge_coverage(full_stage3, columnar)
+        saw_f128 |= f128
+        saw_vc2_multichunk |= vc2_mc
+        saw_f128_midcut |= f128_midcut
+    assert any_chunks, "live capture carried no number chunks -- vacuous gate"
+
+    # Teeth on the sharp edges (the whole point of the rich corpus): the
+    # gate must actually EXERCISE the F128 block + the VC2 K>=2 rank reset
+    # on every grid point, else the equivalence is proven only on the
+    # trivial single-chunk arms (the audit's blind-spot).
+    assert saw_f128, "no F128 (block 6) chunk exercised -- vacuous F128 arm"
+    assert saw_vc2_multichunk, (
+        "no per-(ct, VC2) rank >= 1 exercised -- vacuous VC2 multi-chunk arm"
+    )
+    # Only the cut grid point straddles the F128 mid-body: there the
+    # 2-rows / 1-surviving-slot edge (a kernel F128 slice longer than the
+    # surviving chunk count) MUST appear -- the precise edge a slice-start
+    # re-derivation would mis-count.
+    if max_depth == 3 and context_len == 7:
+        assert saw_f128_midcut, (
+            "the mid-cut F128 (2 idx_2d rows, 1 surviving slot) was not "
+            "exercised -- the slice-base re-derivation hazard is untested"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Teeth: a SYNTHETIC multi-same-block-per-ct stream where the per-(ct, block)
+# rank reset is load-bearing -- a rolled ``ct_ordinal`` MUST mis-route.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_two_ct_vc2_stream():
+    """Two call_targets, two VC2 chunks each, interleaved with an F32 chunk.
+
+    The shared rank + gather tail reads ``numbers_per_TokenType[VC2]`` at
+    ``slice_start + rank``; with two VC2 chunks per ct the rank goes 0, 1
+    WITHIN each ct and RESETS at the ct boundary. A rolled ``ct_ordinal``
+    breaks that reset, so the gathered significands diverge. Returns a
+    ``(stage3_stub, columnar)`` pair sharing one ``numbers_per_TokenType``.
+    """
+
+    class _Stage3Stub:
+        # ``_build_global_chunk_stream`` reads only ``numbers_per_TokenType``
+        # when fed a columnar ``numbers`` (no tree walk), so a stub carrying
+        # just that mapping is sufficient + decoupled from the object tree.
+        def __init__(self, numbers_per_TokenType):
+            self.numbers_per_TokenType = numbers_per_TokenType
+
+    from tokenizer.tokens import TokenType
+
+    # Per-type source tables: distinct values so a mis-routed gather is
+    # observable. VC2 has 4 sources (ct0: rows 0,1; ct1: rows 2,3).
+    vc2_sig = np.array([10, 11, 12, 13], dtype=np.uint64)
+    vc2_sex = np.array([100, 101, 102, 103], dtype=np.uint32)
+    f32_sig = np.array([20, 21], dtype=np.uint64)
+    f32_sex = np.array([200, 201], dtype=np.uint32)
+    numbers_per_TokenType = {T: (np.zeros(0, np.uint64), np.zeros(0, np.uint32))
+                             for T in _NUMBER_BLOCK_TOKEN_TYPES}
+    numbers_per_TokenType[TokenType.VALUED_CONST_V2] = (vc2_sig, vc2_sex)
+    numbers_per_TokenType[TokenType.FLOAT32] = (f32_sig, f32_sex)
+
+    # Stream (DFS-then-stream): ct0 [VC2, VC2, F32], ct1 [VC2, VC2, F32].
+    out_block = np.array([0, 0, 3, 0, 0, 3], dtype=np.int64)
+    ct_ordinal = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
+    # ct0's VC2 slice starts at 0, F32 at 0; ct1's VC2 at 2, F32 at 1.
+    slice_start = np.array([0, 0, 0, 2, 2, 1], dtype=np.int64)
+    variant_chunk_offsets = np.array([0, 3, 6], dtype=np.int64)
+    columnar = NumberChunkColumns(
+        out_block=out_block,
+        slice_start=slice_start,
+        ct_ordinal=ct_ordinal,
+        variant_chunk_offsets=variant_chunk_offsets,
+    )
+    return _Stage3Stub(numbers_per_TokenType), columnar
+
+
+def test_number_chunk_columns_gate_has_teeth():
+    """Slice-start + rank perturbations both mis-route the synthetic stream."""
+    import dataclasses
+
+    stage3, columnar = _synthetic_two_ct_vc2_stream()
+    ref_sig, ref_sex = _build_global_chunk_stream(stage3, columnar)[:2]
+    # Non-vacuous: the reference gather actually consumes per-(ct, block)
+    # ranks > 0 (the second VC2 chunk of each ct).
+    assert ref_sig.tolist() == [10, 11, 20, 12, 13, 21], (
+        f"unexpected reference gather: {ref_sig.tolist()}"
+    )
+
+    # Rolled ct_ordinal breaks the per-(ct, block) rank reset.
+    bad_ct = dataclasses.replace(
+        columnar, ct_ordinal=np.roll(columnar.ct_ordinal, 1)
+    )
+    bad_sig = _build_global_chunk_stream(stage3, bad_ct)[0]
+    assert not np.array_equal(bad_sig, ref_sig), (
+        "rolled ct_ordinal did NOT diverge -- vacuous gate"
+    )
+
+    # Shifted slice_start mis-routes every chunk's source base.
+    bad_start = dataclasses.replace(
+        columnar, slice_start=columnar.slice_start * 0 + 1
+    )
+    bad_sig2 = _build_global_chunk_stream(stage3, bad_start)[0]
+    assert not np.array_equal(bad_sig2, ref_sig), (
+        "shifted slice_start did NOT diverge -- vacuous gate"
+    )

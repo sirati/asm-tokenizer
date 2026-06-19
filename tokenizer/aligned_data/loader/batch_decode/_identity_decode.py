@@ -49,17 +49,31 @@ in a single vectorised pass.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import os
 
 import numpy as np
 
+from dedup_hashmap import build_identity_carriers_kernel
+
 from tokenizer.token_manager import VocabularyManager
 
-if TYPE_CHECKING:
-    from ._types import Stage2Batch
+from ._dense_columns import DenseColumns
 
 
-__all__ = ["build_identity_idx_2d", "view_cast_identities"]
+__all__ = [
+    "IdentitySlicesCSR",
+    "build_identity_idx_2d",
+    "view_cast_identities",
+]
+
+
+# When set, derive the per-call_target identity CSR via the original
+# per-node Python loop (the byte-identity oracle) instead of the
+# vectorised cumsum. Equivalence-gate / mutation-test hook only -- the
+# production path is the vectorised one.
+_USE_PYTHON_IDENTITY_SLICES = bool(
+    os.environ.get("ASM_PYTHON_IDENTITY_SLICES")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,27 +95,26 @@ _V2_EAGER_BLOCK_END = VocabularyManager._V2_EAGER_BLOCK_END  # 272
 
 
 def build_identity_idx_2d(
-    stage2_batch: "Stage2Batch",
+    dense: DenseColumns,
     inline_bytes: np.ndarray,
     inline_byte_slices: list[slice],
-) -> tuple[np.ndarray, list[slice]]:
+) -> tuple[np.ndarray, "IdentitySlicesCSR"]:
     """Build the identity-token idx_2d table per ALG-5.
 
-    Walks sections -> variants -> call_targets in DFS encounter order
-    (the linearisation stage 1 produced + stage 2 mirrors). For each
-    SURVIVING identity carrier in each call_target's raw token stream
-    emits one row into ``identity_idx_2d`` that points (in
-    ``inline_bytes`` coordinates) at the carrier's payload bytes.
+    Reads the shared :class:`DenseColumns` front-matter over the DFS
+    (== emitted-node) node axis. For each SURVIVING identity carrier in
+    each call_target's raw token stream emits one row into
+    ``identity_idx_2d`` that points (in ``inline_bytes`` coordinates) at
+    the carrier's payload bytes.
 
     Excludes prepend slots: stage 4 writes them directly per ALG-9.
 
     Parameters
     ----------
-    stage2_batch
-        The level-1 stage-2 result. The walk only reads
-        ``stage1.state.raw_tokens`` / ``runlen_number`` /
-        ``number_mask`` / ``carries_inline_mask`` (via the level-4
-        ``stage1.state`` back-pointer) and the per-call-target
+    dense
+        The shared dense front-matter (:class:`DenseColumns`). The walk
+        reads each node's ``raw_tokens`` / ``runlen_number`` /
+        ``real_mask`` / ``digit_cumsum`` and its per-node
         ``surviving_token_count`` / ``surviving_identity_count``.
     inline_bytes
         The u8 array stage 3a produced (size ``1 + total_surviving_bytes``;
@@ -123,14 +136,16 @@ def build_identity_idx_2d(
         of byte offsets into ``inline_bytes``. Prepend slots are NOT
         included here (stage 4 writes them into
         ``identities_flat_caller_local`` directly per ALG-9).
-    identity_slices : list[slice]
-        One entry per level-4 call_target (matching the order of
-        ``inline_byte_slices``). Each slice points into the level-1
-        ``identities_flat_caller_local`` array and INCLUDES the
-        prepend slot at ``slice.start``. Slice length =
+    identity_slices : IdentitySlicesCSR
+        Lazy per-call_target identity CSR (one entry per level-4
+        call_target, matching the order of ``inline_byte_slices``).
+        Indexing yields a ``slice`` into the level-1
+        ``identities_flat_caller_local`` array that INCLUDES the prepend
+        slot at ``slice.start``; the range length =
         ``surviving_identity_count`` of the call_target (which equals
-        ``1 + in_stream_id_count`` when the call_target survives at
-        all, else ``0``).
+        ``1 + in_stream_id_count`` when the call_target survives at all,
+        else ``0``). The hot path reads ``.starts`` / ``.stops`` for the
+        vectorised level-1 scatter without ever materialising slices.
     """
 
     # ------------------------------------------------------------------
@@ -143,13 +158,13 @@ def build_identity_idx_2d(
     # CSR arrays. Output ``identity_idx_2d`` rows stay in DFS-then-stream
     # encounter order -- byte-identical to the per-call_target walk.
     # ------------------------------------------------------------------
-    identity_slices = _identity_slices(stage2_batch)
+    identity_slices = _identity_slices(dense)
 
     (
         carrier_offsets,
         carrier_L,
         carrier_raw_positions,
-    ) = _gather_identity_carriers(stage2_batch, inline_byte_slices)
+    ) = _gather_identity_carriers(dense, inline_byte_slices)
 
     identity_idx_2d = _identity_rows_from_carriers(
         carrier_offsets, carrier_L, carrier_raw_positions
@@ -158,115 +173,147 @@ def build_identity_idx_2d(
     return identity_idx_2d, identity_slices
 
 
-def _identity_slices(stage2_batch: "Stage2Batch") -> list[slice]:
-    """Per-call_target ``identity_slice`` list (DFS order, all targets).
+class IdentitySlicesCSR:
+    """Lazy per-call_target identity CSR over the level-1 array.
 
-    Each slice covers ``surviving_identity_count`` entries (INCLUDING the
+    Holds the per-node ``starts`` / ``stops`` cumsum arrays (one entry per
+    DFS node, INCLUDING the prepend slot at ``start``) and materialises a
+    ``slice`` only on element access. The vector hot path reads the CSR
+    arrays directly (``.starts`` / ``.stops``) for the vectorised level-1
+    scatter; the staged tree-walk indexes per call_target and gets a real
+    ``slice`` back -- so the per-node ``slice``-object Python loop only
+    runs when the tree is actually assembled, never on the hot path.
+
+    Supports the read-only sequence protocol the consumers need:
+    ``len()``, positive/negative ``__getitem__`` (returning ``slice``),
+    iteration, and truthiness. It is NOT a ``list`` -- there is no
+    materialised slice list anywhere on the hot path.
+    """
+
+    __slots__ = ("starts", "stops")
+
+    def __init__(self, starts: np.ndarray, stops: np.ndarray) -> None:
+        self.starts = starts
+        self.stops = stops
+
+    def __len__(self) -> int:
+        return int(self.starts.shape[0])
+
+    def __getitem__(self, i: int) -> slice:
+        return slice(int(self.starts[i]), int(self.stops[i]))
+
+    def __iter__(self):
+        for start, stop in zip(self.starts.tolist(), self.stops.tolist()):
+            yield slice(start, stop)
+
+    @property
+    def total_length(self) -> int:
+        """Total level-1 length (== ``stops[-1]`` / ``[-1].stop``, 0 empty)."""
+        return int(self.stops[-1]) if self.stops.shape[0] else 0
+
+
+def _identity_slices(dense: DenseColumns) -> IdentitySlicesCSR:
+    """Per-call_target identity CSR (DFS order, all targets).
+
+    Each entry covers ``surviving_identity_count`` slots (INCLUDING the
     prepend slot) into the level-1 ``identities_flat_caller_local`` array;
-    fully-dropped call_targets get a zero-length slice at the running
-    offset. This is a plain cumsum over the per-call_target surviving
-    identity counts -- the same offsets the per-call_target walk produced,
-    one ``slice`` object per target.
+    fully-dropped call_targets get a zero-length range at the running
+    offset. This is a plain cumsum over the per-node surviving identity
+    counts -- the same offsets the per-call_target walk produced.
+
+    Vectorised: ``stops = cumsum(surviving_identity_count)`` and
+    ``starts = stops - surviving_identity_count``; the
+    ``surviving_token_count == 0 => surviving_identity_count == 0``
+    invariant is a single boolean reduction. No per-node Python loop.
+    """
+    if _USE_PYTHON_IDENTITY_SLICES:
+        return _identity_slices_python_oracle(dense)
+
+    sic = np.ascontiguousarray(dense.surviving_identity_count, dtype=np.int64)
+    stc = np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64)
+    # Defensive: a fully-dropped call_target (surviving_token_count == 0)
+    # also has zero surviving identity tokens -- the prepend at expanded
+    # position 0 is itself an identity token.
+    if np.any((stc == 0) & (sic != 0)):
+        raise AssertionError(
+            "Stage 2 invariant violated: a call_target with "
+            "surviving_token_count == 0 must also have "
+            "surviving_identity_count == 0 (the prepend at "
+            "expanded position 0 is itself an identity token)."
+        )
+    stops = np.cumsum(sic)
+    starts = stops - sic
+    return IdentitySlicesCSR(starts, stops)
+
+
+def _identity_slices_python_oracle(dense: DenseColumns) -> IdentitySlicesCSR:
+    """Original per-node Python prefix-sum -- byte-identity oracle.
+
+    Pinned verbatim from the pre-port loop: one running offset, one
+    ``slice`` per node, the ``surviving_token_count == 0 => sic == 0``
+    assert per node. Materialises the CSR arrays from the produced
+    slices so it returns the same :class:`IdentitySlicesCSR` type as the
+    vectorised path (the equivalence gate compares the produced
+    ``starts`` / ``stops``).
     """
     slices: list[slice] = []
     level1_offset = 0
-    for stage2_section in stage2_batch.sections:
-        for stage2_variant in stage2_section.variants:
-            for stage2_ct in stage2_variant.call_targets:
-                sic = int(stage2_ct.surviving_identity_count)
-                if int(stage2_ct.surviving_token_count) == 0:
-                    # Defensive: a fully-dropped call_target also has zero
-                    # surviving identity tokens (the prepend at expanded
-                    # position 0 is itself an identity token).
-                    assert sic == 0, (
-                        "Stage 2 invariant violated: a call_target with "
-                        "surviving_token_count == 0 must also have "
-                        "surviving_identity_count == 0 (the prepend at "
-                        "expanded position 0 is itself an identity token)."
-                    )
-                slices.append(slice(level1_offset, level1_offset + sic))
-                level1_offset += sic
-    return slices
+    for e in range(dense.n_nodes):
+        sic = int(dense.surviving_identity_count[e])
+        if int(dense.surviving_token_count[e]) == 0:
+            assert sic == 0, (
+                "Stage 2 invariant violated: a call_target with "
+                "surviving_token_count == 0 must also have "
+                "surviving_identity_count == 0 (the prepend at "
+                "expanded position 0 is itself an identity token)."
+            )
+        slices.append(slice(level1_offset, level1_offset + sic))
+        level1_offset += sic
+    starts = np.fromiter(
+        (sl.start for sl in slices), dtype=np.int64, count=len(slices)
+    )
+    stops = np.fromiter(
+        (sl.stop for sl in slices), dtype=np.int64, count=len(slices)
+    )
+    return IdentitySlicesCSR(starts, stops)
 
 
 def _gather_identity_carriers(
-    stage2_batch: "Stage2Batch",
+    dense: DenseColumns,
     inline_byte_slices: list[slice],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Flat per-carrier ``(first_payload_offset, L, raw_position)``.
 
-    Walks the DFS call_target stream collecting, for each SURVIVING
-    in-stream identity carrier (the first ``surviving_identity_count - 1``
-    identity-band real tokens of each surviving call_target's raw stream),
-    its absolute first-payload byte offset into ``inline_bytes`` and its
-    payload length ``L`` (per the ALG-5 width table). The gather is a pure
-    array-collection loop (one ``np.concatenate`` per output); the ALG-5
-    row build runs once over the flat arrays.
+    For each SURVIVING in-stream identity carrier (the first
+    ``surviving_identity_count - 1`` identity-band real tokens of each
+    surviving node's raw stream), the carrier's absolute first-payload
+    byte offset into ``inline_bytes`` + its payload length ``L`` (per the
+    ALG-5 width table) + its raw position, in DFS-then-stream order.
+
+    GIL-released (B-S3): the per-node Python gather loop (per-node
+    ``np.nonzero`` of the identity-band real mask + the ``runlen_number``
+    / ``digit_cumsum`` gathers) is a single ``py.detach`` Rust kernel
+    reading the flat :class:`DenseColumns` columns directly. The ALG-5
+    row build (:func:`_identity_rows_from_carriers`) stays in numpy --
+    it is already one vectorised pass over these flat triples.
     """
-    offset_chunks: list[np.ndarray] = []
-    L_chunks: list[np.ndarray] = []
-    pos_chunks: list[np.ndarray] = []
-
-    ct_iter_idx = 0
-    for stage2_section in stage2_batch.sections:
-        for stage2_variant in stage2_section.variants:
-            for stage2_ct in stage2_variant.call_targets:
-                inline_byte_slice = inline_byte_slices[ct_iter_idx]
-                ct_iter_idx += 1
-
-                if int(stage2_ct.surviving_token_count) == 0:
-                    continue
-                in_stream_id_count = (
-                    int(stage2_ct.surviving_identity_count) - 1
-                )
-                if in_stream_id_count <= 0:
-                    continue
-
-                state = stage2_ct.stage1.state
-                raw_tokens = state.raw_tokens
-
-                # Identity tokens are NEVER promoted, so the surviving
-                # in-stream carriers are the FIRST ``in_stream_id_count``
-                # identity-band real tokens in raw order (the cut chops
-                # later carriers but never reorders).
-                identity_carrier_mask = state.real_mask & (
-                    (raw_tokens >= _V2_IDENTITY_BLOCK_START)
-                    & (raw_tokens < _V2_EAGER_BLOCK_END)
-                )
-                identity_carrier_positions = np.nonzero(
-                    identity_carrier_mask
-                )[0]
-                p = identity_carrier_positions[
-                    :in_stream_id_count
-                ].astype(np.int64)
-
-                n = int(raw_tokens.shape[0])
-                runlen_number = state.runlen_number
-                # Payload length L = runlen_number[p+1] when p+1 in
-                # bounds (else 0; a carrier at the last raw slot has no
-                # payload). np.where avoids the OOB gather.
-                has_p1 = p < (n - 1)
-                safe_p1 = np.where(has_p1, p + 1, np.int64(0))
-                L_raw = runlen_number[safe_p1].astype(np.int64)
-                L = np.where(has_p1, L_raw, np.int64(0))
-
-                # First payload byte = exclusive digit cumsum at p+1 +
-                # the call_target's inline-byte base.
-                first_payload_offset = state.digit_cumsum[p + 1].astype(
-                    np.int64
-                ) + np.int64(inline_byte_slice.start)
-
-                offset_chunks.append(first_payload_offset)
-                L_chunks.append(L)
-                pos_chunks.append(p)
-
-    if not offset_chunks:
-        empty_i = np.empty(0, dtype=np.int64)
-        return empty_i, empty_i.copy(), empty_i.copy()
-    return (
-        np.concatenate(offset_chunks),
-        np.concatenate(L_chunks),
-        np.concatenate(pos_chunks),
+    inline_slice_start = np.fromiter(
+        (sl.start for sl in inline_byte_slices),
+        dtype=np.int64,
+        count=len(inline_byte_slices),
+    )
+    return build_identity_carriers_kernel(
+        np.ascontiguousarray(dense.raw_tokens, dtype=np.uint16),
+        np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.uint16),
+        np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.digit_cumsum, dtype=np.uint32),
+        np.ascontiguousarray(dense.digit_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
+        np.ascontiguousarray(dense.surviving_identity_count, dtype=np.int64),
+        inline_slice_start,
+        int(_V2_IDENTITY_BLOCK_START),
+        int(_V2_EAGER_BLOCK_END),
     )
 
 
@@ -355,3 +402,59 @@ def view_cast_identities(
     # zero-identity-tokens test.
     gathered = inline_bytes[identity_idx_2d]
     return gathered.view(">u2").reshape(-1)
+
+
+def scatter_in_stream_identities(
+    identity_slices: "IdentitySlicesCSR",
+    identities_in_stream: np.ndarray,
+) -> np.ndarray:
+    """Allocate the level-1 identities array + scatter the in-stream ids.
+
+    Builds ``identities_flat_caller_local`` (``u16`` of length
+    ``identity_slices.total_length``) with prepend slots left 0 (stage 4
+    fills them per ALG-9), and scatters ``identities_in_stream`` (the
+    view-cast caller-local u16 ids, in DFS-then-stream order) into the
+    POST-PREPEND sub-range ``[start + 1 : stop]`` of every surviving
+    call_target.
+
+    Vectorised: the destination indices are
+    ``concat over nodes of arange(start + 1, stop)`` -- the classic
+    cumulative-offset arange (``np.repeat`` of the per-node first
+    post-prepend index + a within-node ``arange`` derived from the
+    per-node in-stream lengths), then ONE fancy-index assignment. No
+    per-node Python loop.
+
+    The flat emission order of ``identities_in_stream`` is "all in-stream
+    identities of call_target 0, then 1, ..." with per-call_target length
+    ``surviving_identity_count - 1`` for surviving targets and 0 for
+    fully-dropped ones -- exactly the lengths
+    ``max(stop - start - 1, 0)`` recover, so the global arange consumes
+    ``identities_in_stream`` left-to-right in the same order.
+    """
+    starts = identity_slices.starts
+    stops = identity_slices.stops
+    flat = np.zeros(identity_slices.total_length, dtype=np.uint16)
+
+    # Per-node in-stream length: surviving targets have slot 0 = prepend,
+    # slots 1..end = in-stream ids; fully-dropped (zero-length) targets
+    # contribute nothing. ``max(.., 0)`` keeps a zero-length range at 0.
+    in_stream_len = np.maximum(stops - starts - 1, 0)
+    total = int(in_stream_len.sum())
+    if total != int(identities_in_stream.shape[0]):
+        raise AssertionError(
+            f"identity in-stream count mismatch: per-call_target lengths "
+            f"sum to {total} u16 ids but the view-cast produced "
+            f"{int(identities_in_stream.shape[0])}"
+        )
+    if total == 0:
+        return flat
+
+    # First POST-PREPEND destination index per node (start + 1), repeated
+    # by the node's in-stream length, plus a within-node 0..len arange.
+    first_dest = starts + 1
+    base = np.repeat(first_dest, in_stream_len)
+    within = np.arange(total, dtype=np.int64) - np.repeat(
+        np.cumsum(in_stream_len) - in_stream_len, in_stream_len
+    )
+    flat[base + within] = identities_in_stream
+    return flat

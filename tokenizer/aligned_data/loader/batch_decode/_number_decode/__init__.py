@@ -6,18 +6,19 @@ Module layout (one concern per file):
 
 * :mod:`._band_constants` -- vocab anchors + canonical NUMBER-block
   TokenType ordering + per-type row widths.
-* :mod:`._batched_carriers` -- cross-call_target NUMBER-band carrier
-  identification + location (segmented expanded->raw map + byte
-  offsets); the flat carrier table the per-type emitters batch over.
-* :mod:`._emit_fixed_fp` -- batched per-carrier row emission for F16 /
-  BF16 / F32 / F64 / F80.
-* :mod:`._emit_f128` -- batched per-carrier row emission for FLOAT128
-  (1- and 2-chunk variants + the mid-cut LSB-only case).
-* :mod:`._emit_vc2` -- batched per-carrier row emission for
-  VALUED_CONST_V2 (ALG-8 multi-chunk packing).
+* :mod:`._flat_segments` -- GIL-bound front matter: walk the shared
+  Step-1 call_target columns once + concatenate the flat per-segment
+  NUMBER-band context the GIL-released emission kernel consumes.
 * :mod:`._entry` -- :func:`build_number_idx_2d` orchestrator: build the
-  carrier table, dispatch per-type emit, reconstruct per-call_target
-  slices.
+  flat segments, run ``dedup_hashmap.build_number_idx_2d_kernel`` (the
+  GIL-released carrier-recovery + ALG-2/7/8 row emission state machine),
+  reconstruct per-call_target slices from the per-carrier ROW counts.
+
+The carrier identification (segmented expanded->raw recovery + byte
+offsets) and the per-:class:`TokenType` row emission (ALG-7 fixed-width,
+ALG-2 F128 1/2-chunk, ALG-8 VC2 multi-chunk packing) live in the Rust
+kernel ``dedup_hashmap.build_number_idx_2d_kernel`` (see
+``dedup_hashmap/src/number_idx_2d.rs``).
 """
 
 from ._band_constants import _NUMBER_BLOCK_TOKEN_TYPES

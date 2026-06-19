@@ -59,207 +59,91 @@ Plan reference: ``batch_decode_plan.md`` -- ALG-1 + ALG-2 + ALG-8 +
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import numpy as np
 
+from dedup_hashmap import build_inline_bytes_kernel
 
-if TYPE_CHECKING:
-    from ._types import Stage2Batch, Stage2CallTarget
+from ._dense_columns import DenseColumns
 
 
 __all__ = ["build_inline_bytes"]
 
 
 # ---------------------------------------------------------------------------
-# Per-call-target surviving-byte extraction. Buffer layout retains every
+# Public entry point: feed the dense columns to the GIL-released gather
+# kernel + build the per-call-target slice list from the returned counts.
+#
+# The per-call-target surviving-byte extraction (the old per-node
+# ``_surviving_bytes`` Python loop with masks) is now ONE ``py.detach``
+# Rust kernel (``dedup_hashmap.build_inline_bytes_kernel``) reading the
+# flat :class:`DenseColumns` columns directly. The kernel retains every
 # consumed carrier's FULL payload so 3c's ALG-8 offset formula stays
 # independent of which chunks survived the cut; the chunk-count branch
 # (VC2 ceil(L/8), F128 NaN/Inf detection) is 3c's concern.
 # ---------------------------------------------------------------------------
 
 
-def _surviving_bytes(stage2_call_target: "Stage2CallTarget") -> np.ndarray:
-    """Buffered inline bytes for one call_target as a ``u8`` array.
-
-    Returns the raw inline-digit values (already truncated to ``u8``)
-    in raw-stream order. Every consumed raw carrier contributes its
-    FULL ``L``-byte payload -- including the last consumed carrier
-    when only some of its chunks survived the cut. 3c chooses which
-    chunks to emit ``idx_2d`` rows for; the buffer always carries the
-    full per-source payload so ALG-8's per-chunk offset formula stays
-    valid.
-
-    Parameters
-    ----------
-    stage2_call_target
-        Reads ``stage1.state.raw_tokens`` / ``.number_mask`` /
-        ``.real_mask`` / ``.runlen_number`` plus this stage's
-        ``expanded_token_ids`` / ``extra_value_v2_mask`` /
-        ``extra_f128_mask`` / ``partial_cut_length`` / ``is_cut``.
-
-    Returns
-    -------
-    ``np.ndarray[np.uint8]``
-        Length equals the contributed byte count for this call_target
-        (full payload per consumed carrier). Zero for fully-dropped
-        call_targets.
-
-    Notes
-    -----
-    The narrowing-assignment trick (ALG-1) is realized via an explicit
-    ``.astype(np.uint8)`` on the boolean-indexed slice -- boolean
-    indexing already produces a fresh array, so the cast is in-place
-    on the temporary. For inline-band ids (``< 256``) the cast is
-    lossless.
-    """
-    state = stage2_call_target.stage1.state
-    raw_tokens = state.raw_tokens
-    number_mask = state.number_mask
-
-    # ---- fully-included path ------------------------------------------------
-    if not stage2_call_target.is_cut:
-        # All inline-digit positions of the raw stream survive. The
-        # ``raw_tokens > number_mask`` boolean index returns a fresh
-        # copy already; the ``.astype(np.uint8)`` narrows the dtype
-        # cheaply (the cast applies to the temporary, not the
-        # underlying memmap).
-        return raw_tokens[number_mask].astype(np.uint8)
-
-    # ---- cut path -----------------------------------------------------------
-    # ``partial_cut_length`` is the prefix length in expanded_token_ids
-    # that survives. Slot 0 of expanded_token_ids is the synthetic
-    # prepend (no inline bytes); slots [1, partial_cut_length) are the
-    # surviving body. A cut at or before slot 1 contributes no inline
-    # bytes (only the prepend or nothing survives).
-    partial_cut_length = stage2_call_target.partial_cut_length
-    if partial_cut_length <= 1:
-        return np.empty(0, dtype=np.uint8)
-
-    extra_vc2_mask = stage2_call_target.extra_value_v2_mask
-    extra_f128_mask = stage2_call_target.extra_f128_mask
-
-    # Within the visible body [1, partial_cut_length), a slot is either
-    # a "painted continuation" (extra_*_mask True -- it was an inline-
-    # digit byte the promotion painted into a carrier slot) or a "real
-    # carrier" (real_mask True in the raw stream). Painted slots do
-    # NOT consume a fresh raw-stream carrier.
-    visible_extra_vc2 = extra_vc2_mask[1:partial_cut_length]
-    visible_extra_f128 = extra_f128_mask[1:partial_cut_length]
-    visible_is_painted = visible_extra_vc2 | visible_extra_f128
-    visible_is_real_carrier = ~visible_is_painted
-
-    # Number of raw-stream carriers consumed by the visible body.
-    n_carriers_consumed = int(visible_is_real_carrier.sum())
-    if n_carriers_consumed == 0:
-        # No raw carriers consumed -- e.g. the visible body is entirely
-        # painted slots. This shouldn't be reachable (the first slot
-        # past the prepend is always a real carrier per the strip
-        # walk), but the empty-output guard keeps the function total.
-        return np.empty(0, dtype=np.uint8)
-
-    # Raw positions of all carriers in raw-stream order.
-    carrier_positions = np.nonzero(state.real_mask)[0]
-    # The last raw carrier consumed by the visible body.
-    p_last = int(carrier_positions[n_carriers_consumed - 1])
-
-    # Payload length L = inline-digit run-length immediately following
-    # the last carrier. ``runlen_number`` stores run-start lengths;
-    # ``runlen_number[p+1]`` is exactly the per-source payload length.
-    # The last consumed carrier contributes its FULL ``L`` bytes -- 3c
-    # will skip emitting ``idx_2d`` rows for dropped chunks, but the
-    # ALG-8 per-chunk offset formula assumes the full payload is
-    # addressable in the buffer regardless of which chunks survived.
-    runlen_number = state.runlen_number
-    if p_last + 1 < runlen_number.shape[0]:
-        L_last = int(runlen_number[p_last + 1])
-    else:
-        L_last = 0
-
-    # ---- bytes from all consumed carriers (full per-source payload) ----------
-    # Inline-digit positions are owned by their preceding
-    # ``carries_inline_mask`` carrier in raw-stream order (the v2 codec
-    # emits the payload IMMEDIATELY after its owning carrier, never
-    # orphan bytes). To pick up every consumed carrier's FULL payload
-    # we slice ``number_mask`` up to ``p_last + 1 + L_last`` -- this
-    # captures all inline bytes belonging to carriers strictly before
-    # ``p_last`` (their payloads precede ``p_last``) plus the entire
-    # ``L_last``-byte payload of the last consumed carrier.
-    number_mask_keep = number_mask.copy()
-    number_mask_keep[p_last + 1 + L_last :] = False
-    bytes_kept = raw_tokens[number_mask_keep]
-
-    return bytes_kept.astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point: walk the stage-2 hierarchy + build the flat buffer.
-# ---------------------------------------------------------------------------
-
-
 def build_inline_bytes(
-    stage2_batch: "Stage2Batch",
+    dense: DenseColumns,
 ) -> tuple[np.ndarray, list[slice]]:
     """Concatenate surviving inline bytes across the batch (ALG-1).
 
-    Walks the 4-level hierarchy of ``stage2_batch`` in DFS encounter
-    order (sections -> variants -> call_targets, root-first) and
-    produces:
+    Reads the shared :class:`DenseColumns` front-matter in DFS
+    (== emitted-node) order -- the same per-node columns the stage-3
+    sites used to re-walk the ``Stage2Batch`` tree for -- and produces:
 
     * ``inline_bytes`` -- ``u8`` array of length
       ``1 + total_surviving_bytes``. Index 0 is the leading-zero pad
       (consumed by short-payload ``idx_2d`` gathers per plan D9).
     * ``inline_byte_slices`` -- one :class:`slice` per level-4
-      call_target, parallel to the DFS walk order. The first slice
+      call_target, parallel to the DFS node axis. The first slice
       starts at ``1`` (past the pad); each subsequent slice starts at
       the previous slice's ``.stop``. Fully-dropped call_targets get
       a zero-length slice (``stop == start``).
 
-    The narrowing-assignment trick (ALG-1) materializes inside
-    :func:`_surviving_bytes` -- each per-call-target byte array is
-    already ``u8``, so this entry point is a pure concatenation.
+    GIL-released (B-S3): the per-node ``_surviving_bytes`` Python gather
+    loop (per-CT masked digit pick + the cut-path carrier walk) is a
+    single ``py.detach`` Rust kernel reading the flat
+    :class:`DenseColumns` columns directly. The kernel returns the flat
+    ``inline_bytes`` buffer (leading-zero pad included) + the per-node
+    contributed byte count; this entry point derives the abutting slice
+    list from the counts. The narrowing-assignment trick (ALG-1) lives
+    in the kernel (``raw_token as u8`` keeps the low byte; inline-band
+    ids ``< 256`` so it is lossless).
 
     Parameters
     ----------
-    stage2_batch
-        Output of stage 2 (length-predict + cutoff walk).
+    dense
+        The shared dense front-matter (:class:`DenseColumns`) -- the
+        per-node RAW / EXPANDED columns + surviving / cut scalars over
+        the full DFS node axis.
 
     Returns
     -------
     tuple of ``(np.ndarray[np.uint8], list[slice])``
         The flat byte buffer and the per-call-target slice list.
     """
-    # Per-call-target byte arrays, parallel to the DFS walk order.
-    per_call_target_bytes: list[np.ndarray] = []
-
-    for stage2_section in stage2_batch.sections:
-        for stage2_variant in stage2_section.variants:
-            for stage2_call_target in stage2_variant.call_targets:
-                per_call_target_bytes.append(_surviving_bytes(stage2_call_target))
-
-    # Length budget: 1 (leading-zero pad) + sum of per-call-target byte
-    # counts. Pre-allocating avoids a second pass over the per-call-
-    # target arrays.
-    per_call_target_counts = np.array(
-        [arr.shape[0] for arr in per_call_target_bytes], dtype=np.int64
+    inline_bytes, per_call_target_counts = build_inline_bytes_kernel(
+        np.ascontiguousarray(dense.raw_tokens, dtype=np.uint16),
+        np.ascontiguousarray(dense.number_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.uint16),
+        np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.is_cut, dtype=np.bool_),
+        np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
+        np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.node_offsets, dtype=np.int64),
     )
-    total_bytes = int(per_call_target_counts.sum())
-    inline_bytes = np.zeros(1 + total_bytes, dtype=np.uint8)
-    # ``inline_bytes[0]`` stays 0 from the allocation -- this is the
-    # leading-zero pad referenced by short-payload idx_2d gathers
-    # (plan D9 + Stage 3 step 1).
 
     # Per-call-target slices into ``inline_bytes``. First slice starts
-    # past the pad (offset 1); subsequent slices abut the previous
-    # stop.
+    # past the leading-zero pad (offset 1); subsequent slices abut the
+    # previous stop. Fully-dropped call_targets get a zero-length slice.
     inline_byte_slices: list[slice] = []
     cursor = 1
-    for arr, count in zip(per_call_target_bytes, per_call_target_counts):
+    for count in per_call_target_counts:
         n = int(count)
-        sl = slice(cursor, cursor + n)
-        if n > 0:
-            inline_bytes[sl] = arr
-        inline_byte_slices.append(sl)
+        inline_byte_slices.append(slice(cursor, cursor + n))
         cursor += n
 
     return inline_bytes, inline_byte_slices

@@ -30,6 +30,9 @@ import pytest
 from tokenizer.aligned_data.loader.batch_decode._fp_normalize import (
     normalize_per_token_type,
 )
+from tokenizer.aligned_data.loader.batch_decode._flat_call_targets import (
+    dense_columns_from_stage2,
+)
 from tokenizer.aligned_data.loader.batch_decode._number_decode import (
     build_number_idx_2d,
 )
@@ -374,7 +377,7 @@ def test_f128_3c_to_3d_chain_byte_equivalent(
         f128_is_nan_or_inf,
         vc2_sidecar,
     ) = build_number_idx_2d(
-        stage2_batch, inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
     )
 
     # Sanity: f128_is_nan_or_inf length = n_sources; idx_2d row count =
@@ -478,7 +481,7 @@ def test_f32_plus_f128_chain_byte_equivalent() -> None:
         f128_is_nan_or_inf,
         vc2_sidecar,
     ) = build_number_idx_2d(
-        stage2_batch, inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
     )
 
     n_f128_sources = len(f128_values)
@@ -605,7 +608,7 @@ def test_f128_mid_cut_finite_emits_both_chunks_without_assertion() -> None:
         _,
         f128_is_nan_or_inf,
         vc2_sidecar,
-    ) = build_number_idx_2d(stage2_batch, inline_bytes, [ct_slice])
+    ) = build_number_idx_2d(dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice])
 
     # 3c contract: 2 finite F128 sources, each contributes 2 chunks
     # (LSB + MSB) INDEPENDENT of the cut. Total rows = 2 + 2 = 4.
@@ -725,7 +728,7 @@ def test_f128_midcut_finite_3d_emits_both_chunks_byte_equivalent() -> None:
     )
 
     idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
-        stage2_batch, inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
     )
 
     # 3c emits BOTH chunks even though only the LSB chunk is stream-
@@ -785,7 +788,7 @@ def test_f128_midcut_finite_nonzero_lsb_lsb_chunk_is_correctly_normalized() -> N
 
     stage2_batch, inline_bytes, ct_slice = _build_f128_midcut_stream(bits)
     idx_2d_per_type, _, f128_is_nan_or_inf, vc2_sidecar = build_number_idx_2d(
-        stage2_batch, inline_bytes, [ct_slice]
+        dense_columns_from_stage2(stage2_batch), inline_bytes, [ct_slice]
     )
     out = normalize_per_token_type(
         idx_2d_per_type=idx_2d_per_type,
