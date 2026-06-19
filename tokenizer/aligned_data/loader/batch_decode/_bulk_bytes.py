@@ -43,6 +43,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dedup_hashmap import build_carrier_signs_kernel
+
 from tokenizer.token_manager import VocabularyManager
 from tokenizer.tokens import TokenType
 
@@ -310,118 +312,28 @@ def _batched_carrier_signs(
     continuation slots and the per-node prepend slot contribute no entries
     (a painted slot borrows its carrier's raw position; the prepend lives
     in the IDENTITY band).
+
+    GIL-released (B-S3): the per-kept-node Python gather loop (slicing
+    ``expanded[1:surviving]`` + ``np.nonzero(real_mask)`` per node, then
+    the segmented ``cumsum(is_real) - 1`` carrier walk) is now a single
+    ``py.detach`` Rust kernel reading the flat :class:`DenseColumns`
+    columns directly. The kernel reproduces the same arithmetic the numpy
+    path did, in the same kept-DFS-then-stream order, byte-identically.
     """
-    kept_idx = np.asarray(dense.kept_node_index, dtype=np.int64).tolist()
-    n_kept = len(kept_idx)
-    if n_kept == 0:
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.bool_),
-        )
-
-    # --- flat ``expanded[1:surviving]`` concatenation (slot 0 dropped) ---
-    expanded_chunks: list[np.ndarray] = []
-    painted_chunks: list[np.ndarray] = []
-    # --- flat per-node ``real_positions`` + ``is_negative`` ---
-    real_pos_chunks: list[np.ndarray] = []
-    is_neg_chunks: list[np.ndarray] = []
-    exp_seg_len = np.empty(n_kept, dtype=np.int64)
-    real_seg_base = np.empty(n_kept, dtype=np.int64)
-
-    real_running = 0
-    for i, e in enumerate(kept_idx):
-        surviving = int(dense.surviving_token_count[e])
-        raw_slice = dense.node_raw_slice(e)
-        expanded_slice = dense.node_expanded_slice(e)
-        expanded_chunks.append(
-            dense.expanded[expanded_slice][1:surviving].astype(
-                np.int64, copy=False
-            )
-        )
-        painted_chunks.append(
-            dense.extra_value_v2_mask[expanded_slice][1:surviving]
-            | dense.extra_f128_mask[expanded_slice][1:surviving]
-        )
-        exp_seg_len[i] = max(surviving - 1, 0)
-        real_positions = np.nonzero(dense.real_mask[raw_slice])[0]
-        real_pos_chunks.append(real_positions.astype(np.int64, copy=False))
-        is_neg_chunks.append(
-            dense.is_negative_per_position[raw_slice][real_positions]
-        )
-        real_seg_base[i] = real_running
-        real_running += int(real_positions.shape[0])
-
-    expanded_flat = np.concatenate(expanded_chunks)
-    is_painted_flat = np.concatenate(painted_chunks)
-    is_real_flat = ~is_painted_flat
-    real_pos_flat = np.concatenate(real_pos_chunks)
-    is_neg_at_real_flat = np.concatenate(is_neg_chunks)
-
-    if expanded_flat.shape[0] == 0:
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.bool_),
-        )
-
-    # CSR over the expanded-prefix axis (segment i = call_target i). A
-    # kept call_target with ``surviving == 1`` has a ZERO-LENGTH body
-    # segment (its only surviving slot is the prepend, dropped from the
-    # ``[1:surviving]`` body axis); ``np.repeat`` over the per-segment
-    # lengths yields the per-slot segment id correctly even for those empty
-    # segments (the mark-and-cumsum CSR expansion would silently MERGE
-    # consecutive zero-length boundaries, shifting all later segment ids).
-    exp_seg_offsets = np.zeros(n_kept + 1, dtype=np.int64)
-    np.cumsum(exp_seg_len, out=exp_seg_offsets[1:])
-    seg_id = np.repeat(np.arange(n_kept, dtype=np.int64), exp_seg_len)
-
-    # SEGMENTED ``cumsum(is_real) - 1`` per call_target. A global cumsum
-    # carries the running real-count across segment boundaries; subtract
-    # the cumulative value carried in at each segment's exclusive start to
-    # reset it to the per-call_target ``cumsum(is_real) - 1`` the scalar
-    # walk uses. The per-segment carry-in is the INCLUSIVE global cum at
-    # the previous flat element (0 for the first segment), broadcast over
-    # the segment via ``seg_id``. ``global_cum_excl`` is the exclusive
-    # prefix sum, so its value at each segment's first flat index is
-    # exactly that carry-in.
-    is_real_i64 = is_real_flat.astype(np.int64)
-    global_cum = np.cumsum(is_real_i64)
-    global_cum_excl = global_cum - is_real_i64
-    # ``seg_carry_in[seg]`` = exclusive global cum at the segment's first
-    # element. ``exp_seg_offsets[:-1]`` is the first flat index of each
-    # segment; for a zero-length segment that index coincides with the
-    # next segment's start (no flat element belongs to it, so it is never
-    # read through ``seg_id`` anyway). Trailing zero-length segments would
-    # push the index to ``total``; clip to keep the gather in-bounds (the
-    # clipped value is unused).
-    first_idx = np.minimum(
-        exp_seg_offsets[:-1], int(global_cum_excl.shape[0]) - 1
+    block_idx, signs = build_carrier_signs_kernel(
+        np.ascontiguousarray(dense.expanded, dtype=np.int64),
+        np.ascontiguousarray(dense.extra_value_v2_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.extra_f128_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.node_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.is_negative_per_position, dtype=np.bool_),
+        np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
+        np.ascontiguousarray(dense.kept_node_index, dtype=np.int64),
+        int(_NUMBER_BAND_LO_SHIFTED),
+        int(_NUMBER_BAND_HI_SHIFTED),
     )
-    seg_carry_in = global_cum_excl[first_idx]
-    real_idx_inclusive = global_cum - 1 - seg_carry_in[seg_id]
-
-    # NUMBER-band non-painted carriers.
-    in_number_band = (expanded_flat >= _NUMBER_BAND_LO_SHIFTED) & (
-        expanded_flat < _NUMBER_BAND_HI_SHIFTED
-    )
-    carrier_mask = in_number_band & is_real_flat
-    if not carrier_mask.any():
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.bool_),
-        )
-
-    carrier_seg = seg_id[carrier_mask]
-    # Global index into the concatenated ``real_pos`` / ``is_neg`` arrays
-    # = per-call_target base + per-call_target real index.
-    carrier_real_global = (
-        real_seg_base[carrier_seg]
-        + real_idx_inclusive[carrier_mask]
-    )
-    carrier_signs = is_neg_at_real_flat[carrier_real_global]
-    carrier_block_idx = (
-        expanded_flat[carrier_mask] - _NUMBER_BAND_LO_SHIFTED
-    )
-    return carrier_block_idx, carrier_signs
+    return block_idx, signs
 
 
 # ---------------------------------------------------------------------------

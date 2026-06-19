@@ -15,7 +15,14 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }
+# ``extension-module`` is enabled via pyproject's
+# ``[tool.maturin] features = ["pyo3/extension-module"]`` for the wheel
+# build (it suppresses the libpython link, which the loaded-into-CPython
+# extension wants). It is NOT a default feature here: a ``cargo test``
+# harness is an ordinary binary that must resolve the CPython symbols, so
+# leaving the link suppression opt-in is what lets the in-crate unit
+# tests build + run under ``nix develop``.
+pyo3 = { version = "0.28" }
 numpy = "0.28"
 hashbrown = "0.15"
 

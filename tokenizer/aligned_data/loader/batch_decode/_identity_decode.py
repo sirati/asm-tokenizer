@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from dedup_hashmap import build_identity_carriers_kernel
+
 from tokenizer.token_manager import VocabularyManager
 
 from ._dense_columns import DenseColumns
@@ -189,68 +191,36 @@ def _gather_identity_carriers(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Flat per-carrier ``(first_payload_offset, L, raw_position)``.
 
-    Walks the DFS node axis collecting, for each SURVIVING in-stream
-    identity carrier (the first ``surviving_identity_count - 1``
-    identity-band real tokens of each surviving node's raw stream), its
-    absolute first-payload byte offset into ``inline_bytes`` and its
-    payload length ``L`` (per the ALG-5 width table). The gather is a pure
-    array-collection loop (one ``np.concatenate`` per output); the ALG-5
-    row build runs once over the flat arrays.
+    For each SURVIVING in-stream identity carrier (the first
+    ``surviving_identity_count - 1`` identity-band real tokens of each
+    surviving node's raw stream), the carrier's absolute first-payload
+    byte offset into ``inline_bytes`` + its payload length ``L`` (per the
+    ALG-5 width table) + its raw position, in DFS-then-stream order.
+
+    GIL-released (B-S3): the per-node Python gather loop (per-node
+    ``np.nonzero`` of the identity-band real mask + the ``runlen_number``
+    / ``digit_cumsum`` gathers) is a single ``py.detach`` Rust kernel
+    reading the flat :class:`DenseColumns` columns directly. The ALG-5
+    row build (:func:`_identity_rows_from_carriers`) stays in numpy --
+    it is already one vectorised pass over these flat triples.
     """
-    offset_chunks: list[np.ndarray] = []
-    L_chunks: list[np.ndarray] = []
-    pos_chunks: list[np.ndarray] = []
-
-    for e in range(dense.n_nodes):
-        inline_byte_slice = inline_byte_slices[e]
-
-        if int(dense.surviving_token_count[e]) == 0:
-            continue
-        in_stream_id_count = int(dense.surviving_identity_count[e]) - 1
-        if in_stream_id_count <= 0:
-            continue
-
-        raw_slice = dense.node_raw_slice(e)
-        raw_tokens = dense.raw_tokens[raw_slice]
-
-        # Identity tokens are NEVER promoted, so the surviving
-        # in-stream carriers are the FIRST ``in_stream_id_count``
-        # identity-band real tokens in raw order (the cut chops
-        # later carriers but never reorders).
-        identity_carrier_mask = dense.real_mask[raw_slice] & (
-            (raw_tokens >= _V2_IDENTITY_BLOCK_START)
-            & (raw_tokens < _V2_EAGER_BLOCK_END)
-        )
-        identity_carrier_positions = np.nonzero(identity_carrier_mask)[0]
-        p = identity_carrier_positions[:in_stream_id_count].astype(np.int64)
-
-        n = int(raw_tokens.shape[0])
-        runlen_number = dense.runlen_number[raw_slice]
-        # Payload length L = runlen_number[p+1] when p+1 in
-        # bounds (else 0; a carrier at the last raw slot has no
-        # payload). np.where avoids the OOB gather.
-        has_p1 = p < (n - 1)
-        safe_p1 = np.where(has_p1, p + 1, np.int64(0))
-        L_raw = runlen_number[safe_p1].astype(np.int64)
-        L = np.where(has_p1, L_raw, np.int64(0))
-
-        # First payload byte = exclusive digit cumsum at p+1 +
-        # the call_target's inline-byte base.
-        first_payload_offset = dense.digit_cumsum[dense.node_digit_slice(e)][
-            p + 1
-        ].astype(np.int64) + np.int64(inline_byte_slice.start)
-
-        offset_chunks.append(first_payload_offset)
-        L_chunks.append(L)
-        pos_chunks.append(p)
-
-    if not offset_chunks:
-        empty_i = np.empty(0, dtype=np.int64)
-        return empty_i, empty_i.copy(), empty_i.copy()
-    return (
-        np.concatenate(offset_chunks),
-        np.concatenate(L_chunks),
-        np.concatenate(pos_chunks),
+    inline_slice_start = np.fromiter(
+        (sl.start for sl in inline_byte_slices),
+        dtype=np.int64,
+        count=len(inline_byte_slices),
+    )
+    return build_identity_carriers_kernel(
+        np.ascontiguousarray(dense.raw_tokens, dtype=np.int64),
+        np.ascontiguousarray(dense.real_mask, dtype=np.bool_),
+        np.ascontiguousarray(dense.runlen_number, dtype=np.int64),
+        np.ascontiguousarray(dense.raw_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.digit_cumsum, dtype=np.int64),
+        np.ascontiguousarray(dense.digit_offsets, dtype=np.int64),
+        np.ascontiguousarray(dense.surviving_token_count, dtype=np.int64),
+        np.ascontiguousarray(dense.surviving_identity_count, dtype=np.int64),
+        inline_slice_start,
+        int(_V2_IDENTITY_BLOCK_START),
+        int(_V2_EAGER_BLOCK_END),
     )
 
 

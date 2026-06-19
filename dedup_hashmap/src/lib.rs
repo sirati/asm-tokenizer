@@ -34,12 +34,16 @@
 //! Callers should check membership with `__contains__` / `lookup` when
 //! the sentinel value is itself a legitimate entry value.
 
+mod carrier_signs;
 mod hashmap_macro;
+mod identity_gather;
 mod number_idx_2d;
 mod remap_walk;
 mod segment_distinct;
 
+use carrier_signs::build_carrier_signs_kernel;
 use hashmap_macro::define_hashmap;
+use identity_gather::build_identity_carriers_kernel;
 use number_idx_2d::build_number_idx_2d_kernel;
 use pyo3::prelude::*;
 use remap_walk::apply_remap_walk;
@@ -301,6 +305,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Stage-3c NUMBER-band idx_2d emission kernel (ALG-2/7/8). See
     // `number_idx_2d.rs`.
     m.add_function(wrap_pyfunction!(build_number_idx_2d_kernel, m)?)?;
+
+    // Stage-3 per-source carrier-sign collection kernel. See
+    // `carrier_signs.rs`.
+    m.add_function(wrap_pyfunction!(build_carrier_signs_kernel, m)?)?;
+
+    // Stage-3b identity carrier gather kernel (ALG-5 front matter). See
+    // `identity_gather.rs`.
+    m.add_function(wrap_pyfunction!(build_identity_carriers_kernel, m)?)?;
 
     Ok(())
 }
