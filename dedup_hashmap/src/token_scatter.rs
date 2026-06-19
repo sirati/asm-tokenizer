@@ -144,7 +144,15 @@ fn run_kernel(
         }
         let row_u = row as usize;
         // body_start = gcum[e] - gcum[row_offsets[row]].
-        let body_base = gcum[row_offsets[row_u] as usize];
+        let row_off = row_offsets[row_u];
+        if row_off < 0 || row_off as usize >= gcum.len() {
+            return Err(format!(
+                "row {row_u} row_offsets {row_off} out of range for gcum \
+                 length {}",
+                gcum.len()
+            ));
+        }
+        let body_base = gcum[row_off as usize];
         let body_start = gcum[e] - body_base;
         let col_base = prefix_len[row_u] + body_start;
         let src_base = node_offsets[e];
