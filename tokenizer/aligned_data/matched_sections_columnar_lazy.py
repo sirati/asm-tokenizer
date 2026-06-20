@@ -42,9 +42,10 @@ yields exactly the bytes the full-batch parse would have written there.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -70,6 +71,11 @@ __all__ = ["LazyColumnarSections", "parse_sections_columnar_lazy"]
 
 
 logger = logging.getLogger(__name__)
+
+# The MISSING-edge tally fills on every frontier resolve / batch seed, so the
+# raw per-fill log spams. Bound the EMISSION (not the count) to one line per
+# this many seconds; the running total carried on each emit stays exact.
+_MISSING_LOG_INTERVAL_S = 3600.0
 
 
 @dataclass(frozen=True)
@@ -203,6 +209,7 @@ class LazyColumnarSections:
         blob_u8: np.ndarray,
         section_offsets: np.ndarray,
         section_lengths: np.ndarray,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._blob = blob_u8
         self._offsets = np.asarray(section_offsets, dtype=np.int64).reshape(-1)
@@ -251,6 +258,14 @@ class LazyColumnarSections:
         # has it all resident, so it accumulates per fill and logs the
         # incremental contribution -- bounded to the touched sections.
         self._missing_count = 0
+        # Per-object throttle for the MISSING-edge diagnostic LOG (the count
+        # above is never throttled). ``_missing_last_emit`` is the monotonic
+        # time of the last emitted line (None until the first); ``_missing_
+        # since_emit`` accumulates the entries added since then, reported on
+        # the next emit so no contribution is lost from the message.
+        self._clock = clock
+        self._missing_last_emit: Optional[float] = None
+        self._missing_since_emit = 0
 
     # -- the global node->section inverse (same contract as the eager one) -
     @cached_property
@@ -332,17 +347,27 @@ class LazyColumnarSections:
         new_missing = int(
             (sub.pce_section_variant_index == MISSING_VARIANT_INDEX).sum()
         )
-        if new_missing:
-            self._missing_count += new_missing
-            logger.error(
-                "sorted_index: %d per-call entries carry "
-                "MISSING_VARIANT_INDEX in newly-touched sections "
-                "(running total %d). Each one silently drops a splice edge "
-                "-- the callee's variant set does not cover the caller's "
-                "vkey.",
-                new_missing,
-                self._missing_count,
-            )
+        if not new_missing:
+            return
+        self._missing_count += new_missing
+        self._missing_since_emit += new_missing
+        now = self._clock()
+        first_emit = self._missing_last_emit is None
+        due = first_emit or (
+            now - self._missing_last_emit >= _MISSING_LOG_INTERVAL_S
+        )
+        if not due:
+            return
+        logger.error(
+            "sorted_index: %d per-call entries carry MISSING_VARIANT_INDEX "
+            "in newly-touched sections since the last report (running total "
+            "%d). Each one silently drops a splice edge -- the callee's "
+            "variant set does not cover the caller's vkey.",
+            self._missing_since_emit,
+            self._missing_count,
+        )
+        self._missing_last_emit = now
+        self._missing_since_emit = 0
 
     def missing_variant_index_count(self) -> int:
         """Touched-bounded running MISSING-edge tally (not the full catalog).
@@ -492,6 +517,7 @@ def parse_sections_columnar_lazy(
     blob_u8: np.ndarray,
     section_offsets: np.ndarray,
     section_lengths: np.ndarray,
+    clock: Callable[[], float] = time.monotonic,
 ) -> LazyColumnarSections:
     """Open a :class:`LazyColumnarSections` over ``section_offsets``.
 
@@ -500,6 +526,10 @@ def parse_sections_columnar_lazy(
     table/variant/per-call columns fill on first
     :meth:`LazyColumnarSections.ensure_sections`. ``section_lengths`` is
     REQUIRED (the per-call-entry CSR base is derived from it without a
-    global jump-table read; see :func:`_build_skeleton`).
+    global jump-table read; see :func:`_build_skeleton`). ``clock`` is
+    injected only to make the MISSING-edge log throttle testable; production
+    callers take the default monotonic clock.
     """
-    return LazyColumnarSections(blob_u8, section_offsets, section_lengths)
+    return LazyColumnarSections(
+        blob_u8, section_offsets, section_lengths, clock=clock
+    )
