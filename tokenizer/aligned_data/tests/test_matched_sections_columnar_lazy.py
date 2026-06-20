@@ -25,6 +25,7 @@ from tokenizer.aligned_data.matched_sections_columnar import (
     parse_sections_columnar,
 )
 from tokenizer.aligned_data.matched_sections_columnar_lazy import (
+    _MISSING_LOG_INTERVAL_S,
     parse_sections_columnar_lazy,
 )
 from tokenizer.aligned_data.sorted_index.tests.fixtures import (
@@ -170,3 +171,80 @@ def test_missing_inventory_bounded_to_touched(tmp_path: Path) -> None:
     assert lazy.missing_variant_index_count() == 0  # nothing filled yet
     lazy.ensure_sections(np.arange(n_sec))
     assert lazy.missing_variant_index_count() == full
+
+
+class _MissingStub:
+    """Minimal ``sub`` for :meth:`LazyColumnarSections._tally_missing`.
+
+    The tally reads only ``pce_section_variant_index``; ``n_missing`` slots
+    carry the sentinel so each call contributes exactly that many.
+    """
+
+    def __init__(self, n_missing: int) -> None:
+        self.pce_section_variant_index = np.full(
+            n_missing, MISSING_VARIANT_INDEX, dtype=np.uint16
+        )
+
+
+def _missing_log_records(caplog):
+    return [r for r in caplog.records if "MISSING_VARIANT_INDEX" in r.message]
+
+
+def test_missing_log_throttled_to_one_per_interval(tmp_path, caplog) -> None:
+    """The MISSING-edge log emits <=1/interval; the tally stays exact."""
+    clock = [0.0]
+    # Build a lazy catalog with an injected, manually-advanced clock.
+    base = build_missing_variant_index_fixture(tmp_path / "throttle")
+    name = _binary_name(base)
+    starts, lengths = read_csv_section_index_arrays(base / f"{name}_index.bin")
+    blob = np.fromfile(base / f"{name}_sections.bin", dtype=np.uint8)
+    lazy = parse_sections_columnar_lazy(
+        blob, starts, lengths, clock=lambda: clock[0]
+    )
+
+    caplog.set_level("ERROR", logger="tokenizer.aligned_data."
+                                      "matched_sections_columnar_lazy")
+
+    # (1) First call with new MISSING entries EMITS.
+    lazy._tally_missing(_MissingStub(3))
+    assert len(_missing_log_records(caplog)) == 1
+    assert lazy.missing_variant_index_count() == 3
+
+    # (2) Subsequent calls within the interval ACCUMULATE but do NOT emit.
+    clock[0] = _MISSING_LOG_INTERVAL_S - 1.0
+    lazy._tally_missing(_MissingStub(5))
+    lazy._tally_missing(_MissingStub(7))
+    assert len(_missing_log_records(caplog)) == 1  # still just the first
+    assert lazy.missing_variant_index_count() == 3 + 5 + 7
+
+    # (3) A call after >= the interval RE-EMITS with the running total, and
+    #     reports the entries accumulated since the previous emission.
+    clock[0] = _MISSING_LOG_INTERVAL_S
+    lazy._tally_missing(_MissingStub(2))
+    records = _missing_log_records(caplog)
+    assert len(records) == 2
+    assert lazy.missing_variant_index_count() == 3 + 5 + 7 + 2
+    # running total (17) is in the second line; since-last-emit count is 14.
+    assert "17" in records[1].message
+    assert records[1].args[0] == 5 + 7 + 2  # since the first emit
+    assert records[1].args[1] == 17  # running total
+
+
+def test_missing_tally_unchanged_by_throttle(tmp_path) -> None:
+    """Throttling the LOG does not alter the running-total counting."""
+    base = build_missing_variant_index_fixture(tmp_path / "count")
+    name = _binary_name(base)
+    starts, lengths = read_csv_section_index_arrays(base / f"{name}_index.bin")
+    blob = np.fromfile(base / f"{name}_sections.bin", dtype=np.uint8)
+
+    # Fixed clock (never advances -> only the first call ever emits) must
+    # still reach the SAME running total as the unthrottled eager catalog.
+    eager = parse_sections_columnar(blob, starts, lengths)
+    lazy = parse_sections_columnar_lazy(
+        blob, starts, lengths, clock=lambda: 0.0
+    )
+    lazy.ensure_sections(np.arange(starts.size))
+    assert (
+        lazy.missing_variant_index_count()
+        == eager.missing_variant_index_count()
+    )
