@@ -29,6 +29,8 @@ from typing import Any, Optional, TYPE_CHECKING
 from tokenizer.disasm.ghidra_provider import jvm_types
 from tokenizer.disasm.ghidra_provider.mnemonic import (
     _extract_x86_prefixes,
+    _ppc_branch_condition,
+    _ppc_has_cr0_update,
     _split_ghidra_mnemonic,
     _strip_arm_cc_suffix,
 )
@@ -475,11 +477,37 @@ def _build_prefixes_arm(ghidra_insn: Any) -> list[Any]:
 def _build_prefixes_ppc(ghidra_insn: Any) -> list[Any]:
     """Build typed prefix-view instances for a PPC instruction.
 
-    Stub for forward-compat; same shape as ``_build_prefixes_arm``.
-    The ``bc`` and ``update_cr0`` signals are not extracted by the
-    Ghidra path today.
+    Recovers the two per-instruction PPC modifiers the angr/Capstone path
+    surfaces as ``cs_insn.bc`` / ``cs_insn.update_cr0`` from Ghidra's
+    mnemonic-suffix encoding (SLEIGH folds both into the displayed
+    mnemonic; the ``mnemonic`` helpers own the extraction). Emits the SAME
+    typed views as the angr builder so downstream stays provider-agnostic:
+
+    - ``_PpcBranchConditionPrefix(bc=...)`` for a recognized conditional
+      branch (``beq`` / ``bne`` / ``blt`` / ... and their link / absolute /
+      register variants), carrying the ``_PPC_BC_NAMES`` contract value.
+    - ``_PpcUpdateCr0Prefix`` for the Rc-bit ``.`` suffix (``add.`` / ``or.``).
+
+    Mirrors the ARM builder idiom: the signal is recovered from the
+    mnemonic string because Ghidra exposes no typed BO/BI / Rc operand.
+    The CTR-decrement ``bdnzt`` / ``bdnzf`` forms carry their condition as
+    a separate operand (not folded into the mnemonic) and so emit no
+    branch-condition view here -- a deliberate omission over emitting a
+    wrong value.
     """
-    return []
+    from tokenizer.disasm.ghidra_views import (
+        _PpcBranchConditionPrefix,
+        _PpcUpdateCr0Prefix,
+    )
+
+    raw = str(ghidra_insn.getMnemonicString()).lower()
+    out: list[Any] = []
+    bc = _ppc_branch_condition(raw)
+    if bc is not None:
+        out.append(_PpcBranchConditionPrefix(bc=bc))
+    if _ppc_has_cr0_update(raw):
+        out.append(_PpcUpdateCr0Prefix())
+    return out
 
 
 def _build_prefixes_empty(ghidra_insn: Any) -> list[Any]:
