@@ -1,0 +1,10 @@
+=== phase-1 size stats (raw binary vs _output.csv) ===
+raw binaries (SRC):     167248
+phase-1 outputs paired: 83971
+outputs w/o source:     0
+sources w/o output:     83277
+raw total:              53.57 GiB (57524875464 B)
+output total:           110.71 GiB (118869223363 B)
+overall output/raw:     2.0664x
+per-file ratio:         mean=2.1410x min=0.0006x max=4.8830x
+per-binary CSV:         /home/k/kruppb/size_stats/phase1_report.csv

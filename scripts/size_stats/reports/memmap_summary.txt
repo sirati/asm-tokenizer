@@ -1,0 +1,8 @@
+=== phase-3 memmap size stats (build_memmap artifacts vs sum of raw binaries) ===
+programs (binaries):    132
+raw binary files:       167248
+memmap total (counted): 67.99 GiB (72999078625 B)
+sections.csv excluded:  2.81 GiB (3012852662 B)
+raw binary total:       81.95 GiB (87992910680 B)
+overall memmap/raw:     0.8296x
+per-program CSV:        /home/k/kruppb/size_stats/memmap_report.csv
