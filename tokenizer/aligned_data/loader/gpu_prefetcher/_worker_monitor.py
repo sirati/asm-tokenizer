@@ -27,7 +27,19 @@ through the ready queue instead of spinning forever.
 from __future__ import annotations
 
 import multiprocessing as mp
-from typing import Sequence
+from typing import Any, Callable, Sequence
+
+
+def default_proc_describe(worker: "mp.Process") -> str:
+    """Default cause formatter for a multiprocessing worker.
+
+    Names the dead process by its ``name``, ``pid``, and ``exitcode`` --
+    the multiprocessing-specific identity. A thread-based pool (which has
+    no pid/exitcode) injects its own formatter via
+    :class:`WorkerMonitor`'s ``describe`` seam rather than duplicating
+    :meth:`WorkerMonitor.crashed`.
+    """
+    return f"{worker.name}(pid={worker.pid}, exitcode={worker.exitcode})"
 
 
 class PrefetchWorkerDied(RuntimeError):
@@ -47,10 +59,24 @@ class WorkerMonitor:
     transitions False -> True at most once and never back. That monotonic
     edge is the safe trigger: combined with a freshly drained result queue,
     it proves the owed result will never arrive.
+
+    The verdict (:meth:`crashed`) is generic over anything with
+    ``.is_alive()`` -- a ``multiprocessing.Process`` OR a
+    ``threading.Thread`` -- so a thread-based ready pool reuses it
+    verbatim. Only the human-readable cause is process-shaped (pid /
+    exitcode), so it is delegated to an injectable ``describe`` formatter
+    (default :func:`default_proc_describe`); the thread pool passes a
+    thread-name formatter instead of duplicating :meth:`crashed`.
     """
 
-    def __init__(self, workers: Sequence["mp.Process"]) -> None:
+    def __init__(
+        self,
+        workers: Sequence[Any],
+        *,
+        describe: Callable[[Any], str] = default_proc_describe,
+    ) -> None:
         self._workers = list(workers)
+        self._describe = describe
 
     def crashed(self) -> bool:
         """True once ANY worker has exited (a clean exit only happens at
@@ -62,10 +88,8 @@ class WorkerMonitor:
         return any(not w.is_alive() for w in self._workers)
 
     def death_cause(self) -> str:
-        """Human-readable summary of the dead workers and their exit codes."""
+        """Human-readable summary of the dead workers via the formatter."""
         parts = [
-            f"{w.name}(pid={w.pid}, exitcode={w.exitcode})"
-            for w in self._workers
-            if not w.is_alive()
+            self._describe(w) for w in self._workers if not w.is_alive()
         ]
         return ", ".join(parts) if parts else "no worker has exited"
