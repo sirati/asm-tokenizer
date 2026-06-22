@@ -172,6 +172,34 @@ class DataLoaderConfig:
             postprocess=postprocess,
         )
 
+    @classmethod
+    def from_produce(
+        cls,
+        *,
+        key: Hashable,
+        produce: CloseableProduce,
+        ready_depth: int = 4,
+    ) -> "DataLoaderConfig":
+        """Register an ALREADY-BUILT produce (a consumer-owned closure).
+
+        For the case where the consumer composes its OWN
+        :class:`CloseableProduce` -- e.g. a redraw-retry wrapper around
+        ``make_cross_binary_produce(..., postprocess=identity)`` that
+        validates each draw against an asm-domain predicate and redraws
+        (advancing the produce's rng) before translating. That
+        validity/retry concern stays the consumer's; this only plugs the
+        finished produce into the threaded keep-N + GPU-overlap engine. The
+        ``make_produce`` thunk therefore IGNORES the facade's postprocess
+        (the produce already bakes in whatever post-processing it wants) --
+        ``lambda _pp: produce``.
+        """
+        return cls(
+            key=key,
+            make_produce=lambda _pp: produce,
+            ready_depth=ready_depth,
+            postprocess=None,
+        )
+
 
 class VectorBatchDataLoader:
     """Construction-time-postprocess facade over the ready pool stack.

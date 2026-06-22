@@ -948,6 +948,34 @@ def test_facade_rejects_empty_configs():
         VectorBatchDataLoader(configs=[])
 
 
+def test_facade_from_produce_registers_prebuilt_and_ignores_postprocess():
+    # from_produce plugs a consumer-owned CloseableProduce (e.g. a redraw-
+    # retry wrapper) into the facade's threaded keep-N engine. The
+    # construction postprocess is IGNORED (the produce already bakes in
+    # whatever it wants), and close() still fires per worker on shutdown.
+    from tokenizer.aligned_data.loader.ready_pool import (
+        DataLoaderConfig,
+        VectorBatchDataLoader,
+    )
+
+    produce = _CloseableProduce()
+
+    def _would_mutate(batch):
+        return {**batch, "postprocessed": True}
+
+    cfg = DataLoaderConfig.from_produce(
+        key="retry", produce=produce, ready_depth=2
+    )
+    with VectorBatchDataLoader(configs=[cfg], postprocess=_would_mutate) as dl:
+        batch = dl.get("retry")
+    # The produce's OWN output (FIFO oldest), NOT run through the
+    # construction postprocess -- the thunk dropped _pp on the floor.
+    assert "postprocessed" not in batch
+    assert batch == {"i": 0}
+    # The pool released the consumer's produce on shutdown.
+    assert produce.close_calls == 1
+
+
 # ==========================================================================
 # F. CROSS-BINARY decode seam -- make_cross_binary_produce over
 #    load_batch_cross_depth, BYTE-IDENTICAL to the primitive.
