@@ -50,6 +50,7 @@ from tokenizer.aligned_data.loader.gpu_prefetcher._worker_monitor import (
 )
 
 from ._config import PoolConfig
+from ._produce import is_closeable_produce
 
 
 __all__ = ["ReadyPool", "ReadyPoolWorkerDied"]
@@ -204,15 +205,44 @@ class ReadyPool:
         no further. A ``produce`` exception is enqueued (so the consumer
         re-raises it in FIFO position) and the loop exits -- the monitor
         then surfaces the dead thread to any later :meth:`get`.
+
+        OPTIONAL cleanup seam: whichever way this thread stops (clean close,
+        consumer abandonment, or a fatal ``produce`` exception), the
+        ``finally`` releases this worker's per-thread ``produce`` resources
+        IF the produce honours the :class:`CloseableProduce` protocol --
+        duck-typed, so this loop never learns a decode / handle internal.
+        Each thread closes its OWN call into ``produce`` (the produce's
+        thread-local cache is keyed to the calling thread), so N workers over
+        one config each release only what they opened.
         """
         ready_q = self._ready[cfg.key]
-        while not self._closing.is_set():
-            try:
-                batch = cfg.produce()
-            except BaseException as exc:  # noqa: BLE001 - surface to consumer
-                self._offer(ready_q, exc)
-                return
-            self._offer(ready_q, batch)
+        try:
+            while not self._closing.is_set():
+                try:
+                    batch = cfg.produce()
+                except BaseException as exc:  # noqa: BLE001 - surface to consumer
+                    self._offer(ready_q, exc)
+                    return
+                self._offer(ready_q, batch)
+        finally:
+            self._close_produce(cfg.produce)
+
+    @staticmethod
+    def _close_produce(produce: Any) -> None:
+        """Release this worker's ``produce`` resources via the optional seam.
+
+        A no-op unless ``produce`` satisfies :class:`CloseableProduce`. The
+        pool stays ignorant of what ``close()`` frees -- it only knows "a
+        produce MAY be closeable". A failure to close is swallowed (the
+        worker is already stopping; a release error must not mask the stop
+        reason nor crash teardown).
+        """
+        if not is_closeable_produce(produce):
+            return
+        try:
+            produce.close()
+        except BaseException:  # noqa: BLE001 - teardown best-effort
+            pass
 
     def _offer(self, ready_q: "queue.Queue", item: Any) -> None:
         """Put ``item`` on the bounded ready queue, honouring close.

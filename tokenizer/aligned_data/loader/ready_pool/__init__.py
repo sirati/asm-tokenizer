@@ -65,8 +65,10 @@ GPU-overlap usage (the user ``postprocess`` adapts numpy -> torch pytree)::
 from __future__ import annotations
 
 from ._config import PoolConfig
+from ._dataloader import DataLoaderConfig, VectorBatchDataLoader
 from ._gpu_pool import GpuReadyPool
 from ._pool import ReadyPool, ReadyPoolWorkerDied
+from ._produce import CloseableProduce, Produce, is_closeable_produce
 from ._vector_batch_source import (
     DecodeParams,
     Draw,
@@ -76,12 +78,17 @@ from ._vector_batch_source import (
 
 
 __all__ = [
+    "CloseableProduce",
+    "DataLoaderConfig",
     "DecodeParams",
     "Draw",
     "GpuReadyPool",
     "PoolConfig",
+    "Produce",
     "ReadyPool",
     "ReadyPoolWorkerDied",
     "Sampler",
+    "VectorBatchDataLoader",
+    "is_closeable_produce",
     "make_vector_batch_produce",
 ]

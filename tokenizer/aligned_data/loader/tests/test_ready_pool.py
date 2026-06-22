@@ -583,3 +583,358 @@ def test_vector_batch_produce_end_to_end(tmp_path):
     # 5 draws succeeded against ONE reused per-binary session+handles
     # (open-once-reuse) -- a fresh open per draw would still pass but this
     # exercises the reuse path the pool depends on for throughput.
+
+
+# ==========================================================================
+# D. CLEANUP SEAM -- the OPTIONAL CloseableProduce protocol on shutdown
+# ==========================================================================
+# The pool's refill loop calls produce.close() in a finally when each worker
+# stops, IF the produce honours the CloseableProduce protocol -- duck-typed
+# via the runtime-checkable Protocol, never an isinstance ladder over decode
+# types. A non-closeable produce (the common case in the fake tests) must
+# still work untouched.
+from tokenizer.aligned_data.loader.ready_pool import (  # noqa: E402
+    CloseableProduce,
+    is_closeable_produce,
+)
+
+
+class _CloseableProduce:
+    """A fake closeable produce: counts calls + records its close() call(s).
+
+    ``close`` is invoked PER REFILL THREAD (the thread-local resource owner),
+    so the counter is thread-safe and the test asserts close was called at
+    least once -- exactly once per worker that ran this produce.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+        self.close_calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> dict:
+        with self._lock:
+            i = self._n
+            self._n += 1
+        return {"i": i}
+
+    def close(self) -> None:
+        with self._lock:
+            self.close_calls += 1
+
+
+def test_closeable_produce_satisfies_protocol():
+    # The structural seam: a __call__ + close() object is a CloseableProduce;
+    # a plain __call__-only fake (and a bare function) is NOT.
+    assert is_closeable_produce(_CloseableProduce())
+    assert isinstance(_CloseableProduce(), CloseableProduce)
+    assert not is_closeable_produce(_CountingProduce("a"))
+    assert not is_closeable_produce(_produce_dies_immediately)
+
+
+def test_worker_closes_produce_on_clean_shutdown():
+    produce = _CloseableProduce()
+    cfg = PoolConfig(key="a", produce=produce, ready_depth=2)
+    pool = ReadyPool([cfg], threads_per_config=1).start()
+    pool.get("a")  # ensure the worker ran at least one produce.
+    pool.close()
+    # The single refill thread released its produce resources on shutdown.
+    assert produce.close_calls == 1, (
+        f"expected one close() on clean shutdown, got {produce.close_calls}"
+    )
+
+
+def test_worker_closes_produce_per_thread_on_shutdown():
+    # N threads over one config => close() called once PER worker (each owns
+    # its own thread-local resources; the pool closes each independently).
+    produce = _CloseableProduce()
+    cfg = PoolConfig(key="a", produce=produce, ready_depth=4)
+    pool = ReadyPool([cfg], threads_per_config=3).start()
+    for _ in range(6):
+        pool.get("a")
+    pool.close()
+    assert produce.close_calls == 3, (
+        f"expected one close() per worker (3), got {produce.close_calls}"
+    )
+
+
+def test_worker_closes_produce_even_after_produce_raises():
+    # The finally fires on the fatal-exception exit too: a produce that
+    # raises (worker dies) still gets close() so its resources are released.
+    class _RaiseThenCloseable(_CloseableProduce):
+        def __call__(self) -> dict:
+            super().__call__()
+            raise ValueError("boom")
+
+    produce = _RaiseThenCloseable()
+    cfg = PoolConfig(key="a", produce=produce, ready_depth=2)
+    with ReadyPool([cfg], threads_per_config=1) as pool:
+        with pytest.raises(ValueError, match="boom"):
+            pool.get("a")
+        # The dead worker still ran its close() in the finally.
+        deadline = time.monotonic() + 5.0
+        while produce.close_calls < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert produce.close_calls == 1
+
+
+def test_non_closeable_produce_shuts_down_without_crash():
+    # The seam is OPTIONAL: a plain __call__-only produce must shut down
+    # cleanly (the pool simply skips the close() call). No crash, threads
+    # joined.
+    cfg = PoolConfig(key="a", produce=_CountingProduce("a"), ready_depth=2)
+    pool = ReadyPool([cfg], threads_per_config=1).start()
+    pool.get("a")
+    pool.close()  # must not raise despite no close() on the produce.
+    for workers in pool._threads.values():
+        for t in workers:
+            assert not t.is_alive()
+
+
+def test_close_failure_does_not_break_shutdown():
+    # A close() that raises must not crash teardown nor leave threads alive
+    # (best-effort release; the worker is already stopping).
+    class _BadClose(_CloseableProduce):
+        def close(self) -> None:
+            raise RuntimeError("close blew up")
+
+    produce = _BadClose()
+    cfg = PoolConfig(key="a", produce=produce, ready_depth=2)
+    pool = ReadyPool([cfg], threads_per_config=1).start()
+    pool.get("a")
+    pool.close()  # swallows the close() failure.
+    for workers in pool._threads.values():
+        for t in workers:
+            assert not t.is_alive()
+
+
+# ==========================================================================
+# E. FACADE -- VectorBatchDataLoader (construction-time postprocess + wiring)
+# ==========================================================================
+# A single construction-time postprocess is fanned out to EVERY config's
+# produce (running on the worker thread); the facade composes ReadyPool [+
+# GpuReadyPool] and delegates get()/prime+get(stream). Exercised with a fake
+# produce injected through make_vector_batch_produce on a real fixture for
+# the CPU path, and the fake CudaBackend pattern for the GPU path.
+def test_facade_construction_postprocess_applied_to_every_config(tmp_path):
+    import numpy as np
+
+    from tokenizer.aligned_data.loader.batch_decode._types import (
+        SectionPointerSpec,
+    )
+    from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+    from tokenizer.aligned_data.loader.ready_pool import (
+        DataLoaderConfig,
+        DecodeParams,
+        VectorBatchDataLoader,
+    )
+    from tokenizer.aligned_data.loader.vector_batch.tests._byte_identity_harness import (  # noqa: E501
+        _BINARY_NAME,
+        _nonempty_matched_idxs,
+        _prepare,
+    )
+    from tokenizer.aligned_data.sorted_index.tests.fixtures import (
+        build_combined_fixture,
+        make_test_vocab_manager,
+    )
+
+    base = _prepare(build_combined_fixture, tmp_path)
+    idxs = _nonempty_matched_idxs(base)
+    assert idxs
+
+    L = 48
+
+    def make_sampler(b):
+        def sampler(rng) -> tuple:
+            chosen = rng.choice(len(idxs), size=b, replace=False)
+            pointers = [
+                SectionPointerSpec(arm=SectionKind.MATCHED, idx=int(idxs[i]))
+                for i in chosen
+            ]
+            return (_BINARY_NAME, pointers)
+
+        return sampler
+
+    # ONE construction-time postprocess; the marker proves it ran for EVERY
+    # config's batches (off the worker thread, as the final produce stage).
+    def postprocess(result) -> dict:
+        return {"marked": True, "tokens": result.tokens}
+
+    cfgs = [
+        DataLoaderConfig(
+            key="small",
+            sampler=make_sampler(min(2, len(idxs))),
+            decode_params=DecodeParams(context_len=L),
+            ready_depth=2,
+        ),
+        DataLoaderConfig(
+            key="big",
+            sampler=make_sampler(min(3, len(idxs))),
+            decode_params=DecodeParams(context_len=L),
+            ready_depth=2,
+        ),
+    ]
+
+    with VectorBatchDataLoader(
+        base_path=base,
+        configs=cfgs,
+        postprocess=postprocess,
+        vocab_manager=make_test_vocab_manager(),
+        seed=7,
+    ) as loader:
+        for key in ("small", "big"):
+            for _ in range(3):
+                batch = loader.get(key)
+                assert batch["marked"] is True
+                assert batch["tokens"].shape[1] == L
+                assert batch["tokens"].dtype == np.uint16
+
+
+def test_facade_per_config_postprocess_override(tmp_path):
+    from tokenizer.aligned_data.loader.batch_decode._types import (
+        SectionPointerSpec,
+    )
+    from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+    from tokenizer.aligned_data.loader.ready_pool import (
+        DataLoaderConfig,
+        DecodeParams,
+        VectorBatchDataLoader,
+    )
+    from tokenizer.aligned_data.loader.vector_batch.tests._byte_identity_harness import (  # noqa: E501
+        _BINARY_NAME,
+        _nonempty_matched_idxs,
+        _prepare,
+    )
+    from tokenizer.aligned_data.sorted_index.tests.fixtures import (
+        build_combined_fixture,
+        make_test_vocab_manager,
+    )
+
+    base = _prepare(build_combined_fixture, tmp_path)
+    idxs = _nonempty_matched_idxs(base)
+    assert idxs
+
+    def sampler(rng) -> tuple:
+        i = int(rng.choice(len(idxs)))
+        return (_BINARY_NAME, [SectionPointerSpec(arm=SectionKind.MATCHED, idx=int(idxs[i]))])
+
+    cfgs = [
+        DataLoaderConfig(
+            key="default",
+            sampler=sampler,
+            decode_params=DecodeParams(context_len=32),
+            ready_depth=2,
+        ),
+        # This config overrides the construction-level postprocess cleanly.
+        DataLoaderConfig(
+            key="override",
+            sampler=sampler,
+            decode_params=DecodeParams(context_len=32),
+            ready_depth=2,
+            postprocess=lambda result: {"via": "override"},
+        ),
+    ]
+
+    with VectorBatchDataLoader(
+        base_path=base,
+        configs=cfgs,
+        postprocess=lambda result: {"via": "construction"},
+        vocab_manager=make_test_vocab_manager(),
+        seed=7,
+    ) as loader:
+        assert loader.get("default")["via"] == "construction"
+        assert loader.get("override")["via"] == "override"
+
+
+def test_facade_cpu_get_without_device():
+    # Without a device the facade is the CPU path: get(key) delegates to the
+    # wrapped ReadyPool. A fake closeable produce stands in for the decode.
+    from tokenizer.aligned_data.loader.ready_pool import VectorBatchDataLoader
+
+    loader = VectorBatchDataLoader.__new__(VectorBatchDataLoader)
+    # Wire a tiny pool by hand to assert delegation without a real decode.
+    cfg = PoolConfig(key="a", produce=_CountingProduce("a"), ready_depth=2)
+    loader._postprocess = None
+    loader._pool = ReadyPool([cfg], threads_per_config=1)
+    loader._gpu = None
+    with loader:
+        assert loader.get("a")["i"] == 0
+        # CPU path rejects the GPU-only surface cleanly.
+        with pytest.raises(RuntimeError, match="GPU pipelined path"):
+            loader.prime("a", stream=_FakeStream("copy"))
+
+
+def test_facade_gpu_prime_get_delegates_to_gpu_pool():
+    # With a device the facade exposes the pipelined GPU path; prime/get(
+    # stream) delegate to the wrapped GpuReadyPool. Reuses the fake CudaBackend
+    # so the overlap is exercised WITHOUT a GPU.
+    from tokenizer.aligned_data.loader.ready_pool import VectorBatchDataLoader
+
+    backend = _FakeCudaBackend()
+    copy_stream = _FakeStream("copy")
+
+    counter = {"n": 0}
+    lock = threading.Lock()
+
+    def produce():
+        with lock:
+            i = counter["n"]
+            counter["n"] += 1
+        return {"x": FakeTensor(f"ax{i}"), "i": i}
+
+    # Build the facade but inject the fake-backed pool/gpu through the same
+    # public knobs the production path uses (cuda_backend + to_device +
+    # is_leaf seams). We hand-wire the pool to use the fake produce (the
+    # facade's only job is wiring; the decode is orthogonal here).
+    loader = VectorBatchDataLoader.__new__(VectorBatchDataLoader)
+    loader._postprocess = None
+    cfg = PoolConfig(key="a", produce=produce, ready_depth=4)
+    loader._pool = ReadyPool([cfg], threads_per_config=1)
+    loader._gpu = GpuReadyPool(
+        loader._pool,
+        device="cuda:fake",
+        cuda_backend=backend,
+        to_device=lambda t, _d: backend.move_leaf(t),
+        is_leaf=_is_fake_tensor,
+    )
+    with loader:
+        loader.prime("a", stream=copy_stream)
+        b0 = loader.get("a", stream=copy_stream)
+        b1 = loader.get("a", stream=copy_stream)
+    assert b0["x"].device == "cuda"
+    assert b1["x"].device == "cuda"
+    # The pipeline launched uploads on the supplied copy stream (delegation).
+    copies = [e for e in backend.log if e[0] == "copy"]
+    assert len(copies) >= 2
+    assert all(e[2] == copy_stream.label for e in copies)
+
+
+def test_facade_gpu_get_requires_stream():
+    from tokenizer.aligned_data.loader.ready_pool import VectorBatchDataLoader
+
+    backend = _FakeCudaBackend()
+    loader = VectorBatchDataLoader.__new__(VectorBatchDataLoader)
+    loader._postprocess = None
+    cfg = PoolConfig(
+        key="a", produce=lambda: {"x": FakeTensor("a0")}, ready_depth=2
+    )
+    loader._pool = ReadyPool([cfg], threads_per_config=1)
+    loader._gpu = GpuReadyPool(
+        loader._pool,
+        device="cuda:fake",
+        cuda_backend=backend,
+        to_device=lambda t, _d: backend.move_leaf(t),
+        is_leaf=_is_fake_tensor,
+    )
+    with loader:
+        with pytest.raises(TypeError, match="requires a stream"):
+            loader.get("a")  # GPU path without a stream is a usage error.
+
+
+def test_facade_rejects_empty_configs():
+    from tokenizer.aligned_data.loader.ready_pool import (
+        VectorBatchDataLoader,
+    )
+
+    with pytest.raises(ValueError, match="at least one"):
+        VectorBatchDataLoader(base_path="/tmp/nope", configs=[])

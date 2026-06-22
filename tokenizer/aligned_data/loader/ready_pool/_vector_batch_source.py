@@ -64,6 +64,8 @@ from tokenizer.aligned_data.loader.vector_batch.session_handles import (
     open_vector_batch_arm_set,
 )
 
+from ._produce import CloseableProduce
+
 
 __all__ = ["DecodeParams", "Draw", "Sampler", "make_vector_batch_produce"]
 
@@ -108,8 +110,15 @@ def make_vector_batch_produce(
     postprocess: Callable[[VectorBatchResult], Any] = _identity,
     vocab_manager=None,
     seed: Optional[int] = None,
-) -> Callable[[], Any]:
-    """Build the no-arg ``produce`` closure for a :class:`PoolConfig`.
+) -> "CloseableProduce":
+    """Build the no-arg ``produce`` callable for a :class:`PoolConfig`.
+
+    The returned object is callable (``produce()`` runs the pipeline) AND
+    honours the :class:`CloseableProduce` seam: its ``close()`` releases the
+    CALLING thread's per-binary session + handle cache. The pool's refill
+    loop calls ``close()`` in a ``finally`` when each worker stops, so the
+    open-once-per-thread handles are released deterministically (mirroring
+    the repo's explicit-close lifecycle) instead of waiting on thread exit.
 
     Each call runs the full produce pipeline: draw
     ``(binary_name, section_pointers)`` from ``sampler``, ensure that
@@ -148,7 +157,7 @@ def make_vector_batch_produce(
         non-reproducible generator per thread.
     """
     base_path = Path(base_path)
-    state = _ProduceState(
+    return _ProduceState(
         base_path=base_path,
         sampler=sampler,
         decode_params=decode_params,
@@ -156,17 +165,20 @@ def make_vector_batch_produce(
         vocab_manager=vocab_manager,
         seed=seed,
     )
-    return state.produce
 
 
 class _ProduceState:
-    """Per-config produce state with THREAD-LOCAL handle/session caches.
+    """The callable + closeable produce, with THREAD-LOCAL handle caches.
 
-    The cache + RNG live in :class:`threading.local` so each refill thread
-    opens + reuses its OWN per-binary mmap handles + session and draws from
-    its OWN RNG stream -- mmap views and the session's file handles are not
-    safe to share across threads, and an independent RNG per thread keeps
-    each thread's draws reproducible from ``seed``.
+    Implements the :class:`CloseableProduce` seam: ``__call__()`` runs one
+    produce pipeline; ``close()`` releases the CALLING thread's cache. The
+    cache + RNG live in :class:`threading.local` so each refill thread opens
+    + reuses its OWN per-binary mmap handles + session and draws from its OWN
+    RNG stream -- mmap views and the session's file handles are not safe to
+    share across threads, and an independent RNG per thread keeps each
+    thread's draws reproducible from ``seed``. ``close()`` therefore frees
+    exactly what the calling worker opened (the pool calls it per worker on
+    shutdown).
     """
 
     def __init__(
@@ -203,7 +215,7 @@ class _ProduceState:
             local.cache = {}
         return local
 
-    def produce(self) -> Any:
+    def __call__(self) -> Any:
         local = self._thread_state()
         binary_name, section_pointers = self._sampler(local.rng)
         session, handles = self._ensure_open(local, binary_name)
@@ -247,3 +259,25 @@ class _ProduceState:
             cache[binary_name] = (session_cm, session, handles)
         _session_cm, session, handles = cache[binary_name]
         return session, handles
+
+    def close(self) -> None:
+        """Release the CALLING thread's open-once session + handle cache.
+
+        The :class:`CloseableProduce` seam (called by the pool's refill loop
+        in a ``finally`` when this worker stops). Closes every cached
+        binary's arm-set handles + exits its session context for THIS thread
+        only -- the cache is thread-local, so a worker frees exactly what it
+        opened, mirroring the explicit-close discipline of
+        :meth:`VectorBatchArmSet.close` / ``BinarySession``'s context exit.
+        A thread that never drew anything has no cache yet -> a clean no-op.
+        Each binary is released independently so one failure does not strand
+        the rest; the cache is cleared so a later draw re-opens fresh.
+        """
+        local = self._local
+        cache: Dict[str, Tuple] = getattr(local, "cache", None) or {}
+        for session_cm, _session, handles in cache.values():
+            try:
+                handles.close()
+            finally:
+                session_cm.__exit__(None, None, None)
+        cache.clear()
