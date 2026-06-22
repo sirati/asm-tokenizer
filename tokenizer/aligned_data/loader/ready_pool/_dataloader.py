@@ -1,20 +1,33 @@
 """Construction-time DataLoader facade: ONE postprocess, fanned out + wired.
 
-Single concern -- ERGONOMIC ASSEMBLY. This module composes the existing
-pieces (:func:`make_vector_batch_produce` -> :class:`ReadyPool` -> optional
-:class:`GpuReadyPool`) behind ONE constructor so a consumer states its
-configs + a SINGLE construction-time ``postprocess`` once, instead of
+Single concern -- ERGONOMIC ASSEMBLY, DECODE-AGNOSTIC. This module composes
+the existing pieces (a decode ``produce`` seam -> :class:`ReadyPool` ->
+optional :class:`GpuReadyPool`) behind ONE constructor so a consumer states
+its configs + a SINGLE construction-time ``postprocess`` once, instead of
 hand-building a produce closure per config and assembling the pools itself.
 It REIMPLEMENTS none of the pool / gpu / decode logic -- every method
 delegates to the wrapped pool(s); the only thing this module owns is the
 wiring.
 
+DECODE-AGNOSTIC (why the facade no longer hardcodes a seam): the training
+distribution is EITHER single-binary (``vector_batch_tokens``) OR
+cross-binary x cross-depth (``load_batch_cross_depth``), and the facade must
+drive BOTH as first-class peers with NO branching on seam type. Each
+:class:`DataLoaderConfig` therefore carries a ``make_produce`` THUNK --
+``Callable[[postprocess], CloseableProduce]`` -- already bound to that
+config's decode seam + parameters; the facade only resolves the postprocess
+and calls the thunk. The two classmethod constructors
+(:meth:`DataLoaderConfig.single_binary` / :meth:`DataLoaderConfig.cross_binary`)
+build the thunk over :func:`make_vector_batch_produce` /
+:func:`make_cross_binary_produce` respectively, so the facade never imports
+either seam's internals beyond that wiring and never special-cases a seam.
+
 THE REQUIREMENT (why this exists): "during construction a postprocessing
 function is passed; it runs on the dataloader results and returns what is
 uploaded to the GPU." That one ``postprocess`` is fanned out by passing the
-SAME callable into every config's :func:`make_vector_batch_produce`, so it
-runs as the final produce stage ON THE WORKER THREAD (off the train loop),
-overlapped with compute -- NOT at upload time.
+SAME callable into every config's ``make_produce`` thunk, so it runs as the
+final produce stage ON THE WORKER THREAD (off the train loop), overlapped
+with compute -- NOT at upload time.
 
 PER-CONFIG OVERRIDE (a nicety that falls out cleanly): a
 :class:`DataLoaderConfig` may carry its own ``postprocess``; when present it
@@ -29,11 +42,6 @@ CPU vs GPU surface (one facade, the device decides):
   * ``device=<cuda>`` -> GPU pipelined path: :meth:`prime(key, stream=...)`
     then :meth:`get(key, stream=...)` drive the double-buffered H2D overlap
     via the wrapped :class:`GpuReadyPool`.
-
-B (batch size) stays SAMPLER-DRIVEN (``B = len(section_pointers)``) exactly
-as today -- the facade only carries config metadata and threads the shared
-``base_path`` / ``vocab_manager`` / ``seed`` into each produce; it never
-reaches into the sampler's draw.
 """
 
 from __future__ import annotations
@@ -43,8 +51,13 @@ from pathlib import Path
 from typing import Any, Callable, Hashable, Optional, Sequence, Union
 
 from ._config import PoolConfig
+from ._cross_binary_source import (
+    CrossDecodeParams,
+    make_cross_binary_produce,
+)
 from ._gpu_pool import GpuReadyPool
 from ._pool import ReadyPool
+from ._produce import CloseableProduce
 from ._vector_batch_source import (
     DecodeParams,
     Sampler,
@@ -56,36 +69,121 @@ from ._vector_batch_source import (
 __all__ = ["DataLoaderConfig", "VectorBatchDataLoader"]
 
 
+#: A config's decode-seam thunk: given the resolved postprocess (the FINAL
+#: produce stage), return the bound :class:`CloseableProduce`. The seam +
+#: its parameters are already captured inside; the facade only resolves the
+#: postprocess and calls it -- which is what keeps the facade decode-agnostic.
+MakeProduce = Callable[[Callable[[Any], Any]], CloseableProduce]
+
+
 @dataclass(frozen=True)
 class DataLoaderConfig:
-    """One registered config for :class:`VectorBatchDataLoader`.
+    """One registered, DECODE-AGNOSTIC config for :class:`VectorBatchDataLoader`.
 
     Bundles the per-config knobs the facade needs to build that config's
-    produce + register it: ``key`` (retrieval label, any hashable),
-    ``sampler`` (the pluggable draw policy -- owns B + arm + binary),
-    ``decode_params`` (the :class:`DecodeParams` bundle carrying context_len
-    L + decode flags), and ``ready_depth`` (keep-N-ready / backpressure
-    bound). ``postprocess`` is the OPTIONAL per-config override: ``None``
-    defers to the dataloader's construction-level postprocess.
+    produce + register it WITHOUT the facade knowing which decode seam backs
+    it: ``key`` (retrieval label, any hashable), ``make_produce`` (the THUNK
+    -- given the resolved postprocess, returns the bound
+    :class:`CloseableProduce` over whichever decode seam this config uses),
+    and ``ready_depth`` (keep-N-ready / backpressure bound). ``postprocess``
+    is the OPTIONAL per-config override: ``None`` defers to the dataloader's
+    construction-level postprocess.
+
+    Build instances via the classmethod constructors -- they capture the
+    seam + its parameters inside ``make_produce`` so the facade stays
+    seam-agnostic:
+
+      * :meth:`single_binary` -- the per-binary ``vector_batch_tokens`` seam
+        (B = ``len(section_pointers)``, sampler-driven).
+      * :meth:`cross_binary` -- the cross-binary x cross-depth
+        ``load_batch_cross_depth`` seam (B = ``params.batch_size``, a draw
+        parameter), returning the per-row-identity
+        :class:`MultiBinaryBatchDecodeResult`.
     """
 
     key: Hashable
-    sampler: Sampler
-    decode_params: DecodeParams
+    make_produce: MakeProduce
     ready_depth: int = 4
     postprocess: Optional[Callable[[Any], Any]] = None
+
+    @classmethod
+    def single_binary(
+        cls,
+        *,
+        key: Hashable,
+        base_path: Union[str, Path],
+        sampler: Sampler,
+        decode_params: DecodeParams,
+        ready_depth: int = 4,
+        postprocess: Optional[Callable[[Any], Any]] = None,
+        vocab_manager: Any = None,
+        seed: Optional[int] = None,
+    ) -> "DataLoaderConfig":
+        """A config for the single-binary ``vector_batch_tokens`` seam.
+
+        Captures ``base_path`` / ``sampler`` / ``decode_params`` /
+        ``vocab_manager`` / ``seed`` inside a ``make_produce`` thunk over
+        :func:`make_vector_batch_produce` so the facade only threads the
+        resolved postprocess through. B is the sampler's draw
+        (``len(section_pointers)``).
+        """
+        return cls(
+            key=key,
+            make_produce=lambda pp: make_vector_batch_produce(
+                base_path=base_path,
+                sampler=sampler,
+                decode_params=decode_params,
+                postprocess=pp,
+                vocab_manager=vocab_manager,
+                seed=seed,
+            ),
+            ready_depth=ready_depth,
+            postprocess=postprocess,
+        )
+
+    @classmethod
+    def cross_binary(
+        cls,
+        *,
+        key: Hashable,
+        collection_factory: Callable[[], Any],
+        params: CrossDecodeParams,
+        ready_depth: int = 4,
+        postprocess: Optional[Callable[[Any], Any]] = None,
+        seed: Optional[int] = None,
+    ) -> "DataLoaderConfig":
+        """A config for the cross-binary x cross-depth ``load_batch_cross_depth`` seam.
+
+        Captures ``collection_factory`` / ``params`` / ``seed`` inside a
+        ``make_produce`` thunk over :func:`make_cross_binary_produce` so the
+        facade only threads the resolved postprocess through. B is a draw
+        parameter (``params.batch_size``); each batch carries per-row binary
+        identity (``binary_id_per_row`` / ``binary_names``).
+        """
+        return cls(
+            key=key,
+            make_produce=lambda pp: make_cross_binary_produce(
+                collection_factory=collection_factory,
+                params=params,
+                postprocess=pp,
+                seed=seed,
+            ),
+            ready_depth=ready_depth,
+            postprocess=postprocess,
+        )
 
 
 class VectorBatchDataLoader:
     """Construction-time-postprocess facade over the ready pool stack.
 
-    Constructed with the shared decode context (``base_path`` /
-    ``vocab_manager`` / ``seed``), a sequence of :class:`DataLoaderConfig`,
-    ONE ``postprocess`` applied to every config (unless a config overrides
-    it), and -- optionally -- a CUDA ``device`` (+ cuda knobs) to enable the
-    pipelined GPU path. It builds each config's produce via
-    :func:`make_vector_batch_produce`, constructs the :class:`ReadyPool`,
-    and (when a device is given) wraps a :class:`GpuReadyPool`.
+    Constructed with a sequence of :class:`DataLoaderConfig` (each carrying
+    its own decode-seam thunk + parameters), ONE ``postprocess`` applied to
+    every config (unless a config overrides it), and -- optionally -- a CUDA
+    ``device`` (+ cuda knobs) to enable the pipelined GPU path. For each
+    config it builds that config's produce via ``cfg.make_produce(...)``,
+    constructs the :class:`ReadyPool`, and (when a device is given) wraps a
+    :class:`GpuReadyPool`. It is DECODE-AGNOSTIC: the thunk carries the seam,
+    so the facade never branches on single- vs cross-binary.
 
     Public surface (context manager):
 
@@ -101,11 +199,8 @@ class VectorBatchDataLoader:
     def __init__(
         self,
         *,
-        base_path: Union[str, Path],
         configs: Sequence[DataLoaderConfig],
         postprocess: Callable[[Any], Any] = _identity,
-        vocab_manager: Any = None,
-        seed: Optional[int] = None,
         threads_per_config: int = 1,
         device: Any = None,
         cuda_backend: Any = None,
@@ -117,20 +212,14 @@ class VectorBatchDataLoader:
             raise ValueError("at least one DataLoaderConfig is required")
         self._postprocess = postprocess
         # Fan the SINGLE construction-time postprocess (or a config's clean
-        # override) into each config's produce, so it runs on the worker
-        # thread as the final produce stage. Everything else here is pure
-        # composition of the existing seam.
+        # override) into each config's decode-seam thunk, so it runs on the
+        # worker thread as the final produce stage. Everything else here is
+        # pure composition of the existing seams -- the thunk carries which
+        # decode seam each config uses, so this loop never branches on it.
         pool_configs = [
             PoolConfig(
                 key=cfg.key,
-                produce=make_vector_batch_produce(
-                    base_path=base_path,
-                    sampler=cfg.sampler,
-                    decode_params=cfg.decode_params,
-                    postprocess=cfg.postprocess or self._postprocess,
-                    vocab_manager=vocab_manager,
-                    seed=seed,
-                ),
+                produce=cfg.make_produce(cfg.postprocess or self._postprocess),
                 ready_depth=cfg.ready_depth,
             )
             for cfg in configs

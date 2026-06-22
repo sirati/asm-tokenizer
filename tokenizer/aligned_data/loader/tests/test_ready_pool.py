@@ -760,27 +760,31 @@ def test_facade_construction_postprocess_applied_to_every_config(tmp_path):
     def postprocess(result) -> dict:
         return {"marked": True, "tokens": result.tokens}
 
+    vocab = make_test_vocab_manager()
     cfgs = [
-        DataLoaderConfig(
+        DataLoaderConfig.single_binary(
             key="small",
+            base_path=base,
             sampler=make_sampler(min(2, len(idxs))),
             decode_params=DecodeParams(context_len=L),
             ready_depth=2,
+            vocab_manager=vocab,
+            seed=7,
         ),
-        DataLoaderConfig(
+        DataLoaderConfig.single_binary(
             key="big",
+            base_path=base,
             sampler=make_sampler(min(3, len(idxs))),
             decode_params=DecodeParams(context_len=L),
             ready_depth=2,
+            vocab_manager=vocab,
+            seed=7,
         ),
     ]
 
     with VectorBatchDataLoader(
-        base_path=base,
         configs=cfgs,
         postprocess=postprocess,
-        vocab_manager=make_test_vocab_manager(),
-        seed=7,
     ) as loader:
         for key in ("small", "big"):
             for _ in range(3):
@@ -818,29 +822,33 @@ def test_facade_per_config_postprocess_override(tmp_path):
         i = int(rng.choice(len(idxs)))
         return (_BINARY_NAME, [SectionPointerSpec(arm=SectionKind.MATCHED, idx=int(idxs[i]))])
 
+    vocab = make_test_vocab_manager()
     cfgs = [
-        DataLoaderConfig(
+        DataLoaderConfig.single_binary(
             key="default",
+            base_path=base,
             sampler=sampler,
             decode_params=DecodeParams(context_len=32),
             ready_depth=2,
+            vocab_manager=vocab,
+            seed=7,
         ),
         # This config overrides the construction-level postprocess cleanly.
-        DataLoaderConfig(
+        DataLoaderConfig.single_binary(
             key="override",
+            base_path=base,
             sampler=sampler,
             decode_params=DecodeParams(context_len=32),
             ready_depth=2,
             postprocess=lambda result: {"via": "override"},
+            vocab_manager=vocab,
+            seed=7,
         ),
     ]
 
     with VectorBatchDataLoader(
-        base_path=base,
         configs=cfgs,
         postprocess=lambda result: {"via": "construction"},
-        vocab_manager=make_test_vocab_manager(),
-        seed=7,
     ) as loader:
         assert loader.get("default")["via"] == "construction"
         assert loader.get("override")["via"] == "override"
@@ -937,4 +945,264 @@ def test_facade_rejects_empty_configs():
     )
 
     with pytest.raises(ValueError, match="at least one"):
-        VectorBatchDataLoader(base_path="/tmp/nope", configs=[])
+        VectorBatchDataLoader(configs=[])
+
+
+# ==========================================================================
+# F. CROSS-BINARY decode seam -- make_cross_binary_produce over
+#    load_batch_cross_depth, BYTE-IDENTICAL to the primitive.
+# ==========================================================================
+# The cross-binary x cross-depth training distribution: one batch draws
+# across MULTIPLE binaries and downstream REQUIRES per-row binary identity.
+# make_cross_binary_produce must WRAP (never reimplement) the existing
+# load_batch_cross_depth primitive, so a seam draw is byte-identical to a
+# direct primitive draw on the same collection with the same RNG. These tests
+# build a REAL two-binary collection fixture (mirroring the sorted_index
+# cross-depth tests) so the byte-identity gate runs hermetically.
+
+import contextlib  # noqa: E402
+import logging as _xb_logging  # noqa: E402
+
+
+@contextlib.contextmanager
+def caplog_silence():
+    """Mute the cross-depth path's noisy per-draw logging during the gate."""
+    prev_disable = _xb_logging.root.manager.disable
+    _xb_logging.disable(_xb_logging.CRITICAL)
+    try:
+        yield
+    finally:
+        _xb_logging.disable(prev_disable)
+
+
+def _build_cross_binary_collection_factory(tmp_path):
+    """Build a TWO-binary, three-depth collection + a no-arg open thunk.
+
+    Lays two distinct binaries (distinct func/section pools) into two memmap
+    dirs with the real sorted index + geometry sidecars over depths {0,1,3}
+    under a MAX reduction, mirroring the sorted_index cross-depth fixture.
+    Returns ``(specs, collection_factory)`` -- the factory opens a FRESH
+    production-shaped :class:`IndexedMemmapCollection` over BOTH dirs each
+    call (so the seam can open one per thread, and the reference can open its
+    own).
+    """
+    import numpy as np
+
+    from tokenizer.aligned_data.realized_lengths import (
+        generate_realized_geometry,
+    )
+    from tokenizer.aligned_data.sorted_index import (
+        IndexSpec,
+        IndexedMemmapCollection,
+        LengthReduction,
+        MissingIndexPolicy,
+        ReductionKind,
+    )
+    from tokenizer.aligned_data.sorted_index._builder import (
+        write_sorted_index_files,
+    )
+    from tokenizer.aligned_data.loader.tests._corpus import (
+        MatchedFunctionSpec,
+        build_corpus_with_registry,
+    )
+    from tokenizer.aligned_data.loader.tests._corpus.specs import VariantSpec
+    from tokenizer.aligned_data.sorted_index.tests.fixtures import (
+        _DeterministicVariantRegistry,
+        make_test_vocab_manager,
+    )
+    from tokenizer.aligned_data.sorted_index.tests._length_helpers import (
+        ensure_sidecar,
+    )
+
+    max_red = LengthReduction(ReductionKind.MAX)
+    depths = (0, 1, 3)
+    specs = [IndexSpec(reduction=max_red, depth=d) for d in depths]
+
+    def _simple_variant(vkey, seed_base: int, n_tokens: int) -> VariantSpec:
+        base = 272 + (seed_base + 1) * 100
+        tokens = np.arange(base, base + n_tokens, dtype=np.uint16)
+        return VariantSpec(
+            vkey=vkey,
+            tokens=tokens,
+            block_rl=np.array([n_tokens], dtype=np.uint8),
+            insn_rl=np.array([2, n_tokens - 2], dtype=np.uint8),
+        )
+
+    def _build_binary(memmap_dir, binary_name: str, salt: int) -> None:
+        memmap_dir.mkdir(parents=True, exist_ok=True)
+        matched = (
+            MatchedFunctionSpec(
+                func_name=f"f_{binary_name}_a",
+                variants=(
+                    _simple_variant((f"{binary_name}_a", 0), salt + 0, 7),
+                    _simple_variant((f"{binary_name}_a", 1), salt + 1, 9),
+                ),
+                called=(),
+            ),
+            MatchedFunctionSpec(
+                func_name=f"f_{binary_name}_b",
+                variants=(
+                    _simple_variant((f"{binary_name}_b", 0), salt + 2, 6),
+                    _simple_variant((f"{binary_name}_b", 1), salt + 3, 8),
+                ),
+                called=(),
+            ),
+        )
+        build_corpus_with_registry(
+            memmap_dir,
+            binary_name,
+            matched=matched,
+            unmatched=(),
+            variants=_DeterministicVariantRegistry(),
+        )
+        ensure_sidecar(memmap_dir, binary_name)
+        write_sorted_index_files(
+            memmap_dir, binary_name, reductions=[max_red], depths=list(depths)
+        )
+        generate_realized_geometry(memmap_dir, binary_name)
+
+    dir_a = tmp_path / "pkgA"
+    dir_b = tmp_path / "pkgB"
+    _build_binary(dir_a, "alpha", salt=0)
+    _build_binary(dir_b, "beta", salt=10)
+
+    def collection_factory():
+        return IndexedMemmapCollection.discover(
+            [dir_a, dir_b],
+            specs=specs,
+            on_missing=MissingIndexPolicy.SKIP_WITH_ERROR_LOG,
+            vocab_manager=make_test_vocab_manager(),
+        )
+
+    return specs, collection_factory
+
+
+def _assert_multibinary_equal(ref, got) -> None:
+    """Byte-equality of two :class:`MultiBinaryBatchDecodeResult`."""
+    import numpy as np
+
+    assert np.array_equal(got.inner.tokens, ref.inner.tokens)
+    assert np.array_equal(got.binary_id_per_row, ref.binary_id_per_row)
+    assert got.binary_names == ref.binary_names
+    assert np.array_equal(got.depth_per_row, ref.depth_per_row)
+    # Inner sidecar arrays + their row offsets.
+    assert np.array_equal(got.inner.identities, ref.inner.identities)
+    assert np.array_equal(
+        got.inner.identity_row_offsets, ref.inner.identity_row_offsets
+    )
+    assert np.array_equal(
+        got.inner.numbers_significant, ref.inner.numbers_significant
+    )
+    assert np.array_equal(
+        got.inner.numbers_sign_exponent, ref.inner.numbers_sign_exponent
+    )
+    assert np.array_equal(
+        got.inner.number_row_offsets, ref.inner.number_row_offsets
+    )
+    # fid sidecar (present iff include_fid_sidecar).
+    assert np.array_equal(got.inner.fid_sidecar, ref.inner.fid_sidecar)
+    assert np.array_equal(
+        got.inner.fid_row_offsets, ref.inner.fid_row_offsets
+    )
+
+
+def test_cross_binary_produce_byte_identical_to_primitive(tmp_path):
+    # THE GATE: a seam draw reproduces load_batch_cross_depth EXACTLY. The
+    # seam derives its per-thread rng as
+    # default_rng(SeedSequence(S).spawn(1)[0]); construct the reference RNG
+    # the SAME way so the cross-(binary x spec) urn draws are identical.
+    import numpy as np
+
+    from tokenizer.aligned_data.loader.ready_pool import (
+        CrossDecodeParams,
+        PoolConfig,
+        ReadyPool,
+        make_cross_binary_produce,
+    )
+
+    _, collection_factory = _build_cross_binary_collection_factory(tmp_path)
+
+    SEED = 4242
+    params = CrossDecodeParams(
+        target_length=0,
+        batch_size=16,
+        context_len=64,
+        num_variants_per_section=1,
+        band=(1, 10_000_000),
+        include_fid_sidecar=True,
+    )
+
+    # Reference: drive the primitive directly with the SAME per-thread rng
+    # the seam will derive from SEED.
+    ref_rng = np.random.default_rng(
+        np.random.SeedSequence(SEED).spawn(1)[0]
+    )
+    with caplog_silence():
+        with collection_factory() as ref_coll:
+            ref = ref_coll.load_batch_cross_depth(
+                target_length=params.target_length,
+                batch_size=params.batch_size,
+                rng=ref_rng,
+                band=params.band,
+                context_len=params.context_len,
+                num_variants_per_section=params.num_variants_per_section,
+                variant_padding=params.variant_padding,
+                inlined_equivalent_call_targets_only=(
+                    params.inlined_equivalent_call_targets_only
+                ),
+                include_fid_sidecar=params.include_fid_sidecar,
+            )
+
+    # Seam: a 1-thread ReadyPool over make_cross_binary_produce, get() once.
+    produce = make_cross_binary_produce(
+        collection_factory=collection_factory,
+        params=params,
+        seed=SEED,
+    )
+    cfg = PoolConfig(key="xb", produce=produce, ready_depth=2)
+    with caplog_silence():
+        with ReadyPool([cfg], threads_per_config=1) as pool:
+            got = pool.get("xb")
+
+    _assert_multibinary_equal(ref, got)
+    # Sanity: a genuine cross-binary batch carries both binaries' identities
+    # (alphabetical, unqualified when the dir names don't collide).
+    assert set(got.binary_names) == {"alpha", "beta"}
+    assert got.binary_id_per_row.max() < len(got.binary_names)
+
+
+def test_cross_binary_seam_thread_safety(tmp_path):
+    # threads_per_config=2 over the cross seam runs many gets without error;
+    # each result carries binary_id_per_row aligned to binary_names (ids in
+    # range, names consistent). Each thread owns its OWN collection + RNG.
+    from tokenizer.aligned_data.loader.ready_pool import (
+        CrossDecodeParams,
+        PoolConfig,
+        ReadyPool,
+        make_cross_binary_produce,
+    )
+
+    _, collection_factory = _build_cross_binary_collection_factory(tmp_path)
+
+    params = CrossDecodeParams(
+        target_length=0,
+        batch_size=12,
+        context_len=48,
+        num_variants_per_section=1,
+        band=(1, 10_000_000),
+    )
+    produce = make_cross_binary_produce(
+        collection_factory=collection_factory,
+        params=params,
+        seed=7,
+    )
+    cfg = PoolConfig(key="xb", produce=produce, ready_depth=4)
+    with caplog_silence():
+        with ReadyPool([cfg], threads_per_config=2) as pool:
+            results = [pool.get("xb") for _ in range(20)]
+    for res in results:
+        n = len(res.binary_names)
+        assert n >= 1
+        assert res.binary_id_per_row.min() >= 0
+        assert res.binary_id_per_row.max() < n
+        assert res.binary_id_per_row.shape[0] == res.inner.tokens.shape[0]
