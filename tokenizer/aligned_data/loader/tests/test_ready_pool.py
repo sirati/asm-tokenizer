@@ -1234,3 +1234,36 @@ def test_cross_binary_seam_thread_safety(tmp_path):
         assert res.binary_id_per_row.min() >= 0
         assert res.binary_id_per_row.max() < n
         assert res.binary_id_per_row.shape[0] == res.inner.tokens.shape[0]
+
+
+def test_cross_binary_callable_batch_size_resolved_per_draw(tmp_path):
+    # batch_size may be a no-arg callable resolved on EACH draw (e.g. an OOM
+    # auto-recovery loop shrinking the live B for this bucket); consecutive
+    # produce() calls honour the changing size -- so a dynamic-B consumer can
+    # drive the clean .cross_binary facade instead of bypassing it.
+    from tokenizer.aligned_data.loader.ready_pool import (
+        CrossDecodeParams,
+        make_cross_binary_produce,
+    )
+
+    _, collection_factory = _build_cross_binary_collection_factory(tmp_path)
+
+    # Both sizes are below the fixture's available-section count, so the urn
+    # draws EXACTLY B; differing values prove the callable is resolved per draw.
+    sizes = iter([8, 4])
+    params = CrossDecodeParams(
+        target_length=0,
+        batch_size=lambda: next(sizes),
+        context_len=48,
+        band=(1, 10_000_000),
+    )
+    produce = make_cross_binary_produce(
+        collection_factory=collection_factory, params=params, seed=99
+    )
+    with caplog_silence():
+        first = produce()
+        second = produce()
+        produce.close()
+    # Each draw resolved the callable -> B rows in that batch.
+    assert first.inner.tokens.shape[0] == 8
+    assert second.inner.tokens.shape[0] == 4

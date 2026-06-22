@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Union
 
 import numpy as np
 
@@ -87,10 +87,18 @@ class CrossDecodeParams:
     spec) urn draws, and ``target_length`` / ``band`` select the length
     universe sampled over. ``context_len`` is the sequence length L; the
     rest mirror the primitive's same-named flags.
+
+    ``batch_size`` may be a plain ``int`` (fixed B for every draw) OR a
+    no-arg ``Callable[[], int]`` RESOLVED PER DRAW -- so a consumer whose B
+    changes between draws (e.g. an OOM auto-recovery loop that shrinks the
+    live max batch size for this seq-len bucket) can drive the clean
+    :meth:`DataLoaderConfig.cross_binary` facade instead of bypassing it. The
+    callable is resolved on the worker thread at each ``produce()`` call,
+    mirroring the ``Union[int, ...]`` precedent of ``DecodeParams.max_depth``.
     """
 
     target_length: int
-    batch_size: int
+    batch_size: Union[int, Callable[[], int]]
     context_len: int
     num_variants_per_section: int = 1
     band: Optional[Tuple[int, int]] = None
@@ -212,9 +220,12 @@ class _CrossProduceState:
     def __call__(self) -> Any:
         local = self._thread_state()
         p = self._params
+        # B may be a per-draw callable (live max batch size, e.g. shrunk by
+        # an OOM auto-recovery loop); resolve it here on the worker thread.
+        batch_size = p.batch_size() if callable(p.batch_size) else p.batch_size
         result = local.collection.load_batch_cross_depth(
             target_length=p.target_length,
-            batch_size=p.batch_size,
+            batch_size=batch_size,
             rng=local.rng,
             band=p.band,
             context_len=p.context_len,
