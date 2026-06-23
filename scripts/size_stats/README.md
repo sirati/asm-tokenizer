@@ -58,17 +58,24 @@ Phase-1 (per-binary):
 | overall output/raw | **2.07×** |
 | per-file ratio | mean 2.14×, min 0.0006×, max 4.88× |
 
-Memmap (aggregate):
+Memmap (aggregate, after the phase-3 build completed):
 
 | metric | value |
 |---|---|
-| programs (binaries) | 132 |
-| memmap total (counted) | 67.99 GiB |
-| `*sections.csv` excluded | 2.81 GiB |
+| programs (binaries) | 133 |
+| memmap total (counted) | 80.07 GiB |
+| `*sections.csv` excluded | 3.32 GiB |
 | raw binary total (all 167,248) | 81.95 GiB |
-| memmap / all-raw | **0.83×** |
-| memmap / tokenized-raw (53.57 GiB) | **1.27×** |
+| memmap / all-raw | **0.98×** |
+| memmap / tokenized-raw (53.57 GiB) | **1.49×** |
 
-Note: roughly half the raw binaries have no phase-1 output, so the memmap (built
-from the tokenized subset) is 0.83× of the *whole* raw corpus but 1.27× of the
-*tokenized* subset that actually fed it.
+Note: roughly half the raw binaries lie outside the tokenized set, so the memmap
+(built from the tokenized subset) is 0.98× of the *whole* raw corpus but 1.49× of
+the *tokenized* subset that actually fed it.
+
+## Thesis write-up
+
+`reports/dataset_size_stats.typ` is a self-contained, compilable Typst section
+documenting these results (corpus, method, phase-1 and phase-3 tables,
+discussion) for inclusion in the thesis via `#include`. Compile with
+`typst compile reports/dataset_size_stats.typ`.
