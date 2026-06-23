@@ -24,6 +24,17 @@
 #   SRC_ROOT    raw-binary root (the `dataset/` dir holding <pkg>/<variant>/<binname>)
 #   OUT_ROOT    tokenizer `out/` dir holding the `build_memmap/` subtree
 #   REPORT_CSV  optional path for the per-program CSV (default: stdout-only summary)
+# Env:
+#   SIZE_STATS_PRUNE       space-separated top-level source subdir names to
+#                          exclude from the raw-binary walk (subset splits etc.)
+#   SIZE_STATS_PROG_STRIP  ERE removed from each raw binary's basename to derive
+#                          its program name (e.g. '-O[0-9s]+-[0-9a-f]+$' for the
+#                          opt/hash variant suffix). When set, the raw
+#                          denominator is scoped to ONLY programs that have a
+#                          built memmap, and memmap coverage is reported -- use
+#                          this when the phase-3 build is partial so the ratio
+#                          compares against the binaries actually in the memmaps,
+#                          not the whole corpus.
 
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -41,19 +52,29 @@ require_dir "$OUT_ROOT" OUT_ROOT
 MEMMAP_ROOT="$OUT_ROOT/build_memmap"
 require_dir "$MEMMAP_ROOT" "OUT_ROOT/build_memmap"
 
-awk -F'\t' -v report="$REPORT_CSV" '
+awk -F'\t' -v report="$REPORT_CSV" -v strip="${SIZE_STATS_PROG_STRIP:-}" '
 function hr(b,   u, i, x) {
     split("B KiB MiB GiB TiB PiB", u, " ")
     i=1; x=b+0
     while (x>=1024 && i<6) { x/=1024; i++ }
     return sprintf((i==1 ? "%d %s" : "%.2f %s"), x, u[i])
 }
-# Pass 1: raw binaries -- the aggregate denominator. Skip the .json sidecars
-# (metadata, not binaries). All other files under SRC_ROOT are raw binaries.
+# Pass 1: raw binaries. Skip .json sidecars (metadata, not binaries). When a
+# program-strip rule is given, derive each binary`s program name (basename minus
+# the strip pattern, e.g. the opt/hash variant suffix) and accumulate raw bytes
+# per program -- so the denominator can be scoped to only the programs that have
+# a built memmap (the existing memmap files), rather than the whole corpus.
 FNR==NR {
     if ($2 ~ /\.json$/) next
-    raw_tot += $1
+    rawall_tot += $1
     raw_count++
+    if (strip != "") {
+        nseg = split($2, sp, "/")
+        prog = sp[nseg]
+        sub(strip, "", prog)
+        rawbyprog[prog] += $1
+        if (!(prog in srcprog)) { srcprog[prog] = 1; src_prog_count++ }
+    }
     next
 }
 # Pass 2: memmap artifacts. relpath = <program>/<file>.
@@ -69,21 +90,30 @@ FNR==NR {
 END {
     for (prog in seen) {
         prog_count++
+        if (strip != "") built_raw += rawbyprog[prog]
         if (report != "")
             printf "%s,%d,%d\n", prog, mem[prog], excl[prog] > report
     }
-    printf "=== phase-3 memmap size stats (build_memmap artifacts vs sum of raw binaries) ===\n"
-    printf "programs (binaries):    %d\n", prog_count
+    raw_used = (strip != "" ? built_raw : rawall_tot)
+    printf "=== phase-3 memmap size stats (build_memmap artifacts vs raw binaries) ===\n"
+    printf "built programs:         %d\n", prog_count
     printf "raw binary files:       %d\n", raw_count
     printf "memmap total (counted): %s (%d B)\n", hr(mem_tot), mem_tot
     printf "sections.csv excluded:  %s (%d B)\n", hr(excl_tot), excl_tot
-    printf "raw binary total:       %s (%d B)\n", hr(raw_tot), raw_tot
-    if (raw_tot > 0)
-        printf "overall memmap/raw:     %.4fx\n", mem_tot / raw_tot
+    if (strip != "") {
+        printf "source programs total:  %d\n", src_prog_count
+        printf "memmap coverage:        %d/%d programs (%.1f%%)\n", prog_count, src_prog_count, (src_prog_count>0 ? 100.0*prog_count/src_prog_count : 0)
+        printf "raw (built programs):   %s (%d B)\n", hr(built_raw), built_raw
+        printf "raw (all binaries):     %s (%d B)\n", hr(rawall_tot), rawall_tot
+    } else {
+        printf "raw binary total:       %s (%d B)\n", hr(rawall_tot), rawall_tot
+    }
+    if (raw_used > 0)
+        printf "memmap/raw (built):     %.4fx\n", mem_tot / raw_used
     if (report != "")
         printf "per-program CSV:        %s\n", report
 }
-' <(list_file_sizes "$SRC_ROOT") <(list_file_sizes "$MEMMAP_ROOT")
+' <(list_file_sizes "$SRC_ROOT" ${SIZE_STATS_PRUNE:-}) <(list_file_sizes "$MEMMAP_ROOT")
 
 # awk wrote the rows; prepend the header line.
 if [[ -n "$REPORT_CSV" && -f "$REPORT_CSV" ]]; then

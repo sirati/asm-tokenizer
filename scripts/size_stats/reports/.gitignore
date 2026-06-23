@@ -1,2 +1,3 @@
-# 5.3MB reproducible per-binary dump; regenerate with phase1_size_stats.sh
+# Reproducible per-binary dumps (regenerate with phase1_size_stats.sh)
 phase1_report.csv
+*_phase1_report.csv

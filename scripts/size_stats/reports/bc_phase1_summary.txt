@@ -1,0 +1,14 @@
+=== phase-1 size stats (raw binary vs _output.csv) ===
+raw binaries (SRC):     46513
+phase-1 output anchors: 46511
+--- aggregate (all outputs vs all raw binaries) ---
+raw total (all):        24.16 GiB (25936623210 B)
+output total (all):     33.52 GiB (35996742594 B)
+aggregate output/raw:   1.3879x
+--- per-binary (structural pairing) ---
+outputs paired:         0
+outputs w/o source:     46511
+sources w/o output:     46513
+raw total (paired):     0 B (0 B)
+output total (paired):  0 B (0 B)
+per-binary CSV:         /home/k/kruppb/size_stats/bc_phase1_report.csv

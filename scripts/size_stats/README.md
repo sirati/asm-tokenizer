@@ -13,17 +13,28 @@ pointing them at the NFS trees.
 Shared file-measurement primitives live in `_lib.sh` (a single `find`-with-%s
 walk, byte humanizer); each reporter owns its own join + summary.
 
+Optional env var `SIZE_STATS_PRUNE` (space-separated top-level source subdir
+names) excludes subtrees from the raw-binary walk — e.g. non-tokenized subset
+splits like BinaryCorp's `small_train`/`small_test`.
+
 ## `phase1_size_stats.sh` — per-binary: raw ELF vs its phase-1 `_output.csv`
 
-For every phase-1 `*_output.csv` it pairs the output with the raw binary it came
-from and emits `(raw_bytes, output_csv_bytes, ratio)` per binary. The join is
-exact: the output anchor's parent directory relative to `OUT_ROOT`
-(`<pkg>/<variant>/<binname>`) is identical to the raw binary's path relative to
-`SRC_ROOT` — no fragile parsing of the canonical
-`<arch>-<comp>-<ver>-<opt>_<pkg>__<hash>` base name (which never appears on the
-source side). `.json` sidecars and the phase-1 sidecars
-(`_meta.json`, `_strings.bin`, `_function_ranges.txt`) are not counted; only the
-`_output.csv` artifact is.
+Reports two figures. **Aggregate** (layout-agnostic): the sum of all
+`*_output.csv` bytes over the sum of all raw binary bytes — needs no pairing and
+is exact when coverage is complete. **Per-binary** (structural join): pairs each
+output with its raw binary to recover the inflation distribution and a
+coverage-robust paired ratio.
+
+The join tries two source relpaths per output anchor, using whichever names an
+existing raw binary: (1) the anchor's parent dir relative to `OUT_ROOT` — the
+per-binary-subdir layout (`<pkg>/<variant>/<binname>/<base>_output.csv` ↔
+`<pkg>/<variant>/<binname>`); (2) the anchor with `_output.csv` stripped — the
+flat layout (`<pkg>/<base>_output.csv` ↔ `<pkg>/<base>`). Both are membership
+tests against the raw set, so the right one wins with no per-dataset branching.
+Layouts that mangle the name between source and output (e.g. BinaryCorp's
+truncated build hash) don't pair structurally — rely on the aggregate there.
+Only `_output.csv` is counted; `.json`/`_meta.json`/`_strings.bin`/
+`_function_ranges.txt` sidecars are excluded.
 
 Report CSV columns: `binary,raw_bytes,output_csv_bytes,ratio_out_over_raw`.
 
@@ -40,42 +51,43 @@ inspection.
 
 Report CSV columns: `program,memmap_bytes,sections_csv_excluded_bytes`.
 
-## Applied: `gen-binary-dataset` → `tokenizer-gen-binary-dataset` (LMU, 2026-06-23)
+## Applied: three corpora on LMU (2026-06-23)
 
-Run on the LMU gateway against
-`/home/k/kruppb/BIG/slurm/{gen-binary-dataset/out/dataset, tokenizer-gen-binary-dataset/out}`.
-Captured outputs in `reports/`.
+Run on the LMU gateway. Roots:
 
-Phase-1 (per-binary):
+| corpus | SRC_ROOT | OUT_ROOT | extra env |
+|---|---|---|---|
+| gen-binary-dataset | `BIG/slurm/gen-binary-dataset/out/dataset` | `BIG/slurm/tokenizer-gen-binary-dataset/out` | — |
+| Dataset-1 | `~/corpus-v2` | `~/slurm/tokenizer/out` | memmap: `SIZE_STATS_PROG_STRIP='^.*_'` |
+| BinaryCorp | `~/binarycorps` | `~/slurm/tokenizer-binarycorps/out` | `SIZE_STATS_PRUNE='small_train small_test'`; memmap `SIZE_STATS_PROG_STRIP='-O[0-9s]+-[0-9a-f]+$'` |
 
-| metric | value |
-|---|---|
-| raw binaries on disk | 167,248 |
-| phase-1 outputs paired | 83,971 (outputs with no matching source: 0) |
-| sources without an output | 83,277 |
-| raw total (paired) | 53.57 GiB |
-| `_output.csv` total | 110.71 GiB |
-| overall output/raw | **2.07×** |
-| per-file ratio | mean 2.14×, min 0.0006×, max 4.88× |
+Captured outputs in `reports/` (`<corpus>_phase1_*`, `<corpus>_memmap_*`).
 
-Memmap (aggregate, after the phase-3 build completed):
+Phase-1 — token stream vs. the raw binaries that were tokenized:
 
-| metric | value |
-|---|---|
-| programs (binaries) | 133 |
-| memmap total (counted) | 80.07 GiB |
-| `*sections.csv` excluded | 3.32 GiB |
-| raw binary total (all 167,248) | 81.95 GiB |
-| memmap / all-raw | **0.98×** |
-| memmap / tokenized-raw (53.57 GiB) | **1.49×** |
+| corpus | raw (tok.) | output | inflation | per-binary median |
+|---|---|---|---|---|
+| gen-binary-dataset | 53.57 GiB | 110.71 GiB | **2.07×** | 2.27× |
+| Dataset-1 | 12.08 GiB | 29.66 GiB | **2.46×** | 1.98× |
+| BinaryCorp | 24.16 GiB | 33.52 GiB | **1.39×** | — (no structural pairing; ~100% coverage so aggregate is exact) |
 
-Note: roughly half the raw binaries lie outside the tokenized set, so the memmap
-(built from the tokenized subset) is 0.98× of the *whole* raw corpus but 1.49× of
-the *tokenized* subset that actually fed it.
+Phase-3 — `build_memmap` artefacts vs. the raw binaries present in those maps:
+
+| corpus | programs (built) | memmap | sections.csv excl. | raw (in maps) | map / raw |
+|---|---|---|---|---|---|
+| gen-binary-dataset | 133 / 133 | 80.07 GiB | 3.32 GiB | 53.57 GiB | **1.49×** |
+| Dataset-1 | 28 / 28 | 17.14 GiB | 1.14 GiB | 12.11 GiB | **1.42×** |
+| BinaryCorp | 821 / 9,684 | 13.24 GiB | 702.15 MiB | 12.25 GiB | **1.08×** |
+
+Notes: a memmap group merges every opt/build variant of a binary, so program
+count ≪ binary count. The raw denominator is scoped to binaries whose program
+has a built memmap. **BinaryCorp's phase-3 build is only 8.5% complete (821 of
+9,684 programs)** — its 1.08× is the ratio over the built subset; rerun when the
+build finishes.
 
 ## Thesis write-up
 
 `reports/dataset_size_stats.typ` is a self-contained, compilable Typst section
-documenting these results (corpus, method, phase-1 and phase-3 tables,
-discussion) for inclusion in the thesis via `#include`. Compile with
-`typst compile reports/dataset_size_stats.typ`.
+documenting these results across all three corpora (corpora overview, method,
+phase-1 and phase-3 comparison tables, discussion) for inclusion in the thesis
+via `#include`. Compile with `typst compile reports/dataset_size_stats.typ`.
