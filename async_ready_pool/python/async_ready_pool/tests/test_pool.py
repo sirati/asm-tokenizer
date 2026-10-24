@@ -40,3 +40,22 @@ def test_failure_is_scoped_to_one_registration() -> None:
         else:
             pytest.fail("producer failure was not surfaced")
         assert pool.get("healthy") == "ok"
+
+
+def test_loader_backends_are_checked(tmp_path) -> None:
+    from async_ready_pool import RustLoader, RustPreloader, SessionEnded
+
+    with pytest.raises(ValueError, match="needs program"):
+        RustPreloader(None, 1, loader="tokens", backend="local")
+    with pytest.raises(ValueError, match="unknown backend"):
+        RustPreloader(None, 1, loader="tokens", backend="elsewhere")
+    with pytest.raises(ValueError, match='for backend="local"'):
+        RustPreloader(None, 1, loader="tokens", backend="bridge", program="/bin/true")
+    with pytest.raises(SessionEnded):
+        RustPreloader(None, 1, loader="tokens", backend="bridge", socket=str(tmp_path / "none"))
+    with pytest.raises(ValueError, match="programs"):
+        AsyncReadyPool([PoolConfig("k", RustLoader("tokens"), 1)], backend="local")
+    with pytest.raises(ValueError, match="either a producer or a loader"):
+        RustPreloader(lambda _id: 1, 1, loader="tokens")
+    with pytest.raises(ValueError, match="for loaders"):
+        RustPreloader(lambda _id: 1, 1).register(1, {"x": 1})
