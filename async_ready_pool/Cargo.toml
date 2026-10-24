@@ -1,0 +1,22 @@
+[package]
+name = "tokenizer-async-ready-pool"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Generic bounded asynchronous preparation pool with a PyO3 facade."
+
+[lib]
+# Rust extension is shipped as the ``_native`` submodule of the
+# ``async_ready_pool`` Python package so the pure-Python facade layer can
+# live alongside it in ``python/async_ready_pool/``. See ``pyproject.toml``
+# ``[tool.maturin]`` for the matching ``module-name`` and
+# ``python-source`` settings.
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.28" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

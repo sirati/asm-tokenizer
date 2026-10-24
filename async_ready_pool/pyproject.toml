@@ -1,0 +1,19 @@
+[build-system]
+requires      = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name            = "tokenizer-async-ready-pool"
+version         = "0.1.0"
+description     = "Reusable bounded asynchronous preparation pool for asm-tokenizer consumers."
+requires-python = ">=3.12"
+license         = { text = "Apache-2.0" }
+authors         = [{ name = "sirati" }]
+
+[tool.maturin]
+# Rust extension lands as ``async_ready_pool._native``; the pure-Python
+# facade layer (typed producer facade) lives in
+# ``python/async_ready_pool/__init__.py`` alongside it.
+module-name   = "async_ready_pool._native"
+python-source = "python"
+features      = ["pyo3/extension-module"]
