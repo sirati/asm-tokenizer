@@ -13,6 +13,38 @@ use crate::core::{GetError, PreloadCore, PreloadPool, RegistrationId};
 
 type Batch = Py<PyAny>;
 type PythonProducer = Box<dyn Fn(RegistrationId) -> Result<Batch, String> + Send + Sync>;
+const CPU_CAPSULE: &std::ffi::CStr = c"async_ready_pool.cpu.v1";
+
+/// Native callers retain this capsule while synchronously borrowing task data.
+#[pyfunction]
+#[pyo3(signature = (workers=8))]
+fn cpu_executor(py: Python<'_>, workers: usize) -> PyResult<Py<PyAny>> {
+    let api = crate::cpu::Api::new(workers).map_err(PyValueError::new_err)?;
+    let pointer = Box::into_raw(api);
+    let capsule = unsafe {
+        pyo3::ffi::PyCapsule_New(
+            pointer.cast(),
+            CPU_CAPSULE.as_ptr(),
+            Some(drop_cpu_executor),
+        )
+    };
+    if capsule.is_null() {
+        unsafe {
+            drop(Box::from_raw(pointer));
+        }
+        return Err(PyErr::fetch(py));
+    }
+    Ok(unsafe { Bound::from_owned_ptr(py, capsule) }.unbind())
+}
+
+unsafe extern "C" fn drop_cpu_executor(capsule: *mut pyo3::ffi::PyObject) {
+    let pointer = unsafe { pyo3::ffi::PyCapsule_GetPointer(capsule, CPU_CAPSULE.as_ptr()) };
+    if !pointer.is_null() {
+        unsafe {
+            drop(Box::from_raw(pointer.cast::<crate::cpu::Api>()));
+        }
+    }
+}
 
 #[pyclass]
 pub struct RustPreloader {
@@ -126,5 +158,6 @@ impl Drop for RustPreloader {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustPreloader>()?;
+    m.add_function(wrap_pyfunction!(cpu_executor, m)?)?;
     Ok(())
 }

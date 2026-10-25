@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterable
 
-from ._native import RustPreloader
+from ._native import RustPreloader, cpu_executor
 
 Producer = Callable[[], Any]
 
@@ -96,4 +96,4 @@ class AsyncReadyPool:
         self.close()
 
 
-__all__ = ["AsyncReadyPool", "PoolConfig", "Producer", "RustPreloader"]
+__all__ = ["AsyncReadyPool", "PoolConfig", "Producer", "RustPreloader", "cpu_executor"]

@@ -5,6 +5,7 @@
 //! handling; CUDA and data-format concerns remain in their caller modules.
 
 mod core;
+mod cpu;
 mod python;
 
 pub use core::{ClaimStop, GetError, PreloadCore, PreloadPool, RegistrationId};
