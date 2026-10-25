@@ -4,9 +4,9 @@
 //! shape or meaning of prepared values; callers register opaque IDs and pull
 //! opaque Python objects.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 
 use crate::core::{GetError, PreloadPool, RegistrationId};
@@ -16,7 +16,7 @@ type PythonProducer = Box<dyn Fn(RegistrationId) -> Result<Batch, String> + Send
 
 #[pyclass]
 pub struct RustPreloader {
-    pool: PreloadPool<Batch, PythonProducer>,
+    pool: Mutex<PreloadPool<Batch, PythonProducer>>,
 }
 
 #[pymethods]
@@ -34,23 +34,33 @@ impl RustPreloader {
             })
         });
         let pool = PreloadPool::new(producer, n_threads).map_err(PyValueError::new_err)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool: Mutex::new(pool),
+        })
     }
 
     /// Register one opaque producer slot and return its registration ID.
-    fn register(&mut self, keep_ready: usize) -> PyResult<RegistrationId> {
-        self.pool
-            .register(keep_ready)
+    #[pyo3(signature = (keep_ready, count=None))]
+    fn register(
+        &self,
+        py: Python<'_>,
+        keep_ready: usize,
+        count: Option<usize>,
+    ) -> PyResult<RegistrationId> {
+        py.detach(|| self.pool.lock().unwrap().register_limit(keep_ready, count))
             .map_err(PyValueError::new_err)
     }
 
-    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.pool.start())
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.pool.lock().unwrap().start())
             .map_err(PyRuntimeError::new_err)
     }
 
     fn get(&self, py: Python<'_>, registration: RegistrationId) -> PyResult<Py<PyAny>> {
-        match py.detach(|| self.pool.get(registration)) {
+        let consumer = py
+            .detach(|| self.pool.lock().unwrap().consumer())
+            .map_err(|_| PyRuntimeError::new_err("preloader is closed or not started"))?;
+        match py.detach(|| consumer.get(registration)) {
             Ok(batch) => Ok(batch),
             Err(GetError::UnknownBucket(id)) => {
                 Err(PyValueError::new_err(format!("unknown registration {id}")))
@@ -61,15 +71,24 @@ impl RustPreloader {
             Err(GetError::Closing) => Err(PyRuntimeError::new_err(
                 "preloader is closed or not started",
             )),
+            Err(GetError::Exhausted) => Err(PyStopIteration::new_err("preparation plan exhausted")),
         }
     }
 
-    fn ready_counts(&self) -> Vec<(u64, usize)> {
-        self.pool.ready_counts()
+    fn ready_counts(&self, py: Python<'_>) -> Vec<(u64, usize)> {
+        py.detach(|| self.pool.lock().unwrap().ready_counts())
     }
 
-    fn close(&mut self, py: Python<'_>) {
-        py.detach(|| self.pool.close());
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| self.pool.lock().unwrap().close());
+    }
+}
+
+impl Drop for RustPreloader {
+    fn drop(&mut self) {
+        // A Python object normally drops while holding the GIL. Workers can
+        // need it to finish, so joining while attached would deadlock.
+        let _ = Python::try_attach(|py| py.detach(|| self.pool.get_mut().unwrap().close()));
     }
 }
 

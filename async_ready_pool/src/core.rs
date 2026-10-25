@@ -47,6 +47,7 @@ struct Bucket<T> {
     keep_ready: usize,
     in_flight: usize,
     failure: Option<String>,
+    remaining: Option<usize>,
 }
 
 impl<T> Bucket<T> {
@@ -54,8 +55,11 @@ impl<T> Bucket<T> {
     /// minus what is ready minus what workers are already producing for it.
     /// Saturating (never negative) so an over-full bucket reports a 0 deficit.
     fn deficit(&self) -> usize {
-        self.keep_ready
-            .saturating_sub(self.ready.len() + self.in_flight)
+        let slots = self
+            .keep_ready
+            .saturating_sub(self.ready.len() + self.in_flight);
+        self.remaining
+            .map_or(slots, |remaining| slots.min(remaining))
     }
 }
 
@@ -77,6 +81,7 @@ pub enum GetError {
     Failed(String),
     /// `close()` was called while a puller waited (or before it asked).
     Closing,
+    Exhausted,
 }
 
 /// What a blocked `claim` returns when there is no work to do.
@@ -86,6 +91,7 @@ pub enum ClaimStop {
     Failed,
     /// `close()` was called; the worker should exit.
     Closing,
+    Finished,
 }
 
 /// The bucket-keyed ready-buffer. Cloneable handle is NOT provided here; the
@@ -114,6 +120,10 @@ impl<T> PreloadCore<T> {
     /// `keep_ready == 0` is rejected by the caller (the pyclass) — a 0-target
     /// bucket could never satisfy a `get`.
     pub fn register(&self, key: RegistrationId, keep_ready: usize) {
+        self.register_limit(key, keep_ready, None);
+    }
+
+    pub fn register_limit(&self, key: RegistrationId, keep_ready: usize, remaining: Option<usize>) {
         let mut inner = self.inner.lock().unwrap();
         inner
             .buckets
@@ -124,6 +134,7 @@ impl<T> PreloadCore<T> {
                 keep_ready,
                 in_flight: 0,
                 failure: None,
+                remaining,
             });
     }
 
@@ -146,7 +157,11 @@ impl<T> PreloadCore<T> {
                 return Err(ClaimStop::Closing);
             }
             if let Some(key) = most_starved(&inner.buckets) {
-                inner.buckets.get_mut(&key).unwrap().in_flight += 1;
+                let bucket = inner.buckets.get_mut(&key).unwrap();
+                bucket.in_flight += 1;
+                if let Some(remaining) = &mut bucket.remaining {
+                    *remaining -= 1;
+                }
                 return Ok(key);
             }
             if inner
@@ -155,6 +170,13 @@ impl<T> PreloadCore<T> {
                 .all(|bucket| bucket.failure.is_some())
             {
                 return Err(ClaimStop::Failed);
+            }
+            if inner
+                .buckets
+                .values()
+                .all(|bucket| bucket.failure.is_some() || bucket.remaining == Some(0))
+            {
+                return Err(ClaimStop::Finished);
             }
             // Every healthy bucket is full: wait for a drain (not_full) to open a slot.
             // Spurious wakeups are fine — the loop re-checks the predicate.
@@ -173,7 +195,7 @@ impl<T> PreloadCore<T> {
             bucket.ready.push_back(item);
         }
         // A new item is ready for exactly one waiting puller.
-        self.not_empty.notify_one();
+        self.not_empty.notify_all();
     }
 
     /// Release a reserved slot WITHOUT depositing (the produce failed): mark
@@ -218,6 +240,10 @@ impl<T> PreloadCore<T> {
             }
             if inner.closing {
                 return Err(GetError::Closing);
+            }
+            let bucket = inner.buckets.get(&key).unwrap();
+            if bucket.remaining == Some(0) && bucket.in_flight == 0 {
+                return Err(GetError::Exhausted);
             }
             inner = self.not_empty.wait(inner).unwrap();
         }
@@ -283,6 +309,14 @@ where
     }
 
     pub fn register(&mut self, keep_ready: usize) -> Result<RegistrationId, &'static str> {
+        self.register_limit(keep_ready, None)
+    }
+
+    pub fn register_limit(
+        &mut self,
+        keep_ready: usize,
+        count: Option<usize>,
+    ) -> Result<RegistrationId, &'static str> {
         if self.closed {
             return Err("pool has been closed");
         }
@@ -297,7 +331,7 @@ where
             .next_registration
             .checked_add(1)
             .ok_or("registration id exhausted")?;
-        self.core.register(registration, keep_ready);
+        self.core.register_limit(registration, keep_ready, count);
         Ok(registration)
     }
 
@@ -318,7 +352,9 @@ where
                 loop {
                     let registration = match core.claim() {
                         Ok(registration) => registration,
-                        Err(ClaimStop::Closing) | Err(ClaimStop::Failed) => return,
+                        Err(ClaimStop::Closing)
+                        | Err(ClaimStop::Failed)
+                        | Err(ClaimStop::Finished) => return,
                     };
                     let produced = catch_unwind(AssertUnwindSafe(|| producer(registration)));
                     match produced {
@@ -341,6 +377,13 @@ where
             return Err(GetError::Closing);
         }
         self.core.get(registration)
+    }
+
+    pub fn consumer(&self) -> Result<Arc<PreloadCore<T>>, GetError> {
+        if !self.started {
+            return Err(GetError::Closing);
+        }
+        Ok(Arc::clone(&self.core))
     }
 
     pub fn ready_counts(&self) -> Vec<(RegistrationId, usize)> {
@@ -398,6 +441,7 @@ mod tests {
             keep_ready: 5,
             in_flight: 1,
             failure: None,
+            remaining: None,
         };
         assert_eq!(b.deficit(), 2);
     }
@@ -409,6 +453,7 @@ mod tests {
             keep_ready: 2,
             in_flight: 0,
             failure: None,
+            remaining: None,
         };
         assert_eq!(b.deficit(), 0);
     }
@@ -423,6 +468,7 @@ mod tests {
                 keep_ready: 2,
                 in_flight: 0,
                 failure: None,
+                remaining: None,
             },
         );
         m.insert(
@@ -432,6 +478,7 @@ mod tests {
                 keep_ready: 5,
                 in_flight: 0,
                 failure: None,
+                remaining: None,
             },
         );
         assert_eq!(most_starved(&m), Some(key(2, 2)));
@@ -447,6 +494,7 @@ mod tests {
                 keep_ready: 1,
                 in_flight: 0,
                 failure: None,
+                remaining: None,
             },
         );
         assert_eq!(most_starved(&m), None);
@@ -604,5 +652,19 @@ mod tests {
         assert_eq!(pool.get(first).unwrap() % 10, 0);
         assert_eq!(pool.get(second).unwrap() % 10, 0);
         pool.close();
+    }
+
+    #[test]
+    fn finite_claims_stop_at_plan_length() {
+        let core = PreloadCore::<u64>::new();
+        core.register_limit(7, 4, Some(2));
+        assert_eq!(core.claim(), Ok(7));
+        assert_eq!(core.claim(), Ok(7));
+        assert_eq!(core.claim(), Err(ClaimStop::Finished));
+        core.deposit(7, 10);
+        core.deposit(7, 11);
+        assert_eq!(core.get(7), Ok(10));
+        assert_eq!(core.get(7), Ok(11));
+        assert_eq!(core.get(7), Err(GetError::Exhausted));
     }
 }

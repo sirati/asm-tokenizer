@@ -23,6 +23,7 @@ class PoolConfig:
     key: Hashable
     producer: Producer
     ready_depth: int
+    count: int | None = None
 
 
 class AsyncReadyPool:
@@ -49,7 +50,7 @@ class AsyncReadyPool:
         for config in config_list:
             if config.key in self._ids:
                 raise ValueError(f"duplicate pool key: {config.key!r}")
-            registration = self._impl.register(config.ready_depth)
+            registration = self._impl.register(config.ready_depth, config.count)
             self._ids[config.key] = registration
             by_id[registration] = config.producer
 

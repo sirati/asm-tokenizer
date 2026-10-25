@@ -13,3 +13,10 @@ consumer wait forever after a producer fails or the pool closes.
 
 CUDA, tensor upload, tokenizer-specific sampling, and checkpoint/RNG policy
 remain outside this crate.
+
+`PoolConfig(..., count=N)` limits a registration to exactly N preparations.
+A drained finite registration raises `StopIteration`; completion does not
+poison buffered results. Use one worker for a stateful ordered source.
+Checkpoints can store the immutable source state attached to the last consumed
+result, while a bounded number of later results are prepared independently.
+`close()` joins workers with the GIL released and wakes blocked consumers.
