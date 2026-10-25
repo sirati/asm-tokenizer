@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 
-use crate::core::{GetError, PreloadPool, RegistrationId};
+use crate::core::{GetError, PreloadCore, PreloadPool, RegistrationId};
 
 type Batch = Py<PyAny>;
 type PythonProducer = Box<dyn Fn(RegistrationId) -> Result<Batch, String> + Send + Sync>;
@@ -22,7 +22,8 @@ pub struct RustPreloader {
 #[pymethods]
 impl RustPreloader {
     #[new]
-    fn new(produce: Py<PyAny>, n_threads: usize) -> PyResult<Self> {
+    #[pyo3(signature = (produce, n_threads, persistent=false))]
+    fn new(produce: Py<PyAny>, n_threads: usize, persistent: bool) -> PyResult<Self> {
         let callback = Arc::new(produce);
         let producer: PythonProducer = Box::new(move |registration| {
             Python::attach(|py| {
@@ -33,7 +34,8 @@ impl RustPreloader {
                     .map_err(|error| format!("producer raised: {error}"))
             })
         });
-        let pool = PreloadPool::new(producer, n_threads).map_err(PyValueError::new_err)?;
+        let pool = PreloadPool::with_persistence(producer, n_threads, persistent)
+            .map_err(PyValueError::new_err)?;
         Ok(Self {
             pool: Mutex::new(pool),
         })
@@ -57,22 +59,32 @@ impl RustPreloader {
     }
 
     fn get(&self, py: Python<'_>, registration: RegistrationId) -> PyResult<Py<PyAny>> {
-        let consumer = py
-            .detach(|| self.pool.lock().unwrap().consumer())
-            .map_err(|_| PyRuntimeError::new_err("preloader is closed or not started"))?;
-        match py.detach(|| consumer.get(registration)) {
-            Ok(batch) => Ok(batch),
-            Err(GetError::UnknownBucket(id)) => {
-                Err(PyValueError::new_err(format!("unknown registration {id}")))
-            }
-            Err(GetError::Failed(message)) => Err(PyRuntimeError::new_err(format!(
-                "producer failed for registration {registration}: {message}"
-            ))),
-            Err(GetError::Closing) => Err(PyRuntimeError::new_err(
-                "preloader is closed or not started",
-            )),
-            Err(GetError::Exhausted) => Err(PyStopIteration::new_err("preparation plan exhausted")),
-        }
+        let consumer = self.consumer(py)?;
+        py.detach(|| consumer.get(registration))
+            .map_err(|error| pool_error(error, registration))
+    }
+
+    fn cancel(&self, py: Python<'_>, registration: RegistrationId) -> PyResult<()> {
+        let consumer = self.consumer(py)?;
+        py.detach(|| consumer.cancel(registration))
+            .map_err(|error| pool_error(error, registration))
+    }
+
+    #[pyo3(signature = (registration, keep_ready, count=None))]
+    fn rearm(
+        &self,
+        py: Python<'_>,
+        registration: RegistrationId,
+        keep_ready: usize,
+        count: Option<usize>,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.pool
+                .lock()
+                .unwrap()
+                .rearm_limit(registration, keep_ready, count)
+        })
+        .map_err(PyValueError::new_err)
     }
 
     fn ready_counts(&self, py: Python<'_>) -> Vec<(u64, usize)> {
@@ -81,6 +93,25 @@ impl RustPreloader {
 
     fn close(&self, py: Python<'_>) {
         py.detach(|| self.pool.lock().unwrap().close());
+    }
+}
+
+impl RustPreloader {
+    fn consumer(&self, py: Python<'_>) -> PyResult<Arc<PreloadCore<Batch>>> {
+        py.detach(|| self.pool.lock().unwrap().consumer())
+            .map_err(|_| PyRuntimeError::new_err("preloader is closed or not started"))
+    }
+}
+
+fn pool_error(error: GetError, registration: RegistrationId) -> PyErr {
+    match error {
+        GetError::UnknownBucket(id) => PyValueError::new_err(format!("unknown registration {id}")),
+        GetError::Failed(message) => PyRuntimeError::new_err(format!(
+            "producer failed for registration {registration}: {message}"
+        )),
+        GetError::Closing => PyRuntimeError::new_err("preloader is closed or not started"),
+        GetError::Exhausted => PyStopIteration::new_err("preparation plan exhausted"),
+        GetError::Cancelled => PyStopIteration::new_err("preparation registration cancelled"),
     }
 }
 

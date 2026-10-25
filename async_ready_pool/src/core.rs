@@ -48,6 +48,8 @@ struct Bucket<T> {
     in_flight: usize,
     failure: Option<String>,
     remaining: Option<usize>,
+    cancelled: bool,
+    generation: u64,
 }
 
 impl<T> Bucket<T> {
@@ -82,6 +84,7 @@ pub enum GetError {
     /// `close()` was called while a puller waited (or before it asked).
     Closing,
     Exhausted,
+    Cancelled,
 }
 
 /// What a blocked `claim` returns when there is no work to do.
@@ -97,6 +100,7 @@ pub enum ClaimStop {
 /// The bucket-keyed ready-buffer. Cloneable handle is NOT provided here; the
 /// pyclass wraps a single `Arc<PreloadCore<T>>` shared with every worker.
 pub struct PreloadCore<T> {
+    persistent: bool,
     inner: Mutex<Inner<T>>,
     not_empty: Condvar,
     not_full: Condvar,
@@ -106,7 +110,12 @@ impl<T> PreloadCore<T> {
     /// Build an empty core (no buckets yet). Buckets are added by `register`
     /// before the workers start.
     pub fn new() -> Self {
+        Self::with_persistence(false)
+    }
+
+    pub fn with_persistence(persistent: bool) -> Self {
         PreloadCore {
+            persistent,
             inner: Mutex::new(Inner {
                 buckets: HashMap::new(),
                 closing: false,
@@ -135,7 +144,10 @@ impl<T> PreloadCore<T> {
                 in_flight: 0,
                 failure: None,
                 remaining,
+                cancelled: false,
+                generation: 0,
             });
+        self.not_full.notify_all();
     }
 
     /// Whether a bucket is registered (for the pyclass `get` pre-check).
@@ -164,17 +176,19 @@ impl<T> PreloadCore<T> {
                 }
                 return Ok(key);
             }
-            if inner
-                .buckets
-                .values()
-                .all(|bucket| bucket.failure.is_some())
+            if !self.persistent
+                && inner
+                    .buckets
+                    .values()
+                    .all(|bucket| bucket.failure.is_some())
             {
                 return Err(ClaimStop::Failed);
             }
-            if inner
-                .buckets
-                .values()
-                .all(|bucket| bucket.failure.is_some() || bucket.remaining == Some(0))
+            if !self.persistent
+                && inner
+                    .buckets
+                    .values()
+                    .all(|bucket| bucket.failure.is_some() || bucket.remaining == Some(0))
             {
                 return Err(ClaimStop::Finished);
             }
@@ -192,10 +206,13 @@ impl<T> PreloadCore<T> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(bucket) = inner.buckets.get_mut(&key) {
             bucket.in_flight = bucket.in_flight.saturating_sub(1);
-            bucket.ready.push_back(item);
+            if !bucket.cancelled {
+                bucket.ready.push_back(item);
+            }
         }
         // A new item is ready for exactly one waiting puller.
         self.not_empty.notify_all();
+        self.not_full.notify_all();
     }
 
     /// Release a reserved slot WITHOUT depositing (the produce failed): mark
@@ -207,7 +224,7 @@ impl<T> PreloadCore<T> {
             bucket.in_flight = bucket.in_flight.saturating_sub(1);
         }
         if let Some(bucket) = inner.buckets.get_mut(&key) {
-            if bucket.failure.is_none() {
+            if !bucket.cancelled && bucket.failure.is_none() {
                 bucket.failure = Some(message);
             }
         }
@@ -224,9 +241,18 @@ impl<T> PreloadCore<T> {
     /// the bucket back up (the self-refilling property).
     pub fn get(&self, key: RegistrationId) -> Result<T, GetError> {
         let mut inner = self.inner.lock().unwrap();
+        let generation = inner
+            .buckets
+            .get(&key)
+            .ok_or(GetError::UnknownBucket(key))?
+            .generation;
         loop {
             if !inner.buckets.contains_key(&key) {
                 return Err(GetError::UnknownBucket(key));
+            }
+            let bucket = inner.buckets.get(&key).unwrap();
+            if bucket.cancelled || bucket.generation != generation {
+                return Err(GetError::Cancelled);
             }
             // A producer failure is surfaced before buffered data for THIS
             // registration, while unrelated registrations keep running.
@@ -247,6 +273,62 @@ impl<T> PreloadCore<T> {
             }
             inner = self.not_empty.wait(inner).unwrap();
         }
+    }
+
+    /// Discard this registration, waiting for its callbacks before returning.
+    /// Ready values drop outside the core lock. Other registrations keep running.
+    pub fn cancel(&self, key: RegistrationId) -> Result<(), GetError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closing {
+            return Err(GetError::Closing);
+        }
+        let discarded = {
+            let bucket = inner
+                .buckets
+                .get_mut(&key)
+                .ok_or(GetError::UnknownBucket(key))?;
+            bucket.cancelled = true;
+            bucket.generation = bucket
+                .generation
+                .checked_add(1)
+                .expect("registration generation exhausted");
+            bucket.remaining = Some(0);
+            std::mem::take(&mut bucket.ready)
+        };
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+        while inner.buckets.get(&key).unwrap().in_flight > 0 {
+            inner = self.not_full.wait(inner).unwrap();
+        }
+        drop(inner);
+        drop(discarded);
+        Ok(())
+    }
+
+    /// Rearm a fully cancelled registration without recreating CPU workers.
+    pub fn rearm_limit(
+        &self,
+        key: RegistrationId,
+        keep_ready: usize,
+        count: Option<usize>,
+    ) -> Result<(), &'static str> {
+        if keep_ready == 0 {
+            return Err("keep_ready must be greater than zero");
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closing {
+            return Err("pool has been closed");
+        }
+        let bucket = inner.buckets.get_mut(&key).ok_or("unknown registration")?;
+        if !bucket.cancelled || bucket.in_flight != 0 {
+            return Err("cancel the registration before rearming it");
+        }
+        bucket.keep_ready = keep_ready;
+        bucket.remaining = count;
+        bucket.failure = None;
+        bucket.cancelled = false;
+        self.not_full.notify_all();
+        Ok(())
     }
 
     /// Signal every worker to exit and every puller to stop waiting. Idempotent.
@@ -294,11 +376,19 @@ where
     F: Fn(RegistrationId) -> Result<T, String> + Send + Sync + 'static,
 {
     pub fn new(producer: F, workers: usize) -> Result<Self, &'static str> {
+        Self::with_persistence(producer, workers, false)
+    }
+
+    pub fn with_persistence(
+        producer: F,
+        workers: usize,
+        persistent: bool,
+    ) -> Result<Self, &'static str> {
         if workers == 0 {
             return Err("workers must be greater than zero");
         }
         Ok(Self {
-            core: Arc::new(PreloadCore::new()),
+            core: Arc::new(PreloadCore::with_persistence(persistent)),
             producer: Arc::new(producer),
             workers,
             next_registration: 0,
@@ -333,6 +423,21 @@ where
             .ok_or("registration id exhausted")?;
         self.core.register_limit(registration, keep_ready, count);
         Ok(registration)
+    }
+
+    pub fn rearm_limit(
+        &self,
+        registration: RegistrationId,
+        keep_ready: usize,
+        count: Option<usize>,
+    ) -> Result<(), &'static str> {
+        if !self.started || self.closed {
+            return Err("pool is closed or not started");
+        }
+        if !self.core.persistent {
+            return Err("rearming requires persistent workers");
+        }
+        self.core.rearm_limit(registration, keep_ready, count)
     }
 
     pub fn start(&mut self) -> Result<(), &'static str> {
@@ -442,6 +547,8 @@ mod tests {
             in_flight: 1,
             failure: None,
             remaining: None,
+            cancelled: false,
+            generation: 0,
         };
         assert_eq!(b.deficit(), 2);
     }
@@ -454,6 +561,8 @@ mod tests {
             in_flight: 0,
             failure: None,
             remaining: None,
+            cancelled: false,
+            generation: 0,
         };
         assert_eq!(b.deficit(), 0);
     }
@@ -469,6 +578,8 @@ mod tests {
                 in_flight: 0,
                 failure: None,
                 remaining: None,
+                cancelled: false,
+                generation: 0,
             },
         );
         m.insert(
@@ -479,6 +590,8 @@ mod tests {
                 in_flight: 0,
                 failure: None,
                 remaining: None,
+                cancelled: false,
+                generation: 0,
             },
         );
         assert_eq!(most_starved(&m), Some(key(2, 2)));
@@ -495,6 +608,8 @@ mod tests {
                 in_flight: 0,
                 failure: None,
                 remaining: None,
+                cancelled: false,
+                generation: 0,
             },
         );
         assert_eq!(most_starved(&m), None);
@@ -666,5 +781,93 @@ mod tests {
         assert_eq!(core.get(7), Ok(10));
         assert_eq!(core.get(7), Ok(11));
         assert_eq!(core.get(7), Err(GetError::Exhausted));
+    }
+    #[test]
+    fn persistent_finite_plans_reuse_the_same_worker_without_extra_claims() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let produced = calls.clone();
+        let mut pool = PreloadPool::with_persistence(
+            move |_| {
+                Ok((
+                    thread::current().id(),
+                    produced.fetch_add(1, Ordering::SeqCst),
+                ))
+            },
+            1,
+            true,
+        )
+        .unwrap();
+        let key = pool.register_limit(2, Some(2)).unwrap();
+        pool.start().unwrap();
+        let first = pool.get(key).unwrap();
+        assert_eq!(first.1, 0);
+        assert_eq!(pool.get(key).unwrap(), (first.0, 1));
+        assert_eq!(pool.get(key), Err(GetError::Exhausted));
+        pool.consumer().unwrap().cancel(key).unwrap();
+        pool.rearm_limit(key, 2, Some(3)).unwrap();
+        for value in 2..5 {
+            assert_eq!(pool.get(key).unwrap(), (first.0, value));
+        }
+        assert_eq!(pool.get(key), Err(GetError::Exhausted));
+        pool.close();
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn cancellation_waits_for_inflight_and_discards_both_ready_and_late_values() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let core = Arc::new(PreloadCore::with_persistence(true));
+        core.register_limit(0, 2, Some(2));
+        assert_eq!(core.claim(), Ok(0));
+        core.deposit(0, 10u64);
+        assert_eq!(core.claim(), Ok(0));
+        let cancelling = core.clone();
+        let (started, waiting) = mpsc::channel();
+        let (finished, complete) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started.send(()).unwrap();
+            cancelling.cancel(0).unwrap();
+            finished.send(()).unwrap();
+        });
+        waiting.recv().unwrap();
+        assert!(complete.recv_timeout(Duration::from_millis(20)).is_err());
+        core.deposit(0, 99);
+        complete.recv_timeout(Duration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(core.get(0), Err(GetError::Cancelled));
+        assert_eq!(core.ready_counts(), vec![(0, 0)]);
+        core.rearm_limit(0, 1, Some(1)).unwrap();
+        assert_eq!(core.claim(), Ok(0));
+        core.deposit(0, 100);
+        assert_eq!(core.get(0), Ok(100));
+        assert_eq!(core.get(0), Err(GetError::Exhausted));
+        core.close();
+    }
+
+    #[test]
+    fn failed_persistent_registration_can_be_explicitly_cancelled_and_rearmed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let mut pool = PreloadPool::with_persistence(
+            move |_| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("first plan".into())
+                } else {
+                    Ok(7u64)
+                }
+            },
+            1,
+            true,
+        )
+        .unwrap();
+        let key = pool.register_limit(1, Some(1)).unwrap();
+        pool.start().unwrap();
+        assert_eq!(pool.get(key), Err(GetError::Failed("first plan".into())));
+        pool.consumer().unwrap().cancel(key).unwrap();
+        pool.rearm_limit(key, 1, Some(1)).unwrap();
+        assert_eq!(pool.get(key), Ok(7));
+        pool.close();
     }
 }

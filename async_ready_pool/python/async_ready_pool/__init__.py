@@ -34,7 +34,7 @@ class AsyncReadyPool:
     callback and releases it while waiting or joining.
     """
 
-    def __init__(self, configs: Iterable[PoolConfig], workers: int = 1) -> None:
+    def __init__(self, configs: Iterable[PoolConfig], workers: int = 1, *, persistent: bool = False) -> None:
         config_list = list(configs)
         if not config_list:
             raise ValueError("at least one pool config is required")
@@ -42,11 +42,13 @@ class AsyncReadyPool:
             raise ValueError("workers must be >= 1")
         self._ids: dict[Hashable, int] = {}
         by_id: dict[int, Producer] = {}
+        self._producers = by_id
+        self._persistent = persistent
 
         def dispatch(registration: int) -> Any:
             return by_id[registration]()
 
-        self._impl = RustPreloader(dispatch, workers)
+        self._impl = RustPreloader(dispatch, workers, persistent)
         for config in config_list:
             if config.key in self._ids:
                 raise ValueError(f"duplicate pool key: {config.key!r}")
@@ -64,6 +66,21 @@ class AsyncReadyPool:
         except KeyError as exc:
             raise KeyError(f"unknown pool key: {key!r}") from exc
         return self._impl.get(registration)
+
+    def cancel(self, key: Hashable) -> None:
+        """Discard pending values after waiting for this registration's callbacks."""
+        self._impl.cancel(self._ids[key])
+
+    def reset(self, config: PoolConfig) -> None:
+        """Replace one finite request while retaining its worker/registration."""
+        if not self._persistent:
+            raise ValueError("reset requires persistent workers")
+        if config.ready_depth < 1:
+            raise ValueError("ready_depth must be positive")
+        registration = self._ids[config.key]
+        self._impl.cancel(registration)
+        self._producers[registration] = config.producer
+        self._impl.rearm(registration, config.ready_depth, config.count)
 
     def ready_counts(self) -> dict[Hashable, int]:
         counts = dict(self._impl.ready_counts())
