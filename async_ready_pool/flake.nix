@@ -12,7 +12,7 @@
       in {
         devShells.default = pkgs.mkShell {
           name = "tokenizer-async-ready-pool-dev";
-          nativeBuildInputs = with pkgs; [ rustc cargo maturin pkg-config ];
+          nativeBuildInputs = with pkgs; [ rustc cargo rustfmt maturin pkg-config ];
           buildInputs = [ pkgs.python3 ];
         };
       });

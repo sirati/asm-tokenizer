@@ -10,6 +10,7 @@
 //!   integers  little endian, fixed width
 //!   string    u16 length + UTF-8 bytes
 //!   list      u16 count + items
+//!   bytes     u32 length + bytes
 //!   option    u8 0|1 + value
 //! ```
 //!
@@ -21,7 +22,7 @@
 use std::fmt;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"LBRG");
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 16;
 /// The largest packet either side sends or accepts.
 pub const MAX_MESSAGE: usize = 64 * 1024;
@@ -41,6 +42,10 @@ pub const MAX_DIMS: usize = 8;
 /// Directory entries per `Listing` page; each is at most ~270 bytes.
 pub const MAX_ENTRIES: usize = 128;
 pub const MAX_REGISTRATIONS: usize = 1024;
+/// Integers in one list parameter.
+pub const MAX_INTS: usize = 4096;
+/// A source's state to resume from, as a registration carries it.
+pub const MAX_RESUME: usize = 48 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -160,6 +165,13 @@ impl<'a> Reader<'a> {
         }
         Ok(s.to_owned())
     }
+    pub fn bytes(&mut self, max: usize) -> Result<Vec<u8>, DecodeError> {
+        let len = self.u32()? as usize;
+        if len > max {
+            return Err(DecodeError::TooLong);
+        }
+        Ok(self.take(len)?.to_vec())
+    }
     pub fn name(&mut self) -> Result<String, DecodeError> {
         let s = self.str(MAX_NAME)?;
         if !valid_name(&s) {
@@ -221,6 +233,14 @@ impl Writer {
         }
         self.u16(s.len() as u16);
         self.buf.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+    pub fn bytes(&mut self, b: &[u8], max: usize) -> Result<(), EncodeError> {
+        if b.len() > max {
+            return Err(EncodeError("bytes over their limit"));
+        }
+        self.u32(b.len() as u32);
+        self.buf.extend_from_slice(b);
         Ok(())
     }
     pub fn name(&mut self, s: &str) -> Result<(), EncodeError> {
@@ -328,6 +348,8 @@ pub enum Value {
     Bool(bool),
     /// One of a parameter's fixed choices.
     Choice(String),
+    /// A list of integers.
+    Ints(Vec<i64>),
 }
 
 impl Value {
@@ -349,6 +371,13 @@ impl Value {
                 w.u8(4);
                 w.name(v)?;
             }
+            Value::Ints(v) => {
+                w.u8(5);
+                w.count(v.len(), MAX_INTS)?;
+                for x in v {
+                    w.i64(*x);
+                }
+            }
         }
         Ok(())
     }
@@ -365,6 +394,14 @@ impl Value {
             }
             3 => Value::Bool(r.bool()?),
             4 => Value::Choice(r.name()?),
+            5 => {
+                let n = r.count(MAX_INTS, 8)?;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(r.i64()?);
+                }
+                Value::Ints(v)
+            }
             _ => return Err(DecodeError::BadTag),
         })
     }
@@ -373,10 +410,22 @@ impl Value {
 /// What a parameter accepts.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamKind {
-    Int { min: i64, max: i64 },
-    Float { min: f64, max: f64 },
+    Int {
+        min: i64,
+        max: i64,
+    },
+    Float {
+        min: f64,
+        max: f64,
+    },
     Bool,
     Choice(Vec<String>),
+    /// A list of at most `max_len` integers, each in `min..=max`.
+    Ints {
+        min: i64,
+        max: i64,
+        max_len: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -397,6 +446,9 @@ impl ParamSpec {
             }
             (ParamKind::Bool, Value::Bool(_)) => true,
             (ParamKind::Choice(cs), Value::Choice(c)) => cs.iter().any(|x| x == c),
+            (ParamKind::Ints { min, max, max_len }, Value::Ints(v)) => {
+                v.len() <= *max_len as usize && v.iter().all(|x| min <= x && x <= max)
+            }
             _ => false,
         }
     }
@@ -421,6 +473,12 @@ impl ParamSpec {
                 for c in cs {
                     w.name(c)?;
                 }
+            }
+            ParamKind::Ints { min, max, max_len } => {
+                w.u8(5);
+                w.i64(*min);
+                w.i64(*max);
+                w.u16(*max_len);
             }
         }
         match &self.default {
@@ -458,6 +516,13 @@ impl ParamSpec {
                     cs.push(r.name()?);
                 }
                 ParamKind::Choice(cs)
+            }
+            5 => {
+                let (min, max, max_len) = (r.i64()?, r.i64()?, r.u16()?);
+                if min > max || max_len as usize > MAX_INTS {
+                    return Err(DecodeError::BadValue);
+                }
+                ParamKind::Ints { min, max, max_len }
             }
             _ => return Err(DecodeError::BadTag),
         };
@@ -582,11 +647,21 @@ pub enum ClientMsg {
         path: String,
         offset: u32,
     },
-    /// A registration: its ready depth, typed parameters and input files.
+    /// A registration: its ready depth, typed parameters and input files;
+    /// the state to resume from (a `resume_state` an earlier item carried);
+    /// whether its items are made on request (`Request`) or kept ready.
     Register {
         keep_ready: u32,
         params: Vec<(String, Value)>,
         files: Vec<FileRef>,
+        resume: Option<Vec<u8>>,
+        on_request: bool,
+    },
+    /// The next item of a registration on request, with its parameters.
+    /// No reply; items come back to `Get`s in the order they were requested.
+    Request {
+        registration: u64,
+        params: Vec<(String, Value)>,
     },
     Start {
         workers: u32,
@@ -623,8 +698,10 @@ pub enum HostMsg {
         entries: Vec<DirEntry>,
         more: bool,
     },
+    /// The registration's ID and the parameters each of its requests takes.
     Registered {
         registration: u64,
+        request_params: Vec<ParamSpec>,
     },
     Started,
     Batch(BatchDesc),
@@ -650,6 +727,7 @@ mod kind {
     pub const RELEASE: u16 = 0x06;
     pub const READY_COUNTS: u16 = 0x07;
     pub const CLOSE: u16 = 0x08;
+    pub const REQUEST: u16 = 0x09;
 
     pub const WELCOME: u16 = 0x81;
     pub const REFUSED: u16 = 0x82;
@@ -661,6 +739,24 @@ mod kind {
     pub const READY_COUNTS_REPLY: u16 = 0x88;
     pub const CLOSED: u16 = 0x89;
     pub const FATAL: u16 = 0x8a;
+}
+
+fn encode_values(w: &mut Writer, params: &[(String, Value)]) -> Result<(), EncodeError> {
+    w.count(params.len(), MAX_PARAMS)?;
+    for (name, value) in params {
+        w.name(name)?;
+        value.encode(w)?;
+    }
+    Ok(())
+}
+
+fn decode_values(r: &mut Reader<'_>) -> Result<Vec<(String, Value)>, DecodeError> {
+    let n = r.count(MAX_PARAMS, 4)?;
+    let mut params = Vec::with_capacity(n);
+    for _ in 0..n {
+        params.push((r.name()?, Value::decode(r)?));
+    }
+    Ok(params)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,19 +825,33 @@ impl ClientMsg {
                 keep_ready,
                 params,
                 files,
+                resume,
+                on_request,
             } => {
                 w.u32(*keep_ready);
-                w.count(params.len(), MAX_PARAMS)?;
-                for (name, value) in params {
-                    w.name(name)?;
-                    value.encode(&mut w)?;
-                }
+                encode_values(&mut w, params)?;
                 w.count(files.len(), MAX_FILES)?;
                 for f in files {
                     w.name(&f.root)?;
                     w.str(&f.path, MAX_PATH)?;
                 }
+                match resume {
+                    None => w.u8(0),
+                    Some(b) => {
+                        w.u8(1);
+                        w.bytes(b, MAX_RESUME)?;
+                    }
+                }
+                w.bool(*on_request);
                 kind::REGISTER
+            }
+            ClientMsg::Request {
+                registration,
+                params,
+            } => {
+                w.u64(*registration);
+                encode_values(&mut w, params)?;
+                kind::REQUEST
             }
             ClientMsg::Start { workers } => {
                 w.u32(*workers);
@@ -779,11 +889,7 @@ impl ClientMsg {
             },
             kind::REGISTER => {
                 let keep_ready = r.u32()?;
-                let n = r.count(MAX_PARAMS, 4)?;
-                let mut params = Vec::with_capacity(n);
-                for _ in 0..n {
-                    params.push((r.name()?, Value::decode(&mut r)?));
-                }
+                let params = decode_values(&mut r)?;
                 let n = r.count(MAX_FILES, 5)?;
                 let mut files = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -792,12 +898,23 @@ impl ClientMsg {
                         path: r.str(MAX_PATH)?,
                     });
                 }
+                let resume = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.bytes(MAX_RESUME)?),
+                    _ => return Err(DecodeError::BadTag),
+                };
                 ClientMsg::Register {
                     keep_ready,
                     params,
                     files,
+                    resume,
+                    on_request: r.bool()?,
                 }
             }
+            kind::REQUEST => ClientMsg::Request {
+                registration: r.u64()?,
+                params: decode_values(&mut r)?,
+            },
             kind::START => ClientMsg::Start { workers: r.u32()? },
             kind::GET => ClientMsg::Get {
                 registration: r.u64()?,
@@ -855,8 +972,15 @@ impl HostMsg {
                 w.bool(*more);
                 kind::LISTING
             }
-            HostMsg::Registered { registration } => {
+            HostMsg::Registered {
+                registration,
+                request_params,
+            } => {
                 w.u64(*registration);
+                w.count(request_params.len(), MAX_PARAMS)?;
+                for p in request_params {
+                    p.encode(&mut w)?;
+                }
                 kind::REGISTERED
             }
             HostMsg::Started => kind::STARTED,
@@ -976,9 +1100,18 @@ impl HostMsg {
                     more: r.bool()?,
                 }
             }
-            kind::REGISTERED => HostMsg::Registered {
-                registration: r.u64()?,
-            },
+            kind::REGISTERED => {
+                let registration = r.u64()?;
+                let n = r.count(MAX_PARAMS, 5)?;
+                let mut request_params = Vec::with_capacity(n);
+                for _ in 0..n {
+                    request_params.push(ParamSpec::decode(&mut r)?);
+                }
+                HostMsg::Registered {
+                    registration,
+                    request_params,
+                }
+            }
             kind::STARTED => HostMsg::Started,
             kind::BATCH => {
                 let batch = r.u64()?;
@@ -1089,6 +1222,8 @@ mod tests {
             keep_ready: 1,
             params: vec![],
             files: vec![],
+            resume: None,
+            on_request: false,
         }
         .encode(1)
         .unwrap();

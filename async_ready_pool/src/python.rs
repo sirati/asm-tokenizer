@@ -21,11 +21,11 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::{create_exception, ffi};
 
 use crate::bridge::client::{ArrayView, Client, DEFAULT_SOCKET, Error, LoaderInfo};
-use crate::bridge::proto::{EntryKind, FileRef, ParamKind, RefuseCode, Value};
+use crate::bridge::proto::{EntryKind, FileRef, ParamKind, ParamSpec, RefuseCode, Value};
 use crate::core::{GetError, PreloadPool, RegistrationId};
 
 type Batch = Py<PyAny>;
-type PythonProducer = Box<dyn Fn(RegistrationId) -> Result<Batch, String> + Send + Sync>;
+type PythonProducer = Box<dyn Fn(RegistrationId, u64) -> Result<Batch, String> + Send + Sync>;
 
 create_exception!(
     _native,
@@ -104,9 +104,9 @@ fn split_file(info: &LoaderInfo, s: &str) -> PyResult<FileRef> {
     })
 }
 
-fn to_value(info: &LoaderInfo, name: &str, v: &Bound<'_, PyAny>) -> PyResult<Value> {
-    let Some(spec) = info.params.iter().find(|p| p.name == name) else {
-        let known: Vec<_> = info.params.iter().map(|p| p.name.as_str()).collect();
+fn to_value(specs: &[ParamSpec], name: &str, v: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let Some(spec) = specs.iter().find(|p| p.name == name) else {
+        let known: Vec<_> = specs.iter().map(|p| p.name.as_str()).collect();
         return Err(PyValueError::new_err(format!(
             "unknown parameter {name:?} (known: {})",
             known.join(", ")
@@ -119,6 +119,19 @@ fn to_value(info: &LoaderInfo, name: &str, v: &Bound<'_, PyAny>) -> PyResult<Val
         }
         ParamKind::Float { .. } => Value::Float(v.extract()?),
         ParamKind::Choice(_) => Value::Choice(v.extract()?),
+        ParamKind::Ints { .. } => {
+            let mut out = Vec::new();
+            for x in v.try_iter()? {
+                let x = x?;
+                if x.is_instance_of::<pyo3::types::PyBool>() {
+                    return Err(PyValueError::new_err(format!(
+                        "parameter {name:?} takes ints"
+                    )));
+                }
+                out.push(x.extract::<i64>()?);
+            }
+            Value::Ints(out)
+        }
         ParamKind::Int { .. } => {
             return Err(PyValueError::new_err(format!(
                 "parameter {name:?} takes an int"
@@ -134,10 +147,43 @@ fn to_value(info: &LoaderInfo, name: &str, v: &Bound<'_, PyAny>) -> PyResult<Val
     Ok(value)
 }
 
+/// The values of a parameter dict, checked against `specs`, with every
+/// parameter without a default given.
+fn to_values(
+    specs: &[ParamSpec],
+    params: Option<Bound<'_, PyDict>>,
+) -> PyResult<Vec<(String, Value)>> {
+    let mut values = Vec::new();
+    if let Some(params) = params {
+        for (k, v) in params.iter() {
+            let name: String = k.extract()?;
+            values.push((name.clone(), to_value(specs, &name, &v)?));
+        }
+    }
+    for spec in specs {
+        if spec.default.is_none() && !values.iter().any(|(n, _)| n == &spec.name) {
+            return Err(PyValueError::new_err(format!(
+                "parameter {:?} is required",
+                spec.name
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn describe(py: Python<'_>, specs: &[ParamSpec]) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    for p in specs {
+        d.set_item(&p.name, format!("{:?}", p.kind))?;
+    }
+    Ok(d.unbind())
+}
+
 struct LoaderState {
     client: Client,
     workers: u32,
-    registrations: u64,
+    /// Per registration: on request, and the parameters of its requests.
+    registrations: Vec<(bool, Vec<ParamSpec>)>,
     started: bool,
     closed: bool,
 }
@@ -190,7 +236,7 @@ impl RustPreloader {
                     ));
                 }
                 let callback = Arc::new(produce);
-                let producer: PythonProducer = Box::new(move |registration| {
+                let producer: PythonProducer = Box::new(move |registration, _ticket| {
                     Python::attach(|py| {
                         callback
                             .bind(py)
@@ -235,8 +281,10 @@ impl RustPreloader {
                         };
                         let roots = roots.unwrap_or_default();
                         let shared = max_shared_bytes.unwrap_or(DEFAULT_LOCAL_SHARED);
-                        py.detach(|| Client::spawn_local(&program, &loader, &roots, shared, workers))
-                            .map_err(|e| to_py(e, None))?
+                        py.detach(|| {
+                            Client::spawn_local(&program, &loader, &roots, shared, workers)
+                        })
+                        .map_err(|e| to_py(e, None))?
                     }
                     other => {
                         return Err(PyValueError::new_err(format!(
@@ -254,7 +302,7 @@ impl RustPreloader {
                     inner: Inner::Loader(LoaderState {
                         client,
                         workers,
-                        registrations: 0,
+                        registrations: Vec::new(),
                         started: false,
                         closed: false,
                     }),
@@ -268,23 +316,32 @@ impl RustPreloader {
     }
 
     /// Registers one producer slot and returns its registration ID. A loader
-    /// takes its parameters and inputs ("<root>" or "<root>/<path>") here.
-    #[pyo3(signature = (keep_ready, params = None, files = None))]
+    /// takes its parameters and inputs ("<root>" or "<root>/<path>") here,
+    /// and `resume`, the bytes of an item's `resume_state` to go on after.
+    /// `on_request`: items are made only as `request` asks for them, in that
+    /// order; otherwise `keep_ready` are kept made ahead.
+    #[pyo3(signature = (keep_ready, params = None, files = None, *, resume = None, on_request = false))]
     fn register(
         &mut self,
         py: Python<'_>,
         keep_ready: usize,
         params: Option<Bound<'_, PyDict>>,
         files: Option<Vec<String>>,
+        resume: Option<Vec<u8>>,
+        on_request: bool,
     ) -> PyResult<RegistrationId> {
         let state = match &mut self.inner {
             Inner::Callback(pool) => {
-                if params.is_some() || files.is_some() {
+                if params.is_some() || files.is_some() || resume.is_some() {
                     return Err(PyValueError::new_err(
-                        "params and files are for loaders",
+                        "params, files and resume are for loaders",
                     ));
                 }
-                return pool.register(keep_ready).map_err(PyValueError::new_err);
+                return match on_request {
+                    true => pool.register_on_request(keep_ready),
+                    false => pool.register(keep_ready),
+                }
+                .map_err(PyValueError::new_err);
             }
             Inner::Loader(state) => state,
         };
@@ -299,20 +356,12 @@ impl RustPreloader {
             .filter(|k| *k > 0)
             .ok_or_else(|| PyValueError::new_err("keep_ready must be greater than zero"))?;
         let info = state.client.info().clone();
-        let mut values = Vec::new();
-        if let Some(params) = params {
-            for (k, v) in params.iter() {
-                let name: String = k.extract()?;
-                values.push((name.clone(), to_value(&info, &name, &v)?));
-            }
-        }
-        for spec in &info.params {
-            if spec.default.is_none() && !values.iter().any(|(n, _)| n == &spec.name) {
-                return Err(PyValueError::new_err(format!(
-                    "parameter {:?} is required",
-                    spec.name
-                )));
-            }
+        let values = to_values(&info.params, params)?;
+        if resume
+            .as_ref()
+            .is_some_and(|r| r.len() > crate::bridge::proto::MAX_RESUME)
+        {
+            return Err(PyValueError::new_err("resume state over its size limit"));
         }
         let files = files
             .unwrap_or_default()
@@ -328,11 +377,67 @@ impl RustPreloader {
             )));
         }
         let client = &state.client;
-        let id = py
-            .detach(|| client.register(keep_ready, values, files))
+        let (id, request_params) = py
+            .detach(|| client.register(keep_ready, values, files, resume, on_request))
             .map_err(|e| to_py(e, None))?;
-        state.registrations += 1;
+        if id != state.registrations.len() as u64 {
+            return Err(SessionEnded::new_err(
+                "the host numbered a registration out of order",
+            ));
+        }
+        state.registrations.push((on_request, request_params));
         Ok(id)
+    }
+
+    /// Asks a registration on request for its next item, with the request's
+    /// parameters (checked here against the registration's). Items come
+    /// back to `get` in the order they were requested.
+    #[pyo3(signature = (registration, params = None))]
+    fn request(
+        &self,
+        py: Python<'_>,
+        registration: RegistrationId,
+        params: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let state = match &self.inner {
+            Inner::Callback(pool) => {
+                if params.is_some() {
+                    return Err(PyValueError::new_err("request parameters are for loaders"));
+                }
+                return pool.request(registration, 1).map_err(PyValueError::new_err);
+            }
+            Inner::Loader(state) => state,
+        };
+        if !state.started || state.closed {
+            return Err(PyRuntimeError::new_err(
+                "preloader is closed or not started",
+            ));
+        }
+        let Some((on_request, specs)) = state.registrations.get(registration as usize) else {
+            return Err(PyValueError::new_err(format!(
+                "unknown registration {registration}"
+            )));
+        };
+        if !on_request {
+            return Err(PyValueError::new_err(format!(
+                "registration {registration} is kept ready, not on request"
+            )));
+        }
+        let values = to_values(specs, params)?;
+        let client = &state.client;
+        py.detach(|| client.request(registration, values))
+            .map_err(|e| to_py(e, Some(registration)))
+    }
+
+    /// The parameters each request of a registration takes, by name.
+    fn request_params(&self, py: Python<'_>, registration: RegistrationId) -> PyResult<Py<PyDict>> {
+        let state = self.loader()?;
+        match state.registrations.get(registration as usize) {
+            Some((_, specs)) => describe(py, specs),
+            None => Err(PyValueError::new_err(format!(
+                "unknown registration {registration}"
+            ))),
+        }
     }
 
     fn start(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -348,7 +453,7 @@ impl RustPreloader {
         if state.started {
             return Err(PyRuntimeError::new_err("pool has already been started"));
         }
-        if state.registrations == 0 {
+        if state.registrations.is_empty() {
             return Err(PyRuntimeError::new_err(
                 "register at least one producer before start",
             ));
@@ -386,7 +491,7 @@ impl RustPreloader {
                 "preloader is closed or not started",
             ));
         }
-        if registration >= state.registrations {
+        if registration >= state.registrations.len() as u64 {
             return Err(PyValueError::new_err(format!(
                 "unknown registration {registration}"
             )));
@@ -484,11 +589,7 @@ impl RustPreloader {
         let d = PyDict::new(py);
         d.set_item("loader", &i.loader)?;
         d.set_item("roots", i.roots.clone())?;
-        let params = PyDict::new(py);
-        for p in &i.params {
-            params.set_item(&p.name, format!("{:?}", p.kind))?;
-        }
-        d.set_item("params", params)?;
+        d.set_item("params", describe(py, &i.params)?)?;
         d.set_item("files", (i.min_files, i.max_files))?;
         d.set_item("max_shared_bytes", i.max_shared_bytes)?;
         d.set_item("max_workers", i.max_workers)?;

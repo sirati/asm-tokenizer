@@ -4,21 +4,33 @@
 //! ([`crate::bridge`]; the `loader-bridge` crate serves it to a container).
 //!
 //! A [`Loader`] declares typed parameters and how many inputs a registration
-//! takes, and opens a [`Source`] per registration. A source has a fixed
-//! layout (named arrays with element types and shapes) and fills one item at
-//! a time into a [`BatchMut`]. Inputs are files, or directories the loader
-//! walks itself through [`DataDir`], always opened beneath the data roots the
-//! runner was configured with; the loader never sees a path the consumer
-//! chose that was not resolved that way.
+//! takes, and opens a [`Source`] per registration. Inputs are files, or
+//! directories the loader walks itself through [`DataDir`], always opened
+//! beneath the data roots the runner was configured with; the loader never
+//! sees a path the consumer chose that was not resolved that way.
 //!
-//! A source's `fill` must write every byte of every array: runners reuse
-//! the memory of released items without clearing it.
+//! A source makes its items one after another. [`Source::next`] does what
+//! must happen in order (draws from the source's random state, cursors) and
+//! returns an [`Item`]; runners call it for a registration's items one at a
+//! time, in the order the consumer gets them. The item then says its layout
+//! (named arrays with element types and shapes, which may differ from item
+//! to item) and fills itself into a [`BatchMut`], on any worker,
+//! concurrently with other items. `fill` must write every byte of every
+//! array: runners reuse the memory of released items without clearing it.
+//!
+//! A registration is either kept ready (the runner keeps `keep_ready` items
+//! made ahead, each with the source's default request) or on request: each
+//! item is asked for with its own parameters ([`Source::request_params`]),
+//! and the items come back in the order they were asked for. A source that
+//! can say where it is ([`Source::state`]) can be resumed: every item then
+//! carries [`RESUME_STATE`], the state after it, and a registration given
+//! that state ([`Loader::open`]'s `resume`) goes on with the item after it.
 //!
 //! [`RustPreloader`]: crate#python
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 pub use crate::bridge::proto::{
     ArrayDesc, DType, DirEntry, EntryKind, ParamKind, ParamSpec, Value, valid_name,
@@ -27,6 +39,13 @@ pub use crate::bridge::proto::{
 pub use crate::fs::{DataDir, DataKind, PathError, Root};
 
 use crate::bridge::proto;
+
+/// The array every item of a resumable source carries: the source's state
+/// after the item, as bytes.
+pub const RESUME_STATE: &str = "resume_state";
+
+/// Requests a registration on request may have waiting.
+pub const MAX_QUEUED_REQUESTS: usize = 4096;
 
 /// Validated parameters of one registration: each declared one, with the
 /// value given or its default.
@@ -86,6 +105,12 @@ impl Params {
             _ => panic!("parameter {name} is not a declared bool"),
         }
     }
+    pub fn ints(&self, name: &str) -> &[i64] {
+        match self.values.get(name) {
+            Some(Value::Ints(v)) => v,
+            _ => panic!("parameter {name} is not a declared int list"),
+        }
+    }
     pub fn choice(&self, name: &str) -> &str {
         match self.values.get(name) {
             Some(Value::Choice(v)) => v,
@@ -133,19 +158,53 @@ pub trait Loader: Send + Sync + 'static {
     fn takes_dirs(&self) -> bool {
         false
     }
-    /// Prepares a registration. An error is reported to the consumer, which
-    /// may try again.
-    fn open(&self, params: &Params, files: Vec<InputFile>) -> Result<Box<dyn Source>, String>;
+    /// Prepares a registration. `resume` is a [`RESUME_STATE`] an item of an
+    /// earlier registration with the same parameters and inputs carried: the
+    /// source then makes the items that would have followed that one. A
+    /// state the loader does not recognise is an error. An error is reported
+    /// to the consumer, which may try again.
+    fn open(
+        &self,
+        params: &Params,
+        files: Vec<InputFile>,
+        resume: Option<&[u8]>,
+    ) -> Result<Box<dyn Source>, String>;
 }
 
-/// Produces the items of one registration, from the pool's worker threads,
-/// concurrently.
-pub trait Source: Send + Sync + 'static {
-    /// The arrays of every item.
+/// Makes the items of one registration, one after another.
+pub trait Source: Send + 'static {
+    /// The parameters of one request. A registration kept ready asks for
+    /// every item with their defaults; one on request with the values of
+    /// each request.
+    fn request_params(&self) -> Vec<ParamSpec> {
+        Vec::new()
+    }
+    /// The arrays of the largest item this source makes: what a runner
+    /// budgets its memory for. An item larger than this fails.
+    fn max_layout(&self) -> Vec<ArraySpec>;
+    /// The next item, for `request`: everything that has to happen in order.
+    /// Called for one item at a time, in the order the consumer gets them.
+    /// An error fails the registration: the consumer's next `get` for it
+    /// raises this message.
+    fn next(&mut self, request: &Params) -> Result<Box<dyn Item>, String>;
+    /// The state after the last `next`, for [`Loader::open`]'s `resume`;
+    /// None when the source cannot be resumed. At most
+    /// [`proto::MAX_RESUME`] bytes.
+    fn state(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// The longest `state` can be, for the memory budget.
+    fn max_state_len(&self) -> usize {
+        proto::MAX_RESUME
+    }
+}
+
+/// One item a source decided on, to be filled on any worker.
+pub trait Item: Send + 'static {
+    /// Its arrays.
     fn layout(&self) -> Vec<ArraySpec>;
-    /// Fills one item, every byte of every array. An error fails the
-    /// registration: the consumer's next `get` for it raises this message.
-    fn fill(&self, batch: &mut BatchMut<'_>) -> Result<(), String>;
+    /// Writes every byte of every array.
+    fn fill(self: Box<Self>, batch: &mut BatchMut<'_>) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,19 +411,217 @@ impl OwnedBatch {
     }
 }
 
-/// Fills one item of `source` in process memory.
-pub fn fill_owned(source: &dyn Source, layout: &Layout) -> Result<OwnedBatch, String> {
-    let mut item = OwnedBatch::new(layout);
-    let arrays = item.arrays.clone();
-    let mut batch = BatchMut::new(item.buf_mut(), &arrays).ok_or("layout outside the item")?;
-    source.fill(&mut batch)?;
-    Ok(item)
+/// Fills one item in process memory.
+pub fn fill_owned(item: Box<dyn Item>, layout: &Layout) -> Result<OwnedBatch, String> {
+    let mut owned = OwnedBatch::new(layout);
+    let arrays = owned.arrays.clone();
+    let mut batch = BatchMut::new(owned.buf_mut(), &arrays).ok_or("layout outside the item")?;
+    item.fill(&mut batch)?;
+    Ok(owned)
 }
 
-/// One item of `source`, outside any pool: for a loader's tests and tools.
-pub fn fill_detached(source: &dyn Source) -> Result<OwnedBatch, String> {
-    let layout = Layout::of(&source.layout())?;
-    fill_owned(source, &layout)
+/// The next item of `source` for a request with `values` (the rest at
+/// their defaults), outside any pool: for a loader's tests and tools.
+pub fn next_detached(
+    source: &mut dyn Source,
+    values: Vec<(String, Value)>,
+) -> Result<OwnedBatch, String> {
+    let request = Params::resolve(&source.request_params(), values)?;
+    let item = source.next(&request)?;
+    let layout = Layout::of(&item.layout())?;
+    fill_owned(item, &layout)
+}
+
+/// The next item of `source` with the default request.
+pub fn fill_detached(source: &mut dyn Source) -> Result<OwnedBatch, String> {
+    next_detached(source, Vec::new())
+}
+
+// ---------------------------------------------------------------------------
+// A registration as runners drive it.
+
+struct Turn {
+    source: Box<dyn Source>,
+    /// The ticket whose item is next.
+    next: u64,
+    /// Set once an item failed: the later ones fail too.
+    failed: bool,
+    requests: VecDeque<Params>,
+}
+
+/// One registration's source with the order its items are made in: item
+/// `ticket` is made after item `ticket - 1`, with the `ticket`-th request
+/// for a registration on request.
+pub struct Stream {
+    turn: Mutex<Turn>,
+    turned: Condvar,
+    request_specs: Vec<ParamSpec>,
+    /// The request of every item of a registration kept ready; None on request.
+    defaults: Option<Params>,
+    max: Layout,
+    resumable: bool,
+    max_state: usize,
+}
+
+/// An item made by its stream's source, with the arrays it fills.
+pub struct Prepared {
+    item: Box<dyn Item>,
+    state: Option<Vec<u8>>,
+    layout: Layout,
+}
+
+impl Prepared {
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Fills the item and, for a resumable source, its [`RESUME_STATE`].
+    pub fn fill(self, batch: &mut BatchMut<'_>) -> Result<(), String> {
+        if let Some(state) = &self.state {
+            let i = batch.index_of(RESUME_STATE).expect("in the layout");
+            batch.bytes_mut(i).copy_from_slice(state);
+        }
+        self.item.fill(batch)
+    }
+}
+
+impl Stream {
+    /// `on_request`: items only as requests ask for them; otherwise every
+    /// item with the default request, which needs every request parameter
+    /// to have a default.
+    pub fn new(source: Box<dyn Source>, on_request: bool) -> Result<Stream, String> {
+        let request_specs = source.request_params();
+        if request_specs.len() > proto::MAX_PARAMS {
+            return Err("the loader declares too many request parameters".into());
+        }
+        let defaults = match on_request {
+            true => None,
+            false => Some(Params::resolve(&request_specs, Vec::new()).map_err(|e| {
+                format!("this loader's items need requests (register on request): {e}")
+            })?),
+        };
+        let resumable = source.state().is_some();
+        let max_state = source.max_state_len().min(proto::MAX_RESUME);
+        let mut max = source.max_layout();
+        if max.iter().any(|a| a.name == RESUME_STATE) {
+            return Err(format!(
+                "{RESUME_STATE} is the runner's array, not a loader's"
+            ));
+        }
+        if resumable {
+            max.push(ArraySpec::new(RESUME_STATE, DType::U8, &[max_state as u64]));
+        }
+        let max = Layout::of(&max)?;
+        Ok(Stream {
+            turn: Mutex::new(Turn {
+                source,
+                next: 0,
+                failed: false,
+                requests: VecDeque::new(),
+            }),
+            turned: Condvar::new(),
+            request_specs,
+            defaults,
+            max,
+            resumable,
+            max_state,
+        })
+    }
+
+    pub fn request_params(&self) -> &[ParamSpec] {
+        &self.request_specs
+    }
+
+    pub fn on_request(&self) -> bool {
+        self.defaults.is_none()
+    }
+
+    /// What an item may take at most, the resume state included.
+    pub fn max_layout(&self) -> &Layout {
+        &self.max
+    }
+
+    /// Queues a request; the caller then asks its pool for one more item.
+    pub fn push_request(&self, values: Vec<(String, Value)>) -> Result<(), String> {
+        if self.defaults.is_some() {
+            return Err("request for a registration that is kept ready".into());
+        }
+        let params = Params::resolve(&self.request_specs, values)?;
+        let mut t = self.turn.lock().unwrap();
+        if t.requests.len() >= MAX_QUEUED_REQUESTS {
+            return Err(format!("more than {MAX_QUEUED_REQUESTS} requests waiting"));
+        }
+        t.requests.push_back(params);
+        Ok(())
+    }
+
+    /// Item `ticket`, once the items before it are made.
+    pub fn next(&self, ticket: u64) -> Result<Prepared, String> {
+        let mut t = self.turn.lock().unwrap();
+        while t.next != ticket && !t.failed {
+            t = self.turned.wait(t).unwrap();
+        }
+        if t.failed {
+            return Err("an earlier item of this registration failed".into());
+        }
+        // A loader panic must wake later tickets, too. Catch it while the
+        // turn lock is held so neither poison nor a parked ticket survives.
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.make(&mut t)))
+            .unwrap_or_else(|_| Err("source panicked while planning an item".into()));
+        match made {
+            Ok(_) => t.next += 1,
+            Err(_) => t.failed = true,
+        }
+        self.turned.notify_all();
+        made
+    }
+
+    fn make(&self, t: &mut Turn) -> Result<Prepared, String> {
+        let request = match &self.defaults {
+            Some(d) => d.clone(),
+            None => t
+                .requests
+                .pop_front()
+                .ok_or("an item claimed without a request")?,
+        };
+        let item = t.source.next(&request)?;
+        let mut specs = item.layout();
+        if specs.iter().any(|a| a.name == RESUME_STATE) {
+            return Err(format!(
+                "{RESUME_STATE} is the runner's array, not a loader's"
+            ));
+        }
+        let state = match self.resumable {
+            false => None,
+            true => {
+                let s = t
+                    .source
+                    .state()
+                    .ok_or("a resumable source returned no state")?;
+                if s.len() > self.max_state {
+                    return Err(format!(
+                        "the source's state is {} bytes, more than {}",
+                        s.len(),
+                        self.max_state
+                    ));
+                }
+                specs.push(ArraySpec::new(RESUME_STATE, DType::U8, &[s.len() as u64]));
+                Some(s)
+            }
+        };
+        let layout = Layout::of(&specs)?;
+        if layout.bytes > self.max.bytes {
+            return Err(format!(
+                "an item of {} bytes, the source's max_layout is {}",
+                layout.bytes, self.max.bytes
+            ));
+        }
+        Ok(Prepared {
+            item,
+            state,
+            layout,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -376,7 +633,7 @@ mod local {
     use crate::core::{GetError, PreloadPool, RegistrationId};
     use std::path::Path;
 
-    type Producer = Box<dyn Fn(RegistrationId) -> Result<OwnedBatch, String> + Send + Sync>;
+    type Producer = Box<dyn Fn(RegistrationId, u64) -> Result<OwnedBatch, String> + Send + Sync>;
 
     /// A loader run in this process: registrations over data roots, filled
     /// by the pool's workers into process memory.
@@ -384,7 +641,7 @@ mod local {
         loader: L,
         roots: Vec<Root>,
         specs: Vec<ParamSpec>,
-        sources: Vec<(usize, Arc<dyn Source>, Layout)>,
+        streams: Vec<(usize, Arc<Stream>)>,
         pool: Option<PreloadPool<OwnedBatch, Producer>>,
     }
 
@@ -406,7 +663,7 @@ mod local {
                 loader,
                 roots: opened,
                 specs,
-                sources: Vec::new(),
+                streams: Vec::new(),
                 pool: None,
             })
         }
@@ -429,15 +686,30 @@ mod local {
             path: &str,
             offset: u32,
         ) -> Result<(Vec<DirEntry>, bool), String> {
-            self.root(root)?.list(path, offset).map_err(|e| e.to_string())
+            self.root(root)?
+                .list(path, offset)
+                .map_err(|e| e.to_string())
         }
 
-        /// Registers a source: `files` are (root, path beneath it).
+        /// Registers a source kept ready: `files` are (root, path beneath it).
         pub fn register(
             &mut self,
             keep_ready: usize,
             values: Vec<(String, Value)>,
             files: &[(&str, &str)],
+        ) -> Result<RegistrationId, String> {
+            self.register_with(keep_ready, values, files, None, false)
+        }
+
+        /// Registers a source, from `resume` when given, on request or kept
+        /// ready.
+        pub fn register_with(
+            &mut self,
+            keep_ready: usize,
+            values: Vec<(String, Value)>,
+            files: &[(&str, &str)],
+            resume: Option<&[u8]>,
+            on_request: bool,
         ) -> Result<RegistrationId, String> {
             if self.pool.is_some() {
                 return Err("register must happen before start".into());
@@ -477,35 +749,62 @@ mod local {
                 };
                 opened.push(input);
             }
-            let source = self.loader.open(&params, opened)?;
-            let layout = Layout::of(&source.layout())?;
-            self.sources.push((keep_ready, Arc::from(source), layout));
-            Ok(self.sources.len() as RegistrationId - 1)
+            let source = self.loader.open(&params, opened, resume)?;
+            let stream = Stream::new(source, on_request)?;
+            self.streams.push((keep_ready, Arc::new(stream)));
+            Ok(self.streams.len() as RegistrationId - 1)
+        }
+
+        /// The parameters each request of a registration takes.
+        pub fn request_params(&self, registration: RegistrationId) -> Option<&[ParamSpec]> {
+            self.streams
+                .get(registration as usize)
+                .map(|(_, s)| s.request_params())
         }
 
         pub fn start(&mut self, workers: usize) -> Result<(), String> {
             if self.pool.is_some() {
                 return Err("pool has already been started".into());
             }
-            if self.sources.is_empty() {
+            if self.streams.is_empty() {
                 return Err("register at least one producer before start".into());
             }
-            let jobs: Vec<(Arc<dyn Source>, Layout)> = self
-                .sources
-                .iter()
-                .map(|(_, s, l)| (Arc::clone(s), l.clone()))
-                .collect();
-            let producer: Producer = Box::new(move |id| {
-                let (source, layout) = &jobs[id as usize];
-                fill_owned(source.as_ref(), layout)
+            let jobs: Vec<Arc<Stream>> = self.streams.iter().map(|(_, s)| Arc::clone(s)).collect();
+            let producer: Producer = Box::new(move |id, ticket| {
+                let prepared = jobs[id as usize].next(ticket)?;
+                let layout = prepared.layout().clone();
+                let mut owned = OwnedBatch::new(&layout);
+                let arrays = owned.arrays.clone();
+                let mut batch =
+                    BatchMut::new(owned.buf_mut(), &arrays).ok_or("layout outside the item")?;
+                prepared.fill(&mut batch)?;
+                Ok(owned)
             });
             let mut pool = PreloadPool::new(producer, workers)?;
-            for (keep_ready, _, _) in &self.sources {
-                pool.register(*keep_ready)?;
+            for (keep_ready, stream) in &self.streams {
+                match stream.on_request() {
+                    true => pool.register_on_request(*keep_ready)?,
+                    false => pool.register(*keep_ready)?,
+                };
             }
             pool.start()?;
             self.pool = Some(pool);
             Ok(())
+        }
+
+        /// Asks a registration on request for its next item.
+        pub fn request(
+            &self,
+            registration: RegistrationId,
+            values: Vec<(String, Value)>,
+        ) -> Result<(), String> {
+            let (Some(pool), Some((_, stream))) =
+                (&self.pool, self.streams.get(registration as usize))
+            else {
+                return Err("not started, or no such registration".into());
+            };
+            stream.push_request(values)?;
+            pool.request(registration, 1).map_err(str::to_owned)
         }
 
         pub fn get(&self, registration: RegistrationId) -> Result<OwnedBatch, GetError> {
@@ -518,7 +817,7 @@ mod local {
         pub fn ready_counts(&self) -> Vec<(RegistrationId, usize)> {
             match &self.pool {
                 Some(p) => p.ready_counts(),
-                None => (0..self.sources.len() as u64).map(|i| (i, 0)).collect(),
+                None => (0..self.streams.len() as u64).map(|i| (i, 0)).collect(),
             }
         }
 

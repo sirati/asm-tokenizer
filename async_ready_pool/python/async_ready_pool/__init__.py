@@ -18,6 +18,13 @@ Where a Rust loader runs is the backend, the same API either way:
 
 ``backend=`` picks it; left out, ``$ASYNC_READY_POOL_BACKEND`` does, else
 ``"local"``.
+
+A loader's key is kept ready (``ready_depth`` items made ahead, each with the
+loader's default request) or, with ``on_request=True``, filled on request:
+:meth:`AsyncReadyPool.request` asks for each item with its own parameters
+and :meth:`AsyncReadyPool.get` returns them in that order. A loader that can
+be resumed puts ``resume_state`` in every item, the state after it; a
+:class:`RustLoader` with ``resume=`` those bytes goes on with the next item.
 """
 
 from __future__ import annotations
@@ -38,6 +45,8 @@ class RustLoader:
     loader: str
     params: Mapping[str, Any] = field(default_factory=dict)
     files: tuple[str, ...] = ()
+    resume: bytes | None = None
+    on_request: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,7 +128,11 @@ class AsyncReadyPool:
                         sessions[producer.loader] = impl
                         self._impls.append(impl)
                     registration = impl.register(
-                        config.ready_depth, dict(producer.params), list(producer.files)
+                        config.ready_depth,
+                        dict(producer.params),
+                        list(producer.files),
+                        resume=producer.resume,
+                        on_request=producer.on_request,
                     )
                 else:
                     if callbacks is None:
@@ -144,6 +157,14 @@ class AsyncReadyPool:
         except KeyError as exc:
             raise KeyError(f"unknown pool key: {key!r}") from exc
         return impl.get(registration)
+
+    def request(self, key: Hashable, params: Mapping[str, Any] | None = None) -> None:
+        """Asks a key filled on request for its next item."""
+        try:
+            impl, registration = self._keys[key]
+        except KeyError as exc:
+            raise KeyError(f"unknown pool key: {key!r}") from exc
+        impl.request(registration, dict(params) if params is not None else None)
 
     def ready_counts(self) -> dict[Hashable, int]:
         counts = {id(impl): dict(impl.ready_counts()) for impl in self._impls}

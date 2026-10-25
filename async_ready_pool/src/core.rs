@@ -31,7 +31,7 @@
 //! reserves the slot (`in_flight += 1`); a deposit converts it to a ready item
 //! (`in_flight -= 1`, push); a failed produce releases it (`in_flight -= 1`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
@@ -42,20 +42,51 @@ use std::thread::{self, JoinHandle};
 pub type RegistrationId = u64;
 
 /// Per-bucket mutable state: the ready ring + its target + the in-flight count.
+///
+/// Items come out in claim order: each claim takes the bucket's next ticket,
+/// and an item deposited ahead of an earlier ticket waits in `early` until
+/// the ones before it are in.
 struct Bucket<T> {
     ready: VecDeque<T>,
     keep_ready: usize,
+    /// Claimed and not yet in `ready` (being produced, or in `early`).
     in_flight: usize,
-    failure: Option<String>,
+    /// The first ticket that failed, and why.
+    failure: Option<(u64, String)>,
+    next_ticket: u64,
+    next_out: u64,
+    early: BTreeMap<u64, T>,
+    /// Some for a bucket filled on request: claims it may still hand out.
+    granted: Option<usize>,
 }
 
 impl<T> Bucket<T> {
+    fn new(keep_ready: usize, granted: Option<usize>) -> Bucket<T> {
+        Bucket {
+            ready: VecDeque::new(),
+            keep_ready,
+            in_flight: 0,
+            failure: None,
+            next_ticket: 0,
+            next_out: 0,
+            early: BTreeMap::new(),
+            granted,
+        }
+    }
+
     /// How many more items this bucket WANTS dispatched right now: the target
-    /// minus what is ready minus what workers are already producing for it.
-    /// Saturating (never negative) so an over-full bucket reports a 0 deficit.
+    /// minus what is ready minus what workers are already producing for it,
+    /// and for a bucket on request at most what was asked for and not yet
+    /// claimed. Saturating (never negative) so an over-full bucket reports a
+    /// 0 deficit.
     fn deficit(&self) -> usize {
-        self.keep_ready
-            .saturating_sub(self.ready.len() + self.in_flight)
+        let room = self
+            .keep_ready
+            .saturating_sub(self.ready.len() + self.in_flight);
+        match self.granted {
+            Some(g) => room.min(g),
+            None => room,
+        }
     }
 }
 
@@ -119,12 +150,29 @@ impl<T> PreloadCore<T> {
             .buckets
             .entry(key)
             .and_modify(|b| b.keep_ready = keep_ready)
-            .or_insert_with(|| Bucket {
-                ready: VecDeque::new(),
-                keep_ready,
-                in_flight: 0,
-                failure: None,
-            });
+            .or_insert_with(|| Bucket::new(keep_ready, None));
+    }
+
+    /// Register a bucket filled on request: no item is produced until
+    /// [`grant`](Self::grant) asks for it, and at most `keep_ready` wait
+    /// ready at once.
+    pub fn register_on_request(&self, key: RegistrationId, keep_ready: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.buckets.insert(key, Bucket::new(keep_ready, Some(0)));
+    }
+
+    /// Asks a bucket on request for `n` more items. False when the bucket is
+    /// unknown or not on request.
+    pub fn grant(&self, key: RegistrationId, n: usize) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.buckets.get_mut(&key).and_then(|b| b.granted.as_mut()) {
+            Some(g) => {
+                *g = g.saturating_add(n);
+                self.not_full.notify_all();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether a bucket is registered (for the pyclass `get` pre-check).
@@ -133,21 +181,28 @@ impl<T> PreloadCore<T> {
     }
 
     /// Block until SOME bucket has a deficit, then reserve one of its slots and
-    /// return its key (the worker then produces an item for it OUTSIDE the
-    /// lock). Returns `Err` when the worker should exit (failure or closing).
+    /// return its key and the slot's ticket (the worker then produces an item
+    /// for it OUTSIDE the lock and deposits it under that ticket). Returns
+    /// `Err` when the worker should exit (failure or closing).
     ///
     /// Reserving here (`in_flight += 1`) under the lock is what makes the
     /// most-starved pick race-free: the next worker scanning sees this slot
     /// already accounted for.
-    pub fn claim(&self) -> Result<RegistrationId, ClaimStop> {
+    pub fn claim(&self) -> Result<(RegistrationId, u64), ClaimStop> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if inner.closing {
                 return Err(ClaimStop::Closing);
             }
             if let Some(key) = most_starved(&inner.buckets) {
-                inner.buckets.get_mut(&key).unwrap().in_flight += 1;
-                return Ok(key);
+                let b = inner.buckets.get_mut(&key).unwrap();
+                b.in_flight += 1;
+                if let Some(g) = b.granted.as_mut() {
+                    *g -= 1;
+                }
+                let ticket = b.next_ticket;
+                b.next_ticket += 1;
+                return Ok((key, ticket));
             }
             if inner
                 .buckets
@@ -162,31 +217,34 @@ impl<T> PreloadCore<T> {
         }
     }
 
-    /// Deposit a produced item into its bucket: convert the reserved in-flight
-    /// slot into a ready item and wake one puller. Called by the worker AFTER
-    /// `produce` succeeds. If the bucket vanished (only on close) the item is
-    /// dropped.
-    pub fn deposit(&self, key: RegistrationId, item: T) {
+    /// Deposit the item of claim `ticket` into its bucket: once every earlier
+    /// ticket's item is in, it becomes ready (in ticket order) and pullers
+    /// wake. Called by the worker AFTER `produce` succeeds. If the bucket
+    /// vanished (only on close) the item is dropped.
+    pub fn deposit(&self, key: RegistrationId, ticket: u64, item: T) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(bucket) = inner.buckets.get_mut(&key) {
-            bucket.in_flight = bucket.in_flight.saturating_sub(1);
-            bucket.ready.push_back(item);
+            bucket.early.insert(ticket, item);
+            while let Some(item) = bucket.early.remove(&bucket.next_out) {
+                bucket.next_out += 1;
+                bucket.in_flight = bucket.in_flight.saturating_sub(1);
+                bucket.ready.push_back(item);
+            }
         }
-        // A new item is ready for exactly one waiting puller.
-        self.not_empty.notify_one();
+        // Pullers of several buckets share the condvar: wake them all.
+        self.not_empty.notify_all();
     }
 
-    /// Release a reserved slot WITHOUT depositing (the produce failed): mark
-    /// the pool failed and wake EVERYONE so no caller parks. Sticky: a second
-    /// failure keeps the first message.
-    pub fn fail(&self, key: RegistrationId, message: String) {
+    /// Release a reserved slot WITHOUT depositing (the produce of `ticket`
+    /// failed): mark the registration failed and wake EVERYONE so no caller
+    /// parks. Sticky: the earliest failed ticket's message is kept. Items
+    /// before it are still handed out; `get` fails once they are.
+    pub fn fail(&self, key: RegistrationId, ticket: u64, message: String) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(bucket) = inner.buckets.get_mut(&key) {
             bucket.in_flight = bucket.in_flight.saturating_sub(1);
-        }
-        if let Some(bucket) = inner.buckets.get_mut(&key) {
-            if bucket.failure.is_none() {
-                bucket.failure = Some(message);
+            if bucket.failure.as_ref().is_none_or(|(t, _)| ticket < *t) {
+                bucket.failure = Some((ticket, message));
             }
         }
         // Wake every parked puller AND refiller — they re-check the bucket failure.
@@ -206,15 +264,19 @@ impl<T> PreloadCore<T> {
             if !inner.buckets.contains_key(&key) {
                 return Err(GetError::UnknownBucket(key));
             }
-            // A producer failure is surfaced before buffered data for THIS
-            // registration, while unrelated registrations keep running.
-            if let Some(msg) = &inner.buckets.get(&key).unwrap().failure {
-                return Err(GetError::Failed(msg.clone()));
-            }
-            if let Some(item) = inner.buckets.get_mut(&key).unwrap().ready.pop_front() {
+            let bucket = inner.buckets.get_mut(&key).unwrap();
+            // Every ready item comes before a failed one.
+            if let Some(item) = bucket.ready.pop_front() {
                 // Opened a slot: a refiller should top this bucket up.
-                self.not_full.notify_one();
+                self.not_full.notify_all();
                 return Ok(item);
+            }
+            // A producer failure, once the items before it are handed out,
+            // while unrelated registrations keep running.
+            if let Some((ticket, msg)) = &bucket.failure {
+                if bucket.next_out >= *ticket {
+                    return Err(GetError::Failed(msg.clone()));
+                }
             }
             if inner.closing {
                 return Err(GetError::Closing);
@@ -247,11 +309,13 @@ impl<T> PreloadCore<T> {
 }
 
 /// Generic Rust-facing pool. It owns worker scheduling and lifecycle; the
-/// caller supplies only `producer(registration) -> Result<T, String>`.
+/// caller supplies only `producer(registration, ticket) -> Result<T, String>`.
+/// `ticket` numbers a registration's items from 0 in the order they are
+/// handed out by `get`.
 pub struct PreloadPool<T, F>
 where
     T: Send + 'static,
-    F: Fn(RegistrationId) -> Result<T, String> + Send + Sync + 'static,
+    F: Fn(RegistrationId, u64) -> Result<T, String> + Send + Sync + 'static,
 {
     core: Arc<PreloadCore<T>>,
     producer: Arc<F>,
@@ -265,7 +329,7 @@ where
 impl<T, F> PreloadPool<T, F>
 where
     T: Send + 'static,
-    F: Fn(RegistrationId) -> Result<T, String> + Send + Sync + 'static,
+    F: Fn(RegistrationId, u64) -> Result<T, String> + Send + Sync + 'static,
 {
     pub fn new(producer: F, workers: usize) -> Result<Self, &'static str> {
         if workers == 0 {
@@ -283,6 +347,31 @@ where
     }
 
     pub fn register(&mut self, keep_ready: usize) -> Result<RegistrationId, &'static str> {
+        self.add(keep_ready, false)
+    }
+
+    /// A registration filled on request: nothing is produced for it until
+    /// [`request`](Self::request) asks, and at most `keep_ready` items wait.
+    pub fn register_on_request(
+        &mut self,
+        keep_ready: usize,
+    ) -> Result<RegistrationId, &'static str> {
+        self.add(keep_ready, true)
+    }
+
+    /// Asks a registration on request for `n` more items.
+    pub fn request(&self, registration: RegistrationId, n: usize) -> Result<(), &'static str> {
+        if self.closed {
+            return Err("pool has been closed");
+        }
+        if self.core.grant(registration, n) {
+            Ok(())
+        } else {
+            Err("not a registration on request")
+        }
+    }
+
+    fn add(&mut self, keep_ready: usize, on_request: bool) -> Result<RegistrationId, &'static str> {
         if self.closed {
             return Err("pool has been closed");
         }
@@ -297,7 +386,11 @@ where
             .next_registration
             .checked_add(1)
             .ok_or("registration id exhausted")?;
-        self.core.register(registration, keep_ready);
+        if on_request {
+            self.core.register_on_request(registration, keep_ready);
+        } else {
+            self.core.register(registration, keep_ready);
+        }
         Ok(registration)
     }
 
@@ -316,16 +409,18 @@ where
             let producer = Arc::clone(&self.producer);
             self.handles.push(thread::spawn(move || {
                 loop {
-                    let registration = match core.claim() {
-                        Ok(registration) => registration,
+                    let (registration, ticket) = match core.claim() {
+                        Ok(claim) => claim,
                         Err(ClaimStop::Closing) | Err(ClaimStop::Failed) => return,
                     };
-                    let produced = catch_unwind(AssertUnwindSafe(|| producer(registration)));
+                    let produced =
+                        catch_unwind(AssertUnwindSafe(|| producer(registration, ticket)));
                     match produced {
-                        Ok(Ok(item)) => core.deposit(registration, item),
-                        Ok(Err(message)) => core.fail(registration, message),
+                        Ok(Ok(item)) => core.deposit(registration, ticket, item),
+                        Ok(Err(message)) => core.fail(registration, ticket, message),
                         Err(_) => core.fail(
                             registration,
+                            ticket,
                             "producer panicked (Rust unwind caught in worker)".to_owned(),
                         ),
                     }
@@ -363,7 +458,7 @@ where
 impl<T, F> Drop for PreloadPool<T, F>
 where
     T: Send + 'static,
-    F: Fn(RegistrationId) -> Result<T, String> + Send + Sync + 'static,
+    F: Fn(RegistrationId, u64) -> Result<T, String> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         self.close();
@@ -395,9 +490,8 @@ mod tests {
     fn deficit_is_target_minus_ready_and_inflight() {
         let b = Bucket::<u64> {
             ready: VecDeque::from(vec![1, 2]),
-            keep_ready: 5,
             in_flight: 1,
-            failure: None,
+            ..Bucket::new(5, None)
         };
         assert_eq!(b.deficit(), 2);
     }
@@ -406,9 +500,7 @@ mod tests {
     fn deficit_saturates_when_overfull() {
         let b = Bucket::<u64> {
             ready: VecDeque::from(vec![1, 2, 3]),
-            keep_ready: 2,
-            in_flight: 0,
-            failure: None,
+            ..Bucket::new(2, None)
         };
         assert_eq!(b.deficit(), 0);
     }
@@ -416,24 +508,8 @@ mod tests {
     #[test]
     fn most_starved_picks_largest_deficit() {
         let mut m = HashMap::new();
-        m.insert(
-            key(1, 1),
-            Bucket::<u64> {
-                ready: VecDeque::new(),
-                keep_ready: 2,
-                in_flight: 0,
-                failure: None,
-            },
-        );
-        m.insert(
-            key(2, 2),
-            Bucket::<u64> {
-                ready: VecDeque::new(),
-                keep_ready: 5,
-                in_flight: 0,
-                failure: None,
-            },
-        );
+        m.insert(key(1, 1), Bucket::<u64>::new(2, None));
+        m.insert(key(2, 2), Bucket::<u64>::new(5, None));
         assert_eq!(most_starved(&m), Some(key(2, 2)));
     }
 
@@ -444,9 +520,7 @@ mod tests {
             key(1, 1),
             Bucket::<u64> {
                 ready: VecDeque::from(vec![9]),
-                keep_ready: 1,
-                in_flight: 0,
-                failure: None,
+                ..Bucket::new(1, None)
             },
         );
         assert_eq!(most_starved(&m), None);
@@ -457,15 +531,51 @@ mod tests {
         let core = PreloadCore::<u64>::new();
         core.register(key(4, 8), 2);
         let k = core.claim().unwrap();
-        assert_eq!(k, key(4, 8));
+        assert_eq!(k, (key(4, 8), 0));
         // The slot is now in-flight, so a second claim targets the SAME bucket
         // (still 1 deficit) not a phantom over-dispatch.
         let k2 = core.claim().unwrap();
-        assert_eq!(k2, key(4, 8));
-        core.deposit(k, 100);
-        core.deposit(k2, 200);
+        assert_eq!(k2, (key(4, 8), 1));
+        // Deposited out of order, handed out in claim order.
+        core.deposit(k2.0, k2.1, 200);
+        assert_eq!(core.ready_counts(), vec![(key(4, 8), 0)]);
+        core.deposit(k.0, k.1, 100);
         assert_eq!(core.get(key(4, 8)).unwrap(), 100);
         assert_eq!(core.get(key(4, 8)).unwrap(), 200);
+    }
+
+    #[test]
+    fn items_before_a_failure_are_handed_out_first() {
+        let core = PreloadCore::<u64>::new();
+        core.register(1, 4);
+        let claims: Vec<_> = (0..4).map(|_| core.claim().unwrap()).collect();
+        core.fail(1, claims[3].1, "later".into());
+        core.fail(1, claims[2].1, "first".into());
+        core.deposit(1, claims[1].1, 11);
+        core.deposit(1, claims[0].1, 10);
+        assert_eq!(core.get(1), Ok(10));
+        assert_eq!(core.get(1), Ok(11));
+        assert_eq!(core.get(1), Err(GetError::Failed("first".into())));
+    }
+
+    #[test]
+    fn a_bucket_on_request_fills_only_what_was_asked() {
+        let core = Arc::new(PreloadCore::<u64>::new());
+        core.register_on_request(1, 4);
+        let c2 = Arc::clone(&core);
+        let h = thread::spawn(move || c2.claim());
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!h.is_finished(), "claimed without a request");
+        assert!(core.grant(1, 2));
+        assert_eq!(h.join().unwrap(), Ok((1, 0)));
+        assert_eq!(core.claim(), Ok((1, 1)));
+        let c3 = Arc::clone(&core);
+        let h = thread::spawn(move || c3.claim());
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!h.is_finished(), "claimed past the requests");
+        core.close();
+        assert_eq!(h.join().unwrap(), Err(ClaimStop::Closing));
+        assert!(!core.grant(7, 1));
     }
 
     #[test]
@@ -482,7 +592,7 @@ mod tests {
         let h = thread::spawn(move || c2.get(key(1, 1)));
         // Give the puller time to park on not_empty, then fail the pool.
         thread::sleep(std::time::Duration::from_millis(50));
-        core.fail(key(1, 1), "boom".to_string());
+        core.fail(key(1, 1), 0, "boom".to_string());
         assert_eq!(h.join().unwrap(), Err(GetError::Failed("boom".into())));
     }
 
@@ -491,11 +601,11 @@ mod tests {
         let core = PreloadCore::<u64>::new();
         core.register(key(1, 1), 1);
         core.register(key(2, 1), 1);
-        let failed = core.claim().unwrap();
-        core.fail(failed, "broken source".to_owned());
-        let healthy = core.claim().unwrap();
+        let (failed, t) = core.claim().unwrap();
+        core.fail(failed, t, "broken source".to_owned());
+        let (healthy, ticket) = core.claim().unwrap();
         assert_ne!(healthy, failed);
-        core.deposit(healthy, 42);
+        core.deposit(healthy, ticket, 42);
         assert_eq!(
             core.get(failed),
             Err(GetError::Failed("broken source".into()))
@@ -519,8 +629,8 @@ mod tests {
         let core = Arc::new(PreloadCore::<u64>::new());
         core.register(key(1, 1), 1);
         // Fill the only slot so the next claim parks on not_full.
-        let k = core.claim().unwrap();
-        core.deposit(k, 7);
+        let (k, t) = core.claim().unwrap();
+        core.deposit(k, t, 7);
         let c2 = Arc::clone(&core);
         let h = thread::spawn(move || c2.claim());
         thread::sleep(std::time::Duration::from_millis(50));
@@ -532,15 +642,15 @@ mod tests {
     fn full_bucket_blocks_claim_until_drained() {
         let core = Arc::new(PreloadCore::<u64>::new());
         core.register(key(1, 1), 1);
-        let k = core.claim().unwrap();
-        core.deposit(k, 1);
+        let (k, t) = core.claim().unwrap();
+        core.deposit(k, t, 1);
         // Bucket full (1/1). A claim must park until a get() drains it.
         let c2 = Arc::clone(&core);
         let h = thread::spawn(move || c2.claim());
         thread::sleep(std::time::Duration::from_millis(50));
         // Drain — frees the slot, wakes the parked claim.
         assert_eq!(core.get(key(1, 1)).unwrap(), 1);
-        assert_eq!(h.join().unwrap(), Ok(key(1, 1)));
+        assert_eq!(h.join().unwrap(), Ok((key(1, 1), 1)));
     }
 
     #[test]
@@ -563,7 +673,7 @@ mod tests {
             workers.push(thread::spawn(move || {
                 loop {
                     match c.claim() {
-                        Ok(k) => c.deposit(k, k), // tag = registration ID
+                        Ok((k, t)) => c.deposit(k, t, k), // tag = registration ID
                         Err(_) => break,
                     }
                 }
@@ -597,12 +707,21 @@ mod tests {
 
     #[test]
     fn typed_pool_owns_workers_for_the_caller() {
-        let mut pool = PreloadPool::new(|registration| Ok(registration * 10), 2).unwrap();
+        let mut pool =
+            PreloadPool::new(|registration, ticket| Ok(registration * 1000 + ticket), 3).unwrap();
         let first = pool.register(2).unwrap();
         let second = pool.register(1).unwrap();
+        let third = pool.register_on_request(2).unwrap();
         pool.start().unwrap();
-        assert_eq!(pool.get(first).unwrap() % 10, 0);
-        assert_eq!(pool.get(second).unwrap() % 10, 0);
+        for t in 0..20 {
+            assert_eq!(pool.get(first).unwrap(), first * 1000 + t);
+        }
+        assert_eq!(pool.get(second).unwrap(), second * 1000);
+        assert!(pool.request(first, 1).is_err());
+        pool.request(third, 3).unwrap();
+        for t in 0..3 {
+            assert_eq!(pool.get(third).unwrap(), third * 1000 + t);
+        }
         pool.close();
     }
 }

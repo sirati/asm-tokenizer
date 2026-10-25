@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use crate::bridge::SEALS;
 use crate::bridge::proto::{
     self, ArrayDesc, BatchDesc, ClientMsg, DType, DirEntry, FileRef, HostMsg, ParamSpec,
     RefuseCode, Value,
 };
-use crate::bridge::SEALS;
 use crate::bridge::wire;
 
 pub const DEFAULT_SOCKET: &str = "/run/loader-bridge/sock";
@@ -291,7 +291,7 @@ fn read_welcome(conn: &OwnedFd) -> Result<LoaderInfo, Error> {
             Ok(Some(_)) => {
                 return Err(Error::Disconnected(
                     "unexpected fds in the handshake".into(),
-                ))
+                ));
             }
             Ok(None) => return Err(Error::Disconnected("the host closed the connection".into())),
             Err(e) => return Err(Error::Io(format!("receive: {e}"))),
@@ -325,14 +325,14 @@ fn read_welcome(conn: &OwnedFd) -> Result<LoaderInfo, Error> {
                 },
             )) => return Err(Error::UnknownLoader(message)),
             Ok((_, HostMsg::Refused { code, message })) => {
-                return Err(Error::Refused(code, message))
+                return Err(Error::Refused(code, message));
             }
             Ok((_, HostMsg::Fatal { message })) => return Err(Error::Disconnected(message)),
             Ok(_) => return Err(Error::Disconnected("unexpected handshake reply".into())),
             Err(e) => {
                 return Err(Error::Disconnected(format!(
                     "malformed handshake reply: {e}"
-                )))
+                )));
             }
         };
         Ok(info)
@@ -340,12 +340,11 @@ fn read_welcome(conn: &OwnedFd) -> Result<LoaderInfo, Error> {
 }
 
 impl Client {
-
     pub fn info(&self) -> &LoaderInfo {
         &self.info
     }
 
-    fn request(&self, msg: &ClientMsg) -> Result<Reply, Error> {
+    fn call(&self, msg: &ClientMsg) -> Result<Reply, Error> {
         let id = self.shared.next_request.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         {
@@ -363,7 +362,7 @@ impl Client {
     }
 
     fn expect(&self, msg: &ClientMsg) -> Result<HostMsg, Error> {
-        match self.request(msg)? {
+        match self.call(msg)? {
             Reply::Msg(HostMsg::Refused { code, message }) => Err(Error::Refused(code, message)),
             Reply::Msg(m) => Ok(m),
             Reply::Batch(_) => Err(Error::Disconnected("unexpected batch".into())),
@@ -387,20 +386,46 @@ impl Client {
         }
     }
 
+    /// Registers a source: from `resume` (an item's `resume_state`) when
+    /// given; on request (items only as [`request`](Self::request) asks) or
+    /// kept ready. Returns its ID and the parameters its requests take.
     pub fn register(
         &self,
         keep_ready: u32,
         params: Vec<(String, Value)>,
         files: Vec<FileRef>,
-    ) -> Result<u64, Error> {
+        resume: Option<Vec<u8>>,
+        on_request: bool,
+    ) -> Result<(u64, Vec<ParamSpec>), Error> {
         match self.expect(&ClientMsg::Register {
             keep_ready,
             params,
             files,
+            resume,
+            on_request,
         })? {
-            HostMsg::Registered { registration } => Ok(registration),
+            HostMsg::Registered {
+                registration,
+                request_params,
+            } => Ok((registration, request_params)),
             _ => Err(Error::Disconnected("unexpected reply".into())),
         }
+    }
+
+    /// Asks a registration on request for its next item. The host checks
+    /// the parameters; values it refuses end the session, so check them
+    /// against the registration's request parameters first.
+    pub fn request(&self, registration: u64, params: Vec<(String, Value)>) -> Result<(), Error> {
+        if self.shared.dead.lock().unwrap().is_some() {
+            return Err(self.shared.disconnected(""));
+        }
+        self.shared.send(
+            0,
+            &ClientMsg::Request {
+                registration,
+                params,
+            },
+        )
     }
 
     pub fn start(&self, workers: u32) -> Result<(), Error> {
@@ -412,7 +437,7 @@ impl Client {
 
     /// The next item of a registration; blocks until one is ready.
     pub fn get(&self, registration: u64) -> Result<Batch, Error> {
-        match self.request(&ClientMsg::Get { registration })? {
+        match self.call(&ClientMsg::Get { registration })? {
             Reply::Batch(b) if b.registration == registration => Ok(b),
             Reply::Msg(HostMsg::GetFailed {
                 closing: false,
