@@ -81,7 +81,7 @@ class ReadyPool:
     """In-process, threaded, multi-config keep-N-ready batch pool.
 
     See the module docstring for the design. Public surface:
-    :meth:`start`, :meth:`get`, :meth:`close`, and the context-manager
+    :meth:`start`, :meth:`get`, :meth:`cancel`, :meth:`close`, and the context-manager
     protocol. Each registered :class:`PoolConfig` gets its own FIFO ready
     buffer kept filled to ``ready_depth`` by ``threads_per_config`` daemon
     worker threads.
@@ -122,6 +122,8 @@ class ReadyPool:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> "ReadyPool":
+        if self._closing.is_set():
+            raise RuntimeError("ReadyPool is closed")
         if self._started:
             return self
         for key, cfg in self._configs.items():
@@ -140,10 +142,14 @@ class ReadyPool:
         self._started = True
         return self
 
+    def cancel(self) -> None:
+        """Latch cancellation before startup or wake blocked gets on their liveness poll."""
+        self._closing.set()
+
     def close(self) -> None:
+        self.cancel()
         if not self._started:
             return
-        self._closing.set()
         # Unblock any worker parked on a full ready queue so it can observe
         # the closing flag and exit. A best-effort non-blocking drain frees
         # a slot per config; the workers are daemons, so a residual park is
@@ -180,6 +186,8 @@ class ReadyPool:
         ready_q = self._ready[key]
         monitor = self._monitors[key]
         while True:
+            if self._closing.is_set():
+                raise RuntimeError("ReadyPool is closed")
             try:
                 item = ready_q.get(timeout=_LIVENESS_POLL_SECS)
             except queue.Empty:
@@ -192,6 +200,8 @@ class ReadyPool:
                         f"a batch for config {key!r}: {monitor.death_cause()}"
                     )
                 continue
+            if self._closing.is_set():
+                raise RuntimeError("ReadyPool is closed")
             if isinstance(item, BaseException):
                 raise item
             return item
