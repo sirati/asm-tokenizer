@@ -147,9 +147,9 @@ class ReadyPool:
         self._closing.set()
 
     def close(self) -> None:
-        self.cancel()
         if not self._started:
             return
+        self.cancel()
         # Unblock any worker parked on a full ready queue so it can observe
         # the closing flag and exit. A best-effort non-blocking drain frees
         # a slot per config; the workers are daemons, so a residual park is

@@ -18,6 +18,16 @@ def test_cancel_before_start_is_latched():
     pool.close()
 
 
+def test_close_before_start_leaves_the_pool_startable():
+    pool = ReadyPool([PoolConfig(key="batch", produce=lambda: "batch", ready_depth=1)])
+    pool.close()
+    pool.start()
+    try:
+        assert pool.get("batch") == "batch"
+    finally:
+        pool.close()
+
+
 def test_cancel_interrupts_a_blocked_queue_wait(monkeypatch):
     import tokenizer.aligned_data.loader.ready_pool._pool as module
     waiting = threading.Event()
