@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from tokenizer.aligned_data.loader.binary_files import BinaryFiles
 
 from tokenizer.aligned_data.csv_section_index import (
     read_csv_section_index_arrays,
@@ -62,7 +63,7 @@ def sections_bin_path(base_path: Path, binary_name: str) -> Path:
     input footprint (e.g. a worker staging inputs to node-local scratch)
     both join through here instead of re-spelling the suffix.
     """
-    return Path(base_path) / f"{binary_name}_sections.bin"
+    return BinaryFiles.at(base_path, binary_name).sections_bin
 
 
 def index_locator_path(base_path: Path, binary_name: str) -> Path:
@@ -72,7 +73,7 @@ def index_locator_path(base_path: Path, binary_name: str) -> Path:
     :func:`sections_bin_path`; the matched/unmatched region reads and the
     input-footprint enumerator share it.
     """
-    return Path(base_path) / f"{binary_name}_index.bin"
+    return BinaryFiles.at(base_path, binary_name).matched_index
 
 
 @dataclass(frozen=True)

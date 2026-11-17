@@ -24,6 +24,7 @@ from typing import Dict
 import numpy as np
 
 from tokenizer.aligned_data.loader.metadata_loader import SectionKind
+from tokenizer.aligned_data.loader.binary_files import BinaryFiles
 from tokenizer.aligned_data.loader._sections_bin_walk import SectionRegion
 from tokenizer.aligned_data.matched_sections_columnar import ColumnarSections
 from tokenizer.aligned_data.realized_lengths import RealizedGeometryReader
@@ -46,6 +47,7 @@ __all__ = [
     "VectorBatchArmSet",
     "open_vector_batch_handles",
     "open_vector_batch_arm_set",
+    "vector_batch_input_paths",
 ]
 
 
@@ -140,6 +142,19 @@ class VectorBatchArmSet:
         self.close()
 
 
+def vector_batch_input_paths(base_path: Path, binary_name: str) -> tuple[Path, ...]:
+    """The binary metadata/body and geometry inputs of both vector arms.
+
+    This is a path manifest only; optional absent inputs remain represented.
+    Geometry paths come from the same reader operation used by open.
+    """
+    return tuple(dict.fromkeys((
+        *BinaryFiles.at(base_path, binary_name).paths(),
+        *(path for arm in _ARM_BY_KIND.values()
+          for path in RealizedGeometryReader.input_paths(base_path, binary_name, arm).paths()),
+        *(arm.data_path(base_path, binary_name) for arm in _ARM_BY_KIND.values()))))
+
+
 def open_vector_batch_handles(
     base_path: Path,
     binary_name: str,
@@ -190,7 +205,7 @@ def open_vector_batch_handles(
     # Hand the prefix readers an empty buffer so they mirror that exactly
     # (see ``_prefix`` / ``_prefix_values`` empty-buffer handling). The
     # file is SHARED across arms -- both arms' ``var_ref_offset`` index it.
-    variants_path = base_path / f"{binary_name}_variants.bin"
+    variants_path = BinaryFiles.at(base_path, binary_name).variants_bin
     variants_u8 = (
         np.memmap(variants_path, dtype=np.uint8, mode="r")
         if variants_path.exists()

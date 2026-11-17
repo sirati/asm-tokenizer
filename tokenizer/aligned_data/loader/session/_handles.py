@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
+from ..binary_files import BinaryFiles
 
 from ...matched_sections_bin import Section, parse_section_bin
 from ...memmap_format import MATCHED_SECTIONS_BIN_PRELUDE_SIZE
@@ -68,7 +69,7 @@ class _HandlesMixin:
         # ``matched_arm`` and ``unmatched_arm`` share the same BIN file;
         # which arm's path we resolve doesn't matter, but we walk through
         # the conventional per-binary filename for clarity.
-        path = self._base_path / f"{self._binary_name}_sections.bin"
+        path = BinaryFiles.at(self._base_path, self._binary_name).sections_bin
         # Pin the mmap so the view (and any Section sliced from it) stays
         # valid for the session lifetime; __exit__ releases the view then
         # drops this ref, so the mapping unmaps by refcounting with no
@@ -126,8 +127,8 @@ class _HandlesMixin:
                     f"cannot switch to {kind} mid-session"
                 )
             return self._data_mmap
-        suffix = "_unmatched_data.bin" if kind == "unmatched" else "_data.bin"
-        path = self._base_path / f"{self._binary_name}{suffix}"
+        paths = BinaryFiles.at(self._base_path, self._binary_name)
+        path = paths.unmatched_data if kind == "unmatched" else paths.matched_data
         mmap = np.memmap(str(path), dtype=np.uint8, mode="r")
         # Validate the 16-byte file-level prelude up front so a stale /
         # pre-prelude / wrong-format bin fails loud on open instead of
@@ -179,7 +180,7 @@ class _HandlesMixin:
             raise RuntimeError("BinarySession used outside its with-block")
         if self._variants_mmap is not None:
             return self._variants_mmap
-        path = self._base_path / f"{self._binary_name}_variants.bin"
+        path = BinaryFiles.at(self._base_path, self._binary_name).variants_bin
         if not path.exists():
             return None
         mmap = np.memmap(str(path), dtype=np.uint8, mode="r")

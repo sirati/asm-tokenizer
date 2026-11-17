@@ -25,6 +25,7 @@ here.
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass, fields
 from typing import Tuple
 
 import numpy as np
@@ -41,6 +42,15 @@ __all__ = [
     "realized_geometry_present",
     "require_realized_geometry",
 ]
+
+
+@dataclass(frozen=True)
+class GeometryFiles:
+    geometry: Path
+    index: Path
+
+    def paths(self) -> tuple[Path, ...]:
+        return tuple(vars(self)[schema.name] for schema in fields(self))
 
 
 class RealizedGeometryReader:
@@ -82,6 +92,15 @@ class RealizedGeometryReader:
         self._csr = csr
 
     @classmethod
+    def input_paths(
+        cls, base_path: Path, binary_name: str,
+        arm: RealizedGeometryArm = GEOMETRY_MATCHED_ARM,
+    ) -> GeometryFiles:
+        """The same pair open consumes, without mapping or reading it."""
+        return GeometryFiles(arm.geometry_path(Path(base_path), binary_name),
+                             arm.index_path(Path(base_path), binary_name))
+
+    @classmethod
     def open(
         cls,
         base_path: Path,
@@ -96,10 +115,9 @@ class RealizedGeometryReader:
         check.
         """
         base_path = Path(base_path)
-        geometry_path = arm.geometry_path(base_path, binary_name)
-        index_path = arm.index_path(base_path, binary_name)
+        paths = cls.input_paths(base_path, binary_name, arm)
         require_realized_geometry(base_path, binary_name, arm)
-        body, ids, values, csr = read_geometry_pair(geometry_path, index_path)
+        body, ids, values, csr = read_geometry_pair(paths.geometry, paths.index)
         return cls(body, ids, values, csr)
 
     # ------------------------------------------------------------------

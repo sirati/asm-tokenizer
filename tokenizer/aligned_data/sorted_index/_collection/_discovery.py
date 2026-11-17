@@ -36,6 +36,7 @@ refused) is owned by :func:`_qualify_names`.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -47,7 +48,22 @@ from ._member import CollectionMember, MissingIndexPolicy
 from ._spec import spec_tag
 
 
-__all__ = ["discover_members"]
+__all__ = ["discover_members", "plan_members", "CollectionManifest", "IndexInput"]
+
+
+@dataclass(frozen=True)
+class IndexInput:
+    specification: IndexSpec
+    qualified_name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class CollectionManifest:
+    """Immutable metadata from the reader's membership decision; no live readers."""
+    members: tuple[CollectionMember, ...]
+    indices: tuple[IndexInput, ...]
+    files: tuple[Path, ...]
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,16 +144,13 @@ def _idx_path(memmap_dir: Path, binary_name: str, spec: IndexSpec) -> Path:
     )
 
 
-def discover_members(
+def plan_members(
     memmap_dirs: Sequence[Path],
     *,
     specs: Sequence[IndexSpec],
-    on_missing: MissingIndexPolicy,
-) -> Tuple[
-    List[CollectionMember],
-    Dict[IndexSpec, Dict[str, SortedIndexReader]],
-]:
-    """Resolve kept members + their per-spec readers (NO section parse).
+    on_missing: MissingIndexPolicy = MissingIndexPolicy.RAISE,
+) -> CollectionManifest:
+    """Resolve kept members and consumed file paths without opening any reader.
 
     For each directory, a binary EXISTS iff its matched-arm
     ``<binary>_index.bin`` is present. A binary is KEPT iff, for EVERY
@@ -149,14 +162,13 @@ def discover_members(
     ``on_missing`` (RAISE: one :class:`ValueError` listing every triple;
     SKIP: one ERROR log per excluded binary naming exactly which specs
     were missing, then exclude). Returns the
-    alphabetical-by-``qualified_name`` member list plus the
-    ``{IndexSpec -> {qualified_name -> SortedIndexReader}}`` per-spec
-    reader maps the collection wires into its per-spec samplers.
+    alphabetical-by-``qualified_name`` members and index inputs are immutable
+    metadata. discover_members opens these exact index inputs. The manifest
+    includes every binary/vector file the corresponding reader can consume.
 
-    Discovery is deliberately section-parse-FREE: it builds only the
-    cheap ``.idx`` readers + membership and never constructs a
-    :class:`BinaryDataset` (which would eagerly parse every binary's
-    section arms up front). The collection defers each
+    Discovery queries directory metadata only. It constructs neither an
+    index reader nor a :class:`BinaryDataset` (which would eagerly parse
+    every binary's section arms up front). The collection defers each
     :class:`BinaryDataset` to its first session/handles use, so only
     sampled binaries pay the parse and never all at once at startup.
     """
@@ -206,17 +218,33 @@ def discover_members(
     ]
     members.sort(key=lambda m: m.qualified_name)
 
+    indices = tuple(IndexInput(spec, member.qualified_name,
+                              _idx_path(member.memmap_dir, member.binary_name, spec))
+                    for member in members for spec in specs)
+    from tokenizer.aligned_data.loader.vector_batch.session_handles import vector_batch_input_paths
+    files = tuple(dict.fromkeys((
+        *(path for member in members for path in vector_batch_input_paths(member.memmap_dir, member.binary_name)),
+        *(index.path for index in indices))))
+    return CollectionManifest(tuple(members), indices, files)
+
+
+def discover_members(
+    memmap_dirs: Sequence[Path],
+    *,
+    specs: Sequence[IndexSpec],
+    on_missing: MissingIndexPolicy,
+) -> Tuple[List[CollectionMember], Dict[IndexSpec, Dict[str, SortedIndexReader]]]:
+    """Open index readers from the shared metadata-only membership operation."""
+    plan = plan_members(memmap_dirs, specs=specs, on_missing=on_missing)
+
     readers_by_spec: Dict[IndexSpec, Dict[str, SortedIndexReader]] = {
         spec: {} for spec in specs
     }
-    for member in members:
-        for spec in specs:
-            readers_by_spec[spec][member.qualified_name] = SortedIndexReader(
-                _idx_path(member.memmap_dir, member.binary_name, spec),
-                reduction=spec.reduction,
-                depth=spec.depth,
-            )
-    return members, readers_by_spec
+    for index in plan.indices:
+        spec = index.specification
+        readers_by_spec[spec][index.qualified_name] = SortedIndexReader(
+            index.path, reduction=spec.reduction, depth=spec.depth)
+    return list(plan.members), readers_by_spec
 
 
 def _handle_missing(
