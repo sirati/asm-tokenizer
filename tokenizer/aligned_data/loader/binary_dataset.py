@@ -26,6 +26,7 @@ import numpy as np
 from .extern_providers_loader import load_extern_providers
 from .function_data import FunctionData
 from .function_names_loader import load_function_names
+from .binary_files import BinaryFiles
 from .matched_function import MatchedFunction
 from .metadata_loader import (
     BinaryArmPaths,
@@ -64,21 +65,18 @@ class BinaryDataset:
         # ``unmatched_sections_bin`` attributes alias the shared file
         # so each arm's consumer has a kind-tagged path attribute.
         self.matched_sections = self.base_path / f"{binary_name}_sections.csv"
-        self.matched_sections_bin = self.base_path / f"{binary_name}_sections.bin"
-        self.matched_data = self.base_path / f"{binary_name}_data.bin"
-        self.matched_index = self.base_path / f"{binary_name}_index.bin"
+        paths = BinaryFiles.at(self.base_path, binary_name)
+        self.matched_sections_bin = paths.sections_bin
+        self.matched_data = paths.matched_data
+        self.matched_index = paths.matched_index
         self.unmatched_sections = self.base_path / f"{binary_name}_unmatched_sections.csv"
         self.unmatched_sections_bin = self.matched_sections_bin
-        self.unmatched_data = self.base_path / f"{binary_name}_unmatched_data.bin"
-        self.unmatched_index = self.base_path / f"{binary_name}_unmatched_index.bin"
-        self.variants_bin = self.base_path / f"{binary_name}_variants.bin"
-        self.variants_sidecar = self.base_path / f"{binary_name}_variants.csv"
-        self.function_names_sidecar = (
-            self.base_path / f"{binary_name}_function_names.txt"
-        )
-        self.extern_providers = (
-            self.base_path / f"{binary_name}_extern_providers.txt"
-        )
+        self.unmatched_data = paths.unmatched_data
+        self.unmatched_index = paths.unmatched_index
+        self.variants_bin = paths.variants_bin
+        self.variants_sidecar = paths.variants_sidecar
+        self.function_names_sidecar = paths.function_names_sidecar
+        self.extern_providers = paths.extern_providers
 
         # Function-names sidecar: hard cutover. Required whenever either
         # arm exists; both arms' section catalogs reference names
@@ -147,6 +145,15 @@ class BinaryDataset:
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def input_paths(base_path: Path, binary_name: str) -> tuple[Path, ...]:
+        """Potential consumed files; absent optional sidecars stay visible as paths.
+
+        Debug-only section CSV catalogs are outside the reader's input set.
+        This performs no corpus reads or dataset construction.
+        """
+        return BinaryFiles.at(base_path, binary_name).paths()
+
     def _arm_paths(self, kind: SectionKind) -> BinaryArmPaths:
         """Bundle the per-arm path quad. Single switch point — the rest
         of the shell only sees ``BinaryArmPaths``. ``sections_bin``
